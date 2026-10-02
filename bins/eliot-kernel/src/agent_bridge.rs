@@ -1273,8 +1273,9 @@ impl KernelComposition {
     /// Replay and race semantics, all decided from retained identity plus
     /// digests: an exact digest replay is idempotent (even across deadline
     /// expiry, which never invalidates a terminal accepted result); a
-    /// changed same-ticket result is `IdentityConflict` unless it meets the
-    /// `NotReady` supersede gate while the bridge leg is still open.
+    /// changed same-ticket result is `IdentityConflict`. `NotReady`
+    /// reconsideration requires the exact due time and changed named dependency
+    /// revision on a fresh successor ticket while the bridge leg is open.
     #[cfg(all(test, windows))]
     pub(super) fn submit_agent_activation_result(
         &self,
@@ -2832,4 +2833,299 @@ fn rehydrate_one_activation_result(
             retention_order: retained.retention_order,
         },
     ))
+}
+
+#[cfg(all(test, windows))]
+#[path = "agent_bridge/activation_owner_tests.rs"]
+mod activation_owner_tests;
+
+#[cfg(all(test, windows))]
+mod successor_result_allowed_tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+    use eliot_protocol::{
+        AgentActivationResolutionDisposition as Disposition, AgentActivationResolutionResult,
+        AgentActivationResolutionTicket, AgentActivationRetryDirective,
+        AgentActivationTicketPredecessor, AgentBridgeActivationRequest, AgentBridgeAttachKind,
+    };
+
+    const DEMAND_ID: &str = "demand-notready-guard";
+    const DEPENDENCY_REF: &str = "workscope/task-readiness";
+    const INCOMING_NOT_BEFORE_UNIX_MS: u64 = 300;
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    struct GuardFixture {
+        pending: AgentActivationPendingState,
+        successor: super::super::AgentActivationSuccessorBinding,
+        incoming: AgentActivationResolutionResult,
+    }
+
+    enum Refusal {
+        IdentityConflict,
+        Timeout,
+    }
+
+    fn state_fence() -> TestResult<eliot_contracts::StateFence> {
+        let lineage = eliot_contracts::EpochLineageId::new("4b8b9b5b-9e2b-4bc0-8ae4-432109876543")?;
+        let sequence = NonZeroU64::new(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "test epoch must be non-zero",
+            )
+        })?;
+        let epoch = eliot_contracts::EpochId::new(lineage, sequence)?;
+        let generation = eliot_contracts::ResourceGeneration::new(1)?;
+        Ok(eliot_contracts::StateFence::new(epoch, generation))
+    }
+
+    fn activation_request(
+        request_id: eliot_contracts::RequestId,
+        connection_id: &str,
+        cancellation_id: &str,
+        deadline_unix_ms: u64,
+        peer_receipt_sha256: &str,
+        fence: eliot_contracts::StateFence,
+    ) -> TestResult<AgentBridgeActivationRequest> {
+        let product_id = eliot_contracts::ProductId::new("eliot-agent-bridge")?;
+        let source_id = eliot_contracts::SourceId::new("notready-guard-test")?;
+        Ok(AgentBridgeActivationRequest {
+            wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID.to_owned(),
+            wire_version: AgentBridgeActivationRequest::CONTRACT_VERSION,
+            operation: eliot_protocol::AGENT_BRIDGE_ACTIVATION_OPERATION.to_owned(),
+            demand_id: DEMAND_ID.to_owned(),
+            connection_id: connection_id.to_owned(),
+            workspace_selector: None,
+            attach_kind: AgentBridgeAttachKind::Managed,
+            pre_attach_blind_interval: None,
+            request_identity: eliot_protocol::RequestIdentity {
+                request: eliot_receipts::RequestBinding {
+                    metadata: eliot_contracts::RequestMetadata {
+                        request_id,
+                        session_id: None,
+                        task_id: None,
+                        product_id,
+                        source_id,
+                        state_fence: fence.clone(),
+                        clock: eliot_contracts::ClockReading::default(),
+                    },
+                    state_fence: fence,
+                },
+                idempotency_key: "idempotency-notready-guard".to_owned(),
+                deadline_unix_ms,
+                cancellation_id: cancellation_id.to_owned(),
+            },
+            peer_admission_receipt_sha256: peer_receipt_sha256.to_owned(),
+            request_sha256: String::new(),
+        }
+        .with_computed_digest()?)
+    }
+
+    fn ticket(
+        ticket_id: &str,
+        successor_of: Option<AgentActivationTicketPredecessor>,
+    ) -> TestResult<AgentActivationResolutionTicket> {
+        let activation_request_id =
+            eliot_contracts::RequestId::new(format!("request-{ticket_id}"))?;
+        let connection_id = "connection-notready-guard";
+        let cancellation_id = "cancel-notready-guard";
+        let peer_admission_receipt_sha256 = "b".repeat(64);
+        let state_fence = state_fence()?;
+        let request = activation_request(
+            activation_request_id.clone(),
+            connection_id,
+            cancellation_id,
+            1_000,
+            &peer_admission_receipt_sha256,
+            state_fence.clone(),
+        )?;
+        Ok(AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: AgentActivationResolutionTicket::CONTRACT_VERSION,
+            ticket_id: ticket_id.to_owned(),
+            activation_request_id,
+            demand_id: DEMAND_ID.to_owned(),
+            activation_request_sha256: request.request_sha256,
+            peer_admission_receipt_sha256,
+            connection_id: connection_id.to_owned(),
+            workspace_selector: None,
+            cancellation_id: cancellation_id.to_owned(),
+            state_fence,
+            kernel_deadline_unix_ms: 1_000,
+            successor_of,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()?)
+    }
+
+    fn not_ready(revision: &str, not_before_unix_ms: u64) -> Disposition {
+        Disposition::NotReady {
+            recovery_handle: "recovery-notready-guard".to_owned(),
+            retry: AgentActivationRetryDirective {
+                dependency_ref: DEPENDENCY_REF.to_owned(),
+                observed_dependency_revision: revision.to_owned(),
+                not_before_unix_ms,
+            },
+        }
+    }
+
+    fn fixture() -> TestResult<GuardFixture> {
+        fixture_at(100, 150)
+    }
+
+    fn fixture_at(not_before_unix_ms: u64, resolved_at_unix_ms: u64) -> TestResult<GuardFixture> {
+        let predecessor_ticket = ticket("ticket-predecessor", None)?;
+        let predecessor_result = AgentActivationResolutionResult::new(
+            &predecessor_ticket,
+            50,
+            not_ready("revision-1", not_before_unix_ms),
+        )?;
+        let successor = super::super::AgentActivationSuccessorBinding {
+            predecessor_ticket_id: predecessor_ticket.ticket_id.clone(),
+            predecessor_ticket_sha256: predecessor_ticket.ticket_sha256.clone(),
+            predecessor_result_sha256: predecessor_result.result_sha256.clone(),
+            dependency_ref: DEPENDENCY_REF.to_owned(),
+            observed_dependency_revision: "revision-1".to_owned(),
+            not_before_unix_ms,
+        };
+        let successor_ticket = ticket(
+            "ticket-successor",
+            Some(AgentActivationTicketPredecessor {
+                predecessor_ticket_id: successor.predecessor_ticket_id.clone(),
+                predecessor_ticket_sha256: successor.predecessor_ticket_sha256.clone(),
+                predecessor_result_sha256: successor.predecessor_result_sha256.clone(),
+                dependency_ref: successor.dependency_ref.clone(),
+                observed_dependency_revision: successor.observed_dependency_revision.clone(),
+                not_before_unix_ms: successor.not_before_unix_ms,
+            }),
+        )?;
+        let mut incoming = AgentActivationResolutionResult::new_for_successor(
+            &successor_ticket,
+            resolved_at_unix_ms.max(not_before_unix_ms),
+            not_ready("revision-2", INCOMING_NOT_BEFORE_UNIX_MS),
+            2,
+            "revision-2",
+        )?;
+        if resolved_at_unix_ms < not_before_unix_ms {
+            // Exercise the direct guard's early-time refusal with a correctly
+            // sealed result whose resolved time precedes its exact due bound.
+            incoming.resolved_at_unix_ms = resolved_at_unix_ms;
+            incoming = incoming.with_computed_digest()?;
+        }
+
+        let mut pending = AgentActivationPendingState::default();
+        pending.results.insert(
+            predecessor_ticket.ticket_id.clone(),
+            AgentActivationResultRecord {
+                result: predecessor_result,
+                demand_id: DEMAND_ID.to_owned(),
+                phase: AgentActivationResultPhase::DeferredNotReady,
+                retention_order: 1,
+            },
+        );
+        pending.entries.insert(
+            successor_ticket.ticket_id.clone(),
+            AgentActivationPending {
+                ticket: successor_ticket.clone(),
+                request: activation_request(
+                    successor_ticket.activation_request_id.clone(),
+                    &successor_ticket.connection_id,
+                    &successor_ticket.cancellation_id,
+                    successor_ticket.kernel_deadline_unix_ms,
+                    &successor_ticket.peer_admission_receipt_sha256,
+                    successor_ticket.state_fence.clone(),
+                )?,
+                claim_lease_until_unix_ms: None,
+                claim_dependency_ref: Some(DEPENDENCY_REF.to_owned()),
+                claim_dependency_revision: Some("revision-2".to_owned()),
+                successor_of: Some(successor.clone()),
+                owner_readback: None,
+            },
+        );
+        Ok(GuardFixture {
+            pending,
+            successor,
+            incoming,
+        })
+    }
+
+    #[test]
+    fn successor_result_requires_due_changed_named_dependency_revision() -> TestResult {
+        let fixture = fixture()?;
+
+        assert!(
+            KernelComposition::successor_result_allowed(
+                &fixture.pending,
+                &fixture.successor,
+                &fixture.incoming,
+                DEMAND_ID,
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn successor_result_rejects_due_unchanged_early_and_foreign_claims() -> TestResult {
+        let mut unchanged = fixture()?;
+        unchanged.successor.observed_dependency_revision = "revision-2".to_owned();
+
+        let early = fixture_at(200, 150)?;
+
+        let mut foreign_dependency = fixture()?;
+        foreign_dependency
+            .pending
+            .entries
+            .get_mut("ticket-successor")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "successor claim is missing")
+            })?
+            .claim_dependency_ref = Some("workscope/foreign-dependency".to_owned());
+
+        let mut foreign_claim_revision = fixture()?;
+        foreign_claim_revision
+            .pending
+            .entries
+            .get_mut("ticket-successor")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "successor claim is missing")
+            })?
+            .claim_dependency_revision = Some("revision-foreign".to_owned());
+
+        let cases = [
+            (
+                "due but unchanged revision",
+                unchanged,
+                Refusal::IdentityConflict,
+            ),
+            ("changed revision but not due", early, Refusal::Timeout),
+            (
+                "foreign dependency claim",
+                foreign_dependency,
+                Refusal::IdentityConflict,
+            ),
+            (
+                "foreign claim revision",
+                foreign_claim_revision,
+                Refusal::IdentityConflict,
+            ),
+        ];
+        for (name, fixture, expected) in cases {
+            let actual = KernelComposition::successor_result_allowed(
+                &fixture.pending,
+                &fixture.successor,
+                &fixture.incoming,
+                DEMAND_ID,
+            );
+            assert!(
+                match expected {
+                    Refusal::IdentityConflict =>
+                        matches!(actual, Err(TransportError::IdentityConflict)),
+                    Refusal::Timeout => matches!(actual, Err(TransportError::Timeout)),
+                },
+                "{name} must be refused",
+            );
+        }
+        Ok(())
+    }
 }
