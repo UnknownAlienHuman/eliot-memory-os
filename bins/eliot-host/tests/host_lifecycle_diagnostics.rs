@@ -28,6 +28,12 @@
 //! - `boundary_rows_bind_a_landed_case` binds every production row to a landed
 //!   case that actually asserts, so the table cannot claim proof that does not
 //!   exist.
+//! - `lifecycle_start_requested_boundary_observation_is_emitted_and_distinct`
+//!   is the A2 close: the `start.requested` boundary exists as a frozen
+//!   production row, is emitted on its owning contour, and production's own
+//!   formatter renders a record that no sibling fact (the attempt issued, the
+//!   manifest start, the process observed, authenticated readiness, the
+//!   terminal) can be mistaken for.
 //!
 //! The 22-case matrix itself is LANDED, with no gap: all 22 cases carry a
 //! `// WORK_UNIT_CASE: 891/<n>` marker, and each marker's `fn` is a real
@@ -301,6 +307,7 @@ fn production_source() -> String {
 struct BoundaryRow {
     name: String,
     event: String,
+    owner_state: String,
     test: String,
 }
 
@@ -610,6 +617,7 @@ fn production_boundary_rows(lib: &str) -> Vec<BoundaryRow> {
             current = Some(BoundaryRow {
                 name: String::new(),
                 event: String::new(),
+                owner_state: String::new(),
                 test: String::new(),
             });
             continue;
@@ -627,6 +635,8 @@ fn production_boundary_rows(lib: &str) -> Vec<BoundaryRow> {
             row.name = quoted(value);
         } else if let Some(value) = trimmed.strip_prefix("event: ") {
             row.event = frozen_event(value);
+        } else if let Some(value) = trimmed.strip_prefix("owner_state: ") {
+            row.owner_state = quoted(value);
         } else if let Some(value) = trimmed.strip_prefix("test: ") {
             row.test = quoted(value);
         }
@@ -1225,6 +1235,241 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         correlation,
     );
     assert_scm_sink_failure_is_inert_and_observations_carry_no_secret_canaries(&scm_text);
+}
+
+// ---------------------------------------------------------------------------
+// A2: the start-requested boundary observation.
+//
+// `BOUNDARY_START_REQUESTED` is this file's own vocabulary for "a start was
+// REQUESTED": production resolves it through its own `boundary_by_event`
+// (`src/lib.rs`), so the value it renders as `detail=` is exactly the frozen
+// `event` of the `start.requested` table row. The four facts the binding
+// property names are four DISTINCT production rows with distinct frozen
+// events, so the start request cannot be told apart from its siblings only by
+// construction — the proof below shows production itself rendering four
+// different records for them.
+//
+// The seam driven is production's own `host_diagnostics::observe_entrypoint_with_detail`,
+// which is the exact owner function `host_lifecycle_observe_requested` calls
+// with the resolved row event (`src/lib.rs`). The `#[cfg(windows)]`
+// `HostComposition::start_approved_contour` that owns the call site cannot be
+// driven from this non-`cfg(test)` integration target, so the CALL SITE is
+// pinned as a source fact and the EMISSION is pinned as an executed render of
+// the resolved constant. Both halves are stated; neither is claimed as more.
+// ---------------------------------------------------------------------------
+
+/// The resolved `code=` production renders for `BOUNDARY_START_REQUESTED`.
+///
+/// PRIMARY pin, not a spelling count: the constant resolves its row through the
+/// owner's own `boundary_by_event("host.start requested")` call, so the
+/// resolved string IS what `host_lifecycle_frozen_event` renders. Counting the
+/// literal `"host.start requested"` could not detect the constant being
+/// repointed at a sibling's row; this can.
+fn assert_start_requested_resolves_to_its_own_production_row(lib: &str) -> String {
+    let resolved = resolved_boundary_event(lib, "BOUNDARY_START_REQUESTED");
+    let rows = production_boundary_rows(lib);
+    let row = rows
+        .iter()
+        .find(|row| row.name == "start.requested")
+        .expect("the production table must own a start.requested row");
+    assert_eq!(
+        row.event, resolved,
+        "BOUNDARY_START_REQUESTED must resolve to the start.requested row's own frozen event"
+    );
+    // The resolved value must be a real production row's event, so the pin
+    // cannot be satisfied by a spelling no row owns.
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.event == resolved)
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["start.requested"],
+        "exactly one production row may own the start-requested event"
+    );
+    resolved
+}
+
+/// The `start.requested` observation is emitted by production, and production's
+/// own formatter renders it as a `detail=` distinct from every sibling fact.
+///
+/// Returns the captured text so the caller asserts against the very same
+/// capture. Non-emptiness is asserted FIRST and on a record production really
+/// emits, so no denial below can be satisfied by an empty capture.
+fn assert_start_requested_renders_a_record_distinct_from_its_siblings(
+    resolved: &str,
+    siblings: &[(&str, String)],
+) -> String {
+    // The real production emitter, driven exactly as
+    // `host_lifecycle_observe_requested` drives it: the Startup stage plus the
+    // resolved frozen row event as the bounded detail.
+    let emitted = capture_emit(|| {
+        observe_entrypoint_with_detail(EntrypointStage::Startup, resolved);
+    });
+
+    // NON-EMPTY FIRST. A denial over an empty capture would pass vacuously, so
+    // the capture is proved to hold a real production record before any
+    // negative assertion reads it.
+    assert!(
+        emitted.contains(&format!("detail={resolved:?}")),
+        "the capture must be non-empty and carry the exact resolved production detail, \
+         got: {emitted}"
+    );
+    assert!(
+        emitted.contains(HOST_DIAGNOSTICS_TARGET),
+        "the record must come from the production diagnostics target, got: {emitted}"
+    );
+    assert!(
+        emitted.contains("event=\"host.entrypoint_stage\""),
+        "the record must be the production entrypoint event, got: {emitted}"
+    );
+
+    // DISTINGUISHABILITY: the start request renders none of its siblings'
+    // events, so a reader can never confuse "requested" with "the attempt was
+    // issued", "the process was observed", or "readiness was established".
+    for (sibling_row, sibling_event) in siblings {
+        assert_ne!(
+            sibling_event.as_str(),
+            resolved,
+            "row {sibling_row:?} must not render the start-requested event"
+        );
+        assert!(
+            !emitted.contains(&format!("detail={sibling_event:?}")),
+            "the start-requested record must render no sibling fact {sibling_row:?} \
+             ({sibling_event:?}), got: {emitted}"
+        );
+    }
+    // A request is never a terminal, and never an ownership or readiness claim.
+    // These are the machine-status spellings the issue's case 16 forbids in
+    // free-text form; a start request may carry none of them.
+    for never in [
+        "semantically_ready",
+        "process_started",
+        "host.terminal_error",
+        "correlation_available",
+    ] {
+        assert!(
+            !emitted.contains(never),
+            "a start request must render no terminal/readiness/liveness claim {never:?}, \
+             got: {emitted}"
+        );
+    }
+    emitted
+}
+
+/// The `start_approved_contour` call site emits the start request, and it is
+/// DISTINCT from the boundary the reachable start path actually emits.
+///
+/// The `#[cfg(windows)]` `HostComposition::start_approved_contour` that owns the
+/// emission cannot be driven from this non-`cfg(test)` integration target, so
+/// this is a SOURCE-SHAPE pin and says so: it proves the emission call exists on
+/// the owner whose `source_item` the row names, and that the reachable start
+/// path is a DIFFERENT row (`start-manifest.requested`). The honest consequence
+/// is stated rather than papered over: the observation is emitted, but the
+/// function that emits it has no in-repo call expression, so the live `open`
+/// path reaches the manifest boundary instead. Wiring `start_approved_contour`
+/// in is a lifecycle-algorithm change owned by the semantic owner and is out of
+/// this issue's scope; what this file proves is the boundary's existence,
+/// emission and distinguishability, not its reachability.
+fn assert_start_requested_is_emitted_and_not_the_manifest_boundary(lib: &str) {
+    let rows = production_boundary_rows(lib);
+    let owner = rows
+        .iter()
+        .find(|row| row.name == "start.requested")
+        .expect("the production table must own a start.requested row");
+    assert!(
+        lib.contains("pub fn start_approved_contour("),
+        "the start.requested row names HostComposition::start_approved_contour, \
+         which must exist in production"
+    );
+    assert_eq!(
+        owner.owner_state, "approved generation/launch descriptor",
+        "the request is owned by the approved generation/launch descriptor, \
+         never by a launched or ready contour"
+    );
+    // The emission call site, on that exact owner.
+    assert!(
+        lib.contains("host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);"),
+        "the owning fn must emit the start-requested boundary"
+    );
+    // The reachable start path is a DIFFERENT row. It emits
+    // `BOUNDARY_START_MANIFEST_REQUESTED`, not the start request, so the two
+    // facts cannot be conflated by a reader of the frozen table.
+    let manifest = rows
+        .iter()
+        .find(|row| row.name == "start-manifest.requested")
+        .expect("the production table must own a start-manifest.requested row");
+    assert_ne!(
+        manifest.event, owner.event,
+        "the manifest request must not render the start-requested event"
+    );
+    assert!(
+        lib.contains("host_lifecycle_observe_requested(BOUNDARY_START_MANIFEST_REQUESTED);"),
+        "the live start_manifest_contour must emit the manifest boundary"
+    );
+    // The owner's declared caller is the honest statement of reachability.
+    assert!(
+        owner.test.starts_with("891/"),
+        "the row must still name a landed #891 case, got {:?}",
+        owner.test
+    );
+}
+
+/// The frozen event production renders for one production boundary row.
+///
+/// Read out of the REAL table, never re-spelled, so the sibling events the
+/// distinction is asserted against cannot drift from production.
+fn production_row_event(rows: &[BoundaryRow], name: &str) -> String {
+    rows.iter()
+        .find(|row| row.name == name)
+        .unwrap_or_else(|| panic!("the production table must own a {name:?} row"))
+        .event
+        .clone()
+}
+
+/// A2: the start-requested boundary observation exists, is emitted by
+/// production, and renders a record no sibling fact can be mistaken for.
+#[test]
+fn lifecycle_start_requested_boundary_observation_is_emitted_and_distinct() {
+    // Production source only, with the landed case module excised, so a case
+    // body cannot satisfy its own source pin.
+    let lib = production_source();
+
+    let resolved = assert_start_requested_resolves_to_its_own_production_row(&lib);
+    let rows = production_boundary_rows(&lib);
+    // The four facts the binding property separates: the request, the attempt
+    // being issued, the process being observed, and authenticated readiness.
+    let siblings = [
+        ("start.started", production_row_event(&rows, "start.started")),
+        ("start.terminal", production_row_event(&rows, "start.terminal")),
+        (
+            "start-manifest.requested",
+            production_row_event(&rows, "start-manifest.requested"),
+        ),
+        (
+            "start-manifest.started",
+            production_row_event(&rows, "start-manifest.started"),
+        ),
+        (
+            "liveness.observed",
+            production_row_event(&rows, "liveness.observed"),
+        ),
+        (
+            "readiness-proof.ready",
+            production_row_event(&rows, "readiness-proof.ready"),
+        ),
+    ];
+
+    assert_start_requested_is_emitted_and_not_the_manifest_boundary(&lib);
+    let emitted =
+        assert_start_requested_renders_a_record_distinct_from_its_siblings(&resolved, &siblings);
+
+    // Sanity: the capture really held the one record this case is about, so the
+    // sibling denials above read a non-empty capture and not a vacuous one.
+    assert_eq!(
+        count_occurrences(&emitted, "host.entrypoint_stage"),
+        1,
+        "the driven observation renders exactly one entrypoint record, got: {emitted}"
+    );
 }
 
 /// The 22-case denominator, asserted exactly: every case in `1..=22` carries
