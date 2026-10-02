@@ -166,6 +166,14 @@ Discovery/classification API reuse:
   functions directly (import, never copy) so denominator drift in one
   place invalidates both consumers.
 
+  ``enumerate_measurement_candidates`` is the whole-file read-only
+  counterpart: it walks a declared scan root and returns EVERY site the
+  accepted rules above already match, before owner allocation, so a
+  consumer can diff live source against stored rows without seeding its
+  universe from those rows. It adds no pattern and changes no class; it
+  only applies the existing trigger arms to a whole file instead of to one
+  already-declared needle.
+
 Usage:
   python scripts/context_measurement_inventory.py sync --root .
   python scripts/context_measurement_inventory.py check --root .
@@ -1361,6 +1369,177 @@ def discover_context_measurements(
         )
     candidates.sort(key=lambda item: _case_sort_key(str(item["case_ref"])))
     return file_records, candidates
+
+
+def enumerate_measurement_candidates(
+    root: Path,
+    rels: tuple[str, ...] | list[str] | None = None,
+    file_cache: dict[str, dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    """Enumerate EVERY estimator candidate in the declared scan roots (#866 API).
+
+    Read-only lexical enumeration over finite exact ``.rs`` paths. This is the
+    producer's whole-file counterpart to :func:`discover_context_measurements`:
+    that one locates one *already declared* signal, while this one finds every
+    site in the loaded source that the EXISTING accepted rules already match,
+    whether or not the stored denominator declares it.
+
+    Rule discipline (this is an enumeration API, not a new grammar):
+
+    * A line is a candidate ONLY when one of the rule regexes that already name
+      an *estimator expression* matches it -- ``ESTIMATOR_HELPER_RE``,
+      ``ESTIMATOR_CALL_RE``, ``CHAR_RATIO`` or ``BYTE_RATIO`` -- or when it is a
+      declared ``EXCLUSION_CASES`` needle. No pattern is added, widened or
+      reordered here, so every arm of the closed 15-class rule set stays exactly
+      as accepted.
+
+      Those four are the *trigger* arms: each one matches an estimator by its own
+      lexical shape (a named ``estimate_*``/``measure_*`` helper, a call into
+      one, a ``chars().count()``/byte ratio). The remaining rule arms
+      (``MEASURED_FIELD``, ``CONVERTER_DEFINED``, ``TOLERATED_LITERAL``) are
+      deliberately NOT triggers: they are *classification refinements* that fire
+      only on a needle already chosen (``MEASURED_FIELD`` matches any
+      ``estimated_tokens``-shaped identifier anywhere, and ``CONVERTER_DEFINED``
+      matches any ``u64::try_from``/``saturating_add``), so using them to
+      trigger enumeration would report every ordinary integer conversion in the
+      tree as a measurement candidate. They are still applied, because the label
+      below comes from the single classifier, which consults them.
+
+    * The label is produced by calling :func:`classify_context_measurement`, the
+      single classifier. This function never decides a class itself, and it never
+      swallows a ``CLASSIFICATION_OPEN`` result: such a line is returned with
+      ``classification = "unclassified"`` and the producer's own error code, so
+      the consumer can name it instead of the scan silently narrowing to what
+      happened to classify.
+    * ``EXCLUSION_CASES`` needles are carried as ``declared-exclusion`` with the
+      producer's own reason, because an exact declared exclusion IS this
+      producer's answer for that site and must not be re-reported as a finding.
+
+    Accounting: a candidate whose exact ``(path, span_start)`` is a span the
+    stored denominator already locates is ``known = True``; every other
+    candidate is ``known = False``. ``known`` is a *measurement* the consumer
+    may read, never an instruction to skip: a ``known`` candidate can still be
+    unaccounted if no stored row sits at that span.
+
+    Determinism: candidates are sorted by ``(path, span_start, rule)``, so any
+    traversal order yields byte-identical output. Every returned candidate
+    carries ``path``, ``span_start``, ``span_end``, ``rule``, ``signal``,
+    ``classification``, ``evidence``, ``item``, ``item_scope``, ``span_bytes``,
+    ``span_digest``, ``known`` and ``declared_case_ref``.
+
+    ``rels`` defaults to the declared scan-root universe (every path the
+    denominator touches). ``root`` is only resolved and validated; nothing is
+    written, no network or clock is used, and no subprocess is spawned.
+
+    Known vs newly observed: a candidate whose exact ``(path, span_start)`` span
+    is one the declared denominator already locates is marked ``known = True``;
+    every other candidate is ``known = False``. ``known`` is a measurement the
+    consumer may read, never an instruction to skip -- a ``known`` candidate can
+    still be unaccounted if no stored row sits at that span. The owner is
+    deliberately left as ``UNRESOLVED_OWNER`` for every candidate -- owner
+    allocation happens later and never in this function, so enumeration cannot
+    launder an unowned estimator into an owned row.
+    """
+    root = _root(root)
+    declared_rels = tuple(
+        sorted({rel for _ref, _owner, rel, _sig in DENOMINATOR_CASES} | {e[1] for e in EXCLUSION_CASES})
+    )
+    targets = tuple(sorted(set(rels))) if rels is not None else declared_rels
+    if not targets:
+        raise InventoryError("EMPTY_SCAN", "enumeration selected no scan roots; refusing empty coverage")
+    cache = file_cache if file_cache is not None else _load_files(root, targets)
+    for rel in targets:
+        if rel not in cache:
+            raise InventoryError("SCAN_INPUT_MISSING", f"declared scan root was not loaded: {rel}")
+
+    # The (path, span_start) pairs the stored denominator already accounts for,
+    # so a candidate can be reported as known without re-deciding ownership.
+    # Only cases whose path is actually loaded are resolved: a caller may
+    # enumerate a bounded subset, and an unloaded path is simply not part of
+    # this enumeration's universe.
+    declared_sites: dict[tuple[str, int], str] = {}
+    for case_ref, _owner, rel, signal in DENOMINATOR_CASES:
+        if rel not in cache:
+            continue
+        try:
+            start, _end = _locate_signal(cache[rel], rel, signal)
+        except InventoryError:
+            continue
+        declared_sites.setdefault((rel, start), case_ref)
+
+    exclusion_needles: dict[str, str] = {}
+    for _ref, rel, needle, reason in EXCLUSION_CASES:
+        exclusion_needles.setdefault(f"{rel}\x00{needle}", reason)
+
+    out: list[dict[str, object]] = []
+    for rel in targets:
+        record = cache[rel]
+        masked_lines = record["masked_lines"]
+        depths = record["depths"]
+        assert isinstance(masked_lines, list)
+        assert isinstance(depths, list)
+        for lineno, line in enumerate(masked_lines, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            matched: list[str] = []
+            # The accepted *trigger* arms, in the same first-match spirit as the
+            # classifier: the most specific arm names the site. These four match
+            # an estimator by lexical shape. MEASURED_FIELD and CONVERTER_DEFINED
+            # are classifier refinements, not triggers -- see the docstring.
+            if ESTIMATOR_HELPER_RE.search(stripped):
+                matched.append("ESTIMATOR_HELPER_RE")
+            if ESTIMATOR_CALL_RE.search(stripped):
+                matched.append("ESTIMATOR_CALL_RE")
+            if CHAR_RATIO.search(stripped):
+                matched.append("CHAR_RATIO")
+            if BYTE_RATIO.search(stripped):
+                matched.append("BYTE_RATIO")
+            declared_exclusion = exclusion_needles.get(f"{rel}\x00{stripped}")
+            if matched or declared_exclusion is not None:
+                item, item_scope = _scope_of(masked_lines, depths, lineno, rel)
+                if declared_exclusion is not None:
+                    label = "declared-exclusion"
+                    evidence = (
+                        f"declared unrelated byte/character metric {stripped!r}: {declared_exclusion}"
+                    )
+                    rule = "EXCLUSION_CASES"
+                    signal = stripped
+                else:
+                    signal = stripped
+                    try:
+                        label, evidence = classify_context_measurement(signal, rel, item_scope)
+                        rule = matched[0]
+                    except InventoryError as exc:
+                        # Never silently narrow the enumeration to whatever
+                        # happened to classify: carry the producer's own
+                        # fail-closed code so the consumer can name the site.
+                        label = "unclassified"
+                        evidence = f"{exc.code}: {exc.detail}"
+                        rule = matched[0]
+                out.append(
+                    {
+                        "path": rel,
+                        "span_start": lineno,
+                        "span_end": lineno,
+                        "span_bytes": _span_bytes(record, lineno, lineno),
+                        "span_digest": _span_digest(record, lineno, lineno),
+                        "rule": rule,
+                        "matched_rules": list(matched),
+                        "signal": signal,
+                        "classification": label,
+                        "evidence": evidence,
+                        "item": item,
+                        "item_scope": item_scope,
+                        "package": str(record["package"]),
+                        "source_sha256": str(record["sha256"]),
+                        "owner": UNRESOLVED_OWNER,
+                        "known": (rel, lineno) in declared_sites,
+                        "declared_case_ref": declared_sites.get((rel, lineno), ""),
+                    }
+                )
+    out.sort(key=lambda item: (str(item["path"]), int(item["span_start"]), str(item["rule"])))  # type: ignore[arg-type]
+    return out
 
 
 def discover_exclusions(
