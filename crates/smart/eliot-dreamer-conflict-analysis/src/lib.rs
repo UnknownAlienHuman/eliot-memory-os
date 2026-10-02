@@ -6846,12 +6846,14 @@ mod tests {
                 lifecycle: ConflictLifecycle::Open,
                 receipt_digest: receipt.bundle_digest.clone(),
             },
-            vec![MissingConflictPosition::new(
-                SourceId::new("source-b").expect("valid source"),
-                MemberDisposition::Unavailable,
-                "the rival's owner has not released its stance yet",
-            )
-            .expect("valid missing position")],
+            vec![
+                MissingConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    MemberDisposition::Unavailable,
+                    "the rival's owner has not released its stance yet",
+                )
+                .expect("valid missing position"),
+            ],
         )
         .expect("a declared-but-absent open rival is a two-member denominator");
         assert_eq!(
@@ -6952,12 +6954,14 @@ mod tests {
                 lifecycle: ConflictLifecycle::Open,
                 receipt_digest: receipt.bundle_digest.clone(),
             },
-            vec![MissingConflictPosition::new(
-                SourceId::new("source-b").expect("valid source"),
-                MemberDisposition::AuthoritativeAbsence,
-                "the rival's owner states no such position exists",
-            )
-            .expect("valid missing position")],
+            vec![
+                MissingConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    MemberDisposition::AuthoritativeAbsence,
+                    "the rival's owner states no such position exists",
+                )
+                .expect("valid missing position"),
+            ],
         );
         assert!(
             matches!(

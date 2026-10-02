@@ -128,7 +128,11 @@ impl MissingConflictPosition {
     }
     /// Validates the bounded reason; the disposition vocabulary is closed by type.
     pub fn validate(&self) -> Result<(), ContractError> {
-        validate_bounded_text(&self.reason, "conflict.missing_position.reason", MAX_SHORT_TEXT)
+        validate_bounded_text(
+            &self.reason,
+            "conflict.missing_position.reason",
+            MAX_SHORT_TEXT,
+        )
     }
     /// Returns whether this member is still open and therefore in the denominator.
     ///
