@@ -11513,8 +11513,8 @@ mod tests {
     use eliot_canonical::CanonicalWriteEnvelope;
     use eliot_config::Applicability;
     use eliot_contracts::{
-        ClockReading, ContractId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
-        TaskId,
+        ClockReading, ContractId, ProductId, ReceiptId, RequestId, RequestMetadata, SessionId,
+        SourceId, TaskId,
     };
     use eliot_coordination::{
         RegisterSession as CoordinationRegisterSession, WorkItem, WorkLeaseRequest, WorkState,
@@ -14318,7 +14318,7 @@ mod tests {
             "principal:issuer",
             TaskId::new("task-closure").expect("task id"),
             "scope:work",
-            eliot_receipts::ReceiptId::new("receipt-observed").expect("receipt id"),
+            ReceiptId::new("receipt-observed").expect("receipt id"),
             ClockReading {
                 valid_time_ms: Some(1_800_000_000_000),
                 known_time_ms: Some(1_800_000_000_000),
@@ -14479,7 +14479,7 @@ mod tests {
             },
         };
         let linked = ReceiptIdentity {
-            receipt_id: eliot_receipts::ReceiptId::new("receipt-linked").expect("receipt id"),
+            receipt_id: ReceiptId::new("receipt-linked").expect("receipt id"),
             canonical_sha256: "f".repeat(64),
         };
         let closure = pending_closure_fixture(&fence, Some(linked.clone()));
