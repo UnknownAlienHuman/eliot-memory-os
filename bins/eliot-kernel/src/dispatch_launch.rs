@@ -2456,9 +2456,11 @@ fn testd_material_bytes(
 /// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
 ///   vocabulary; its `receipt_digest` is the admission identity).
 /// * `epoch`/`generation` — the live authority bound at admission.
-/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
-///   executable-join launch nonce when the join is present; the caller
-///   request already binds it, and the child re-proves binding).
+/// * `nonce` — the I7.5/I15.2 Kernel session nonce. It is independent of the
+///   executable join's immutable `launch_nonce` and is carried only for
+///   authenticated-session correlation. Action authority is derived from
+///   the join's `launch_nonce`; the child reader preserves both values
+///   separately (`bins/eliot-native-worker/src/lib.rs::validate_kernel_file`).
 /// * `grant` — the shared `DispatchGrant` object.
 ///
 /// The concrete `ProcessRequest` plus the composed provider ports arrive
@@ -2474,7 +2476,7 @@ pub fn native_worker_material_bytes(
     receipt: &NativeWorkerClaimReceipt,
     epoch: &EpochId,
     generation: u64,
-    nonce: &str,
+    session_nonce: &str,
     grant: &DispatchGrant,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
     // The child-side 1911 contract consumes these exact operation names. The
@@ -2505,21 +2507,21 @@ pub fn native_worker_material_bytes(
             "native action envelope authority epoch is not the live admitted epoch".to_owned(),
         ));
     }
-    if request
+    let launch_nonce = request
         .executable_binding
         .as_ref()
-        .is_some_and(|binding| binding.launch_nonce != nonce)
-    {
-        return Err(DispatchLaunchError::Inconsistent(
-            "native worker launch nonce does not match its owner executable binding".to_owned(),
-        ));
-    }
+        .map(|binding| binding.launch_nonce.as_str())
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native action authority requires the owner executable binding".to_owned(),
+            )
+        })?;
     let derivation = native_worker_dispatch_derivation(
         request.claim_id.as_str(),
         request.operation_id.as_str(),
         request.worker_generation,
         epoch,
-        nonce,
+        launch_nonce,
     )?;
     let action_envelopes = WORKER_ENVELOPE_OPS
         .into_iter()
@@ -2571,7 +2573,7 @@ pub fn native_worker_material_bytes(
         "receipt": receipt,
         "epoch": epoch,
         "generation": generation,
-        "nonce": nonce,
+        "nonce": session_nonce,
         "grant": grant,
         "action_envelopes": action_envelopes,
     });
@@ -5001,7 +5003,7 @@ pub enum PreparedNativeWorkerLaunch {
 pub struct ReadyNativeWorkerLaunch {
     /// The receipt for the claim identity.
     pub receipt: Box<NativeWorkerClaimReceipt>,
-    /// The I7.5/I15.2 launch nonce written to the dispatch file.
+    /// The I7.5/I15.2 Kernel session nonce written to the dispatch file.
     pub nonce: String,
     /// Deterministic child operation identity derived from the binding
     /// digest, so the admitted executor replays (never double-spawns) an
@@ -5186,22 +5188,12 @@ pub fn prepare_native_worker_launch(
         .ok_or_else(|| {
             DispatchLaunchError::Inconsistent("native admission time is not well-formed".to_owned())
         })?;
-    let nonce = mint_dispatch_nonce(
+    let session_nonce = mint_dispatch_nonce(
         DispatchedWorkerKind::NativeWorker,
         &receipt.binding_digest,
         admitted_at_nanos,
         contour.principal_owner.as_str(),
     )?;
-    if material
-        .request
-        .executable_binding
-        .as_ref()
-        .is_some_and(|binding| binding.launch_nonce != nonce)
-    {
-        return Err(DispatchLaunchError::Inconsistent(
-            "native worker launch nonce does not match its owner executable binding".to_owned(),
-        ));
-    }
     let generation = Generation::new(generation)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let operation_id = OperationId::new(format!(
@@ -5242,7 +5234,7 @@ pub fn prepare_native_worker_launch(
                 effect_digest: None,
                 material_path: None,
                 testd_owner_binding: None,
-                nonce: nonce.clone(),
+                nonce: session_nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
                 testd_admission: None,
@@ -5274,7 +5266,7 @@ pub fn prepare_native_worker_launch(
         &receipt,
         &authority_epoch,
         generation.get(),
-        &nonce,
+        &session_nonce,
         &grant,
     );
     let bytes = match bytes {
@@ -5295,7 +5287,7 @@ pub fn prepare_native_worker_launch(
     }
     Ok(PreparedNativeWorkerLaunch::Ready(ReadyNativeWorkerLaunch {
         receipt: Box::new(receipt),
-        nonce,
+        nonce: session_nonce,
         operation_id,
         material_path,
         executable: material.executable.to_path_buf(),
@@ -7005,6 +6997,16 @@ mod tests {
         };
         assert_eq!(native_ready.receipt.claim_id, "claim-dispatch-1");
         assert_nonce_shape(&native_ready.nonce);
+        let executable_launch_nonce = native_request
+            .executable_binding
+            .as_ref()
+            .expect("claim carries its owner executable join")
+            .launch_nonce
+            .as_str();
+        assert_ne!(
+            native_ready.nonce, executable_launch_nonce,
+            "Kernel session nonce stays independent from the immutable owner launch nonce"
+        );
         let native_file = child_dir.join(
             DispatchedWorkerKind::NativeWorker
                 .material_file_name()
@@ -7100,15 +7102,8 @@ mod tests {
             );
             assert_eq!(
                 envelope["applicable_authority"],
-                native_worker_dispatch_derivation(
-                    &native_request.claim_id,
-                    &native_request.operation_id,
-                    native_request.worker_generation,
-                    &epoch,
-                    &native_ready.nonce,
-                )
-                .expect("authority derivation")
-                .authority_id
+                "native-worker-dispatch-authority-32042f5816c3e1544f6245237d2806de605234a3fbd603016fb16b5c53827daa",
+                "action authority is independently pinned to the owner's join launch nonce"
             );
             assert!(
                 envelope["verifier"]
@@ -7141,6 +7136,55 @@ mod tests {
         assert_eq!(
             native_replayed.receipt_digest, native_ready.receipt.receipt_digest,
             "native replay reconciles by the original receipt identity"
+        );
+        // A changed launch nonce under the already-admitted claim identity
+        // keeps its owner digest opaque, recomputes only the request's
+        // canonical digests, and returns the existing typed ORS conflict.
+        // The production material file remains the original presentation.
+        let mut changed_nonce_request = native_request.clone();
+        changed_nonce_request
+            .executable_binding
+            .as_mut()
+            .expect("claim carries its owner executable join")
+            .launch_nonce = "launch-nonce-foreign-0123456789".to_owned();
+        changed_nonce_request.binding_digest = changed_nonce_request
+            .compute_binding_digest()
+            .expect("changed request binding digest");
+        changed_nonce_request.request_digest = changed_nonce_request
+            .canonical_request_digest()
+            .expect("changed canonical request digest");
+        changed_nonce_request
+            .validate()
+            .expect("changed nonce remains a shape-valid presented join");
+        changed_nonce_request
+            .validate_canonical_digest()
+            .expect("changed request digests are internally consistent");
+        let changed_nonce_material = NativeWorkerLaunchMaterial {
+            request: &changed_nonce_request,
+            executable: native_material.executable,
+            executable_sha256: native_material.executable_sha256,
+            working_directory: native_material.working_directory,
+        };
+        let changed_nonce = prepare_native_worker_launch(
+            &kernel,
+            &changed_nonce_material,
+            now_nanos + 2_000_000,
+        )
+        .expect("changed claim identity answers with typed conflict");
+        let PreparedNativeWorkerLaunch::Refused(changed_nonce_refusal) = changed_nonce else {
+            panic!("changed owner launch nonce under one claim identity must be refused");
+        };
+        assert!(
+            matches!(
+                *changed_nonce_refusal,
+                eliot_kernel_service::NativeWorkerClaimResponse::Conflict(_)
+            ),
+            "changed owner nonce is refused by the existing typed conflict"
+        );
+        assert_eq!(
+            std::fs::read(&native_file).expect("original native material remains readable"),
+            native_bytes,
+            "refused changed nonce cannot overwrite the original material"
         );
         // Reconcile proves the durable ORS record still binds the receipt.
         let native_reconcile =
@@ -7582,12 +7626,18 @@ mod tests {
         // join publisher must source runs over the live admitted material
         // here. Deterministic: an exact recompute agrees bit-for-bit, so a
         // replay re-derives the identical owner record.
+        let live_launch_nonce = live_request
+            .executable_binding
+            .as_ref()
+            .expect("live claim carries its executable join")
+            .launch_nonce
+            .as_str();
         let live_first = native_worker_dispatch_derivation(
             &live_request.claim_id,
             &live_request.operation_id,
             live_request.worker_generation,
             &epoch,
-            &live_ready.nonce,
+            live_launch_nonce,
         )
         .expect("owner derivation builds over live material");
         let live_replay = native_worker_dispatch_derivation(
@@ -7595,7 +7645,7 @@ mod tests {
             &live_request.operation_id,
             live_request.worker_generation,
             &epoch,
-            &live_ready.nonce,
+            live_launch_nonce,
         )
         .expect("owner derivation replays");
         assert_eq!(live_first, live_replay, "owner derivation is replay-stable");
