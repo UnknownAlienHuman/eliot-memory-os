@@ -495,6 +495,84 @@ pub(crate) fn observe_dispatch_exposure(
     }
 }
 
+/// Reads the receipt's own digest-bound full-delivery evidence, refusing
+/// anything this completion seam cannot observe.
+///
+/// Only `FULL` delivery carrying both the produced result and the rendered
+/// representation is observable here, and the produced digest must equal the
+/// representation digest the delivery owner recorded: the protocol rejects
+/// oversize bodies instead of cutting them, and token measurement has no owner
+/// on this path, so token observations stay absent rather than zero. The
+/// ORIGINAL recorded digests are compared with this operation; none is
+/// recomputed.
+fn verified_full_delivery(
+    receipt: &ToolExposureReceiptV2,
+) -> Result<
+    (&ProducedToolResultIdentity, &DeliveredToolRepresentation),
+    eliot_receipts::ToolExposureError,
+> {
+    if !matches!(receipt.result_delivery, ResultDelivery::Full) {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.result_delivery",
+            reason: "completion seam observes only digest-bound full delivery",
+        });
+    }
+    let produced = receipt.produced_result.as_ref().ok_or(
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.result_delivery",
+            reason: "completion delivery requires the produced result it evidences",
+        },
+    )?;
+    let delivered = receipt.delivered_representation.as_ref().ok_or(
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.delivery_source_ref",
+            reason: "full delivery requires rendered representation evidence",
+        },
+    )?;
+    if produced.result_digest != delivered.representation_digest {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.delivery_source_ref",
+            reason: "produced digest does not bind the delivered representation",
+        });
+    }
+    Ok((produced, delivered))
+}
+
+/// Populates the `expanded_or_retried` stage from the expansion owner.
+///
+/// The authorized-expansion owner (`ToolExposureReceiptV2::record_expanded_delivery`)
+/// records `expanded_or_retried` together with the exact
+/// `prior_delivery_receipt_id` it expanded from, so that link IS the owner
+/// evidence this stage cites — never a recomputed value and never a stage
+/// inferred from delivery or use. A recorded expansion whose link is absent is
+/// an inconsistent owner record and fails typed rather than being cited
+/// against an invented reference.
+///
+/// Every other disposition stays explicitly unresolved unknown: an absent
+/// owner is recorded as unknown, never as `false`, a default, or an empty
+/// string. A recorded `false` joins `None` here because this seam observes no
+/// owner evidence for a negative expansion verdict at all, so there is no
+/// source reference it could cite honestly.
+fn completion_retry_fact(
+    receipt: &ToolExposureReceiptV2,
+) -> Result<Option<OwnerStageFact>, eliot_receipts::ToolExposureError> {
+    if receipt.expanded_or_retried != Some(true) {
+        return Ok(None);
+    }
+    let prior = receipt
+        .delivered_representation
+        .as_ref()
+        .and_then(|delivered| delivered.prior_delivery_receipt_id.as_deref())
+        .ok_or(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.expanded_or_retried",
+            reason: "a recorded expansion carries no owner expansion link to cite",
+        })?;
+    Ok(Some(OwnerStageFact::supplied(
+        true,
+        format!("exposure-expansion:{prior}"),
+    )?))
+}
+
 /// Populates the completion-seam-owned exposure evidence for one persisted
 /// result and seals it as the durable observation draft.
 ///
@@ -506,10 +584,10 @@ pub(crate) fn observe_dispatch_exposure(
 ///   Both bind the `host-request-persisted-completion` coordinates, never
 ///   caller prose;
 /// - `result_delivery` is `FULL` with the produced digest and the delivery
-///   owner's measured source handle. Only digest-bound full delivery is
-///   observable here: the protocol rejects oversize bodies instead of cutting
-///   them, and token measurement has no owner on this path, so token
-///   observations stay absent rather than zero;
+///   owner's measured source handle, read by [`verified_full_delivery`];
+/// - `expanded_or_retried` is the expansion owner's own recorded verdict, cited
+///   by the exact prior-delivery link it expanded from
+///   ([`completion_retry_fact`]); anything else stays explicitly unresolved;
 /// - observable use holds only on the campaign lane when the completed
 ///   receipt records it (the lane verifier consumed the verified view),
 ///   bound to the `campaign-packet-verified-view` evidence. Query and Skill
@@ -517,12 +595,12 @@ pub(crate) fn observe_dispatch_exposure(
 ///   explicitly unresolved — never `false`;
 /// - the terminal outcome carries the receipt's recorded reference verbatim.
 ///
-/// Registration, advertisement, eligibility, selection, and retry stay
-/// explicitly `null`: unresolved unknown owned elsewhere, never `false`,
-/// never inferred from a neighbouring stage, and never overwritten — the
-/// dispatch seam already recorded its own stages in its own draft under the
-/// same idempotency lineage. Turn, run, and attempt identities likewise stay
-/// unresolved; the surface identity is the admission-derived route, exactly
+/// Registration, advertisement, eligibility, and selection stay explicitly
+/// `null`: unresolved unknown owned elsewhere, never `false`, never inferred
+/// from a neighbouring stage, and never overwritten — the dispatch seam
+/// already recorded its own stages in its own draft under the same idempotency
+/// lineage. Turn, run, and attempt identities likewise stay unresolved; the
+/// surface identity is the admission-derived route, exactly
 /// like the dispatch draft, so both drafts join one revision lineage. The
 /// Tool Definition version stays explicitly `null`: the definition owner
 /// lives on the publish side and this seam never mints or guesses it.
@@ -566,30 +644,8 @@ pub(crate) fn completion_exposure_draft(
             reason: "exposure draft names a different operation than its envelope",
         });
     }
-    if !matches!(receipt.result_delivery, ResultDelivery::Full) {
-        return Err(eliot_receipts::ToolExposureError::InvalidField {
-            field: "history.result_delivery",
-            reason: "completion seam observes only digest-bound full delivery",
-        });
-    }
-    let produced = receipt.produced_result.as_ref().ok_or(
-        eliot_receipts::ToolExposureError::InvalidField {
-            field: "history.result_delivery",
-            reason: "completion delivery requires the produced result it evidences",
-        },
-    )?;
-    let delivered = receipt.delivered_representation.as_ref().ok_or(
-        eliot_receipts::ToolExposureError::InvalidField {
-            field: "history.delivery_source_ref",
-            reason: "full delivery requires rendered representation evidence",
-        },
-    )?;
-    if produced.result_digest != delivered.representation_digest {
-        return Err(eliot_receipts::ToolExposureError::InvalidField {
-            field: "history.delivery_source_ref",
-            reason: "produced digest does not bind the delivered representation",
-        });
-    }
+    let (produced, delivered) = verified_full_delivery(receipt)?;
+    let retried = completion_retry_fact(receipt)?;
     let coordinates = format!(
         "host-request-persisted-completion:{}:{}",
         receipt.receipt_id, produced.result_digest
@@ -629,7 +685,7 @@ pub(crate) fn completion_exposure_draft(
         "result_delivery": delivery,
         "result_digest": produced.result_digest,
         "delivery_source_ref": delivered.source_handle,
-        "expanded_or_retried": null,
+        "expanded_or_retried": retried,
         "observably_used_in_decision_action_or_verifier": used,
         "terminal_task_or_product_outcome_ref": receipt.terminal_task_or_product_outcome_ref,
         "exposure_history_version": EXPOSURE_HISTORY_VERSION,
@@ -657,5 +713,188 @@ pub(crate) fn observe_completion_exposure(
         Err(_) => crate::kernel_diagnostics::observe_terminal_error(
             crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
         ),
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect/unwrap for fail-fast setup"
+)]
+mod exposure_completion_retry_tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+    use eliot_protocol::{
+        HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
+    };
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_envelope() -> HostRequestEnvelope {
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test lineage");
+        let epoch = EpochId::new(
+            lineage,
+            std::num::NonZeroU64::new(3).expect("nonzero sequence"),
+        )
+        .expect("test epoch");
+        let fence = StateFence::new(
+            epoch,
+            ResourceGeneration::new(7).expect("nonzero generation"),
+        );
+        HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: HostRequestIdentity {
+                request_id: RequestId::new("host-request-1").expect("valid request id"),
+                correlation_projection: None,
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: "eliot.query".to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: "a".repeat(64),
+            },
+            state_fence: fence,
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("envelope must digest")
+    }
+
+    fn test_request() -> ToolCallRequest {
+        ToolCallRequest {
+            tool_definition: "eliot.query".to_owned(),
+            route_fingerprint: "route-fingerprint-1".to_owned(),
+            call_class: ToolCallClass::BroadSearch,
+            inputs_digest: "b".repeat(64),
+            intent: None,
+        }
+    }
+
+    fn digest_of(value: &serde_json::Value) -> String {
+        sha256_hex(&canonical_json_bytes(value).expect("value must canonicalize"))
+    }
+
+    fn representation(digest: &str) -> DeliveredToolRepresentation {
+        DeliveredToolRepresentation {
+            representation_digest: digest.to_owned(),
+            source_handle: "hostreq:source-handle".to_owned(),
+            byte_count: 128,
+            token_observation: TokenCountObservation::Unavailable {
+                reason: TokenCountUnavailableReason::MeasurementUnavailable,
+            },
+            prior_delivery_receipt_id: None,
+        }
+    }
+
+    /// Builds the real expansion-owner path: a truncated original delivery is
+    /// expanded into a linked successor receipt that records
+    /// `expanded_or_retried`. The receipt id is the envelope's own operation
+    /// id, so the completion applier joins the evaluated operation.
+    fn expanded_receipt() -> (HostRequestEnvelope, ToolCallRequest, ToolExposureReceiptV2) {
+        let envelope = test_envelope();
+        let request = test_request();
+        let operation = eliot_protocol::host_request_operation_id(&envelope);
+        let response = serde_json::json!({"hits": ["evidence-alpha"]});
+        let digest = digest_of(&response);
+        let original = ToolExposureReceiptV2::admission_observed(
+            "hostreq:original-truncated".to_owned(),
+            request.tool_definition.clone(),
+            request.route_fingerprint.clone(),
+        )
+        .expect("admission skeleton")
+        .record_truncated_delivery(
+            ProducedToolResultIdentity {
+                result_digest: digest.clone(),
+                artifact_ref: None,
+                source_handle: Some("hostreq:source-handle".to_owned()),
+            },
+            representation(&digest),
+        )
+        .expect("truncated delivery");
+        let expanded = original
+            .record_expanded_delivery(
+                operation,
+                ProducedToolResultIdentity {
+                    result_digest: digest.clone(),
+                    artifact_ref: None,
+                    source_handle: Some("hostreq:source-handle".to_owned()),
+                },
+                representation(&digest),
+            )
+            .expect("authorized expansion");
+        (envelope, request, expanded)
+    }
+
+    /// Positive: the expansion owner's recorded `expanded_or_retried` verdict
+    /// populates the retry stage, cited by the exact prior-delivery link the
+    /// owner recorded. Nothing else about the draft changes.
+    #[test]
+    fn completion_draft_cites_the_owner_expansion_link_for_retry() {
+        let (envelope, request, receipt) = expanded_receipt();
+        let draft = completion_exposure_draft(&envelope, &request, &receipt, false)
+            .expect("the expansion owner's recorded verdict must populate the stage");
+        assert_eq!(
+            draft.body()["expanded_or_retried"],
+            serde_json::json!({
+                "observed": true,
+                "source_ref": "exposure-expansion:hostreq:original-truncated",
+            }),
+            "the retry stage cites the owner's own expansion link"
+        );
+        // The independently judged stages are untouched by the retry join.
+        assert_eq!(
+            draft.body()["called"]["source_ref"],
+            serde_json::json!(format!(
+                "host-request-persisted-completion:{}:{}",
+                receipt.receipt_id,
+                receipt
+                    .produced_result
+                    .as_ref()
+                    .expect("produced")
+                    .result_digest
+            )),
+            "retry never rewrites the call stage"
+        );
+        assert_eq!(
+            draft.body()["observably_used_in_decision_action_or_verifier"],
+            serde_json::Value::Null,
+            "unknown use coverage stays unknown, never coerced to false"
+        );
+    }
+
+    /// Refusal: a receipt claiming an expansion with no owner expansion link
+    /// has no source reference this seam could cite honestly, so the applier
+    /// fails typed instead of inventing one.
+    #[test]
+    fn completion_draft_refuses_an_expansion_without_its_owner_link() {
+        let (envelope, request, receipt) = expanded_receipt();
+        let mut forged = receipt.clone();
+        let mut delivered = forged
+            .delivered_representation
+            .clone()
+            .expect("expansion carries representation evidence");
+        delivered.prior_delivery_receipt_id = None;
+        forged.delivered_representation = Some(delivered);
+        let error = completion_exposure_draft(&envelope, &request, &forged, false)
+            .expect_err("an expansion without its owner link must fail typed");
+        assert_eq!(
+            error,
+            eliot_receipts::ToolExposureError::InvalidField {
+                field: "history.expanded_or_retried",
+                reason: "a recorded expansion carries no owner expansion link to cite",
+            },
+            "the refusal names the stage, never citing an invented source"
+        );
     }
 }
