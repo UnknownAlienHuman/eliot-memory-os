@@ -1981,7 +1981,10 @@ mod default_members_guard_tests {
         // Same decision through the parameterised detector, over the same
         // bytes, so the positive arm is proven on the live data and not only
         // on a fixture.
-        assert_eq!(default_members_section_refuses_facade(WORKSPACE_MANIFEST), Ok(()));
+        assert_eq!(
+            default_members_section_refuses_facade(WORKSPACE_MANIFEST),
+            Ok(())
+        );
         // The baked manifest really does carry a default-members list; the
         // positive is a real parse, not a fail-closed "no section" fallthrough.
         assert!(WORKSPACE_MANIFEST.contains("default-members"));
