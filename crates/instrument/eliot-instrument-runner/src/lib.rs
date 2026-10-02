@@ -31,6 +31,7 @@ pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
 pub mod testd_profile_dispatch;
+pub mod testd_registry;
 pub mod verification_profile;
 
 pub use admission_submission::{AdmissionSubmission, submit_admission_snapshot};
@@ -107,8 +108,17 @@ pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
 };
 pub use testd_profile_dispatch::{
-    TESTD_DISPATCH_BINDINGS, TestdDispatchBinding, TestdDispatchError, dispatched_testd_profiles,
+    TESTD_DISPATCH_BINDINGS, TestdDispatchBinding, TestdDispatchError,
+    compose_testd_profile_dispatch, dispatched_testd_profiles,
     instrument_contract_for_testd_profile, verify_testd_dispatch,
+};
+pub use testd_registry::{
+    READY_PROVIDER_REGISTRY_GENERATION, TESTD_PROVIDER_REGISTRY_CONTENT_TYPE,
+    TestdProviderRegistryMetadata, TestdProviderRegistryObservations,
+    TestdProviderRegistrySnapshot, bind_testd_provider_registry_snapshot,
+    build_testd_provider_registry, compose_testd_provider_dispatch,
+    decode_testd_provider_registry_snapshot, encode_testd_provider_registry_snapshot,
+    validate_testd_provider_factory,
 };
 pub use verification_profile::{
     AggregateOutcome, DeclaredEnvironmentDependency, ExternalToolProvenance, PROFILE_PROOF_CEILING,
