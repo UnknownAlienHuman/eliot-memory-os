@@ -40,8 +40,8 @@ use eliot_types::{
     MemoryTrajectoryCorrectness, MemoryWriteEnvelope, MetaPolicyExecutionAction,
     MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
     ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
-    ProjectSequence, RecallL0Request, RecallL0Response, SessionId, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
+    ProjectSequence, RecallCandidatePayload, RecallL0Request, RecallL0Response, SessionId,
+    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
     TaskAcceptanceEvidenceKind, TaskContract, TaskId, ToolObservation, VerificationId,
     VerificationRun, WriteId, WriteReceipt, WriteStatus,
 };
@@ -631,16 +631,24 @@ fn joined_search_fields(value: &Value, fields: &[&str]) -> String {
         .join(" ")
 }
 
-fn payload_bool(payload: &Value, field: &str) -> bool {
-    payload.get(field).and_then(Value::as_bool).unwrap_or(false)
-}
-
-fn payload_i32(payload: &Value, field: &str) -> i32 {
-    payload
-        .get(field)
-        .and_then(Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
-        .unwrap_or(0)
+/// Decodes the shared `recall_candidate.payload` column contract for one of the
+/// six record-type arms of [`envelope_projection_rows`].
+///
+/// The refusal is the store's own fail-closed path, never a silent empty string:
+/// a declared control-envelope member with the wrong JSON type is a policy
+/// violation of the shared column contract, and `StoreError::PolicyViolation` is
+/// the store's existing typed refusal (already used at
+/// `envelope_projection_rows`'s revision and sequence fences).
+fn shared_column_contract(
+    payload: &Value,
+    record_type: &str,
+) -> Result<RecallCandidatePayload, StoreError> {
+    RecallCandidatePayload::from_wire(payload).map_err(|violation| {
+        StoreError::PolicyViolation(format!(
+            "{record_type} recall_candidate.payload violates the shared recall column contract: {}",
+            violation.as_str()
+        ))
+    })
 }
 
 fn normalized_memory_lifecycle(status: LifecycleStatus) -> eliot_types::MemoryLifecycleState {
@@ -679,7 +687,8 @@ struct RecallCandidateInput<'a> {
     known_decision_delta: i32,
     prior_beneficial_use: i32,
     contradiction_signal: bool,
-    payload: &'a Value,
+    /// The typed shared `recall_candidate.payload` column contract for this arm.
+    contract: &'a RecallCandidatePayload,
 }
 
 fn recall_candidate(input: RecallCandidateInput<'_>) -> RecallCandidateRow {
@@ -707,9 +716,9 @@ fn recall_candidate(input: RecallCandidateInput<'_>) -> RecallCandidateRow {
         known_decision_delta: input.known_decision_delta,
         prior_beneficial_use: input.prior_beneficial_use,
         contradiction_signal: input.contradiction_signal,
-        harm_signal: payload_bool(input.payload, "harmful"),
-        repetition_signal: payload_bool(input.payload, "repeated"),
-        distraction_signal: payload_bool(input.payload, "distraction"),
+        harm_signal: input.contract.harm_signal(),
+        repetition_signal: input.contract.repetition_signal(),
+        distraction_signal: input.contract.distraction_signal(),
     }
 }
 
@@ -858,6 +867,7 @@ fn envelope_projection_rows(
 
     for claim in &envelope.claims {
         let status = serialized_name(claim.status);
+        let contract = shared_column_contract(&claim.payload, "claim_card")?;
         let row = recall_candidate(RecallCandidateInput {
             record_ref: format!("claim_card:{}", claim.claim_id),
             handle: format!("claim:{}", claim.claim_id),
@@ -878,15 +888,9 @@ fn envelope_projection_rows(
                 ),
                 searchable_value(&claim.payload),
             ),
-            cue_text: joined_search_fields(
-                &claim.payload,
-                &["path", "symbol", "error", "task_class"],
-            ),
+            cue_text: contract.cue_text(),
             scope_text: envelope.scope.clone(),
-            concept_text: joined_search_fields(
-                &claim.payload,
-                &["concept_id", "concept_refs", "subsystem"],
-            ),
+            concept_text: contract.claim_concept_text(),
             task_id: envelope.task_id,
             status: status.clone(),
             lifecycle_state: lifecycle,
@@ -900,18 +904,19 @@ fn envelope_projection_rows(
             memory_revision,
             project_sequence,
             verification_value: 0,
-            known_decision_delta: i32::from(payload_bool(&claim.payload, "changed_outcome")),
-            prior_beneficial_use: payload_i32(&claim.payload, "beneficial_use_count"),
+            known_decision_delta: contract.known_decision_delta(),
+            prior_beneficial_use: contract.prior_beneficial_use(),
             contradiction_signal: matches!(
                 claim.status,
                 EpistemicStatus::Contested | EpistemicStatus::Rejected
             ),
-            payload: &claim.payload,
+            contract: &contract,
         });
         rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
 
     for evidence in &envelope.evidence_atoms {
+        let contract = shared_column_contract(&evidence.payload, "evidence_atom")?;
         let row = recall_candidate(RecallCandidateInput {
             record_ref: format!("evidence_atom:{}", evidence.evidence_id),
             handle: format!("evidence:{}", evidence.evidence_id),
@@ -923,12 +928,9 @@ fn envelope_projection_rows(
                 searchable_value(&evidence.payload),
                 evidence.source_id,
             ),
-            cue_text: joined_search_fields(
-                &evidence.payload,
-                &["path", "symbol", "error", "task_class"],
-            ),
+            cue_text: contract.cue_text(),
             scope_text: envelope.scope.clone(),
-            concept_text: joined_search_fields(&evidence.payload, &["concept_id", "concept_refs"]),
+            concept_text: contract.concept_text(),
             task_id: envelope.task_id,
             status: "observed".to_owned(),
             lifecycle_state: lifecycle,
@@ -937,16 +939,17 @@ fn envelope_projection_rows(
             memory_revision,
             project_sequence,
             verification_value: 25,
-            known_decision_delta: i32::from(payload_bool(&evidence.payload, "changed_outcome")),
-            prior_beneficial_use: payload_i32(&evidence.payload, "beneficial_use_count"),
+            known_decision_delta: contract.known_decision_delta(),
+            prior_beneficial_use: contract.prior_beneficial_use(),
             contradiction_signal: false,
-            payload: &evidence.payload,
+            contract: &contract,
         });
         rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
 
     for verification in &envelope.verification_runs {
         let status = serialized_name(verification.result);
+        let contract = shared_column_contract(&verification.payload, "verification_run")?;
         let row = recall_candidate(RecallCandidateInput {
             record_ref: format!("verification_run:{}", verification.verification_id),
             handle: format!("verification:{}", verification.verification_id),
@@ -962,15 +965,9 @@ fn envelope_projection_rows(
                     .map_or_else(String::new, |id| id.to_string()),
                 searchable_value(&verification.payload),
             ),
-            cue_text: joined_search_fields(
-                &verification.payload,
-                &["path", "symbol", "error", "task_class"],
-            ),
+            cue_text: contract.cue_text(),
             scope_text: envelope.scope.clone(),
-            concept_text: joined_search_fields(
-                &verification.payload,
-                &["concept_id", "concept_refs"],
-            ),
+            concept_text: contract.concept_text(),
             task_id: envelope.task_id,
             status,
             lifecycle_state: lifecycle,
@@ -987,10 +984,10 @@ fn envelope_projection_rows(
                 eliot_types::VerificationResult::Failed => 60,
                 eliot_types::VerificationResult::Inconclusive => 10,
             },
-            known_decision_delta: i32::from(payload_bool(&verification.payload, "changed_outcome")),
-            prior_beneficial_use: payload_i32(&verification.payload, "beneficial_use_count"),
+            known_decision_delta: contract.known_decision_delta(),
+            prior_beneficial_use: contract.prior_beneficial_use(),
             contradiction_signal: verification.result == eliot_types::VerificationResult::Failed,
-            payload: &verification.payload,
+            contract: &contract,
         });
         rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
@@ -1006,6 +1003,7 @@ fn envelope_projection_rows(
         ) {
             continue;
         }
+        let contract = shared_column_contract(&observation.payload, "tool_observation")?;
         let row = recall_candidate(RecallCandidateInput {
             record_ref: format!("tool_observation:{}", observation.observation_id),
             handle: format!("observation:{}", observation.observation_id),
@@ -1017,15 +1015,9 @@ fn envelope_projection_rows(
                 observation.tool_name,
                 searchable_value(&observation.payload),
             ),
-            cue_text: joined_search_fields(
-                &observation.payload,
-                &["path", "symbol", "error", "task_class"],
-            ),
+            cue_text: contract.cue_text(),
             scope_text: envelope.scope.clone(),
-            concept_text: joined_search_fields(
-                &observation.payload,
-                &["concept_id", "concept_refs"],
-            ),
+            concept_text: contract.concept_text(),
             task_id: envelope.task_id,
             status: "observed".to_owned(),
             lifecycle_state: lifecycle,
@@ -1034,10 +1026,10 @@ fn envelope_projection_rows(
             memory_revision,
             project_sequence,
             verification_value: 10,
-            known_decision_delta: i32::from(payload_bool(&observation.payload, "changed_outcome")),
-            prior_beneficial_use: payload_i32(&observation.payload, "beneficial_use_count"),
+            known_decision_delta: contract.known_decision_delta(),
+            prior_beneficial_use: contract.prior_beneficial_use(),
             contradiction_signal: false,
-            payload: &observation.payload,
+            contract: &contract,
         });
         rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
 
@@ -1071,6 +1063,7 @@ fn envelope_projection_rows(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or(eliot_types::MemoryLifecycleState::Active);
+        let contract = shared_column_contract(body, receipt_kind)?;
         let artifact = recall_candidate(RecallCandidateInput {
             record_ref: format!("canonical_record:{}", observation.observation_id),
             handle: format!("{prefix}:{identity}"),
@@ -1087,12 +1080,9 @@ fn envelope_projection_rows(
                     "subsystem_concept_refs",
                 ],
             ),
-            cue_text: joined_search_fields(body, &["path", "symbol", "error", "task_class"]),
+            cue_text: contract.cue_text(),
             scope_text: searchable_field(body, "path"),
-            concept_text: joined_search_fields(
-                body,
-                &["concept_id", "concept_refs", "subsystem_concept_refs"],
-            ),
+            concept_text: contract.artifact_concept_text(),
             task_id: envelope.task_id,
             status: artifact_status.clone(),
             lifecycle_state: artifact_lifecycle,
@@ -1105,10 +1095,10 @@ fn envelope_projection_rows(
             memory_revision,
             project_sequence,
             verification_value: 30,
-            known_decision_delta: i32::from(payload_bool(body, "changed_outcome")),
-            prior_beneficial_use: payload_i32(body, "beneficial_use_count"),
+            known_decision_delta: contract.known_decision_delta(),
+            prior_beneficial_use: contract.prior_beneficial_use(),
             contradiction_signal: matches!(artifact_status.as_str(), "contested" | "rejected"),
-            payload: body,
+            contract: &contract,
         });
         rows.extend(projection_rows(
             envelope.project_id,
@@ -1118,18 +1108,16 @@ fn envelope_projection_rows(
     }
 
     for failure in &envelope.failures {
+        let contract = shared_column_contract(&failure.payload, "failure_fingerprint")?;
         let row = recall_candidate(RecallCandidateInput {
             record_ref: format!("failure_fingerprint:{}", failure.fingerprint),
             handle: format!("failure:{}", failure.fingerprint),
             record_type: "failure_fingerprint".to_owned(),
             preview: failure.summary.clone(),
             search_text: format!("{} {}", failure.summary, searchable_value(&failure.payload)),
-            cue_text: joined_search_fields(
-                &failure.payload,
-                &["path", "symbol", "error", "task_class"],
-            ),
+            cue_text: contract.cue_text(),
             scope_text: envelope.scope.clone(),
-            concept_text: joined_search_fields(&failure.payload, &["concept_id", "concept_refs"]),
+            concept_text: contract.concept_text(),
             task_id: envelope.task_id,
             status: "observed".to_owned(),
             lifecycle_state: lifecycle,
@@ -1139,9 +1127,9 @@ fn envelope_projection_rows(
             project_sequence,
             verification_value: 35,
             known_decision_delta: 1,
-            prior_beneficial_use: payload_i32(&failure.payload, "beneficial_use_count"),
+            prior_beneficial_use: contract.prior_beneficial_use(),
             contradiction_signal: false,
-            payload: &failure.payload,
+            contract: &contract,
         });
         rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
@@ -1765,15 +1753,22 @@ impl CanonicalStore {
                 }
                 let payload = serde_json::to_value(&segment)
                     .map_err(|error| StoreError::Decode(error.to_string()))?;
+                // The seventh and last construction of `RecallCandidateInput`.
+                // It reads the SAME typed shared column contract as the other
+                // six arms rather than the stringly `cue_text` /
+                // `concept_text` pair, so a segment carrying a declared cue or
+                // concept member now reaches retrieval instead of being
+                // silently unsearchable.
+                let contract = shared_column_contract(&payload, "memory_blob_segment")?;
                 let row = recall_candidate(RecallCandidateInput {
                     record_ref: format!("canonical_record:{}", record.record_id),
                     handle: segment.parent_handle.clone(),
                     record_type: "memory_blob_segment".to_owned(),
                     preview: segment.preview_text.clone(),
                     search_text: segment.search_text.clone(),
-                    cue_text: String::new(),
+                    cue_text: contract.cue_text(),
                     scope_text: envelope.scope.clone(),
-                    concept_text: String::new(),
+                    concept_text: contract.concept_text(),
                     task_id: envelope.task_id,
                     status: "observed".to_owned(),
                     lifecycle_state: lifecycle,
@@ -1782,10 +1777,10 @@ impl CanonicalStore {
                     memory_revision,
                     project_sequence,
                     verification_value: 20,
-                    known_decision_delta: 0,
-                    prior_beneficial_use: 0,
+                    known_decision_delta: contract.known_decision_delta(),
+                    prior_beneficial_use: contract.prior_beneficial_use(),
                     contradiction_signal: false,
-                    payload: &payload,
+                    contract: &contract,
                 });
                 rows.extend(projection_rows_for_source(
                     envelope.project_id,
