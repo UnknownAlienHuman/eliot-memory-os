@@ -69,7 +69,27 @@ fn projection_01_propagation_single_terminal() {
     );
     assert!(src("src/host_composition_phase_b.rs").contains("fn materialize_phase_b"));
     assert!(src("src/phase_b_previous_authority.rs").contains("historical evidence observed"));
-    assert!(src("src/credential_control/codec.rs").contains("malformed retained"));
+    let cd = src("src/credential_control/codec.rs");
+    for l in [
+        "host.credential codec marker rejected",
+        "host.credential codec envelope rejected",
+        "marker-record-shape",
+        "marker-expected-mac",
+        "marker-mac-mismatch",
+        "marker-protected-object-mismatch",
+        "marker-wire-version-mismatch",
+        "envelope-record-shape",
+        "envelope-expected-mac",
+        "envelope-mac-mismatch",
+        "envelope-protected-object-mismatch",
+        "envelope-wire-version-mismatch",
+    ] {
+        assert!(cd.contains(&format!("\"{l}\"")), "codec label {l} gone");
+    }
+    // Bind to emission, not vocabulary: the helper plus both 6-branch
+    // reject paths, so deleting any `credential_codec_observe` call fails.
+    assert!(cd.contains("credential_codec_observe(CodecRejectReason::"));
+    assert_eq!(count(&cd, "credential_codec_observe("), 13, "codec stopped observing");
     let c = "corr-980-1";
     let t = emit(|| {
         observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, &format!("{inner} {c}"));
