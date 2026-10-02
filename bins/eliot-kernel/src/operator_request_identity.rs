@@ -46,7 +46,6 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use eliot_contracts::{
     ClockReading, EpochId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId,
