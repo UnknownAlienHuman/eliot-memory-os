@@ -2063,7 +2063,9 @@ mod slice_7_native_owner_tests {
     /// implementor returns `Ok(None)`, so `resolve_production_inputs` always
     /// takes its blocked arm here. (The packet-to-result mapping
     /// [`map_orientation_packet`] is a separate function covered by its own
-    /// module below; it takes no carrier and is not on this path.)
+    /// module below. It takes no carrier, and on this path it is reached only
+    /// through the production composer, which this arm calls, downstream of
+    /// the owner-supply gate that blocks before it on today's tree.)
     #[test]
     fn orientation_without_owner_supply_publishes_blocked_pulse() {
         let admission = admission();

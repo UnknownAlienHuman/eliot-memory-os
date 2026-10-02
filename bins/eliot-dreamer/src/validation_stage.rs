@@ -22,12 +22,14 @@
 //! fail-closed with [`DreamerError::UnsupportedJobClass`] if they do.
 //!
 //! [`resolve_validation_inputs`] is a fail-closed gate in production and
-//! nothing more. Both production callers discard the mapped value (`let
-//! _validation` in `lib.rs`, `let _inputs` in the end-to-end pipeline proof),
-//! and no downstream stage reads `scope_id`, `task_id` or `operation_id` off
-//! [`ValidationInputs`], so the G1 split is observable and testable here but is
-//! not currently an effect on any later stage; the identity the owner validates
-//! arrives inside the Governor-resolved [`GroundingValidationInput`] instead.
+//! nothing more. It has exactly ONE production caller, which discards the
+//! mapped value (`lib.rs` binds it to `_validation`); the end-to-end pipeline
+//! proof is `#![cfg(test)]` and binds it to `_inputs`, so it is a test caller
+//! and not a second production one. No downstream stage reads `scope_id`,
+//! `task_id` or `operation_id` off [`ValidationInputs`], so the G1 split is
+//! observable and testable here but is not currently an effect on any later
+//! stage; the identity the owner validates arrives inside the
+//! Governor-resolved [`GroundingValidationInput`] instead.
 //!
 //! Slice B adaptations:
 //!
@@ -132,12 +134,13 @@ pub(crate) enum ValidationInputs {
 /// [`validate_admitted_draft`]: resolution maps identity only and never
 /// synthesizes draft material.
 ///
-/// In production the mapped value is DISCARDED by both callers (`lib.rs` binds
-/// it to `_validation`, the end-to-end pipeline proof binds it to `_inputs`) and
-/// no downstream stage reads `scope_id`, `task_id` or `operation_id` off it, so
-/// the observable production effect of this function is the fail-closed `?` and
-/// nothing else. The G1 split below is proved here in this file's tests, not
-/// asserted as an effect on a later stage.
+/// In production the mapped value is DISCARDED by the one production caller
+/// (`lib.rs` binds it to `_validation`); the end-to-end pipeline proof is
+/// `#![cfg(test)]` and binds it to `_inputs`. No downstream stage reads
+/// `scope_id`, `task_id` or `operation_id` off it, so the observable production
+/// effect of this function is the fail-closed `?` and nothing else. The G1
+/// split below is proved here in this file's tests, not asserted as an effect
+/// on a later stage.
 pub(crate) fn resolve_validation_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -661,7 +664,12 @@ mod slice_6_validation_tests {
     /// regroup, drop or rewrite them. The assertion below therefore pins a real
     /// property of the mapping's read set, not a claim about Orientation
     /// candidates: this seam consumes no candidate, so G2, G3 and G4 are vacuous
-    /// here and are decided elsewhere in the crate.
+    /// here. G2 and G4 are decided elsewhere in the crate - G2 at
+    /// `production_orientation.rs:600` and G4 at `dispatch_stage.rs:685-686`,
+    /// which both consume a packet this seam never builds. G3's flat-vector
+    /// shape is not pinned anywhere in this crate: `anchored_evidence_by_status`
+    /// appears in this module only in the documentation of the field, never in a
+    /// read, so nothing here would go red if that shape changed.
     ///
     /// The identity the mapping DOES read is carried through whole, which is
     /// what the rendered check below shows. No claim is made that the payload

@@ -771,7 +771,9 @@ pub(crate) fn preservation_of(
 /// member is derived from admitted material or measured by the caller — usage
 /// from the admitted budget, policy sealed against the admitted `policy_ref`,
 /// the seven preservation verdicts each computed from the derived bundle and
-/// the rebuilt frozen manifest, and `observation_time_ms` as the caller
+/// the rebuilt frozen manifest - with the single `authority_ceiling` exception
+/// named in [`identity_and_closure_findings`] - and `observation_time_ms` as
+/// the caller
 /// measured it for this attempt ([`observed_attempt_wall_ms`]). The observation
 /// is the admitted job's own elapsed wall time because that is the unit the
 /// owner compares it against; it is never a literal, and the owner refuses a

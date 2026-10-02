@@ -20,7 +20,15 @@
 //! ([`ground_for_validation`](eliot_dreamer_claim_grounding::ground_for_validation)),
 //! which also owns the carrier's single construction site. That handoff grounds
 //! the admitted draft exactly once per admitted job, inside that one owner
-//! call, and this module adds no second grounding entry beside it.
+//! call, and this module adds no second grounding entry to the ADMITTED path.
+//! The one other entry is the refusal-recovery run, and it is named here
+//! because it is disclosed where it is written: the production refusal path
+//! ([`handoff_denied`](crate::validation_stage::handoff_denied)) passes a real
+//! grounding over the request it retains, through the injectable seam
+//! [`ground_admitted_draft_with`] below, purely to recover a refusal class the
+//! owning crate collapsed. That is a second grounding of the retained request,
+//! not a second admitted grounding, and it lives in this file and in
+//! `validation_stage.rs`.
 //!
 //! "Exactly once per admitted job" is scoped to that handoff, not to the whole
 //! process. The Orientation Product Pulse re-runs the same pure grounding over

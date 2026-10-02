@@ -117,6 +117,7 @@ mod learning_admission;
 mod learning_attribution;
 mod learning_closure;
 mod learning_delta_integration;
+mod learning_experiment;
 mod learning_promotion;
 mod learning_record_commit;
 mod migration_inventory;
@@ -225,6 +226,12 @@ pub use learning_delta_integration::{
     derive_delta_at_boundary, emit_activation_receipt_at_attempt_close, issue_delta_admission,
     retry_canonical_evidence_for_delta, retry_lineage_for_delta, store_attempt_close,
     store_derived_delta, verify_delta_delivery,
+};
+pub use learning_experiment::{
+    AssignmentOwnerRecord, AttributionLineageOwnerRecord, BoundedPlanOwnerRecord,
+    ContaminationOwnerRecord, EvidenceFreezeOwnerRecord, ExperimentLoopOutcome,
+    ExperimentOwnerInput, ExperimentRefusal, MechanismOwnerRecord, OutcomeOwnerRecord,
+    RollbackOwnerRecord, derive_experiment_candidate, run_improvement_experiment_loop,
 };
 pub use learning_promotion::{
     LearningPromotionError, LearningPromotionOutcome, PromotionAdmissionReceipt,

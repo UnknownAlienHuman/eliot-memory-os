@@ -292,11 +292,12 @@ fn orientation_pipeline_threads_screen_to_blocked_pulse_receipt() {
 ///   grounded value past it;
 /// * the A-05 data is exactly what this root holds, derived from admitted
 ///   material (policy sealed against the admitted `policy_ref`, usage from the
-///   admitted budget, the seven preservation verdicts each computed from the
-///   derived bundle and rebuilt manifest) plus the attempt's measured elapsed
-///   observation time — and the preservation provenance itself is asserted by
-///   showing the report changes with the admitted handle set, not by counting
-///   its verdicts;
+///   admitted budget, and the seven preservation verdicts each computed from
+///   the derived bundle and rebuilt manifest — with the one exception
+///   `admitted_material` names, whose third conjunct reads the standing
+///   grounding policy this root issues rather than admitted material) plus the
+///   attempt's measured elapsed observation time; the preservation provenance
+///   is asserted by the report changing with the handle set, not by counting;
 /// * what the root does **not** hold stays what it is: no rival declarations
 ///   are fabricated, and the carrier's frozen cancellation field — which has no
 ///   unobserved state — carries this root's asserted negative, never a
@@ -1387,13 +1388,12 @@ fn submit_orientation_stops_at_controller_gate() {
     let Err(error) = refused else {
         panic!("orientation submit must stop at the controller gate");
     };
-    // The scrutinee is `error`, not `&error`, and that is load-bearing.
-    // `DreamerError::InvalidAdmission` carries a `&'static str`, so matching
-    // the OWNED error against this pattern binds `reason: &'static str` — the
-    // same shape every sibling reason guard in this file uses. Matching
-    // `&error` instead would flip the default binding mode to `ref` and bind
-    // `reason: &&'static str`, which has no `PartialEq<&str>` and so cannot be
-    // compared to the literal without a dereference.
+    // The scrutinee is `error`, not `&error`, which keeps this guard the same
+    // shape as every sibling reason guard in this file:
+    // `DreamerError::InvalidAdmission` carries a `&'static str`, so matching the
+    // OWNED error binds `reason: &'static str`. The binding copies rather than
+    // moves, because the payload is a shared static string, so the error is not
+    // moved here and the assertion message below can still format it.
     assert!(
         matches!(
             error,

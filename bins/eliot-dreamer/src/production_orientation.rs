@@ -96,7 +96,7 @@
 //! (`production_orientation.rs:469-478`). The
 //! crate's own
 //! `submit_orientation_stops_at_controller_gate` proof
-//! (`pipeline_e2e.rs:1370`) asserts exactly this: an Orientation `submit` stops at
+//! (`pipeline_e2e.rs:1373`) asserts exactly this: an Orientation `submit` stops at
 //! the controller gate. The blocked disposition published downstream is reached
 //! today only from the unit-level pipeline proofs, not from `main.rs`.
 //!
