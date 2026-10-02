@@ -2,7 +2,7 @@ use crate::StoreError;
 use eliot_types::{SurrealServerConfig, strict_json_has_no_duplicate_members};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -38,11 +38,29 @@ struct RpcRequest<'a> {
 // unprompted `session` only appears on the live-query notification path, and
 // this client never issues `live`. SurrealDB's RPC is JSON-RPC-shaped, not
 // JSON-RPC-2.0-enveloped, so there is no `jsonrpc` member to allow for.
+//
+// Exactly one outcome member is required, and the `result` member is decoded as
+// `Option<Option<Value>>` rather than `Option<Value>` because serde maps an
+// explicit JSON `null` onto `None` for any `Option<T>` field: with a bare
+// `Option<Value>` an absent `result` and a present `"result": null` are the same
+// value here, and SurrealDB sends the second one for real. At the pinned
+// `v3.1.4` tag `surrealdb/core/src/rpc/response.rs` builds the response from
+// `pub result: Result<DbResult, TypesError>`, so `into_value` always emits
+// `result` or `error` and never neither; that tag's own
+// `surrealdb/core/src/rpc/protocol.rs` returns `DbResult::Other(PublicValue::None)`
+// for `attach`/`detach` (lines 133/139), `ping` (275), `authenticate` (656),
+// `invalidate` (740), `revoke` (783) and `reset` (795), which serializes as
+// `"result": null`. `DbResponse::from_value` in that same file answers a frame
+// carrying neither member with the internal error "DbResponse must have either
+// 'result' or 'error' field", so upstream names the neither-case invalid and
+// this client refuses it in `rpc_result` instead of defaulting it to a null
+// success.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RpcResponse {
     id: Option<Value>,
-    result: Option<Value>,
+    #[serde(default, deserialize_with = "present_member")]
+    result: Option<Option<Value>>,
     error: Option<RpcErrorBody>,
 }
 
@@ -221,6 +239,21 @@ fn parse_response(text: &str) -> Result<RpcResponse, StoreError> {
     serde_json::from_str(text).map_err(|error| StoreError::Decode(error.to_string()))
 }
 
+/// Keeps a present-but-null member distinguishable from an absent one.
+///
+/// A derived `Option<T>` field calls `deserialize_option`, which serde's
+/// `Deserializer` answers with `visit_none` for an explicit `null`; so
+/// `result: Option<Value>` cannot tell `{}` from `{"result": null}`. This
+/// wrapper re-wraps the member's own `Option` decode, so absent stays `None`
+/// (the field `default`), an explicit `null` becomes `Some(None)` and any other
+/// value becomes `Some(Some(value))`.
+fn present_member<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Value>::deserialize(deserializer).map(Some)
+}
+
 fn rpc_result(response: RpcResponse) -> Result<Value, StoreError> {
     if let Some(error) = response.error {
         return Err(StoreError::RpcError {
@@ -230,7 +263,19 @@ fn rpc_result(response: RpcResponse) -> Result<Value, StoreError> {
         });
     }
 
-    Ok(response.result.unwrap_or(Value::Null))
+    match response.result {
+        Some(Some(result)) => Ok(result),
+        // A present `result` member holding SurrealDB's own "no payload" null.
+        Some(None) => Ok(Value::Null),
+        // No outcome member at all. SurrealDB's `DbResponse::into_value` emits
+        // `result` or `error` and never neither, so this frame is refused
+        // instead of being answered with a default null success. The message
+        // names the missing members and nothing else: no response body is
+        // echoed into the error.
+        None => Err(StoreError::Decode(
+            "surreal rpc response carried neither a result nor an error member".to_owned(),
+        )),
+    }
 }
 
 const fn millis(ms: u64) -> Duration {
