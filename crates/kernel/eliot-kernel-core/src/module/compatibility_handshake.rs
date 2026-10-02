@@ -728,6 +728,142 @@ pub fn admit_handshake(
     })
 }
 
+/// The I1.12 verdict that travels WITH one candidate generation, plus the
+/// structured refusal when admission was refused (I1.12; I14.14 step 2,
+/// "validate protocol/dependency/license/state-class compatibility").
+///
+/// Both outcomes carry the SAME durable record shape. An admitted candidate
+/// keeps every negotiated field and no refusal; a refused one keeps every
+/// offered field and adds the exact [`CompatibilityMismatch`]. The record is
+/// therefore never replaced by its own refusal, so the versioned-artifact
+/// registry reads one evidence shape and can derive a durable degraded
+/// condition from a refused row alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateActivation {
+    evidence: eliot_ors::CompatibilityEvidence,
+    refusal: Option<CompatibilityMismatch>,
+}
+
+impl CandidateActivation {
+    /// Returns the durable verdict that travels with the candidate generation.
+    #[must_use]
+    pub const fn evidence(&self) -> &eliot_ors::CompatibilityEvidence {
+        &self.evidence
+    }
+
+    /// Returns the exact structured refusal, when admission was refused.
+    #[must_use]
+    pub const fn refusal(&self) -> Option<&CompatibilityMismatch> {
+        self.refusal.as_ref()
+    }
+
+    /// Fails closed unless this candidate was admitted.
+    ///
+    /// This is the gate every process boundary and every candidate activation
+    /// consults before the peer is accepted or the route is switched: an
+    /// incompatible artifact is refused with the mismatching field named, and
+    /// the evidence that carried the refusal is already durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`CompatibilityMismatch`] naming the incompatible
+    /// I1.12 field.
+    pub fn require_admitted(
+        &self,
+    ) -> Result<&eliot_ors::CompatibilityEvidence, &CompatibilityMismatch> {
+        match &self.refusal {
+            Some(mismatch) => Err(mismatch),
+            None => Ok(&self.evidence),
+        }
+    }
+}
+
+/// Evaluates one candidate generation for activation and returns the verdict
+/// that travels WITH it.
+///
+/// This is the single producer of the persisted I1.12 evidence a later
+/// rollback re-verifies: the record is built from the candidate's own offered
+/// fields, so a refused candidate retains its evidence durably instead of
+/// having it replaced by the refusal.
+///
+/// The two `admitted_*` versions are recorded only for an admitted candidate.
+/// ORS requires them to be recorded together or not at all, and a refused
+/// candidate never completed the whole negotiation, so neither is claimed.
+///
+/// `observed_at_ms` is the CALLER's observation clock: the decision itself
+/// reads no clock, so the same candidate against the same durable state always
+/// produces the same verdict and the only wall-clock input is the value the
+/// caller already holds.
+///
+/// # Errors
+///
+/// Returns a [`KernelError`] only when the candidate's own offered fields
+/// cannot be projected onto the durable record shape. An incompatible
+/// candidate is NOT an error here: it is an admitted-to-the-record refusal
+/// carrying its structured reason.
+pub fn admit_candidate_activation(
+    candidate: &CompatibilityEnvelope,
+    durable: &DurableCompatibilityState,
+    observed_at_ms: i64,
+) -> Result<CandidateActivation, KernelError> {
+    let admitted = admit_handshake(candidate, durable);
+    let refusal_record = match admitted.as_ref().err() {
+        Some(mismatch) => Some(eliot_ors::CompatibilityRefusal::new(
+            mismatch.field().to_string(),
+            mismatch.reason(),
+            observed_at_ms,
+        )?),
+        None => None,
+    };
+    let protocol_range = candidate.protocol_range();
+    let canonical_format_range = candidate.canonical_format_range();
+    let (admitted_protocol_version, admitted_canonical_format_version) = match &admitted {
+        Ok(evidence) => (
+            Some(evidence.protocol_version()),
+            Some(evidence.canonical_format_version()),
+        ),
+        Err(_) => (None, None),
+    };
+    let evidence = eliot_ors::CompatibilityEvidence::new(
+        candidate.envelope_version(),
+        protocol_range.min(),
+        protocol_range.max(),
+        candidate.contract_set_digest(),
+        canonical_format_range.min(),
+        canonical_format_range.max(),
+        candidate.architecture_source_digest(),
+        candidate.normative_receipt().seal_tag(),
+        candidate.module_generation().value(),
+        candidate.authority_epoch().lineage_id.to_string(),
+        candidate.authority_epoch().sequence.get(),
+        candidate.required_capabilities().to_vec(),
+        candidate.optional_capabilities().to_vec(),
+        recorded_class_text(candidate.migration_class())?,
+        admitted_protocol_version,
+        admitted_canonical_format_version,
+        refusal_record,
+    )?;
+    Ok(CandidateActivation {
+        evidence,
+        refusal: admitted.err(),
+    })
+}
+
+/// The recorded spelling of one state migration class.
+///
+/// It is the class's own serialized name, so the text ORS stores and the text
+/// [`recorded_migration_class`] reads back are the same value by construction
+/// instead of by a second hand-maintained list of spellings.
+fn recorded_class_text(class: StateMigrationClass) -> Result<String, KernelError> {
+    serde_json::to_value(class)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(KernelError::InvalidField {
+            field: "compatibility_envelope.migration_class",
+            reason: "must project to its recorded spelling",
+        })
+}
+
 /// Restores the recorded evidence a durable Generation Registry row carries.
 ///
 /// Issue #1890 persists the whole handshake outcome with the candidate
@@ -1068,6 +1204,60 @@ mod tests {
         )?;
         let mismatch = admit_rollback(&evidence, &relined).unwrap_err();
         assert_eq!(mismatch.field(), MismatchField::AuthorityEpoch);
+        Ok(())
+    }
+
+    /// I1.12 acceptance: a candidate whose protocol range overlaps but whose
+    /// canonical-format range is incompatible is refused before activation,
+    /// with the mismatching field reported - and the refusal is carried by the
+    /// SAME durable record that carries the generation and epoch lineage, so a
+    /// later rollback re-verifies that verdict instead of "it launched once".
+    #[test]
+    fn refused_candidate_activation_keeps_evidence_and_names_the_field()
+    -> Result<(), KernelError> {
+        let activation = admit_candidate_activation(
+            &envelope(
+                VersionRange::new(8, 9).unwrap(),
+                receipt_for(ARCH),
+                epoch(LINEAGE, 3),
+                StateMigrationClass::Additive,
+            ),
+            &durable(),
+            1_700_000_000_000,
+        )?;
+        let mismatch = activation.require_admitted().unwrap_err();
+        assert_eq!(mismatch.field(), MismatchField::CanonicalFormatRange);
+        let evidence = activation.evidence();
+        // The protocol range DID overlap, and the refusal names the field that
+        // did not: the protocol version is claimed only on a full admission.
+        assert_eq!(evidence.protocol_range(), (1, 3));
+        assert_eq!(evidence.canonical_format_range(), (8, 9));
+        assert_eq!(evidence.admitted_protocol_version(), None);
+        let refusal = evidence.refusal().expect("the refusal is durable");
+        assert_eq!(refusal.field(), "canonical_format_range");
+        // Generation and epoch lineage survive the refusal.
+        assert_eq!(evidence.module_generation(), ResourceGeneration::genesis());
+        assert_eq!(evidence.authority_lineage_id(), LINEAGE);
+        assert_eq!(evidence.authority_sequence(), 3);
+        // An admitted candidate keeps the same record with no refusal, and the
+        // recorded migration class projects back onto the handshake vocabulary.
+        let admitted = admit_candidate_activation(
+            &envelope(
+                VersionRange::new(6, 9).unwrap(),
+                receipt_for(ARCH),
+                epoch(LINEAGE, 3),
+                StateMigrationClass::Additive,
+            ),
+            &durable(),
+            1_700_000_000_000,
+        )?;
+        let evidence = admitted.require_admitted().map_err(|_| KernelError::InvalidField {
+            field: "compatibility_envelope",
+            reason: "compatible candidate must be admitted",
+        })?;
+        assert_eq!(evidence.admitted_canonical_format_version(), Some(7));
+        assert_eq!(evidence.refusal(), None);
+        assert_eq!(evidence.migration_class(), "ADDITIVE");
         Ok(())
     }
 }
