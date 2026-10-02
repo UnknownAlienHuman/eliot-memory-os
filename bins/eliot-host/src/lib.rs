@@ -6923,25 +6923,50 @@ impl HostComposition {
         // created root are the SAME fact rather than two facts a reader has to
         // correlate.
         //
-        // The authority's OWN approved set and its currently active generation go
-        // in with the call, so the seam can refuse a destination bound to a
-        // SUPERSEDED source generation BEFORE the first step of the publication.
-        // The record-time comparison below cannot do that: it runs after this call
-        // has already committed a directory, so its refusal left a created root
-        // on disk that nothing recorded. Both values are read out of the registry
-        // projection this composition inspected above — `approved_generations()` is
-        // that projection's approved rows and `approved()` is its own ACTIVE row —
-        // so neither is a field of the admitted request.
+        // The authority is RE-READ here, between admitting and materialising, and it
+        // is this SECOND read — not the one above — that supplies both operands
+        // the seam compares. `OwnerEvidence::inspect` opens its own
+        // `ProtectedRootLease` pair and runs its own read-only registry
+        // inspection, so the operands now come from two registry reads separated
+        // in time by this operation: the admission's recorded source generation
+        // from the first, the authority's own currently ACTIVE approved row from
+        // the second. Reusing the FIRST read is exactly what made the seam's
+        // comparison `x != x` at the only production call site —
+        // `approved_generations()` is that same projection's approved rows and
+        // `approved()` its own active row — so it could never fire. Currency is
+        // re-read in this crate rather than inside `eliot-installation` precisely
+        // because that crate holds no registry handle, and acquiring one would
+        // be a new trust boundary rather than a refactor.
+        //
+        // A cutover committed in between therefore moves the ACTIVE generation,
+        // and the seam refuses BEFORE the first step of the publication, creating
+        // nothing. The record-time comparison in the record call below is not
+        // redundant with that: on THIS path it cannot run at all, because the
+        // caller still holds the pre-cutover `evidence.revision()` and the CAS
+        // fence refuses the write before the record clause is reached — which is
+        // precisely the orphan this re-read prevents, the publication having
+        // already committed by then. That comparison remains the fence for a
+        // caller passing a current `expected_revision`, and for the
+        // admission-only seam `record_prepared_isolated_destination`, which
+        // never materialises anything. The two divide the work; neither is dead
+        // code.
         //
         // A refusal here is still PRE-EFFECT for the destination record: nothing
         // is created and nothing is retained, and a publication that committed
         // without a readable identity leaves the created root preserved, never
         // removed by path name.
+        let re_inspected =
+            crate::backup_preparation::OwnerEvidence::inspect(&self.registry_host_root)
+                .map_err(|_| {
+                    "the source installation owner evidence could not be re-inspected, so the \
+                     currency of the destination cannot be proved before it is created"
+                })?;
+        let re_inspected_active_generation = re_inspected.approved().manifest.generation.clone();
         let materialisation = eliot_installation::materialise_prepared_isolated_destination(
             &allocation.admission,
             &area_lease,
-            approved_generations,
-            &approved_target_generation,
+            re_inspected.approved_generations(),
+            &re_inspected_active_generation,
         )
         .map_err(|error| Self::isolated_destination_reason(&error))?;
 

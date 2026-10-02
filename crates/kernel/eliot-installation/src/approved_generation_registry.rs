@@ -4016,14 +4016,30 @@ impl ApprovedGenerationRegistry {
         // stale, which is refused rather than recorded.
         //
         // This is the SECOND of two comparisons of the same field, and both are
-        // kept on purpose. `materialise_prepared_isolated_destination` runs the
-        // first BEFORE it creates anything, so a stale generation never produces
-        // a directory; this one re-proves the same property against the very
-        // projection that is about to retain the record, and it closes the window
-        // between the two — a cutover committed after the destination was created
-        // but before it was recorded. Removing this one would widen that window to
-        // the whole materialise step again; removing the other would only restore
-        // the "refused after the effect" ordering this pair exists to prevent.
+        // kept on purpose; they divide the work rather than duplicate it.
+        //
+        // `materialise_prepared_isolated_destination` runs the FIRST one BEFORE it
+        // creates anything, against a read of the authority taken AFTER admission,
+        // so on that path a cutover between the two is refused with no directory
+        // created at all. This one runs against the projection RE-READ INSIDE the
+        // write transaction, by `read_registry_in_write`, which is later than any
+        // snapshot a caller can be holding, so it decides currency against the
+        // projection that is about to retain the record rather than against the
+        // caller's stale view of it.
+        //
+        // It is NOT redundant, and it is NOT dead code, and the reason is the
+        // opposite of what it was previously documented as. It does not close a
+        // window between the two comparisons: on the production path the caller
+        // holds a pre-cutover `expected_revision`, so `mutate_atomic` refuses at
+        // the compare-and-save fence before this closure runs at all, and THAT
+        // refusal — after the directory already exists — is the orphan this pair
+        // exists to prevent. Removing this clause would not widen that window,
+        // because the window is closed by refusing to create, not by refusing to
+        // record. It is still needed because it is the only fence for a caller
+        // passing a CURRENT `expected_revision`, whose write would otherwise land
+        // a record bound to a generation the projection has moved off, and for the
+        // admission-only seam `record_prepared_isolated_destination`, which never
+        // materialises anything and so has no materialise-time comparison to run.
         if Some(&admission.isolation.source_active_generation) != self.active_generation.as_ref() {
             return Err(InstallationError::IdentityConflict);
         }

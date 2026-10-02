@@ -845,12 +845,17 @@ impl ProposedRestorationRequirements {
 ///   current.
 ///
 ///   The materialise-time comparison is the load-bearing one, because that is
-///   where the effect happens. The record-time comparison alone ran after
-///   `OwnedDirectoryPublication::publish` had already committed a directory, so
-///   its refusal left that created root unrecorded — an orphan this authority
-///   does not know about. The two are not redundant: the first proves currency
-///   before the effect, the second re-proves it against the same registry that
-///   is about to retain the record.
+///   where the effect happens. On the production path the record-time comparison
+///   cannot act as the gate that matters: the caller still holds a pre-cutover
+///   `expected_revision`, so the registry CAS fence refuses the write after
+///   `OwnedDirectoryPublication::publish` has already committed a directory and
+///   before the record clause is reached, leaving that created root unrecorded —
+///   an orphan this authority does not know about. The two are not redundant:
+///   the first proves currency BEFORE the effect, on a read taken after
+///   admission; the second proves it against the projection that is about to
+///   retain the record, which is the only fence for a caller passing a current
+///   `expected_revision` and for the admission-only seam
+///   [`crate::RedbInstallationRegistry::record_prepared_isolated_destination`].
 /// - [`Self::source_installation_root`] and [`Self::source_host_root`] are
 ///   re-compared by [`prove_isolated_destination_root`] at materialise time:
 ///   the destination is re-proved DISJOINT from the recorded source root, so a
@@ -2062,10 +2067,10 @@ pub fn admit_prepared_isolated_destination(
 /// [`IsolationEvidence::source_active_generation`] is compared here, BEFORE the
 /// pre-effect proof and therefore before the first step of the publication,
 /// against the generation this installation authority CURRENTLY approves. That
-/// current generation is not taken on this function's word: `approved_generations`
-/// is the authority's OWN approved rows and `current_approved_target` is resolved
-/// through [`resolve_current_approved_target`], which requires the row it names to
-/// be the one that collection currently marks `active` — the same bit
+/// current generation is not taken on this function's word: the approved rows
+/// handed in are the authority's OWN and `current_approved_target` is resolved
+/// through [`resolve_current_approved_target`], which requires the row it names
+/// to be the one that collection currently marks `active` — the same bit
 /// [`ApprovedGenerationRegistry::validate`](crate::ApprovedGenerationRegistry::validate)
 /// keeps equal to `active_generation()` and
 /// [`ApprovedGenerationRegistry::active`](crate::ApprovedGenerationRegistry::active)
@@ -2074,14 +2079,25 @@ pub fn admit_prepared_isolated_destination(
 /// so neither arm can be reached by presenting a target and a source generation
 /// that agree with each other.
 ///
-/// This is a GATE, not a report. The same binding was already compared at record
+/// This is a GATE, not a report. The same binding is also compared at record
 /// time inside
 /// [`RedbInstallationRegistry::record_prepared_isolated_destination_creation`],
-/// and a comparison that runs after `OwnedDirectoryPublication::publish` has
-/// already committed a directory is not a gate on it: the refusal arrived after a
-/// root existed on disk, and that root was left unrecorded — an orphan this
-/// authority does not know about. A preparation bound to a superseded source
-/// generation is therefore refused with NO directory created.
+/// but that comparison sits DOWNSTREAM of this function's publication, and it
+/// runs against a projection re-read inside the write transaction. On the
+/// production path the caller holds a pre-cutover `expected_revision`, so a
+/// cutover committed between the admission and the record is refused by the CAS
+/// fence at `redb_state.rs` before the record clause is even reached — and THAT
+/// refusal is the orphan: a directory this function already published, left on
+/// disk and unrecorded. The two comparisons therefore divide the work rather
+/// than duplicate it. This one decides currency BEFORE the effect, on a read
+/// taken after admission, which is what stops the effect from happening at all;
+/// the record-time one decides it against the projection about to retain the
+/// record, which is the only fence for a caller passing a current
+/// `expected_revision` and for the admission-only seam
+/// [`RedbInstallationRegistry::record_prepared_isolated_destination`], which
+/// never materialises anything. Neither is redundant and neither is dead code. A
+/// preparation bound to a superseded source generation is refused here with NO
+/// directory created.
 ///
 /// It is NOT the record-time clause that was removed from the registry. That one
 /// compared the destination's `approved_target_build` against the source's own
@@ -2130,7 +2146,7 @@ pub fn admit_prepared_isolated_destination(
 pub fn materialise_prepared_isolated_destination(
     admission: &PreparedDestinationAdmission,
     isolated_area_lease: &ProtectedRootLease,
-    approved_generations: &[ApprovedGeneration],
+    current_approved_generations: &[ApprovedGeneration],
     current_approved_target: &PlatformHandle,
 ) -> Result<PreparedDestinationMaterialisation, IsolatedDestinationError> {
     // The ORIGINAL retained record is re-validated, so a materialisation can
@@ -2149,11 +2165,13 @@ pub fn materialise_prepared_isolated_destination(
     //     moved on from creates NOTHING.
     //
     //     Why it lives here and not only at record time: the record-time
-    //     comparison inside `record_prepared_isolated_destination_creation` runs
-    //     AFTER this function has already performed its real effect. A check
-    //     that runs after the effect is not a gate on the effect — it left a
-    //     refusal that had already created a directory on disk and left that
-    //     created root unrecorded, an orphan the authority does not know about.
+    //     comparison inside `record_prepared_isolated_destination_creation` sits
+    //     DOWNSTREAM of this function's real effect. On the production path the
+    //     caller holds a pre-cutover `expected_revision`, so the registry CAS
+    //     fence refuses the write before that comparison is reached — and by then
+    //     this function has already created a directory on disk, leaving that
+    //     created root unrecorded: an orphan the authority does not know about.
+    //     A check that cannot run until after the effect is not a gate on it.
     //
     //     Why this is not the deleted record-time clause: that clause compared
     //     the destination's APPROVED TARGET BUILD against the source's own active
@@ -2167,8 +2185,13 @@ pub fn materialise_prepared_isolated_destination(
     //     authority's own approved collection, so a forged pair of fields that
     //     merely agree with each other cannot satisfy it.
     let approved_target =
-        resolve_current_approved_target(approved_generations, current_approved_target)?;
-    if &admission.isolation.source_active_generation != &approved_target.manifest.generation {
+        resolve_current_approved_target(current_approved_generations, current_approved_target)?;
+    // BY VALUE on both arms. The left arm is a durable record's own recorded
+    // binding and the right arm is a live read of the authority's approved
+    // collection, so they are two independent observations; comparing the
+    // handles by value rather than by reference keeps the comparison from
+    // degenerating into a comparison of two borrowed places.
+    if admission.isolation.source_active_generation != approved_target.manifest.generation {
         return Err(IsolatedDestinationError::Installation(
             InstallationError::IdentityConflict,
         ));

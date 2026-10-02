@@ -978,8 +978,36 @@ fn live_admission(
     admission
 }
 
-/// The DECISIVE case: a destination bound to a SUPERSEDED source generation is
-/// refused with NO DIRECTORY CREATED.
+/// The authority as it reads AFTER a cutover has been committed under it: the
+/// superseded generation is RETAINED and still APPROVED, a successor row is
+/// approved and ACTIVE, and `active_generation` names the successor.
+///
+/// This is the shape production reaches when a cutover lands between admission
+/// and materialisation. The old regression case could not express it: it passed
+/// the same fixture snapshot for the approved set and the handle, so the seam's
+/// comparison received the active generation for both arms and could not fail on
+/// an input production can construct. Here the two operands come from genuinely
+/// different reads — the admission bound the pre-cutover generation, and the
+/// approved collection handed to the seam is the post-cutover one.
+#[cfg(windows)]
+fn committed_cutover(fixture: &Fixture) -> (ApprovedGenerationRegistry, PlatformHandle) {
+    let superseded = fixture.active_generation.clone();
+    let successor = approved_generation(&installation_key("c"), "generation-958-successor", true);
+    let successor_generation = successor.manifest.generation.clone();
+    let mut registry = fixture.registry.clone();
+    for row in &mut registry.generations {
+        if row.manifest.generation == superseded {
+            row.active = false;
+        }
+    }
+    registry.generations.push(successor);
+    registry.active_generation = Some(successor_generation.clone());
+    must(registry.validate());
+    (registry, successor_generation)
+}
+
+/// The DECISIVE case: a CUTOVER committed between admission and materialisation
+/// is refused with NO DIRECTORY CREATED.
 ///
 /// # What is being proved
 ///
@@ -987,10 +1015,10 @@ fn live_admission(
 /// inside `record_prepared_isolated_destination_unchecked`. Production calls
 /// `materialise_prepared_isolated_destination` — which performs the real effect,
 /// `OwnedDirectoryPublication::create` then `.publish` — BEFORE it calls
-/// `record_prepared_isolated_destination_creation`. So a stale generation
-/// created a directory on disk and was then refused, leaving that created root
-/// unrecorded: an orphan the authority does not know about. A check that runs
-/// after the effect is not a gate on the effect.
+/// `record_prepared_isolated_destination_creation`. So a generation the source
+/// had moved on from created a directory on disk and was then refused, leaving
+/// that created root unrecorded: an orphan the authority does not know about. A
+/// check that runs after the effect is not a gate on the effect.
 ///
 /// The assertion is therefore on the FILESYSTEM, not on the returned value: a
 /// boolean cannot distinguish "refused before creating" from "created, then
@@ -1003,7 +1031,8 @@ fn live_admission(
 /// consistent — and `OwnedDirectoryPublication` commits the directory. The
 /// call returns `Ok`, and the leaf exists. The refusal assertion fails AND the
 /// filesystem assertion fails, because the root this test requires to be absent
-/// is precisely the orphan the old ordering produced.
+/// is precisely the orphan the old ordering produced. This is therefore the only
+/// case here that fails when the guard is removed.
 ///
 /// # Ownership
 ///
@@ -1012,38 +1041,34 @@ fn live_admission(
 /// owned path after the retained lease is dropped.
 #[cfg(windows)]
 #[test]
-fn a_superseded_source_generation_creates_no_destination_directory() {
+fn a_cutover_committed_after_admission_creates_no_destination_directory() {
     let fixture = fixture();
     // A genuinely NEW installation identity: not the active installation, not the
     // other approved one, and a valid owner installation key — so the refusal
     // cannot be attributed to any destination-identity clause.
     let destination = installation_key("9");
-    let area = live_isolated_area("stale-generation");
+    let area = live_isolated_area("cutover-generation");
     let destination_root = area.destination_root(&destination);
     assert!(
         !std::path::Path::new(&destination_root).exists(),
         "the fixture starts from an absent leaf, so any root found below was created by this call"
     );
 
-    // The admission binds the SUPERSEDED generation this authority retains but no
-    // longer has active. The approved set and the handle handed to the seam are
-    // the authority's own CURRENTLY ACTIVE row. Both arms are authority state and
-    // they disagree — which is exactly the condition that must refuse, and exactly
-    // what a forged self-consistent claim cannot produce.
-    let superseded = fixture
-        .registry
-        .generations
-        .iter()
-        .find(|generation| !generation.active)
-        .map(|generation| generation.manifest.generation.clone())
-        .expect("the fixture retains one approved generation that is not active");
-    let admission = live_admission(&area, &destination, &superseded);
+    // The admission binds the generation that WAS active when the destination was
+    // prepared, bound exactly as production binds it — from the first read. Then a
+    // cutover is committed and the authority is read again. The approved set and
+    // the handle handed to the seam are the SECOND read's CURRENTLY ACTIVE row.
+    // Both arms are authority state, taken from reads separated in time, and they
+    // disagree — which is exactly the condition that must refuse, and exactly what
+    // a forged self-consistent claim cannot produce.
+    let admission = live_admission(&area, &destination, &fixture.active_generation);
+    let (current, current_generation) = committed_cutover(&fixture);
 
     let outcome = materialise_prepared_isolated_destination(
         &admission,
         &area.lease,
-        &fixture.registry.generations,
-        &fixture.active_generation,
+        &current.generations,
+        &current_generation,
     );
 
     assert!(
@@ -1053,8 +1078,9 @@ fn a_superseded_source_generation_creates_no_destination_directory() {
                 InstallationError::IdentityConflict
             ))
         ),
-        "a preparation bound to a generation the source has moved on from is stale; the typed \
-         class is the same one the record-time clause produced, so one class spans both layers"
+        "a cutover committed after this preparation was admitted leaves it bound to a \
+         generation the source has moved on from; the typed class is the same one the \
+         record-time clause produced, so one class spans both layers"
     );
     // THE DECISIVE ASSERTION: the filesystem, not the returned value.
     assert!(
@@ -1095,12 +1121,20 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
         "the fixture starts from an absent leaf, so the creation below is this operation's"
     );
     let admission = live_admission(&area, &destination, &fixture.active_generation);
+    // A genuinely INDEPENDENT second read, as production performs between
+    // admission and materialisation. It carries the same values here, which is
+    // the point: this case exists to catch the guard OVER-refusing or INVERTING,
+    // which is the regression the deleted `approved_target_build ==
+    // active_generation` clause caused. An assertion of `Ok` cannot fail when a
+    // correct guard is removed, so all removal-sensitivity belongs to the cutover
+    // case and none is faked here.
+    let re_read = fixture();
 
     let materialisation = must(materialise_prepared_isolated_destination(
         &admission,
         &area.lease,
-        &fixture.registry.generations,
-        &fixture.active_generation,
+        &re_read.registry.generations,
+        &re_read.active_generation,
     ));
 
     assert!(
