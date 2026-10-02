@@ -214,10 +214,117 @@ impl KernelComposition {
         {
             return serde_json::json!({"status": "unknown"});
         }
+
+        // The manifest is a replay index, not a second owner of the
+        // request/result bytes. Re-open the original ORS row by its exact
+        // operation/request pair and verify every value before exposing the
+        // replay. Missing historical bytes, a substituted original fence,
+        // or an altered digest remains unknown.
+        let Some(request_digest) = manifest.retained_request_digest.as_deref() else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        if !is_lower_sha256(request_digest)
+            || !manifest.admitted_payload_retained
+            || !manifest.result_bytes_retained
+        {
+            return serde_json::json!({"status": "unknown"});
+        }
+        let Ok(owner_operation_id) = eliot_ors::OperationIdentity::new(operation_id.to_owned())
+        else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        let Ok(Some(owner_record)) = self
+            .generation_gateway
+            .ors
+            .load_host_request(&owner_operation_id, request_digest)
+        else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        let (Some(payload_body), Some(result_response)) = (
+            owner_record.payload_body.as_ref(),
+            owner_record.result_response.as_ref(),
+        ) else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        let (Some(payload_digest), Some(result_digest), Some(state_fence)) = (
+            manifest.payload_digest.as_deref(),
+            manifest.result_digest.as_deref(),
+            manifest.state_fence.as_ref(),
+        ) else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        let owner_fence_digest = canonical_json_bytes(state_fence)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let owner_payload_digest = canonical_json_bytes(payload_body)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let owner_result_digest = canonical_json_bytes(result_response)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let owner_schema = owner_record
+            .payload_schema_id
+            .as_ref()
+            .map(|schema| schema.as_str());
+        let manifest_schema = manifest.action_contract_ref.as_deref();
+        let owner_state = format!("{:?}", owner_record.state);
+        let owner_evidence = owner_record.result_evidence.as_ref();
+        let owner_receipt = owner_record
+            .result_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.semantic_receipt_ref.as_deref());
+        if owner_record.operation_id.as_str() != operation_id
+            || owner_record.request_digest != request_digest
+            || owner_record.admitted_state_fence.as_ref() != Some(state_fence)
+            || owner_fence_digest.as_deref() != Some(owner_record.fence_digest.as_str())
+            || owner_record.capability_ref.as_str() != manifest.capability.as_deref().unwrap_or("")
+            || owner_schema != manifest_schema
+            || owner_record.payload_digest != payload_digest
+            || owner_payload_digest.as_deref() != Some(payload_digest)
+            || owner_record.result_digest.as_deref() != Some(result_digest)
+            || owner_result_digest.as_deref() != Some(result_digest)
+            || owner_record.request_digest != manifest.input_handle.as_deref().unwrap_or("")
+            || owner_record.result_digest.as_deref()
+                != manifest.output_handle.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.actual_route.as_deref())
+                != manifest.actual_route.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.invoked_operation.as_deref())
+                != manifest.invoked_operation.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.input_handle.as_deref())
+                != manifest.input_handle.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.output_handle.as_deref())
+                != manifest.output_handle.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.adapter_identity.as_deref())
+                != manifest.adapter_identity.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.executor_identity.as_deref())
+                != manifest.executor_identity.as_deref()
+            || owner_evidence.and_then(|evidence| evidence.side_effects.as_deref())
+                != manifest.side_effects.as_deref()
+            || owner_receipt != manifest.result_receipt.as_deref()
+            || owner_record.connection_ref.as_str()
+                != manifest.connection_id.as_deref().unwrap_or("")
+            || owner_record.session_ref.as_ref().map(|value| value.as_str())
+                != manifest.session_id.as_deref()
+            || owner_record.task_ref.as_ref().map(|value| value.as_str())
+                != manifest.task_id.as_deref()
+            || owner_record.request_id.as_str() != manifest.trace_id
+            || Some(owner_state.as_str()) != manifest.durable_state.as_deref()
+            || owner_record.attempt.as_ref().map(|attempt| attempt.attempt_id.as_str())
+                != manifest.lease_attempt_id.as_deref()
+            || owner_record
+                .attempt
+                .as_ref()
+                .map(|attempt| attempt.fencing_generation)
+                != manifest.fencing_generation
+        {
+            return serde_json::json!({"status": "unknown"});
+        }
         observe_health("kernel.health.trace_replay_projected", "success");
         serde_json::json!({
             "status": "known",
             "value": manifest,
+            "retained_input": payload_body,
+            "retained_output": result_response,
         })
     }
 
