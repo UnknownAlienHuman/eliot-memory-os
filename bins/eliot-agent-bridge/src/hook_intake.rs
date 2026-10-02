@@ -842,8 +842,8 @@ mod tests {
         // return under test. The document prefix keeps the test honest about
         // what a hook payload looks like without the ceiling being decided by
         // it: the raw byte stream is what the boundary bounds.
-        over.extend_from_slice(r#"{"a":1}"#);
-        let prefix = r#"{"a":1}"#.len();
+        over.extend_from_slice(br#"{"a":1}"#);
+        let prefix = br#"{"a":1}"#.len();
         over.extend(std::iter::repeat_n(b' ', ceiling + 1 - prefix - 1));
         over.push(b'\r');
         assert_eq!(over.len(), ceiling + 1);
@@ -873,8 +873,17 @@ mod tests {
         ] {
             assert_ne!(chunk, 0, "arrival {arrival} would not produce fills");
             let mut reader = ChunkReader::new(&framed, chunk);
-            let error = acquire_hook_payload(&mut reader)
-                .unwrap_or_else(|| panic!("{arrival} must refuse the over-limit record"));
+            // `acquire_hook_payload` returns the ACCEPTED BYTES in the `Ok` arm,
+            // so the refusal has to be unwrapped from the `Err` arm: binding the
+            // result and treating it as the error would hold a `Vec<u8>` here.
+            let error = match acquire_hook_payload(&mut reader) {
+                Ok(accepted) => panic!(
+                    "{arrival}: the over-limit record must be refused, \
+                     not accepted as {} bytes",
+                    accepted.len()
+                ),
+                Err(error) => error,
+            };
             match error {
                 HookIntakeError::StdinOversize {
                     limit_bytes,
@@ -929,8 +938,8 @@ mod tests {
     fn content_cr_record_at_the_ceiling_is_accepted_byte_complete_for_every_chunking() {
         let ceiling = HOOK_INPUT_PROFILE.max_record_bytes;
         let mut exact = Vec::with_capacity(ceiling + 2);
-        exact.extend_from_slice(r#"{"a":1}"#);
-        let prefix = r#"{"a":1}"#.len();
+        exact.extend_from_slice(br#"{"a":1}"#);
+        let prefix = br#"{"a":1}"#.len();
         exact.extend(std::iter::repeat_n(b' ', ceiling - prefix - 1));
         exact.push(b'\r');
         assert_eq!(exact.len(), ceiling);
