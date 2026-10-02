@@ -943,7 +943,11 @@ mod tests {
         exact.extend(std::iter::repeat_n(b' ', ceiling - prefix - 1));
         exact.push(b'\r');
         assert_eq!(exact.len(), ceiling);
-        assert_eq!(exact.last(), Some(&b'\r'), "the content CR is the last byte");
+        assert_eq!(
+            exact.last(),
+            Some(&b'\r'),
+            "the content CR is the last byte"
+        );
         let mut framed = exact.clone();
         framed.push(b'\r');
         framed.push(b'\n');
@@ -978,8 +982,7 @@ mod tests {
                 "the ceiling-exact record must not lose its content CR: {arrival}"
             );
             assert_eq!(
-                record,
-                exact,
+                record, exact,
                 "the accepted record must be byte-identical to the content written: {arrival}"
             );
             // And it decodes: the accepted bytes are a whole document.

@@ -412,17 +412,15 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
                     // The whole fill leaves the stream here, and the one
                     // CR that is held is the only byte whose
                     // classification is deferred.
-                    None if available.last() == Some(&b'\r') => {
-                        (available.len() - 1, available.len(), false, false, true, false)
-                    }
-                    None => (
-                        available.len(),
+                    None if available.last() == Some(&b'\r') => (
+                        available.len() - 1,
                         available.len(),
                         false,
                         false,
-                        false,
+                        true,
                         false,
                     ),
+                    None => (available.len(), available.len(), false, false, false, false),
                 }
             };
             (
@@ -495,8 +493,7 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
         // `terminated && !eof_final && chunk_len == 0`: the content CR was
         // declared framing, dropped uncharged, and the ceiling compared a total
         // that was short by exactly one.
-        let carriage_return_was_content =
-            carriage_return_held && !carriage_return_frames_newline;
+        let carriage_return_was_content = carriage_return_held && !carriage_return_frames_newline;
         // `chunk_len` is this fill's own content bytes; the held CR is not among
         // them, because the previous iteration consumed it. So the held CR is
         // `owed`'s only contribution and it is charged EXACTLY once, here or as
