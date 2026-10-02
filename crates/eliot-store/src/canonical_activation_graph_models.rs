@@ -51,7 +51,7 @@ pub(super) struct RawActivationRelation {
 ///           supports: …, verified_by: … };
 /// ```
 ///
-/// A SurrealDB `SELECT` always yields an array, so a genuinely empty family
+/// A `SurrealDB` `SELECT` always yields an array, so a genuinely empty family
 /// arrives as `[]` and a family with no rows is not an absent key. The
 /// projection has exactly one revision (introduced with the decoder in
 /// `8830234a9`, `crates/eliot-store/src/surql/load_ul_activation_graph.surql`)
@@ -71,7 +71,7 @@ pub(super) struct RawActivationRelation {
 /// repair and must be reviewed at that call site.
 ///
 /// Preceding `Value` normalization boundary: the query result already arrives
-/// materialized as `serde_json::Value` from the SurrealDB WebSocket RPC ingress
+/// materialized as `serde_json::Value` from the `SurrealDB` WebSocket RPC ingress
 /// `SurrealRpc::request` → `parse_response` (`serde_json::from_str`,
 /// `crates/eliot-store/src/surreal_rpc.rs:173`), and is re-materialized by
 /// `serde_json::from_value` in `decode_value`

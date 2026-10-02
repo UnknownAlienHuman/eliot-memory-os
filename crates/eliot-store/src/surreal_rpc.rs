@@ -1,5 +1,5 @@
 use crate::StoreError;
-use eliot_types::{StrictJsonErrorKind, SurrealServerConfig, strict_json_has_no_duplicate_members};
+use eliot_types::{SurrealServerConfig, strict_json_has_no_duplicate_members};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
