@@ -6640,6 +6640,7 @@ pub(crate) fn requested_host_request_record(
         capability_ref: label(&envelope.identity.capability)?,
         fence_digest: sha256_json(&envelope.state_fence)
             .map_err(|_| TransportError::SessionFenced)?,
+        admitted_state_fence: Some(envelope.state_fence.clone()),
         authority_epoch: envelope.state_fence.authority_epoch.clone(),
         generation: envelope.state_fence.resource_generation.value(),
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
@@ -8856,6 +8857,7 @@ fn watchdog_export_projection_record(
         scope_ref: None,
         capability_ref: label(WATCHDOG_EXPORT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
+        admitted_state_fence: Some(submitted_fence.clone()),
         authority_epoch: submitted_fence.authority_epoch.clone(),
         generation: payload.watchdog_generation,
         deadline_unix_ms: payload.expires_at_ms,
@@ -9101,6 +9103,7 @@ fn watchdog_intent_projection_record(
         scope_ref: None,
         capability_ref: label(WATCHDOG_INTENT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
+        admitted_state_fence: Some(submitted_fence.clone()),
         authority_epoch: submitted_fence.authority_epoch.clone(),
         generation: intent.lineage_generation,
         deadline_unix_ms: payload.expires_at_ms,
