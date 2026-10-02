@@ -78,3 +78,6 @@ crates/*/*/Cargo.lock
 
 # Per-item build/verification evidence written by swarm managers. Never committed.
 items/
+
+# Lane control + scratch directory (manager-owned, never part of a delivery)
+v2/
