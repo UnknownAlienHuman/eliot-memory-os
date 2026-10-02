@@ -565,3 +565,58 @@ fn require_distinct_owners(cells: &[(String, String)]) -> Result<(), CellRegistr
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONTRACT_TEXT, DECLARED_CELLS, MANIFEST_TEXT, enforce_declared_cells, parse_contract,
+        parse_manifest, require_distinct_owners,
+    };
+
+    #[test]
+    fn real_generated_declarations_enforce_clean() {
+        // The positive case is the shipped one: the committed manifest,
+        // contract block and compiled table agree, so the guard
+        // `DaemonComposition::start` calls answers `Ok`.
+        assert!(
+            enforce_declared_cells().is_ok(),
+            "the committed declaration/contract tree must enforce clean"
+        );
+
+        let Ok(manifest) = parse_manifest(MANIFEST_TEXT) else {
+            panic!("the real bins/eliotd/Cargo.toml declaration must parse");
+        };
+        let Ok(contract) = parse_contract(CONTRACT_TEXT) else {
+            panic!("the real generated contract block must parse");
+        };
+
+        // One owner row per declared cell, and the compiled table mirrors both.
+        assert_eq!(
+            manifest.len(),
+            8,
+            "the real eliotd declaration carries its eight daemon cells"
+        );
+        assert_eq!(
+            contract.len(),
+            manifest.len(),
+            "every declared cell has exactly one contract projection row"
+        );
+        assert_eq!(
+            DECLARED_CELLS.len(),
+            manifest.len(),
+            "the compiled registry carries the same cell count as the manifest"
+        );
+
+        // Every real owner is distinct: I2.23 second-owner defect absent.
+        assert!(
+            require_distinct_owners(
+                &manifest
+                    .iter()
+                    .map(|row| (row.cell.clone(), row.owner.clone()))
+                    .collect::<Vec<(String, String)>>()
+            )
+            .is_ok(),
+            "the real declaration names a distinct mutable-state owner per cell"
+        );
+    }
+}
