@@ -2742,11 +2742,13 @@ mod tests {
     ///
     /// Windows-gated because both fixtures resolve a REAL retained OS contour:
     /// `ProgramData` through `protected_program_data_root` and the portable
-    /// root through a `UserOwnedRootReadLease`. The DERIVATION under test is
-    /// platform-independent, but the contours it is derived from are not, so on
-    /// another platform there is nothing to assert and the two
-    /// `ProfileViolation` arms below are still covered by the derivation
-    /// itself refusing `portable_dev` before it touches the OS.
+    /// root through a `UserOwnedRootReadLease` over a root this operation
+    /// creates AND provisions with the user-owned protected DACL that read lease
+    /// requires. The DERIVATION under test is platform-independent, but the
+    /// contours it is derived from are not, so on another platform there is
+    /// nothing to assert and the two `ProfileViolation` arms below are still
+    /// covered by the derivation itself refusing `portable_dev` before it
+    /// touches the OS.
     #[cfg(windows)]
     #[test]
     fn declared_installations_root_is_derived_and_shared_with_the_hierarchy() {
@@ -2839,9 +2841,24 @@ mod tests {
 
     /// A retained disposable portable root, which declares no shared area.
     ///
-    /// `derive_portable` re-resolves the root through a real
+    /// `derive_portable` re-resolves the anchor through a real
     /// `UserOwnedRootReadLease`, so the fixture creates it and is therefore
     /// Windows-gated with its only consumer.
+    ///
+    /// That read lease is READ-ONLY by name: it compares the anchor's security
+    /// descriptor BYTE-FOR-BYTE against the exact user-owned protected DACL and
+    /// refuses anything else, including the inherited DACL a plain
+    /// `create_dir_all` leaves behind. Creating the directory is therefore not
+    /// enough to make the contour provable — the ACL must be provisioned, which
+    /// is what the `UserOwnedRootLease` below does before it is dropped.
+    ///
+    /// This needs no elevation. The anchor is a directory this process's own user
+    /// just created and therefore owns, and the lease opens it with
+    /// `WRITE_DAC | WRITE_OWNER` precisely so the owner can install that policy.
+    /// What the lease writes is the DACL it then verifies; the read lease is what
+    /// refuses a root nobody provisioned. Provisioning here is the only way the
+    /// derivation under test is reachable from an unelevated test process, and
+    /// skipping it would make this fixture assert nothing.
     #[cfg(windows)]
     fn portable_roots() -> crate::RuntimeStateRoots {
         let root = std::env::temp_dir().join(format!(
@@ -2851,6 +2868,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("the portable fixture root is creatable");
+        // A directory this operation just created under its OWN unique name, so
+        // the provisioning lease is writing the ACL of a directory it owns and
+        // no pre-existing state is being rewritten.
+        drop(
+            eliot_platform_windows::UserOwnedRootLease::open_existing(&root)
+                .expect("the fixture root admits the user-owned protected DACL it owns"),
+        );
         crate::RuntimeStateRoots::derive_portable(
             crate::PlatformHandle::new(root.to_string_lossy().into_owned())
                 .expect("the fixture root is a valid handle"),

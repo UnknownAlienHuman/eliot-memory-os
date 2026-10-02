@@ -3836,9 +3836,25 @@ impl ApprovedGenerationRegistry {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        // Committed only if the whole projection still validates, and rolled
+        // back otherwise, for the same reason as the admission write in
+        // [`Self::record_prepared_isolated_destination_unchecked`]: a refusal
+        // must not leave behind a retained record the projection itself
+        // declares invalid.
+        //
+        // The rollback is deliberately NARROW. A refused creation receipt leaves
+        // the ADMISSION retained, which is not a half-written pair: the
+        // admission was admitted on its own merits and the destination root is
+        // created and recorded in a later step, so "admitted, not yet
+        // materialised" is a real state this authority must be able to hold. What
+        // must never survive is the creation receipt, because a receipt this
+        // projection refuses is a claim about a root that was never proved.
         self.prepared_destination_materialisations
             .push(materialisation.clone());
-        self.validate()?;
+        if let Err(error) = self.validate() {
+            self.prepared_destination_materialisations.pop();
+            return Err(error);
+        }
         Ok(materialisation.clone())
     }
 
@@ -4041,8 +4057,29 @@ impl ApprovedGenerationRegistry {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        // The write is COMMITTED only if the whole projection still validates
+        // with the record in it, and is rolled back otherwise.
+        //
+        // `Self::validate` is where this authority's own self-consistency
+        // cross-checks live: the approved target must name a generation in the
+        // registry's approved collection, the bound source generation must name
+        // one too, and the destination must not be an installation identity the
+        // registry holds. Those are comparisons against an INDEPENDENT expected
+        // set — the retained approved rows — not against a field of the incoming
+        // record, which is why the refusal they produce is worth having.
+        //
+        // Validating AFTER the push without the rollback made a refusal
+        // non-atomic: the record was already retained, so the projection both
+        // returned `IdentityConflict` AND held the very record it had just
+        // declared invalid. Restoring the projection before returning the error
+        // is what makes "a refused destination is never retained" true of every
+        // refusal this function can produce, not only of the ones that happen to
+        // be decided before the push.
         self.prepared_isolated_destinations.push(admission.clone());
-        self.validate()?;
+        if let Err(error) = self.validate() {
+            self.prepared_isolated_destinations.pop();
+            return Err(error);
+        }
         Ok(admission.clone())
     }
 

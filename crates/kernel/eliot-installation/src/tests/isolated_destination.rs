@@ -392,8 +392,17 @@ fn stale_source_active_generation_is_refused() {
     // self-consistency check therefore passes, and only the record-time
     // comparison against the CURRENT active generation can refuse this.
     admission.approved_target_build = superseded.clone();
+    // The isolation evidence digest binds the source generation AND the leaf
+    // observation, so editing the evidence invalidates the evidence digest.
+    // It is therefore recomputed HERE, after the edit, and only then is the
+    // admission digest that folds it in recomputed. Recomputing only the outer
+    // digest leaves a record that fails its own `validate` on the evidence, and
+    // the case would be proving the digest check rather than the staleness
+    // refusal it exists to prove.
     admission.isolation.source_active_generation = superseded.clone();
+    admission.isolation.evidence_digest = must(admission.isolation.computed_digest());
     admission.admission_digest = must(admission.computed_digest());
+    must(admission.isolation.validate());
     must(admission.validate());
     let durable = ApprovedGenerationRegistry {
         prepared_isolated_destinations: vec![admission.clone()],
@@ -417,6 +426,27 @@ fn stale_source_active_generation_is_refused() {
 /// This is a real cross-check against an INDEPENDENT expected set — the
 /// registry's approved collection — rather than a caller-presented manifest and
 /// approval that merely agree with each other.
+///
+/// # Which refusal actually fires
+///
+/// This case was originally written to provoke the clause
+/// `active_generation == Some(approved_target_build)`, which the predecessor
+/// held in the record path. That clause was DELETED, correctly: in the
+/// production shape the approved target and the source's active generation are
+/// the same field of the same approved row, so it was `a == a` and it refused
+/// every legitimate destination. With it gone, this record no longer provokes
+/// any pre-write comparison — the source generation it binds still matches the
+/// current active generation, and the destination identity is genuinely new.
+///
+/// The refusal therefore comes from somewhere else, and the case is written
+/// against THAT: `ApprovedGenerationRegistry::validate`, the projection's own
+/// self-consistency pass, refuses a retained admission whose approved target
+/// names no row in the approved collection. It fires on the way out of the
+/// record call, after the write — which is exactly why the record call commits
+/// the write only once that pass succeeds and rolls it back when it does not.
+/// The `is_empty` assertion below is therefore the load-bearing half of this
+/// case: it is what distinguishes a refusal from a refusal-that-left-the-record
+/// behind, and it is the half that was wrong before the rollback existed.
 #[test]
 fn approved_target_must_be_a_generation_this_authority_approves() {
     let mut fixture = fixture();
@@ -424,6 +454,19 @@ fn approved_target_must_be_a_generation_this_authority_approves() {
     admission.approved_target_build = test_handle("generation-not-approved-here");
     admission.admission_digest = must(admission.computed_digest());
     must(admission.validate());
+    // The record is durably self-consistent — nothing about it is malformed, and
+    // its own digest binds its own content. It is refused only because the
+    // authority's approved collection does not contain the target it names.
+    let durable = ApprovedGenerationRegistry {
+        prepared_isolated_destinations: vec![admission.clone()],
+        ..fixture.registry.clone()
+    };
+    assert!(
+        durable.validate().is_err(),
+        "a record naming an unapproved target cannot be retained by a valid projection, which is \
+         the independent expectation the record call is held to"
+    );
+
     assert!(
         matches!(
             record(&mut fixture, &admission, LIVE_PURGE_REVISION),
@@ -431,7 +474,12 @@ fn approved_target_must_be_a_generation_this_authority_approves() {
         ),
         "an approved target this authority does not approve is refused"
     );
-    assert!(fixture.registry.prepared_isolated_destinations().is_empty());
+    assert!(
+        fixture.registry.prepared_isolated_destinations().is_empty(),
+        "the refused record is rolled back, so the projection does not both refuse the admission \
+         and retain it"
+    );
+    must(fixture.registry.validate());
 }
 
 /// Two operations may never share one destination, and a changed record for the
