@@ -248,6 +248,22 @@ impl NativeWorkerDispatchAuthority {
         })
     }
 
+    /// Returns the immutable identity of this exact issuer.
+    ///
+    /// Governed action envelopes must bind to the same authority that issues
+    /// the process permit. Read the identity from the stored issuer instead
+    /// of deriving a parallel expected value or trusting a presented carrier.
+    pub fn authority_id(&self) -> Result<String, NativeWorkerError> {
+        self.authority
+            .lock()
+            .map(|authority| authority.authority_id().as_str().to_owned())
+            .map_err(|_| {
+                NativeWorkerError::KernelAdmissionRequired(
+                    "dispatch authority lock poisoned".to_owned(),
+                )
+            })
+    }
+
     /// Issues one permit bound to the exact immutable intent.
     ///
     /// Mirrors the broker issue: the fence and lease come from the validated

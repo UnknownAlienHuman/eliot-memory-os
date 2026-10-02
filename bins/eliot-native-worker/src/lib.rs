@@ -319,6 +319,7 @@ where
         admitted_work_scope_id: &str,
         state_fence: &serde_json::Value,
         authority_epoch: &serde_json::Value,
+        expected_authority_id: &str,
     ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
         let actions = admit_product_envelopes(
             &[GOVERNED_SERVE_OP],
@@ -326,6 +327,7 @@ where
             admitted_work_scope_id,
             state_fence,
             authority_epoch,
+            expected_authority_id,
         )?;
         self.serve_stdio().await?;
         Ok(actions)
@@ -344,6 +346,7 @@ where
         admitted_work_scope_id: &str,
         state_fence: &serde_json::Value,
         authority_epoch: &serde_json::Value,
+        expected_authority_id: &str,
     ) -> Result<(Vec<governed_action::ValidatedAction>, bool), NativeWorkerError> {
         let actions = admit_product_envelopes(
             &[GOVERNED_SERVE_OP],
@@ -351,6 +354,7 @@ where
             admitted_work_scope_id,
             state_fence,
             authority_epoch,
+            expected_authority_id,
         )?;
         let shutdown = self.serve_one_frame(reader, writer).await?;
         Ok((actions, shutdown))
@@ -689,9 +693,10 @@ pub const GOVERNED_SERVE_OP: &str = "serve_stdio";
 /// For every required operation, in order: a carrier must be presented
 /// (missing), its bytes must decode to the closed envelope (malformed), the
 /// decoded operation must name the required operation (mismatched), the
-/// decoded `WorkScope` must equal the admitted claim's `WorkScope`, and the
+/// decoded `WorkScope` must equal the admitted claim's `WorkScope`, the
 /// decoded State Fence plus Authority Epoch must equal the admitted
-/// material's fence and epoch (stale). The full governed gate
+/// material's fence and epoch (stale), and `applicable_authority` must equal
+/// the immutable identity of the exact dispatch issuer. The full governed gate
 /// ([`governed_action::require_governed_op`]) then admits each envelope. The
 /// returned validated actions preserve the action/contract provenance the
 /// drive pairs with its receipt. Pure projection: no lifecycle submit, no
@@ -702,6 +707,7 @@ pub fn admit_product_envelopes(
     admitted_work_scope_id: &str,
     state_fence: &serde_json::Value,
     authority_epoch: &serde_json::Value,
+    expected_authority_id: &str,
 ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
     fn refuse(operation: &str, reason: String) -> NativeWorkerError {
         NativeWorkerError::KernelAdmissionRequired(
@@ -715,10 +721,10 @@ pub fn admit_product_envelopes(
                 retry_status:
                     "retryable: resubmit the drive with authority-bound envelopes".to_owned(),
                 required_authority: format!(
-                    "authority-bound action envelope for '{operation}' (WorkScope, State Fence, Authority Epoch, applicable authority)"
+                    "action envelope for '{operation}' bound to the admitted WorkScope, State Fence, Authority Epoch, and immutable dispatch authority"
                 ),
                 required_repair:
-                    "attach a carrier per driven operation with matching WorkScope/fence/epoch"
+                    "attach a carrier per driven operation with matching WorkScope/fence/epoch and the admitted dispatch authority"
                         .to_owned(),
                 allowed_next_action: format!(
                     "submit the drive with a valid envelope for '{operation}'"
@@ -726,6 +732,12 @@ pub fn admit_product_envelopes(
             }
             .to_string(),
         )
+    }
+    if expected_authority_id.trim().is_empty() {
+        return Err(refuse(
+            operations.first().copied().unwrap_or("unknown"),
+            "immutable admitted dispatch authority is unavailable".to_owned(),
+        ));
     }
     let mut admitted = Vec::with_capacity(operations.len());
     for operation in operations {
@@ -778,6 +790,14 @@ pub fn admit_product_envelopes(
                 ),
             ));
         }
+        if envelope.applicable_authority != expected_authority_id {
+            return Err(refuse(
+                operation,
+                format!(
+                    "carried envelope for '{operation}' does not match the immutable admitted dispatch authority"
+                ),
+            ));
+        }
         let validated = governed_action::require_governed_op(Some(&envelope), operation)
             .map_err(NativeWorkerError::from)?;
         admitted.push(validated);
@@ -806,6 +826,7 @@ pub async fn drive_governed_material<E, A, R, C, L>(
     worker: &mut NativeWorker<E, A, R, C>,
     material: &admitted_material::ValidatedAdmittedMaterial,
     process: ProcessRequest,
+    expected_authority_id: &str,
 ) -> Result<
     (
         Vec<governed_action::ValidatedAction>,
@@ -841,6 +862,7 @@ where
         &material.admission.claim().work_scope_id,
         &fence,
         &epoch,
+        expected_authority_id,
     )?;
     let ready = drive_admitted_claimed(
         lifecycle,
@@ -2742,6 +2764,18 @@ mod tests {
         })
     }
 
+    fn action_authority(epoch: &serde_json::Value) -> String {
+        eliot_kernel::native_worker_dispatch_derivation_from_epoch_json(
+            "claim-1",
+            "operation-1",
+            1,
+            epoch,
+            "join-launch-nonce-1",
+        )
+        .unwrap_or_else(|error| panic!("Kernel derivation succeeds: {error:?}"))
+        .authority_id
+    }
+
     fn action_carrier(
         carrier_op: &str,
         envelope_op: &str,
@@ -2764,7 +2798,7 @@ mod tests {
             "authority_epoch": epoch,
             "tool_profile": envelope_op,
             "affected_resources": ["external-adapter"],
-            "applicable_authority": format!("kernel-authority-for-{envelope_op}"),
+            "applicable_authority": action_authority(epoch),
         });
         ActionEnvelopeCarrier {
             operation: carrier_op.to_owned(),
@@ -2804,12 +2838,14 @@ mod tests {
     fn product_envelopes_admit_per_op_with_provenance() {
         let fence = action_fence();
         let epoch = action_epoch();
+        let authority = action_authority(&epoch);
         let actions = admit_product_envelopes(
             &GOVERNED_DRIVE_OPS,
             &drive_carriers("scope-1", &fence, &epoch),
             "scope-1",
             &fence,
             &epoch,
+            &authority,
         )
         .unwrap_or_else(|error| panic!("valid carriers must admit: {error:?}"));
         assert_eq!(actions.len(), GOVERNED_DRIVE_OPS.len());
@@ -2817,6 +2853,7 @@ mod tests {
             assert_eq!(&action.operation, operation);
             assert_eq!(action.impact, governed_action::ImpactClass::Material);
             assert_eq!(action.verifier, "verifier-1911");
+            assert_eq!(action.applicable_authority, authority);
         }
         let serve = admit_product_envelopes(
             &[GOVERNED_SERVE_OP],
@@ -2830,6 +2867,7 @@ mod tests {
             "scope-1",
             &fence,
             &epoch,
+            &authority,
         )
         .unwrap_or_else(|error| panic!("serve carrier must admit: {error:?}"));
         assert_eq!(serve.len(), 1);
@@ -2840,9 +2878,17 @@ mod tests {
     fn product_envelopes_refuse_missing_mismatched_stale_or_malformed() {
         let fence = action_fence();
         let epoch = action_epoch();
+        let authority = action_authority(&epoch);
         // Missing: no carrier for the first driven op.
         let detail = expect_denial(
-            admit_product_envelopes(&GOVERNED_DRIVE_OPS, &[], "scope-1", &fence, &epoch),
+            admit_product_envelopes(
+                &GOVERNED_DRIVE_OPS,
+                &[],
+                "scope-1",
+                &fence,
+                &epoch,
+                &authority,
+            ),
             "empty carriers",
         );
         assert!(
@@ -2859,6 +2905,7 @@ mod tests {
                 "scope-1",
                 &fence,
                 &epoch,
+                &authority,
             ),
             "operation disagreement",
         );
@@ -2881,6 +2928,7 @@ mod tests {
                 "scope-1",
                 &fence,
                 &epoch,
+                &authority,
             ),
             "stale fence",
         );
@@ -2906,6 +2954,7 @@ mod tests {
                 "scope-1",
                 &fence,
                 &epoch,
+                &authority,
             ),
             "stale epoch",
         );
@@ -2926,6 +2975,7 @@ mod tests {
                 "scope-1",
                 &fence,
                 &epoch,
+                &authority,
             ),
             "empty carrier bytes",
         );
@@ -2944,6 +2994,7 @@ mod tests {
                 "scope-1",
                 &fence,
                 &epoch,
+                &authority,
             ),
             "undecodable bytes",
         );
