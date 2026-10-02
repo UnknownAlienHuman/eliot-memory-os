@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::authority_recovery::map_transition_receipt_error;
 use crate::activation_outcome::{
@@ -1267,6 +1268,18 @@ fn product_proof_missing_evidence(
         ));
     }
     missing.into_iter().collect()
+}
+
+/// Samples the wall clock in the same millisecond unit as durable readiness
+/// lease deadlines. A clock error is a refusal; callers cannot substitute an
+/// earlier admission timestamp after owner I/O.
+fn current_unix_ms() -> Result<u64, CompositionError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    u64::try_from(elapsed.as_millis()).map_err(|error| {
+        CompositionError::Recovery(format!("current Unix time is out of range: {error}"))
+    })
 }
 
 /// Errors raised before daemon readiness.
@@ -9487,7 +9500,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
         claim: &ColdStartReadinessClaim,
-        owner_readback: &ColdStartOwnerReadback,
+        owner_readback_input: &ColdStartOwnerReadback,
         selection: &TaskSelectionEvidence,
         current: &CurrentTaskSelection,
     ) -> Result<WriteReceipt, CompositionError> {
@@ -9504,13 +9517,91 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 missing_inputs,
             }),
             MaterialAdmission::Admitted { .. } => {
+                // Caller-supplied projections are comparisons only. Re-read
+                // the exact durable terminal and acceptance-set owner here so
+                // a self-consistent stale CurrentTaskSelection cannot authorize
+                // a direct call to this public Governor entrypoint.
+                let before_owner_read = current_unix_ms()?;
+                let owner_readback =
+                    self.cold_start_owner_readback_for_claim(claim, before_owner_read)?;
+                if &owner_readback != owner_readback_input {
+                    return Err(CompositionError::Recovery(
+                        "task-bound caller readback differs from the current durable owner terminal".to_owned(),
+                    ));
+                }
+                let (activation, owner_receipt) = self
+                    .current_task_selection_for_claim(current_unix_ms()?, claim)?;
+                if owner_receipt != owner_readback.receipt {
+                    return Err(CompositionError::Recovery(
+                        "current task selection differs from the exact owner terminal".to_owned(),
+                    ));
+                }
+                let owner_selection = match &owner_receipt.task_binding {
+                    TaskBindingState::CurrentTaskContract {
+                        task_ref,
+                        task_revision,
+                        acceptance_digest,
+                        selection_source_ref,
+                        evidence_ref,
+                    } => TaskSelectionEvidence {
+                        task_ref: task_ref.clone(),
+                        task_revision: *task_revision,
+                        acceptance_digest: acceptance_digest.clone(),
+                        work_scope_ref: owner_receipt.scope.scope_ref.clone(),
+                        selection_source_ref: selection_source_ref.clone(),
+                        evidence_ref: evidence_ref.clone(),
+                        contamination_flags: Vec::new(),
+                    },
+                    TaskBindingState::None_
+                    | TaskBindingState::Exploratory { .. }
+                    | TaskBindingState::Stale { .. }
+                    | TaskBindingState::Ambiguous { .. } => {
+                        return Err(CompositionError::ActivationTaskSelectionRequired);
+                    }
+                };
+                let activation = activation.ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+                if &owner_selection != selection
+                    || activation.task_id.as_str() != owner_selection.task_ref
+                    || activation.task_revision != owner_selection.task_revision
+                    || activation.work_scope_id != owner_selection.work_scope_ref
+                {
+                    return Err(CompositionError::Recovery(
+                        "task-bound caller selection differs from the original owner selection".to_owned(),
+                    ));
+                }
+                let owner_current = self
+                    .recheck_task_selection_for_claim(
+                        current_unix_ms()?,
+                        claim,
+                        &owner_selection,
+                    )
+                    .await?;
+                // The async acceptance-set owner read may have crossed an
+                // expiry or fence change. Re-read at a fresh time before
+                // entering the effect handoff.
+                let final_readback = self
+                    .cold_start_owner_readback_for_claim(claim, current_unix_ms()?)?;
+                let current_fence = self.snapshot.state_fence();
+                if final_readback != owner_readback
+                    || owner_current.state_fence != current_fence
+                    || activation.state_fence != current_fence
+                    || &owner_current != current
+                    || owner_current.task_ref != owner_selection.task_ref
+                    || owner_current.task_revision != owner_selection.task_revision
+                    || owner_current.work_scope_ref != owner_selection.work_scope_ref
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                owner_selection
+                    .recheck_against_current(&owner_current, &current_fence)
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))?;
                 let scope = require_fresh_matched_binding(
                     self.owners.work_scope.as_ref(),
-                    &envelope.request.state_fence,
+                    &current_fence,
                     "task-bound canonical write work scope is not freshly matched",
                 )?;
                 if scope.binding.scope.scope_ref != envelope.scope_id.as_str()
-                    || scope.binding.scope.scope_ref.as_str() != selection.work_scope_ref.as_str()
+                    || scope.binding.scope.scope_ref.as_str() != owner_selection.work_scope_ref.as_str()
                 {
                     return Err(CompositionError::Recovery(
                         "task-bound canonical write differs from the retained WorkScope".to_owned(),
@@ -9524,8 +9615,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         envelope,
                         claim,
                         owner_readback,
-                        selection,
-                        current,
+                        &owner_selection,
+                        &owner_current,
                     )
                     .await
             }
