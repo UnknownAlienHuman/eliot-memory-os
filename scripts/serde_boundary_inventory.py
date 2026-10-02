@@ -22,6 +22,23 @@ never safe; missing owner/contract/profile blocks dispatch without blocking
 inventory completion. Unknown/unsupported rows are explicit evidence, never
 empty success.
 
+Closure is derived from the decoder that enforces it, never asserted:
+
+- ``deny_unknown_fields`` proves *structural* closure (the derived decoder
+  refuses an unknown object member). It says nothing about whether the bytes
+  were written under a schema revision this build owns, so it is recorded as
+  one closure step among others and never as the whole claim.
+- A *decoder-bound version selection* is a ``#[serde(deserialize_with =
+  "...")]`` binding on a version-bearing member whose named helper is declared
+  in the same file, selects the version from the decoded content, and refuses
+  (``Err``) a revision the build does not own. A version-bearing row is
+  ``current-closed`` only when that step exists; removing the binding, the
+  helper, or its refusal flips the row back to ``needs-repair``.
+- A *closed owner field set* is a manual decoder that reads keys itself and
+  refuses every key outside a declared ``const NAME: &[&str]`` set. The inner
+  and outer owners of one wire carry the SAME constant, which is how the
+  artifact expresses that both owners describe the same closed wire.
+
 Freshness and integrity:
 
 - The denominator separates the *scan universe* (tracked source path identity,
@@ -80,8 +97,8 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.serde-boundary-inventory.v1"
-TOOL_VERSION = "0.4.0"
-RULE_REVISION = "929.4"
+TOOL_VERSION = "0.5.0"
+RULE_REVISION = "929.5"
 ISSUE = 929
 OWNED_TOML_REL = (
     "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
@@ -262,6 +279,22 @@ CHILDREN: tuple[dict, ...] = (
         "write_after": [],
     },
     {
+        # #940: the live production decoder for the UL activation-graph
+        # projection had no bounded owner at all (owner UNASSIGNED, BLOCKED).
+        # It is allocated here, under the #929 inventory's own bounded Store
+        # decoder family, rather than left unassigned. The file is distinct
+        # from #976's legacy-record projection, so it is a separate child with
+        # its own write scope and proof path.
+        "child": "#929",
+        "family": "F-DENY-STORE-ACTIVATION-GRAPH",
+        "files": ["canonical_activation_graph_models.rs"],
+        "base": "crates/eliot-store/src",
+        "tests": ["crates/eliot-store/tests/serde_activation_graph_boundary.rs"],
+        "requirements": ["710/06", "710/11", "710/12", "710/13", "710/16"],
+        "prerequisites": [],
+        "write_after": [],
+    },
+    {
         "child": "#977",
         "family": "F-DENY-BRIDGE-INPUT",
         "files": ["main.rs", "request_input.rs"],
@@ -419,6 +452,10 @@ CANONICAL_ROW_KEYS = (
     "refusal",
     "invalidation",
     "evidence",
+    "closure_evidence",
+    "version_members",
+    "version_selection",
+    "field_set_admission",
     "deny_unknown_fields",
     "tag",
     "untagged",
@@ -792,6 +829,7 @@ def _serde_flags(attr_text: str) -> dict[str, bool | str]:
         "remote": "",
         "with": "",
         "deserialize_with": "deserialize_with" in low,
+        "deserialize_with_helper": "",
     }
     m = re.search(r'tag\s*=\s*"([^"]+)"', attr_text)
     if m:
@@ -802,6 +840,12 @@ def _serde_flags(attr_text: str) -> dict[str, bool | str]:
     m = re.search(r'with\s*=\s*"([^"]+)"', attr_text)
     if m:
         flags["with"] = m.group(1)
+    # The helper NAME, not just the presence of the attribute: closure is
+    # decided by what the named helper does, so the identity must survive into
+    # the scan (the masked text blanks string contents, hence raw attr text).
+    m = re.search(r'(?<![\w.])deserialize_with\s*=\s*"([^"]+)"', attr_text)
+    if m:
+        flags["deserialize_with_helper"] = m.group(1)
     return flags
 
 
@@ -885,6 +929,276 @@ def _is_test_scope(rel: str, masked: str, offset: int, func: str, mod: str) -> b
     if func.startswith("test_"):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Decoder-bound closure derivation (#935, #940, #941).
+#
+# Every value below is read from the SAME source bytes the scan already reads
+# (the file's masked text for structure, the raw span text for quoted
+# attribute/const values). Nothing here is a table of paths, type names or
+# issue numbers, so deleting the validation in source deletes the closure:
+#
+#   * remove ``#[serde(deserialize_with = "select_...")]`` from a version
+#     member  -> the row has no decoder-bound version selection again;
+#   * remove the helper's refusal (its ``Err``)  -> it stops being a selector;
+#   * remove the ``unknown_field`` refusal from a manual decoder, or the
+#     ``const NAME: &[&str]`` closed set it refuses against -> the row has no
+#     closed owner field set any more.
+#
+# Doc comments and string literals are masked before any of this is decided,
+# so prose asserting a refusal can never stand in for the refusal itself.
+# ---------------------------------------------------------------------------
+
+# A version-bearing member name, by shape: the schema revision a wire carries.
+_VERSION_MEMBER_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:")
+# A declared closed key set (`const MEMORY_INFLUENCE_ACK_FIELDS: &[&str] = [...]`).
+_CLOSED_FIELD_SET_RE = re.compile(
+    r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*&\s*\[\s*&\s*str\s*\]\s*=\s*&?\s*\[([^\]]*)\]"
+)
+# A refused key in a hand-written map decoder.
+_UNKNOWN_FIELD_CALL_RE = re.compile(r"\bunknown_field\s*\(")
+# A value surface in a decoder REGION. Deliberately narrower than
+# ``_VALUE_USE_RE``: a ``Visitor`` impl always declares ``type Value = T`` and
+# returns ``Result<Self::Value, _>``, and neither is routing. What matters is a
+# real generic value on the wire -- ``serde_json::Value``, a ``Value`` inside a
+# generic, or a ``from_value`` call.
+_VALUE_SURFACE_RE = re.compile(
+    r"serde_json\s*::\s*Value|\bfrom_value\s*\(|serde\s*::\s*de\s*::\s*value"
+)
+_VALUE_IN_GENERIC_RE = re.compile(
+    r"\b(?:Option|Result|Box|Vec|HashMap|BTreeMap)\s*<\s*[^<>]*?(?<!:)\bValue\b"
+)
+
+
+def _routes_generic_value(region: str) -> bool:
+    """Whether a decoder region routes a generic value (``serde_json::Value``).
+
+    ``Self::Value`` and ``type Value = T`` are a Visitor's associated type, not
+    a value surface, so an occurrence immediately preceded by ``::`` is excluded
+    before the bare-``Value`` pattern is applied. The qualified patterns are
+    matched against the region as written so a real ``serde_json::Value`` cannot
+    be normalised away.
+    """
+    if _VALUE_SURFACE_RE.search(region):
+        return True
+    probe = re.sub(r"(?:::|\.)[A-Za-z_][A-Za-z0-9_]*\b", "::", region)
+    return bool(_VALUE_IN_GENERIC_RE.search(probe))
+
+
+# A declared schema-version value the decoder compares against, however it is
+# spelled: `COGNITIVE_RUN_SCHEMA_VERSION` declared in this file, or
+# `crate::SCHEMA_VERSION` declared in a sibling module. Only the trailing
+# ``VERSION`` segment is recognised; the COMPARISON is the decoder's act, so the
+# name is evidence of shape, never of authority.
+_VERSION_VALUE_RE = re.compile(
+    r"\b((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*[A-Z][A-Z0-9_]*VERSION)\b"
+)
+_COMPARISON_RE = re.compile(r"==|!=")
+_FN_DECL_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}]*>)?\s*\(")
+
+_VERSION_SELECTORS: dict[str, dict[str, tuple[int, int]]] = {}
+_CLOSED_FIELD_SETS: dict[str, dict[str, tuple[str, ...]]] = {}
+
+
+def _mask_key(masked: str) -> str:
+    """Cache key for a masked file.
+
+    The digest, never the text: a full-workspace scan passes thousands of
+    distinct masked files through these lookups, and retaining each one as a
+    dict key would hold the whole workspace source in memory for the process.
+    """
+    return _sha256_text(masked)
+
+
+def _is_version_member(name: str) -> bool:
+    return name == "schema_version" or name.endswith("_schema_version")
+
+
+def _version_members(masked_span: str) -> list[str]:
+    """Version-bearing members declared by the item's own span (masked)."""
+    return sorted(
+        {
+            match.group(1)
+            for match in _VERSION_MEMBER_RE.finditer(masked_span)
+            if _is_version_member(match.group(1))
+        }
+    )
+
+
+def _compared_version_value(body: str) -> str:
+    """The schema-version value this function body compares against, or "".
+
+    Read from the masked body, so a doc comment or string literal naming a
+    version can never pass as the comparison itself.
+    """
+    normalized = re.sub(r"[ \t]+", " ", body)
+    for match in _VERSION_VALUE_RE.finditer(normalized):
+        left = normalized[: match.start()][-60:]
+        right = normalized[match.end() :][:60]
+        if _COMPARISON_RE.search(left) or _COMPARISON_RE.search(right):
+            return re.sub(r"\s+", "", match.group(1))
+    return ""
+
+
+def _fn_declarations(masked: str) -> dict[str, tuple[int, int]]:
+    """``fn name -> (name-end offset, body-end offset)`` for one masked file."""
+    key = _mask_key(masked)
+    cached = _VERSION_SELECTORS.get(key)
+    if cached is not None:
+        return cached
+    declarations: dict[str, tuple[int, int]] = {}
+    for match in _FN_DECL_RE.finditer(masked):
+        name = match.group(1)
+        if name in declarations:
+            continue
+        declarations[name] = (
+            match.end(),
+            _extend_to_close_brace(masked, match.end()),
+        )
+    _VERSION_SELECTORS[key] = declarations
+    return declarations
+
+
+def _version_selectors(masked: str, helpers: list[str]) -> dict[str, str]:
+    """Map each named helper that SELECTS AND REFUSES a version to its value.
+
+    A selector is a function declared in this same file whose body compares the
+    decoded value against a schema-version value and refuses otherwise
+    (``Err``). Both halves are required: a function that only mentions a version
+    constant (a producer stamping a new record, a caller-side comparison) is not
+    a decoder admission step, and neither is one that compares without refusing.
+
+    Resolution is limited to this file. A helper this file does not declare
+    cannot be shown to refuse, so the row keeps no version selection and stays
+    ``needs-repair``: the tool never credits a closure it cannot read.
+    """
+    declarations = _fn_declarations(masked)
+    selectors: dict[str, str] = {}
+    for helper in helpers:
+        span = declarations.get(helper)
+        if span is None:
+            continue
+        body = masked[span[0] : span[1]]
+        if not re.search(r"\bErr\s*\(", body):
+            continue
+        value = _compared_version_value(body)
+        if value:
+            selectors[helper] = value
+    return selectors
+
+
+def _closed_field_sets(raw: str) -> dict[str, tuple[str, ...]]:
+    """Declared closed key sets and the keys each one admits."""
+    key = _mask_key(raw)
+    cached = _CLOSED_FIELD_SETS.get(key)
+    if cached is not None:
+        return cached
+    sets: dict[str, tuple[str, ...]] = {}
+    for match in _CLOSED_FIELD_SET_RE.finditer(raw):
+        keys = tuple(sorted(set(re.findall(r'"([^"]*)"', match.group(2)))))
+        if keys:
+            sets[match.group(1)] = keys
+    _CLOSED_FIELD_SETS[key] = sets
+    return sets
+
+
+def _bound_deserialize_helpers(raw_span: str) -> list[tuple[str, str]]:
+    """``(member, helper)`` pairs bound by ``deserialize_with`` in this span."""
+    bound: list[tuple[str, str]] = []
+    for match in re.finditer(r'(?<![\w.])deserialize_with\s*=\s*"([^"]+)"', raw_span):
+        tail = raw_span[match.end() :]
+        member = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*:", tail)
+        if member:
+            bound.append((member.group(1), match.group(1)))
+    return bound
+
+
+_IMPL_FOR_RE = re.compile(r"\bimpl\s*(?:<[^;{}]*>)?[^;{}]*?\bfor\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _manual_decoder_region(masked: str, type_name: str, span_masked: str) -> str:
+    """The row's own span plus the same file's decoder for the same wire.
+
+    A manual ``Deserialize`` for an outer union is usually a short impl that
+    delegates to a visitor; the admission evidence lives in that visitor, not in
+    the impl header. Two name-derived extensions, both inside this same file, so
+    the region never borrows another type's decoder:
+
+    * a visitor struct this type's decoder names (``<Type>Visitor``), and
+    * every ``impl ... for <Type>Visitor`` block, matched tolerantly so a
+      path-qualified ``serde::de::Visitor`` impl is seen too.
+    """
+    parts = [span_masked]
+    visitor = "%sVisitor" % type_name
+    for match in re.finditer(r"\bstruct\s+%s\b" % re.escape(visitor), masked):
+        parts.append(masked[match.start() : _extend_to_close_brace(masked, match.end())])
+    for match in _IMPL_FOR_RE.finditer(masked):
+        if match.group(1) != visitor:
+            continue
+        header = masked[match.start() : match.end()]
+        if not re.search(r"(?:\w+::)*\bVisitor\b", header):
+            continue
+        parts.append(masked[match.start() : _extend_to_close_brace(masked, match.end())])
+    return "\n".join(parts)
+
+
+def _field_set_admission(
+    masked: str,
+    type_name: str,
+    span_masked: str,
+    declared_sets: frozenset[str],
+) -> list[str]:
+    """Closed owner field sets this manual decoder itself refuses against.
+
+    Four source facts, all required:
+
+    * the decoder reads the object's keys itself (``next_key``);
+    * it refuses an undeclared key (``unknown_field(``);
+    * it names a closed key set in that refusal; and
+    * that name is DECLARED as ``const NAME: &[&str]`` somewhere in this row's
+      own package, so the name cannot be satisfied by an unrelated identifier.
+
+    A FIFTH condition refuses rather than credits: if the decoder region routes
+    a generic ``Value``/``Map`` at all, the closed key set proves only the outer
+    shape and the row keeps its existing bypass refusal. A closed outer key set
+    is not proof that a value-routed inner payload preserves canonical identity,
+    and this tool must not trade one refusal for a weaker one.
+
+    The inner owner of the wire names the SAME constant, so both owners of one
+    wire are recorded against the same closed set and the two rows reconcile.
+    """
+    if not declared_sets:
+        return []
+    region = _manual_decoder_region(masked, type_name, span_masked)
+    if "next_key" not in region or not _UNKNOWN_FIELD_CALL_RE.search(region):
+        return []
+    if _routes_generic_value(region):
+        return []
+    return sorted(
+        name for name in declared_sets
+        if re.search(r"\b%s\b" % re.escape(name), region)
+    )
+
+
+def _closure(cand: dict) -> dict:
+    """The derived closure steps of one candidate row (never a constant)."""
+    version_members = cand.get("version_members") or []
+    selection = cand.get("version_selection") or []
+    admission = cand.get("field_set_admission") or []
+    parts: list[str] = []
+    for token in selection:
+        parts.append("decoder-version-selection:" + token)
+    for name in admission:
+        parts.append("owner-field-set:" + name)
+    if cand["attributes"].get("deny_unknown_fields"):
+        parts.append("structural-deny-unknown-fields")
+    return {
+        "closure_evidence": ";".join(sorted(parts)) if parts else "none",
+        "version_members": version_members,
+        "version_selection": selection,
+        "field_set_admission": admission,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1334,7 @@ def _scan_text(
     file_digest: str,
     build_class: str,
     release_class: str,
+    declared_sets: frozenset[str] = frozenset(),
 ) -> list[dict]:
     try:
         masked = _mask_rust(text)
@@ -1040,6 +1355,9 @@ def _scan_text(
                 "digest": _sha256_text(rel + span_digest + exc.code),
                 "attributes": {},
                 "helpers": [],
+                "version_members": [],
+                "version_selection": [],
+                "field_set_admission": [],
                 "decoder_calls": [],
                 "value_routing": False,
                 "test_scope": _is_test_scope(rel, "", 0, "", ""),
@@ -1104,6 +1422,22 @@ def _scan_text(
             field in span_text
             for field in ("identity", "authority", "scope", "principal", "fence", "receipt")
         )
+        # Decoder-bound closure steps, derived from this row's own span and the
+        # same file's declarations (see the derivation block above).
+        bound_helpers = _bound_deserialize_helpers(raw_span)
+        selectors = _version_selectors(masked, sorted({h for _m, h in bound_helpers}))
+        version_selection = sorted(
+            {
+                "%s->%s@%s" % (member, helper, selectors[helper])
+                for member, helper in bound_helpers
+                if _is_version_member(member) and helper in selectors
+            }
+        )
+        field_set_admission: list[str] = []
+        if kind in ("manual-impl", "visitor"):
+            field_set_admission = _field_set_admission(
+                masked, type_name, span_text, declared_sets
+            )
         candidates.append(
             {
                 "id": _stable_row_id(package, rel, kind, type_name, func),
@@ -1128,6 +1462,9 @@ def _scan_text(
                     "with": str(flags["with"]),
                     "deserialize_with": bool(flags["deserialize_with"]),
                 },
+                "version_members": _version_members(span_text),
+                "version_selection": version_selection,
+                "field_set_admission": field_set_admission,
                 "helpers": sorted(set(helpers)),
                 "decoder_calls": [],
                 "value_routing": bool(_VALUE_USE_RE.search(span_text)),
@@ -1218,6 +1555,9 @@ def _scan_text(
                     "deserialize_with": False,
                 },
                 "helpers": [],
+                "version_members": [],
+                "version_selection": [],
+                "field_set_admission": [],
                 "decoder_calls": [],
                 "value_routing": target == "Value" or method == "value",
                 "test_scope": test_scope,
@@ -1274,6 +1614,9 @@ def _scan_text(
                         "deserialize_with": False,
                     },
                     "helpers": [name],
+                    "version_members": [],
+                    "version_selection": [],
+                    "field_set_admission": [],
                     "decoder_calls": [],
                     "value_routing": False,
                     "test_scope": _is_test_scope(rel, masked, m.start(), func, mod_name),
@@ -1421,6 +1764,14 @@ def _row_input_digest(row: dict, profile: dict, legacy: dict, digest_of) -> str:
                 "file_digest": row.get("file_digest", ""),
                 "kind": row.get("kind", ""),
                 "attributes": row.get("attributes", {}),
+                # The derived closure steps are part of what this row's verdict
+                # depends on, so they are inside its input digest: editing the
+                # decoder that enforces (or stops enforcing) closure invalidates
+                # the row as STALE_INPUT rather than passing unnoticed.
+                "closure_evidence": row.get("closure_evidence", ""),
+                "version_members": row.get("version_members", []),
+                "version_selection": row.get("version_selection", []),
+                "field_set_admission": row.get("field_set_admission", []),
                 "callers": caller_inputs,
                 "profile": profile_input,
                 "legacy": legacy_input,
@@ -1873,6 +2224,12 @@ def _refusal_typing(cand: dict, verdict: dict) -> str:
     if disposition == "named-legacy":
         return "none:legacy-precedence-proof-required"
     if disposition == "current-closed":
+        # The refusal names WHICH decoder step closed the row, read from the
+        # same source evidence the disposition was decided on.
+        if cand.get("version_selection"):
+            return "none:decoder-version-selection:" + "+".join(cand["version_selection"])
+        if cand.get("field_set_admission"):
+            return "none:owner-field-set-admission:" + "+".join(cand["field_set_admission"])
         return "none:strict-shape-no-bypass"
     if verdict.get("owner") == "#977":
         return "refuse-dispatch-before-bounded-acquisition"
@@ -1885,6 +2242,8 @@ def _refusal_typing(cand: dict, verdict: dict) -> str:
         return "refuse-unvalidated-value-conversion"
     if not attrs.get("deny_unknown_fields"):
         return "refuse-unknown-fields"
+    if cand.get("version_members") and not cand.get("version_selection"):
+        return "refuse-unvalidated-version-admission"
     return "refuse-unowned-admission"
 
 
@@ -1991,6 +2350,30 @@ def _classify(row: dict, profile: dict, legacy: dict) -> dict:
             "canonical_impact": "bounded-ingress: rejection precedes dispatch; no canonical bytes admitted before validation",
             "schema_class": "current",
         }
+    if kind in ("manual-impl", "visitor") and row.get("field_set_admission"):
+        # A hand-written decoder that reads its own keys and refuses every key
+        # outside a declared closed set IS the decoder-bound admission step for
+        # that wire; it is not a permissive bypass. The inner owner of the same
+        # wire names the same constant, so both owners are recorded against the
+        # same closed field set. This branch is reachable only from derived
+        # evidence (``next_key`` + ``unknown_field(`` + the declared const), and
+        # it still requires a bounded owner below, so it never closes an unowned
+        # row. Every other manual decoder keeps the bypass refusal unchanged.
+        child = _child_for_rel(rel)
+        if child:
+            return {
+                "disposition": "current-closed",
+                "owner": child,
+                "repair_child": child,
+                "repair_readiness": "NO_REPAIR_REQUIRED",
+                "blocked_reason": "",
+                "safety": "PENDING_EXECUTED_PROOF",
+                "callers": [rel],
+                "invalidation": "invalidate on declared field set, refusal, helper, caller or schema change",
+                "limit_binding": "not-applicable: non-acquisition row closed by a declared key set; no invented limits",
+                "canonical_impact": "preserved: the decoder refuses every key outside owner field set %s before the value exists; a union member closed by the same set describes the same wire; drift must be versioned" % ",".join(row["field_set_admission"]),
+                "schema_class": "current",
+            }
     if kind == "visitor":
         child = _child_for_rel(rel) or "UNASSIGNED"
         blocked = child == "UNASSIGNED"
@@ -2046,8 +2429,41 @@ def _classify(row: dict, profile: dict, legacy: dict) -> dict:
             "canonical_impact": "unknown: permissive shape may admit non-canonical bytes",
             "schema_class": "current",
         }
+    # `deny_unknown_fields` proves structural closure only: the derived decoder
+    # refuses an unknown member, but nothing checks the revision the bytes were
+    # written under. A row that carries a version-bearing member is therefore
+    # NOT closed by shape alone; it is closed only when the decoder itself binds
+    # that member to a version selection that refuses a revision this build does
+    # not own. The step is derived from the source binding and the helper body,
+    # so removing the binding (or its refusal) restores `needs-repair` here.
+    version_members = row.get("version_members") or []
+    version_selection = row.get("version_selection") or []
+    if version_members and not version_selection:
+        child = _child_for_rel(rel) or "UNASSIGNED"
+        blocked = child == "UNASSIGNED"
+        return {
+            "disposition": "needs-repair",
+            "owner": child,
+            "repair_child": child,
+            "repair_readiness": "BLOCKED" if blocked else "READY_FOR_REPAIR",
+            "blocked_reason": "missing-owner: no bounded repair child for this path" if blocked else "",
+            "safety": "NOT_SAFE",
+            "callers": [rel],
+            "invalidation": "invalidate on version member, decoder binding, selector refusal, caller or schema change",
+            "limit_binding": "not-applicable: non-acquisition row; version selection needs a decoder-bound refusal, not invented limits",
+            "canonical_impact": "unknown: version-bearing member %s decodes with no decoder-bound version selection; a closed shape alone cannot prove the accepted revision" % ",".join(version_members),
+            "schema_class": "current",
+        }
     child = _child_for_rel(rel)
     if child:
+        if version_selection:
+            canonical_impact = (
+                "preserved: decoder-bound version selection (%s) refuses an unowned revision before the "
+                "record exists; structural closure alone would not be owner proof; drift must be versioned"
+                % ",".join(version_selection)
+            )
+        else:
+            canonical_impact = "preserved: deny_unknown_fields with no bypass shapes; drift must be versioned"
         return {
             "disposition": "current-closed",
             "owner": child,
@@ -2056,9 +2472,9 @@ def _classify(row: dict, profile: dict, legacy: dict) -> dict:
             "blocked_reason": "",
             "safety": "PENDING_EXECUTED_PROOF",
             "callers": [rel],
-            "invalidation": "invalidate on attribute, caller, schema or owner change",
+            "invalidation": "invalidate on attribute, version selection, caller, schema or owner change",
             "limit_binding": "not-applicable: non-acquisition row with strict shape; no invented limits",
-            "canonical_impact": "preserved: deny_unknown_fields with no bypass shapes; drift must be versioned",
+            "canonical_impact": canonical_impact,
             "schema_class": "current",
         }
     return {
@@ -2113,6 +2529,23 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
     legacy = _legacy_evidence(root)
 
     package_cache: dict[str, str] = {}
+    # Closed owner key sets declared anywhere in the scanned universe, grouped
+    # by package. A decoder may refuse against a set its own owner declares in a
+    # sibling module of the SAME package (that is exactly how an outer union and
+    # its inner owner share one closed wire), so the names are resolved
+    # package-wide from the declared ``const NAME: &[&str]`` sources themselves.
+    declared_sets_by_package: dict[str, set[str]] = {}
+    for rel in scan_rels:
+        try:
+            probe = (root / rel).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        names = _closed_field_sets(probe)
+        if not names:
+            continue
+        declared_sets_by_package.setdefault(
+            _package_for_path(root, rel, package_cache), set()
+        ).update(names)
     candidates: list[dict] = []
     for rel in scan_rels:
         path = root / rel
@@ -2151,6 +2584,9 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
                     "file_digest": "",
                     "attributes": {},
                     "helpers": [],
+                    "version_members": [],
+                    "version_selection": [],
+                    "field_set_admission": [],
                     "decoder_calls": [],
                     "value_routing": False,
                     "test_scope": False,
@@ -2161,12 +2597,21 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
                 }
             )
             continue
-        for row in _scan_text(rel, text, package, file_digest, build_class, release_class):
+        for row in _scan_text(
+            rel,
+            text,
+            package,
+            file_digest,
+            build_class,
+            release_class,
+            frozenset(declared_sets_by_package.get(package, ())),
+        ):
             candidates.append(row)
 
     # Bind classification/allocation per row (no canned rows: all computed).
     rows: list[dict] = []
     for cand in candidates:
+        closure = _closure(cand)
         verdict = _classify(cand, profile, legacy)
         admission = "ship" if (
             cand["release_class"] == "release-reachable" and not cand["test_scope"]
@@ -2220,6 +2665,13 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
             "boundary_evidence": boundary_evidence,
             "attributes": cand["attributes"],
             "helpers": cand["helpers"],
+            # Derived closure steps (see the decoder-bound closure block). Kept
+            # on the row so both the disposition and the recorded evidence come
+            # from the same source bytes.
+            "closure_evidence": closure["closure_evidence"],
+            "version_members": cand.get("version_members", []),
+            "version_selection": cand.get("version_selection", []),
+            "field_set_admission": cand.get("field_set_admission", []),
             "decoder_calls": cand["decoder_calls"],
             "value_routing": cand["value_routing"],
             "test_scope": cand["test_scope"],
@@ -2676,6 +3128,16 @@ def _render_toml(inventory: dict) -> bytes:
         lines.append("refusal = %s" % _escape_toml_str(str(row["refusal"])))
         lines.append("invalidation = %s" % _escape_toml_str(str(row["invalidation"])))
         lines.append("evidence = %s" % _escape_toml_str(str(row["evidence"])))
+        lines.append("closure_evidence = %s" % _escape_toml_str(str(row.get("closure_evidence", ""))))
+        lines.append("version_members = [%s]" % ", ".join(
+            _escape_toml_str(v) for v in row.get("version_members", [])
+        ))
+        lines.append("version_selection = [%s]" % ", ".join(
+            _escape_toml_str(v) for v in row.get("version_selection", [])
+        ))
+        lines.append("field_set_admission = [%s]" % ", ".join(
+            _escape_toml_str(v) for v in row.get("field_set_admission", [])
+        ))
         attrs = row["attributes"]
         lines.append("deny_unknown_fields = %s" % ("true" if attrs.get("deny_unknown_fields") else "false"))
         lines.append("tag = %s" % _escape_toml_str(str(attrs.get("tag", ""))))
