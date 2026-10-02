@@ -90,6 +90,16 @@ fn test_bundle(target: &str) -> BackupBundle {
 /// [`BackupBundle::build`] the other fixtures use — the members are produced by
 /// [`CanonicalRecord::new`], which computes and validates each record's own
 /// digest, rather than by hand-editing a record's fields.
+///
+/// The export fence declares the interval those members occupy, because the
+/// bundle owner checks the declared `event_range.count` against the number of
+/// canonical events actually carried and refuses a disagreement as a
+/// `FenceMismatch` on `event range count` — a fence claiming an empty interval
+/// beside one carried member describes nothing this bundle contains. The
+/// bounds are the `1..=event_count` interval the sibling capture fixtures in
+/// `tests/backup_capture.rs` declare for the same reason; `EventRange::validate`
+/// admits an interval only as `(None, None, 0)` or as bounds whose width equals
+/// the count, so a non-empty member set must state its bounds.
 fn test_bundle_with_events(target: &str, event_ids: &[&str]) -> BackupBundle {
     let events = event_ids
         .iter()
@@ -102,6 +112,7 @@ fn test_bundle_with_events(target: &str, event_ids: &[&str]) -> BackupBundle {
             .expect("canonical event validates")
         })
         .collect();
+    let event_count = events.len() as u64;
     let source_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     BackupBundle::build(BackupInput {
         backup_id: format!("backup-960-{target}"),
@@ -116,9 +127,9 @@ fn test_bundle_with_events(target: &str, event_ids: &[&str]) -> BackupBundle {
             revision_heads: Vec::new(),
             ordering_heads: Vec::new(),
             event_range: EventRange {
-                first_sequence: None,
-                last_sequence: None,
-                count: 0,
+                first_sequence: Some(1),
+                last_sequence: Some(event_count),
+                count: event_count,
             },
             blob_reachability_manifest: Vec::new(),
             consistent: true,
