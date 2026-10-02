@@ -7,8 +7,8 @@
 use std::fmt;
 
 use eliot_types::strict_json_has_no_duplicate_members;
-use serde::de::Visitor;
 use serde::Deserialize;
+use serde::de::Visitor;
 use serde_json::Value;
 
 use crate::error::AdapterError;
@@ -267,13 +267,18 @@ pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
 /// A provider outcome is one of three observable states, and this maps each to
 /// exactly one result:
 ///
-/// * `error` present — refused as [`AdapterError::ProviderUnavailable`],
-///   unchanged. The provider's `code`, `message`, `kind` and `details` are the
-///   provider's own words and stay unread: nothing in this crate turns any of
-///   them into a message, and [`AdapterError::ProviderUnavailable`] carries no
-///   payload to carry them in. Surfacing the provider's `kind` at this
-///   boundary therefore needs a payload-bearing variant in `crate::error` and a
-///   mapping in `AdapterError::into_store_error`, which this cell does not own.
+/// * `error` present — refused as [`AdapterError::ProviderRefused`], which
+///   retains the bounded, non-content-bearing facts the provider stated: its
+///   `kind` (its own failure family, `None` when the frame names none) and its
+///   numeric `code`. `message` and `details` are dropped at this mapping site
+///   and reach no payload, no message and no log; `details` is unbounded vendor
+///   prose and `AdapterError::provider_refused` accepts no argument that could
+///   carry it. This is a distinct refusal from
+///   [`AdapterError::ProviderUnavailable`], which every local transport, pool
+///   and health condition in this crate also produces and for which no provider
+///   frame exists to state a cause, and an absent `kind` stays absent: it is
+///   never promoted to an authentication, validation, query or internal
+///   verdict.
 /// * `result` member present — that member's value, including a real JSON
 ///   `null`, which is how a SurrealQL `NONE` value arrives on the wire. A
 ///   genuine null payload is therefore an admitted `Ok(Value::Null)` here and
@@ -294,8 +299,16 @@ pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
 ///   outcome the frame itself never earned. The response body is never echoed.
 pub(super) fn rpc_result(response: RpcResponse) -> Result<Value, AdapterError> {
     if let Some(error) = response.error {
-        let _ = (error.code, error.message, error.kind, error.details);
-        return Err(AdapterError::ProviderUnavailable);
+        // `message` and `details` are dropped here and are unretainable by
+        // construction: `provider_refused` has no parameter that could carry
+        // them. What the provider stated as a fact — its failure family and its
+        // numeric code — crosses as the provider's own words, `None` included,
+        // so an absent family is never a verdict.
+        let _ = (error.message, error.details);
+        return Err(AdapterError::provider_refused(
+            error.code,
+            error.kind.as_deref(),
+        ));
     }
     response.result.into_present().ok_or_else(|| {
         AdapterError::Serialization(
@@ -346,7 +359,10 @@ mod tests {
         // missing `result` member is attributable as the whole cause: this is
         // not a lexical refusal and not an unknown-member refusal.
         assert!(admitted(frame).is_ok());
-        assert!(matches!(outcome(frame), Err(AdapterError::Serialization(_))));
+        assert!(matches!(
+            outcome(frame),
+            Err(AdapterError::Serialization(_))
+        ));
         Ok(())
     }
 
@@ -354,9 +370,8 @@ mod tests {
     fn repeated_result_member_is_refused_by_the_raw_gate() -> Result<(), AdapterError> {
         let single = br#"{"id":7,"result":"last"}"#;
         let twice = br#"{"id":7,"result":"first","result":"last"}"#;
-        let gate = AdapterError::Serialization(
-            StrictJsonErrorKind::DuplicateKey.as_str().to_owned(),
-        );
+        let gate =
+            AdapterError::Serialization(StrictJsonErrorKind::DuplicateKey.as_str().to_owned());
         // The last-wins projection of the twice-written frame decodes fine, so
         // only the lexical duplicate can be what refuses the pair of frames.
         assert_eq!(outcome(single)?, Value::String("last".to_owned()));
@@ -393,7 +408,16 @@ mod tests {
         // frame names no `result` member at all, so the refusal below cannot be
         // the absent-outcome refusal wearing a null success.
         assert!(admitted(frame).is_ok());
-        assert_eq!(outcome(frame), Err(AdapterError::ProviderUnavailable));
+        // The provider's own family and code cross, and the vendor prose
+        // members cannot: `message` and `details` are dropped at the mapping
+        // site, so the equality below is exact.
+        assert_eq!(
+            outcome(frame),
+            Err(AdapterError::ProviderRefused {
+                kind: Some("Query".to_owned()),
+                code: -32000,
+            })
+        );
         Ok(())
     }
 }

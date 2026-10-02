@@ -11,6 +11,17 @@
 use eliot_store_api::StoreError;
 use thiserror::Error;
 
+/// Bounded ceiling on the provider `kind` word retained by
+/// [`AdapterError::ProviderRefused`] (#937, #938, #940).
+///
+/// The pinned `v3.1.4` provider states `kind` as a closed failure-family tag
+/// (`ErrorDetails::kind_str`, documented on `client::rpc_parse::RpcErrorBody`),
+/// but nothing in this crate bounds the length of a string a frame may carry,
+/// so the retained word is truncated to this ceiling on a `char` boundary. The
+/// vendor `details` object is never retained at all and has no ceiling here:
+/// it is unbounded vendor prose and no public error member may retain it.
+const PROVIDER_KIND_MAX_CHARS: usize = 64;
+
 /// Failure of the `SurrealDB` store bridge.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AdapterError {
@@ -42,6 +53,24 @@ pub enum AdapterError {
         "canonical allocation contention; re-read allocation by operation identity {operation_id}"
     )]
     AllocationContention { operation_id: String },
+    /// A provider error frame refused the request (#937, #938, #940).
+    ///
+    /// Distinct from [`Self::ProviderUnavailable`], which every local
+    /// transport, pool and health condition in this crate also produces and for
+    /// which no provider frame exists that could state a cause. Here the
+    /// provider answered, so the bounded, non-content-bearing facts it stated
+    /// are retained: `kind`, its own failure family, and `code`, its JSON-RPC
+    /// numeric code.
+    ///
+    /// `kind` is the provider's word, never an ELIOT verdict, and stays `None`
+    /// when the frame named none: an absent family is recorded as no family
+    /// stated and is never promoted to an authentication, validation, query or
+    /// internal cause. `crate::error::AdapterError::provider_refused` is the only
+    /// construction path: it bounds the retained word and deliberately accepts
+    /// no `message` or `details` argument, so no caller can retain unbounded
+    /// vendor prose in it.
+    #[error("provider refused the request; provider kind = {kind:?}, provider code = {code}")]
+    ProviderRefused { kind: Option<String>, code: i64 },
     #[error("named operation is unavailable: {operation}")]
     NamedOperationUnavailable { operation: String },
     #[error("configuration error: {0}")]
@@ -53,6 +82,32 @@ pub enum AdapterError {
 }
 
 impl AdapterError {
+    /// Builds the bounded refusal record for one provider error frame
+    /// (#937, #938, #940).
+    ///
+    /// `kind` is retained exactly as the provider stated it, or `None` when the
+    /// frame stated none; a word longer than [`PROVIDER_KIND_MAX_CHARS`] is
+    /// truncated on a `char` boundary and marked with an ellipsis, so the
+    /// payload stays bounded whatever a frame carries. `code` is the provider's
+    /// numeric JSON-RPC code and is bounded by construction.
+    ///
+    /// The provider's `message` and `details` are not accepted as arguments at
+    /// all: they are unbounded vendor prose, and this signature is the reason
+    /// neither can reach this payload, `Display` or `Debug`.
+    pub(crate) fn provider_refused(code: i64, kind: Option<&str>) -> Self {
+        Self::ProviderRefused {
+            kind: kind.map(|kind| {
+                if kind.chars().count() > PROVIDER_KIND_MAX_CHARS {
+                    let retained: String = kind.chars().take(PROVIDER_KIND_MAX_CHARS).collect();
+                    format!("{retained}...")
+                } else {
+                    kind.to_owned()
+                }
+            }),
+            code,
+        }
+    }
+
     /// Maps an adapter error to the store boundary without wildcard collapse.
     /// Each provider observation keeps a distinct typed `StoreError` so
     /// `StoreFailure::from_store_error` preserves its disposition:
@@ -67,6 +122,7 @@ impl AdapterError {
     /// `UnknownOperation`; configuration defects stay deterministic
     /// `InvalidField` and serialization defects stay `Serialization`, both
     /// with provider prose dropped in favour of bounded static text.
+    ///
     /// Contract ceiling (honest stop; extending it needs a Contract Challenge
     /// owned outside Wave A): `StoreError` has no Backpressure, Deadline,
     /// `MigrationRequired` or `Partial` variants, so `MigrationRequired` and
@@ -74,12 +130,29 @@ impl AdapterError {
     /// produce the `MigrationRequired`, `Backpressured` or `DeadlineExceeded`
     /// dispositions. Live migration paths keep their exact outcome via
     /// `map_schema_bootstrap_error`, not this function.
+    ///
+    /// Second contract ceiling, for [`Self::ProviderRefused`]: `StoreError` has
+    /// no payload-bearing member that can carry a bounded provider cause
+    /// without asserting a cause the provider did not state. Its only
+    /// payload-bearing members are `InvalidField` (two `&'static str`, so a
+    /// dynamic family cannot cross, plus a deterministic field verdict),
+    /// `TransitionDigestMismatch` (a digest verdict), `Serialization` and
+    /// `Security` (an authentication verdict). Mapping a `Query`,
+    /// `Validation`, `Internal` or absent `kind` onto any of them would invent
+    /// exactly the verdict this variant exists to stop, so the typed
+    /// disposition stays the transport-loss `Unavailable` and the provider's
+    /// `kind` and `code` stay readable above the `StoreError` seam, on the
+    /// adapter's own error. This is a stated ceiling, not a claim that
+    /// `Unavailable` is the right retry class for every provider refusal: it is
+    /// the disposition [`Self::ProviderUnavailable`] already produced for these
+    /// frames, so this arm neither improves nor worsens it.
     pub fn into_store_error(self) -> StoreError {
         match self {
             Self::Store(error) => error,
             Self::ProviderUnavailable | Self::AllocationContention { .. } => {
                 StoreError::Unavailable
             }
+            Self::ProviderRefused { .. } => StoreError::Unavailable,
             Self::ProviderConflict => StoreError::RevisionConflict,
             Self::UnknownOutcome { .. } | Self::PartialOutcome => {
                 StoreError::MissingReceiptEnvelope
