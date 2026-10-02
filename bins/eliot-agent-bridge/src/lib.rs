@@ -83,7 +83,10 @@ pub mod settled_plan_transport;
 mod transport_profile;
 mod understanding_bootstrap;
 pub use bridge_contract::{
-    BridgeContractError, agent_bridge_contract, validate_agent_bridge_contract,
+    AGENT_BRIDGE_DECLARATION_WIRE_ID, AGENT_BRIDGE_DECLARATION_WIRE_VERSION,
+    AgentBridgeI65Declaration, BridgeContractError, agent_bridge_contract,
+    issue_agent_bridge_declaration, validate_agent_bridge_contract,
+    validate_agent_bridge_declaration,
 };
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
@@ -4687,17 +4690,24 @@ fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, Runtime
 /// the face's validated continuity binding: the presented attach session
 /// must still equal the retained kernel-issued session before any route
 /// refusal is reached.
+///
+/// The owner-issued I6.5 declaration for the sealed binding is issued before
+/// the front door is contacted and gated against the Kernel-issued admission
+/// fence after the receipt is proven, before the retained transport is split
+/// into the three faces: see [`validate_agent_bridge_declaration`].
 pub fn kernel_ports_with_declaration(
     declaration_path: &Path,
 ) -> Result<KernelPorts, RuntimeBuildError> {
     let loaded = load_declaration(declaration_path)?;
     let declaration = &loaded.declaration;
-    // Build and validate the I6.5 bridge contract against the admitted
-    // declaration. The contract is bound to the admitted artifact/config/
-    // generation, not a self-reported version; a mismatch refuses composition.
-    let bridge_contract = agent_bridge_contract(declaration)
-        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
-    validate_agent_bridge_contract(&bridge_contract, declaration)
+    // Issue the owner-issued I6.5 declaration for the sealed binding BEFORE the
+    // Kernel front door is contacted. The issuer takes only the sealed binding,
+    // so the record cannot name the authority fence the Kernel has not issued
+    // yet; that value arrives with the admission receipt and is compared by the
+    // gate below. The contract is bound to the admitted artifact/config/
+    // generation, not a self-reported version, and issuance validates it before
+    // it leaves this step.
+    let issued_declaration = issue_agent_bridge_declaration(declaration)
         .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
     let (current_sid, _current_session) = current_os_identity()?;
     let expectation = eliot_platform_windows::KernelFrontDoorServerExpectation::new(
@@ -4777,6 +4787,14 @@ pub fn kernel_ports_with_declaration(
             "receipt connection mismatch".to_owned(),
         ));
     }
+    // The owner-issued declaration gate, run BEFORE the sealed binding is
+    // consumed into the three kernel faces. The Kernel-issued fence comes from
+    // the authenticated admission receipt, so it is a value the issuer's caller
+    // did not construct; a declaration issued for another runtime generation,
+    // another authority epoch or another admitted binding is refused here
+    // instead of being admitted as its own proof.
+    validate_agent_bridge_declaration(&issued_declaration, declaration, &receipt.state_fence)
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
     Ok(kernel_faces_from_admission(
         transport, runtime, loaded, limits, receipt,
     ))
