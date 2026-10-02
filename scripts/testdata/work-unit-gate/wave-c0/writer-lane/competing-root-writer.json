@@ -1,0 +1,225 @@
+{
+ "header": {
+  "base_sha": "0000000000000000000000000000000000000000",
+  "branch_exceptions": [],
+  "canonical_branch_pattern": "^(work|fix|docs|chore|refactor|test)/([0-9]+)-([a-z0-9-]+)$",
+  "complete": true,
+  "missing_sections": [],
+  "producer": "root-controller",
+  "repository": "UnknownAlienHuman/eliot-memory-os",
+  "rule_revision": "v4",
+  "source_sha": "0000000000000000000000000000000000000000"
+ },
+ "issues": [
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- Cargo.toml\n- Cargo.lock\n- docs/code-navigation/PACKAGE_DOCS_INDEX.md\n- docs/code-navigation/PROTOTYPE_DOCS_INDEX.md\n- scripts/tests/test_wave_admission_c0.py\n- scripts/testdata/work-unit-gate/wave-c0\n- crates/smart/eliot-dreamer-contracts/Cargo.toml\n- crates/smart/eliot-dreamer-contracts/module.toml\n- crates/smart/eliot-epistemic-contracts/Cargo.toml\n- crates/smart/eliot-epistemic-contracts/module.toml\n- crates/smart/eliot-cue-contracts/Cargo.toml\n- crates/smart/eliot-cue-contracts/module.toml\n- crates/smart/eliot-context-contracts/Cargo.toml\n- crates/smart/eliot-context-contracts/module.toml\n- crates/smart/eliot-memory-curation-contracts/Cargo.toml\n- crates/smart/eliot-memory-curation-contracts/module.toml\n- crates/smart/eliot-learning-contracts/Cargo.toml\n- crates/smart/eliot-learning-contracts/module.toml\n\n## Must not modify\n- Rust source/tests\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [
+    578,
+    580,
+    584,
+    586,
+    590,
+    804
+   ],
+   "number": 829,
+   "prohibited_paths": [
+    "crates/**/*.rs"
+   ],
+   "state": "open",
+   "title": "[A-C0-INTEGRATION] Admit proved cognitive contract cells through one root-workspace owner",
+   "write_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
+    "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md",
+    "scripts/tests/test_wave_admission_c0.py",
+    "scripts/testdata/work-unit-gate/wave-c0",
+    "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+    "crates/smart/eliot-dreamer-contracts/module.toml",
+    "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+    "crates/smart/eliot-epistemic-contracts/module.toml",
+    "crates/smart/eliot-cue-contracts/Cargo.toml",
+    "crates/smart/eliot-cue-contracts/module.toml",
+    "crates/smart/eliot-context-contracts/Cargo.toml",
+    "crates/smart/eliot-context-contracts/module.toml",
+    "crates/smart/eliot-memory-curation-contracts/Cargo.toml",
+    "crates/smart/eliot-memory-curation-contracts/module.toml",
+    "crates/smart/eliot-learning-contracts/Cargo.toml",
+    "crates/smart/eliot-learning-contracts/module.toml"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- crates/smart/eliot-dreamer-contracts/Cargo.toml\n- crates/smart/eliot-dreamer-contracts/module.toml\n- crates/smart/eliot-dreamer-contracts/src\n- crates/smart/eliot-dreamer-contracts/tests\n\n## Must not modify\n- Cargo.toml at repository root\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 578,
+   "prohibited_paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+   ],
+   "state": "closed",
+   "title": "[A-03] implement crates/smart/eliot-dreamer-contracts",
+   "write_paths": [
+    "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+    "crates/smart/eliot-dreamer-contracts/module.toml",
+    "crates/smart/eliot-dreamer-contracts/src",
+    "crates/smart/eliot-dreamer-contracts/tests"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- crates/smart/eliot-epistemic-contracts/Cargo.toml\n- crates/smart/eliot-epistemic-contracts/module.toml\n- crates/smart/eliot-epistemic-contracts/src\n- crates/smart/eliot-epistemic-contracts/tests\n\n## Must not modify\n- Cargo.toml at repository root\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 580,
+   "prohibited_paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+   ],
+   "state": "closed",
+   "title": "[A-06e] implement crates/smart/eliot-epistemic-contracts",
+   "write_paths": [
+    "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+    "crates/smart/eliot-epistemic-contracts/module.toml",
+    "crates/smart/eliot-epistemic-contracts/src",
+    "crates/smart/eliot-epistemic-contracts/tests"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- crates/smart/eliot-cue-contracts/Cargo.toml\n- crates/smart/eliot-cue-contracts/module.toml\n- crates/smart/eliot-cue-contracts/src\n- crates/smart/eliot-cue-contracts/tests\n\n## Must not modify\n- Cargo.toml at repository root\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 804,
+   "prohibited_paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+   ],
+   "state": "closed",
+   "title": "[A-10] implement crates/smart/eliot-cue-contracts",
+   "write_paths": [
+    "crates/smart/eliot-cue-contracts/Cargo.toml",
+    "crates/smart/eliot-cue-contracts/module.toml",
+    "crates/smart/eliot-cue-contracts/src",
+    "crates/smart/eliot-cue-contracts/tests"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- crates/smart/eliot-context-contracts/Cargo.toml\n- crates/smart/eliot-context-contracts/module.toml\n- crates/smart/eliot-context-contracts/src\n- crates/smart/eliot-context-contracts/tests\n\n## Must not modify\n- Cargo.toml at repository root\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 584,
+   "prohibited_paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+   ],
+   "state": "closed",
+   "title": "[A-15] implement crates/smart/eliot-context-contracts",
+   "write_paths": [
+    "crates/smart/eliot-context-contracts/Cargo.toml",
+    "crates/smart/eliot-context-contracts/module.toml",
+    "crates/smart/eliot-context-contracts/src",
+    "crates/smart/eliot-context-contracts/tests"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- crates/smart/eliot-memory-curation-contracts/Cargo.toml\n- crates/smart/eliot-memory-curation-contracts/module.toml\n- crates/smart/eliot-memory-curation-contracts/src\n- crates/smart/eliot-memory-curation-contracts/tests\n\n## Must not modify\n- Cargo.toml at repository root\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 586,
+   "prohibited_paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+   ],
+   "state": "closed",
+   "title": "[A-19c] implement crates/smart/eliot-memory-curation-contracts",
+   "write_paths": [
+    "crates/smart/eliot-memory-curation-contracts/Cargo.toml",
+    "crates/smart/eliot-memory-curation-contracts/module.toml",
+    "crates/smart/eliot-memory-curation-contracts/src",
+    "crates/smart/eliot-memory-curation-contracts/tests"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- crates/smart/eliot-learning-contracts/Cargo.toml\n- crates/smart/eliot-learning-contracts/module.toml\n- crates/smart/eliot-learning-contracts/src\n- crates/smart/eliot-learning-contracts/tests\n\n## Must not modify\n- Cargo.toml at repository root\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 590,
+   "prohibited_paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+   ],
+   "state": "closed",
+   "title": "[A-21] implement crates/smart/eliot-learning-contracts",
+   "write_paths": [
+    "crates/smart/eliot-learning-contracts/Cargo.toml",
+    "crates/smart/eliot-learning-contracts/module.toml",
+    "crates/smart/eliot-learning-contracts/src",
+    "crates/smart/eliot-learning-contracts/tests"
+   ]
+  },
+  {
+   "body": "## Objective\n\nAdmit or prove one C0 cognitive contract cell.\n\n## Exclusive mutable scope\n- Cargo.toml\n- Cargo.lock\n- scripts/testdata/work-unit-gate/wave-c1\n\n## Must not modify\n- Rust source/tests\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1.\n1. Case one\n",
+   "dependencies": [],
+   "number": 830,
+   "prohibited_paths": [
+    "crates/**/*.rs"
+   ],
+   "state": "open",
+   "title": "[A-C1-INTEGRATION] second serialized root-workspace admission wave",
+   "write_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "scripts/testdata/work-unit-gate/wave-c1"
+   ]
+  }
+ ],
+ "pull_requests": [
+  {
+   "base_ref": "main",
+   "base_sha": "0000000000000000000000000000000000000000",
+   "body": "Implements #829",
+   "changed_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
+    "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md",
+    "scripts/tests/test_wave_admission_c0.py",
+    "scripts/testdata/work-unit-gate/wave-c0",
+    "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+    "crates/smart/eliot-dreamer-contracts/module.toml",
+    "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+    "crates/smart/eliot-epistemic-contracts/module.toml",
+    "crates/smart/eliot-cue-contracts/Cargo.toml",
+    "crates/smart/eliot-cue-contracts/module.toml",
+    "crates/smart/eliot-context-contracts/Cargo.toml",
+    "crates/smart/eliot-context-contracts/module.toml",
+    "crates/smart/eliot-memory-curation-contracts/Cargo.toml",
+    "crates/smart/eliot-memory-curation-contracts/module.toml",
+    "crates/smart/eliot-learning-contracts/Cargo.toml",
+    "crates/smart/eliot-learning-contracts/module.toml"
+   ],
+   "draft": false,
+   "head_ref": "work/829-admit-c0-contracts",
+   "head_repo": "UnknownAlienHuman/eliot-memory-os",
+   "merged": false,
+   "number": 2682,
+   "state": "open",
+   "title": "fix: Admit proved cognitive contract cells through one root-workspace owner (#829)"
+  },
+  {
+   "base_ref": "main",
+   "base_sha": "0000000000000000000000000000000000000000",
+   "body": "Implements #830",
+   "changed_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "scripts/testdata/work-unit-gate/wave-c1"
+   ],
+   "draft": false,
+   "head_ref": "work/830-admit-c1-contracts",
+   "head_repo": "UnknownAlienHuman/eliot-memory-os",
+   "merged": false,
+   "number": 2700,
+   "state": "open",
+   "title": "work/830-admit-c1-contracts"
+  }
+ ],
+ "repository_records": {
+  "retired_refs": [],
+  "workstreams": []
+ },
+ "schema": "eliot-assignment-snapshot-v1"
+}
