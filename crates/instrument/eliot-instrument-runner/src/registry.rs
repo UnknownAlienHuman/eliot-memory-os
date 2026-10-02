@@ -63,6 +63,19 @@ const ADMITTED_FEATURES: &str = "admission-pinned feature set from the profile c
 /// Timeout policy identity every process entry binds.
 const ADMITTED_TIMEOUT: &str = "P-03 wall/idle timeout policy for the admitted stage";
 
+/// Closed source-snapshot Git process instrument registered for the current
+/// selected-source capture path.
+/// Invocation profile selected by the selected-source source snapshot owner.
+pub const GIT_SOURCE_SNAPSHOT_PROFILE: &str = "git-source-snapshot";
+/// Exact finite operation identities used by the selected-source Git owner.
+pub const GIT_SOURCE_RESOLVE_ROOT_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.resolve-root";
+pub const GIT_SOURCE_INITIALIZE_INDEX_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.initialize-index";
+pub const GIT_SOURCE_CAPTURE_OVERLAY_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.capture-overlay";
+pub const GIT_SOURCE_WRITE_TREE_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.write-tree";
+pub const GIT_SOURCE_ENUMERATE_TREE_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.enumerate-tree";
+pub const GIT_SOURCE_READ_BLOB_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.read-blob";
+pub const GIT_SOURCE_ARCHIVE_TREE_INSTRUMENT: &str = "eliot.instrument.git.source-snapshot.archive-tree";
+
 /// Failures raised while building or resolving the provider registry.
 ///
 /// Every variant is typed and fail-closed: no stringly-typed catch-all drives
@@ -1060,7 +1073,7 @@ impl ProviderRegistry {
         })
     }
 
-    /// Assembles the six ready provider entries.
+    /// Assembles the ready provider entries, including finite Git source-snapshot operations.
     ///
     /// Kind bindings follow each adapter launch path: `rustc` admits only
     /// [`InstrumentKind::Build`] (`RustcAdapter::launch` rejects anything
@@ -1092,6 +1105,57 @@ impl ProviderRegistry {
             rustfmt_entry(fingerprints, generation)?,
             nextest_entry(fingerprints, generation)?,
             scip_entry(fingerprints, generation)?,
+            rust_analyzer_diagnostics_entry(fingerprints, generation)?,
+            rust_analyzer_version_entry(fingerprints, generation)?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_RESOLVE_ROOT_INSTRUMENT,
+                "resolve-root",
+                vec!["rev-parse".to_owned(), "--show-toplevel".to_owned()],
+            )?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_INITIALIZE_INDEX_INSTRUMENT,
+                "initialize-index",
+                vec!["read-tree".to_owned(), "HEAD".to_owned()],
+            )?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_CAPTURE_OVERLAY_INSTRUMENT,
+                "capture-overlay",
+                vec!["add".to_owned(), "--all".to_owned(), "--force".to_owned()],
+            )?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_WRITE_TREE_INSTRUMENT,
+                "write-tree",
+                vec!["write-tree".to_owned()],
+            )?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_ENUMERATE_TREE_INSTRUMENT,
+                "enumerate-tree",
+                vec!["ls-tree".to_owned(), "-r".to_owned(), "-z".to_owned()],
+            )?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_READ_BLOB_INSTRUMENT,
+                "read-blob",
+                vec!["cat-file".to_owned(), "blob".to_owned()],
+            )?,
+            git_source_snapshot_entry(
+                fingerprints,
+                generation,
+                GIT_SOURCE_ARCHIVE_TREE_INSTRUMENT,
+                "archive-tree",
+                vec!["archive".to_owned(), "--format=tar".to_owned()],
+            )?,
             dotnet_entry(fingerprints, generation)?,
         ];
         let registry = Self::build(entries, generation, normative_pair_digest)?;
@@ -1292,6 +1356,68 @@ impl ProviderRegistry {
         }
         Ok(())
     }
+}
+
+/// Git source snapshot entry: finite read/capture operations through the
+/// original Kernel ProcessExecutor path. The command resolver in
+/// `git_source_snapshot_profile` owns the closed argv vocabulary; this entry
+/// records the shared executable/provider identity and exact P-03 policy.
+fn git_source_snapshot_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+    instrument_name: &'static str,
+    operation_name: &'static str,
+    command_prefix: Vec<String>,
+) -> Result<RegistryEntry, ContractError> {
+    let instrument = contract_id(instrument_name)?;
+    let executable = "git";
+    let toolchain = "Git executable observed by the current selected-source environment owner";
+    let resource_contract =
+        "original Governor Process ActionLease and P-03 ProcessIntent resource ceilings";
+    let cancellation_contract =
+        "P-03 inspect/cancel/reconcile through the exact per-command OperationId and State Fence";
+    let parser = diagnostic_id()?;
+    let normalizer = diagnostic_id()?;
+    Ok(RegistryEntry {
+        profile: instrument.clone(),
+        profile_version: ContractVersion::new(1, 0, 0),
+        instrument,
+        kinds: vec![InstrumentKind::Inspect],
+        adapter: GIT_SOURCE_SNAPSHOT_PROFILE.to_owned(),
+        adapter_version: ContractVersion::new(1, 0, 0),
+        executable: ExecutableIdentity::process(
+            executable,
+            "selected-source environment owner resolves Git and supplies the original canonical path, digest, version, and environment projection",
+        ),
+        toolchain: toolchain.to_owned(),
+        targets: worktree_targets(),
+        environment_class: ISOLATED_PROCESS.to_owned(),
+        resource_contract: resource_contract.to_owned(),
+        cancellation_contract: cancellation_contract.to_owned(),
+        parser: parser.clone(),
+        normalizer: normalizer.clone(),
+        evaluator: normalizer,
+        verifier: verifier_id()?,
+        invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: toolchain.to_owned(),
+            executable: executable.to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact: format!(
+                "selected-source Git {operation_name} with admitted argv prefix [{}]",
+                command_prefix.join(" ")
+            ),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: format!("one owner-issued P-03 OperationId for Git source-snapshot {operation_name}"),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract.to_owned(),
+        }),
+        generation,
+    })
 }
 
 impl<'a> IntoIterator for &'a ProviderRegistry {
@@ -1618,6 +1744,90 @@ fn scip_entry(
             timeout: "not applicable: decoder-only, decode is bounded by MAX_SCIP_BYTES".to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
+        }),
+        generation,
+    })
+}
+
+/// Rust Analyzer diagnostics entry: one-shot process, normalized by the LSP bridge.
+fn rust_analyzer_diagnostics_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+) -> Result<RegistryEntry, ContractError> {
+    rust_analyzer_entry(
+        fingerprints,
+        generation,
+        crate::profile::RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT,
+        crate::profile::DIAGNOSTIC_PARSER_CONTRACT,
+        "one-shot diagnostics invocation through the shared ProcessExecutor",
+        "P-03 OperationId for one-shot Rust Analyzer diagnostics under the admitted State Fence",
+    )
+}
+
+/// Rust Analyzer version entry: one-shot process with its own parser identity.
+fn rust_analyzer_version_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+) -> Result<RegistryEntry, ContractError> {
+    rust_analyzer_entry(
+        fingerprints,
+        generation,
+        crate::profile::RUST_ANALYZER_VERSION_INSTRUMENT,
+        crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT,
+        "one-shot --version probe through the shared ProcessExecutor",
+        "P-03 OperationId for one-shot Rust Analyzer version probe under the admitted State Fence",
+    )
+}
+
+fn rust_analyzer_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+    instrument_name: &'static str,
+    parser_name: &'static str,
+    artifact: &'static str,
+    operation: &'static str,
+) -> Result<RegistryEntry, ContractError> {
+    let instrument = contract_id(instrument_name)?;
+    let resource_contract =
+        "composition-root ProcessExecutor admission bounds one-shot stdout/stderr and runtime";
+    let cancellation_contract =
+        "P-03 cancel/reconcile through the original OperationId and State Fence";
+    let toolchain = "rust-analyzer installed by the admitted Rust toolchain owner";
+    let executable = "rust-analyzer";
+    Ok(RegistryEntry {
+        profile: contract_id(instrument_name)?,
+        profile_version: ContractVersion::new(1, 0, 0),
+        instrument,
+        kinds: vec![InstrumentKind::Inspect],
+        adapter: crate::profile::RUST_ANALYZER_PROFILE.to_owned(),
+        adapter_version: ContractVersion::new(1, 0, 0),
+        executable: ExecutableIdentity::process(
+            executable,
+            "Rust toolchain owner resolves installed rust-analyzer and supplies the original canonical path, content digest, version, and environment digest; a PATH name is not admission",
+        ),
+        toolchain: toolchain.to_owned(),
+        targets: worktree_targets(),
+        environment_class: ISOLATED_PROCESS.to_owned(),
+        resource_contract: resource_contract.to_owned(),
+        cancellation_contract: cancellation_contract.to_owned(),
+        parser: contract_id(parser_name)?,
+        normalizer: contract_id(crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT)?,
+        evaluator: contract_id(crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT)?,
+        verifier: verifier_id()?,
+        invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: toolchain.to_owned(),
+            executable: executable.to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact: artifact.to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: operation.to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract.to_owned(),
         }),
         generation,
     })
@@ -2131,5 +2341,58 @@ mod tests {
             entry.check_resolved_executable(Some(&observation)),
             Err(RegistryError::ExecutableMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn current_registry_resolves_only_the_seven_finite_git_source_operations() {
+        let fingerprints = test_fingerprints();
+        let registry = unreachable_id(ProviderRegistry::ready(
+            7,
+            "normative".to_owned(),
+            &fingerprints,
+        ));
+        let freshness = RegistryFreshness {
+            generation: 7,
+            normative_pair_digest: "normative",
+            fingerprints: &fingerprints,
+        };
+        let operations = [
+            GIT_SOURCE_RESOLVE_ROOT_INSTRUMENT,
+            GIT_SOURCE_INITIALIZE_INDEX_INSTRUMENT,
+            GIT_SOURCE_CAPTURE_OVERLAY_INSTRUMENT,
+            GIT_SOURCE_WRITE_TREE_INSTRUMENT,
+            GIT_SOURCE_ENUMERATE_TREE_INSTRUMENT,
+            GIT_SOURCE_READ_BLOB_INSTRUMENT,
+            GIT_SOURCE_ARCHIVE_TREE_INSTRUMENT,
+        ];
+        for operation in operations {
+            let invocation = test_invocation(operation, InstrumentKind::Inspect, Vec::new());
+            let entry = registry
+                .resolve_current(&invocation, &freshness)
+                .expect("finite Git source operation is current");
+            assert_eq!(entry.adapter, GIT_SOURCE_SNAPSHOT_PROFILE);
+            assert!(entry.check_resolved_executable(Some(&git_observation(Vec::new()))).is_ok());
+        }
+
+        let unknown = test_invocation(
+            "eliot.instrument.git.source-snapshot.reset",
+            InstrumentKind::Inspect,
+            Vec::new(),
+        );
+        assert!(matches!(
+            registry.resolve_current(&unknown, &freshness),
+            Err(RegistryError::Missing { .. })
+        ));
+    }
+
+    fn git_observation(arguments: Vec<String>) -> ResolvedExecutableIdentity {
+        unreachable_id(ResolvedExecutableIdentity::new(
+            GIT_SOURCE_RESOLVE_ROOT_INSTRUMENT,
+            "/usr/bin/git".to_owned(),
+            "a".repeat(64),
+            Some("git version 2.46.0".to_owned()),
+            "b".repeat(64),
+            arguments,
+        ))
     }
 }

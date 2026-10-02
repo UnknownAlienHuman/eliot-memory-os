@@ -1504,6 +1504,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "daemon_degraded"
             | "daemon_fatal"
             | super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
+            | super::daemon_request_dispatch::EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION
             | "agent_activation_claim"
             | "agent_activation_submit"
             | "agent_activation_reconcile"
@@ -1638,6 +1639,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "task_controller_claim"
             | "task_controller_result"
             | "campaign_packet_claim"
+            | "source_capture.claim"
+            | "source_capture.stage"
             | "campaign_packet_result"
             // Issue #1741: the finish claim/result legs are separate admitted
             // operations with their own queue and attempt type, so the frame

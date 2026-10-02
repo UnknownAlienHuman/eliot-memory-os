@@ -670,6 +670,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // closed validator.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitProposedAttempt,
+        transition_classes: &[TransitionClass::TaskControl],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
 ];
 
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
@@ -1012,6 +1018,10 @@ pub fn validate_transition_against_catalogue(
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 validate_task_contract_acceptance_transition(transition, &command.parameters)?;
             }
+            NamedMutationOperation::AdmitProposedAttempt => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                validate_proposed_attempt_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
             }
@@ -1021,6 +1031,26 @@ pub fn validate_transition_against_catalogue(
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_proposed_attempt_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let record = crate::decode_proposed_attempt_record(
+        NamedMutationOperation::AdmitProposedAttempt,
+        parameters,
+    )?;
+    if record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "proposed_attempt.task_id",
+            reason: "must match the prepared transition task",
+        });
     }
     Ok(())
 }

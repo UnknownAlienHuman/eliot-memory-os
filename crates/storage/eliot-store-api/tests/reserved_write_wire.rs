@@ -24,10 +24,10 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
-    SourceId, StateFence,
+    SourceId, StateFence, TransactionSequence,
 };
 use eliot_protocol::{ProtocolVersion, RequestIdentity};
-use eliot_receipts::RequestBinding;
+use eliot_receipts::{CausalBinding, RequestBinding};
 use eliot_store_api::{
     CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_RESERVED_WRITE, CommitId, EFFECTS, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
@@ -38,7 +38,7 @@ use eliot_store_api::{
     WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
     WriterEpochBinding, bind_issue18_digests, bind_issue18_receipt,
     bind_policy_config_schema_versions, decode_request_frame, decode_response_frame,
-    issue_store_receipt_envelope, request_frame, response_frame,
+    issue_store_receipt_envelope_with_causal, request_frame, response_frame,
 };
 use serde_json::{Value, json};
 
@@ -214,8 +214,22 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
     };
     bind_issue18_receipt(transition, &mut receipt, &request.expected_revision_heads);
     bind_policy_config_schema_versions(transition, &mut receipt);
-    receipt.envelope =
-        Some(issue_store_receipt_envelope(&request.context, transition, &receipt, 1).unwrap());
+    let causal = CausalBinding {
+        state_fence: request.context.state_fence.clone(),
+        transaction_sequence: TransactionSequence::genesis(),
+        parent_receipt_id: None,
+        predecessor_receipt_ids: Vec::new(),
+    };
+    receipt.envelope = Some(
+        issue_store_receipt_envelope_with_causal(
+            &request.context,
+            transition,
+            &receipt,
+            1,
+            &causal,
+        )
+        .unwrap(),
+    );
     receipt.validate().unwrap();
     receipt
 }

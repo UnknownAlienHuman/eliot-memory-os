@@ -23,12 +23,14 @@ pub mod build_projection;
 pub mod cache_lane;
 pub mod capsule_binding;
 mod dev_fast;
+pub mod git_source_snapshot_profile;
 pub mod package_disposition;
 pub mod process_owner;
 pub mod profile;
 pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
+pub mod rust_analyzer_profile;
 pub mod testd_port;
 pub mod testd_profile_dispatch;
 pub mod verification_profile;
@@ -40,6 +42,12 @@ pub use build_projection::{
     CleanupDecision, DeclaredWorkItem, FlightResolution, HeldLease, LiveClaim, PreemptionClass,
     ProducerClaim, ProducerCompletion, ProducerOutcome, ProjectedBuild, QuarantinedArtifact,
     TargetClass, TargetRootBuildCoordinator, restrict_agent_argv,
+};
+pub use git_source_snapshot_profile::{
+    GitSourceSnapshotCommand, GitSourceSnapshotProcessProfile,
+    GitSourceSnapshotProfileError, GitSourceSnapshotResourceTargets,
+    prepare_current_git_source_snapshot_profile,
+    validate_git_source_snapshot_admission,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use capsule_binding::{
@@ -82,6 +90,8 @@ pub use profile::{
     ProfileCompiler, ProfileError, ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA,
     REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
     StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout, WorkScope,
+    RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT, RUST_ANALYZER_PROFILE,
+    RUST_ANALYZER_VERSION_INSTRUMENT,
     admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
     package_verification_profile, test_profile,
 };
@@ -102,6 +112,9 @@ pub use registry::{
     ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, PROFILE_IDENTITY_SLOTS,
     ProfileIdentities, ProfileIdentityParams, ProviderRegistry, REQUIRED_IDENTITY_SLOTS,
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
+};
+pub use rust_analyzer_profile::{
+    RustAnalyzerProcessProfile, RustAnalyzerProfileError, resolve_current as resolve_rust_analyzer_profile,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,

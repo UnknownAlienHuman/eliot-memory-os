@@ -716,6 +716,11 @@ pub struct AdmissionReservationIdentityInput {
     pub work_item_id: OperationIdentity,
     /// Attempt identity proposed before canonical admission.
     pub proposed_attempt_id: OperationIdentity,
+    /// Original parent operation that makes this a distinct selected-source
+    /// proposal. `None` preserves the legacy identity preimage for owners that
+    /// do not have a retained source request.
+    #[serde(default)]
+    pub causal_operation_id: Option<OperationIdentity>,
     /// Exact semantic admission revision this reservation is bound to.
     pub semantic_admission_revision: String,
     /// Complete immutable claim set the reservation reserves.
@@ -764,16 +769,30 @@ pub fn admission_reservation_identity(
         &input.semantic_admission_revision,
         "admission_reservation.semantic_admission_revision",
     )?;
-    let preimage = serde_json::to_vec(&(
-        RESERVATION_IDENTITY_DOMAIN,
-        ADMISSION_RESERVATION_STAGE_VERSION,
-        &input.work_item_id,
-        &input.proposed_attempt_id,
-        &input.semantic_admission_revision,
-        &input.claims,
-        &input.state_fence,
-        &input.authority_epoch,
-    ))
+    let preimage = if let Some(causal_operation_id) = &input.causal_operation_id {
+        serde_json::to_vec(&(
+            RESERVATION_IDENTITY_DOMAIN,
+            ADMISSION_RESERVATION_STAGE_VERSION,
+            &input.work_item_id,
+            &input.proposed_attempt_id,
+            &input.semantic_admission_revision,
+            &input.claims,
+            &input.state_fence,
+            &input.authority_epoch,
+            causal_operation_id,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            RESERVATION_IDENTITY_DOMAIN,
+            ADMISSION_RESERVATION_STAGE_VERSION,
+            &input.work_item_id,
+            &input.proposed_attempt_id,
+            &input.semantic_admission_revision,
+            &input.claims,
+            &input.state_fence,
+            &input.authority_epoch,
+        ))
+    }
     .map_err(|error| OrsError::Encoding(error.to_string()))?;
     OperationIdentity::new(format!("admission-reservation:{}", sha256_hex(&preimage)))
 }
@@ -817,15 +836,28 @@ pub fn proposed_attempt_identity(
     input: &AdmissionReservationIdentityInput,
 ) -> Result<OperationIdentity, OrsError> {
     let _ = admission_reservation_identity(input)?;
-    let preimage = serde_json::to_vec(&(
-        PROPOSED_ATTEMPT_DOMAIN,
-        ADMISSION_RESERVATION_STAGE_VERSION,
-        &input.work_item_id,
-        &input.semantic_admission_revision,
-        &input.claims,
-        &input.state_fence,
-        &input.authority_epoch,
-    ))
+    let preimage = if let Some(causal_operation_id) = &input.causal_operation_id {
+        serde_json::to_vec(&(
+            PROPOSED_ATTEMPT_DOMAIN,
+            ADMISSION_RESERVATION_STAGE_VERSION,
+            &input.work_item_id,
+            &input.semantic_admission_revision,
+            &input.claims,
+            &input.state_fence,
+            &input.authority_epoch,
+            causal_operation_id,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            PROPOSED_ATTEMPT_DOMAIN,
+            ADMISSION_RESERVATION_STAGE_VERSION,
+            &input.work_item_id,
+            &input.semantic_admission_revision,
+            &input.claims,
+            &input.state_fence,
+            &input.authority_epoch,
+        ))
+    }
     .map_err(|error| OrsError::Encoding(error.to_string()))?;
     OperationIdentity::new(format!("admission-attempt:{}", sha256_hex(&preimage)))
 }

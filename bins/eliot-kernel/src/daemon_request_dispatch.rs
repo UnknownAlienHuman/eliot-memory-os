@@ -26,6 +26,8 @@ use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::MaintenanceTriggerDeliveryError;
 #[cfg(windows)]
+use eliot_kernel_service::ProcessExecutionRequest;
+#[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
@@ -65,12 +67,12 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignSourceRevisionRef, CanonicalRequestView, CausalWriteReceipt,
+    MAX_RECOVERY_OWNER_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
 
@@ -102,6 +104,12 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// through the single timing owner and always answers with its exact durable
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
+/// Authenticated current-source process execution/readback route. The payload
+/// wraps the existing closed P-03 request under `request` so its tagged
+/// `operation` discriminator does not collide with the daemon routing key.
+/// Every leg remains bound to the daemon frame's original request identity
+/// and authenticated session.
+pub(crate) const EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION: &str = "execute_current_source_process";
 /// Authenticated Governor publish operation carrying one live-derivation
 /// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
 /// publishes its exact revision, exact active fingerprint, and exact
@@ -653,6 +661,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
         INTEGRATION_BRIDGE_APPLY_NAME => INTEGRATION_BRIDGE_APPLY_NAME,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
+        EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION => EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
@@ -704,6 +713,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "watchdog_export_claim" => "watchdog_export_claim",
         "watchdog_export_result" => "watchdog_export_result",
         "campaign_packet_claim" => "campaign_packet_claim",
+        "source_capture.claim" => "source_capture.claim",
+        "source_capture.stage" => "source_capture.stage",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
         "task_controller_result" => "task_controller_result",
@@ -736,6 +747,18 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
     request: NamedReadRequest,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentSourceProcessOperation {
+    /// The exact closed P-03 operation. It is nested because the daemon's
+    /// routing envelope also uses the top-level `operation` JSON key.
+    request: ProcessExecutionRequest,
+    /// Original Governor owner-read `TaskBinding` identity. The EBP identity is
+    /// compared against this value before the process gateway is entered.
+    admitted_task_id: eliot_contracts::TaskId,
 }
 
 /// Strips the daemon transport's routing key from one application body.
@@ -3543,8 +3566,13 @@ impl KernelComposition {
                     .await
             }
             "apply_prepared" => {
-                Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
-                    .await
+                Box::pin(self.store_apply_operation(
+                    session,
+                    request_id.clone(),
+                    payload.clone(),
+                    request_identity,
+                ))
+                .await
             }
             NOTIFICATION_STATE_MUTATION_OPERATION => {
                 Box::pin(self.notification_state_operation(
@@ -3673,6 +3701,22 @@ impl KernelComposition {
                 #[cfg(not(windows))]
                 {
                     let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION => {
+                #[cfg(windows)]
+                {
+                    self.execute_current_source_process_operation(
+                        session,
+                        payload.clone(),
+                        request_identity,
+                    )
+                    .await
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (session, payload, request_identity);
                     Err(TransportError::SessionFenced)
                 }
             }
@@ -4284,6 +4328,88 @@ impl KernelComposition {
                                 "recovery": null,
                             }),
                         })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "source_capture.claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| !object.is_empty()) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_selected_source_capture_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, invocation, request_identity)) => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": {
+                                    "envelope": envelope,
+                                    "invocation": invocation,
+                                    "request_identity": request_identity,
+                                }},
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "source_capture.stage" => {
+                #[cfg(windows)]
+                {
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 3 {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let operation_id = object
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let request_digest = object
+                        .get("request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let intent: eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent =
+                        serde_json::from_value(
+                            object
+                                .get("intent")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let original_identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    let staged = self.stage_selected_source_capture_host_request(
+                        session,
+                        operation_id,
+                        request_digest,
+                        original_identity,
+                        &intent,
+                    )?;
+                    let staged_record = serde_json::to_value(staged.staged.snapshot.record())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let stage_receipt = serde_json::to_value(staged.staged.snapshot.receipt())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(serde_json::json!({
+                        "status": "known",
+                        "value": { "stage": {
+                            "record": staged.record,
+                            "stage_receipt_id": staged.stage_receipt_id,
+                            "staged_record": staged_record,
+                            "stage_receipt": stage_receipt,
+                        }},
+                        "recovery": null,
+                    }))
                 }
                 #[cfg(not(windows))]
                 {
@@ -5068,6 +5194,37 @@ impl KernelComposition {
         frame.request_id = Some(request_id);
         frame.validate()?;
         Ok(frame)
+    }
+
+    #[cfg(windows)]
+    async fn execute_current_source_process_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: CurrentSourceProcessOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let admitted_task_id = operation.admitted_task_id;
+        let request = operation.request;
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        let (_, session_binding) = super::caller_binding(session)?;
+        let response = self
+            .execute_current_source_process_request(
+                session,
+                session_binding,
+                request,
+                identity,
+                &admitted_task_id,
+            )
+            .await;
+        let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": response,
+            "recovery": null,
+        }))
     }
 
     fn accepted_daemon_response() -> serde_json::Value {
@@ -9560,6 +9717,7 @@ impl KernelComposition {
         session: &Session,
         request_id: RequestId,
         payload: serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreApplyOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
@@ -9568,6 +9726,27 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         validate_store_session_fence(session, &operation.context.state_fence)?;
+        let proposed_attempt_commands = operation
+            .transition
+            .named_operations
+            .iter()
+            .filter(|command| {
+                command.operation == eliot_store_api::NamedMutationOperation::AdmitProposedAttempt
+            })
+            .collect::<Vec<_>>();
+        if proposed_attempt_commands.len() > 1 {
+            return Err(TransportError::IdentityConflict);
+        }
+        let proposed_attempt = proposed_attempt_commands
+            .first()
+            .map(|command| {
+                eliot_store_api::decode_proposed_attempt_record(
+                    eliot_store_api::NamedMutationOperation::AdmitProposedAttempt,
+                    &command.parameters,
+                )
+                .map_err(|_| TransportError::IdentityConflict)
+            })
+            .transpose()?;
         // Issue #1796 (I6.8): the pre-stage admission boundary emits one typed
         // rejection carrying every detected defect with `stage_state: none`,
         // `ordering_sequence_assigned: false`, `write_mutation_status:
@@ -9648,6 +9827,20 @@ impl KernelComposition {
             .await?
         {
             return Ok(replayed);
+        }
+        if let Some(record) = proposed_attempt.as_ref() {
+            if self
+                .validate_source_capture_transition_for_commit(
+                    session,
+                    &operation.context,
+                    &operation.transition,
+                    request_identity,
+                    record,
+                )
+                .is_err()
+            {
+                return Err(TransportError::IdentityConflict);
+            }
         }
         if let Some(rejection) =
             self.material_write_admission_response(&operation.context.state_fence)
@@ -9782,8 +9975,9 @@ impl KernelComposition {
         // enumerates, revalidates by the envelope's recorded hash, and reconciles
         // by operation identity into either the canonical receipt or a durable
         // Recovery Problem whenever ORS does hold one.
+        let expected_identity = operation.transition.identity.clone();
         match gateway
-            .apply(
+            .apply_with_causal(
                 &operation.context,
                 operation.transition,
                 operation.expected_revision_heads,
@@ -9791,14 +9985,28 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => {
+            Ok(pair) => {
+                if let Some(record) = proposed_attempt {
+                    if let Err(error) =
+                        eliot_kernel_service::source_capture_mutation::verify_proposed_attempt_readback(
+                            &gateway,
+                            record,
+                            expected_identity,
+                            pair.clone(),
+                        )
+                        .await
+                    {
+                        return Ok(Self::store_error_response_text("write_receipt", &error));
+                    }
+                }
+                let receipt = &pair.receipt;
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
                         if let Err(error) = self.p07_ors.commit_campaign_source_publications(
                             &campaign_source_operation_id,
                             &campaign_source_request_digest,
                             &campaign_source_publications,
-                            &receipt,
+                            receipt,
                         ) {
                             // Keep the source reservation. An exact replay of
                             // this same canonical operation obtains the
@@ -9820,7 +10028,7 @@ impl KernelComposition {
                     }
                 }
                 Ok(store_apply_response(
-                    &receipt,
+                    &pair,
                     verified_correction.as_ref(),
                     journal_issue,
                 ))
@@ -9848,8 +10056,8 @@ impl KernelComposition {
         verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
         journal_issue: Option<&str>,
     ) -> Result<Option<serde_json::Value>, TransportError> {
-        let Ok(Some(receipt)) = gateway
-            .receipt(
+        let Ok(Some(pair)) = gateway
+            .receipt_with_causal(
                 &operation.context.state_fence,
                 operation.transition.identity.operation_id.clone(),
             )
@@ -9857,6 +10065,7 @@ impl KernelComposition {
         else {
             return Ok(None);
         };
+        let receipt = &pair.receipt;
         if receipt.operation_id != operation.transition.identity.operation_id
             || receipt.idempotency_key != operation.transition.identity.idempotency_key
             || receipt.canonical_request_hash
@@ -9869,8 +10078,36 @@ impl KernelComposition {
         receipt
             .validate()
             .map_err(|_| TransportError::IdentityConflict)?;
+        pair.validate()
+            .map_err(|_| TransportError::IdentityConflict)?;
+        let proposed_attempt_commands = operation
+            .transition
+            .named_operations
+            .iter()
+            .filter(|command| {
+                command.operation == eliot_store_api::NamedMutationOperation::AdmitProposedAttempt
+            })
+            .collect::<Vec<_>>();
+        if proposed_attempt_commands.len() > 1 {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(command) = proposed_attempt_commands.first() {
+            let record = eliot_store_api::decode_proposed_attempt_record(
+                eliot_store_api::NamedMutationOperation::AdmitProposedAttempt,
+                &command.parameters,
+            )
+            .map_err(|_| TransportError::IdentityConflict)?;
+            eliot_kernel_service::source_capture_mutation::verify_proposed_attempt_readback(
+                gateway,
+                record,
+                operation.transition.identity.clone(),
+                pair.clone(),
+            )
+            .await
+            .map_err(|_| TransportError::IdentityConflict)?;
+        }
         Ok(Some(store_apply_response(
-            &receipt,
+            &pair,
             verified_correction,
             journal_issue,
         )))
@@ -9882,6 +10119,7 @@ impl KernelComposition {
         _session: &Session,
         _request_id: RequestId,
         payload: serde_json::Value,
+        _request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)
@@ -13300,13 +13538,16 @@ fn persist_pre_stage_corrections(
     }
 }
 fn store_apply_response(
-    receipt: &WriteReceipt,
+    pair: &CausalWriteReceipt,
     verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
     journal_issue: Option<&str>,
 ) -> serde_json::Value {
     let mut response = serde_json::json!({
         "status": "known",
-        "value": { "kind": "write_receipt", "value": receipt },
+        "value": {
+            "kind": "causal_write_receipt",
+            "value": { "receipt": pair.receipt, "causal": pair.causal },
+        },
         "recovery": null,
     });
     // A local recovery/persistence failure is reported here without claiming
