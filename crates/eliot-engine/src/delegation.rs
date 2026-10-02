@@ -677,7 +677,7 @@ impl fmt::Display for ProviderCallLedgerUnknown {
 
 impl From<ProviderCallLedgerUnknown> for EngineError {
     fn from(unknown: ProviderCallLedgerUnknown) -> Self {
-        EngineError::WriteRejected(unknown.to_string())
+        EngineError::ProviderCallLedgerUnknown(unknown.to_string())
     }
 }
 
@@ -691,7 +691,9 @@ fn validate_provider_call_ledger(ledger: &ProviderCallLedger) -> Result<(), Engi
     let mut campaigns = HashSet::new();
     for budget in &ledger.budgets {
         if !protected_delegation_identity_is_valid(&budget.campaign_id) {
-            return Err(rejected("provider call campaign identity is empty or unbounded"));
+            return Err(rejected(
+                "provider call campaign identity is empty or unbounded",
+            ));
         }
         if !campaigns.insert(budget.campaign_id.as_str()) {
             return Err(rejected("provider call campaign identity is not unique"));

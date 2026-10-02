@@ -55,7 +55,7 @@ pub enum EngineError {
     /// unknown ledger as one more rejected write. The payload is the bounded
     /// refusal `delegation::ProviderCallLedgerUnknown` renders: candidate codes
     /// and fault codes only, never ledger contents, field values or file bytes.
-    #[error("provider call ledger is unknown; new provider calls are blocked pending reconciliation: {0}")]
+    #[error("{0}")]
     ProviderCallLedgerUnknown(String),
 
     #[error("encoding rejected")]
