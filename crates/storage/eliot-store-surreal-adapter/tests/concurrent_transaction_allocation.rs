@@ -302,7 +302,7 @@ impl Harness {
             .creation_flags(0x0800_0000);
         let (mut child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
             || command.spawn(),
-            |child: &std::process::Child| child.id(),
+            |child: &std::process::Child| Some(child.id()),
             eliot_store_surreal_adapter::reap_refused_std_child,
         )
         .expect("bootstrap provider is admitted into its kill-on-close job");

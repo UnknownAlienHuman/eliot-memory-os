@@ -148,7 +148,7 @@ fn bootstrap(config: &SurrealAdapterConfig) -> ProofResult {
     // child; there is no unassigned fallback.
     let (child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
         || command.spawn(),
-        |child: &Child| child.id(),
+        |child: &Child| Some(child.id()),
         eliot_store_surreal_adapter::reap_refused_std_child,
     )?;
     let mut process = Bootstrap(child);

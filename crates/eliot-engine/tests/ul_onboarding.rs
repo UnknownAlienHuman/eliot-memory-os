@@ -441,7 +441,7 @@ fn spawn_surreal(exe: &Path, password: &str, port: u16) -> TestResult<OwnedChild
         .stderr(Stdio::inherit());
     let (child, kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
         || command.spawn(),
-        |child: &Child| child.id(),
+        |child: &Child| Some(child.id()),
         eliot_store_surreal_adapter::reap_refused_std_child,
     )?;
     Ok(OwnedChild::new(child, kill_on_close))
