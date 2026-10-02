@@ -1,11 +1,11 @@
-inventory_digest = "6bebbab034f166dbd226b73ed327fefa4da81e03970e50ab973a7b7007d53909"
+inventory_digest = "45e243c1b9d18048dbe84a897b1713ca9c3988cf89610c44ab9e8959e6a8dd03"
 proposed_splits = []
 
 [header]
 schema = "eliot.context-measurement-inventory.v2"
 rule_revision = "866.4"
 tool_version = "0.2.0"
-source_sha = "315d0a617f043c15ab727d70741059e4aa03457933353bcf24923eb5a73cc558"
+source_sha = "f8f9be37dc20d623cbe8cc86630ff20d71c8d928f4ccb6572121a89da5f7a9b4"
 source_sha_kind = "sha256 over sorted <path>:<sha256> of the declared scan roots; the generated artifact is never one of its own inputs, so committing it does not stale the inventory"
 rule_digest = "14421b66e43380d1e4a362571bb561c0d7d871ab8ee012dd3245d0320bf8a70e"
 owner_digest = "0b937c796a591bc265b2512277d7aa397920eaa521a0fd7a2467aa053b2397cb"
@@ -13,7 +13,7 @@ owner_map_path = ".github/work-units/context-measurement-owner-map.toml"
 owner_map_status = "SUPPLIED"
 owner_map_digest = "1e598dc28c46b8556831edaf4962a7ba703aa30f72b4020eef13c2208454dee0"
 scan_denominator_files = 27
-scan_denominator_bytes = 1475673
+scan_denominator_bytes = 1477762
 candidate_count = 72
 classified_count = 72
 owned_count = 68
@@ -29,7 +29,7 @@ scan_roots = ["crates/eliot-app/src/commands/data_and_memory.rs", "crates/eliot-
 exclusions = ["exc/1|crates/eliot-app/src/cognitive_field_runner.rs:11659-11659|unrelated_byte_or_character_metric|83224db3c2de82a5|collection-length partition for execution chunking (executions/target_chunks); no byte/char/token/STU semantic|declared unrelated byte/character metric: 'executions.len().div_ceil(target_chunks)'; excluded with exact evidence, not a package skip", "exc/2|crates/eliot-app/src/host_runtime/event_and_authority.rs:2907-2907|unrelated_byte_or_character_metric|8a15cd14ee1d7efe|seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'input.ttl_seconds.div_ceil(60)'; excluded with exact evidence, not a package skip", "exc/3|crates/eliot-app/src/host_runtime/supervised_process.rs:1545-1545|unrelated_byte_or_character_metric|2fb187414f7c18f4|digest text length bound on a hash string; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'hash.chars().count() <= 128'; excluded with exact evidence, not a package skip", "exc/4|crates/eliot-app/src/host_runtime/supervised_process.rs:1576-1576|unrelated_byte_or_character_metric|1b53d5d338573ec6|log-detail truncation bound; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'if detail.chars().count() > 512'; excluded with exact evidence, not a package skip", "exc/5|crates/eliot-engine/src/host.rs:188-188|unrelated_byte_or_character_metric|bd25287324ab7b71|nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens|declared unrelated byte/character metric: 'let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()'; excluded with exact evidence, not a package skip", "exc/6|crates/eliot-engine/src/host.rs:186-186|unrelated_byte_or_character_metric|2a73328ae0d67216|summed description character count reported only as listing_characters; never divided or relabelled as tokens|declared unrelated byte/character metric: 'descriptions += description_characters'; excluded with exact evidence, not a package skip"]
 classifications = ["exact-utf8-envelope", "normative-stu-estimate", "serializer-identity-bound", "route-identity-bound", "estimator-policy-unvalidated", "capacity-fit-analysis", "exact-observation", "stale-or-absent-observation", "transformed-observation", "test-only", "token_estimate_without_tokenizer", "character_count_mislabeled_as_tokens", "bare_measurement_field_or_conversion", "unrelated_byte_or_character_metric", "unresolved"]
 owner_allocations = ["#704:9", "#783:21", "#878:17", "#880:21", "unresolved:4"]
-consumer_worksets_digest = "6df56c1ab12979696a2feb275079ad13755916ff4ffb5e39e5af571a4caf959f"
+consumer_worksets_digest = "82bfbd7c7302e0bc4d9d7b3f53b921c28c695dccfa06613c805730e050f2009f"
 
 [[rows]]
 id = "c0001"
@@ -1593,16 +1593,16 @@ package = "eliot-engine"
 item = "fn derive_utility_ledger"
 item_scope = "production"
 signal = ".saturating_add(record.serialized_bytes.div_ceil(1024));"
-span_start = 65
-span_end = 65
+span_start = 67
+span_end = 67
 span_bytes = 77
-source_sha256 = "dd4bc3c42b05ddd1d1d9a838b7ba66c58bac82055d9c03031834f5faf064ce51"
+source_sha256 = "9c92a34d5974a04044cfe1955c6ed3d78956fff474b067a499672786235462a1"
 span_digest = "c3f2df183d31ada0e76b1252a6db81c6afccb5b0f1ccdf1eb977952bebaf769e"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "3ddc3cb6f3c17a68ba500e35ccc7e22ab8bbb7495b375a98822a51b14cb1104f"
-evidence = "bare unit conversion feeding a measurement field: '.saturating_add(record.serialized_bytes.div_ceil(1024));'; no estimator policy; measured at crates/eliot-engine/src/memory_distillation.rs:65-65 inside `fn derive_utility_ledger`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
+row_digest = "ffc67a08bb7a42c88deaf2416b3dd063c9a337e85a11cf236da923f42d519519"
+evidence = "bare unit conversion feeding a measurement field: '.saturating_add(record.serialized_bytes.div_ceil(1024));'; no estimator policy; measured at crates/eliot-engine/src/memory_distillation.rs:67-67 inside `fn derive_utility_ledger`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/17 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1618,16 +1618,16 @@ package = "eliot-engine"
 item = "fn apply_utility_signal"
 item_scope = "production"
 signal = "MemoryUtilitySignalKind::ContextTokenCost => {"
-span_start = 607
-span_end = 607
+span_start = 609
+span_end = 609
 span_bytes = 55
-source_sha256 = "dd4bc3c42b05ddd1d1d9a838b7ba66c58bac82055d9c03031834f5faf064ce51"
+source_sha256 = "9c92a34d5974a04044cfe1955c6ed3d78956fff474b067a499672786235462a1"
 span_digest = "3375f65912768916ad2b752b7d539f68e677adb86f3109d726c5e4d0c17179a6"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "e9d46dcdae43c689adcddd8096f1e25f93f681fd0d37f15736a835c29244c4bf"
-evidence = "bare measurement field or projection: 'MemoryUtilitySignalKind::ContextTokenCost => {'; carries no estimator policy of its own; measured at crates/eliot-engine/src/memory_distillation.rs:607-607 inside `fn apply_utility_signal`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
+row_digest = "a69f43b323d4a4b10061a3a5e68e72db1391399610dc4ee9a88d94ea2d4997c8"
+evidence = "bare measurement field or projection: 'MemoryUtilitySignalKind::ContextTokenCost => {'; carries no estimator policy of its own; measured at crates/eliot-engine/src/memory_distillation.rs:609-609 inside `fn apply_utility_signal`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/18 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1643,16 +1643,16 @@ package = "eliot-engine"
 item = "fn plan"
 item_scope = "production"
 signal = ".map(|item| canonical_bytes_for_measured_units(item.token_units))"
-span_start = 219
-span_end = 219
+span_start = 221
+span_end = 221
 span_bytes = 78
-source_sha256 = "dd4bc3c42b05ddd1d1d9a838b7ba66c58bac82055d9c03031834f5faf064ce51"
+source_sha256 = "9c92a34d5974a04044cfe1955c6ed3d78956fff474b067a499672786235462a1"
 span_digest = "635daa336a74dcbc975457c5013cd7f11cba6c766526307a4b27392c61806313"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "c5fe7360902bc0552e85a98cfa4cf4eab3546772b9e9accb3d2ad27ab5533ceb"
-evidence = "bare measurement field or projection: '.map(|item| canonical_bytes_for_measured_units(item.token_units))'; carries no estimator policy of its own; measured at crates/eliot-engine/src/memory_distillation.rs:219-219 inside `fn plan`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
+row_digest = "ac35176972c30dd87a7159bb17917fd5f1b2dda072d4ece67bea8d9bf7039bb6"
+evidence = "bare measurement field or projection: '.map(|item| canonical_bytes_for_measured_units(item.token_units))'; carries no estimator policy of its own; measured at crates/eliot-engine/src/memory_distillation.rs:221-221 inside `fn plan`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/19 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1668,16 +1668,16 @@ package = "eliot-engine"
 item = "fn corpus_profile"
 item_scope = "production"
 signal = "let item_bytes = canonical_bytes_for_measured_units(item.token_units)?;"
-span_start = 894
-span_end = 894
+span_start = 920
+span_end = 920
 span_bytes = 80
-source_sha256 = "dd4bc3c42b05ddd1d1d9a838b7ba66c58bac82055d9c03031834f5faf064ce51"
+source_sha256 = "9c92a34d5974a04044cfe1955c6ed3d78956fff474b067a499672786235462a1"
 span_digest = "6047e49839cc8e2ea082947a29869ab8068f7c558394ce129236124cd163a2c0"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "780846dd59c1aa6649e8761f423b42b2d9e2b73ca2be2ee96220380ddbcd0c0e"
-evidence = "bare measurement field or projection: 'let item_bytes = canonical_bytes_for_measured_units(item.token_units)?;'; carries no estimator policy of its own; measured at crates/eliot-engine/src/memory_distillation.rs:894-894 inside `fn corpus_profile`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
+row_digest = "4cc0e6a9c59f4b66c1f020840f86d104ee0d87878bcdaeedab41515751982f12"
+evidence = "bare measurement field or projection: 'let item_bytes = canonical_bytes_for_measured_units(item.token_units)?;'; carries no estimator policy of its own; measured at crates/eliot-engine/src/memory_distillation.rs:920-920 inside `fn corpus_profile`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/memory_distillation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/20 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1939,7 +1939,7 @@ role = "engine-consumer"
 seam = "engine-skill-memory"
 row_ids = ["c0048", "c0049", "c0050", "c0051", "c0052", "c0053", "c0054", "c0055", "c0056", "c0057", "c0058", "c0059", "c0060", "c0061", "c0062", "c0063", "c0064", "c0065", "c0066", "c0067", "c0068"]
 source_paths = ["crates/eliot-engine/src/memory_distillation.rs", "crates/eliot-engine/src/memory_lifecycle.rs", "crates/eliot-engine/src/skill.rs", "crates/eliot-engine/src/skill_curator.rs"]
-items = ["c0056:crates/eliot-engine/src/skill.rs:981-1019", "c0057:crates/eliot-engine/src/skill.rs:1054-1054", "c0058:crates/eliot-engine/src/skill.rs:237-237", "c0059:crates/eliot-engine/src/skill_curator.rs:657-657", "c0060:crates/eliot-engine/src/skill_curator.rs:660-660", "c0061:crates/eliot-engine/src/skill_curator.rs:596-596", "c0062:crates/eliot-engine/src/skill_curator.rs:728-741", "c0063:crates/eliot-engine/src/memory_distillation.rs:65-65", "c0064:crates/eliot-engine/src/memory_distillation.rs:607-607", "c0065:crates/eliot-engine/src/memory_distillation.rs:219-219", "c0066:crates/eliot-engine/src/memory_distillation.rs:894-894", "c0067:crates/eliot-engine/src/memory_lifecycle.rs:578-578", "c0068:crates/eliot-engine/src/memory_lifecycle.rs:610-610"]
+items = ["c0056:crates/eliot-engine/src/skill.rs:981-1019", "c0057:crates/eliot-engine/src/skill.rs:1054-1054", "c0058:crates/eliot-engine/src/skill.rs:237-237", "c0059:crates/eliot-engine/src/skill_curator.rs:657-657", "c0060:crates/eliot-engine/src/skill_curator.rs:660-660", "c0061:crates/eliot-engine/src/skill_curator.rs:596-596", "c0062:crates/eliot-engine/src/skill_curator.rs:728-741", "c0063:crates/eliot-engine/src/memory_distillation.rs:67-67", "c0064:crates/eliot-engine/src/memory_distillation.rs:609-609", "c0065:crates/eliot-engine/src/memory_distillation.rs:221-221", "c0066:crates/eliot-engine/src/memory_distillation.rs:920-920", "c0067:crates/eliot-engine/src/memory_lifecycle.rs:578-578", "c0068:crates/eliot-engine/src/memory_lifecycle.rs:610-610"]
 source_span_bytes = 3037
 source_span_stu = 1013
 read_only_paths = ["crates/smart/eliot-context-measurement/src/capacity.rs", "crates/smart/eliot-context-measurement/src/observation.rs", "crates/smart/eliot-context-measurement/tests/measurement.rs"]
@@ -1948,16 +1948,16 @@ read_only_bytes = 168
 read_only_stu = 56
 test_paths = ["crates/eliot-engine/tests/memory_distillation.rs", "crates/eliot-engine/tests/memory_ecology.rs", "crates/eliot-engine/tests/skill_curator.rs", "crates/eliot-engine/tests/skill_lifecycle.rs"]
 test_path_evidence = "git ls-files --error-unmatch <path> in the owning worktree; the generator re-verifies existence, byte count and sha256 without spawning git"
-test_bytes = 114029
-test_stu = 38010
+test_bytes = 124471
+test_stu = 41491
 routed_required_reading = ["crates/AGENTS.md", "docs/architecture/A10-04-delegation.md", "docs/architecture/A14-08-development-doctrine.md", "docs/architecture/I02-16-crate-size-and-agent-context-envelope.md", "docs/architecture/I02-17-parallel-agent-development-contract.md", "docs/architecture/I07-20-agent-facing-error-contract.md", "docs/architecture/I12-32-context-economy-ledger.md", "docs/architecture/I18-21-local-and-ci-parity.md", "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md"]
 source_scope_bytes = 3205
 source_scope_stu = 1069
-workset_bytes = 117234
-workset_stu = 39078
-scan_root_bytes = 245993
-scan_root_stu = 81998
-workset_stu_share_of_scan_root = "0.0130"
+workset_bytes = 127676
+workset_stu = 42559
+scan_root_bytes = 248082
+scan_root_stu = 82694
+workset_stu_share_of_scan_root = "0.0129"
 share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only spans against the declared scan-root universe; a scan-root universe is never context"
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
@@ -1965,4 +1965,4 @@ write_serialization_edges = ["single-writer: crates/eliot-engine/src/{skill.rs,s
 dispatch_ready = true
 dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "02d3ac7f08298abadda3809927e65843a477342dea278cd607cbf1b8200eae75"
+workset_digest = "0eedc0bcc9637e11bb17ec4470aee36b48c8cbe34d1c6240db559ca3512bf62f"
