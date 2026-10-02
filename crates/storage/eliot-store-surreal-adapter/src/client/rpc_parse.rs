@@ -303,3 +303,97 @@ pub(super) fn rpc_result(response: RpcResponse) -> Result<Value, AdapterError> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use eliot_types::StrictJsonErrorKind;
+    use serde_json::json;
+
+    use super::*;
+
+    /// Decodes one wire frame from its raw bytes, exactly as the ingress does.
+    ///
+    /// Every fixture below is a byte literal. A `serde_json::Value` fixture is
+    /// already the collapsed projection of those bytes, so it cannot observe
+    /// the lexical facts the duplicate-member tests exist to pin.
+    fn admitted(frame: &[u8]) -> Result<RpcResponse, AdapterError> {
+        let text = std::str::from_utf8(frame)
+            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+        parse_response(text)
+    }
+
+    /// The outcome one admitted frame reports.
+    fn outcome(frame: &[u8]) -> Result<Value, AdapterError> {
+        rpc_result(admitted(frame)?)
+    }
+
+    #[test]
+    fn a_present_null_result_is_admitted_as_value_null() -> Result<(), AdapterError> {
+        // At the pinned `v3.1.4` tag `attach`, `detach`, `ping`, `authenticate`,
+        // `invalidate`, `revoke` and `reset` all answer `PublicValue::None`,
+        // which serialises as JSON `null`. `serde_json` reports that through
+        // `visit_none`, so the frame is byte-identical to one carrying no
+        // `result` member unless presence is tracked: a genuine `null` result is
+        // a success, and it must not be refused as an absent member.
+        assert_eq!(outcome(br#"{"id":7,"result":null}"#)?, Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn a_frame_naming_no_outcome_member_is_refused() -> Result<(), AdapterError> {
+        let frame = br#"{"id":7}"#;
+        // Both the raw gate and the closed envelope admit these bytes, so the
+        // missing `result` member is attributable as the whole cause: this is
+        // not a lexical refusal and not an unknown-member refusal.
+        assert!(admitted(frame).is_ok());
+        assert!(matches!(outcome(frame), Err(AdapterError::Serialization(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_result_member_is_refused_by_the_raw_gate() -> Result<(), AdapterError> {
+        let single = br#"{"id":7,"result":"last"}"#;
+        let twice = br#"{"id":7,"result":"first","result":"last"}"#;
+        let gate = AdapterError::Serialization(
+            StrictJsonErrorKind::DuplicateKey.as_str().to_owned(),
+        );
+        // The last-wins projection of the twice-written frame decodes fine, so
+        // only the lexical duplicate can be what refuses the pair of frames.
+        assert_eq!(outcome(single)?, Value::String("last".to_owned()));
+        assert_eq!(outcome(twice), Err(gate));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_top_level_member_is_refused_but_result_interior_members_are_not()
+    -> Result<(), AdapterError> {
+        let frame = br#"{"id":7,"result":{"unmodelled":{"kind":"Thing","rows":[1,2]}}}"#;
+        let expected = json!({
+            "unmodelled": {
+                "kind": "Thing",
+                "rows": [1, 2],
+            }
+        });
+        // `deny_unknown_fields` closes the envelope and stops at the member
+        // boundary: `result` stays a vendor document, so the interior members
+        // it carries survive untouched. That asymmetry is the whole reason the
+        // envelope is safe to close against a `Value`-typed result.
+        assert_eq!(outcome(frame)?, expected);
+        // The same frame without the unknown member is admitted, so the
+        // `session` member is attributable as the cause of the refusal.
+        assert!(admitted(br#"{"id":7,"result":null}"#).is_ok());
+        assert!(admitted(br#"{"id":7,"session":"s","result":null}"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_error_frame_is_refused_not_read_as_a_null_success() -> Result<(), AdapterError> {
+        let frame = br#"{"id":7,"error":{"code":-32000,"message":"boom","kind":"Query"}}"#;
+        // The vendor error object is admitted by the closed envelope, and this
+        // frame names no `result` member at all, so the refusal below cannot be
+        // the absent-outcome refusal wearing a null success.
+        assert!(admitted(frame).is_ok());
+        assert_eq!(outcome(frame), Err(AdapterError::ProviderUnavailable));
+        Ok(())
+    }
+}

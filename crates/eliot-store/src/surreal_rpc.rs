@@ -383,3 +383,101 @@ const fn millis(ms: u64) -> Duration {
 fn millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use eliot_types::StrictJsonErrorKind;
+    use serde_json::json;
+
+    use super::*;
+
+    /// Decodes one wire frame from its raw bytes, exactly as the read loop does.
+    ///
+    /// Every fixture below is a byte literal. A `serde_json::Value` fixture is
+    /// already the collapsed projection of those bytes, so it cannot observe
+    /// the lexical facts the duplicate-member tests exist to pin.
+    fn admitted(frame: &[u8]) -> Result<RpcResponse, StoreError> {
+        let text = std::str::from_utf8(frame)
+            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        parse_response(text)
+    }
+
+    /// The outcome one admitted frame reports for `method`.
+    fn outcome(method: &str, frame: &[u8]) -> Result<Value, StoreError> {
+        rpc_result(method, admitted(frame)?)
+    }
+
+    #[test]
+    fn a_present_null_result_is_admitted_as_value_null() -> Result<(), StoreError> {
+        // At the pinned `v3.1.4` tag `attach`, `detach`, `ping`, `authenticate`,
+        // `invalidate`, `revoke` and `reset` all answer `PublicValue::None`,
+        // which serialises as JSON `null`. `serde_json` reports that through
+        // `visit_none`, so `{}` and `{"result": null}` are the same value for any
+        // derived `Option<Value>` field: the `present_member` wrapper is the only
+        // thing that keeps a genuine null result a success.
+        assert_eq!(outcome("ping", br#"{"id":"r-1","result":null}"#)?, Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn a_frame_naming_no_outcome_member_is_refused() -> Result<(), StoreError> {
+        let frame = br#"{"id":"r-1"}"#;
+        // Both the raw gate and the closed envelope admit these bytes, so the
+        // missing `result` member is attributable as the whole cause: this is
+        // not a lexical refusal and not an unknown-member refusal. It matters
+        // most for `signin` and `use`, which discard the value, so a null
+        // default here would read as a completed authentication.
+        assert!(admitted(frame).is_ok());
+        assert!(matches!(outcome("signin", frame), Err(StoreError::Decode(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_result_member_is_refused_by_the_raw_gate() -> Result<(), StoreError> {
+        let single = br#"{"id":"r-1","result":"last"}"#;
+        let twice = br#"{"id":"r-1","result":"first","result":"last"}"#;
+        // The last-wins projection of the twice-written frame decodes fine, so
+        // only the lexical duplicate can be what refuses the pair of frames, and
+        // it refuses them before the response id is read for routing.
+        assert_eq!(outcome("query", single)?, Value::String("last".to_owned()));
+        assert!(matches!(
+            outcome("query", twice),
+            Err(StoreError::Decode(reason)) if reason == StrictJsonErrorKind::DuplicateKey.as_str()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_top_level_member_is_refused_but_result_interior_members_are_not()
+    -> Result<(), StoreError> {
+        let frame = br#"{"id":"r-1","result":{"unmodelled":{"kind":"Thing","rows":[1,2]}}}"#;
+        let expected = json!({
+            "unmodelled": {
+                "kind": "Thing",
+                "rows": [1, 2],
+            }
+        });
+        // `deny_unknown_fields` closes the envelope and stops at the member
+        // boundary: `result` stays a vendor document, so the interior members
+        // it carries survive untouched. That asymmetry is the whole reason the
+        // envelope is safe to close against a `Value`-typed result.
+        assert_eq!(outcome("query", frame)?, expected);
+        // The same frame without the unknown member is admitted, so the
+        // `session` member is attributable as the cause of the refusal.
+        assert!(admitted(br#"{"id":"r-1","result":null}"#).is_ok());
+        assert!(admitted(br#"{"id":"r-1","session":"s","result":null}"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_error_frame_is_refused_not_read_as_a_null_success() -> Result<(), StoreError> {
+        let frame = br#"{"id":"r-1","error":{"code":-32000,"message":"boom","kind":"Query"}}"#;
+        // The vendor error object is admitted by the closed envelope, and this
+        // frame names no `result` member at all, so the refusal below is the
+        // provider's own refusal and never the absent-outcome refusal wearing a
+        // null success.
+        assert!(admitted(frame).is_ok());
+        assert!(matches!(outcome("query", frame), Err(StoreError::RpcError { .. })));
+        Ok(())
+    }
+}
