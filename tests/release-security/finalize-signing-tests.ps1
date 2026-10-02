@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$GovernorRetirementReadbackOnly
+)
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -106,6 +108,168 @@ function New-FakeRfc3161Evidence {
     }
 }
 
+function Invoke-GovernorRetirementReadbackForwardingProof([string]$TempRoot) {
+    $bundle = Join-Path $TempRoot 'governor-retirement-readback-forwarding'
+    New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Value (
+        [ordered]@{ governor_disposition = 'retired-legacy-entrypoint' } | ConvertTo-Json -Depth 4) -Encoding utf8
+
+    $script:finalizeSigningGovernorReadbackProof = [pscustomobject]@{
+        expected_readback = [pscustomobject]@{ state = 'SUPPLIED'; operation_id = 'operation-original' }
+        expected_receipt = [pscustomobject]@{ state = 'VERIFIED'; operation_id = 'operation-original' }
+        current_readback = $null
+        current_receipt = $null
+        binding_calls = 0
+        reference = [pscustomobject]@{ approval_identity = 'fixture-owner-approval'; candidate_commit = ('1' * 40) }
+    }
+    $proof = $script:finalizeSigningGovernorReadbackProof
+    $proof.current_readback = $proof.expected_readback
+    $proof.current_receipt = $proof.expected_receipt
+
+    # These scoped doubles surround the real finalizer readback function. The
+    # approval-binding double accepts only the exact evidence objects produced
+    # by the original context, so omitting, recreating or substituting either
+    # object fails the same production caller path exercised below.
+    function Resolve-GovernorApprovalContext(
+        [string]$Repo,
+        [string]$SourceCommit,
+        [string]$ApprovalPath,
+        [string]$TrustRootRef,
+        [string]$OwnerReceiptPath
+    ) {
+        if ($SourceCommit -cne ('1' * 40) -or
+            $ApprovalPath -cne 'fixture-owner-approval' -or
+            $TrustRootRef -cne 'fixture-owner-pinned-root' -or
+            $OwnerReceiptPath -cne 'fixture-owner-receipt') {
+            throw 'finalizer readback did not retain its explicit approval inputs'
+        }
+        [pscustomobject]@{
+            supplied = $true
+            approval_input = [pscustomobject]@{ body = 'fixture approval body'; sha256 = ('a' * 64) }
+            trust_policy = [pscustomobject]@{ sha256 = ('b' * 64) }
+            issuer = [pscustomobject]@{ identity = 'fixture admitted issuer' }
+            issuer_readback = $script:finalizeSigningGovernorReadbackProof.current_readback
+            receipt_verification = $script:finalizeSigningGovernorReadbackProof.current_receipt
+        }
+    }
+    function Resolve-GovernorApprovalReferenceOrNull([object]$Release) {
+        $script:finalizeSigningGovernorReadbackProof.reference
+    }
+    function Resolve-GovernorRetirementApprovalBinding(
+        [string]$Repo,
+        [string]$SourceCommit,
+        [object]$ApprovalBody,
+        [object]$TrustPolicy,
+        [object]$Issuer,
+        [object]$IssuerReadback,
+        [object]$ReceiptVerification
+    ) {
+        $proof = $script:finalizeSigningGovernorReadbackProof
+        $proof.binding_calls = [int]$proof.binding_calls + 1
+        if (-not [object]::ReferenceEquals($IssuerReadback, $proof.current_readback) -or
+            -not [object]::ReferenceEquals($ReceiptVerification, $proof.current_receipt)) {
+            throw 'finalizer readback did not forward its original issuer evidence unchanged'
+        }
+        if (-not [object]::ReferenceEquals($IssuerReadback, $proof.expected_readback) -or
+            -not [object]::ReferenceEquals($ReceiptVerification, $proof.expected_receipt)) {
+            throw 'test verifier refused substituted or missing issuer evidence'
+        }
+        [pscustomobject]@{ kind = 'Retired'; reason = 'fixture owner evidence admitted' }
+    }
+    function New-GovernorRetirementApprovalReference(
+        [object]$Binding,
+        [string]$ApprovalFileSha256,
+        [string]$TrustFileSha256
+    ) {
+        $script:finalizeSigningGovernorReadbackProof.reference
+    }
+    function Assert-GovernorApprovalReferenceShape([object]$Reference, [string]$SourceCommit) { }
+    function Assert-GovernorApprovalIdentityAgreement([object]$Recomputed, [object]$Carried, [string]$Purpose) {
+        if (-not [object]::ReferenceEquals($Recomputed, $script:finalizeSigningGovernorReadbackProof.reference) -or
+            -not [object]::ReferenceEquals($Carried, $script:finalizeSigningGovernorReadbackProof.reference)) {
+            throw "fixture approval identity changed at $Purpose"
+        }
+    }
+    function Resolve-GovernorRetirementBundleTrustMaterial(
+        [object]$Reference,
+        [string]$ApprovalPath,
+        [string]$TrustPath,
+        [string]$Purpose
+    ) {
+        [pscustomobject]@{
+            trust_state = 'SUPPLIED'
+            approval_body = 'fixture offline approval body'
+            approval_file_sha256 = ('c' * 64)
+            trust_file_sha256 = ('b' * 64)
+        }
+    }
+    function New-GovernorRetirementReplayRecord([object]$Reference, [object]$ApprovalBody) {
+        [pscustomobject]@{ approval_identity = [string]$Reference.approval_identity }
+    }
+
+    $sourceCommit = '1' * 40
+    $result = Assert-GovernorRetirementApprovalReadback `
+        $bundle `
+        $sourceCommit `
+        'fixture-owner-approval' `
+        'fixture-owner-pinned-root' `
+        'fixture-owner-receipt'
+    if (-not [bool]$result.retired -or $proof.binding_calls -ne 2 -or
+        -not [object]::ReferenceEquals($result.approval_reference, $proof.reference)) {
+        throw 'normal finalizer readback did not verify original owner evidence in both online and offline binding calls'
+    }
+
+    $proof.current_readback = [pscustomobject]@{ state = 'SUPPLIED'; operation_id = 'operation-substituted' }
+    $proof.current_receipt = $proof.expected_receipt
+    $substitutionRefused = $false
+    try {
+        [void](Assert-GovernorRetirementApprovalReadback `
+            $bundle $sourceCommit 'fixture-owner-approval' 'fixture-owner-pinned-root' 'fixture-owner-receipt')
+    }
+    catch {
+        $substitutionRefused = ([string]$_.Exception.Message -match 'substituted or missing issuer evidence')
+    }
+    if (-not $substitutionRefused) {
+        throw 'finalizer readback accepted a substituted owner issuer readback'
+    }
+
+    $proof.current_readback = $null
+    $proof.current_receipt = $proof.expected_receipt
+    $missingReadbackRefused = $false
+    try {
+        [void](Assert-GovernorRetirementApprovalReadback `
+            $bundle $sourceCommit 'fixture-owner-approval' 'fixture-owner-pinned-root' 'fixture-owner-receipt')
+    }
+    catch {
+        $missingReadbackRefused = ([string]$_.Exception.Message -match 'substituted or missing issuer evidence')
+    }
+    if (-not $missingReadbackRefused) {
+        throw 'finalizer readback accepted missing owner issuer readback evidence'
+    }
+
+    $proof.current_readback = $proof.expected_readback
+    $proof.current_receipt = $null
+    $missingReceiptRefused = $false
+    try {
+        [void](Assert-GovernorRetirementApprovalReadback `
+            $bundle $sourceCommit 'fixture-owner-approval' 'fixture-owner-pinned-root' 'fixture-owner-receipt')
+    }
+    catch {
+        $missingReceiptRefused = ([string]$_.Exception.Message -match 'substituted or missing issuer evidence')
+    }
+    if (-not $missingReceiptRefused) {
+        throw 'finalizer readback accepted missing owner receipt verification evidence'
+    }
+
+    [pscustomobject]@{
+        normal_original_context_forwarded_to_both_bindings = $true
+        substituted_issuer_readback_refused = $substitutionRefused
+        missing_issuer_readback_refused = $missingReadbackRefused
+        missing_receipt_verification_refused = $missingReceiptRefused
+        binding_calls = $proof.binding_calls
+    }
+}
+
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 $root = Join-Path $tempBase "eliot-finalize-signing-$([guid]::NewGuid().ToString('N'))"
 $source = Join-Path $root 'unsigned'
@@ -124,8 +288,31 @@ $fakeCertificate = [pscustomobject]@{
     Extensions = @($codeSigningExtension)
 }
 
+if ($GovernorRetirementReadbackOnly) {
+    try {
+        $proof = Invoke-GovernorRetirementReadbackForwardingProof $root
+        [ordered]@{
+            component = 'eliot_governor_retirement_readback_tests'
+            status = 'VERIFIED'
+            original_context_forwarded_to_online_and_offline_binding = [bool]$proof.normal_original_context_forwarded_to_both_bindings
+            substituted_readback_refused = [bool]$proof.substituted_issuer_readback_refused
+            missing_readback_refused = [bool]$proof.missing_issuer_readback_refused
+            missing_receipt_refused = [bool]$proof.missing_receipt_verification_refused
+            binding_calls = [int]$proof.binding_calls
+        } | ConvertTo-Json -Depth 4
+    }
+    finally {
+        $resolvedRoot = [System.IO.Path]::GetFullPath($root)
+        if ($resolvedRoot.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedRoot)) {
+            Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
+        }
+    }
+    return
+}
+
 try {
     New-Item -ItemType Directory -Path (Join-Path $source 'runtime') -Force | Out-Null
+    $governorReadbackProof = Invoke-GovernorRetirementReadbackForwardingProof $root
     Set-Content -LiteralPath $tool -Value 'fake tool; never executed' -Encoding ascii
     $roles = @(Get-AuthenticodeRoleDefinitions)
     $roleMarker = 1
@@ -926,6 +1113,11 @@ try {
     [ordered]@{
         component = 'eliot_release_finalize_signing_tests'
         status = 'VERIFIED'
+        governor_retirement_original_context_forwarded = [bool]$governorReadbackProof.normal_original_context_forwarded_to_both_bindings
+        governor_retirement_substituted_readback_refused = [bool]$governorReadbackProof.substituted_issuer_readback_refused
+        governor_retirement_missing_readback_refused = [bool]$governorReadbackProof.missing_issuer_readback_refused
+        governor_retirement_missing_receipt_refused = [bool]$governorReadbackProof.missing_receipt_verification_refused
+        governor_retirement_binding_calls = [int]$governorReadbackProof.binding_calls
         exact_roles = 7
         cli_trust_role_signed = $true
         explicit_signtool_store_timestamp = $true
