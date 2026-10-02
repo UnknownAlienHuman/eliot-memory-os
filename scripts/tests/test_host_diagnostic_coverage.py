@@ -42,6 +42,7 @@ SYNTH_TESTS = f"{TESTS}/host_synthetic_diagnostics.rs"
 SYNTH_TABLE = f"{FIXTURE_REL}/{TABLE_REL}"
 
 FACADE = f"{SRC}/host_diagnostics.rs"
+LIB_RS = f"{SRC}/lib.rs"
 MAIN_RS = f"{SRC}/main.rs"
 SINK_RS = f"{SRC}/host_sink.rs"
 CONSOLE_RS = f"{SRC}/host_console.rs"
@@ -67,6 +68,11 @@ FROZEN_FIXTURE_FILES = (
 )
 
 ZERO_DIGEST = "0" * 64
+
+# The production-shaped `tracing` use every facade-bypass control injects. It is
+# a real macro call, never a comment: a comment exercises the comment skip, not
+# the cfg-scoped exemption the check exists to prove.
+TRACING_USE = 'tracing::info!("leaked");'
 
 
 def replace_once(text: str, old: str, new: str) -> str:
@@ -143,6 +149,14 @@ def input_paths(table_text: str) -> list[str]:
     ]
 
 
+def line_of(text: str, needle: str) -> int:
+    """1-based line number of ``needle`` in ``text``, refusing an absent anchor."""
+    offset = text.find(needle)
+    if offset < 0:
+        raise AssertionError(f"anchor absent: {needle!r}")
+    return text.count("\n", 0, offset) + 1
+
+
 def duplicate_input(text: str, rel: str) -> str:
     """Copy one ``[[input]]`` entry in place, producing a duplicate declaration."""
     lines = text.split("\n")
@@ -184,6 +198,38 @@ class SyntheticCoverageTests(unittest.TestCase):
         code, rendered = self.verdict()
         self.assertEqual(code, audit.EXIT_CODES["STALE"], rendered)
         self.assertIn(needle, rendered)
+
+    def inject(self, rel: str, block: str) -> int:
+        """Append ``block`` to a tracked fixture file; return the injected line."""
+        text = self.read(rel) + block
+        self.write(rel, text)
+        return line_of(text, TRACING_USE)
+
+    def inject_top(self, rel: str, block: str) -> int:
+        """Insert ``block`` as the first item of a tracked fixture file.
+
+        The block lands after the leading ``//!`` header and before every other
+        item, so it sits above any ``#[cfg(...)]`` gate the file already owns.
+        """
+        lines = self.read(rel).split("\n")
+        head = 0
+        while lines[head].startswith("//!"):
+            head += 1
+        text = "\n".join(lines[:head] + block.rstrip("\n").split("\n") + lines[head:])
+        self.write(rel, text)
+        return line_of(text, TRACING_USE)
+
+    def assert_scan_silent(self, rel: str) -> None:
+        """The mutation landed and was scanned, yet the bypass scan stayed silent.
+
+        Asserting the digest staleness alongside the silence is what makes this
+        control meaningful: without it, a mutation that never reached the scan
+        would satisfy a bare "not reported" assertion for the wrong reason.
+        """
+        code, rendered = self.verdict()
+        self.assertEqual(code, audit.EXIT_CODES["STALE"], rendered)
+        self.assertIn(f"file digest mismatch (stale table): {rel}", rendered)
+        self.assertNotIn("tracing use outside facade", rendered)
 
     # --------------------------------------------------------- positive side
 
@@ -369,9 +415,92 @@ class SyntheticCoverageTests(unittest.TestCase):
         self.write_table(table)
         self.assert_stale("S-sink-start-delivery incomplete delivery must not claim tests")
 
+    # The `B-facade-singleton` bypass scan is a PRODUCTION-contour check with two
+    # exemptions: a full-line comment, and a `cfg`-gated region the admitted cfg
+    # vocabulary resolves as test-only. A comment control can only ever exercise
+    # the first exemption, so the controls below all inject a real production
+    # `tracing::info!` line. Each one also asserts the exact `path:line`, which
+    # is what pins the report to the injected use rather than to some other
+    # finding in the same run.
+
     def test_tracing_use_outside_the_facade_fails_closed(self) -> None:
-        self.write(CONSOLE_RS, self.read(CONSOLE_RS) + "\n// tracing::info!(\"leaked\")\n")
-        self.assert_stale(f"tracing use outside facade: {CONSOLE_RS}")
+        line = self.inject(CONSOLE_RS, f"\n{TRACING_USE}\n")
+        self.assert_stale(f"tracing use outside facade: {CONSOLE_RS}:{line}")
+
+    def test_tracing_use_in_a_recognised_test_cfg_is_silent(self) -> None:
+        """``#[cfg(all(test, windows))]`` is admitted vocabulary: test-only.
+
+        This is the positive half of the exemption. Its discriminating power is
+        only real because the fail-closed control below pins the opposite
+        verdict for an unrecognised cfg carrying the same ``test`` predicate.
+        """
+        line = self.inject(
+            LIB_RS,
+            "\n#[cfg(all(test, windows))]\nmod synthetic_capture {\n"
+            f"    {TRACING_USE}\n"
+            "}\n",
+        )
+        self.assertGreater(line, line_of(self.read(LIB_RS), "#[cfg(all(test, windows))]"))
+        self.assert_scan_silent(LIB_RS)
+
+    def test_tracing_use_in_an_unrecognised_test_cfg_still_fails_closed(self) -> None:
+        """The fail-closed property: an unfamiliar cfg cannot widen the exemption.
+
+        ``#[cfg(all(test, feature = "..."))]`` is outside the admitted vocabulary,
+        so the scanner must treat it as NOT test-only and report the use. A
+        scanner that widened the exemption on any ``test``-bearing attribute
+        would pass the recognised-cfg control above and fail this one, so the
+        pair distinguishes "recognised test cfg" from "unrecognised cfg".
+        """
+        line = self.inject(
+            LIB_RS,
+            "\n#[cfg(all(test, feature = \"synthetic-capture\"))]\n"
+            "mod synthetic_capture {\n"
+            f"    {TRACING_USE}\n"
+            "}\n",
+        )
+        self.assert_stale(f"tracing use outside facade: {LIB_RS}:{line}")
+
+    def test_tracing_use_under_a_non_test_cfg_is_reported(self) -> None:
+        """``#[cfg(windows)]`` is admitted vocabulary but not test-only.
+
+        This is the recognised-cfg counterpart to the fail-closed control: the
+        exemption keys on ``test`` being provably required, not on the cfg being
+        one the parser happens to accept.
+        """
+        line = self.inject(
+            LIB_RS,
+            "\n#[cfg(windows)]\nmod synthetic_probe {\n"
+            f"    {TRACING_USE}\n"
+            "}\n",
+        )
+        self.assert_stale(f"tracing use outside facade: {LIB_RS}:{line}")
+
+    def test_tracing_use_in_a_doc_comment_is_silent(self) -> None:
+        """A doc comment describing the seam is not a production use."""
+        self.write(
+            CONSOLE_RS,
+            self.read(CONSOLE_RS)
+            + f"\n/// Emits via {TRACING_USE} in the console contour.\n",
+        )
+        self.assert_scan_silent(CONSOLE_RS)
+
+    def test_tracing_use_above_a_test_gate_is_reported(self) -> None:
+        """The exemption cannot leak upward past the gated item it belongs to.
+
+        ``lib.rs`` already owns a ``#[cfg(test)] mod`` below its production
+        items. Injecting the production use at the very top of the same file
+        puts it above that gate, so a scanner that widened the exemption to the
+        whole file (or leaked it upward) would go silent here.
+        """
+        line = self.inject_top(
+            LIB_RS,
+            "fn synthetic_console_probe() {\n"
+            f"    {TRACING_USE}\n"
+            "}\n",
+        )
+        self.assertLess(line, line_of(self.read(LIB_RS), "#[cfg(test)]"))
+        self.assert_stale(f"tracing use outside facade: {LIB_RS}:{line}")
 
     def test_host_consuming_the_platform_port_fails_closed(self) -> None:
         self.write(SINK_RS, self.read(SINK_RS) + "\npub use platform_windows::event_log::EventLogSink;\n")
