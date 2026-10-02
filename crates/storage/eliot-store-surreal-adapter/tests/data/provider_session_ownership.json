@@ -49,7 +49,7 @@
       "symbol": "provider_environment",
       "from": "src/client.rs",
       "to": "src/client/provider_owner.rs",
-      "old_body_sha256": "a51e3995ef0fba6d1d53ff8a6a1187c03c40a2691c5ed692370741fd0c10ec85"
+      "old_body_sha256": "d3435f1c11c8b63e7a463300db3d802c0f8f0f4b6d37cfd53fd90d6c38509b6a"
     },
     {
       "symbol": "connect_started_provider",
