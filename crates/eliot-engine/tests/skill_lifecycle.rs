@@ -132,6 +132,99 @@ fn skill_need_estimate_and_filter_include_only_allowed_skills() {
 }
 
 #[test]
+fn unvalidated_measurement_never_changes_skill_need_inclusion() {
+    // The #880 authority-separation invariant: measurement is EVIDENCE ONLY and
+    // must not decide Include/Exclude. Two otherwise identical, admissible
+    // Skills are paired so the ONLY difference is the size of the serialized
+    // envelope, hence the ONLY difference in their canonical unvalidated STU.
+    // Because the unvalidated STU is absent from `distractor_risk`, both must
+    // receive the SAME verdict AND the SAME `distractor_risk` value.
+    let project_id = eliot_types::ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+
+    let mut small = active_skill();
+    small.name = "skill lifecycle scoped skill".to_owned();
+    let small_context = skill_context(small.skill_id);
+    let small_estimate = SkillNeedEstimator::estimate(project_id, task_id, &small, &small_context);
+
+    // Same admissible Skill, materially different serialized envelope size, so
+    // a different canonical unvalidated STU. Nothing else differs.
+    let mut large = small.clone();
+    large.skill_id = SkillId::new_v7();
+    large.name = "skill lifecycle scoped skill with a much larger serialized envelope".to_owned();
+    large.purpose = "apply the verifier-backed procedural path, documented at length, \
+        with a deliberately oversized purpose string so the exact serialized byte length \
+        - and therefore the unvalidated STU - differs substantially from the paired skill."
+        .to_owned();
+    let large_context = skill_context(large.skill_id);
+    let large_estimate = SkillNeedEstimator::estimate(project_id, task_id, &large, &large_context);
+
+    // Sanity: the paired fixtures really do differ in envelope size / STU, and
+    // both are individually admissible (so a differing verdict could only come
+    // from the measurement, which is exactly the defect being pinned).
+    assert_ne!(
+        serde_json::to_vec(&small).map(|bytes| bytes.len()),
+        serde_json::to_vec(&large).map(|bytes| bytes.len())
+    );
+    assert_eq!(large_estimate.verdict, small_estimate.verdict);
+    assert_eq!(large_estimate.distractor_risk, small_estimate.distractor_risk);
+
+    // The shared verdict is the real Include/Exclude decision this audit is
+    // about, and it is reached by both the estimator and the filter that
+    // populates `skills_included`.
+    assert_eq!(small_estimate.verdict, eliot_types::SkillNeedVerdict::Include);
+    let filter = SkillDistractorFilterService::filter(
+        project_id,
+        task_id,
+        &[small.clone(), large.clone()],
+        &small_context,
+    );
+    assert!(filter.skills_included.contains(&small.skill_id));
+    assert!(filter.skills_included.contains(&large.skill_id));
+
+    // The canonical measurement is real and materially different between the
+    // pair: each Skill's record carries its OWN conservative unvalidated STU of
+    // its own exact serialized bytes. These are the two figures the audit says
+    // must not reach the Include/Exclude decision, and the identical
+    // `distractor_risk` asserted above is what proves they do not.
+    let small_stu = SkillLifecycleService::record_for(&small, None).context_cost;
+    let large_stu = SkillLifecycleService::record_for(&large, None).context_cost;
+    let small_bytes = serde_json::to_vec(&small).expect("skill card serializes").len();
+    let large_bytes = serde_json::to_vec(&large).expect("skill card serializes").len();
+    assert_eq!(small_stu, Some(u64::try_from(small_bytes + 2).unwrap() / 3));
+    assert_eq!(large_stu, Some(u64::try_from(large_bytes + 2).unwrap() / 3));
+    assert_ne!(large_stu, small_stu, "the pair differs only in envelope size");
+}
+
+#[test]
+fn skill_need_estimator_does_not_measure_at_all() {
+    // Second limb of the same audit defect, pinned structurally: a measurement
+    // FAILURE must not make a Skill look expensive. The old code substituted
+    // the most punitive value (`Err(_) => 0.25`) for absent evidence, so a
+    // failed measurement made a Skill look maximally expensive. The estimate no
+    // longer calls the measurement owner at all, so an absent, failed or
+    // unknown measurement cannot reach `distractor_risk` - not as a maximum
+    // penalty, and not as zero. This asserts the source of the production
+    // function, so reintroducing a cost term fails here.
+    let source = include_str!("../src/skill.rs");
+    let start = source
+        .find("impl SkillNeedEstimator {")
+        .expect("SkillNeedEstimator is defined in skill.rs");
+    let end = source[start..]
+        .find("pub struct SkillDistractorFilterService")
+        .map_or(source.len(), |offset| start + offset);
+    let estimate = &source[start..end];
+
+    assert!(!estimate.contains("cost_penalty"));
+    assert!(!estimate.contains("measure_skill_context_envelope"));
+    assert!(!estimate.contains("estimated_context_cost"));
+    assert!(!estimate.contains("stu"));
+    assert!(!estimate.contains("2000.0"));
+    assert!(!estimate.contains("u32::MAX"));
+    assert!(!estimate.contains("0.25,"));
+}
+
+#[test]
 fn procedural_skill_packet_is_l3_state_not_truth() {
     let project_id = eliot_types::ProjectId::new_v7();
     let task_id = TaskId::new_v7();

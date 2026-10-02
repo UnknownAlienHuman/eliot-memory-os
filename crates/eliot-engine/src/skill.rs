@@ -545,19 +545,19 @@ impl SkillNeedEstimator {
         } else {
             0.0
         };
-        // The canonical unvalidated STU of the exact serialized Skill envelope.
-        // Unknown measurement evidence is never zero, cheap or preferred: an
-        // unavailable canonical measurement takes the maximum risk penalty and
-        // cannot lower `distractor_risk` below what an unknown cost may allow.
-        let cost_penalty = match measure_skill_context_envelope(skill) {
-            Ok(measurement) => {
-                let context_cost = f64::from(
-                    u32::try_from(measurement.estimated_context_cost()).unwrap_or(u32::MAX),
-                );
-                (context_cost / 2000.0).min(0.25)
-            }
-            Err(_) => 0.25,
-        };
+        // Context measurement is EVIDENCE ONLY and is deliberately absent from
+        // this decision. The canonical record is `ConservativeStu` with
+        // `empirical: false` and no bound route/model/tokenizer observation, so
+        // its value is an unvalidated planning estimate: per I02-16 it "never
+        // prove[s] that a Decision Safety Floor fits", and per the #880
+        // contract a correct measurement "does not itself activate/promote/
+        // retire/quarantine/suppress a Skill or grant authority". Including it
+        // here would let two otherwise admissible Skills cross the `0.65`
+        // boundary purely because their unvalidated STU differs, and would
+        // make a FAILED measurement look maximally expensive - an absent
+        // measurement is unknown evidence, never evidence of cost. The Include/
+        // Exclude decision therefore reads only the pre-existing activation and
+        // lifecycle owner; cost is reported as measurement evidence elsewhere.
         let verifier_bonus = if missing_verifier(skill, context) {
             -0.20
         } else {
@@ -567,7 +567,6 @@ impl SkillNeedEstimator {
         let utility =
             (0.30 + (0.35 * scope_match) + recent_success + verifier_bonus).clamp(0.0, 1.0);
         let distractor_risk = (0.20
-            + cost_penalty
             + recent_failure
             + f64::from(activation.decision != SkillActivationDecision::Allow) * 0.30)
             .clamp(0.0, 1.0);
