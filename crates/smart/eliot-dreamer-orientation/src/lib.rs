@@ -18,9 +18,9 @@ pub use input::{
 };
 pub use policy::OrientationPolicy;
 pub use projection::{
-    AnchoredEvidence, InertProbe, OrientationCoverage, OrientationInterpretation,
-    OrientationPacketCandidate, OrientationProvenance, OrientationResidue, OrientationSection,
-    OrientationSectionKind,
+    AnchoredEvidence, InertProbe, InertProbeStatus, OrientationCoverage,
+    OrientationInterpretation, OrientationPacketCandidate, OrientationProvenance, OrientationResidue,
+    OrientationResidueKind, OrientationSection, OrientationSectionKind,
 };
 pub use result::{OrientationDisposition, OrientationResult};
 

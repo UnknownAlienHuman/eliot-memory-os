@@ -26,9 +26,10 @@ use eliot_dreamer_contracts::{
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
-    CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationDisposition, OrientationError, OrientationPacketCandidate, OrientationPolicy,
-    OrientationResidue, project_orientation,
+    CurrentEpistemicPositionHandle, InertProbeStatus, LocalOrientationFrame,
+    OrientationCoverageDenominator, OrientationDisposition, OrientationError,
+    OrientationPacketCandidate, OrientationPolicy, OrientationResidue, OrientationResidueKind,
+    project_orientation,
 };
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
@@ -664,7 +665,7 @@ fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
     );
     assert_eq!(
         packet.recommended_probes_or_next_actions[0].status,
-        "model_recommendation_inert"
+        InertProbeStatus::ModelRecommendationInert
     );
 }
 
@@ -1051,7 +1052,7 @@ fn exact_duplicate_rivals_preserve_every_lineage() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.rival_models_and_dissent.len(), 2);
     for rival in &packet.rival_models_and_dissent {
-        assert_eq!(rival.kind, "counterevidence");
+        assert_eq!(rival.kind, OrientationResidueKind::Counterevidence);
         assert_eq!(rival.text, "same rival");
         assert_eq!(rival.source, "model_draft");
     }
@@ -1182,7 +1183,7 @@ fn relation_projection_stays_explicit() {
     assert_eq!(
         open.hidden_relation_candidates,
         vec![OrientationResidue {
-            kind: "unsupported".into(),
+            kind: OrientationResidueKind::Unsupported,
             text: "typed relation projection is outside the basic Orientation owner".into(),
             source: "orientation_contract".into(),
         }]
@@ -1313,7 +1314,10 @@ fn similarity_signals_cannot_create_relations() {
     )
     .expect("projection");
     assert_eq!(open.hidden_relation_candidates.len(), 1);
-    assert_eq!(open.hidden_relation_candidates[0].kind, "unsupported");
+    assert_eq!(
+        open.hidden_relation_candidates[0].kind,
+        OrientationResidueKind::Unsupported
+    );
 }
 
 // WORK_UNIT_CASE: 628/18
@@ -1328,7 +1332,7 @@ fn unsupported_causal_relation_stays_limited() {
     assert_eq!(
         packet.hidden_relation_candidates,
         vec![OrientationResidue {
-            kind: "unsupported".into(),
+            kind: OrientationResidueKind::Unsupported,
             text: "typed relation projection is outside the basic Orientation owner".into(),
             source: "orientation_contract".into(),
         }]
@@ -1349,13 +1353,19 @@ fn material_gap_denominator_carries_one_disposition_per_gap() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.disposition, OrientationDisposition::Partial);
     assert_eq!(packet.unknowns_and_gaps.len(), 2);
-    assert_eq!(packet.unknowns_and_gaps[0].kind, "unavailable");
+    assert_eq!(
+        packet.unknowns_and_gaps[0].kind,
+        OrientationResidueKind::Unavailable
+    );
     assert_eq!(
         packet.unknowns_and_gaps[0].text,
         "gap-a awaits a future source"
     );
     assert_eq!(packet.unknowns_and_gaps[0].source, "gap-a");
-    assert_eq!(packet.unknowns_and_gaps[1].kind, "unavailable");
+    assert_eq!(
+        packet.unknowns_and_gaps[1].kind,
+        OrientationResidueKind::Unavailable
+    );
     assert_eq!(packet.unknowns_and_gaps[1].text, "gap-b source retired");
     assert_eq!(packet.unknowns_and_gaps[1].source, "gap-b");
     let unknowns = packet
@@ -1385,7 +1395,7 @@ fn bounded_existing_probe_stays_inert() {
     );
     assert_eq!(
         packet.recommended_probes_or_next_actions[0].status,
-        "model_recommendation_inert"
+        InertProbeStatus::ModelRecommendationInert
     );
     assert!(
         packet.recommended_probes_or_next_actions[0]
@@ -1422,7 +1432,10 @@ fn probe_execution_text_cannot_become_live() {
     assert_eq!(packet.disposition, OrientationDisposition::Complete);
     assert_eq!(packet.recommended_probes_or_next_actions.len(), 3);
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(
+            probe.status,
+            InertProbeStatus::ModelRecommendationInert
+        );
         assert!(probe.result_space.is_none());
     }
     let wire = serde_json::to_string(&packet_value(&packet)).expect("packet json");
@@ -1441,7 +1454,10 @@ fn projection_is_pure_with_no_planning_call() {
     assert_eq!(first, second);
     assert_eq!(first.packet_id, second.packet_id);
     for probe in &first.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(
+        probe.status,
+        InertProbeStatus::ModelRecommendationInert
+    );
         assert!(probe.result_space.is_none());
     }
     let wire = serde_json::to_string(&packet_value(&first)).expect("packet json");
@@ -1466,7 +1482,7 @@ fn ambiguity_stays_partial_not_a_question() {
     assert_eq!(packet.disposition, OrientationDisposition::Partial);
     assert!(!packet.unknowns_and_gaps.is_empty());
     for gap in &packet.unknowns_and_gaps {
-        assert_eq!(gap.kind, "unavailable");
+        assert_eq!(gap.kind, OrientationResidueKind::Unavailable);
     }
     let mut emitted: Vec<&str> = Vec::new();
     emitted.push(packet.synthesized_interpretations[0].statement.as_str());
@@ -1492,7 +1508,10 @@ fn ambiguity_stays_partial_not_a_question() {
         );
     }
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(
+        probe.status,
+        InertProbeStatus::ModelRecommendationInert
+    );
     }
 }
 
@@ -1534,7 +1553,10 @@ fn no_brief_payload_or_algorithm() {
     ] {
         assert!(!wire.contains(forbidden), "no brief artifact: {forbidden}");
     }
-    assert_eq!(packet.architecture_implications.kind, "known_empty");
+    assert_eq!(
+        packet.architecture_implications.kind,
+        OrientationResidueKind::KnownEmpty
+    );
     assert_eq!(
         packet.architecture_implications.text,
         "no architecture implications admitted"
@@ -1944,12 +1966,15 @@ fn no_rival_or_probe_algorithm_dependencies() {
         candidate.model.source_handles
     );
     for rival in &packet.rival_models_and_dissent {
-        assert_eq!(rival.kind, "counterevidence");
+        assert_eq!(rival.kind, OrientationResidueKind::Counterevidence);
         assert_eq!(rival.source, "model_draft");
         assert!(candidate.model.counterevidence.contains(&rival.text));
     }
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(
+        probe.status,
+        InertProbeStatus::ModelRecommendationInert
+    );
         assert!(probe.result_space.is_none());
         assert!(candidate.model.recommended_probes.contains(&probe.text));
     }

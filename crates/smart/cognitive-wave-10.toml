@@ -13,13 +13,13 @@ implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 integration_owner = "cognitive-wave-integrator"
 agent_rule = "One agent receives one module manifest, frozen one-hop contracts, exact write scope, proof ceiling and named Product Pulse or Edge proof."
-workspace_rule = "This catalogue is metadata only. It creates no crate, changes no Cargo membership, no Cargo.lock entry, no public type and no generated index. Every crate named here already exists as an admitted root workspace member or an explicitly named prototype. The one Rust change this work unit carries is the retirement of three alias spellings recorded in [[retired_name]]: it adds no type, no variant, no field, no dependency and no behaviour, and every call site of a retired alias is repointed at the single surviving owner of that concern."
+workspace_rule = "This catalogue is metadata only. It creates no crate, changes no Cargo membership, no Cargo.lock entry, no public type and no generated index. Every crate named here already exists as an admitted root workspace member or an explicitly named prototype. The Rust changes this work unit carries are two. The first is the retirement of three alias spellings recorded in [[retired_name]]: every call site of a retired alias is repointed at the single surviving owner of that concern, and no type, variant, field, dependency or behaviour is added. The second is the closing of the two Orientation discriminants recorded in [[type_contract]] ORI-03: the owning crate eliot-dreamer-orientation adds OrientationResidueKind and InertProbeStatus as closed classes and retypes OrientationResidue.kind and InertProbe.status onto them. That second change adds no crate, no dependency, no field and no capability, and it leaves every wire spelling byte-identical because each variant is the snake_case form of the string literal the same constructor already emitted."
 authority_rule = "No row here owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
 dependency_rule = "depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
 order_rule = "No order is created, renumbered or reused by this catalogue. Every [[assignment]] order and every [[assignment_ref]] order below is a value already measured in crates/smart/cognitive-crate-decisions.toml (orders 1-43), crates/smart/cognitive-wave-09.toml (orders 76-86), or a [package.metadata.eliot] agent_order read from the crate's own Cargo.toml."
 label_resolution_rule = "The Issue #262 body names ten crate labels. Six of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning, and by extension any function-only package) do not name a physical crate on base cdf4a29. Each such label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
 freeze_binding_rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is NOT edited by this catalogue. Its exact bytes are pinned by REQUIRED_FREEZE_DIGEST over FREEZE_BYTES in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, enforced by verify_freeze_binding() which propose() calls, and re-read by scripts/read_freeze_digest.py against the CC-W9-REV12-HANDOFF recorded digest and recorded byte length. Per that file's own [readback].rule a byte change is a new freeze candidate, not an edit. Promotion of this index into the freeze is the recorded CC-W2-FREEZE-REPIN handoff."
-disjointness_rule = "This catalogue does not modify bins/, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file. The only Rust files it edits are the three alias retirements in [[retired_name]]: crates/smart/eliot-dreamer-orientation/src/input.rs, crates/smart/eliot-dreamer-orientation/src/lib.rs, crates/smart/eliot-dreamer-concept/src/lib.rs, crates/smart/eliot-dreamer-concept/src/synthesis.rs, crates/smart/eliot-dreamer-cycle/src/durable.rs and crates/smart/eliot-dreamer-cycle/src/lib.rs. No other memory-curation or dreamer-cycle file is touched."
+disjointness_rule = "This catalogue does not modify bins/, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file. The only Rust files it edits are the six alias retirements in [[retired_name]] - crates/smart/eliot-dreamer-orientation/src/input.rs, crates/smart/eliot-dreamer-orientation/src/lib.rs, crates/smart/eliot-dreamer-concept/src/lib.rs, crates/smart/eliot-dreamer-concept/src/synthesis.rs, crates/smart/eliot-dreamer-cycle/src/durable.rs and crates/smart/eliot-dreamer-cycle/src/lib.rs - plus the ORI-03 closed discriminants in crates/smart/eliot-dreamer-orientation/src/projection.rs and the re-export of the two new vocabulary types in crates/smart/eliot-dreamer-orientation/src/lib.rs, and the call sites those retypes force in the owner test crates/smart/eliot-dreamer-orientation/tests/orientation.rs and in the one consumer test crates/smart/eliot-dreamer-orientation-wasm/tests/proof.rs. No other memory-curation or dreamer-cycle file is touched."
 single_ownership_rule = "A concern in this catalogue has exactly one live owner. A second name for a concern is a duplicate owner, not a convenience: an alias, a re-export or a compat spelling that keeps both names live is retired rather than kept, and the retirement is recorded once in [[retired_name]] with its single surviving owner. A re-export that exists only as a consumer boundary over a type the owning crate already declares is not a second owner and is not retired; the two cases are told apart by whether the second name defines anything. Two DISTINCT types that happen to share one name are also not duplicates and are never unified here."
 
 [[stage]]
@@ -99,7 +99,7 @@ owner_crate = "eliot-dreamer-curation"
 owner_module_id = "smart.dreamer.curation"
 measured_order = 31
 family_owner_crates = ["eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
-note = "No shared family envelope type exists in any of the ten; eliot-dreamer-concept emits no result type at all."
+note = "No shared family envelope type exists in any of the ten. The concept kind is not an exception: its emitted result type is eliot_dreamer_contracts ConceptCandidate, defined in crates/smart/eliot-dreamer-contracts/src/concept/result.rs and produced by propose_concept_or_abstraction in crates/smart/eliot-dreamer-concept/src/synthesis.rs. What is still missing is the family envelope, not a per-kind result type."
 
 [[label_resolution]]
 issue_label = "eliot-dreamer-procedural"
@@ -470,13 +470,13 @@ status = "FROZEN_STATIC_FIELD_CONTRACT"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
-fields = ["packet_id_job_id_operation_id_task_id_scope_id_question", "frame_source_coverage_source_materials_omission_handles_coverage_denominator", "resolved_epistemic_position_handles_anchored_evidence_by_status", "synthesized_interpretations_rival_models_and_dissent_hidden_relation_candidates_unknowns_and_gaps", "recommended_probes_or_next_actions_architecture_implications_model_routes_and_cost", "budget_usage_invalidation_conditions_provenance_sections", "preservation_upstream_preservation_model_draft_grounded_draft_disposition_input_digest_output_digest", "section_kind_items_item_digests_digest_known_denominator", "orientation_section_kind_IdentityTaskFrame_Constraints_EvidenceCoverage_Positions_InterpretationsRivalsDissent_UnknownsGaps_RelationCandidates_InertProbes_SafeExternalHandoff_OmissionsExpansionFrontierInvalidation_Preservation"]
+fields = ["packet_id_job_id_operation_id_task_id_scope_id_question", "frame_source_coverage_source_materials_omission_handles_coverage_denominator", "resolved_epistemic_position_handles_anchored_evidence_by_status", "synthesized_interpretations_rival_models_and_dissent_hidden_relation_candidates_unknowns_and_gaps", "recommended_probes_or_next_actions_architecture_implications_model_routes_and_cost", "budget_usage_invalidation_conditions_provenance_sections", "preservation_upstream_preservation_model_draft_grounded_draft_disposition_input_digest_output_digest", "section_kind_items_item_digests_digest_known_denominator", "orientation_section_kind_IdentityTaskFrame_Constraints_EvidenceCoverage_Positions_InterpretationsRivalsDissent_UnknownsGaps_RelationCandidates_InertProbes_SafeExternalHandoff_OmissionsExpansionFrontierInvalidation_Preservation", "orientation_residue_kind_Counterevidence_Unavailable_Unsupported_KnownEmpty_BudgetProvenanceUnavailable", "inert_probe_status_ModelRecommendationInert"]
 denominator = "OrientationCoverage measured from the supplied bundle: material_count, omission_count, non_excluded_count, authoritative_denominator, denominator_digest, manifest_digest; the optional coverage_denominator on the packet"
 denominator_rule = "RECHECK: recount material, omission and non-excluded counts from the supplied bundle and the retained omission handles, and re-derive denominator_digest. A Complete coverage posture without the exact denominator is invalid; absence is never inferred from an empty list."
 complete_rule = "Every Complete state requires the exact independently recheckable coverage denominator above; a section with known = false is an explicit unknown, never filler."
 fence = "task_id, scope_id and the state_fence carried in OrientationProvenance; the operation_id and idempotency_key bind the request."
 omission_semantics = "Missing material appears as an omission_handle or a known = false section with a denominator, never as silent loss."
-invariants = ["a model recommendation stays inert and cannot become a typed plan", "unsupported residue is never upgraded to an algorithmic relation", "provenance proves projection inputs, not truth, delivery or effects", "chronology and causal hypothesis stay separate fields", "no closed section kind is widened", "the free-text OrientationResidue and InertProbe shapes are reported as open, not frozen as closed classes"]
+invariants = ["a model recommendation stays inert and cannot become a typed plan", "unsupported residue is never upgraded to an algorithmic relation", "provenance proves projection inputs, not truth, delivery or effects", "chronology and causal hypothesis stay separate fields", "no closed section kind is widened", "OrientationResidue.kind and InertProbe.status are closed classes at the owning crate, one variant per real constructor, and a discriminator outside the class does not deserialize"]
 
 [[field_contract]]
 id = "SelfQueryBriefContract"
@@ -521,13 +521,13 @@ status = "FROZEN_STATIC_FIELD_CONTRACT_WITH_ONE_MISSING_OWNER_DECISION"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
-fields = ["candidate_id_kind_source_handles_proposed_transformation_support_counterevidence", "scope_and_applicability_preservation_report_uncertainty_verifier_or_replay_expected_benefit_rollback", "kind_Classification_Relation_Episode_Concept_Procedure_Failure_Merge_Split_Reconsolidation_Accessibility_Repair", "handler_result_type_per_kind_ClassificationResult_RelationResult_EpisodeCandidate_ABSENT_FailureAssessment_and_FailureHandlerDecision_StructureRepairCandidate_ReconsolidationResult_AdjustmentProposal_MemoryRepairCandidate", "merge_split_equivalence_report_rollback_plan_invalidation_plan_dependent_dispositions", "reconsolidation_added_and_child_propositions_reactivation_binding_evidence_independence_dependent_outcome", "accessibility_axis_surface_standing_influence_change_protection_and_negative_memory_local_closure", "memory_repair_defect_kind_operation_kind_provenance_repair_spec_contamination_closure_representation_proposal", "chronology_chronology_link_boundary_gap_coverage_overlap_assessment_rollback"]
+fields = ["candidate_id_kind_source_handles_proposed_transformation_support_counterevidence", "scope_and_applicability_preservation_report_uncertainty_verifier_or_replay_expected_benefit_rollback", "kind_Classification_Relation_Episode_Concept_Procedure_Failure_Merge_Split_Reconsolidation_Accessibility_Repair", "handler_result_type_per_kind_ClassificationResult_RelationResult_EpisodeCandidate_ConceptCandidate_FailureAssessment_and_FailureHandlerDecision_StructureRepairCandidate_ReconsolidationResult_AdjustmentProposal_MemoryRepairCandidate", "merge_split_equivalence_report_rollback_plan_invalidation_plan_dependent_dispositions", "reconsolidation_added_and_child_propositions_reactivation_binding_evidence_independence_dependent_outcome", "accessibility_axis_surface_standing_influence_change_protection_and_negative_memory_local_closure", "memory_repair_defect_kind_operation_kind_provenance_repair_spec_contamination_closure_representation_proposal", "chronology_chronology_link_boundary_gap_coverage_overlap_assessment_rollback"]
 denominator = "per-kind denominator over the retained source handles and the declared coverage member set, with explicit omissions, at the named fence"
 denominator_rule = "RECHECK: re-enumerate the affected members, dependent closure and revalidation plan from the retained source handles at the named fence. Similarity only warns; an exact trigger blocks or requires a probe."
 complete_rule = "A kind is Complete only when its own result type reports complete coverage with no unnamed omission. There is no family-level completeness: completeness is per kind."
 fence = "per-kind scope and fence; the family index carries no single fence of its own."
 omission_semantics = "Every kind carries its own omission class; an omitted member stays addressable and is never replaced by a family aggregate."
-invariants = ["merge, split, reconsolidation, accessibility and influence are forward reversible candidates only", "chronology stays separate from causal hypothesis", "no shared family envelope type is invented", "no aggregate intelligence, confidence or utility score across kinds", "the concept handler has no emitted result type on this base and is an explicit missing contract decision"]
+invariants = ["merge, split, reconsolidation, accessibility and influence are forward reversible candidates only", "chronology stays separate from causal hypothesis", "no shared family envelope type is invented", "no aggregate intelligence, confidence or utility score across kinds", "the concept kind emits eliot_dreamer_contracts ConceptCandidate through propose_concept_or_abstraction and is not a missing contract decision; the missing decision is the family envelope alone, recorded once in MM-11"]
 
 [[field_contract]]
 id = "ProceduralCandidateContract"
@@ -683,7 +683,7 @@ contract_index = "MemoryModelCandidateContract"
 functional_cells = ["smart.dreamer.classification", "smart.dreamer.relation", "smart.dreamer.episode", "smart.dreamer.failure", "smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.memory_repair"]
 manifest = "crates/smart/eliot-dreamer-curation/module.toml"
 consumers = ["Governor transition path (candidate only)"]
-missing_owner = "eliot-dreamer-concept exposes EvidenceLedger, EvidenceAssessment and ConceptPolicy only; it emits no result type on this base."
+missing_owner = "The per-kind result type set is complete: the concept kind is measured, not missing. It is eliot-dreamer-contracts ConceptCandidate (crates/smart/eliot-dreamer-contracts/src/concept/result.rs), produced by crates/smart/eliot-dreamer-concept/src/synthesis.rs::propose_concept_or_abstraction. The one owner still missing from this family is the owner-neutral family envelope, recorded once in [[type_contract]] MM-11 and in CC-W2-MEMORY-MODEL-FAMILY."
 
 [[ownership]]
 public_type = "ProcedureCandidate"
@@ -919,19 +919,21 @@ crate = "eliot-dreamer-orientation"
 rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
 defining_refs = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationResidue",
     "crates/smart/eliot-dreamer-orientation/src/projection.rs::InertProbe",
+    "crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationResidueKind",
+    "crates/smart/eliot-dreamer-orientation/src/projection.rs::InertProbeStatus",
     ]
-symbol = "OrientationResidue and InertProbe"
-kind = "struct"
-fields = ["OrientationResidue{kind, text, source}", "InertProbe{text, status, result_space}"]
-wire_spelling = "flat snake_case field names"
-wire_boundary = "serde deny_unknown_fields plus JsonSchema"
-required_optional_none = "InertProbe.result_space is Option"
-units_bounds = "unbounded in source; no MAX_* const applies to these three String fields"
+symbol = "OrientationResidue, OrientationResidueKind, InertProbe, InertProbeStatus"
+kind = "struct plus enum"
+fields = ["OrientationResidue{kind, text, source}", "InertProbe{text, status, result_space}", "orientation_residue_kind_Counterevidence_Unavailable_Unsupported_KnownEmpty_BudgetProvenanceUnavailable", "inert_probe_status_ModelRecommendationInert"]
+wire_spelling = "flat snake_case field names; OrientationResidueKind and InertProbeStatus are the snake_case serde rename_all of their own variant names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema; a discriminant spelling outside the class fails deserialization instead of decoding as free text"
+required_optional_none = "InertProbe.result_space is Option; its None is the only value build_semantics emits, so no probe carries a declared result space"
+units_bounds = "text and source stay unbounded Strings; the two discriminants are bounded by construction, because a residue kind and a probe status are no longer String"
 identity_scope_fence = "not applicable"
 provenance_privacy = "not applicable"
-validation_error = "not applicable"
-compatibility = "the kind and status discriminants are free String, so an implementation agent can still invent values; this is an open gap, not a closed class"
-disposition = "missing_contract_decision"
+validation_error = "not applicable; a packet carrying a discriminant outside the class is refused at the serde boundary, and preserves_candidate_effect_ceiling re-checks that every probe status is the inert one with no result space"
+compatibility = "The class is closed and each member is justified by one real constructor, not by a field name. OrientationResidueKind::Counterevidence is built in build_semantics from candidate.model.counterevidence and re-derived in preserves_rivals_counterevidence_and_temporal_status; ::Unavailable is built in build_semantics from candidate.bundle.omissions; ::Unsupported is built by the make_packet advanced closure for hidden_relation_candidates and for architecture_implications when no denominator declares it known-empty; ::KnownEmpty is built in make_packet when coverage_denominator.known_empty_sections names architecture_implications; ::BudgetProvenanceUnavailable is built in make_packet for model_routes_and_cost. InertProbeStatus::ModelRecommendationInert is the only status build_semantics emits, and build_semantics is the only InertProbe constructor in the workspace. Adding a variant is a breaking change for a pinned consumer."
+disposition = "reused_exact"
 
 [[type_contract]]
 id = "ORI-04"
@@ -1226,23 +1228,27 @@ disposition = "reused_exact"
 id = "MM-04"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-concept"
-rust_path = "crates/smart/eliot-dreamer-concept/src/evidence.rs"
+rust_path = "crates/smart/eliot-dreamer-concept/src/synthesis.rs"
 defining_refs = ["crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceLedger",
     "crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceAssessment",
     "crates/smart/eliot-dreamer-concept/src/policy.rs::ConceptPolicy",
+    "crates/smart/eliot-dreamer-contracts/src/concept/result.rs::ConceptCandidate",
+    "crates/smart/eliot-dreamer-contracts/src/concept/result.rs::ConceptDisposition",
+    "crates/smart/eliot-dreamer-contracts/src/concept/result.rs::ConceptRollback",
+    "crates/smart/eliot-dreamer-concept/src/synthesis.rs::propose_concept_or_abstraction",
     ]
-symbol = "EvidenceLedger, EvidenceAssessment, ConceptPolicy"
-kind = "struct"
-fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
-wire_spelling = "not restated; owned by the defining module"
-wire_boundary = "not restated; owned by the defining module"
-required_optional_none = "not restated; owned by the defining module"
-units_bounds = "not restated; owned by the defining module"
-identity_scope_fence = "not restated; owned by the defining module"
-provenance_privacy = "EvidenceLedger is the provenance surface for this kind"
-validation_error = "owned by the defining module"
-compatibility = "not determinable for a result type that does not exist. The alias ConceptDecision was retired under W2-ONE-OWNER-PER-CONCERN and is recorded in [[retired_name]]; the surviving name is eliot-dreamer-contracts ConceptDisposition, so retiring the alias does not decide the missing result type"
-disposition = "missing_contract_decision"
+symbol = "EvidenceLedger, EvidenceAssessment, ConceptPolicy, ConceptCandidate, ConceptDisposition, ConceptRollback, propose_concept_or_abstraction"
+kind = "struct plus enum plus function"
+fields = ["ConceptCandidate{schema_version, candidate_id, operation_id, input_digest, policy_digest, mode, proposal, disposition, common_disposition, preservation, rollback, proof_ceiling, handler_result}", "ConceptDisposition{Candidate, Hypothesis, Duplicate, Refinement, Conflict, Partial, Insufficient, Ambiguity, Unsupported, Blocked, NoChange, OwnerHandoff, Abstention, Cancelled, InternalDefect}", "ConceptRollback{predecessor, history_refs, reversal_refs, invalidation_refs, note}"]
+wire_spelling = "snake_case via serde rename_all on ConceptDisposition; flat snake_case field names on the three structs"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema on all three types"
+required_optional_none = "ConceptRollback.predecessor is Option and its None means the comparison found no typed predecessor, not an unknown one"
+units_bounds = "MAX_RESULT_BYTES = 4 MiB bounds the serialized candidate in preflight_candidate; ConceptProposal and RelationPreservation carry their own bound sets"
+identity_scope_fence = "candidate_id is the sha256 identity over operation_id, input_digest and policy_digest, and input_digest is the owner concept_input_digest over the validated ConceptInput, so the candidate is bound to one exact input closure and one policy"
+provenance_privacy = "EvidenceLedger is the provenance surface for this kind; ConceptRollback carries only ArtifactId identities already present in that input closure"
+validation_error = "ContractViolation, typed across every phase: validate_concept_acceptance and policy.check_input refuse before semantic work, the budget dimensions are concept.work, concept.stu, concept.candidates and concept.output_bytes, and no phase returns a Missing wrapper or a None-filled candidate"
+compatibility = "The prior claim that this kind emits no result type was false on the current base and is corrected here against measured source. What propose_concept_or_abstraction actually guarantees: it returns Result<ConceptCandidate, ContractViolation> and every terminal path emits a candidate, including the cancelled path, so there is no absence class for this kind. The candidate_id it passes in is input.operation_id, and seal_concept then overwrites it with the identity derived from operation_id, input_digest and policy_digest, so the emitted identity is the derived one. handler_result.result_digest is sealed over the canonical normalized preimage. The proposal and the preservation report are carried verbatim from the input and re-validated, so the result cannot replace them. rollback.validate_against rejects any identity outside the admitted source, evidence and neighborhood closure. common_disposition is a pure function of disposition and structural completeness, and validate_against recomputes it. proof_ceiling is pinned to ProofCeiling::CandidateArtifact and any other value is refused, so this is a candidate and never a truth or an effect. The retired alias ConceptDecision is recorded in [[retired_name]]; the surviving name is eliot-dreamer-contracts ConceptDisposition, which is a nested local class inside this candidate, not a second owner of the candidate"
+disposition = "reused_exact"
 
 [[type_contract]]
 id = "MM-05"
@@ -1461,7 +1467,7 @@ units_bounds = "none"
 identity_scope_fence = "none"
 provenance_privacy = "none"
 validation_error = "none"
-compatibility = "not determinable: the type does not exist on base cdf4a29 in any of the ten handler crates, and eliot-dreamer-concept emits no result type at all"
+compatibility = "not determinable, and this row stays open: the shared family envelope is not the per-kind result type, and every one of the eleven kinds now has a measured result type including concept (MM-04, eliot-dreamer-contracts ConceptCandidate). What no owner has decided is whether one owner-neutral envelope indexes the eleven kinds or each kind stays unindexed. The decision is recorded rather than invented."
 disposition = "missing_contract_decision"
 
 [[type_contract]]
@@ -2289,7 +2295,7 @@ evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-NO-FUNCTION-ONLY-PACKAGE"
-rule = "No crate is created. All twenty-four issue-named physical owners already exist as admitted root workspace members or as explicitly named prototypes; no Cargo.toml, Cargo.lock, workflow or generated index is edited by this work unit. The .rs edits it does carry are the three alias retirements in [[retired_name]], which add no crate, no type, no variant and no dependency."
+rule = "No crate is created. All twenty-four issue-named physical owners already exist as admitted root workspace members or as explicitly named prototypes; no Cargo.toml, Cargo.lock, workflow or generated index is edited by this work unit. The .rs edits it does carry are the three alias retirements in [[retired_name]], which add no crate, no type, no variant and no dependency, and the ORI-03 closed discriminants, which add two types to one existing crate and no crate, no field, no dependency and no capability."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
