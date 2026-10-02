@@ -1213,10 +1213,30 @@ function Test-StoreCase20 {
     $binding = Get-StoreTestBinding
     $allocation = Get-StoreTestAllocation $binding
     $start = Get-StoreTestStartReceipt $binding $allocation
+    $ownedPid = [int]$start['observed']['pid']
+    $ownedImage = [string]$start['observed']['imagePath']
+    $ownedStarted = [string]$start['observed']['startTimeUtc']
     $controller = { param($ctx) return @{ exited = $true; pid = $ctx['pid'] } }
-    $stop = Invoke-StoreStop -Binding $binding -StartReceipt $start -ProcessController $controller
+    # This stop proves ownership of the root it stops, so it observes the owned
+    # process the same way every other stop in this suite does: with a scripted
+    # observer that answers dead-and-tree-complete at both of Stop's two proof
+    # points. Leaving it unbound falls through to the real observer, which cannot
+    # describe this fixture's fake pid: the stop would then end in a
+    # reconciliation record it never resolved, and the next operation onto that
+    # owned run root would be refused by STORE-RECONCILIATION-REQUIRED. That
+    # refusal is the product working, not a defect in this case.
+    $stoppedLive = $false
+    $stopObserver = {
+        param($ctx)
+        return @{ alive = $stoppedLive; pid = $ownedPid; imagePath = $ownedImage; startTimeUtc = $ownedStarted; descendants = @(); treeComplete = $true }
+    }.GetNewClosure()
+    $stop = Invoke-StoreStop -Binding $binding -StartReceipt $start -ProcessController $controller -ProcessObserver $stopObserver
     Assert-StoreTrue $Failures ($stop['ownedPid'] -eq $start['observed']['pid']) '20-owner-pid'
     Assert-StoreTrue $Failures ($stop['runId'] -ceq $binding['runId']) '20-owner-run'
+    # The stop closed this allocation, so its own record is reconciled rather
+    # than left for a later caller to trip over.
+    [void](Complete-StoreTestFixtureReconciliation -Binding $binding -Allocation $allocation `
+        -Resolution '20-case-stopped-the-owned-root')
     $evidence = Invoke-StoreCollectEvidence -Binding $binding -TerminalState 'TimedOut' -LogText 'timed out waiting' -Secrets @()
     Assert-StoreTrue $Failures ($evidence['terminalState'] -ceq 'TimedOut') '20-timeout-preserved'
     Assert-StoreTrue $Failures ($evidence['owner'] -ceq $binding['owner']) '20-owner-preserved'
