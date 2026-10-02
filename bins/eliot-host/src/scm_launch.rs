@@ -270,6 +270,180 @@ pub fn host_scm_unknown_is_transient_pending(detail: &ServiceInspectionUnknownDe
         && detail.current_state() == Some(HOST_SCM_START_PENDING_STATE)
 }
 
+/// Identity slots one `Matching` runtime readback contributes to a record.
+///
+/// The observation already carries the configuration digest SCM actually
+/// admitted, the observed SCM lifecycle state, the progress checkpoint, and —
+/// when SCM reported a live process — that process's exact start identity.
+/// Binding all of them is what makes a record prove a specific incarnation of
+/// the service rather than a phase label, so both `Matching` classification
+/// arms assemble them here and each arm adds only what is genuinely different
+/// about it.
+///
+/// `checkpoint` is `Some` only where the arm binds the SCM progress
+/// checkpoint; an arm that does not observe one passes `None` and the slot is
+/// not rendered at all. `process` is the start identity already rendered by
+/// [`scm_render_process_start_identity`], so the slot borrows the caller's
+/// binding rather than a temporary; an observation SCM reported no live
+/// process for reads `Unavailable`, exactly as before.
+fn scm_matching_observed_fields<'a>(
+    requested: &[(&'static str, super::host_job_launch::LaunchIdentityField<'a>)],
+    observed_config_digest: &'a str,
+    state: ServiceState,
+    checkpoint: Option<u64>,
+    process: Option<&'a str>,
+) -> Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)> {
+    let mut fields = requested.to_vec();
+    fields.push((
+        "observed_config_digest",
+        super::host_job_launch::LaunchIdentityField::Text(observed_config_digest),
+    ));
+    fields.push((
+        "scm_state",
+        super::host_job_launch::LaunchIdentityField::Text(scm_state_name(state)),
+    ));
+    if let Some(checkpoint) = checkpoint {
+        fields.push((
+            "checkpoint",
+            super::host_job_launch::LaunchIdentityField::Number(checkpoint),
+        ));
+    }
+    fields.push((
+        "process",
+        match process {
+            Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields
+}
+
+/// Identity slots one typed `Unknown` runtime readback contributes to a
+/// record.
+///
+/// The platform's own typed diagnostic fields for the failing stage are bound:
+/// the preserved Win32 code, the failing stage, the raw `dwCurrentState`, the
+/// observed PID, and whether that state is the transient `START_PENDING`
+/// checkpoint. The PID is recorded as a PID, never as a start identity — this
+/// readback carries no creation time, so the slot cannot claim one — and a
+/// stage, state, or PID the platform could not observe reads `Unavailable`.
+fn scm_unknown_diagnostic_fields<'a>(
+    requested: &[(&'static str, super::host_job_launch::LaunchIdentityField<'a>)],
+    detail: &ServiceInspectionUnknownDetail,
+) -> Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)> {
+    let mut fields = requested.to_vec();
+    fields.push((
+        "win32_error",
+        super::host_job_launch::LaunchIdentityField::Number(u64::from(detail.win32_error())),
+    ));
+    fields.push((
+        "stage",
+        super::host_job_launch::LaunchIdentityField::Text(detail.stage()),
+    ));
+    fields.push((
+        "current_state",
+        match detail.current_state() {
+            Some(state) => super::host_job_launch::LaunchIdentityField::Number(u64::from(state)),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields.push((
+        "pid",
+        match detail.process_id() {
+            Some(pid) => super::host_job_launch::LaunchIdentityField::Number(u64::from(pid)),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields.push((
+        "transient_pending",
+        super::host_job_launch::LaunchIdentityField::Text(
+            if detail
+                .current_state()
+                .is_some_and(|state| state == HOST_SCM_START_PENDING_STATE)
+            {
+                "pending"
+            } else {
+                "not_pending"
+            },
+        ),
+    ));
+    fields
+}
+
+/// Identity slots one installed-candidate readback request contributes to a
+/// record.
+///
+/// The candidate spec is the identity this readback is about: the candidate
+/// installation identity, its immutable transaction-plan generation, and its
+/// approved config descriptor digest — all three borrowed from the spec the
+/// caller holds, so both the requested record below and the observed record
+/// after the platform read share one binding. The candidate image, descriptor,
+/// state root and platform root are paths and never enter a record.
+fn scm_candidate_identity(
+    spec: &InstalledCandidateSpec,
+) -> [(&'static str, super::host_job_launch::LaunchIdentityField<'_>); 3] {
+    [
+        (
+            "installation",
+            super::host_job_launch::LaunchIdentityField::Text(spec.installation_id.as_str()),
+        ),
+        (
+            "plan_generation",
+            super::host_job_launch::LaunchIdentityField::Number(spec.transaction_plan_generation),
+        ),
+        (
+            "config_digest",
+            super::host_job_launch::LaunchIdentityField::Text(
+                spec.config_descriptor_digest.as_str(),
+            ),
+        ),
+    ]
+}
+
+/// Identity slots one installed-candidate readback observation contributes to
+/// a record.
+///
+/// Beside the candidate identity its owner already holds, the observed
+/// registration identity and the desired-side manifest presence are bound: the
+/// SCM configuration digest that was actually read back, the class of the
+/// readback outcome, the process start identity when SCM reported one, and
+/// whether an installed manifest was found. The manifest's own artifact
+/// digests stay in the returned readback and never enter a record, and a
+/// readback that reported no live process reads `Unavailable`.
+fn scm_candidate_readback_observed_fields<'a>(
+    identity: &[(&'static str, super::host_job_launch::LaunchIdentityField<'a>)],
+    observed_config_digest: &'a str,
+    inspection: &ServiceRegistrationRuntimeInspection,
+    observed_process: Option<&'a str>,
+    manifest_installed: bool,
+) -> Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)> {
+    let mut fields = identity.to_vec();
+    fields.push((
+        "observed_config_digest",
+        super::host_job_launch::LaunchIdentityField::Text(observed_config_digest),
+    ));
+    fields.push((
+        "inspection",
+        super::host_job_launch::LaunchIdentityField::Text(scm_inspection_class(inspection)),
+    ));
+    fields.push((
+        "process",
+        match observed_process {
+            Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields.push((
+        "manifest",
+        super::host_job_launch::LaunchIdentityField::Text(if manifest_installed {
+            "installed"
+        } else {
+            "absent"
+        }),
+    ));
+    fields
+}
+
 /// Pure projection from a platform runtime registration inspection to the
 /// typed host-side cause. Returns `None` only for an admissible `Matching`
 /// observation; every other outcome maps to its fail-closed cause, so
@@ -341,33 +515,14 @@ pub fn classify_host_scm_inspection(
             // that process's exact start identity. Binding all of them is what
             // makes this record prove a specific incarnation of the service
             // rather than a phase label.
-            let mut fields = requested.to_vec();
-            fields.push((
-                "observed_config_digest",
-                super::host_job_launch::LaunchIdentityField::Text(
-                    observation.configuration_digest(),
-                ),
-            ));
-            fields.push((
-                "scm_state",
-                super::host_job_launch::LaunchIdentityField::Text(scm_state_name(
-                    observation.state(),
-                )),
-            ));
-            fields.push((
-                "checkpoint",
-                super::host_job_launch::LaunchIdentityField::Number(u64::from(
-                    observation.checkpoint(),
-                )),
-            ));
             let process = observation.process().map(scm_render_process_start_identity);
-            fields.push((
-                "process",
-                match process.as_deref() {
-                    Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
-                    None => super::host_job_launch::LaunchIdentityField::Unavailable,
-                },
-            ));
+            let fields = scm_matching_observed_fields(
+                &requested,
+                observation.configuration_digest(),
+                observation.state(),
+                Some(u64::from(observation.checkpoint())),
+                process.as_deref(),
+            );
             // WORK_UNIT_CASE: 978/5 — start-identity observed: the admissible
             // service identity + state accepts bootstrap; the ephemeral PID is
             // never identity.
@@ -378,28 +533,16 @@ pub fn classify_host_scm_inspection(
             // The same observed identity is bound here, so an inadmissible
             // state is distinguishable from the admissible readback of the very
             // same service and configuration instead of producing the same two
-            // static strings.
-            let mut fields = requested.to_vec();
-            fields.push((
-                "observed_config_digest",
-                super::host_job_launch::LaunchIdentityField::Text(
-                    observation.configuration_digest(),
-                ),
-            ));
-            fields.push((
-                "scm_state",
-                super::host_job_launch::LaunchIdentityField::Text(scm_state_name(
-                    observation.state(),
-                )),
-            ));
+            // static strings. This arm observes no progress checkpoint, so it
+            // renders no `checkpoint` slot at all.
             let process = observation.process().map(scm_render_process_start_identity);
-            fields.push((
-                "process",
-                match process.as_deref() {
-                    Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
-                    None => super::host_job_launch::LaunchIdentityField::Unavailable,
-                },
-            ));
+            let fields = scm_matching_observed_fields(
+                &requested,
+                observation.configuration_digest(),
+                observation.state(),
+                None,
+                process.as_deref(),
+            );
             // WORK_UNIT_CASE: 978/5 — admissible start-identity absent; the
             // observed state cannot bootstrap.
             scm_launch_observe_bound("host.scm-launch start-identity unknown", &fields);
@@ -446,48 +589,7 @@ pub fn classify_host_scm_inspection(
             // `dwCurrentState`, and the observed PID. The PID is recorded as a
             // PID, never as a start identity — this readback carries no
             // creation time, so the slot cannot claim one.
-            let mut fields = requested.to_vec();
-            fields.push((
-                "win32_error",
-                super::host_job_launch::LaunchIdentityField::Number(u64::from(
-                    detail.win32_error(),
-                )),
-            ));
-            fields.push((
-                "stage",
-                super::host_job_launch::LaunchIdentityField::Text(detail.stage()),
-            ));
-            fields.push((
-                "current_state",
-                match detail.current_state() {
-                    Some(state) => {
-                        super::host_job_launch::LaunchIdentityField::Number(u64::from(state))
-                    }
-                    None => super::host_job_launch::LaunchIdentityField::Unavailable,
-                },
-            ));
-            fields.push((
-                "pid",
-                match detail.process_id() {
-                    Some(pid) => {
-                        super::host_job_launch::LaunchIdentityField::Number(u64::from(pid))
-                    }
-                    None => super::host_job_launch::LaunchIdentityField::Unavailable,
-                },
-            ));
-            fields.push((
-                "transient_pending",
-                super::host_job_launch::LaunchIdentityField::Text(
-                    if detail
-                        .current_state()
-                        .is_some_and(|state| state == HOST_SCM_START_PENDING_STATE)
-                    {
-                        "pending"
-                    } else {
-                        "not_pending"
-                    },
-                ),
-            ));
+            let fields = scm_unknown_diagnostic_fields(&requested, detail);
             // WORK_UNIT_CASE: 978/5 — ephemeral PID observation; never
             // promoted into start-identity.
             scm_launch_observe_bound("host.scm-launch pid observed", &fields);
@@ -1239,26 +1341,8 @@ pub struct InstalledCandidateReadback {
 pub fn read_installed_candidate_contour(
     spec: &InstalledCandidateSpec,
 ) -> Result<InstalledCandidateReadback, HostError> {
-    // The candidate spec is the identity this readback is about: the candidate
-    // installation identity, its immutable transaction-plan generation, and its
-    // approved config descriptor digest. The candidate image, descriptor, state
-    // root and platform root are paths and never enter a record.
-    let identity = [
-        (
-            "installation",
-            super::host_job_launch::LaunchIdentityField::Text(spec.installation_id.as_str()),
-        ),
-        (
-            "plan_generation",
-            super::host_job_launch::LaunchIdentityField::Number(spec.transaction_plan_generation),
-        ),
-        (
-            "config_digest",
-            super::host_job_launch::LaunchIdentityField::Text(
-                spec.config_descriptor_digest.as_str(),
-            ),
-        ),
-    ];
+    // The candidate spec is the identity this readback is about.
+    let identity = scm_candidate_identity(spec);
     scm_launch_observe_bound(
         "host.scm-launch installed candidate readback requested",
         &identity,
@@ -1331,35 +1415,18 @@ pub fn read_installed_candidate_contour(
     // the process start identity when SCM reported one, and whether an
     // installed manifest was found. The manifest's own artifact digests stay in
     // the returned readback and never enter a record.
-    let mut fields = identity.to_vec();
-    fields.push((
-        "observed_config_digest",
-        super::host_job_launch::LaunchIdentityField::Text(configuration_digest.as_str()),
-    ));
-    fields.push((
-        "inspection",
-        super::host_job_launch::LaunchIdentityField::Text(scm_inspection_class(&inspection)),
-    ));
     // The observed process start identity is rendered into a named local that
     // outlives the record below, so the identity slot borrows the binding rather
     // than a temporary that would be dropped at the end of the push expression.
     let observed_process =
         scm_inspection_process(&inspection).map(scm_render_process_start_identity);
-    fields.push((
-        "process",
-        match observed_process.as_deref() {
-            Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
-            None => super::host_job_launch::LaunchIdentityField::Unavailable,
-        },
-    ));
-    fields.push((
-        "manifest",
-        super::host_job_launch::LaunchIdentityField::Text(if manifest.is_some() {
-            "installed"
-        } else {
-            "absent"
-        }),
-    ));
+    let fields = scm_candidate_readback_observed_fields(
+        &identity,
+        &configuration_digest,
+        &inspection,
+        observed_process.as_deref(),
+        manifest.is_some(),
+    );
     scm_launch_observe_bound(
         "host.scm-launch installed candidate readback observed",
         &fields,
