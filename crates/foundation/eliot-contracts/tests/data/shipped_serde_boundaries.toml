@@ -7,7 +7,7 @@ tool_version = "0.5.0"
 rule_revision = "929.5"
 proof_ceiling = "SOURCE_INVENTORY_AND_OWNERSHIP_ONLY"
 issue = 929
-base_sha = "0c8f4690e96dfb05f46ba8c0c019a33a1786d6e3"
+base_sha = "50a13111a8396a7e56fbe52c10b84350fa46b268"
 base_sha_source = "git-rev-parse-HEAD"
 provenance_authority = "informational-observational-outside-proof-ceiling"
 canonical_excludes = ["aggregate_digest", "denominator.scan_file_count"]
@@ -24,7 +24,7 @@ unassigned_count = 9963
 ready_children = 13
 blocked_children = 1
 denominator_digest = "efc9135166eabbb7f52c057ed1eae5ca19b7727d7492b158cbe5587d87d86a5f"
-aggregate_digest = "80cc20efbbbe4c4cf213cce2b07da6f31a8949441d72471e06845a97168296f1"
+aggregate_digest = "63fbd53dc1f0c12c2c0473dbdd1bbba8b8d6950ee70eca15dc017dd3794cd3ec"
 
 [denominator]
 release_roots = ["bins/eliot", "bins/eliot-host", "bins/eliot-kernel", "bins/eliot-store-surreal", "bins/eliot-watchdog", "bins/eliotd"]
