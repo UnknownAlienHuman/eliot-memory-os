@@ -1083,6 +1083,16 @@ function Test-StoreCase19 {
     $ownedPid = [int]$start['observed']['pid']
     $ownedImage = [string]$start['observed']['imagePath']
     $ownedStarted = [string]$start['observed']['startTimeUtc']
+    # Stop asks the observer once per ownership proof point, and THIS arm's proof
+    # points are three: the owned root's state before the graceful phase
+    # (IntegrationHarness.Store.psm1:2119), its state after it (:2208), and --
+    # only because this arm's root is STILL live, so the exact-owned-tree
+    # forced fallback actually runs -- its state after the forced phase
+    # (:2370), which is the post-exit closure proof. The queue supplies exactly
+    # those three answers. A two-answer queue leaves the post-force probe
+    # answering with the default $true, so the owned root is reported still
+    # alive after the forced kill and the arm degrades into a reconciliation
+    # refusal instead of the clean forced stop it is asserting.
     $closing = [Collections.Generic.List[bool]]::new([bool[]]@($true, $false))
     $observer = {
         param($ctx)
@@ -1097,15 +1107,19 @@ function Test-StoreCase19 {
     Assert-StoreTrue $Failures ($graceful['stopState'] -ceq 'OwnedResourcesStopped') '19-graceful-state'
     Assert-StoreTrue $Failures ($graceful['ownedPid'] -eq $ownedPid) '19-graceful-owned-pid'
     $forcedCalls = @{ count = 0 }
-    $closingForced = [Collections.Generic.List[bool]]::new([bool[]]@($true, $true))
+    # This arm's root is STILL live after the graceful phase, so the exact-owned-tree
+    # forced fallback runs -- and the controller is asked for it exactly once. Its
+    # observer is asked three times for the same three reasons as the graceful
+    # arm's: live before the graceful phase, STILL live after it (which is what
+    # selects the forced fallback at all), and gone after the forced phase, which
+    # is the post-exit closure proof the fallback refuses to report without.
+    $closingForced = [Collections.Generic.List[bool]]::new([bool[]]@($true, $true, $false))
     $forcedObserver = {
         param($ctx)
         $alive = $true
         if ($closingForced.Count -gt 0) { $alive = $closingForced[0]; $closingForced.RemoveAt(0) }
         return @{ alive = $alive; pid = $ownedPid; imagePath = $ownedImage; startTimeUtc = $ownedStarted; descendants = @(); treeComplete = $true }
     }.GetNewClosure()
-    # The root is STILL live after the graceful phase, so the exact-owned-tree
-    # forced fallback runs -- and the controller is asked for it exactly once.
     $forcedController = { param($ctx) if ($ctx['phase'] -ceq 'graceful') { return @{ exited = $false; pid = $ctx['pid'] } } else { $forcedCalls['count']++; return @{ exited = $true; pid = $ctx['pid'] } } }.GetNewClosure()
     $forced = Invoke-StoreStop -Binding $binding -StartReceipt $start -ProcessController $forcedController -ProcessObserver $forcedObserver
     Assert-StoreTrue $Failures ($forced['stopPhase'] -ceq 'forced') '19-forced-phase'
