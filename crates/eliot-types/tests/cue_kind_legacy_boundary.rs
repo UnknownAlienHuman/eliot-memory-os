@@ -742,7 +742,7 @@ fn split_boundary_row_id(line: &str) -> Option<(&str, [&str; 5])> {
     }
     let mut rungs = [""; 5];
     let mut parts = id.splitn(5, ':');
-    for rung in rungs.iter_mut() {
+    for rung in &mut rungs {
         *rung = parts.next()?;
     }
     Some((id, rungs))
@@ -1516,8 +1516,6 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
          guard builds; a guard on a head no row carries matches nothing for ever"
     );
     let seam = seam_id_head.as_str();
-    let other_path = "crates/eliot-types/src/ul/cue_index.rs";
-    let contracts_path = "crates/smart/eliot-cue-contracts/src/normalization.rs";
     let live_rows = matched_lines(&inventory, seam_id_head.as_str());
     assert!(
         !live_rows.is_empty(),
@@ -1532,19 +1530,65 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
             "a shipped seam row does not start with the head the guard builds: {line}"
         );
         assert_eq!(
-            rungs[1],
-            "crates/eliot-types/src/ul/cue.rs",
+            rungs[1], "crates/eliot-types/src/ul/cue.rs",
             "wrong path rung: {line}"
         );
     }
-    // From a REAL row id, keep rungs 0..=1 (package, path) verbatim and
-    // replace the remaining three. That yields a well-formed five-part id which
-    // shares its whole head with the shipped row, so it exercises every rung
-    // the guard depends on instead of assuming them.
+    stale_row_guard_matches_every_rung_shape(sample_id, seam, &bare, &inventory);
+    // The other half of the negative control that helper's zero relies on: the
+    // live inventory really does carry a well-formed non-stale row for this
+    // seam. A guard that flags nothing anywhere is vacuous, and this asserts
+    // the opposite direction here, so neither half can pass alone.
+    assert!(
+        live_rows.iter().any(|row| {
+            let Some((_, rungs)) = split_boundary_row_id(row) else {
+                return false;
+            };
+            // A well-formed row that is not stale: the retained explicit name.
+            rungs[1] == "crates/eliot-types/src/ul/cue.rs"
+                && rungs[3] == ["Legacy", bare.as_str(), "V1"].concat()
+        }),
+        "negative control: the live inventory carries no well-formed non-stale \
+         row for this seam, so the zero flagged above proves nothing"
+    );
+    Ok(())
+}
+
+/// The self-test of the stale-row guard: pins that guard against every rung
+/// shape the producer can emit, in both directions, so it cannot be silently
+/// vacuous.
+///
+/// `sample_id` is a REAL row id off the shipped inventory. The probes below
+/// keep rungs 0..=1 (package, path) verbatim and replace the remaining three,
+/// so every probe is a well-formed five-part id sharing its whole head with a
+/// shipped row and exercises each rung the guard reads instead of assuming
+/// them. `seam` is that head and `bare` the historical type spelling; both are
+/// built at runtime by the caller, so this oracle never widens this file's own
+/// `type_row` digest.
+fn stale_row_guard_matches_every_rung_shape(
+    sample_id: &str,
+    seam: &str,
+    bare: &str,
+    inventory: &str,
+) {
+    // The probe bodies below are the frozen rows verbatim, so the spellings they
+    // were frozen with - `bare.as_str()` and `&inventory` - are kept as written.
+    // These two owned shadows make both of those exact spellings well typed here
+    // without the parameters taking a needless reference to a `String`.
+    let bare = bare.to_owned();
+    let inventory = inventory.to_owned();
     let kind_row = |kind: &str, type_name: &str, function: &str| {
         let head = split_prefix_rungs(sample_id, 2);
         [
-            ROW_ID_HEAD, &head, ":", kind, ":", type_name, ":", function, "\"",
+            ROW_ID_HEAD,
+            &head,
+            ":",
+            kind,
+            ":",
+            type_name,
+            ":",
+            function,
+            "\"",
         ]
         .concat()
     };
@@ -1604,7 +1648,7 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         [
             ROW_ID_HEAD,
             "eliot-cue-contracts:",
-            contracts_path,
+            "crates/smart/eliot-cue-contracts/src/normalization.rs",
             ":derive:",
             bare.as_str(),
             ":<root>\"",
@@ -1613,7 +1657,7 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         [
             ROW_ID_HEAD,
             "eliot-types:",
-            other_path,
+            "crates/eliot-types/src/ul/cue_index.rs",
             ":derive:",
             bare.as_str(),
             ":<root>\"",
@@ -1643,19 +1687,6 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         0,
         "the guard flags a live, non-stale shipped row: {stale_rows:?}"
     );
-    assert!(
-        live_rows.iter().any(|row| {
-            let Some((_, rungs)) = split_boundary_row_id(row) else {
-                return false;
-            };
-            // A well-formed row that is not stale: the retained explicit name.
-            rungs[1] == "crates/eliot-types/src/ul/cue.rs"
-                && rungs[3] == ["Legacy", bare.as_str(), "V1"].concat()
-        }),
-        "negative control: the live inventory carries no well-formed non-stale \
-         row for this seam, so the zero flagged above proves nothing"
-    );
-    Ok(())
 }
 
 // WORK_UNIT_CASE: 706/25
