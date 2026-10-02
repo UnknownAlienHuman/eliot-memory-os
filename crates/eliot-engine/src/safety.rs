@@ -754,14 +754,16 @@ impl RestoreService {
                 "restore evidence is a dry run and records no executed restore",
             ));
         }
-        let retained_action_hash = restore_report.receipt.exact_action_hash.as_deref().ok_or_else(
-            || {
+        let retained_action_hash = restore_report
+            .receipt
+            .exact_action_hash
+            .as_deref()
+            .ok_or_else(|| {
                 service_error(
                     "restore_rollback",
                     "restored-to-new-root restore evidence carries no exact action hash",
                 )
-            },
-        )?;
+            })?;
         if restore_report.plan.exact_action_hash.as_deref() != Some(retained_action_hash) {
             return Err(service_error(
                 "restore_rollback",
