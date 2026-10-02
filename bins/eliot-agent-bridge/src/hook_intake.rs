@@ -50,10 +50,21 @@
 //!   terminator's carriage return on a fill of its own, in a one-byte fill, and
 //!   in a 1_000_000-byte fill that divides neither the ceiling nor the
 //!   terminator — the same byte stream, one content total, one disposition,
-//!   because a fill ending on a lone CR is consumed whole with the CR held out
-//!   of the charge and that held CR is charged exactly once by whichever later
-//!   fill resolves it, while every other fill charges its content bytes once
-//!   and consumes every byte it charges;
+//!   because a fill ending on a lone CR is consumed whole with the CR retained
+//!   at its stream position but held out of the charge and that held CR is
+//!   charged exactly once by whichever later fill resolves it, while every
+//!   other fill charges its content bytes once and consumes every byte it
+//!   charges;
+//! - accepted bytes being byte-for-byte the stream's content on a record whose
+//!   content carries carriage returns in several interior positions — at 8 KiB
+//!   boundaries and elsewhere — across every fill size including the shipped
+//!   8 KiB arrival and one fill holding everything, so the accepted record can
+//!   no longer be the same stream in a different order because the reader's
+//!   read size decided where a held CR landed;
+//! - invalid UTF-8 whose only defect is a carriage return sitting between the
+//!   two bytes of a would-be code point being REFUSED as
+//!   `StdinInvalidUtf8` on every fill size, so no read size can reorder the
+//!   bytes into a valid sequence and promote the record past the UTF-8 gate;
 //! - the public hook branch itself, end to end through argv, bounded
 //!   acquisition, decode, the real [`EliotHookService`], and the host decision
 //!   write, with the runtime root supplied by the caller: an accepted payload
@@ -1247,5 +1258,173 @@ mod tests {
             "an over-limit payload must not spool a record; the count is still \
              the one the accepted run wrote"
         );
+    }
+
+    /// The accepted BYTES are the stream's content bytes, in the stream's order,
+    /// whatever the caller's read size is.
+    ///
+    /// Acceptance is not the assertion here, and neither is length: the record
+    /// is accepted at every fill size either way. The assertion is
+    /// `record == exact`, byte for byte, on a record whose content carries
+    /// carriage returns in several interior positions.
+    ///
+    /// The fixture is a 1 MiB record - the published ceiling, so the shipped
+    /// hook arrival is genuinely exercised - of valid JSON (`{"a":1`, then JSON
+    /// whitespace, then `}`) whose padding contains a carriage return at every
+    /// 8 KiB boundary and at one further interior position. A carriage return is
+    /// legal JSON whitespace, so the fixture is a whole document and the
+    /// reordering this pins is silent: the reordered record still decoded, and a
+    /// WRONG payload reached [`EliotHookService`] with nothing reporting an
+    /// error. Driving a reader by hand is enough to decide it, and the hand-
+    /// driven arrivals below are the ones that disagree with each other.
+    ///
+    /// `read_bounded_record` used to hold a lone-CR byte out of the record and
+    /// append it once a later fill proved it content, so the accepted bytes came
+    /// out in FILL order rather than stream order: on this fixture a fill whose
+    /// last byte is a padding CR is the disputed one, and 8 KiB and 64 KiB
+    /// fills - which do land there - handed back different byte strings from 4
+    /// KiB, 128 KiB, 1_000_000 and single-fill arrivals, which do not.
+    ///
+    /// `std::io::BufReader` is exercised here too, because it is the reader
+    /// `run_hook_intake` builds, but over an in-memory slice: its default
+    /// capacity is 4096, which is not the 8192 the earlier report measured, so
+    /// it is named here for exactly what it is - a fill size, expressed the way
+    /// the shipped reader expresses one. A [`std::fs::File`] would not change
+    /// what this fixture depends on, which is where the fill boundary falls.
+    #[test]
+    fn interior_carriage_returns_are_accepted_byte_for_byte_in_stream_order_for_every_chunking() {
+        let ceiling = HOOK_INPUT_PROFILE.max_record_bytes;
+        let mut exact = Vec::with_capacity(ceiling);
+        exact.extend_from_slice(b"{\"a\":1");
+        // A carriage return at every 8 KiB boundary, plus one interior position
+        // no boundary sweep produces: the byte just after the document prefix.
+        for offset in 0..ceiling - b"{\"a\":1".len() - 1 {
+            exact.push(if offset % 8_192 == 0 || offset == 1 {
+                b'\r'
+            } else {
+                b' '
+            });
+        }
+        exact.push(b'}');
+        assert_eq!(exact.len(), ceiling);
+        let interior_crs = exact.iter().filter(|byte| **byte == b'\r').count();
+        assert_eq!(
+            interior_crs,
+            ceiling / 8_192 + 1,
+            "the fixture must hold a carriage return at every 8 KiB boundary and one more"
+        );
+        let mut framed = exact.clone();
+        framed.extend_from_slice(b"\r\n");
+
+        for (arrival, chunk) in [
+            ("one fill holding everything", framed.len()),
+            ("a one-byte fill", 1),
+            ("two-byte fills", 2),
+            ("three-byte fills", 3),
+            ("the shipped 8 KiB arrival", 8 * 1024),
+            ("a 4 KiB fill", 4 * 1024),
+            ("a fill that divides the ceiling", CHUNK),
+            ("a 128 KiB fill", 128 * 1024),
+            ("a fill that divides neither boundary", 1_000_000),
+        ] {
+            assert_ne!(chunk, 0, "arrival {arrival} would not produce fills");
+            let mut reader = ChunkReader::new(&framed, chunk);
+            let record = acquire_hook_payload(&mut reader)
+                .unwrap_or_else(|error| panic!("{arrival} must accept the record: {error:?}"));
+            assert_eq!(
+                record, exact,
+                "the accepted record must be byte-identical to the content written: {arrival}"
+            );
+            // And it decodes: the accepted bytes are a whole document, not a
+            // re-ordered one that happens still to parse.
+            decode_hook_payload(&record)
+                .unwrap_or_else(|error| panic!("{arrival}: the record must parse: {error:?}"));
+        }
+
+        // The shipped reader itself, at capacities around the disputed 8 KiB
+        // fill. `BufReader::new` - what `run_hook_intake` builds - uses 4096;
+        // 8192 is named explicitly here because that is the reported shipped
+        // arrival.
+        for capacity in [4 * 1024, 8 * 1024, 64 * 1024, 128 * 1024, ceiling] {
+            let mut reader = std::io::BufReader::with_capacity(capacity, framed.as_slice());
+            let record = acquire_hook_payload(&mut reader).unwrap_or_else(|error| {
+                panic!("a {capacity}-byte BufReader must accept the record: {error:?}")
+            });
+            assert_eq!(
+                record, exact,
+                "a BufReader of {capacity} bytes must hand back the same bytes"
+            );
+        }
+    }
+
+    /// A held carriage return resolves at its own stream position, so a record
+    /// that contains one in the middle is accepted with the bytes in the order
+    /// the stream put them.
+    ///
+    /// `x`, `\r`, `x`, `\r\n` is one record whose content is `x`, `\r`, `x`. Two
+    /// fills of two bytes split it after each `x`, so each fill ends on a lone
+    /// carriage return and both are held. Appending a held CR when a later fill
+    /// resolved it - instead of retaining it where the stream put it - made the
+    /// two of them land behind the content that already followed them: the
+    /// accepted record was `x`, `x`, `\r` (and on other fills of the same
+    /// stream, `x`, `\r`, `\r`, `x`, `\r`, `\r`, `x`, `\r`, `\x20` and so on).
+    /// Every one of those is the same stream in a different order, and none of
+    /// them is the content written.
+    #[test]
+    fn an_interior_carriage_return_is_accepted_at_its_own_stream_position() {
+        for (arrival, chunk) in [
+            ("one fill holding everything", 6),
+            ("two-byte fills", 2),
+            ("three-byte fills", 3),
+            ("a one-byte fill", 1),
+            ("a 4 KiB fill", 4 * 1024),
+        ] {
+            let mut reader = ChunkReader::new(b"x\rx\r\n", chunk);
+            let record = acquire_hook_payload(&mut reader)
+                .unwrap_or_else(|error| panic!("{arrival} must accept the record: {error:?}"));
+            assert_eq!(
+                record,
+                b"x\rx",
+                "the carriage return belongs between the two x bytes: {arrival}"
+            );
+        }
+    }
+
+    /// Invalid UTF-8 is refused on every fill size, including when a carriage
+    /// return is the only thing between the two bytes of a would-be code point.
+    ///
+    /// The bytes are `C3`, `0D`, `A9`, `0D`, `C3`, `A9`, `63`, `0A`: `é`, a
+    /// carriage return, `é`, `c`, and a bare LF terminator. Terminated, the
+    /// content is those first seven bytes with both terminator bytes removed,
+    /// and that is NOT valid UTF-8: `0xC3` needs a continuation byte and `0x0D`
+    /// is not one, so the content must be REFUSED as
+    /// [`HookIntakeError::StdinInvalidUtf8`] before any decode.
+    ///
+    /// One fill size did not refuse it. Holding a lone-CR byte out of the record
+    /// and appending it behind the content that already followed it turned
+    /// `C3`, `0D`, `A9` into `C3`, `A9`, `0D` - a valid `é` followed by
+    /// whitespace - so a two-byte-fill reader returned
+    /// `Record([195,169,13,13,195,169,99])` where every other read size
+    /// returned `InvalidUtf8`. That is the whole hazard in one case: the byte
+    /// stream did not change, only the read size, and the read size chose to
+    /// promote a record past the UTF-8 gate and into `serde_json::from_str`.
+    #[test]
+    fn invalid_utf8_is_refused_for_every_fill_size_when_a_carriage_return_splits_a_code_point() {
+        const SPLITS_A_CODE_POINT: &[u8] = &[0xC3, 0x0D, 0xA9, 0x0D, 0xC3, 0xA9, 0x63, 0x0A];
+        for fill in 1..=SPLITS_A_CODE_POINT.len() + 1 {
+            let mut reader = ChunkReader::new(SPLITS_A_CODE_POINT, fill);
+            let error = match acquire_hook_payload(&mut reader) {
+                Ok(accepted) => panic!(
+                    "a {fill}-byte fill must not accept {:?}: the CR between the two bytes \
+                     of a code point is content, so the content is not valid UTF-8",
+                    accepted.as_slice()
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, HookIntakeError::StdinInvalidUtf8),
+                "a {fill}-byte fill must refuse this as invalid UTF-8, saw {error:?}"
+            );
+        }
     }
 }
