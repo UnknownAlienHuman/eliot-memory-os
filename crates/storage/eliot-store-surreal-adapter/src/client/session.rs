@@ -512,148 +512,6 @@ async fn connect_started_provider(
     }
 }
 
-/// The ELIOT-issued transport response bound, exercised against the real
-/// provider-library frame codec.
-///
-/// These cases need no provider process: `tungstenite`'s own
-/// `WebSocketContext` is the same codec the session socket runs, and
-/// [`response_bound_config`] is the exact configuration
-/// `connect_started_provider` hands to `connect_async_with_config`. So the
-/// transport refusal they observe is the one an oversize snapshot response would
-/// produce in production, and the mapping they then apply is the production
-/// [`transport_read_error`].
-#[cfg(test)]
-mod transport_response_bound_tests {
-    #![allow(clippy::expect_used)]
-
-    use eliot_store_api::{MAX_SNAPSHOT_BYTES, StoreError};
-    use tokio_tungstenite::tungstenite::protocol::Role;
-
-    use super::*;
-
-    /// The provider library's incidental defaults, restated so the "never
-    /// widened" property is an assertion about the library's own numbers and
-    /// not about whatever they happen to be today.
-    const INCIDENTAL_FRAME_BYTES: usize = 16 << 20;
-    const INCIDENTAL_MESSAGE_BYTES: usize = 64 << 20;
-
-    /// One unmasked server-to-client binary frame declaring `declared_len`
-    /// payload bytes, followed by `payload_len` of them.
-    ///
-    /// The header is written by hand so the declared length and the delivered
-    /// length can differ: the frame codec compares the declared length with
-    /// `max_frame_size` *before* it reads or reserves any payload, so a frame
-    /// one byte over the bound is refused without the payload ever existing.
-    /// This is exactly the "one oversized row forces the complete WebSocket
-    /// message" shape, and it is unreachable through a fake decoded value.
-    fn server_binary_frame(declared_len: u64, payload_len: usize) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(10 + payload_len);
-        // FIN + binary opcode, unmasked, 64-bit extended length.
-        frame.push(0x82);
-        frame.push(0x7F);
-        frame.extend_from_slice(&declared_len.to_be_bytes());
-        frame.resize(10 + payload_len, b'r');
-        frame
-    }
-
-    /// The session-wide ELIOT response bound, as a `usize`.
-    fn session_bound_bytes() -> usize {
-        usize::try_from(ResponseCeiling::session_wide().max_bytes())
-            .expect("the session response bound fits a usize")
-    }
-
-    /// The context the session socket's codec is configured with.
-    fn bounded_context() -> tokio_tungstenite::tungstenite::protocol::WebSocketContext {
-        let config = response_bound_config(ResponseCeiling::session_wide())
-            .expect("the session response bound fits a usize");
-        tokio_tungstenite::tungstenite::protocol::WebSocketContext::new(Role::Client, Some(config))
-    }
-
-    /// The ELIOT-issued bound reaches the transport, and it narrows the
-    /// library's incidental defaults rather than widening them.
-    ///
-    /// Both bounds are asserted, because the hole this repairs is a *frame* above
-    /// 16 MiB as much as a message above 64 MiB. Setting either field back to
-    /// `None`, or to the incidental default, fails here.
-    #[test]
-    fn the_transport_bound_narrows_the_incidental_provider_defaults() {
-        let config = response_bound_config(ResponseCeiling::session_wide())
-            .expect("the session response bound fits a usize");
-        let expected = session_bound_bytes();
-        assert_eq!(config.max_frame_size, Some(expected));
-        assert_eq!(config.max_message_size, Some(expected));
-        assert!(
-            expected < INCIDENTAL_FRAME_BYTES,
-            "the frame bound must narrow the provider library's incidental default"
-        );
-        assert!(
-            expected < INCIDENTAL_MESSAGE_BYTES,
-            "the message bound must narrow the provider library's incidental default"
-        );
-        // The transport can never refuse a capture the owner admits.
-        assert!(
-            expected >= usize::try_from(MAX_SNAPSHOT_BYTES).expect("owner ceiling fits a usize")
-        );
-    }
-
-    /// Refusal case at the transport: a single frame one byte over the
-    /// ELIOT-issued bound is refused *inside the provider library*, with no
-    /// payload delivered, and the production mapping turns that into the typed
-    /// bounded refusal rather than a lost provider.
-    ///
-    /// Dropping the bound from [`response_bound_config`] — the exact defect this
-    /// repairs — makes the frame decode, and retyping the capacity error as a
-    /// transport loss makes both assertions fail.
-    #[test]
-    fn an_oversize_single_frame_is_refused_by_the_transport_as_a_bounded_refusal() {
-        let bound = session_bound_bytes();
-        let declared = u64::try_from(bound + 1).expect("declared length fits a u64");
-        // Nothing of the oversize payload is on the wire at all.
-        let mut wire = std::io::Cursor::new(server_binary_frame(declared, 0));
-        let mut context = bounded_context();
-        let failure = context
-            .read(&mut wire)
-            .expect_err("a frame above the ELIOT bound is refused by the transport");
-        assert!(
-            matches!(
-                failure,
-                TransportError::Capacity(CapacityError::MessageTooLong { .. })
-            ),
-            "the provider library refuses an oversize frame with a capacity error: {failure:?}"
-        );
-        let refusal = transport_read_error(&failure);
-        assert_eq!(refusal, AdapterError::Store(StoreError::PayloadTooLarge));
-        assert_eq!(
-            refusal.into_store_error(),
-            StoreError::PayloadTooLarge,
-            "an oversize response reaches the store boundary as a bounded refusal, not as a retryable unavailable provider"
-        );
-        assert_ne!(
-            transport_read_error(&TransportError::ConnectionClosed),
-            AdapterError::Store(StoreError::PayloadTooLarge),
-            "a genuinely lost provider is a different outcome and must stay one"
-        );
-    }
-
-    /// Positive case at the transport: a frame exactly at the ELIOT-issued bound
-    /// is delivered whole, so the bound refuses oversize responses without
-    /// narrowing the ones an admissible capture needs.
-    #[test]
-    fn a_frame_at_the_transport_bound_is_delivered() {
-        let bound = session_bound_bytes();
-        let declared = u64::try_from(bound).expect("declared length fits a u64");
-        let mut wire = std::io::Cursor::new(server_binary_frame(declared, bound));
-        let mut context = bounded_context();
-        let message = context
-            .read(&mut wire)
-            .expect("a frame at the ELIOT bound is delivered");
-        assert!(
-            matches!(message, Message::Binary(bytes) if bytes.len() == bound),
-            "the whole in-bound frame arrives"
-        );
-    }
-}
-
 #[cfg(all(test, windows))]
 mod ownership_tests {
     #![allow(clippy::expect_used, clippy::print_stdout, clippy::large_futures)]
@@ -1171,5 +1029,147 @@ mod ownership_tests {
         h.cleanup().await;
         assert!(!root.exists());
         println!("986/15 forced child stop awaited; process exit observed; isolated root removed");
+    }
+}
+
+/// The ELIOT-issued transport response bound, exercised against the real
+/// provider-library frame codec.
+///
+/// These cases need no provider process: `tungstenite`'s own
+/// `WebSocketContext` is the same codec the session socket runs, and
+/// [`response_bound_config`] is the exact configuration
+/// `connect_started_provider` hands to `connect_async_with_config`. So the
+/// transport refusal they observe is the one an oversize snapshot response would
+/// produce in production, and the mapping they then apply is the production
+/// [`transport_read_error`].
+#[cfg(test)]
+mod transport_response_bound_tests {
+    #![allow(clippy::expect_used)]
+
+    use eliot_store_api::{MAX_SNAPSHOT_BYTES, StoreError};
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    use super::*;
+
+    /// The provider library's incidental defaults, restated so the "never
+    /// widened" property is an assertion about the library's own numbers and
+    /// not about whatever they happen to be today.
+    const INCIDENTAL_FRAME_BYTES: usize = 16 << 20;
+    const INCIDENTAL_MESSAGE_BYTES: usize = 64 << 20;
+
+    /// One unmasked server-to-client binary frame declaring `declared_len`
+    /// payload bytes, followed by `payload_len` of them.
+    ///
+    /// The header is written by hand so the declared length and the delivered
+    /// length can differ: the frame codec compares the declared length with
+    /// `max_frame_size` *before* it reads or reserves any payload, so a frame
+    /// one byte over the bound is refused without the payload ever existing.
+    /// This is exactly the "one oversized row forces the complete WebSocket
+    /// message" shape, and it is unreachable through a fake decoded value.
+    fn server_binary_frame(declared_len: u64, payload_len: usize) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(10 + payload_len);
+        // FIN + binary opcode, unmasked, 64-bit extended length.
+        frame.push(0x82);
+        frame.push(0x7F);
+        frame.extend_from_slice(&declared_len.to_be_bytes());
+        frame.resize(10 + payload_len, b'r');
+        frame
+    }
+
+    /// The session-wide ELIOT response bound, as a `usize`.
+    fn session_bound_bytes() -> usize {
+        usize::try_from(ResponseCeiling::session_wide().max_bytes())
+            .expect("the session response bound fits a usize")
+    }
+
+    /// The context the session socket's codec is configured with.
+    fn bounded_context() -> tokio_tungstenite::tungstenite::protocol::WebSocketContext {
+        let config = response_bound_config(ResponseCeiling::session_wide())
+            .expect("the session response bound fits a usize");
+        tokio_tungstenite::tungstenite::protocol::WebSocketContext::new(Role::Client, Some(config))
+    }
+
+    /// The ELIOT-issued bound reaches the transport, and it narrows the
+    /// library's incidental defaults rather than widening them.
+    ///
+    /// Both bounds are asserted, because the hole this repairs is a *frame* above
+    /// 16 MiB as much as a message above 64 MiB. Setting either field back to
+    /// `None`, or to the incidental default, fails here.
+    #[test]
+    fn the_transport_bound_narrows_the_incidental_provider_defaults() {
+        let config = response_bound_config(ResponseCeiling::session_wide())
+            .expect("the session response bound fits a usize");
+        let expected = session_bound_bytes();
+        assert_eq!(config.max_frame_size, Some(expected));
+        assert_eq!(config.max_message_size, Some(expected));
+        assert!(
+            expected < INCIDENTAL_FRAME_BYTES,
+            "the frame bound must narrow the provider library's incidental default"
+        );
+        assert!(
+            expected < INCIDENTAL_MESSAGE_BYTES,
+            "the message bound must narrow the provider library's incidental default"
+        );
+        // The transport can never refuse a capture the owner admits.
+        assert!(
+            expected >= usize::try_from(MAX_SNAPSHOT_BYTES).expect("owner ceiling fits a usize")
+        );
+    }
+
+    /// Refusal case at the transport: a single frame one byte over the
+    /// ELIOT-issued bound is refused *inside the provider library*, with no
+    /// payload delivered, and the production mapping turns that into the typed
+    /// bounded refusal rather than a lost provider.
+    ///
+    /// Dropping the bound from [`response_bound_config`] — the exact defect this
+    /// repairs — makes the frame decode, and retyping the capacity error as a
+    /// transport loss makes both assertions fail.
+    #[test]
+    fn an_oversize_single_frame_is_refused_by_the_transport_as_a_bounded_refusal() {
+        let bound = session_bound_bytes();
+        let declared = u64::try_from(bound + 1).expect("declared length fits a u64");
+        // Nothing of the oversize payload is on the wire at all.
+        let mut wire = std::io::Cursor::new(server_binary_frame(declared, 0));
+        let mut context = bounded_context();
+        let failure = context
+            .read(&mut wire)
+            .expect_err("a frame above the ELIOT bound is refused by the transport");
+        assert!(
+            matches!(
+                failure,
+                TransportError::Capacity(CapacityError::MessageTooLong { .. })
+            ),
+            "the provider library refuses an oversize frame with a capacity error: {failure:?}"
+        );
+        let refusal = transport_read_error(&failure);
+        assert_eq!(refusal, AdapterError::Store(StoreError::PayloadTooLarge));
+        assert_eq!(
+            refusal.into_store_error(),
+            StoreError::PayloadTooLarge,
+            "an oversize response reaches the store boundary as a bounded refusal, not as a retryable unavailable provider"
+        );
+        assert_ne!(
+            transport_read_error(&TransportError::ConnectionClosed),
+            AdapterError::Store(StoreError::PayloadTooLarge),
+            "a genuinely lost provider is a different outcome and must stay one"
+        );
+    }
+
+    /// Positive case at the transport: a frame exactly at the ELIOT-issued bound
+    /// is delivered whole, so the bound refuses oversize responses without
+    /// narrowing the ones an admissible capture needs.
+    #[test]
+    fn a_frame_at_the_transport_bound_is_delivered() {
+        let bound = session_bound_bytes();
+        let declared = u64::try_from(bound).expect("declared length fits a u64");
+        let mut wire = std::io::Cursor::new(server_binary_frame(declared, bound));
+        let mut context = bounded_context();
+        let message = context
+            .read(&mut wire)
+            .expect("a frame at the ELIOT bound is delivered");
+        assert!(
+            matches!(message, Message::Binary(bytes) if bytes.len() == bound),
+            "the whole in-bound frame arrives"
+        );
     }
 }
