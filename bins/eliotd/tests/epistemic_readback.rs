@@ -72,11 +72,12 @@ fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
     // Denominator bound to the producer declaration tables in
     // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 23 activated
-    // reads (`ACTIVATED_READS: [ActivatedReadDescriptor; 23]`, declared at
-    // operation_catalogue.rs:334) + 24 activated mutations
-    // (`ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24]`, declared at
-    // operation_catalogue.rs:550) + the genesis bootstrap entry pushed by
-    // `generated_operation_manifests` = 48. The store owner's own count tests in
+    // reads (the `ACTIVATED_READS: [ActivatedReadDescriptor; 23]` declaration,
+    // currently at operation_catalogue.rs:334) + 24 activated mutations (the
+    // `ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24]` declaration,
+    // currently at operation_catalogue.rs:550) + the genesis bootstrap entry
+    // pushed by `generated_operation_manifests` = 48. The store owner's own
+    // count tests in
     // `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`
     // assert the same 48.
     //
@@ -93,9 +94,9 @@ fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     // rather than absorbed into a new number.
     //
     // The declaration line numbers above were re-measured against the current
-    // content of that file on this branch: the same append-driven drift had
-    // already moved them, and `:307`/`:523` had each slid into the preceding
-    // descriptor's doc block instead of its declaration. The backticked
+    // content of `operation_catalogue.rs` on this branch. No superseded
+    // citation is being corrected here: the comment these numbers replaced
+    // cited no line numbers at all. The backticked
     // `ACTIVATED_READS`/`ACTIVATED_MUTATIONS` constructs — not the bare line
     // numbers — are the stable anchor; re-measure before trusting a number here.
     //

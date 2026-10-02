@@ -19,15 +19,21 @@
 //!
 //! # Why the row is keyed by the closure identity
 //!
-//! The key is derived from `(closure_id, closure_revision)` alone. That pair is
-//! what makes the paired `GetAuthorityRevocationHistory` read (and any later
-//! point read of one recorded revocation) a lookup at ONE exact closure
-//! revision rather than a scan for "whatever is current". The durable history
-//! revision is part of the identity on purpose: two records of the same closure
-//! at different durable revisions are two different historical facts, and
-//! collapsing them would let a later revision silently answer for an earlier
-//! one. Nothing else feeds the key, so a caller cannot move the record by
-//! changing an unrelated parameter.
+//! The key is derived from `(closure_id, closure_revision)` alone, because that
+//! is the property this leg actually decides and owns: reading one recorded
+//! revocation back is a point lookup at ONE exact durable closure revision, not a
+//! scan for "whatever is current", so a record can only ever be found at the
+//! durable revision it was recorded at. The durable history revision is part of
+//! the identity on purpose: two records of the same closure at different durable
+//! revisions are two different historical facts — the influence-revocation
+//! contract requires preserving historical decisions and retaining forensic
+//! history (`docs/architecture/I12-20-influence-revocation.md`) — and collapsing
+//! them would let a later revision silently answer for an earlier one. Nothing
+//! else feeds the key, so a caller cannot move the record by changing an
+//! unrelated parameter. No named read is promised here: the paired
+//! `GetAuthorityRevocationHistory` read is served by the Kernel from the
+//! retained P-07 ORS and never reaches this row, so it neither justifies nor
+//! constrains this key.
 //!
 //! The row is create-only. A second commit for the same `(closure_id,
 //! closure_revision)` is refused rather than overwritten, so the owner cannot
@@ -135,7 +141,17 @@ use crate::schema;
 /// this exact closure identity. Classified as a typed semantic/currentness
 /// conflict by `SEMANTIC_CONFLICT_MARKERS` in `apply/atomic_write.rs`, exactly
 /// like the acceptance-set and blackboard create-only siblings.
-const RECORD_CONFLICT: &str = "authority_revocation_record_conflict";
+///
+/// `pub(crate)` SO THAT this crate's own `SEMANTIC_CONFLICT_MARKERS` table, and
+/// its test, can reference THIS SINGLE DEFINITION instead of restating the
+/// literal. Nothing in production consumes the visibility: the marker is
+/// rendered into the statement text by `record_write` below, and the classifier
+/// in `apply/atomic_write.rs` still matches it as a sentinel token. The visibility
+/// exists so a rename or spelling change cannot leave the two halves silently
+/// disagreeing — which would downgrade a deterministic create-only collision
+/// from `ProviderConflict` to an UNKNOWN outcome requiring receipt
+/// reconciliation. It is not a rename and does not change the marker text.
+pub(crate) const RECORD_CONFLICT: &str = "authority_revocation_record_conflict";
 
 /// Versioned `recovery_owner` namespace holding the authority-revocation rows.
 ///
@@ -144,22 +160,22 @@ const RECORD_CONFLICT: &str = "authority_revocation_record_conflict";
 /// `blackboard-item-v1`), not a new table. Defined here rather than in
 /// `eliot-store-api` because this leg introduces the durable row.
 ///
-/// `pub(crate)` SO THAT a future read half reuses THIS constant rather than
-/// re-declaring a second literal: a read half in `apply/read_boundary.rs` will
-/// reach it as
-/// `super::surreal_authority_revocation::AUTHORITY_REVOCATION_RECORD_NAMESPACE`,
-/// the same reuse `read_boundary.rs:506,521` performs for
-/// `eliot_store_api::TASK_CONTRACT_ACCEPTANCE_RECORD_NAMESPACE` (verified at
-/// `read_boundary.rs:506` and `:521`). That read half does not exist yet: the
-/// paired named read `GetAuthorityRevocationHistory` is deliberately and
-/// truthfully unactivated, because the Kernel intercepts it and serves it from
+/// `pub(crate)` SO THAT a future read half, IF AND WHEN ONE IS WRITTEN, reuses
+/// THIS exact constant rather than re-declaring a second literal. No such read
+/// half is planned in this slice and no module is named here as its owner, so
+/// this is a constraint on a future writer, not a statement about where that
+/// code will live. The read boundary's EXISTING reuse of
+/// `eliot_store_api::TASK_CONTRACT_ACCEPTANCE_RECORD_NAMESPACE`
+/// (`read_boundary.rs:506`, `:521`) is the pattern such a writer would follow.
+/// Nothing reads either constant today: the paired named read
+/// `GetAuthorityRevocationHistory` is deliberately and truthfully unactivated,
+/// because the Kernel intercepts it and serves it from
 /// the retained P-07 ORS before the store bridge sees it
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs:10343`, handler
-/// `crates/kernel/eliot-kernel-service/src/owner_history.rs:235`), and nothing
-/// outside this module reads either constant today. The reuse is therefore a
-/// forward obligation, not an observed fact. The sibling constants of the other
-/// two owner records live in `eliot-store-api` only because that crate owned
-/// their rows first; visibility here is crate-internal in the same way
+/// `crates/kernel/eliot-kernel-service/src/owner_history.rs:235`). The reuse is
+/// therefore a forward obligation, not an observed fact. The sibling constants of
+/// the other two owner records live in `eliot-store-api` only because that crate
+/// owned their rows first; visibility here is crate-internal in the same way
 /// `surreal_blackboard::recovery_owner_id` (`apply/surreal_blackboard.rs:164`)
 /// is `pub(crate)` for this crate's own read half.
 pub(crate) const AUTHORITY_REVOCATION_RECORD_NAMESPACE: &str = "authority-revocation-v1";
@@ -171,11 +187,11 @@ pub(crate) const AUTHORITY_REVOCATION_RECORD_NAMESPACE: &str = "authority-revoca
 /// serves: this one names the durable row the authority owner writes.
 ///
 /// `pub(crate)` for the same reason as
-/// [`AUTHORITY_REVOCATION_RECORD_NAMESPACE`]: a future read half in
-/// `apply/read_boundary.rs` must reuse this exact identifier so the read can
-/// never validate a row under a schema string the write half did not write.
-/// That read half does not exist yet, so this is the obligation the visibility
-/// is held for, not a reuse that has already happened.
+/// [`AUTHORITY_REVOCATION_RECORD_NAMESPACE`]: if and when a read half is
+/// written, it must reuse this exact identifier so the read can never validate a
+/// row under a schema string the write half did not write. No such read half is
+/// planned in this slice and no module is named as its owner, so this is the
+/// obligation the visibility is held for, not a reuse that has already happened.
 pub(crate) const AUTHORITY_REVOCATION_RECORD_SCHEMA_V1: &str =
     "eliot.authority.revocation-record.v1";
 
@@ -583,6 +599,177 @@ mod tests {
     }
 
     #[test]
+    fn fence_digest_reproduces_the_producer_derivation_over_the_whole_state_fence() {
+        let fence = test_fence();
+        // WHAT is hashed is pinned here from the PUBLIC building blocks the
+        // producer itself uses, never from the helper under test.
+        //
+        // The Governor derives `fence_digest` as
+        // `canonical_digest(&closure.authority.state_fence)` — `authority_revocation.rs:452`
+        // in `require_recorded_fields_bind_closure` and again `:495` in
+        // `bind_durable_closure_coordinates` (and `:561` on the entry path) —
+        // through `canonical_digest` at `:142`, whose body is exactly
+        // `sha256_hex(canonical_json_bytes(value))` (`:143` and `:146`) over the
+        // `eliot_contracts::{canonical_json_bytes, sha256_hex}` import at `:98`.
+        // `eliot_store_api` re-exports those EXACT two functions rather than
+        // wrapping them (`eliot-store-api/src/lib.rs:16-19`:
+        // `pub use eliot_contracts::{... canonical_json_bytes, sha256_hex}`), so
+        // the producer's two calls and the two calls below are the same
+        // functions on the same canonical bytes; the Governor only maps their
+        // error into `CompositionError::Owner`.
+        //
+        // The expected digest below is WRITTEN from those public functions
+        // rather than obtained from `fence_digest_hex`, which is what makes the
+        // helper's BODY a discriminating variable. Every other test in this
+        // module builds its `fence_digest` fixture value THROUGH
+        // `fence_digest_hex`, and the production comparison compares the caller's
+        // string against the same helper, so before this test an implementation
+        // that hashed only `state_fence.authority_epoch` — silently breaking the
+        // binding to the Governor's `canonical_digest(&closure.authority
+        // .state_fence)` — would have left the entire module green.
+        let expected =
+            sha256_hex(&canonical_json_bytes(&fence).expect("canonical StateFence bytes"));
+        assert_eq!(
+            fence_digest_hex(&fence).expect("fence digest"),
+            expected,
+            "the leg must reproduce the producer's derivation over the WHOLE StateFence"
+        );
+        // The same discriminating statement, named: the authority epoch ALONE is
+        // not the producer's derivation. `StateFence` carries five keys
+        // (`eliot-contracts/src/lib.rs:888-899`), and dropping the other four
+        // would let a row be fenced to one epoch while the producer proved the
+        // full `resource_generation` / `task_revision` / `policy_revision` /
+        // `integration_revision` set.
+        let epoch_only = sha256_hex(
+            &canonical_json_bytes(&fence.authority_epoch).expect("canonical authority-epoch bytes"),
+        );
+        assert_ne!(
+            epoch_only, expected,
+            "the digest must not degenerate to the authority epoch alone"
+        );
+    }
+
+    #[test]
+    fn the_row_is_addressed_by_the_closure_identity_alone_and_stores_the_seven_supplied_values() {
+        let fence = test_fence();
+        // A local closure, not a module helper: the two renders below differ ONLY
+        // in the two parameters the module doc forbids from feeding the key, and
+        // nothing else in this module needs a bare `parameters -> bindings` step.
+        let rendered = |parameters: BTreeMap<String, Value>| {
+            let transition = transition(&fence, parameters);
+            authority_revocation_statements(&transition)
+                .expect("admitted revocation renders")
+                .1
+        };
+        let row_of = |bindings: &Map<String, Value>| -> RecoveryRecord {
+            bindings
+                .get("revocation_record")
+                .and_then(|value| {
+                    serde_json::from_value(value.clone()).expect("row binding decodes")
+                })
+                .expect("row binding")
+        };
+
+        let bindings = rendered(admitted_parameters(&fence));
+        let row = row_of(&bindings);
+
+        // (i) The ADDRESS is pinned. `row.schema` and `row.namespace` are
+        // compared against the declared constants (neither was compared at all
+        // before), and `row.key` is compared against a key derived HERE from the
+        // public building blocks over the closure identity ALONE —
+        // `sha256_hex(canonical_json_bytes(&(closure_id, closure_revision)))`
+        // under this leg's own namespace — rather than against the production
+        // `revocation_record_key`, so the HASHED INPUT SET of the key is now a
+        // discriminating variable and folding any other recorded field into it
+        // fails.
+        assert_eq!(row.namespace, AUTHORITY_REVOCATION_RECORD_NAMESPACE);
+        assert_eq!(row.schema, AUTHORITY_REVOCATION_RECORD_SCHEMA_V1);
+        let identity = canonical_json_bytes(&("revocation-686-01", 9u64))
+            .expect("canonical closure identity bytes");
+        let expected_key = RecoveryRecordKey::new(
+            AUTHORITY_REVOCATION_RECORD_NAMESPACE,
+            format!("revocation_{}", sha256_hex(&identity)),
+        )
+        .expect("expected recovery record key");
+        assert_eq!(row.key, expected_key.key);
+
+        // The forbidden inputs really are outside the key: a record that differs
+        // ONLY in `origin_ref` and `invalidation_reason` lands on the SAME
+        // address and the same durable revision. This is the module doc's "a
+        // caller cannot move the record by changing an unrelated parameter",
+        // stated as an observation over two renders rather than as a claim.
+        let mut moved = admitted_parameters(&fence);
+        moved.insert("origin_ref".to_owned(), json!("root:beta"));
+        moved.insert(
+            "invalidation_reason".to_owned(),
+            json!("SOME_OTHER_TERMINAL_REASON"),
+        );
+        let moved_row = row_of(&rendered(moved));
+        assert_eq!(moved_row.key, row.key);
+        assert_eq!(moved_row.revision, row.revision);
+        assert_eq!(
+            bindings.get("revocation_record_id"),
+            Some(&json!(
+                super::super::surreal_blackboard::recovery_owner_id(&expected_key).expect("row id")
+            ))
+        );
+
+        // (ii) The CONTENT is pinned. `row.payload` is DECODED and every one of
+        // the seven owner-approved fields is asserted BY NAME against the value
+        // that was supplied. The existing positive test only recomputed
+        // `value_digest` from whatever bytes the renderer produced, so a swapped
+        // `origin_ref`/`closure_id`, a dropped `invalidation_reason`, or a
+        // `closure_revision` written as a JSON NUMBER instead of the owner's
+        // decimal STRING all re-digested consistently and passed. No production
+        // helper computes the expectations below: the `fence_digest` expectation
+        // is derived from the same public `canonical_json_bytes` + `sha256_hex`
+        // pair the Governor derives it from, and the payload itself is never
+        // regenerated — the STORED BYTES are read.
+        let payload: Value = serde_json::from_slice(&row.payload).expect("payload bytes decode");
+        assert_eq!(payload.get("origin_ref"), Some(&json!("root:alpha")));
+        assert_eq!(payload.get("closure_id"), Some(&json!("revocation-686-01")));
+        assert_eq!(
+            payload.get("closure_revision"),
+            Some(&json!("9")),
+            "closure_revision travels as the owner's canonical decimal STRING"
+        );
+        assert_eq!(payload.get("affected_digest"), Some(&json!("d".repeat(64))));
+        assert_eq!(
+            payload.get("affected_count"),
+            Some(&json!("3")),
+            "affected_count travels as the owner's canonical decimal STRING"
+        );
+        assert_eq!(
+            payload.get("invalidation_reason"),
+            Some(&json!("KERNEL_REVOCATION_COMMITTED")),
+            "the seventh field is the producer's own recorded value and must not be dropped"
+        );
+        assert_eq!(
+            payload.get("fence_digest"),
+            Some(&json!(sha256_hex(
+                &canonical_json_bytes(&fence).expect("canonical StateFence bytes")
+            )))
+        );
+        // The two counters are strings, not numbers: a numeric spelling would be a
+        // different wire shape than the owner's `u64::to_string()` and would not
+        // compare equal to `json!("9")` / `json!("3")` above, so it is asserted
+        // by type as well to name the property rather than leave it implied.
+        assert!(payload["closure_revision"].is_string());
+        assert!(payload["affected_count"].is_string());
+        // `origin_ref` and `closure_id` hold the values that were SUPPLIED and are
+        // not each other's: swapping them renders a record that binds the wrong
+        // origin to the wrong closure and deep-binds against the durable closure
+        // for a different operation than the one recorded.
+        assert_ne!(payload["origin_ref"], payload["closure_id"]);
+        assert_ne!(payload["origin_ref"], json!("revocation-686-01"));
+        assert_ne!(payload["closure_id"], json!("root:alpha"));
+        // Exactly the seven fields: an eighth minted coordinate (for example a
+        // `RecordedRevocation` shape field) would be adapter-side semantic
+        // defaulting, which `crates/storage/AGENTS.md` forbids.
+        assert_eq!(payload.as_object().map(serde_json::Map::len), Some(7));
+    }
+
+    #[test]
     fn unproven_fence_digest_refuses_before_any_statement_is_rendered() {
         let fence = test_fence();
         let mut parameters = admitted_parameters(&fence);
@@ -636,6 +823,301 @@ mod tests {
         assert!(
             authority_revocation_statements(&fourth).is_ok(),
             "a count above i64::MAX is representable in the payload bytes"
+        );
+    }
+
+    #[test]
+    fn a_second_revocation_command_in_one_transition_is_refused() {
+        let fence = test_fence();
+        let parameters = admitted_parameters(&fence);
+        let mut transition = transition(&fence, parameters.clone());
+        // The closed record is admitted once per transition; a second copy of the
+        // same command is ambiguous about which one owns the row, so it is
+        // refused before any decoding or statement rendering happens.
+        transition.named_operations.push(NamedMutationRequest {
+            operation: NamedMutationOperation::RecordAuthorityRevocation,
+            parameters,
+        });
+        assert_eq!(
+            authority_revocation_statements(&transition),
+            Err(AdapterError::Store(StoreError::Duplicate {
+                field: "authority_revocation.named_operations",
+            }))
+        );
+    }
+
+    #[test]
+    fn a_revocation_presented_under_another_transition_class_is_refused() {
+        let fence = test_fence();
+        let parameters = admitted_parameters(&fence);
+        let mut transition = transition(&fence, parameters);
+        // `RecordAuthorityRevocation` declares `TransitionClass::RecoverySchema`
+        // in the owner catalogue row, which `transition()` already presents. Any
+        // other ceiling is refused: the class is read from the operation's own
+        // declaration, so this leg cannot drift from the owner and a command
+        // smuggled under an unrelated family never reaches the provider.
+        transition.transition_class = TransitionClass::CaptureCandidate;
+        assert_ne!(
+            transition.transition_class,
+            NamedMutationOperation::RecordAuthorityRevocation.transition_class()
+        );
+        assert_eq!(
+            authority_revocation_statements(&transition),
+            Err(AdapterError::Store(StoreError::TransitionClassExceeded))
+        );
+    }
+
+    #[test]
+    fn a_non_string_revocation_parameter_is_refused() {
+        let fence = test_fence();
+        // `null` is the load-bearing case: it substantiates the module
+        // doc's "never coerced, never defaulted" claim. A missing value would be
+        // indistinguishable from a defaulted one, so it is refused rather than
+        // substituted.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert("invalidation_reason".to_owned(), Value::Null);
+        let null_value = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&null_value),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "invalidation_reason",
+                reason: "must be a string, not a null or an untyped value",
+            }))
+        );
+
+        // A number is refused for the same reason and never coerced to text.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert("invalidation_reason".to_owned(), json!(3));
+        let number_value = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&number_value),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "invalidation_reason",
+                reason: "must be a string, not a null or an untyped value",
+            }))
+        );
+    }
+
+    #[test]
+    fn a_blank_or_control_character_revocation_parameter_is_refused() {
+        let fence = test_fence();
+        // Whitespace-only is blank in the owner's sense and never stored as an
+        // empty owner-recorded value.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert("origin_ref".to_owned(), json!("   "));
+        let blank = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&blank),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "origin_ref",
+                reason: "must be a non-blank string without control characters",
+            }))
+        );
+
+        // A non-blank string carrying a control character is refused for the
+        // same reason, so no record ever claims a value the producer refused.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert("closure_id".to_owned(), json!("revocation-686\u{7}01"));
+        let control = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&control),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "closure_id",
+                reason: "must be a non-blank string without control characters",
+            }))
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_counter_spelling_is_refused() {
+        let fence = test_fence();
+        // A leading zero is a malformed spelling of a value the producer emits as
+        // `u64::to_string()`; it is refused rather than normalised into a stored
+        // revision, so the row can never say "9" in one spelling and "09" in
+        // another.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert("closure_revision".to_owned(), json!("09"));
+        let leading_zero = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&leading_zero),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "closure_revision",
+                reason: "must be the canonical decimal string of an unsigned counter",
+            }))
+        );
+
+        // A sign is the same malformed spelling, not a negative number.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert("closure_revision".to_owned(), json!("-1"));
+        let signed = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&signed),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "closure_revision",
+                reason: "must be the canonical decimal string of an unsigned counter",
+            }))
+        );
+
+        // A canonically spelled value beyond `u64` is a different refusal with
+        // its own reason: the digits are well formed, so it must not be reported
+        // as a malformed spelling.
+        let mut parameters = admitted_parameters(&fence);
+        parameters.insert(
+            "affected_count".to_owned(),
+            json!(u64::MAX.to_string() + "0"),
+        );
+        let overflowing = transition(&fence, parameters);
+        assert_eq!(
+            authority_revocation_statements(&overflowing),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "affected_count",
+                reason: "must be a decimal counter that fits an unsigned 64-bit integer",
+            }))
+        );
+    }
+
+    #[test]
+    fn the_create_only_refusal_is_pinned_as_a_structure_not_as_a_fragment() {
+        let fence = test_fence();
+        let transition = transition(&fence, admitted_parameters(&fence));
+        let (sql, _) =
+            authority_revocation_statements(&transition).expect("admitted revocation renders");
+
+        // The positive test above asserts only that the SQL CONTAINS
+        // `CREATE type::record($revocation_table` and CONTAINS the conflict token. Both
+        // substrings survive the two mutations that kill the create-only refusal outright
+        // — `type::is_object($x)` becoming `type::is_string($x)`, and `FROM ONLY` becoming
+        // `FROM` — with every test in this module green. So the GUARD is asserted here as
+        // one contiguous structure: the existence test, the refusal, the `ELSE`, and the
+        // create it guards, in that order and with that exact spelling.
+        let guard = format!(
+            "IF type::is_object($revocation_record_current) {{ THROW '{RECORD_CONFLICT}'; }} \
+             ELSE {{ CREATE type::record($revocation_table, $revocation_record_id) CONTENT {{ \
+             namespace: $revocation_record.namespace, key: $revocation_record.key, \
+             state_fence: $revocation_record.state_fence, revision: $revocation_record.revision, \
+             schema: $revocation_record.schema, payload: <bytes>$revocation_record.payload, \
+             value_digest: $revocation_record.value_digest }};"
+        );
+        assert!(
+            sql.contains(&guard),
+            "the refusal and the row it guards must be rendered as one structure"
+        );
+        // The probe itself: a SINGLE-record point lookup at the exact closure identity.
+        // `ONLY` is load-bearing here — without it the probe answers for whichever record
+        // the scan matched, which is a different question than "does this one durable
+        // closure revision already exist", and it would also be satisfied by a second
+        // record at some other address.
+        assert!(
+            sql.contains(concat!(
+                "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, ",
+                "revision: revision, schema: schema, payload: payload, value_digest: value_digest }",
+                " FROM ONLY type::record($revocation_table, $revocation_record_id)"
+            )),
+            "the guard must probe the exact record, at ONE durable closure revision"
+        );
+        // The guard PRECEDES the create it guards, named on its own so a rendering that
+        // tests for the conflict after the write cannot satisfy the contiguous assertion
+        // above by accident of ordering.
+        let guard_at = sql
+            .find("IF type::is_object(")
+            .expect("the guard is rendered");
+        let create_at = sql
+            .find("CREATE type::record(")
+            .expect("the create is rendered");
+        assert!(
+            guard_at < create_at,
+            "the create-only refusal must be tested before the create, not after it"
+        );
+    }
+
+    #[test]
+    fn an_absent_required_revocation_parameter_is_refused() {
+        let fence = test_fence();
+        // Every other test in this module OVERWRITES a key; none removes one. The
+        // absent-key branch of `declared_text` — the one that refuses with "is a required
+        // owner-approved revocation field" — could therefore be deleted, replaced by a
+        // default, or swapped for the non-string branch with all of them green. Two
+        // fields are removed here, one read early and one read late, so the branch is
+        // shown to be the per-field absence refusal and not an artefact of decode order.
+        let removals: [(&'static str, Value); 2] = [
+            ("closure_id", json!("revocation-686-01")),
+            ("invalidation_reason", json!("KERNEL_REVOCATION_COMMITTED")),
+        ];
+        for (field, value) in removals {
+            let mut parameters = admitted_parameters(&fence);
+            assert_eq!(
+                parameters.remove(field),
+                Some(value),
+                "the admitted fixture supplies {field}, so the map really is missing it"
+            );
+            let missing = transition(&fence, parameters);
+            assert_eq!(
+                authority_revocation_statements(&missing),
+                Err(AdapterError::Store(StoreError::InvalidField {
+                    field,
+                    reason: "is a required owner-approved revocation field",
+                })),
+                "a required owner-approved field that is ABSENT must be refused, not defaulted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_class_gate_admits_exactly_the_class_the_operation_declares() {
+        let fence = test_fence();
+        let parameters = admitted_parameters(&fence);
+        // The class the leg compares against is read from the operation's own declaration.
+        // The expectation below is therefore DERIVED from that declaration and never
+        // restated, and every variant of the ceiling enum is presented, so a gate that
+        // hardcoded any single literal other than the declared one — the drift the class
+        // check's own doc forbids — is refused here for a variant it should have admitted,
+        // while the declared class alone still renders.
+        let declared = NamedMutationOperation::RecordAuthorityRevocation.transition_class();
+        let every_class = [
+            TransitionClass::CaptureCandidate,
+            TransitionClass::Epistemic,
+            TransitionClass::TaskControl,
+            TransitionClass::LifecyclePolicy,
+            TransitionClass::RecoverySchema,
+            TransitionClass::Erasure,
+            TransitionClass::NotificationState,
+            TransitionClass::ReactiveState,
+            TransitionClass::UserAutomation,
+            TransitionClass::InstrumentRegistry,
+        ];
+        for class in every_class {
+            let mut transition = transition(&fence, parameters.clone());
+            transition.transition_class = class;
+            if class == declared {
+                assert!(
+                    authority_revocation_statements(&transition).is_ok(),
+                    "{class:?} is the class the operation declares, so it must render"
+                );
+            } else {
+                assert_eq!(
+                    authority_revocation_statements(&transition),
+                    Err(AdapterError::Store(StoreError::TransitionClassExceeded)),
+                    "{class:?} is not the class the operation declares, so it must be refused"
+                );
+            }
+        }
+        // The declaration the leg reads is named, so a move of this operation to another
+        // family in the owner catalogue cannot pass unnoticed here either.
+        assert_eq!(
+            declared,
+            TransitionClass::RecoverySchema,
+            "the leg reads the operation's declaration; this pins what it currently is"
+        );
+    }
+
+    #[test]
+    fn the_persisted_schema_identifier_is_the_exact_versioned_literal() {
+        // Both existing schema assertions compare the constant against ITSELF, so
+        // changing its VALUE broke nothing: a future read half validates durable rows
+        // under exactly this string, so the literal is asserted against the constant here.
+        assert_eq!(
+            AUTHORITY_REVOCATION_RECORD_SCHEMA_V1, "eliot.authority.revocation-record.v1",
+            "the durable row's schema identifier is pinned by value, not only by reference"
         );
     }
 }

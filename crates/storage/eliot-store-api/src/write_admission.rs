@@ -236,6 +236,10 @@
 //! family column is this inventory's reading of the I5.17 family list; I5.17
 //! itself does not map a named mutation to a family, so the mapping documents
 //! the existing surface rather than making a new activation decision.
+//! The table above is itself incomplete against
+//! `operation_catalogue::ACTIVATED_MUTATIONS`, the governing array: it omits the
+//! activated rows `RecordModuleCatalogSnapshot`, `AdmitMailboxMessage`, and
+//! `RecordAuthorityRevocation`.
 //!
 //! Declared in [`crate::NamedMutationOperation`] but not activated, and therefore
 //! refused pre-stage with `StoreError::UnknownOperation` rather than mapped to a
@@ -281,11 +285,13 @@
 //! and `RecordAuthorityRevocation`. Where the two disagree the array governs.
 //! I5.15's own initial executable set is a contract-denomination list and does
 //! not enumerate named mutations, so the twenty-four rows activate under I5.17
-//! against this crate's proven handler, schema, and consumer triple, with
-//! `RecordAuthorityRevocation` the single narrower exception: its catalogue row,
-//! closed typed-validation arm, and proven per-backend Surreal write leg all
-//! exist, and what is still not proven is the consumer triple of its paired
-//! read, so it is not yet a read-back-proven leg.
+//! against this crate's proven handler, schema, and consumer triple as
+//! ordinary peers, with no narrower row among them: the WRITE row
+//! `RecordAuthorityRevocation` is activated on the same terms as the other
+//! twenty-three, and what remains unproven is the other half of the pair — the
+//! paired READ `GetAuthorityRevocationHistory`, whose read row, proven
+//! per-backend handler and consumer triple do not exist — so the write leg is
+//! activated but not yet read-back-proven.
 //!
 //! # Non-goals
 //!

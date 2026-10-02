@@ -2601,6 +2601,33 @@ mod allocation_classification_tests {
     }
 
     #[test]
+    fn authority_revocation_marker_is_the_one_the_classifier_lists() {
+        use super::super::surreal_authority_revocation::RECORD_CONFLICT;
+
+        // #686 drift guard, other half: the revocation leg renders
+        // `RECORD_CONFLICT` into its `THROW` template while this module's
+        // classifier matches the marker list. Asserting the list holds THAT
+        // constant — not a restated literal — is what makes a rename of the
+        // constant move the list with it, so the two can never drift apart
+        // silently: a real SQL token the classifier does not know would
+        // downgrade a deterministic create-only collision from
+        // `ProviderConflict` to an unknown outcome, which is reconciling
+        // state this crate never blind-retries.
+        assert!(
+            SEMANTIC_CONFLICT_MARKERS.contains(&RECORD_CONFLICT),
+            "the classifier must list the revocation leg's own marker definition"
+        );
+        // The classifier compares provider error TEXT, never Rust symbols, so
+        // the reverse drift is invisible above: a value change keeps the list
+        // membership true while every recorded `THROW` site changes the wire
+        // token. Pin the spelling.
+        assert_eq!(
+            RECORD_CONFLICT, "authority_revocation_record_conflict",
+            "the provider marker text is part of the recorded statement contract"
+        );
+    }
+
+    #[test]
     fn unrecognized_errors_stay_unknown_never_conflict() {
         for error in [
             "connection reset during COMMIT".to_owned(),
@@ -2890,5 +2917,158 @@ mod allocation_classification_tests {
             .expect("a transition naming no revocation operation is not an error");
         assert!(sql.is_empty(), "no statement is contributed");
         assert!(bindings.is_empty(), "no binding is contributed");
+    }
+
+    /// The `transition` fixture with its single `CaptureObservation` command
+    /// replaced by the closed `RecordAuthorityRevocation` command, under the
+    /// transition class and effect ceiling the operation's own catalogue row
+    /// declares.
+    ///
+    /// One helper rather than two copies because BOTH #686 legs need exactly this
+    /// fixture: the positive path needs an admitted revocation to render, and the
+    /// refusal path needs one to collide against. It adapts the existing fixture
+    /// instead of replacing it — the identity, fence, scope and ordering scopes
+    /// stay the shared fixture's, so the assembled transaction still differs from
+    /// its siblings only in the named command. The fixture binds the issue-18
+    /// digests, so they are rebound onto the mutated content instead of left
+    /// stale (`PreparedTransition::validate` recomputes and compares both).
+    fn revocation_transition(operation: &str) -> eliot_store_api::PreparedTransition {
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let mut transition = transition(operation);
+        transition.transition_class = TransitionClass::RecoverySchema;
+        transition.requested_effect_ceiling = EffectClass::ReversibleMutation;
+        transition.named_operations = vec![NamedMutationRequest {
+            operation: NamedMutationOperation::RecordAuthorityRevocation,
+            parameters: BTreeMap::from([
+                ("origin_ref".to_owned(), json!("root:alpha")),
+                ("closure_id".to_owned(), json!("revocation-atomic-01")),
+                // The owner's canonical decimal spelling, non-zero and
+                // representable in the `int` `recovery_owner.revision` column.
+                ("closure_revision".to_owned(), json!("9")),
+                ("affected_digest".to_owned(), json!("d".repeat(64))),
+                ("affected_count".to_owned(), json!("3")),
+                (
+                    "invalidation_reason".to_owned(),
+                    json!("KERNEL_REVOCATION_COMMITTED"),
+                ),
+                // The producer's own derivation of the transition's fence, so
+                // the leg admits the record instead of refusing it as unproven.
+                (
+                    "fence_digest".to_owned(),
+                    json!(eliot_store_api::sha256_hex(
+                        &eliot_store_api::canonical_json_bytes(&fence())
+                            .expect("canonical fence bytes"),
+                    )),
+                ),
+            ]),
+        }];
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
+    }
+
+    #[test]
+    fn authority_revocation_row_commits_in_the_canonical_transaction() {
+        use eliot_store_api::RecoveryRecord;
+        let ctx = context();
+        // #686 positive branch: a transition that DOES name the revocation
+        // operation renders its leg into the canonical transaction — the branch
+        // the inert case above leaves unproven.
+        let transition = revocation_transition("op-revocation-atomic");
+        let plan = plan_apply(&transition, &[], &[], 1, 1).expect("plan applies");
+        let receipt = build_receipt(&ctx, &transition, &plan).expect("receipt builds");
+        let (sql, bindings) = build_apply_statements(
+            &transition,
+            &plan,
+            &receipt,
+            false,
+            1,
+            1,
+            &[],
+            &[],
+            &[],
+            &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+            &ExperienceWrites::default(),
+            &LearningWrites::default(),
+            &InstrumentRegistryWrites::default(),
+        )
+        .expect("statements assemble");
+
+        // The leg's statement text lands in the transaction, carrying the
+        // create-only conflict token that classifies as a semantic conflict.
+        let revocation_create = sql
+            .find("CREATE type::record($revocation_table")
+            .expect("the revocation leg renders its create into the transaction");
+        assert!(
+            sql.contains("authority_revocation_record_conflict"),
+            "the create-only guard travels with the rendered statement"
+        );
+        // All three bindings are installed: every caller-derived byte travels as
+        // a binding, never in the statement text.
+        for name in [
+            "revocation_table",
+            "revocation_record_id",
+            "revocation_record",
+        ] {
+            assert!(
+                bindings.contains_key(name),
+                "the leg installs its {name} binding"
+            );
+        }
+        let row: RecoveryRecord = bindings
+            .get("revocation_record")
+            .and_then(|value| serde_json::from_value(value.clone()).expect("row binding decodes"))
+            .expect("row binding");
+        assert_eq!(
+            row.namespace, "authority-revocation-v1",
+            "the row lands in the revocation namespace"
+        );
+        assert_eq!(
+            row.revision, 9,
+            "the row revision is the owner-recorded closure revision supplied above"
+        );
+        // Atomicity as claimed: the revocation row and the canonical receipt are
+        // assembled into ONE transaction, the row ahead of the receipt create, so
+        // no reader can observe a durable revocation the receipt does not
+        // describe (I5.4: everything commits in one database transaction).
+        let receipt_create = sql
+            .find(schema::TX_CREATE_RECEIPT)
+            .expect("the receipt create closes the boundary");
+        assert!(
+            revocation_create < receipt_create,
+            "the revocation row is assembled before the receipt create"
+        );
+    }
+
+    #[test]
+    fn authority_revocation_leg_refuses_a_colliding_binding() {
+        let transition = revocation_transition("op-revocation-collision");
+        // No other leg in this writer emits `revocation_table`,
+        // `revocation_record_id` or `revocation_record`, so a collision is not
+        // reachable through `build_apply_statements` without fabricating one
+        // there. The guard is proved at its own boundary instead: the leg is
+        // handed a `bindings` map that already holds the names it would install.
+        // All three are pre-loaded so the refusal does not depend on which name
+        // the fragment map yields first.
+        let mut sql = String::new();
+        let mut bindings = Map::from_iter([
+            (
+                "revocation_table".to_owned(),
+                json!(schema::table::RECOVERY_OWNER),
+            ),
+            (
+                "revocation_record_id".to_owned(),
+                json!("recovery_owner:already-bound"),
+            ),
+            ("revocation_record".to_owned(), json!("already-bound")),
+        ]);
+        assert_eq!(
+            append_authority_revocation_statements(&mut sql, &mut bindings, &transition),
+            Err(AdapterError::Serialization(
+                "authority revocation binding collided with a canonical binding".to_owned(),
+            )),
+            "an overwrite of an existing canonical binding is refused, not silent"
+        );
     }
 }

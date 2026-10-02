@@ -545,8 +545,8 @@ struct ActivatedMutationDescriptor {
 /// already-decided closure; committing it records what the authority owner
 /// already fenced and restores no revoked influence). All
 /// activated mutation rows address no store scope, mirroring the scope-free read
-/// descriptors. Every
-/// other mutation stays known-but-unsupported.
+/// descriptors. The one other mutation, `ApplyInstrumentRegistryState`, stays
+/// known-but-unsupported.
 const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,

@@ -174,7 +174,9 @@ const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "revocation operation identit
 /// catalogue.
 ///
 /// The gap that remains is a missing half of the pair, not the gate. This branch
-/// delivers the proven per-backend durable write handler
+/// delivers the per-backend write handler, and what it is proven to do is
+/// RENDER the row inside the canonical transaction - the durable commit itself
+/// is not proven on this slice, and nothing here may be read as claiming it
 /// (`crates/storage/eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
 /// registered in that crate's `apply.rs` and appended into the canonical
 /// transaction by `append_authority_revocation_statements`) and migrates every
@@ -196,8 +198,8 @@ const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "revocation operation identit
 ///
 /// What the value below states is the residual gap exactly as this branch leaves
 /// it: the catalogue gate admits the command and a proven per-backend handler
-/// commits the row, so the remaining gap is a missing READ-BACK rather than a
-/// missing gate. The paired read `GetAuthorityRevocationHistory` still carries no
+/// renders the row into the canonical transaction, so the remaining gap is a missing READ-BACK
+/// rather than a missing gate. The paired read `GetAuthorityRevocationHistory` still carries no
 /// consumer triple, because the Kernel serves it from the retained P-07 ORS
 /// before the store bridge sees it, and nothing on this branch executes the
 /// store end to end, so a resumed revocation is not yet proved to commit. The
@@ -212,10 +214,10 @@ const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "revocation operation identit
 /// without naming the blocker would present an unfinished obligation as a
 /// handled one.
 pub const AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED: &str = "canonical second phase cannot complete: the Store catalogue now admits \
-     NamedMutationOperation::RecordAuthorityRevocation and a proven per-backend handler commits the \
-     row, but the paired read GetAuthorityRevocationHistory has no consumer triple because the \
-     Kernel serves it from the retained P-07 ORS, so a resumed revocation is not yet proved to \
-     commit end to end and the obligation stays pending instead of becoming a recorded revocation";
+     NamedMutationOperation::RecordAuthorityRevocation and a proven per-backend handler renders the row \
+     into the canonical transaction, but the paired read GetAuthorityRevocationHistory has no consumer \
+     triple because the Kernel serves it from the retained P-07 ORS, so a resumed revocation is not yet \
+     proved to commit end to end and the obligation stays pending instead of becoming a recorded revocation";
 
 /// One grant the recovered owner graph names, captured before the composition
 /// lock is released.
@@ -271,7 +273,7 @@ impl AuthorityRevocationIngressPlan {
 /// the Governor drive itself works, and what is missing is the store-side read
 /// back of the record it can now write.
 /// The `admission` field records what the maintenance-request owner did with
-/// obligation: only a [`PendingRevocationAdmission::Admitted`] row carries
+/// the obligation: only a [`PendingRevocationAdmission::Admitted`] row carries
 /// owner authority; a refused row is a non-authoritative diagnostic of a still
 /// pending obligation.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -62,11 +62,17 @@
 //! WRITE leg has since landed too
 //! (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
 //! appended into the canonical atomic transaction by
-//! `append_authority_revocation_statements`), so the envelope this module
-//! emits now reaches a durable create-only `recovery_owner` row. Committing
-//! that row still records only the closure the authority owner already
-//! committed and durably fenced, and grants no re-grant, restoration, or
-//! support.
+//! `append_authority_revocation_statements`), so an envelope this module
+//! renders through [`authority_revocation_envelope`] and
+//! `finish_canonical_revocation` is RENDERED into the canonical transaction as
+//! a create-only `recovery_owner` statement. Rendering is the whole proven
+//! contract of this slice: the leg is wired, and it is not committed. No code
+//! on this tree drives a revocation envelope end to end through that leg, and
+//! the durable precondition it would need — a Kernel-ORS-committed `Revoked`
+//! `GrantClosureReceipt` at the live composition fence — has no production
+//! producer. Should that row ever be committed it still records only the
+//! closure the authority owner already committed and durably fenced, and
+//! grants no re-grant, restoration, or support.
 //! What is still open is the consumer triple of the PAIRED READ, and this
 //! module's decision edge cannot supply it: `GetAuthorityRevocationHistory`
 //! remains known-but-unsupported at that gate and still fails closed with

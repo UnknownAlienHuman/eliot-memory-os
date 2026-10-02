@@ -9646,10 +9646,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// must not be synthesized here.
     ///
     /// Owning work: #1110, "[authority/kernel] Connect G-01 grant and
-    /// introduction lifecycle to the real P-07 owner" (OPEN), whose acceptance
-    /// criteria require "a real non-test `P07AuthorityPort` implementation and
-    /// one production composition caller" and which found, at its audited base,
-    /// that `activate_grant`/`revoke_grant` had no production caller.
+    /// introduction lifecycle to the real P-07 owner". Its acceptance text is
+    /// deliberately not quoted here, because this measurement does not read it
+    /// and a restatement of it is not evidence. What is measured on this tree,
+    /// and is therefore the part of that work still outstanding for this arm,
+    /// is three things: the production ingress that presents an owner-published
+    /// revocation decision to [`Self::apply_authority_request`]; a
+    /// daemon-reachable `GrantClosureReceiptPort` for the second port argument
+    /// of that same callerless entry, which has no daemon-reachable
+    /// implementation; and a durable owner-published revocation DECISION
+    /// record. The `P07AuthorityPort` half is no longer outstanding, and
+    /// quoting a criterion that demands "a real non-test `P07AuthorityPort`
+    /// implementation" as still owed by #1110 would be false: two real
+    /// non-test implementations already exist — `KernelAuthorityClient` in the
+    /// daemon binary and the in-Kernel `GrantActivationPort` — behind a
+    /// production factory in the daemon composition root. What remains for this
+    /// arm is the ingress and the durable decision behind it, not the port
+    /// adapter.
     ///
     /// CITATION CORRECTION: the earlier "(#1692)" here was unsupported as the
     /// owner of THIS gap. `gh issue view 1692` is "[I14-audit] Enforce
@@ -9787,11 +9800,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// closed Store catalogue is no longer the place it starts. Issue #686
     /// activated the `RecordAuthorityRevocation` row, so a well-formed
     /// canonical commit is admitted and typed-validated at that gate instead of
-    /// failing closed there, and the proven per-backend durable WRITE handler
+    /// failing closed there, and it wired the per-backend WRITE handler
     /// (`crates/storage/eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
-    /// registered in that crate's `apply.rs` and appended into the canonical
-    /// atomic transaction by `append_authority_revocation_statements`) gives it
-    /// a durable create-only `recovery_owner` row.
+    /// registered in that crate's `apply.rs`, appended into the canonical
+    /// atomic transaction by `append_authority_revocation_statements`) into this
+    /// leg. That handler RENDERS a create-only `recovery_owner` row as part of
+    /// the one canonical transaction. What it does not yet do is COMMIT the
+    /// row: no real-Surreal edge proof of this leg exists yet, so the rendered
+    /// statements are unit-proven while the commit is not, and nothing here
+    /// may be described as a durable row until such a proof exists. No
+    /// production code drives a revocation envelope end to end through this leg
+    /// either; the render is what this branch proves, not the durable write.
     ///
     /// What remains absent is the CONSUMER TRIPLE of the PAIRED READ, and that
     /// is the whole of the remaining gap. `GetAuthorityRevocationHistory` is
