@@ -323,6 +323,16 @@ fn snapshot_serialization_error(_error: serde_json::Error) -> StoreError {
 /// variant that can carry foreign text is replaced with bounded static text,
 /// and every typed variant — whose fields are already static or bounded digests
 /// — passes through unchanged, so no typed failure is collapsed.
+///
+/// It replaces by value, not by type name: the whole `String` is dropped and the
+/// static reason substituted, so the emitted error carries a class label and
+/// never the message, whatever the message was. Every owner validation reached
+/// from this module routes through here, which is what makes that true rather
+/// than merely intended — `CanonicalEvent::validate` reaches
+/// `ordering_link_hash`, whose `canonical_json_bytes` failure is
+/// `StoreError::Serialization(error.to_string())` in
+/// `eliot-store-api::canonical_event`, and a provider row is what supplies the
+/// bytes that message describes.
 fn redact_snapshot_error(error: StoreError) -> StoreError {
     match error {
         StoreError::Serialization(_) => {
@@ -395,17 +405,45 @@ fn ecxf_response_ceiling() -> Result<ResponseCeiling, StoreError> {
 
 /// Re-proves the response bound a continuation's provider read runs under.
 ///
-/// The retained [`SnapshotState::response_ceiling_bytes`] is the bound the
-/// capture was opened with. Every later provider read re-issues it from the same
-/// retained admitted budget and is refused when that derivation would be
-/// *weaker* than the retained one, so a page or close can never be served under
-/// a laxer response envelope than the capture it continues.
+/// **What this guarantees.** Two things, and only these two:
+///
+/// 1. The bound this call's provider read actually runs under is re-derived
+///    here, by [`capture_response_ceiling`] over the retained
+///    [`SnapshotState::begin`], rather than copied out of the retained
+///    [`SnapshotState::response_ceiling_bytes`]. A retained number is never
+///    served under on its own authority.
+/// 2. That retained bound is refused when it *exceeds* the owner's session-wide
+///    admitted ceiling, [`ResponseCeiling::session_wide`].
+///
+/// **Why the two sides of the comparison are independent.** The left side,
+/// `state.response_ceiling_bytes`, has exactly one input: the retained
+/// caller-admitted per-capture budget `state.begin.bounds.max_bytes`, through
+/// [`capture_response_ceiling`]. The right side, `ResponseCeiling::session_wide`,
+/// takes no arguments at all and is a `const fn` derived from the single
+/// owner-issued `eliot_store_api::MAX_SNAPSHOT_BYTES` plus the fixed protocol
+/// envelope, in a different module (`client::rpc_parse`). Nothing the caller
+/// supplies to this capture reaches that expression.
+///
+/// The comparison this replaces was a tautology and could not fail. Both of its
+/// sides were `state.begin.bounds.max_bytes + SNAPSHOT_PROTOCOL_ENVELOPE_BYTES`
+/// — the retained field had been computed by [`capture_response_ceiling`] over
+/// the very same `request` that was then moved into `state.begin` and never
+/// reassigned — so it evaluated `k + 65536 < k + 65536`, and both its refusal arm
+/// and its `?` arm were unreachable. Comparing the retained bound against a
+/// second derivation *of itself* would have kept the overstated guarantee and
+/// no guard at all.
+///
+/// **Direction.** This only ever refuses. It never widens a bound, never alters
+/// the returned ceiling, and never raises the admitted budget. The refusal is
+/// the same typed error this function already returned —
+/// [`StoreError::InvalidField`] on `snapshot.response_ceiling_bytes` — not a new
+/// variant, not a renamed one and not a warning.
 fn require_capture_response_ceiling(state: &SnapshotState) -> Result<ResponseCeiling, StoreError> {
     let ceiling = capture_response_ceiling(&state.begin)?;
-    if ceiling.max_bytes() < state.response_ceiling_bytes {
+    if state.response_ceiling_bytes > ResponseCeiling::session_wide().max_bytes() {
         return Err(StoreError::InvalidField {
             field: "snapshot.response_ceiling_bytes",
-            reason: "continuation would issue a provider read under a weaker response ceiling than this capture was opened with",
+            reason: "retained capture response ceiling exceeds the owner session-wide admitted response ceiling",
         });
     }
     Ok(ceiling)
@@ -584,7 +622,7 @@ pub(crate) enum CanonicalSourceClass {
     /// `GENERATION_V2` today, and the v2 baseline (`schema.rs`) defines exactly
     /// the eleven tables this enumeration reads: the two
     /// [`CanonicalSourceClass::CapturePoint`] rows plus the nine
-    /// [`CanonicalSourceClass::Member`] rows. The twelve classes below are not
+    /// [`CanonicalSourceClass::Member`] rows. The sixteen classes below are not
     /// among them. Reading a table the admitted generation does not define
     /// inside one `BEGIN … COMMIT` batch aborts the whole transaction (see the
     /// recorded provider observations in `apply/read_boundary.rs`), so capturing
@@ -613,7 +651,7 @@ pub(crate) enum CanonicalSourceClass {
 /// policy and configuration snapshots, required pending operational state,
 /// purge ledger, Architecture revision digest, manifest, and checksums." This
 /// enumeration is the bounded-surreal-adapter's share of that list: the nine
-/// admitted canonical tables, the two point singletons, and the twelve classes
+/// admitted canonical tables, the two point singletons, and the sixteen classes
 /// the admitted generation does not define.
 pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::CapturePoint {
@@ -732,6 +770,19 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::AUTOMATION_REVISION,
     },
+    // `automation_normalization` (issue #2865) is declared by the single owner
+    // and keyed by the UNIQUE `(automation_id, revision)` identity its own DDL
+    // declares, but that DDL ships in `schema::AUTOMATION_TABLES_DDL` — an
+    // additive delta applied explicitly by its owner, never by a generation
+    // baseline. Both admitted baselines (`SCHEMA_DDL_V2` / `SCHEMA_DDL_V3`)
+    // therefore contain no `DEFINE TABLE automation_normalization`, so a
+    // captured disposition would fail this census's own
+    // "captured class is not defined by the admitted generation" arm and a
+    // read would abort the member transaction on an admitted store. It is
+    // declared, not captured, exactly like its automation siblings above.
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_NORMALIZATION,
+    },
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::AUTOMATION_CURRENT,
     },
@@ -822,15 +873,27 @@ fn admitted_generation_ddl(generation: &str) -> Option<&'static str> {
 /// `expected_schema_generation` and that `begin_snapshot` re-checks the observed
 /// generation against, so a capture never runs against another generation, and
 /// this census is therefore run against that same generation's baseline. Only
-/// that baseline is evidence of what a capture may read: the superseded
-/// first-generation baseline is deliberately *not* consulted, even though it is a
-/// strict superset of the v2 table set — it defines `erasure_intent`,
-/// `erasure_outcome`, `notification_record`, `reactive_session`,
-/// `resource_snapshot`, the three captured automation tables, `experience_bank`
-/// and `experience_feedback`, so OR-ing it in would make every one of those
-/// declared classes read as admitted and the census would refuse every capture
-/// before any provider I/O. The marker carries the trailing space, so
-/// `relation_record_extra` can never satisfy `relation_record`.
+/// that baseline is evidence of what a capture may read.
+///
+/// The superseded first-generation baseline is deliberately *not* consulted, and
+/// it is **not** a superset of the v2 table set as an earlier revision of this
+/// comment claimed: `schema::SCHEMA_DDL` (`schema.rs:199`) defines only the nine
+/// tables — `schema_meta`, `write_receipt`, `revision_head`, `ordering_head`,
+/// `canonical_event`, `projection_record`, `relation_record`, `outbox_event`,
+/// `canonical_fence` — and v2 adds `recovery_owner` and `recovery_job` on top of
+/// it, so it is a strict *subset*. It therefore defines **none** of the
+/// [`CanonicalSourceClass::OutsideAdmittedGeneration`] tables: `erasure_intent`
+/// and `erasure_outcome` ship in `schema::ERASURE_TABLES_DDL` (`schema.rs:284`),
+/// `notification_record` in `schema::NOTIFICATION_TABLES_DDL` (`schema.rs:313`),
+/// `reactive_session` and `resource_snapshot` in `schema::REACTIVE_TABLES_DDL`
+/// (`schema.rs:331`), the automation and experience families in
+/// `schema::AUTOMATION_TABLES_DDL` (`schema.rs:364`) and
+/// `schema::EXPERIENCE_TABLES_DDL` (`schema.rs:413`). OR-ing it in would
+/// therefore reclassify nothing; what actually keeps those sixteen classes
+/// outside the admitted generation is that neither `schema::SCHEMA_DDL_V2`
+/// (`schema.rs:450`) nor `schema::SCHEMA_DDL_V3` (`schema.rs:520`) contains any
+/// of them. The marker carries the trailing space, so `relation_record_extra` can
+/// never satisfy `relation_record`.
 ///
 /// The v3 baseline is additive over v2 and re-defines the two erasure tables, so
 /// a bridge that ever admits v3 must give those two classes a captured
@@ -1164,10 +1227,12 @@ struct SnapshotState {
     /// Issued once at begin from the capture's own admitted `bounds.max_bytes`
     /// plus the fixed registry's protocol envelope (see
     /// [`capture_response_ceiling`]) and retained here, so every later page and
-    /// close read is re-proved against it by
-    /// [`require_capture_response_ceiling`]. This is the "snapshot profile" half
-    /// of audit requirement 3: the response bound that actually governed the
-    /// transport is a property of the retained capture, not an implicit global.
+    /// close read re-derives its own bound from this capture's admitted budget
+    /// and refuses this retained value when it exceeds the owner's session-wide
+    /// admitted ceiling (see [`require_capture_response_ceiling`]). This is the
+    /// "snapshot profile" half of audit requirement 3: the response bound that
+    /// actually governed the transport is a property of the retained capture, not
+    /// an implicit global.
     /// `SnapshotEndReceipt` is a frozen `eliot-store-api` type with no field for
     /// it and is outside this leaf's mutable scope, so the bound is bound on the
     /// retained record the receipt's accounting is derived from.
@@ -2695,7 +2760,7 @@ fn resolve_member_references(
             };
             let mut member = member;
             member.reference_digest = reference;
-            member.validate()?;
+            member.validate().map_err(redact_snapshot_error)?;
             members.push((class.token, domain_key(class.domain), member));
         }
     }
@@ -2708,18 +2773,44 @@ fn resolve_member_references(
 /// every `SnapshotMemberType::Reference` member must name the exact
 /// `content_digest` of another member in the same capture.
 ///
-/// It is not a second, independent proof of closure, and the two checks it does
-/// run are not equal in strength. The closure itself is discharged by the
-/// key-index resolution in [`resolve_member_references`], which refuses a typed
-/// edge whose target is absent from the observed rows; and the
-/// reference/member-type coupling is discharged by the `member.validate()` that
-/// every member already passed on the way out of that same function. What is
-/// left here, and what the key index genuinely cannot express, is the
-/// self-reference case: a `Reference` member whose own `content_digest` is the
-/// digest it claims to point at, which would make an edge its own target. The
-/// missing-reference arm is retained so the invariant is checked at the point
-/// the closure is claimed, not only at the point the member is built.
+/// **The census arm is the proof.** Every typed edge this census declares must
+/// name a table the census itself captures as a member class. The two sides of
+/// that comparison are two different declarations, not one declaration counted
+/// twice: the expected side is the set of tables carrying a
+/// [`CanonicalSourceClass::Member`] disposition, the observed side is each
+/// [`MemberReference::target_table`]. The arm can fail, and it fails closed.
+///
+/// It is the closure check that was missing. [`verify_canonical_source_classes`]
+/// proved only that a declared target is *defined by the admitted generation's
+/// baseline* — and a capture-point singleton (`schema_meta`, `canonical_fence`)
+/// is defined by that baseline while never being a member, so a `Reference`
+/// aimed at one passed the census and could never resolve. Previously nothing
+/// refused it: with rows present the capture died per row inside
+/// [`resolve_member_references`], and with the referencing class empty it was
+/// never noticed at all.
+///
+/// **The member-level arms are not the proof and cannot be.** The `present` set
+/// is built from the same `members` slice the loop iterates, and each
+/// `reference_digest` was resolved in [`resolve_member_references`] out of the
+/// same observed rows, so `present.contains(reference)` holds by construction and
+/// that arm can never fire. It is retained as a re-check at the point the closure
+/// is claimed, alongside the two arms that can: a `Reference` member with no
+/// digest, and a `Reference` member whose own `content_digest` is the digest it
+/// claims to point at, which would make an edge its own target.
 fn validate_reference_closure(members: &[SnapshotMember]) -> Result<(), StoreError> {
+    let captured_tables: BTreeSet<&'static str> =
+        captured_member_classes().map(|class| class.table).collect();
+    for class in captured_member_classes() {
+        let Some(reference) = class.reference.as_ref() else {
+            continue;
+        };
+        if !captured_tables.contains(reference.target_table) {
+            return Err(StoreError::InvalidField {
+                field: SNAPSHOT_CLASS_FIELD,
+                reason: "declared reference target is not a captured canonical source class",
+            });
+        }
+    }
     let present: BTreeSet<&str> = members
         .iter()
         .map(|member| member.content_digest.as_str())
@@ -2852,7 +2943,7 @@ fn observed_revision_head(
     point: &CapturePoint,
 ) -> Result<RevisionHead, StoreError> {
     let head: RevisionHead = row_body(row, SCOPE_PROJECTION_FIELD)?;
-    head.validate()?;
+    head.validate().map_err(redact_snapshot_error)?;
     if head.state_fence != point.state_fence {
         return Err(StoreError::FenceMismatch);
     }
@@ -2868,7 +2959,7 @@ fn observed_ordering_head(
     point: &CapturePoint,
 ) -> Result<OrderingHead, StoreError> {
     let head: OrderingHead = row_body(row, SCOPE_PROJECTION_FIELD)?;
-    head.validate()?;
+    head.validate().map_err(redact_snapshot_error)?;
     if head.state_fence != point.state_fence {
         return Err(StoreError::FenceMismatch);
     }
@@ -2910,7 +3001,7 @@ fn observed_events(
     let mut events = observed_class_rows(class_rows, crate::schema::table::CANONICAL_EVENT)
         .map(|row| {
             let event: CanonicalEvent = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
-            event.validate()?;
+            event.validate().map_err(redact_snapshot_error)?;
             if row_index(row, ECXF_SOURCE_RECORD_FIELD, "event_id")? != event.event_id.as_str() {
                 return Err(StoreError::IdentityConflict);
             }
@@ -2949,7 +3040,7 @@ fn observed_projections(
     let mut projections = observed_class_rows(class_rows, crate::schema::table::PROJECTION_RECORD)
         .map(|row| {
             let record: ProjectionPublicationRecord = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
-            record.validate()?;
+            record.validate().map_err(redact_snapshot_error)?;
             if row_index(row, ECXF_SOURCE_RECORD_FIELD, "publication_id")?
                 != record.publication_id.as_str()
             {
@@ -2976,7 +3067,7 @@ fn observed_receipts(
     let mut receipts = observed_class_rows(class_rows, crate::schema::table::WRITE_RECEIPT)
         .map(|row| {
             let receipt: WriteReceipt = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
-            receipt.validate()?;
+            receipt.validate().map_err(redact_snapshot_error)?;
             if row_index(row, ECXF_SOURCE_RECORD_FIELD, "operation_id")?
                 != receipt.operation_id.as_str()
             {
@@ -3951,7 +4042,7 @@ fn build_end_receipt(
         completeness,
         validation_revision: SNAPSHOT_VALIDATION_REVISION,
     };
-    receipt.validate()?;
+    receipt.validate().map_err(redact_snapshot_error)?;
     Ok(receipt)
 }
 
@@ -4476,7 +4567,7 @@ fn serve_next_page(
         predecessor_digest: state.last_digest.clone(),
         next_cursor,
     };
-    page.validate()?;
+    page.validate().map_err(redact_snapshot_error)?;
     page.validate_for_begin(&state.begin)
         .map_err(redact_snapshot_error)?;
     let page_digest =
