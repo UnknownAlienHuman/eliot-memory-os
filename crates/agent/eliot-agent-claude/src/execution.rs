@@ -8,10 +8,15 @@
 //! [`ClaudeSidecarRequest`](crate::ClaudeSidecarRequest), the sealed X2
 //! [`ProcessRequest`](eliot_process::ProcessRequest), a credential
 //! [`SecretRef`](eliot_process::SecretRef) reference (never a raw secret),
-//! the prior idempotency record, the [`UnknownOutcomeGate`](crate::UnknownOutcomeGate),
-//! and the I6.5 `BridgeContract` declaration bound to the exact admitted route
-//! generation. Every rejection happens before any process or credential
-//! acquisition.
+//! the prior idempotency record and the
+//! [`UnknownOutcomeGate`](crate::UnknownOutcomeGate). From those, `prepare`
+//! derives the I6.5 [`BridgeContract`](eliot_contracts::BridgeContract)
+//! declaration bound to the exact admitted route generation and validates the
+//! declaration's own completeness. That declaration is derived here, not
+//! issued by an owner, so it is a completeness check rather than an admission
+//! gate; [`crate::bridge_contract`] records the named ceiling and the missing
+//! declaration issuer. Every rejection happens before any process or
+//! credential acquisition.
 //!
 //! [`ClaudeSidecarFactory`] then drives exactly one immutable sidecar
 //! generation through the shared
@@ -376,14 +381,25 @@ pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, Claude
     .map_err(map_agent_contract)?;
     input.admitted.validate().map_err(map_agent_contract)?;
     input.descriptor.validate_for(&input.binding)?;
-    // I6.5 (issue #1797 A1/W5): this is the consuming gate for the Claude
-    // sidecar declaration. The contract is derived from the exact admitted
-    // descriptor and the exact route of the admitted attempt - the route
-    // `validate_execution_binding` just proved equal to the bound route - and
-    // then re-validated against that same pair, so a declaration presented for
-    // another route generation cannot pass. The refusal lands before the
-    // sealed process binding is consumed and before any operation identity,
-    // credential or task decision exists.
+    // I6.5 (issue #1797 A1/W5): derive the Claude sidecar declaration from the
+    // exact admitted descriptor and the exact route of the admitted attempt,
+    // then validate the declaration itself.
+    //
+    // This is a DECLARATION-COMPLETENESS check, not a generation gate, and it
+    // is not claimed to be one. No owner-issued declaration is presented at
+    // this layer: `ClaudeFactoryInput` carries no contract field, and the
+    // declaration is built from the same two values
+    // `validate_claude_route`, `validate_execution_binding` and
+    // `ClaudeAdapterDescriptor::validate_for` have already proved mutually
+    // equal and current. Every binding branch inside
+    // `validate_claude_adapter_contract` is therefore implied, and deleting
+    // this call changes no outcome. What it still refuses is a declaration
+    // whose declared metadata is incomplete or malformed - the
+    // `BridgeContract::validate` field groups that construction does not
+    // itself check - and a route whose owner digest cannot be recomputed. The
+    // refusal is typed and lands before the sealed process binding is consumed
+    // and before any operation identity, credential or task decision exists.
+    // `crate::bridge_contract` names the missing declaration issuer.
     let admitted_route = &input.admitted.route;
     let contract =
         crate::bridge_contract::claude_adapter_contract(&input.descriptor, admitted_route)

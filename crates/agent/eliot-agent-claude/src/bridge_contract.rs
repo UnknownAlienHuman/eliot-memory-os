@@ -12,13 +12,48 @@
 //! ([`eliot_agent_api::route_fingerprint_digest_for`]), not to a mutable README
 //! or a self-reported version alone.
 //!
-//! Consuming gate: [`crate::execution::prepare`], the factory admission owner
-//! that already refuses a stale descriptor revision and a descriptor route
-//! that differs from the bound one, builds the declaration from that exact
-//! admitted descriptor and the admitted attempt's route and re-validates it
-//! against that same pair before the sealed process binding is consumed. The
-//! refusal is typed and lands before any operation identity, credential or
-//! task decision exists.
+//! ## Named ceiling: no owner-issued declaration is presented at this layer
+//!
+//! The only consumer of this module is [`crate::execution::prepare`]. It
+//! DERIVES the declaration from `(&input.descriptor, &input.admitted.route)`
+//! and validates it against that same pair, so every binding check inside
+//! [`validate_claude_adapter_contract`] is already implied by checks that ran
+//! earlier on the admit path:
+//!
+//! - [`crate::execution::validate_claude_route`] and
+//!   [`crate::execution::validate_binding_for_claude`] fix the bound route to
+//!   the Claude sidecar route;
+//! - `validate_execution_binding` calls
+//!   `ProviderExecutionBinding::validate_against_attempt`, which proves
+//!   `input.admitted.route == input.binding.route`;
+//! - [`crate::execution::ClaudeAdapterDescriptor::validate_for`] proves
+//!   `input.descriptor.route == input.binding.route` and that the adapter id
+//!   and factory revision are current.
+//!
+//! Deleting the `validate_claude_adapter_contract` call in `prepare` therefore
+//! changes no outcome. This module is therefore NOT an admission gate and
+//! claims no rejection of a declaration presented for another route
+//! generation.
+//!
+//! What the call does check is real but narrower: [`BridgeContract::validate`]
+//! over the fourteen declared-metadata field groups that construction does not
+//! itself validate, and the owner-digest recomputation. Those are
+//! declaration-completeness and constant-regression refusals. They are kept
+//! because the issue requires an unknown required metadata item to remain a
+//! qualification gap rather than be filled in, and because the refusal is
+//! typed and lands before any operation identity, credential or task decision
+//! exists.
+//!
+//! The missing owner is a bridge-declaration issuer: a composition or registry
+//! owner (the #874 native-worker adapter registry, or a versioned deployment
+//! declaration loaded the way `eliot-agent-bridge` loads
+//! `AgentBridgeClientDeclaration`) that holds this `BridgeContract` as
+//! independently versioned, artifact/config/route-generation-bound data and
+//! presents it to `prepare` as an input. Until that owner exists, the I6.5
+//! declaration cannot be authoritatively checked in this crate. No generation,
+//! fence, epoch, capability or owner-signed handle is invented here to stand in
+//! for it, and no validation in this module or in `prepare` was weakened to
+//! reach this conclusion.
 
 use eliot_agent_api::{RouteFingerprint, route_fingerprint_digest_for};
 use eliot_contracts::{
@@ -142,15 +177,28 @@ pub fn claude_adapter_contract(
     })
 }
 
-/// Validates the Claude adapter contract against the admitted descriptor and
-/// route.
+/// Validates the Claude adapter declaration against the descriptor and route it
+/// was derived from.
 ///
-/// The contract's bridge identity must match the descriptor's adapter id, the
-/// descriptor must be the current factory revision for the exact route, the
-/// descriptor route must equal the presented route, and the contract's
-/// admitted binding digest must equal the digest recomputed from that exact
-/// route. Any mismatch is a contract-binding failure: a well-formed contract
-/// for a different route is not a pass.
+/// For any caller presenting an arbitrary triple this is exact: the bridge id
+/// must equal the descriptor adapter id, the descriptor must carry the current
+/// Claude adapter id and factory revision, the descriptor route must equal the
+/// presented route, and the declared admitted binding digest must equal the
+/// route owner's digest recomputed over that exact route.
+///
+/// For the one in-repo caller, [`crate::execution::prepare`], the binding
+/// branches are implied rather than load-bearing. `prepare` derives the
+/// declaration from this same `(descriptor, route)` pair, and
+/// [`crate::execution::validate_claude_route`],
+/// `validate_execution_binding` and
+/// [`crate::execution::ClaudeAdapterDescriptor::validate_for`] have already
+/// proved those three values mutually equal and current. What remains genuinely
+/// capable of refusing here is
+/// [`eliot_contracts::BridgeContract::validate`] over the declared metadata
+/// that construction does not itself check, plus the owner-digest
+/// recomputation. It cannot refuse a declaration presented for another route
+/// generation, because no such declaration is presented: see the named ceiling
+/// in the module documentation.
 pub fn validate_claude_adapter_contract(
     contract: &BridgeContract,
     descriptor: &ClaudeAdapterDescriptor,
