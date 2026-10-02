@@ -1,3 +1,4 @@
+use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::{
     CognitiveProjectionCoordinatorHandle, CueIndexService, InjectionPlanner, MetacognitionService,
     PredictionService, TouchedSetRegistry, UlDependencyService, UlLedgerService,
@@ -8,7 +9,7 @@ use eliot_types::{
     CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
     ProjectCharter, ProjectId, ProjectUnderstandingEvidence, SessionId, SubsystemCapsule,
     SystemMap, TaskId, UlInjectionMode, UlMetacognitionView, UlTaskExperimentAssignment,
-    path_matches_boundary, ul_token_estimate,
+    path_matches_boundary,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -304,7 +305,7 @@ impl UlRuntime {
                 "purpose": concept.purpose,
                 "boundary_paths": concept.boundary_paths,
             });
-            units = units.saturating_add(ul_token_estimate(&concept_value.to_string()));
+            units = units.saturating_add(ul_token_estimate(&concept_value.to_string())?);
             concept_values.push(concept_value);
             danger.extend(concept.hotspot_refs.iter().cloned());
             danger.extend(concept.invariant_refs.iter().cloned());
@@ -321,7 +322,7 @@ impl UlRuntime {
             }
             let freshness_name = if capsule_stale { "stale" } else { "fresh" };
             let rendered = render_capsule_with_dirty(capsule, &self.project_root, dirty);
-            let payload_units = ul_token_estimate(&rendered);
+            let payload_units = ul_token_estimate(&rendered)?;
             let mut value = json!({
                 "ref": format!("capsule:{}", capsule.capsule_id),
                 "freshness": freshness_name,
