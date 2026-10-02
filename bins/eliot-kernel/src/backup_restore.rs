@@ -4292,9 +4292,17 @@ fn check_purge_revision_closure(
     // revision may be the owner's own "nothing was applied" zero. This arm is
     // about the entries the archive actually carries: an archive carrying none
     // has no per-entry revision to expect, and `applied` is then empty by
-    // construction because it is built only by iterating `entries`. A
-    // completeness check is never performed against a copy of the caller's own
-    // list, in this arm or the other.
+    // construction because it is built only by iterating `entries`.
+    //
+    // WHAT THIS ARM DOES *NOT* CLAIM (corrected after review): `applied` is
+    // built one-for-one by iterating `entries` at `apply_purge_entries`, so
+    // comparing their LENGTHS is a check against a copy of the same list and
+    // cannot fail. That vacuous half is removed below rather than presented as
+    // corroboration. The only load-bearing half is the zero-revision test,
+    // which reads a value the owner minted. An archive carrying entries always
+    // reaches the comparison (the absent-owner path refuses earlier in
+    // `apply_purge_entries`), and a PRODUCTION execution that holds the owner
+    // always answers, so its comparison is untouched.
     if owner_revision.is_none() && entries.is_empty() {
         // The ONLY case where the owner comparison below cannot be a
         // corroboration: an archive that carries no purge entry, executed by a
@@ -4318,7 +4326,12 @@ fn check_purge_revision_closure(
         // that holds the owner always answers, so its comparison is untouched.
         return Ok(());
     }
-    if applied.len() != entries.len() || applied.iter().any(|record| record.revision == 0) {
+    // The length comparison that used to stand here compared `applied` against
+    // the `entries` slice `applied` was itself built from, so it could never
+    // fail and is not evidence of anything. It is removed rather than kept as
+    // decoration. The zero-revision test below reads a value the OWNER minted,
+    // which is the part that can actually refuse.
+    if applied.iter().any(|record| record.revision == 0) {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
         });

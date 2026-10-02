@@ -620,10 +620,15 @@ fn absent_provider_cannot_produce_ok_or_known_zero() {
         &destination,
         Some(&auth),
     );
+    // The purge obligation is slot 0 and `require_cutover_obligations` walks the
+    // slots in order, so with no purge owner consulted the PURGE slot refuses
+    // first and the reconciliation owner is never reached. Naming the first
+    // refusing slot is the honest expectation; asserting the reconciliation
+    // owner here was stale once the empty-ledger purge arm stopped refusing.
     assert_eq!(
         qualified.unwrap_err(),
         KernelRestoreError::TargetFailed(BackupError::RestoreCapabilityUnsupported {
-            capability: "reconciliation-owner"
+            capability: "purge-owner"
         })
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -961,9 +966,15 @@ fn current_purge_residency_reference_closure_preserved() {
         .expect("restore succeeds");
     let evidence = outcome.evidence.expect("evidence observed");
     assert!(evidence.purge_applied);
+    // An archive with no purge ledger consulted no purge owner, so the purge
+    // obligation is NOT established. Asserting `Satisfied` here contradicted
+    // `apply_finalize`, which reports `MissingCapability` for an empty ledger,
+    // and it is `require_cutover_obligations` that refuses that state - so the
+    // honest expectation is the refusal's own reason, not a closure this seam
+    // never proved. (Corrected after the verifier found the two are different.)
     assert_eq!(
         evidence.obligations.purge.state,
-        RestoreObligationState::Satisfied
+        RestoreObligationState::MissingCapability
     );
     assert_eq!(
         evidence.obligations.reference_validation.state,
