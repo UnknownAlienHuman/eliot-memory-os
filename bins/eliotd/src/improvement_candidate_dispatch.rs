@@ -639,6 +639,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
+use eliot_governor::verify_learning_admission;
 use eliot_improvement::ImprovementCandidate;
 use eliot_improvement::candidate_bounds::{canonical_evidence_lineage, evidence_lineage_digest};
 use eliot_maintenance::improvement_pipeline::{
@@ -669,7 +670,7 @@ use super::improvement_candidate_route::{
     read_improvement_effect_state, route_improvement_candidate,
 };
 use super::improvement_intake_dispatch::{
-    ImprovementArtifact, ImprovementDispatchError, ObservedClosure,
+    GovernedImprovementAdmission, ImprovementArtifact, ImprovementDispatchError, ObservedClosure,
 };
 
 /// Closed store scope for the durable unresolved-effect obligation record.
@@ -1157,11 +1158,17 @@ pub fn dispatch_improvement_candidate_route(
 /// binding is a content comparison of that commitment, not the presence of an
 /// operation reference.
 ///
-/// It contains NO effect outcome, NO receipt, NO permit and NO authority, because
+/// It contains NO effect outcome, NO receipt and NO authority, because
 /// this daemon holds none: the owner's outcome is private to the Governor module
 /// and writable only through its own re-checked seam, which nothing in this
 /// workspace can satisfy. So the record is a named debt plus the denying answer,
 /// never a claim that the effect was settled, completed, or may be retried.
+/// The learning admission that admitted this candidate is likewise NOT record
+/// content — it is the gate the commit itself is evaluated under, passed as
+/// the [`VerifiedLearningAdmission`] the seam re-verifies against the live
+/// owner. The caller states no verdict about it: it hands over the
+/// owner-issued permit and the Governor decides whether the durable record is
+/// effective.
 ///
 /// The key is a function of the obligation's own checked fields and of nothing
 /// else, so re-committing the SAME unresolved obligation on a later pass
@@ -1173,6 +1180,7 @@ pub fn dispatch_improvement_candidate_route(
 pub async fn commit_unknown_effect_obligation(
     composition: &mut DaemonComposition,
     artifact: &ImprovementArtifact,
+    admitted: &GovernedImprovementAdmission,
     effect: &ImprovementEffectState,
     state_fence: &StateFence,
 ) -> Result<Option<WriteReceipt>, ImprovementDispatchError> {
@@ -1209,15 +1217,24 @@ pub async fn commit_unknown_effect_obligation(
     let identity = reconciliation_commit_identity(&record_key, state_fence)?;
     let scope = ScopeId::new(RECONCILIATION_SCOPE)
         .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    // The obligation is a DISPOSITION of the governed admission that admitted
+    // this candidate, so it is committed under that admission rather than under
+    // a constant. Nothing here states a verdict: the permit is re-verified
+    // against the live owner and this pass's fence, and the seam re-verifies it
+    // again against the live fence after the commit. A stale epoch or a drifted
+    // fence therefore makes this record non-effective by derivation.
+    let admission = verify_learning_admission(
+        composition.improvement_governor(),
+        &admitted.permit,
+        state_fence,
+    )?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
             request,
             scope,
             artifact.candidate.evidence_refs.clone(),
-            None,
-            false,
-            false,
+            Some(&admission),
             Vec::new(),
             Vec::new(),
         )
@@ -1269,15 +1286,20 @@ pub async fn commit_unknown_effect_obligation(
 ///
 /// # What the record does NOT carry
 ///
-/// No permit, no authority, no effect outcome, no receipt, and no activation. A
+/// No authority, no effect outcome, no receipt, and no activation. A
 /// `CanaryAdmitted` decision in this record still carries
 /// `execution_authorized == false` and still names the Kernel `#11` owner that
 /// must authorize and execute activation independently; it is a handoff, not an
 /// activation. The retry and completion booleans are the Governor owner's own
 /// answers, and the owner outcome behind them stays private to the owner crate.
+/// The learning admission is not record content either: it is the gate the
+/// commit is evaluated under, as a [`VerifiedLearningAdmission`] the seam
+/// re-verifies against live owner state, and the caller asserts no verdict on
+/// it.
 pub async fn commit_improvement_terminal_decision(
     composition: &mut DaemonComposition,
     artifact: &ImprovementArtifact,
+    admitted: &GovernedImprovementAdmission,
     decision: &ImprovementTerminalDecision,
     state_fence: &StateFence,
 ) -> Result<Option<WriteReceipt>, ImprovementDispatchError> {
@@ -1321,15 +1343,22 @@ pub async fn commit_improvement_terminal_decision(
     let identity = reconciliation_commit_identity(&record_key, state_fence)?;
     let scope = ScopeId::new(RECONCILIATION_SCOPE)
         .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    // As for every other record in this family, the decision is committed under
+    // the governed admission that admitted this candidate, re-verified against
+    // the live owner and this pass's fence. The verdict on that admission is
+    // the Governor's; nothing here asserts one.
+    let admission = verify_learning_admission(
+        composition.improvement_governor(),
+        &admitted.permit,
+        state_fence,
+    )?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
             request,
             scope,
             artifact.candidate.evidence_refs.clone(),
-            None,
-            false,
-            false,
+            Some(&admission),
             Vec::new(),
             Vec::new(),
         )
@@ -1388,6 +1417,7 @@ pub async fn commit_improvement_terminal_decision(
 /// rather than an empty write.
 pub async fn commit_causal_intervention_outcome(
     composition: &mut DaemonComposition,
+    admitted: &GovernedImprovementAdmission,
     candidate: &CausalCandidate,
     outcome: CausalInterventionOutcomeRecord,
     state_fence: &StateFence,
@@ -1431,15 +1461,22 @@ pub async fn commit_causal_intervention_outcome(
     let identity = reconciliation_commit_identity(&record_key, state_fence)?;
     let scope = ScopeId::new(CAUSAL_OUTCOME_SCOPE)
         .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    // The outcome is a disposition under the same live owner the rest of this
+    // family is bound to, so it is evaluated under a verified admission rather
+    // than a constant. Whether this record is EFFECTIVE is the Governor's
+    // verdict on that admission; the writer only presents the permit.
+    let admission = verify_learning_admission(
+        composition.improvement_governor(),
+        &admitted.permit,
+        state_fence,
+    )?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
             request,
             scope,
             vec![proof_ref],
-            None,
-            false,
-            false,
+            Some(&admission),
             Vec::new(),
             Vec::new(),
         )
