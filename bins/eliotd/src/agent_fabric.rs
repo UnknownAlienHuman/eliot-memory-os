@@ -3311,7 +3311,7 @@ impl AgentFabric {
     /// no caller at all, in test and production alike.
     /// `register_semantic_definition` and `bind_semantic_admission` are
     /// unreachable for the same reason. The execution record is owned by the
-    /// AgentCoordinator and the durable owner-revision commit is named by no
+    /// `AgentCoordinator` and the durable owner-revision commit is named by no
     /// crate at all: I10.15:110 fixes the
     /// owner of `SwarmExecutionState` and I10.15:112 requires the separate
     /// per-owner revisions, but neither assigns who EXECUTES that commit. The
