@@ -14,7 +14,15 @@ use super::measurement::ul_token_estimate;
 const MAX_CARDS_PER_SEGMENT: usize = 5;
 const MAX_CO_CHANGE_PARTNERS: usize = 3;
 const MAX_PURPOSE_BYTES: usize = 120;
-const MAX_CARD_TOKEN_UNITS: u32 = 200;
+// #783: the budget is now counted in canonical source token units, so the
+// old `/4` number no longer describes the same envelope. The contract this
+// gate protects is a BYTE envelope on the rendered card body, not a unit
+// count, and the retired `ceil(bytes / 4) <= 200` admitted exactly
+// `4 * 200 - 3 == 797` bytes. Restating that same envelope in canonical units
+// gives `ceil(797 / 3) == 266`, and 266 admits `3 * 266 == 798` bytes, so the
+// one-byte slack the old form also had is preserved rather than tightened or
+// invented. The literal was re-derived, not relaxed.
+const MAX_CARD_TOKEN_UNITS: u32 = 266;
 const EXPECTED_REUSE_NOTE: &str = "when editing this module or investigating its failures";
 
 #[derive(Clone, Debug, Default)]

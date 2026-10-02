@@ -66,7 +66,24 @@ fn t05_module_card_is_deterministic_and_bounded() -> TestResult {
 
     assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
     assert_eq!(first_card.body_md, second[0].body_md);
-    assert!(ul_token_estimate(&first_card.body_md)? <= 200);
+    // #783: the limit is now counted in canonical source token units, so the
+    // old `/4` number no longer describes the same envelope. The contract this
+    // assertion protects is a BYTE envelope, not a unit count, and the retired
+    // `ceil(bytes / 4) <= 200` admitted exactly `4 * 200 - 3 == 797` bytes.
+    // Restating that same envelope in canonical units gives
+    // `ceil(797 / 3) == 266`, and 266 admits `3 * 266 == 798` bytes, so the
+    // one-byte slack the old form also had is preserved rather than tightened
+    // or invented. The literal was re-derived, not relaxed.
+    const CARD_BODY_MAX_UNITS: u32 = 266;
+    // Measured, not assumed: 797 bytes is the retired maximum and must still
+    // fit, 799 must not, and the 798 the canonical form also admits is the
+    // one-byte slack the old form carried.
+    let retired_max = ul_token_estimate(&"x".repeat(4 * 200 - 3))?;
+    let retired_max_plus_two = ul_token_estimate(&"x".repeat(4 * 200 - 1))?;
+    let card_units = ul_token_estimate(&first_card.body_md)?;
+    assert!(card_units <= CARD_BODY_MAX_UNITS);
+    assert!(retired_max <= CARD_BODY_MAX_UNITS);
+    assert!(retired_max_plus_two > CARD_BODY_MAX_UNITS);
     assert_eq!(first_card.verifier, "cargo test -p demo");
     let sections = [
         "PURPOSE:",

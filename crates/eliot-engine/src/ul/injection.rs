@@ -17,8 +17,21 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const MAX_ITEMS: usize = 3;
-const MAX_TOTAL_UNITS: u32 = 400;
-const MAX_PAYLOAD_UNITS: u32 = 300;
+// #783: both injection budgets are now counted in canonical source token
+// units, so the retired `/4` literals no longer describe the same envelopes.
+// The contract these gates protect is a BYTE envelope on the delivered
+// preview line plus serialized payload, not a unit count, and both were
+// calibrated while the local estimator was `ceil(bytes / 4)`, so both are
+// re-derived here the way `crates/eliot-engine/tests/ul_prediction.rs`
+// re-derives `SKILL_BODY_MAX_UNITS`. For a retired limit `u` the old form
+// admitted exactly `4u - 3` bytes; restating that envelope in canonical units
+// gives `ceil((4u - 3) / 3)`. This is the gate that reduces injection
+// throughput, not only delivery form: `attach` at injection.rs:232 drops an
+// item into `overflow` when `total_units + token_cost` exceeds the limit, so
+// leaving 400 in place would have stopped admitting item batches that `/4`
+// still admitted.
+const MAX_TOTAL_UNITS: u32 = 533; // 400 units: 1_597 -> 1_599 bytes.
+const MAX_PAYLOAD_UNITS: u32 = 399; // 300 units: 1_197 -> 1_197 bytes.
 const MAX_LINE_BYTES: usize = 160;
 
 #[derive(Default)]

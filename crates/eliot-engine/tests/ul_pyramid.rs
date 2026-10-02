@@ -96,7 +96,26 @@ fn t06_capsule_has_fixed_sections_and_budget() -> TestResult {
         .collect::<Result<Vec<_>, _>>()?;
 
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(ul_token_estimate(&first.artifact.body_md)? <= 500);
+    // #783: the limit is now counted in canonical source token units, so the
+    // old `/4` number no longer describes the same envelope. The contract this
+    // assertion protects is a BYTE envelope, not a unit count, and the retired
+    // `ceil(bytes / 4) <= 500` admitted exactly `4 * 500 - 3 == 1997` bytes.
+    // Restating that same envelope in canonical units gives
+    // `ceil(1997 / 3) == 666`, and 666 admits `3 * 666 == 1998` bytes, so the
+    // one-byte slack the old form also had is preserved rather than tightened
+    // or invented. The literal was re-derived, not relaxed.
+    const CAPSULE_BODY_MAX_UNITS: u32 = 666;
+    // The re-derived literal is only correct if it admits the byte envelope
+    // the retired `/4` form admitted, so that is measured rather than assumed:
+    // 1_997 bytes is the retired maximum and must fit, 1_999 must not, and the
+    // 1_998 the canonical form also admits is the one-byte slack the old form
+    // carried. Nothing wider is admitted.
+    let retired_max = ul_token_estimate(&"x".repeat(4 * 500 - 3))?;
+    let retired_max_plus_one = ul_token_estimate(&"x".repeat(4 * 500 - 2))?;
+    let first_units = ul_token_estimate(&first.artifact.body_md)?;
+    assert!(first_units <= CAPSULE_BODY_MAX_UNITS);
+    assert!(retired_max <= CAPSULE_BODY_MAX_UNITS);
+    assert!(retired_max_plus_one > CAPSULE_BODY_MAX_UNITS);
     assert_eq!(first, second);
     assert_eq!(
         first.artifact.dependency_manifest.file_deps[0].path,
@@ -150,8 +169,30 @@ fn t06_charter_and_map_are_bounded() -> TestResult {
         None,
     )?;
 
-    assert!(ul_token_estimate(&map.artifact.body_md)? <= 600);
-    assert!(ul_token_estimate(&charter.artifact.body_md)? <= 200);
+    // #783: the same re-derivation applies to the map and charter limits. The
+    // retired `ceil(bytes / 4) <= 600` admitted exactly `4 * 600 - 3 == 2397`
+    // bytes and `ceil(bytes / 4) <= 200` admitted exactly `797` bytes; the
+    // canonical forms are `ceil(2397 / 3) == 799` (admitting `2397` bytes, so
+    // that envelope is exact) and `ceil(797 / 3) == 266` (admitting `798` bytes,
+    // keeping the one-byte slack the old form also had). Neither is widened or
+    // tightened beyond what `/4` already admitted.
+    const MAP_BODY_MAX_UNITS: u32 = 799;
+    const CHARTER_BODY_MAX_UNITS: u32 = 266;
+    // Measured, not assumed, exactly as the capsule assertion above: 2_397 is
+    // the retired map maximum and must fit while 2_398 must not, and 797 is
+    // the retired charter maximum while 799 must not be admitted.
+    let retired_map_max = ul_token_estimate(&"x".repeat(4 * 600 - 3))?;
+    let retired_map_max_plus_one = ul_token_estimate(&"x".repeat(4 * 600 - 2))?;
+    let retired_charter_max = ul_token_estimate(&"x".repeat(4 * 200 - 3))?;
+    let retired_charter_max_plus_two = ul_token_estimate(&"x".repeat(4 * 200 - 1))?;
+    let map_units = ul_token_estimate(&map.artifact.body_md)?;
+    let charter_units = ul_token_estimate(&charter.artifact.body_md)?;
+    assert!(map_units <= MAP_BODY_MAX_UNITS);
+    assert!(charter_units <= CHARTER_BODY_MAX_UNITS);
+    assert!(retired_map_max <= MAP_BODY_MAX_UNITS);
+    assert!(retired_map_max_plus_one > MAP_BODY_MAX_UNITS);
+    assert!(retired_charter_max <= CHARTER_BODY_MAX_UNITS);
+    assert!(retired_charter_max_plus_two > CHARTER_BODY_MAX_UNITS);
     assert_eq!(map, map_again);
     assert_eq!(charter, charter_again);
     assert!(map.artifact.body_md.starts_with("SYSTEMS\n"));

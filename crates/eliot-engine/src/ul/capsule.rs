@@ -14,9 +14,20 @@ use std::path::{Path, PathBuf};
 
 use super::measurement::ul_token_estimate;
 
-const CAPSULE_LIMIT: u32 = 500;
-const MAP_LIMIT: u32 = 600;
-const CHARTER_LIMIT: u32 = 200;
+// #783: all three pyramid limits are now counted in canonical source token
+// units, so the retired `/4` literals no longer describe the same envelopes.
+// Each of these gates protects a BYTE envelope on the rendered `body_md`, not
+// a unit count, and each was calibrated while the local estimator was
+// `ceil(bytes / 4)`, so each is re-derived here the way
+// `crates/eliot-engine/tests/ul_prediction.rs` re-derives
+// `SKILL_BODY_MAX_UNITS`. For a retired limit `u` the old form admitted exactly
+// `4u - 3` bytes; restating that same envelope in canonical units gives
+// `ceil((4u - 3) / 3)`, and the largest length that still fits is `3u'`. The
+// one-byte slack the old form also had is preserved rather than tightened or
+// invented, and no envelope is widened beyond what `/4` already admitted.
+const CAPSULE_LIMIT: u32 = 666; // 500 units: 1_997 -> 1_998 bytes.
+const MAP_LIMIT: u32 = 799; // 600 units: 2_397 -> 2_397 bytes.
+const CHARTER_LIMIT: u32 = 266; // 200 units: 797 -> 798 bytes.
 const STALE_PREFIX: &str = "[STALE: changed dependencies: ";
 
 const CAPSULE_HEADERS: &[&str] = &[

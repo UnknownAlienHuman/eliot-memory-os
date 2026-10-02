@@ -16,7 +16,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const PACKET_PYRAMID_BUDGET: u32 = 1_500;
+// #783: the budget is now counted in canonical source token units, so the
+// old `/4` number no longer describes the same envelope. The contract this
+// gate protects is a BYTE envelope on the rendered capsule, not a unit
+// count: the retired `ceil(bytes / 4) <= 1_500` admitted exactly
+// `4 * 1_500 - 3 == 5_997` bytes, and the canonical form left in place
+// admitted only `3 * 1_500 == 4_500` bytes, so every capsule of 4_501-5_997
+// bytes was silently degraded to `handle_only` at ul.rs:333 with no
+// threshold change and no test noticing. Restating that same envelope in
+// canonical units gives `ceil(5_997 / 3) == 1_999`, and 1_999 admits
+// `3 * 1_999 == 5_997` bytes exactly, so the byte range is restored and not
+// widened. The literal was re-derived, not relaxed.
+const PACKET_PYRAMID_BUDGET: u32 = 1_999;
 const UL_FALLBACK_MATCH_TOKEN_LIMIT: usize = 12;
 
 pub(super) struct PyramidPacketEnrichment {
@@ -564,7 +575,8 @@ fn concept_bridge(task_id: &str, concept: &ConceptNode) -> Vec<CausalBridgeHop> 
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_fallback_match_tokens;
+    use super::{PACKET_PYRAMID_BUDGET, bounded_fallback_match_tokens};
+    use eliot_engine::ul::ul_token_estimate;
 
     #[test]
     fn ul_fallback_matching_keeps_its_twelve_token_boundary() {
@@ -576,5 +588,27 @@ mod tests {
         assert!(tokens.contains("zulu"));
         assert!(tokens.contains("lambda"));
         assert!(!tokens.contains("memory"));
+    }
+
+    /// #783: the re-derived literal is only correct if it admits exactly the
+    /// byte envelope the retired `/4` form admitted, so this pins both ends of
+    /// that envelope rather than trusting the arithmetic in the comment. The
+    /// canonical estimator is exercised directly on byte lengths, so the
+    /// `4_501..=5_997` range that used to be degraded to `handle_only` at
+    /// `ul.rs:333` is proven to fit again, and `5_998` is proven not to.
+    #[test]
+    fn packet_pyramid_budget_admits_the_retired_byte_envelope() {
+        assert!(
+            ul_token_estimate(&"x".repeat(4_500)).expect("measurable") <= PACKET_PYRAMID_BUDGET,
+            "the envelope the retired form already admitted must still fit"
+        );
+        assert!(
+            ul_token_estimate(&"x".repeat(5_997)).expect("measurable") <= PACKET_PYRAMID_BUDGET,
+            "5_997 bytes is the exact old maximum and must fit again"
+        );
+        assert!(
+            ul_token_estimate(&"x".repeat(5_998)).expect("measurable") > PACKET_PYRAMID_BUDGET,
+            "the envelope must not be widened past the retired maximum"
+        );
     }
 }
