@@ -8071,13 +8071,21 @@ impl HostRequestRecord {
         format!("{}::{}", self.operation_id.as_str(), self.request_digest)
     }
 
-    /// Returns whether two records carry the exact same request binding.
+    /// Returns whether two valid records carry the same request binding.
     ///
     /// State, result, commit order, and the post-stage payload body are
     /// excluded: they are ORS-owned progression, not caller binding. The body
     /// stays implied by the compared `payload_digest` because `validate`
-    /// re-checks body/digest equality on every read.
+    /// re-checks body/digest equality on every read. Historical fence-snapshot
+    /// absence remains compatible only because the recorded fence digest,
+    /// epoch, and generation are still compared; it never fills the stored
+    /// row's absent snapshot.
     pub fn same_binding(&self, other: &Self) -> bool {
+        let self_is_valid = self.validate().is_ok();
+        let other_is_valid = other.validate().is_ok();
+        if !self_is_valid || !other_is_valid {
+            return false;
+        }
         self.operation_id == other.operation_id
             && self.kind == other.kind
             && self.request_id == other.request_id
@@ -8119,8 +8127,10 @@ impl HostRequestRecord {
         }
     }
 
-    /// A historical row may lack the retained original snapshot. Two present
-    /// snapshots must agree; the digest binding is always compared separately.
+    /// A historical row may lack the retained original snapshot. Missing on
+    /// either comparison side is compatible only with the separately compared
+    /// recorded digest, epoch, and generation; callers keep the durable row as
+    /// the winner so this comparison never backfills or erases its snapshot.
     fn same_admitted_state_fence(left: Option<&StateFence>, right: Option<&StateFence>) -> bool {
         match (left, right) {
             (Some(left), Some(right)) => left == right,
@@ -8212,6 +8222,14 @@ impl HostRequestRecord {
             ) => {
                 validate_digest(result, "host_request_result_digest")?;
                 validate_result_response(body)?;
+                let canonical = canonical_json_bytes(body)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                if sha256_hex(&canonical).as_str() != result.as_str() {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_result_response",
+                        reason: "result body does not match the recorded result digest",
+                    });
+                }
             }
             // Legacy digest-only row (produced by the digest-only advance
             // before the bounded body existed): loads for compatibility but

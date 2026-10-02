@@ -7591,12 +7591,15 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         record: &crate::HostRequestRecord,
     ) -> Result<crate::HostRequestRecord, OrsError> {
+        record.validate()?;
         let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
         let key = record.record_key();
         if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
             let existing: crate::HostRequestRecord = decode(existing.value())?;
             existing.validate()?;
-            if !existing.same_binding(record) {
+            let admitted_fence_downgraded =
+                existing.admitted_state_fence.is_some() && record.admitted_state_fence.is_none();
+            if admitted_fence_downgraded || !existing.same_binding(record) {
                 return Err(OrsError::HostRequestIdentityConflict {
                     operation_id: record.operation_id.as_str().to_owned(),
                     request_digest: record.request_digest.clone(),
@@ -8151,7 +8154,9 @@ impl RedbRecoveryStore {
             let mut expected = record.clone();
             expected.operation_id.clone_from(&binding.operation_id);
             expected.request_digest.clone_from(&binding.request_digest);
-            if !expected.same_binding(binding) {
+            if expected.admitted_state_fence != binding.admitted_state_fence
+                || !expected.same_binding(binding)
+            {
                 return Err(OrsError::InvalidField {
                     field: "host_request_identity_binding",
                     reason: "identity binding row must preserve the requested operation fields",
@@ -8323,6 +8328,7 @@ impl RedbRecoveryStore {
     ) -> Result<Vec<&'a crate::HostRequestRecord>, OrsError> {
         let mut missing = Vec::new();
         for binding in identity_bindings {
+            binding.validate()?;
             let existing = {
                 let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
                 operations
@@ -8340,12 +8346,14 @@ impl RedbRecoveryStore {
                     && existing.result_digest.is_none()
                     && existing.result_response.is_none()
                     && existing.commit_order == 0;
+                let admitted_fence_downgraded =
+                    existing.admitted_state_fence.is_some() && binding.admitted_state_fence.is_none();
                 let same_binding = if compare_semantic_commitment {
                     Self::host_requests_share_logical_commitment(&existing, binding)
                 } else {
                     existing.same_binding(binding)
                 };
-                if !immutable || !same_binding {
+                if !immutable || admitted_fence_downgraded || !same_binding {
                     return Err(OrsError::HostRequestIdentityConflict {
                         operation_id: binding.operation_id.as_str().to_owned(),
                         request_digest: binding.request_digest.clone(),

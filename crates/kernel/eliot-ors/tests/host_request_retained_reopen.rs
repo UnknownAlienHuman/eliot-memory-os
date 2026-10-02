@@ -147,12 +147,15 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         .load_host_request(&operation_id, &request_digest)
         .expect("exact owner lookup succeeds")
         .expect("original row remains present");
+    assert_eq!(retained.operation_id, operation_id);
+    assert_eq!(retained.request_digest, request_digest);
     assert_eq!(retained.admitted_state_fence.as_ref(), Some(&original_fence));
     assert_eq!(retained.fence_digest, digest(&serde_json::to_value(&original_fence).unwrap()));
     assert_eq!(retained.payload_body.as_ref(), Some(&payload));
     assert_eq!(retained.payload_digest, digest(&payload));
     assert_eq!(retained.result_response.as_ref(), Some(&result));
     assert_eq!(retained.result_digest.as_deref(), Some(digest(&result).as_str()));
+    assert_eq!(retained.state, HostRequestState::ResultReceived);
 
     let changed_request_digest = "e".repeat(64);
     assert!(reopened
@@ -171,6 +174,160 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
     ));
 
+    let mut omitted_retained_fence = original.clone();
+    omitted_retained_fence.admitted_state_fence = None;
+    assert!(matches!(
+        reopened.stage_host_request(&omitted_retained_fence),
+        Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
+    ));
+
+    let substituted_fence = requested_record(
+        operation_id.clone(),
+        &request_digest,
+        fence(8),
+        &payload,
+    );
+    assert!(matches!(
+        reopened.stage_host_request(&substituted_fence),
+        Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
+    ));
+
+    let mut mismatched_fence_digest = original.clone();
+    mismatched_fence_digest.admitted_state_fence = Some(fence(8));
+    assert!(matches!(
+        mismatched_fence_digest.validate(),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_admitted_state_fence",
+            ..
+        })
+    ));
+
+    let substituted_payload = json!({"tool": "GetEvidencePack", "subject": "substituted"});
+    let mut substituted_payload_row = retained.clone();
+    substituted_payload_row.payload_body = Some(substituted_payload.clone());
+    assert!(matches!(
+        substituted_payload_row.validate(),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_payload_body",
+            ..
+        })
+    ));
+    assert!(matches!(
+        reopened.bind_host_request_payload(&operation_id, &request_digest, &substituted_payload),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_payload_body",
+            ..
+        })
+    ));
+
+    let substituted_result = json!({"result": "substituted"});
+    let mut substituted_result_row = retained.clone();
+    substituted_result_row.result_response = Some(substituted_result.clone());
+    assert!(matches!(
+        substituted_result_row.validate(),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_result_response",
+            ..
+        })
+    ));
+    assert!(matches!(
+        reopened.persist_host_request_result(
+            &operation_id,
+            &request_digest,
+            &digest(&result),
+            &substituted_result,
+            None,
+            None,
+        ),
+        Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
+    ));
+
+    let unchanged = reopened
+        .load_host_request(&operation_id, &request_digest)
+        .expect("original owner row remains readable")
+        .expect("original owner row remains retained");
+    assert_eq!(unchanged.admitted_state_fence.as_ref(), Some(&original_fence));
+    assert_eq!(unchanged.payload_body.as_ref(), Some(&payload));
+    assert_eq!(unchanged.result_response.as_ref(), Some(&result));
+
     drop(reopened);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn historical_missing_fence_stays_missing_after_exact_retry_and_reopen() {
+    let path = temp_path();
+    let request_digest = "f".repeat(64);
+    let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
+        .expect("valid operation id");
+    let original_fence = fence(11);
+    let payload = json!({"tool": "GetEvidencePack", "subject": "historical-1838"});
+    let result = json!({"result": "historical-1838"});
+    let mut historical = requested_record(
+        operation_id.clone(),
+        &request_digest,
+        original_fence.clone(),
+        &payload,
+    );
+    historical.admitted_state_fence = None;
+
+    {
+        let store = RedbRecoveryStore::open(&path).expect("owner store opens");
+        store.stage_host_request(&historical).expect("historical row stages");
+        store
+            .advance_host_request(
+                &operation_id,
+                &request_digest,
+                HostRequestState::Admitted,
+                None,
+            )
+            .expect("historical operation admits");
+        store
+            .bind_host_request_payload(&operation_id, &request_digest, &payload)
+            .expect("historical admitted input is retained");
+        store
+            .persist_host_request_result(
+                &operation_id,
+                &request_digest,
+                &digest(&result),
+                &result,
+                None,
+                None,
+            )
+            .expect("historical result is retained");
+    }
+
+    {
+        let reopened = RedbRecoveryStore::open(&path).expect("owner store reopens");
+        let retained = reopened
+            .load_host_request(&operation_id, &request_digest)
+            .expect("historical owner lookup succeeds")
+            .expect("historical row remains present");
+        assert_eq!(retained.operation_id, operation_id);
+        assert_eq!(retained.request_digest, request_digest);
+        assert_eq!(retained.admitted_state_fence, None);
+
+        let retry_with_original_fence = requested_record(
+            operation_id.clone(),
+            &request_digest,
+            original_fence,
+            &payload,
+        );
+        let winner = reopened
+            .stage_host_request(&retry_with_original_fence)
+            .expect("matching historical retry resolves to the durable owner");
+        assert_eq!(winner.admitted_state_fence, None);
+    }
+
+    let final_reopen = RedbRecoveryStore::open(&path).expect("owner store reopens again");
+    let retained = final_reopen
+        .load_host_request(&operation_id, &request_digest)
+        .expect("historical owner lookup succeeds after retry")
+        .expect("historical row is still retained");
+    assert_eq!(retained.admitted_state_fence, None);
+    assert_eq!(retained.payload_body.as_ref(), Some(&payload));
+    assert_eq!(retained.result_response.as_ref(), Some(&result));
+
+    drop(final_reopen);
     let _ = std::fs::remove_file(path);
 }
