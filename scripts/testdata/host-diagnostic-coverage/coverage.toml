@@ -1231,7 +1231,7 @@ phase = "start"
 scope = "none"
 status = "incomplete"
 reason = "missing_test_binding"
-detail = "Emitter present; no bound test. INTERACTION: failures already terminally observed by B-leaf-host-job-launch (host-launch-failed at host_job_launch.rs:535) re-emit here as host-start-failed via lib.rs:6949/6763 without disarm (contrast the disarm-before-delegate precedent at host_composition_store_recovery.rs:84-85). TEST-PHASE A8 must rule single-vs-correlated emission."
+detail = "Emitter present; no bound test. INTERACTION RESOLVED (#978, audit 5910159678 defect 2): on the audited path start_approved_contour -> start_manifest_contour -> HostJobBranches::start_approved the leaf guard was removed and the leaf became phase-only, so this contour's guard is the single owner and one failed launch emits exactly one terminal (host-start-failed); the same guard/emitter is wrapped directly (observe_launch_terminal) only on the cutover call sites, which no operation guard encloses. TEST-PHASE A8 must still rule single-vs-correlated emission."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
@@ -1511,7 +1511,7 @@ operation = "approved job launch (store+kernel) terminal"
 phase = "launch"
 scope = "wired"
 status = "proven"
-detail = "Guard in start_approved (517). INTERACTION: errors re-emit at B-lib-start (host-start-failed) via lib.rs:6949/6763; see B-lib-start detail. TEST-PHASE A8 must rule."
+detail = "Guard in observe_launch_terminal at the cutover call sites only; start_approved arms none. INTERACTION RESOLVED (#978, audit 5910159678 defect 2): this leaf emits no terminal, so B-lib-start owns host-start-failed as the single terminal for the audited path; see B-lib-start detail. TEST-PHASE A8 must still rule."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
@@ -3202,7 +3202,7 @@ n = 8
 title = "each failed operation has exactly one emitter + negatives"
 boundaries = ["B-lib-open", "B-lib-credential-control", "B-lib-kernel-restart-handle", "B-lib-stop", "B-leaf-credential", "B-leaf-store-recovery", "B-leaf-host-job-launch", "B-leaf-scm-launch", "B-main-ref-terminal"]
 decidable = "validator"
-note = "Frozen codes + code-uniqueness + count pins. KNOWN INTERACTION: B-lib-start/B-leaf-host-job-launch double emission; TEST-PHASE A8 negative must rule."
+note = "Frozen codes + code-uniqueness + count pins. RESOLVED INTERACTION: B-lib-start/B-leaf-host-job-launch emit one terminal (host-start-failed) because the launch leaf is phase-only; TEST-PHASE A8 negative must rule."
 
 [[matrix]]
 n = 9
