@@ -261,16 +261,15 @@ fn owner_contour_labels(owner: &str) -> Vec<(String, String)> {
     let production = owner.split("#[cfg(test)]").next().unwrap_or(owner);
     frozen_labels(production, "const fn label(self) -> &'static str {")
 }
-// WORK_UNIT_CASE: 980/1
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the codec disposition vocabulary binding and the single-terminal propagation proof stay in one deterministic probe"
-)]
-fn projection_01_propagation_single_terminal() {
-    let f = fix();
-    let inner = f["inner"].as_str().expect("inner");
-    let term = f["terminal_code"].as_str().expect("term");
+
+/// The previous-projection owner still carries its own failed-binding
+/// vocabulary - a prior projection that is not the exact previous Host
+/// materialization and therefore still requires recovery - and the live
+/// `materialize_phase_b` caller plus the historical authority evidence stay
+/// distinct from it.
+fn assert_previous_projection_failure_vocabulary_is_not_live_materialization(
+    inner: &str,
+) {
     let prev = src("src/phase_b_previous_projection.rs");
     assert!(prev.contains("fn phase_b_previous_projection_observe") && prev.contains(inner));
     assert!(
@@ -279,27 +278,14 @@ fn projection_01_propagation_single_terminal() {
     );
     assert!(src("src/host_composition_phase_b.rs").contains("fn materialize_phase_b"));
     assert!(src("src/phase_b_previous_authority.rs").contains("historical evidence observed"));
-    // Codec contour split (#980), bound to the emission that carries the
-    // contour. `credential_codec_observe` is the codec's only reject emission
-    // and publishes exactly `"{boundary} reason={contour}"`, rendered from the
-    // two closed projections of the discriminant it is handed; `mod
-    // credential_control` is private and `HostCredentialControl::new` is
-    // `pub(super)`, so no integration target can drive the codec. The
-    // disposition vocabulary the codec can emit is therefore DERIVED here from
-    // those emission sites and those two projection functions, and the
-    // collapsed catch-all is denied against that derived vocabulary rather than
-    // against a substring of the file.
-    let cd = src("src/credential_control/codec.rs");
-    let production = cd.split("#[cfg(test)]").next().unwrap_or(cd.as_str());
-    let mut contours = frozen_labels(production, "const fn contour(self) -> &'static str {");
-    let mut boundaries = frozen_labels(production, "const fn boundary(self) -> &'static str {");
-    contours.sort();
-    boundaries.sort();
-    // The frozen #980 contract: five marker contours under the frozen marker
-    // boundary and five envelope contours under the frozen envelope boundary.
-    // Each of the ten must own exactly one emission name and reach the sink
-    // under its own boundary label; an eleventh contour cannot join the
-    // vocabulary without changing this map.
+}
+
+/// The frozen #980 codec contract: five marker contours under the frozen marker
+/// boundary and five envelope contours under the frozen envelope boundary. Each
+/// of the ten owns exactly one emission name and the sink boundary label its
+/// contour reaches the sink under, so an eleventh contour cannot join the
+/// vocabulary without changing this map.
+fn frozen_codec_contour_contract() -> Vec<(String, String, String)> {
     let mut frozen: Vec<(String, String, String)> = Vec::new();
     for (variant, contour) in [
         ("MarkerRecordShape", "marker-record-shape"),
@@ -334,6 +320,20 @@ fn projection_01_propagation_single_terminal() {
         ));
     }
     frozen.sort();
+    frozen
+}
+
+/// The parsed `contour()`/`boundary()` maps equal the frozen ten as a BIJECTION,
+/// so an eleventh contour is red: each of the ten owns exactly one emission name
+/// and every contour reaches the sink under its own frozen boundary label.
+fn codec_contour_and_boundary_maps_are_the_frozen_bijection(
+    production: &str,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut contours = frozen_labels(production, "const fn contour(self) -> &'static str {");
+    let mut boundaries = frozen_labels(production, "const fn boundary(self) -> &'static str {");
+    contours.sort();
+    boundaries.sort();
+    let frozen = frozen_codec_contour_contract();
     assert_eq!(
         contours,
         frozen
@@ -350,11 +350,16 @@ fn projection_01_propagation_single_terminal() {
             .collect::<Vec<_>>(),
         "every contour must reach the sink under its own frozen boundary label"
     );
-    // Every reject path still observes, and each decoder publishes exactly the
-    // five contours it owns. The expected set is the ten frozen contours
-    // partitioned by the decoder that can construct them, so deleting any
-    // `credential_codec_observe` call - or adding one - turns this red instead
-    // of being absorbed by a bumped occurrence count.
+    (contours, boundaries)
+}
+
+/// Every reject path still observes, and each decoder publishes exactly the five
+/// contours it owns, read through its OWN function window in the codec source.
+/// The expected set is the ten frozen contours partitioned by the decoder that
+/// can construct them, so deleting any `credential_codec_observe` call - or
+/// adding one - turns this red instead of being absorbed by a bumped occurrence
+/// count.
+fn codec_each_decoder_publishes_exactly_its_own_five_contours(production: &str) {
     for (decoder, owned) in [
         (
             "pub(super) fn decode_marker(",
@@ -391,13 +396,18 @@ fn projection_01_propagation_single_terminal() {
             "{decoder} must publish exactly its own contours, through the typed discriminant"
         );
     }
+}
+
+/// The codec observes for all ten frozen contours and for nothing outside the
+/// frozen vocabulary.
+fn codec_observes_every_frozen_contour_and_nothing_outside_it(production: &str) {
     let mut published: Vec<String> = call_arguments(production, "credential_codec_observe")
         .iter()
         .map(|argument| typed_discriminant(argument))
         .collect();
     published.sort();
     published.dedup();
-    let mut every: Vec<String> = frozen
+    let mut every: Vec<String> = frozen_codec_contour_contract()
         .iter()
         .map(|(variant, _, _)| variant.clone())
         .collect();
@@ -406,17 +416,23 @@ fn projection_01_propagation_single_terminal() {
         published, every,
         "the codec must observe for all ten contours and for nothing outside the frozen vocabulary"
     );
-    // The restored negative assertion. `credential_codec_observe` may only be
-    // handed a typed discriminant, so a literal detail - the pre-fix shape -
-    // cannot be published from any reject site: `typed_discriminant` fails on
-    // it above. What is asserted here is the whole vocabulary the emission can
-    // render, derived from the two closed projections: the two boundary labels,
-    // the ten contour names, and the joined detail of every contour the
-    // emission sites actually construct. The collapsed `malformed` catch-all
-    // this contour split replaced must be unreachable from it.
+}
+
+/// The restored denial. `credential_codec_observe` may only be handed a typed
+/// discriminant, so a literal detail - the pre-fix shape - cannot be published
+/// from any reject site: `typed_discriminant` fails on it. What is asserted here
+/// is the whole vocabulary the emission can render, derived from the two closed
+/// projections: the two boundary labels, the ten contour names, and the joined
+/// detail of every contour the emission sites actually construct. The collapsed
+/// `malformed` catch-all this contour split replaced must be unreachable from
+/// it, and every token of that vocabulary must be free of `malformed`.
+fn codec_renderable_vocabulary_is_free_of_the_malformed_catch_all(
+    contours: &[(String, String)],
+    boundaries: &[(String, String)],
+) {
     let mut vocabulary: Vec<String> = boundaries.iter().map(|(_, label)| label.clone()).collect();
     vocabulary.extend(contours.iter().map(|(_, contour)| contour.clone()));
-    for (variant, contour) in &contours {
+    for (variant, contour) in contours {
         let boundary = boundaries
             .iter()
             .find(|(name, _)| name == variant)
@@ -432,10 +448,20 @@ fn projection_01_propagation_single_terminal() {
             "the collapsed catch-all disposition is reachable from the codec again: {token}"
         );
     }
-    // Executed proof of the shared facade only: literals go in, the facade's
-    // own record comes back. No production record is manufactured here, and
-    // the detail is no longer assembled from a fixture field, so what is
-    // asserted is exactly what production emitted for that literal.
+}
+
+/// Executed proof of the shared facade only: literals go in, the facade's own
+/// record comes back. No production record is manufactured here, and the detail
+/// is no longer assembled from a fixture field, so what is asserted is exactly
+/// what production emitted for that literal: one record per detail, the exact
+/// entrypoint record count for the two subordinate literals, exactly one terminal
+/// record, one correlation for the injected detail, and the subordinate detail
+/// ordered before the terminal.
+fn assert_facade_emits_one_record_per_detail_and_exactly_one_terminal(
+    f: &Value,
+    inner: &str,
+    term: &str,
+) {
     let c = "corr-980-1";
     let t = emit(|| {
         observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, inner);
@@ -456,6 +482,33 @@ fn projection_01_propagation_single_terminal() {
     );
     assert_eq!(count(&t, c), 1, "inner correlates once, got: {t}");
     assert!(t.find(inner).expect("inner") < t.find(term).expect("term"));
+}
+
+// WORK_UNIT_CASE: 980/1
+#[test]
+fn projection_01_propagation_single_terminal() {
+    let f = fix();
+    let inner = f["inner"].as_str().expect("inner");
+    let term = f["terminal_code"].as_str().expect("term");
+    assert_previous_projection_failure_vocabulary_is_not_live_materialization(inner);
+    // Codec contour split (#980), bound to the emission that carries the
+    // contour. `credential_codec_observe` is the codec's only reject emission
+    // and publishes exactly `"{boundary} reason={contour}"`, rendered from the
+    // two closed projections of the discriminant it is handed; `mod
+    // credential_control` is private and `HostCredentialControl::new` is
+    // `pub(super)`, so no integration target can drive the codec. The
+    // disposition vocabulary the codec can emit is therefore DERIVED here from
+    // those emission sites and those two projection functions, and the
+    // collapsed catch-all is denied against that derived vocabulary rather than
+    // against a substring of the file.
+    let cd = src("src/credential_control/codec.rs");
+    let production = cd.split("#[cfg(test)]").next().unwrap_or(cd.as_str());
+    let (contours, boundaries) =
+        codec_contour_and_boundary_maps_are_the_frozen_bijection(production);
+    codec_each_decoder_publishes_exactly_its_own_five_contours(production);
+    codec_observes_every_frozen_contour_and_nothing_outside_it(production);
+    codec_renderable_vocabulary_is_free_of_the_malformed_catch_all(&contours, &boundaries);
+    assert_facade_emits_one_record_per_detail_and_exactly_one_terminal(&f, inner, term);
 }
 /// The discriminant a production emission site published. An owner emitter may
 /// only be handed a typed discriminant; a literal detail would let one
@@ -546,19 +599,24 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         "process_started",
         "semantically_ready",
     ];
-    // The rollback halves of that list are the CURRENT frozen labels of the
-    // rollback owner's contour map (`RollbackContour::label` in
-    // `phase_b_materialization/rollback_backup.rs`), which stays unreachable
-    // from an integration-test crate: `mod phase_b_materialization` is private
-    // and `phase_b_restore_or_remove` / `phase_b_remove_rollback_backup` are
-    // `pub` only inside it. So each positive is bound here to the exact
-    // production label it abbreviates, and the denial below is proved on the
-    // record production emitted, never on a guessed spelling.
+    assert_rollback_owner_still_publishes_each_positive_label();
+    assert_unknown_projection_proves_no_positive_claim(&positives);
+    assert_failed_without_reason_projection_proves_no_positive_claim(&positives);
+    assert_proven_projection_stays_reachable_and_free_of_rollback_detail();
+}
+
+/// The rollback halves of the denied positives are the CURRENT frozen labels of
+/// the rollback owner's contour map (`RollbackContour::label` in
+/// `phase_b_materialization/rollback_backup.rs`), which stays unreachable from
+/// an integration-test crate: `mod phase_b_materialization` is private and
+/// `phase_b_restore_or_remove` / `phase_b_remove_rollback_backup` are `pub` only
+/// inside it. So each positive is bound here to the exact production label it
+/// abbreviates, and the denial below is proved on the record production emitted,
+/// never on a guessed spelling.
+fn assert_rollback_owner_still_publishes_each_positive_label() {
     let rollback = src("src/phase_b_materialization/rollback_backup.rs");
-    let labels: Vec<&str> = owner_contour_labels(&rollback)
-        .iter()
-        .map(|pair| pair.1.as_str())
-        .collect();
+    let published = owner_contour_labels(&rollback);
+    let labels: Vec<&str> = published.iter().map(|pair| pair.1.as_str()).collect();
     for label in [
         "host.phase-b rollback backup prepared",
         "host.phase-b rollback restored verified",
@@ -570,6 +628,24 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             "rollback owner must still publish the positive label {label:?}"
         );
     }
+}
+
+/// An unknown / unattributed rollback outcome reaching the production projection
+/// type is projected as missing evidence. `tracing_subscriber::fmt` renders
+/// every string-valued field through `Debug`, so a frozen name reaches the
+/// record QUOTED: production writes `evidence="unknown"`, never the bare
+/// `evidence=unknown`. Bool fields keep `Debug`'s unquoted rendering, which is
+/// why the missing-slot pins below read `reason_missing=true`.
+///
+/// The positive claim is a TYPED claim, so it is denied on the exact rendered
+/// discriminant rather than on substrings of the whole capture:
+/// `HostRequestEvidence` is the only slot that can assert a completed operation,
+/// and `AdmittedEvent::is_admitted_by` (`windows_event_log.rs: 140`) admits the
+/// Event Log only for `process_started`, `durable_committed` and `failed`.
+/// Denying those exact values denies the record claim and its sink record at
+/// once, and a renamed or re-worded positive cannot slip past it the way a bare
+/// substring scan can.
+fn assert_unknown_projection_proves_no_positive_claim(positives: &[&str]) {
     let unknown = emit(|| {
         observe_host_request(&HostRequestProjection::unknown(
             EntrypointStage::ScmDispatch,
@@ -579,11 +655,6 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         unknown.contains("host.request"),
         "no projection record: {unknown}"
     );
-    // `tracing_subscriber::fmt` renders every string-valued field through
-    // `Debug`, so a frozen name reaches the record QUOTED: production writes
-    // `evidence="unknown"`, never the bare `evidence=unknown`. Bool fields keep
-    // `Debug`'s unquoted rendering, which is why the missing-slot pins below
-    // read `reason_missing=true`.
     assert!(
         unknown.contains("evidence=\"unknown\""),
         "evidence must be unknown: {unknown}"
@@ -608,20 +679,12 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         !unknown.contains("host.terminal_error"),
         "a projection is never a terminal: {unknown}"
     );
-    for positive in positives {
+    for &positive in positives {
         assert!(
             !unknown.contains(positive),
             "unknown rollback disposition claimed {positive:?}: {unknown}"
         );
     }
-    // The positive claim is a TYPED claim, so it is denied on the exact
-    // rendered discriminant rather than on substrings of the whole capture:
-    // `HostRequestEvidence` is the only slot that can assert a completed
-    // operation, and `AdmittedEvent::is_admitted_by` (`windows_event_log.rs:
-    // 140`) admits the Event Log only for `process_started`,
-    // `durable_committed` and `failed`. Denying those exact values denies the
-    // record claim and its sink record at once, and a renamed or re-worded
-    // positive cannot slip past it the way a bare substring scan can.
     for forbidden in [
         "process_started",
         "semantically_ready",
@@ -633,8 +696,13 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             "unknown rollback disposition held owner evidence {forbidden:?}: {unknown}"
         );
     }
-    // The failed-before-verification sibling disposition: the typed reason is
-    // kept, the payload is not, and no positive claim rides along with it.
+}
+
+/// The failed-before-verification sibling disposition: the typed reason is kept,
+/// the payload is not, and no positive claim rides along with it. The typed
+/// denial is repeated for the sibling disposition, so an unattributed failure
+/// cannot hold any owner evidence either.
+fn assert_failed_without_reason_projection_proves_no_positive_claim(positives: &[&str]) {
     let unattributed = emit(|| {
         observe_host_request(&HostRequestProjection::failed_without_reason(
             EntrypointStage::ScmDispatch,
@@ -648,14 +716,12 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         unattributed.contains("reason_missing=true"),
         "got: {unattributed}"
     );
-    for positive in positives {
+    for &positive in positives {
         assert!(
             !unattributed.contains(positive),
             "unattributed rollback disposition claimed {positive:?}: {unattributed}"
         );
     }
-    // The typed denial is repeated for the sibling disposition, so an
-    // unattributed failure cannot hold any owner evidence either.
     for forbidden in [
         "process_started",
         "semantically_ready",
@@ -667,8 +733,15 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             "unattributed rollback disposition held owner evidence {forbidden:?}: {unattributed}"
         );
     }
-    // Dispositions that genuinely are proven stay reachable and distinct, so
-    // the pair above is a real distinction and not a blanket denial.
+}
+
+/// Dispositions that genuinely are proven stay reachable and distinct, so the
+/// pairs above are a real distinction and not a blanket denial. `observe_host_request`
+/// renders the frozen phase under the `phase` key; `stage` is the
+/// `host.entrypoint_stage` key and is never projected here, so the pin follows
+/// the field production actually writes - quoted, because the stage name is a
+/// string-valued field.
+fn assert_proven_projection_stays_reachable_and_free_of_rollback_detail() {
     let committed = emit(|| {
         observe_host_request(&HostRequestProjection::durable_committed(
             EntrypointStage::ShutdownDrain,
@@ -678,10 +751,6 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         committed.contains("evidence=\"durable_committed\""),
         "got: {committed}"
     );
-    // `observe_host_request` renders the frozen phase under the `phase` key;
-    // `stage` is the `host.entrypoint_stage` key and is never projected here,
-    // so the pin follows the field production actually writes - quoted, because
-    // the stage name is a string-valued field.
     assert!(
         committed.contains("phase=\"shutdown_drain\""),
         "got: {committed}"
@@ -735,6 +804,59 @@ const ROLLBACK_POSITIVE_CLAIMS: [&str; 3] = [
     "host.phase-b rollback backup cleanup completed",
 ];
 
+/// One projection under one admitted Event Log operation: production's own
+/// admission decision is asserted against the frozen proven/unproven contract,
+/// and whatever the disposition the record is a subordinate projection - it owns
+/// no terminal and no positive rollback claim.
+fn assert_projection_reaches_the_event_log_only_when_the_owner_proof_exists(
+    label: &str,
+    projection: &HostRequestProjection,
+    evidence: &HostRequestEvidence,
+    event: AdmittedEvent,
+    proven: bool,
+) {
+    let capture = emit(|| {
+        observe_host_request(&projection.clone().with_operation(event));
+    });
+    assert!(
+        capture.contains("host.request"),
+        "no projection record for {label}: {capture}"
+    );
+    assert_eq!(
+        capture.contains("host.event_log_admission"),
+        proven,
+        "{} with {} must{} reach the Event Log: {capture}",
+        label,
+        event.as_str(),
+        if proven { "" } else { " not" }
+    );
+    if proven {
+        assert_eq!(
+            count(&capture, "host.event_log_admission"),
+            1,
+            "one admission decision per projection: {capture}"
+        );
+        assert!(
+            capture.contains(&format!("operation=\"{}\"", event.as_str())),
+            "the admitted operation must be the one production names: {capture}"
+        );
+        assert!(
+            capture.contains(&format!("evidence=\"{}\"", evidence.as_str())),
+            "the evidence class must be the one production projects: {capture}"
+        );
+    }
+    assert!(
+        !capture.contains("host.terminal_error"),
+        "a projection record is never a terminal: {capture}"
+    );
+    for positive in ROLLBACK_POSITIVE_CLAIMS {
+        assert!(
+            !capture.contains(positive),
+            "the {label} projection claimed {positive:?}: {capture}"
+        );
+    }
+}
+
 /// Executed case, audit 5909832545 required item 5, first obligation: at the
 /// reachable production surface a positive rollback claim is unreachable
 /// without the evidence that proves it.
@@ -761,10 +883,6 @@ const ROLLBACK_POSITIVE_CLAIMS: [&str; 3] = [
 /// particular rollback outcome; `mod rollback_contour_tests` drives the owner
 /// with real outcomes instead.
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the reachable unproven/proven claim gate matrix and the owner label binding stay in one deterministic probe"
-)]
 fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
     const EVENTS: [AdmittedEvent; 3] = [
         AdmittedEvent::ServiceStart,
@@ -819,61 +937,24 @@ fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
     ];
     for (label, projection, evidence) in &dispositions {
         for event in EVENTS {
-            let capture = emit(|| {
-                observe_host_request(&projection.clone().with_operation(event));
-            });
-            assert!(
-                capture.contains("host.request"),
-                "no projection record for {label}: {capture}"
-            );
             let proven = PROVEN
                 .iter()
                 .any(|(admitted, name)| *admitted == event && **name == **label);
-            assert_eq!(
-                capture.contains("host.event_log_admission"),
-                proven,
-                "{} with {} must{} reach the Event Log: {capture}",
+            assert_projection_reaches_the_event_log_only_when_the_owner_proof_exists(
                 label,
-                event.as_str(),
-                if proven { "" } else { " not" }
+                projection,
+                evidence,
+                event,
+                proven,
             );
-            if proven {
-                assert_eq!(
-                    count(&capture, "host.event_log_admission"),
-                    1,
-                    "one admission decision per projection: {capture}"
-                );
-                assert!(
-                    capture.contains(&format!("operation=\"{}\"", event.as_str())),
-                    "the admitted operation must be the one production names: {capture}"
-                );
-                assert!(
-                    capture.contains(&format!("evidence=\"{}\"", evidence.as_str())),
-                    "the evidence class must be the one production projects: {capture}"
-                );
-            }
-            // Whatever the disposition, the record is a subordinate projection:
-            // it owns no terminal and no positive rollback claim.
-            assert!(
-                !capture.contains("host.terminal_error"),
-                "a projection record is never a terminal: {capture}"
-            );
-            for positive in ROLLBACK_POSITIVE_CLAIMS {
-                assert!(
-                    !capture.contains(positive),
-                    "the {label} projection claimed {positive:?}: {capture}"
-                );
-            }
         }
     }
     // Supplementary owner binding: the three positive claims the reachable gate
     // denies above are the owner's own frozen labels, taken from the closed
     // `RollbackContour` projection the owner renders its records from.
     let owner = src("src/phase_b_materialization/rollback_backup.rs");
-    let labels: Vec<&str> = owner_contour_labels(&owner)
-        .iter()
-        .map(|pair| pair.1.as_str())
-        .collect();
+    let published = owner_contour_labels(&owner);
+    let labels: Vec<&str> = published.iter().map(|pair| pair.1.as_str()).collect();
     for positive in ROLLBACK_POSITIVE_CLAIMS {
         assert!(
             labels.contains(&positive),
