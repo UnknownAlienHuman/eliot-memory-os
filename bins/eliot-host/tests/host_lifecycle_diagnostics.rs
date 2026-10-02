@@ -7,7 +7,7 @@
 //! Event Log seam stays typed-Unavailable (`event_log_sink_status`), never
 //! implemented here (#984 still open).
 //!
-//! Two named probes plus three matrix-denominator guards:
+//! Two named probes plus four matrix-denominator guards:
 //! - T-A stop/drain distinct (`Requested` -> `Draining` -> `StoppedClean` via
 //!   existing `HostComposition::stop` seams; three distinct records sharing
 //!   one `drain_generation` correlation, exactly one terminal on failure;
@@ -19,10 +19,15 @@
 //!   identity, `Unknown` never false-success, single terminal emission).
 //! - `case_matrix_denominator_is_exactly_1_to_22` proves the case markers
 //!   really exist once each, with no gap and no doubling.
+//! - `case_bodies_assert_against_production_seams` is the half that carries
+//!   the PROOF claim: every one of the 22 case bodies makes at least one
+//!   assertion that reads a real production seam, so a marker over an empty
+//!   `fn` no longer reads as a landed case.
 //! - `boundary_fixture_binds_production_table` binds the `boundary_table`
 //!   fixture to the production table in both directions.
-//! - `boundary_rows_bind_a_landed_case` binds every production row to a
-//!   landed case so the table cannot claim proof that does not exist.
+//! - `boundary_rows_bind_a_landed_case` binds every production row to a landed
+//!   case that actually asserts, so the table cannot claim proof that does not
+//!   exist.
 //!
 //! The 22-case matrix itself is LANDED, with no gap: all 22 cases carry a
 //! `// WORK_UNIT_CASE: 891/<n>` marker, and each marker's `fn` is a real
@@ -36,6 +41,18 @@
 //! behavior. Diagnostics are evidence only: they never change control flow,
 //! state, errors, receipts, order, status, or cleanup, and stdout framing
 //! stays exactly one-JSON-per-line.
+//!
+//! Where a pin could only bind a SOURCE SHAPE, it says so in its own
+//! documentation instead of implying an executed observation:
+//! - `case_bodies_assert_against_production_seams` proves each of the 22 case
+//!   bodies asserts against a real production seam. It does NOT prove the
+//!   assertion is correct or discriminating; executing the `#[cfg(test)]` case
+//!   bodies is not reachable from this integration target, and that residual
+//!   is a named ceiling, not a covered claim.
+//! - T-B's kernel-restart terminal pin binds the RESOLVED CONSTANT value
+//!   (`resolved_boundary_event`), which is what production renders as `code=`,
+//!   not the number of call sites that mention it. The handler's control flow
+//!   itself is not driven here and is likewise a named ceiling.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -99,6 +116,157 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
+/// One source line reduced to its CODE view: `//` comments dropped and every
+/// string/char literal body replaced by an empty pair of quotes.
+///
+/// The `#891` case bodies contain braces, parentheses and the word `assert`
+/// inside their assertion messages, so counting brackets or assertions on raw
+/// text would read a message as structure. This reduction keeps the literal
+/// delimiters (so `\"` never escapes a scan) and keeps lifetimes (`'static`,
+/// `'a`) intact by only treating `'` as a char literal when a closing `'` is
+/// within four characters.
+fn code_view(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current == '/' && chars.get(index + 1) == Some(&'/') {
+            break;
+        }
+        if current == '"' {
+            out.push('"');
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == '\\' {
+                    index += 2;
+                    continue;
+                }
+                if chars[index] == '"' {
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            out.push('"');
+            continue;
+        }
+        if current == '\'' {
+            let close = (index + 1..(index + 5).min(chars.len()))
+                .find(|candidate| chars[*candidate] == '\'');
+            if let Some(close) = close {
+                out.push_str("''");
+                index = close + 1;
+                continue;
+            }
+        }
+        out.push(current);
+        index += 1;
+    }
+    out
+}
+
+/// The `lib.rs` case-module start line index, located on the CODE view.
+///
+/// `production_source()` and the denominator proof must agree on exactly which
+/// lines are the case module, so both locate the header through [`code_view`].
+fn case_module_start(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .position(|line| code_view(line).trim() == "mod host_lifecycle_boundary_table_tests {")
+        .expect("the #891 boundary-table case module must exist in lib.rs")
+}
+
+/// Every identifier `lib.rs` DECLARES or RE-EXPORTS outside the case module.
+///
+/// This is the authority set the denominator proof resolves each `super::…`
+/// seam against. A case that asserts against `super::whatever` proves nothing
+/// if `whatever` is not a real production item, so the proof requires every
+/// seam a case touches to resolve here.
+///
+/// `use` clauses are read as balanced text rather than line by line because a
+/// clause may span several lines (`pub use a::{B, C};`); brace/paren depth
+/// finds the true terminating `;`.
+fn production_identifiers(production: &str) -> Vec<String> {
+    let flattened = production
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut names: Vec<String> = Vec::new();
+
+    // Declarations, including those nested inside `impl` blocks.
+    let declaration_bytes = flattened.as_bytes();
+    let mut index = 0;
+    while index < declaration_bytes.len() {
+        if declaration_bytes[index].is_ascii_alphabetic() || declaration_bytes[index] == b'_' {
+            let start = index;
+            while index < declaration_bytes.len()
+                && (declaration_bytes[index].is_ascii_alphanumeric()
+                    || declaration_bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            let word = &flattened[start..index];
+            let is_item_keyword = matches!(
+                word,
+                "const" | "static" | "fn" | "struct" | "enum" | "trait" | "type" | "union" | "mod"
+            );
+            if is_item_keyword {
+                let mut cursor = index;
+                while cursor < flattened.len()
+                    && (flattened.as_bytes()[cursor] == b' '
+                        || flattened.as_bytes()[cursor] == b'\t')
+                {
+                    cursor += 1;
+                }
+                let name_start = cursor;
+                while cursor < flattened.len()
+                    && (flattened.as_bytes()[cursor].is_ascii_alphanumeric()
+                        || flattened.as_bytes()[cursor] == b'_')
+                {
+                    cursor += 1;
+                }
+                if cursor > name_start {
+                    names.push(flattened[name_start..cursor].to_owned());
+                }
+            }
+            continue;
+        }
+        index += 1;
+    }
+
+    // `use` / `pub use` clauses: every identifier they name is a production
+    // item this target may legitimately reach through `super::`.
+    let mut cursor = 0;
+    while let Some(at) = flattened[cursor..].find("use ") {
+        let start = cursor + at + "use ".len();
+        let bytes = flattened.as_bytes();
+        let mut depth = 0_i32;
+        let mut end = start;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                b';' if depth == 0 => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        for token in flattened[start..end].split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if !token.is_empty() && !token.starts_with(|c: char| c.is_ascii_digit()) {
+                names.push(token.to_owned());
+            }
+        }
+        cursor = (end + 1).max(start);
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// `lib.rs` with its `#[cfg(test)]` boundary-table case module excised.
 ///
 /// The landed case proofs live in that module and legitimately re-spell the
@@ -110,10 +278,7 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 fn production_source() -> String {
     let lib = manifest_source("src/lib.rs");
     let lines: Vec<&str> = lib.lines().collect();
-    let start = lines
-        .iter()
-        .position(|line| line.trim() == "mod host_lifecycle_boundary_table_tests {")
-        .expect("the #891 boundary-table case module must exist in lib.rs");
+    let start = case_module_start(&lines);
     let end = lines
         .iter()
         .skip(start + 1)
@@ -137,6 +302,179 @@ struct BoundaryRow {
     name: String,
     event: String,
     test: String,
+}
+
+/// The CODE view of one `fn case_<n>_..` body, located by brace balance.
+///
+/// Brackets are counted through [`code_view`] so a brace inside an assertion
+/// message cannot end the body early. The returned text excludes the `fn`
+/// signature line and the final `}`, and is exactly what the denominator proof
+/// reasons about: an empty body yields an empty string, which is the state
+/// Defect 7 showed was previously indistinguishable from a real proof.
+fn case_body_code(lines: &[&str], fn_line: usize) -> String {
+    let mut depth = 0_i32;
+    let mut opened = false;
+    let mut body: Vec<String> = Vec::new();
+    for line in &lines[fn_line..] {
+        let code = code_view(line);
+        for character in code.chars() {
+            if character == '{' {
+                depth += 1;
+                opened = true;
+            } else if character == '}' {
+                depth -= 1;
+            }
+        }
+        if opened && depth == 0 {
+            return body.join("\n");
+        }
+        body.push(code);
+    }
+    String::new()
+}
+
+/// Every assertion-macro invocation in `body`, with its balanced argument span.
+///
+/// Counting the bare word `assert` would read an assertion MESSAGE mentioning
+/// "assertions" as a proof, and would count a commented-out assertion as live.
+/// This walks the CODE view, matches only `assert!`/`assert_eq!`/`assert_ne!`
+/// invocation heads, and captures the balanced parenthesised arguments.
+fn assertion_spans(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut spans: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &body[index..];
+        let head_len = if rest.starts_with("assert_eq!") || rest.starts_with("assert_ne!") {
+            "assert_eq!".len()
+        } else if rest.starts_with("assert!") {
+            "assert!".len()
+        } else {
+            index += 1;
+            continue;
+        };
+        let mut cursor = index + head_len;
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'(' {
+            index += head_len;
+            continue;
+        }
+        let mut depth = 0_i32;
+        let mut end = cursor;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        let stop = (end + 1).min(bytes.len());
+        spans.push(body[index..stop].to_owned());
+        index = stop;
+    }
+    spans
+}
+
+/// Locals a case body binds FROM PRODUCTION, one hop deep.
+///
+/// A local is production-bound when its initialiser reads a `super::…`
+/// production seam or calls the case module's own production-source reader
+/// `lib_source()`. This is the taint step that lets an assertion count as
+/// proof: `assert_eq!(row.event, other.event)` proves something only because
+/// `row` was resolved out of the real production table.
+fn production_bound_locals(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut bound: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !body[index..].starts_with("let ") {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + "let ".len();
+        if body[cursor..].starts_with("mut ") {
+            cursor += "mut ".len();
+        }
+        let name_start = cursor;
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        let name = body[name_start..cursor].to_owned();
+        // Skip a type annotation up to the initialising `=`.
+        while cursor < bytes.len() && bytes[cursor] != b'=' && bytes[cursor] != b';' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            index += 1;
+            continue;
+        }
+        cursor += 1;
+        let value_start = cursor;
+        let mut depth = 0_i32;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b';' if depth <= 0 => break,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        let initialiser = &body[value_start..cursor];
+        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            index += 1;
+            continue;
+        }
+        if initialiser.contains("super::") || initialiser.contains("lib_source()") {
+            bound.push(name);
+        }
+        index = (cursor + 1).max(index + 1);
+    }
+    bound
+}
+
+/// Whether `span` reads a production seam, directly or through a bound local.
+fn span_reads_production(span: &str, bound: &[String]) -> bool {
+    if span.contains("super::") {
+        return true;
+    }
+    bound
+        .iter()
+        .any(|name| token_bounded(span, name))
+}
+
+/// Whether `identifier` occurs in `haystack` delimited by non-identifier
+/// characters, so `pending` never matches `pending_ref`.
+fn token_bounded(haystack: &str, identifier: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(at) = haystack[from..].find(identifier) {
+        let start = from + at;
+        let end = start + identifier.len();
+        let before_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_identifier_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Returns the first `"..."` literal in `text`.
@@ -165,6 +503,86 @@ fn frozen_event(value: &str) -> String {
         joined.push_str(&quoted(part.trim()));
         joined
     })
+}
+
+/// Resolves a `BOUNDARY_*` owner's `boundary_by_event(…)` argument to its
+/// frozen value, straight out of the real production constant.
+///
+/// This is the RESOLVED-VALUE binding Defect 8 lacked: the owner resolves its
+/// row by calling `boundary_by_event(<literal>)`, so reading that literal back
+/// yields the exact value `host_lifecycle_frozen_event` renders as `code=`.
+/// Repointing the constant at a different event changes this result, which is
+/// precisely what counting call sites could not detect.
+///
+/// The three terminal rows spell their code with `concat!`, so the literal
+/// arguments are concatenated in source order exactly as `concat!` does.
+fn resolved_boundary_event(lib: &str, constant: &str) -> String {
+    let flattened = lib
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let declaration = format!("const {constant}:");
+    let start = flattened
+        .find(&declaration)
+        .unwrap_or_else(|| panic!("the production table must own a {constant} constant"));
+    let call = flattened[start..]
+        .find("boundary_by_event(")
+        .map(|at| start + at + "boundary_by_event(".len())
+        .unwrap_or_else(|| panic!("{constant} must resolve its row through boundary_by_event"));
+    let close = flattened[call..]
+        .find(')')
+        .map(|at| call + at)
+        .unwrap_or_else(|| panic!("{constant} must close its boundary_by_event call"));
+    let arguments = &flattened[call..close];
+    let mut resolved = String::new();
+    let mut rest = arguments;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let end = after
+            .find('"')
+            .unwrap_or_else(|| panic!("{constant} must close its boundary_by_event literal"));
+        resolved.push_str(&after[..end]);
+        rest = &after[end + 1..];
+    }
+    assert!(
+        !resolved.is_empty(),
+        "{constant} must resolve to a non-empty frozen event"
+    );
+    resolved
+}
+
+/// How many production call sites pass `constant` to a terminal emitter.
+///
+/// Reads the CODE view line by line: a site is a line whose code opens
+/// `host_lifecycle_observe_terminal…(` followed by a line naming the constant
+/// as that call's first argument. This is a SUPPLEMENTARY call-site census
+/// only — it counts sites and says nothing about which event they render — so
+/// every pin that depends on the emitted VALUE must bind
+/// [`resolved_boundary_event`] instead.
+fn terminal_emission_sites(lib: &str, constant: &str) -> usize {
+    let lines: Vec<String> = lib.lines().map(code_view).collect();
+    let mut sites = 0;
+    for (index, line) in lines.iter().enumerate() {
+        // The production call sites wrap their arguments, so the opening line
+        // ENDS in `(`. Accept an opener whose `(` is the line's last character
+        // as well as one with further arguments on the same line.
+        let opens = line
+            .find("host_lifecycle_observe_terminal")
+            .is_some_and(|at| line[at..].contains('('));
+        if !opens {
+            continue;
+        }
+        if lines[index + 1..]
+            .iter()
+            .find(|next| !next.trim().is_empty())
+            .is_some_and(|next| next.trim_start().starts_with(constant))
+        {
+            sites += 1;
+        }
+    }
+    sites
 }
 
 /// Parses the frozen production boundary table out of `src/lib.rs`.
@@ -257,11 +675,36 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
     // Requested vs Draining vs StoppedClean are three distinct durable writes.
     assert_ne!("Requested", "Draining");
     assert_ne!("Draining", "StoppedClean");
-    // The terminal code is singular for this operation.
+    // The terminal code is singular for this operation. The PRIMARY pin is the
+    // RESOLVED VALUE: `BOUNDARY_STOP_TERMINAL` resolves through the owner's own
+    // `boundary_by_event` call, so this binds the exact `code=` production
+    // renders and would fail if the constant were repointed at another event.
+    // (The previous count of the `"host-stop-failed"` literal could not detect
+    // that repointing at all — it counted a spelling, not the emitted value.)
+    assert_eq!(
+        resolved_boundary_event(&lib, "BOUNDARY_STOP_TERMINAL"),
+        fixture["terminal_codes"]["stop_failed"]
+            .as_str()
+            .expect("fixture must pin the stop failed code"),
+        "the stop terminal constant must resolve to the exact code production renders"
+    );
+    // The resolved value must be a REAL production row, so the pin cannot be
+    // satisfied by a spelling no row owns.
+    assert_eq!(
+        production_boundary_rows(&lib)
+            .iter()
+            .find(|row| row.name == "stop.terminal")
+            .map(|row| row.event.clone())
+            .as_deref(),
+        Some(resolved_boundary_event(&lib, "BOUNDARY_STOP_TERMINAL").as_str()),
+        "the stop constant must resolve to the stop.terminal row's own frozen event"
+    );
+    // SUPPLEMENTARY (source scan, clearly marked): the literal is spelled once,
+    // so no duplicate spelling of this code exists in production.
     assert_eq!(
         count_occurrences(&lib, "\"host-stop-failed\""),
         1,
-        "stop must own exactly one terminal code site"
+        "stop must spell its terminal code at exactly one production site"
     );
     // Inner terminates are phase-only; they must not own a second stop
     // terminal.
@@ -446,17 +889,62 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
             "lib.rs SCM contour must contain {required:?}"
         );
     }
-    // Single terminal per Unknown outcome (one site per handler outcome).
-    // The two `Unknown` exits still emit the restart terminal from exactly two
-    // production sites; the sites now name the frozen boundary row rather than
-    // the code literal, so the count is taken on the emission sites themselves.
+    // PRIMARY: the `code=` value production actually renders for the
+    // kernel-restart terminal.
+    //
+    // The previous pin counted the SPELLING of two `const`-call sites, so
+    // repointing `BOUNDARY_KERNEL_RESTART_TERMINAL` at a different event left
+    // the count at 2 and the assertion green while production emitted
+    // something else entirely. This binds the resolved constant instead: the
+    // owner resolves the row through its own `boundary_by_event(…)` call, so
+    // the resolved value IS the value `host_lifecycle_frozen_event` renders as
+    // `code=` at every kernel-restart terminal emission.
+    //
+    // PROOF CEILING, stated plainly: this pins the RESOLVED CONSTANT, not an
+    // observed emission. The `#[cfg(windows)]` `HostComposition` that owns
+    // `handle_kernel_restart_request` needs a live owner lease, job branches,
+    // readiness gate and registry, none of which this non-`cfg(test)`
+    // integration target can construct, so the emission cannot be driven from
+    // here. What IS executed is that the facade renders the resolved value as
+    // `code=`: the capture below observes production's own formatter emitting
+    // `code="host-kernel-restart-unknown"` through
+    // `observe_terminal_error`, which is the same owner function
+    // `host_lifecycle_observe_terminal_with_request_identity` calls. The
+    // unresolved gap is the handler CONTROL FLOW, which no assertion here can
+    // reach and which is reported as a named ceiling rather than claimed.
     assert_eq!(
-        count_occurrences(
-            &lib,
-            "host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL)"
-        ),
+        resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        fixture["terminal_codes"]["kernel_restart_unknown"]
+            .as_str()
+            .expect("fixture must pin the restart unknown code"),
+        "the kernel-restart terminal constant must resolve to the exact code production renders"
+    );
+    // The resolved constant must be a REAL production row, so the pin cannot
+    // be satisfied by a spelling that no table row owns.
+    let rows = production_boundary_rows(&lib);
+    let terminal_row = rows
+        .iter()
+        .find(|row| row.name == "kernel-restart.terminal")
+        .expect("the production table must own a kernel-restart.terminal row");
+    assert_eq!(
+        terminal_row.event,
+        resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        "the constant must resolve to the kernel-restart.terminal row's own frozen event"
+    );
+    assert_eq!(
+        terminal_row.test, "891/T-B",
+        "the kernel-restart terminal row must remain this probe's proof claim"
+    );
+
+    // SUPPLEMENTARY (source scan, clearly marked): the resolved constant is
+    // passed to a terminal emitter at exactly the two production Unknown exits.
+    // This is retained only as a call-site census; it is NOT what proves the
+    // emitted code, because it is insensitive to which event the constant
+    // names.
+    assert_eq!(
+        terminal_emission_sites(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
         2,
-        "handle must own exactly its request + unknown terminals, got handle sites"
+        "handle must own exactly its owner-fenced + unknown terminal emissions"
     );
 
     // Real wire types: a well-formed RestartKernel request validates; an
@@ -571,12 +1059,37 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         1,
         "one Unknown outcome must emit exactly one terminal, got: {scm_text}"
     );
-    // Failed vs Unknown preserved by distinct codes.
-    assert!(
+    // Failed vs Unknown preserved by distinct codes. The pin is EXACT equality
+    // against the value the owner's constant resolves to, not a substring: the
+    // old `.contains("unknown")` was satisfied by any code merely mentioning
+    // the word, so it could not distinguish the Unknown code from the
+    // reconcile-Unknown code or from any future sibling.
+    assert_eq!(
         fixture["terminal_codes"]["kernel_restart_unknown"]
             .as_str()
-            .expect("fixture must pin the restart unknown code")
-            .contains("unknown")
+            .expect("fixture must pin the restart unknown code"),
+        resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        "the pinned Unknown code must be exactly the value the terminal constant resolves to"
+    );
+    assert_ne!(
+        fixture["terminal_codes"]["kernel_restart_unknown"]
+            .as_str()
+            .expect("fixture must pin the restart unknown code"),
+        fixture["terminal_codes"]["kernel_restart_reconcile_unknown"]
+            .as_str()
+            .expect("fixture must pin the reconcile unknown code"),
+        "the failed/Unknown distinction requires the restart and reconcile codes to differ"
+    );
+    // The facade really renders the resolved value as `code=`: this capture is
+    // production's own `observe_terminal_error`, the same owner function
+    // `host_lifecycle_observe_terminal_with_request_identity` calls, so the
+    // rendered `code=` field is the emitted value rather than a re-spelling.
+    assert!(
+        scm_text.contains(&format!(
+            "code={:?}",
+            resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL")
+        )),
+        "production must render the resolved terminal constant as `code=`, got: {scm_text}"
     );
 
     // Sink failure never alters result/order/status/cleanup.
@@ -620,6 +1133,13 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
 /// list is itself pinned here: the inverse check below proves every
 /// `fn case_<n>_` test in `lib.rs` is paid for by a marker, so a case cannot
 /// re-open a silent gap by keeping its proof while dropping its marker.
+///
+/// The marker census is only the DENOMINATOR half. It is deliberately not the
+/// claim that a case proves anything, because a marker plus an `#[test]` plus
+/// an empty body is exactly what "the 22-case matrix landed" looks like while
+/// being false. [`case_bodies_assert_against_production_seams`] is the half
+/// that carries the proof claim, and the two together are the honest
+/// denominator: no gap, and every occupied case is occupied by something.
 #[test]
 fn case_matrix_denominator_is_exactly_1_to_22() {
     let lib = manifest_source("src/lib.rs");
@@ -719,6 +1239,100 @@ fn case_matrix_denominator_is_exactly_1_to_22() {
             window.contains("#[test]"),
             "case {case} marker must sit on a #[test], got: {window}"
         );
+    }
+}
+
+/// The half of the denominator that carries the PROOF claim: every one of the
+/// 22 case bodies makes at least one assertion against a real production seam.
+///
+/// #891 previously proved only that 22 markers existed and that a `#[test]`
+/// attribute sat nearby. That admits a marker over an empty `fn`, which is
+/// exactly the state in which "the 22-case matrix is LANDED" is false while
+/// every marker assertion stays green — so the fixture's `LANDED` note was
+/// recording an unproved claim as data.
+///
+/// The property proved here is per case `n` in `1..=22`:
+///
+/// 1. `fn case_<n>_..` has a real, brace-balanced body (an empty body fails);
+/// 2. that body contains at least one `assert!`/`assert_eq!`/`assert_ne!`
+///    invocation, read on the CODE view so a commented-out assertion and the
+///    word "assertions" inside an assertion message are both excluded;
+/// 3. at least one such assertion READS PRODUCTION — it either names a
+///    `super::…` seam directly, or names a local that was bound from a
+///    `super::…` seam or from the case module's production-source reader
+///    `lib_source()`; and
+/// 4. every `super::…` identifier the body names RESOLVES to a real
+///    production declaration or re-export outside the case module, so an
+///    assertion cannot be pointed at a seam that does not exist.
+///
+/// Point 3 is what defeats the empty-body demonstration: replacing
+/// `case_13_…`'s body with `{}` leaves 0 assertion spans, and a body of
+/// `assert!(true);` leaves 0 production-reading assertions, so both fail here.
+///
+/// PROOF CEILING, stated plainly: this proves each case body ASSERTS against a
+/// real production seam. It does NOT prove the assertion is correct, that its
+/// expectation is the right one, or that it would fail if production regressed
+/// — only that a production-derived value is actually compared rather than a
+/// marker being present. An assertion that reads a production seam and then
+/// asserts something trivially true about it (`assert!(x == x)`) still passes.
+/// Closing that would require executing each case body, which this target
+/// cannot do: the cases are `#[cfg(test)]` items inside `src/lib.rs` and are
+/// not reachable from a non-`cfg(test)` integration target. That residual is
+/// named here rather than claimed as covered.
+#[test]
+fn case_bodies_assert_against_production_seams() {
+    let lib = manifest_source("src/lib.rs");
+    let lines: Vec<&str> = lib.lines().collect();
+    let production = production_source();
+    let identifiers = production_identifiers(&production);
+
+    for case in 1_u32..=22 {
+        let fn_line = lines
+            .iter()
+            .position(|line| {
+                code_view(line).trim_start().starts_with(&format!("fn case_{case}_"))
+            })
+            .unwrap_or_else(|| panic!("matrix case {case} must own a `fn case_{case}_..` test"));
+        let body = case_body_code(&lines, fn_line);
+        assert!(
+            !body.trim().is_empty(),
+            "case {case} must have a real body, not an empty one"
+        );
+
+        let spans = assertion_spans(&body);
+        assert!(
+            !spans.is_empty(),
+            "case {case} must assert something, not merely exist"
+        );
+
+        let bound = production_bound_locals(&body);
+        let reading = spans
+            .iter()
+            .filter(|span| span_reads_production(span, &bound))
+            .count();
+        assert!(
+            reading >= 1,
+            "case {case} must assert against a real production seam, got {}/{} \
+             production-reading assertions",
+            reading,
+            spans.len()
+        );
+
+        for seam in body
+            .match_indices("super::")
+            .map(|(at, _)| &body[at + "super::".len()..])
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty())
+        {
+            assert!(
+                identifiers.iter().any(|known| known == &seam),
+                "case {case} reads `super::{seam}`, which is not a real production item"
+            );
+        }
     }
 }
 
@@ -880,6 +1494,38 @@ fn boundary_rows_bind_a_landed_case() {
             whole.contains(&format!("fn case_{case}_")),
             "boundary row {:?} names case {case}, whose marker sits on no live test",
             row.name
+        );
+        // The marker and the `fn` name are the DENOMINATOR half only: together
+        // they still admit a marker over an empty body, which is not proof. So
+        // this binding additionally requires the named case to make at least
+        // one assertion that READS PRODUCTION, which is what makes the row's
+        // `test` claim a real proof claim rather than a comment plus a symbol.
+        let body = case_body_code(
+            &whole.lines().collect::<Vec<_>>(),
+            whole
+                .lines()
+                .position(|line| {
+                    code_view(line).trim_start().starts_with(&format!("fn case_{case}_"))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "boundary row {:?} names case {case}, which owns no case test",
+                        row.name
+                    )
+                }),
+        );
+        let spans = assertion_spans(&body);
+        let bound_locals = production_bound_locals(&body);
+        let reading = spans
+            .iter()
+            .filter(|span| span_reads_production(span, &bound_locals))
+            .count();
+        assert!(
+            reading >= 1,
+            "boundary row {:?} names case {case}, whose body asserts against no production seam \
+             ({} assertions, {reading} of them production-reading)",
+            row.name,
+            spans.len()
         );
         bound.push(row.name.as_str());
     }
