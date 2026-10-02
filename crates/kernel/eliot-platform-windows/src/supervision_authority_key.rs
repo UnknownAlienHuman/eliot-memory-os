@@ -2028,6 +2028,7 @@ mod tests {
     /// descriptor read-back — never both being satisfied.
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires the installed EliotHost service-SID token; the DPAPI-NG provider refuses without it"]
     fn physical_service_sid_token_seals_and_refuses_every_other_token() {
         let provider = WindowsSupervisionAuthorityKeyProvider::new();
         let sealed = provider
