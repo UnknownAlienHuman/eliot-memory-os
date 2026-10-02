@@ -2639,7 +2639,18 @@ mod owner_closure_provider_tests {
             }],
             binding: binding(fence),
             allowed_effect: EffectClass::Read,
-            proof_ceiling: ProofCeiling::ScopedVerification,
+            // The compiled mechanical subset stamps its proof ceiling from the
+            // BINDING, not from this declaration
+            // (`MechanicalAuthoritySubset::compile` sets
+            // `proof_ceiling: binding.proof_ceiling`), and
+            // `verify_hydration_mechanical_subset` compares the two for
+            // EQUALITY, not merely for ordering. A declared ceiling narrower
+            // than the binding's is therefore refused there with "admitted
+            // mechanical subset disagrees with its admitted grant intent",
+            // because a subset that never claims more than the binding cannot
+            // re-state a deliberately lower admitted ceiling. This declaration
+            // must therefore carry exactly the binding's ceiling.
+            proof_ceiling: binding(fence).proof_ceiling,
             issued_at_ms: 1_000,
             expires_at_ms: Some(10_000),
             receipt_obligations: vec!["obligation-1".to_owned()],
