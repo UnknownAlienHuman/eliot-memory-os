@@ -1383,8 +1383,7 @@ mod tests {
             let record = acquire_hook_payload(&mut reader)
                 .unwrap_or_else(|error| panic!("{arrival} must accept the record: {error:?}"));
             assert_eq!(
-                record,
-                b"x\rx",
+                record, b"x\rx",
                 "the carriage return belongs between the two x bytes: {arrival}"
             );
         }

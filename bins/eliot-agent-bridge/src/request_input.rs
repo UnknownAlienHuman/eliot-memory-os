@@ -334,18 +334,36 @@ pub(crate) enum ReadOutcome {
 ///
 /// # The accepted bytes are the stream's content bytes, in stream order
 ///
-/// A CR that a fill held is buffered at its true stream position and is
-/// removed, if it is framing, by POSITION. The position is not a guess:
-/// `carriage_return_held_at` is set only in the iteration that appended the
-/// byte, nothing else ever changes it, and nothing is inserted behind it
-/// (`Vec::push` appends, `extend_from_slice` appends, and the only removal is
-/// the discharge below), so while the byte is held it is the LAST element and
-/// discharging it is `pop`. That removes exactly one byte - the one this
-/// function buffered as held - and can never remove a byte that was never
-/// held: `held_at < record.len()` proves the held CR is still buffered, and
-/// discharging requires `terminated && !carriage_return_was_content`, which is
-/// exactly the proven-framing observation. Two held CRs cannot overlap because
-/// a fill that ends on a CR resolves the previous one before holding its own.
+/// A CR that a fill held is buffered at its true stream position, and it is
+/// removed - if it is framing - at that position (`Vec::remove`), by index and
+/// not by "whatever is at the end". The index is the reliable fact: it is
+/// written only by the arm that appended that byte, every append in this loop
+/// goes to the end of `record`, and the only removal is this one, so nothing is
+/// ever inserted or removed in front of `held_at` and the byte named there is
+/// still the byte that was held.
+///
+/// What is NOT a fact is that the held byte is the last one. A fill after the
+/// one that held the CR may charge and append content of its own, and those
+/// bytes land behind the held byte: on `x\rx\r\n` in two-byte fills, the
+/// second fill charges its `x` and appends it after the held CR, so `record`
+/// is `x`, `\r`, `x`, `\r` with the terminator's CR held at `3`. Today the
+/// discharge cannot observe that case, because it only runs when the
+/// terminating fill carries no content of its own, which is what makes the held
+/// byte the last one at that moment - so removing the last element happens to
+/// remove the right byte. That is a property of the reaching condition, not a
+/// property of "the held byte is last", and the discharge reads `held_at` for a
+/// reason: removing the named index keeps it correct under any of the fills,
+/// where removing the last element is correct only while no fill has appended
+/// behind the held byte.
+///
+/// `Vec::remove` is what preserves stream order for everything after the held
+/// byte: it closes the gap and shifts the tail in, so the bytes the stream
+/// placed after the CR keep their order among themselves and stay after
+/// everything the stream placed before it. `held_at < record.len()` proves the
+/// held byte is still buffered, and discharging requires `terminated &&
+/// !carriage_return_was_content`, which is exactly the proven-framing
+/// observation. Two held CRs cannot overlap because a fill that ends on a CR
+/// resolves the previous one before holding its own.
 ///
 /// # Why the ordering cannot depend on the fills
 ///
@@ -498,9 +516,10 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
                 // after all, because no newline can follow it here. Charge it
                 // against the ceiling before the loop continues. The charge and
                 // the buffered position are the same byte - the one buffered at
-                // `held_at`, which the preceding `extend_from_slice` pushed to
-                // `record.len() - 1` - so `record` grows by exactly the byte this
-                // charge counted.
+                // `held_at`, which the preceding `extend_from_slice` left where
+                // it was and the appends that followed moved after it - so the
+                // buffer already contains the byte this charge counts and the
+                // charge counts it exactly once.
                 let Some(total) = record_content_len.checked_add(1) else {
                     return discard_oversize_record(reader, profile);
                 };
@@ -569,27 +588,60 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
         // `extend_from_slice` nor the discharge below is a check the ceiling
         // depends on.
         //
-        // Discharge first: it can only run on the proven-framing observation
-        // (terminated, holding a CR, and that CR not content), which is
-        // `newline == 0` on a non-EOF fill - the only fill that can arrive while
-        // a CR is still held. The held CR is then the last element of `record`,
-        // because nothing has been appended since the iteration that pushed it
-        // and the fill's own content is still to be appended, so `pop` removes
-        // exactly that byte and nothing else. `held_at < record.len()` proves
-        // it is still buffered before the removal is taken.
+        // Discharge the held CR BY POSITION. It can only run on the
+        // proven-framing observation (terminated, holding a CR, and that CR not
+        // content), which is `newline == 0` on a non-EOF fill. Removing the byte
+        // at `held_at` - rather than the last element - is what makes the
+        // discharge independent of how much content a later fill appended
+        // behind the held byte: `Vec::remove` takes exactly the byte this
+        // function buffered as held and shifts the tail in, so every byte the
+        // stream placed after it keeps its order relative to every byte the
+        // stream placed before it. `pop` would be right only while the held byte
+        // is also the last one, which the condition above happens to guarantee
+        // today (the terminating fill carries no content, so nothing is appended
+        // behind the held byte) - but that is a property of the CONDITION, not
+        // of `pop`, and reading `held_at` and then acting on `record.len() - 1`
+        // is how a fill that did append behind it would silently drop the wrong
+        // byte. The index is the fact; the position in the vector at discharge
+        // time is not.
         if terminated && !carriage_return_was_content {
             if let Some(held_at) = carriage_return_held_at {
-                if held_at < record.len() && record.pop() == Some(b'\r') {
-                    // Framing: the CR the terminator's LF immediately follows
-                    // was buffered uncharged and is now removed uncharged, so
-                    // the charge accounted for it never existed.
-                    debug_assert_eq!(held_at + 1, record.len());
-                } else {
-                    // Unreachable: a held CR is always buffered, and nothing
-                    // appends or removes behind it while it is held. Fail
-                    // closed rather than assume it.
-                    return discard_oversize_record(reader, profile);
+                // Discharge at the position that was NAMED. `Vec::remove`
+                // removes exactly the byte at that index and shifts the tail in,
+                // so the bytes the stream placed after the held CR keep their
+                // order and their place behind everything the stream placed
+                // before it. Removing the last element instead is correct only
+                // while nothing has been appended behind the held byte, which is
+                // a property of the reaching condition rather than of the held
+                // byte, so the discharge acts on the index it recorded.
+                //
+                // Framing: the CR the terminator's LF immediately follows was
+                // buffered uncharged and is removed uncharged, so the charge that
+                // would have accounted for it never existed.
+                // `record_content_len` is deliberately NOT decremented: the byte
+                // it never counted is the byte just removed, so the charge and
+                // the buffer are equal again. The value `remove` hands back is
+                // the byte that left, so asserting it is `\r` is the assertion
+                // that the byte removed is the byte that was held - and that it
+                // is what the previous version got wrong by measuring the length
+                // AFTER the removal.
+                match record.remove(held_at) {
+                    b'\r' => {}
+                    // Unreachable: the byte at `held_at` is the byte this
+                    // function buffered as held, so it is always a carriage
+                    // return. Fail closed rather than assume it.
+                    _ => return discard_oversize_record(reader, profile),
                 }
+                // The charge and the buffer stand equal at the end of a
+                // discharge, which is the invariant every path returning a
+                // `Record` depends on. The previous assertion here compared
+                // `held_at + 1` against the length measured AFTER the removal,
+                // which is one less than it must be for any input, so it fired on
+                // every discharge - including the ones these tests exercise.
+                // Nothing about the charge is asserted separately: this equality
+                // is what states it, since the loop cannot have moved the charge
+                // since the comparison above.
+                debug_assert_eq!(record.len(), record_content_len);
             }
         }
         record.extend_from_slice(measured_content);
@@ -607,12 +659,10 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
                 // `carriage_return_was_content` above already charged it,
                 // against the ceiling, in this same iteration, and it is
                 // already buffered at its stream position, so nothing is left to
-                // do. The check below is therefore on the charged total alone,
-                // which is exactly `record.len()` here: `held_at` was the last
-                // append of the previous iteration and this iteration appends
-                // nothing, so `record.len() == held_at + 1 == record_content_len
-                // + owed`, and `owed` was counted in the total compared against
-                // the ceiling.
+                // do. This fill appends nothing, so the charge and the buffer
+                // stand equal here: the one owed charge was for a byte already
+                // buffered, so `record.len() == record_content_len` and that is
+                // what the check below states.
                 debug_assert_eq!(record.len(), record_content_len);
                 if record_content_len == 0 {
                     return Ok(ReadOutcome::Eof);
@@ -635,6 +685,11 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
             if std::str::from_utf8(&record).is_err() {
                 return Ok(ReadOutcome::InvalidUtf8);
             }
+            // Every byte this record retains is content, and every content byte
+            // is retained: the charge and the buffer are equal on the path that
+            // hands the bytes back. A framing CR was buffered uncharged and
+            // removed uncharged, so it never made the two disagree.
+            debug_assert_eq!(record.len(), record_content_len);
             return Ok(ReadOutcome::Record(record));
         }
     }
