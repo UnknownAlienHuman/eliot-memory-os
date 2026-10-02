@@ -123,7 +123,7 @@ use crate::service_registration::{exact_path_text, utf16_text};
 pub use directory_publication::{
     DirectoryPublicationError, DirectoryPublicationOutcome, DirectoryPublicationReceipt,
     DirectoryPublicationUnknown, DirectoryPublicationUnknownReceipt, OwnedDirectoryPublication,
-    sync_directory_for_publication,
+    RetainedRootDisposition, RetainedRootObservation, sync_directory_for_publication,
 };
 pub(crate) use directory_publication::{
     create_owned_directory_relative, rename_directory_from_handle,
