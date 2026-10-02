@@ -769,12 +769,16 @@ pub(super) async fn canonical_memory_snapshot(
 /// current measurement for one canonical memory record.
 ///
 /// A22/W9. The current corpus item carries `token_units` as an exact canonical
-/// STU figure. The historical basis was `chars / 4`, which is neither bytes
-/// nor tokens, so it is published here in its **own** shape: a separate object
-/// with its own discriminator, its own `legacy_unit` and its own `estimated`
-/// status. It is not merged into `token_units`, not renamed to match it and
-/// not carried in any field whose name a reader could mistake for a current
-/// claim.
+/// STU figure. The historical form is published here in its **own** shape: a
+/// separate object with its own discriminator, its own `legacy_unit` and its
+/// own `estimated` status. It is not merged into `token_units`, not renamed to
+/// match it and not carried in any field whose name a reader could mistake for
+/// a current claim.
+///
+/// #783: its figure is measured by the canonical #704 owner over the very same
+/// exact `serde_json` bytes this record's `token_units` was measured from, so
+/// the legacy figure is canonical STU evidence rather than a local `chars / 4`
+/// ratio, and the two forms cannot disagree about the payload they describe.
 ///
 /// The returned value is the object as it appears on the wire. It is built and
 /// then re-decoded through the closed legacy decoder, so the form this surface
@@ -786,13 +790,11 @@ pub(super) fn legacy_memory_token_units_wire(
     records
         .iter()
         .map(|record| {
-            let serialized = serde_json::to_string(&record.receipt_body)
+            let serialized = serde_json::to_vec(&record.receipt_body)
                 .context("serialize canonical memory payload for the legacy wire form")?;
-            let unicode_scalar_values = u64::try_from(serialized.chars().count())
-                .context("legacy memory character count exceeds u64")?;
             legacy_memory_token_units_wire_value(
                 &format!("canonical:{}", record.record_id),
-                unicode_scalar_values,
+                &serialized,
             )
         })
         .collect()
