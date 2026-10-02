@@ -147,6 +147,7 @@ use crate::pulse::{
     check_projection_boundary, fences_compatible, output_digest, run_candidate_stage,
     run_classification_stage, run_conflict_stage, run_cue_stage, run_epistemic_stage,
     run_grounding_stage, run_probe_stage, run_rival_stage, run_understanding_stage,
+    verify_denominator_coverage,
 };
 use crate::{
     DreamJobInput, KernelJobAdmission, ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
@@ -359,12 +360,39 @@ pub(crate) struct AdmittedOrientationRefs<'a> {
     /// The sealed orientation policy.
     pub policy: &'a OrientationPolicy,
 }
+pub(crate) enum OrientationResolution {
+    /// An honest missing-prerequisite answer, published as a blocked pulse.
+    Blocked(Box<OrientationPulseResult>),
+    /// A composer defect: the ledger that would have been published does not
+    /// cover the mandatory denominator, so no result may be published at all.
+    Defect(PulseError),
+}
+
+/// Wraps the absent-supply blocked result, keeping a composer defect typed.
+///
+/// The blocked result and the coverage refusal are different answers and stay
+/// distinguishable across the layer boundary: one is an honest
+/// missing-prerequisite disposition the caller publishes, the other is a
+/// refusal that must not be dressed as one.
+fn blocked_resolution(
+    admission: &KernelJobAdmission,
+    admitted_job: &AdmittedOrientationJob,
+    candidate: &ValidatedCandidate,
+    bundle: &DreamInputBundle,
+    policy: &OrientationPolicy,
+    route: Option<(&ModelRouteRequest, &ModelRouteOutcome)>,
+) -> OrientationResolution {
+    match supply_missing_blocked(admission, admitted_job, candidate, bundle, policy, route) {
+        Ok(blocked) => OrientationResolution::Blocked(Box::new(blocked)),
+        Err(error) => OrientationResolution::Defect(error),
+    }
+}
 pub(crate) fn resolve_production_inputs<'a>(
     admitted: &AdmittedOrientationRefs<'a>,
     route: Option<(&'a ModelRouteRequest, &'a ModelRouteOutcome)>,
     supply: Option<&'a OrientationSupply<'a>>,
     pipeline: &PipelineOrientationRecords<'a>,
-) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
+) -> Result<ProductionOrientationInputs<'a>, OrientationResolution> {
     let AdmittedOrientationRefs {
         admission,
         admitted_job,
@@ -378,24 +406,24 @@ pub(crate) fn resolve_production_inputs<'a>(
         v1: Some(v1),
     } = *pipeline
     else {
-        return Err(Box::new(supply_missing_blocked(
+        return Err(blocked_resolution(
             admission,
             admitted_job,
             candidate,
             bundle,
             policy,
             route,
-        )));
+        ));
     };
     let (Some(supply), Some((model_request, model_outcome))) = (supply, route) else {
-        return Err(Box::new(supply_missing_blocked(
+        return Err(blocked_resolution(
             admission,
             admitted_job,
             candidate,
             bundle,
             policy,
             route,
-        )));
+        ));
     };
     Ok(ProductionOrientationInputs {
         schema_version: PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION,
@@ -482,10 +510,10 @@ pub(crate) fn compose_production_result(
     }
     let admitted = admitted_prefix(&inputs);
     if let Err(field) = validate_identity_closure(&inputs, semantic_job) {
-        return Ok(closure_blocked(&inputs, &admitted, field));
+        return closure_blocked(&inputs, &admitted, field);
     }
     if let Some(reason) = unusable_model_reason(inputs.model_outcome.disposition) {
-        return Ok(unusable_model_blocked(&inputs, &admitted, reason));
+        return unusable_model_blocked(&inputs, &admitted, reason);
     }
     let identity = BlockedIdentity::of(&inputs);
     let model_boundary = present_model_boundary(inputs.model_outcome);
@@ -508,14 +536,14 @@ pub(crate) fn compose_production_result(
     );
     order_stage_records(&mut records);
     if !refused.is_empty() {
-        return Ok(refused_stages_blocked(
+        return refused_stages_blocked(
             identity,
             admitted,
             model_boundary,
             projections_boundary,
             records,
             refused,
-        ));
+        );
     }
 
     let packet = build_projection(
@@ -526,6 +554,12 @@ pub(crate) fn compose_production_result(
         inputs.policy,
     )?;
     records.push(packet_stage_record(&packet)?);
+    // The composed path shares no builder with `blocked_result`, so the
+    // denominator coverage proof runs here too: a `Partial` or `Complete`
+    // pulse is exactly the result a reader trusts to have executed the whole
+    // contract-only path, so an incomplete ledger must refuse rather than
+    // publish a packet under a denominator claim it does not satisfy.
+    verify_denominator_coverage(&records).map_err(PulseError::Boundary)?;
     let dream_packet = crate::dispatch_stage::map_orientation_packet(&packet, semantic_job);
     let (disposition, omissions) = if CONFLICT_OUTPUT_QUALIFIED {
         (OrientationDisposition::Complete, Vec::new())
@@ -778,7 +812,7 @@ fn refused_stages_blocked(
     projections: OrientationBoundaryRecord,
     mut records: Vec<OrientationStageRecord>,
     refused: Vec<String>,
-) -> OrientationPulseResult {
+) -> Result<OrientationPulseResult, PulseError> {
     records.push(blocked_stage_record(
         PulseStageId::Packet,
         PulseStageId::Packet.missing_reason(),
@@ -911,9 +945,17 @@ struct BlockedParts {
 }
 
 /// Assembles one blocked result: full denominator, no packet.
-fn blocked_result(parts: BlockedParts) -> OrientationPulseResult {
-    debug_assert_eq!(parts.stages.len(), MANDATORY_DENOMINATOR.members.len());
-    OrientationPulseResult {
+///
+/// The coverage proof runs here, in the single builder every blocked result
+/// goes through, so no blocked pulse can be published with a ledger that
+/// does not cover the mandatory denominator. A refusal is not reported as a
+/// blocked pulse: it is returned as the typed [`PulseError`] it is, because a
+/// self-inconsistent ledger is a composer defect rather than an owner
+/// condition, and publishing it as `Blocked` would present a defect as an
+/// honest missing-prerequisite answer.
+fn blocked_result(parts: BlockedParts) -> Result<OrientationPulseResult, PulseError> {
+    verify_denominator_coverage(&parts.stages).map_err(PulseError::Boundary)?;
+    Ok(OrientationPulseResult {
         schema_version: ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
         disposition: OrientationDisposition::Blocked,
         proof_ceiling: CEILING_BLOCKED.to_owned(),
@@ -930,7 +972,7 @@ fn blocked_result(parts: BlockedParts) -> OrientationPulseResult {
         packet: None,
         omissions: parts.omissions,
         missing_owners: parts.missing_owners,
-    }
+    })
 }
 
 /// Builds the blocked result for the absent Governor supply channel: the
@@ -943,7 +985,7 @@ fn supply_missing_blocked(
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
     route: Option<(&ModelRouteRequest, &ModelRouteOutcome)>,
-) -> OrientationPulseResult {
+) -> Result<OrientationPulseResult, PulseError> {
     let stages = PulseStageId::ORDER
         .iter()
         .map(|id| blocked_stage_record(*id, id.missing_reason()))
@@ -999,7 +1041,7 @@ fn closure_blocked(
     inputs: &ProductionOrientationInputs,
     admitted: &OrientationAdmittedPrefix,
     field: &'static str,
-) -> OrientationPulseResult {
+) -> Result<OrientationPulseResult, PulseError> {
     let stages = PulseStageId::ORDER
         .iter()
         .map(|id| blocked_stage_record(*id, field))
@@ -1033,7 +1075,7 @@ fn unusable_model_blocked(
     inputs: &ProductionOrientationInputs,
     admitted: &OrientationAdmittedPrefix,
     reason: &'static str,
-) -> OrientationPulseResult {
+) -> Result<OrientationPulseResult, PulseError> {
     let stages = PulseStageId::ORDER
         .iter()
         .map(|id| blocked_stage_record(*id, reason))

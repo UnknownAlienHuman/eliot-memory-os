@@ -541,7 +541,16 @@ fn dispatch_orientation(
         Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
             .map(DreamResult::Orientation)
             .map_err(|error| orientation_denied(&error.into_orientation_error())),
-        Err(blocked) => Ok(DreamResult::Orientation(*blocked)),
+        // A missing prerequisite is an honest blocked disposition and is
+        // published; a composer defect (a ledger that does not cover the
+        // mandatory denominator) is a refusal and is not, so the two answers
+        // stay distinguishable instead of collapsing into one.
+        Err(crate::production_orientation::OrientationResolution::Blocked(blocked)) => {
+            Ok(DreamResult::Orientation(*blocked))
+        }
+        Err(crate::production_orientation::OrientationResolution::Defect(error)) => {
+            Err(orientation_denied(&error.into_orientation_error()))
+        }
     }
 }
 
