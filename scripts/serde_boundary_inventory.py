@@ -320,6 +320,9 @@ ALLOWED_COMMANDS = (
 BASE_SHA_SOURCE = "git-rev-parse-HEAD"
 PROVENANCE_AUTHORITY = "informational-observational-outside-proof-ceiling"
 CANONICAL_EXCLUDED_FIELDS = ("base_sha", "base_sha_source")
+# Explicit degradation recorded at build_inventory (:2103) when git cannot
+# resolve HEAD, so a consumer reads the sentinel instead of re-spelling it.
+UNKNOWN_BASE_SENTINEL = "unknown-base"
 
 CANONICAL_HEADER_KEYS = (
     "schema",
@@ -2100,7 +2103,7 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
     try:
         base_sha = _run_git(root, ["git", "rev-parse", "HEAD"]).decode("utf-8", errors="replace").strip()
     except InventoryError:
-        base_sha = "unknown-base"
+        base_sha = UNKNOWN_BASE_SENTINEL
 
     if scan_rels is None:
         scan_rels = _tracked_rust_files(root)
@@ -2905,15 +2908,28 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
                         "allocation %s lists a glob instead of exact files: %s" % (alloc.get("child"), text),
                     )
     check_write_serialization(stored_allocs)
+    # The returned row projection is the row's OWN ``repair_child`` value
+    # (:2215), which is what ``unassigned_count`` is computed from (:2392,
+    # emitted at :2428) and what the stored artifact already carries
+    # (``CANONICAL_ROW_KEYS`` :410, rendered at :2667). It is returned
+    # unchanged, never recomputed here: a consumer compares the returned
+    # ``unassigned_count`` against these rows instead of re-deriving it.
     return [
         {"candidate_id": r["id"], "id": r["id"], "disposition": r["disposition"],
-         "owner": r["owner"], "digest": r["digest"]}
+         "owner": r["owner"], "repair_child": r["repair_child"], "digest": r["digest"]}
         for r in fresh["rows"]
     ]
 
 
 # ---------------------------------------------------------------------------
 # Public #929 generator/rules API consumed by the #710 closure oracle.
+#
+# Every returned row from ``validate_against_artifact`` carries exactly
+# ``candidate_id``, ``id``, ``disposition``, ``owner``, ``repair_child`` and
+# ``digest``. ``candidate_id`` and ``id`` are the same ``id`` value.
+# ``repair_child`` is the row's own value (:2215), so ``unassigned_count``
+# (:2392, emitted at :2428) is comparable against the returned rows directly,
+# with no rescan and no re-derivation at the consumer.
 # ---------------------------------------------------------------------------
 
 
@@ -2947,6 +2963,11 @@ def iter_candidate_rows(root: Path | str) -> list[dict]:
 
 def check(root: Path | str) -> dict:
     """Read-only validation returning rows (oracle entry point).
+
+    Returns ``{"rows", "digest", "header"}``. Each returned row carries
+    ``candidate_id``, ``id``, ``disposition``, ``owner``, ``repair_child`` and
+    ``digest``; ``header`` is the full header (see :2409), including the counts
+    a consumer compares against those rows.
 
     Raises InventoryError on malformed/stale/missing/extra/duplicate or
     incomplete accounting; never writes.
