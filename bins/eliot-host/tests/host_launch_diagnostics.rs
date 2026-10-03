@@ -39,9 +39,7 @@ use eliot_host::host_diagnostics::{
     DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, HostDiagnosticsError,
     MAX_DIAGNOSTIC_DETAIL_BYTES, MAX_DIAGNOSTIC_FIELD_BYTES, sink_status,
 };
-use eliot_host::windows_event_log::{
-    AdmittedEvent, EventLogRecord, WindowsEventLogError, event_log_sink_status, report_event,
-};
+use eliot_host::windows_event_log::{WindowsEventLogError, event_log_sink_status};
 use eliot_host::{
     HostError, HostLaunchOptions, HostScmRegistrationCause, classify_host_scm_inspection,
     validate_host_scm_bootstrap,
@@ -52,8 +50,7 @@ use eliot_platform_windows::{
 };
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
-use tracing::subscriber::Interest;
-use tracing::{Event, Metadata, Subscriber};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -168,20 +165,31 @@ where
     }
 }
 
-/// A sink-side filter that drops every record while the production path keeps
-/// running, so delivery can be proven to change nothing downstream.
-struct DroppingFilter;
+/// Sink that filters every record out while the production path keeps running.
+///
+/// The filter is deliberately modelled on the *sink* side of the subscriber,
+/// not as a subscriber-wide filter: a subscriber-wide filter would suppress the
+/// records themselves and this case could no longer compare the call count and
+/// order it is here to prove. Here the production path still creates and emits
+/// every record (the recording layer sees all of them, in order) and the sink
+/// below is offered every one of them and delivers none.
+#[derive(Clone, Default)]
+struct DroppingSink {
+    offered: Arc<Mutex<usize>>,
+}
 
-impl<S> Layer<S> for DroppingFilter
+impl DroppingSink {
+    fn offered_records(&self) -> usize {
+        *self.offered.lock().unwrap()
+    }
+}
+
+impl<S> Layer<S> for DroppingSink
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
-        Interest::sometimes()
-    }
-
-    fn enabled(&self, _metadata: &Metadata<'_>, _context: Context<'_, S>) -> bool {
-        false
+    fn on_event(&self, _event: &Event<'_>, _context: Context<'_, S>) {
+        *self.offered.lock().unwrap() += 1;
     }
 }
 
@@ -235,16 +243,20 @@ fn record_emit(emit: impl FnOnce()) -> Vec<CapturedRecord> {
     records.lock().unwrap().clone()
 }
 
-/// The same production execution behind a sink that drops every record.
-fn record_emit_filtered(emit: impl FnOnce()) -> Vec<CapturedRecord> {
+/// The same production execution behind a sink that filters every record out.
+/// Returns what the subscriber still saw plus how many records the filtering
+/// sink was offered, so a case can compare both against the delivered run.
+fn record_emit_filtered(emit: impl FnOnce()) -> (Vec<CapturedRecord>, usize) {
     let records = Arc::new(Mutex::new(Vec::new()));
+    let sink = DroppingSink::default();
     let subscriber = tracing_subscriber::registry()
-        .with(DroppingFilter)
         .with(RecordingLayer {
             records: Arc::clone(&records),
-        });
+        })
+        .with(sink.clone());
     tracing::subscriber::with_default(subscriber, emit);
-    records.lock().unwrap().clone()
+    let captured = records.lock().unwrap().clone();
+    (captured, sink.offered_records())
 }
 
 /// The same production execution behind a sink whose every write fails.
@@ -315,19 +327,115 @@ fn correlation_slot(detail: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-/// The eight correlation slots must be rendered in the frozen order.
-fn assert_correlation_key_order(detail: &str, keys: &[String]) {
-    let mut previous = 0_usize;
-    for key in keys {
-        let needle = format!("{key}=");
-        let index = detail
+/// The rendered detail's `key=value` slots, parsed into `(key, value)` pairs in
+/// the order of the supplied frozen key list.
+///
+/// This helper proves ONE thing only: where each value starts and ends. A value
+/// is NOT whitespace-free - the `phase` value is a multi-word token by
+/// construction (`phase=host.launch requested`) - so the record is never split
+/// on spaces. Instead each value runs from its own `<key>=` anchor to the NEXT
+/// `<key>=` anchor of another frozen key, which is the only separator the
+/// renderer guarantees (`render_phase_slot` emits exactly one space before every
+/// pair after the first, and `bound_field`'s `truncate_to` neither inserts nor
+/// strips spaces). A value that happens to contain another key's letters, or a
+/// key whose name is a prefix of a longer one, therefore cannot shift a boundary.
+///
+/// This helper does NOT prove order and does not prove completeness: it returns
+/// pairs in the order of the list it was handed, by construction.
+/// `assert_frozen_correlation_slots` owns the order claim, because only it reads
+/// the record's own bytes.
+fn parsed_correlation_slots(detail: &str, keys: &[String]) -> Vec<(String, String)> {
+    keys.iter()
+        .map(|key| {
+            let anchor = format!("{key}=");
+            let start = detail
+                .find(&anchor)
+                .unwrap_or_else(|| panic!("a rendered detail must carry {key}=: {detail}"))
+                + anchor.len();
+            let end = keys
+                .iter()
+                .filter(|other| *other != key)
+                .map(|other| format!(" {other}="))
+                .filter_map(|needle| detail[start..].find(&needle).map(|at| start + at))
+                .min()
+                .unwrap_or(detail.len());
+            (key.clone(), detail[start..end].to_owned())
+        })
+        .collect()
+}
+
+/// The frozen correlation contract: every frozen key renders exactly once, in
+/// the frozen order, with a non-empty value.
+///
+/// Both halves are recovered from the RECORD's own bytes, never compared against
+/// the caller's key list - otherwise the assertion would be a tautology, because
+/// the parser builds its result FROM that list. So this does two independent
+/// things:
+///
+/// 1. it reads the byte offset of each `<key>=` anchor out of `detail` and
+///    requires them to be strictly increasing, which is what proves the renderer
+///    emitted the anchors in the frozen order; and
+/// 2. it requires each frozen anchor to occur EXACTLY ONCE in the record, which
+///    is what proves no frozen key is RENDERED TWICE. It does not prove the
+///    record contains nothing else - see the stated limit below.
+///
+/// AN earlier version of this helper ALSO re-composed the record from the parsed
+/// slots and asserted byte-for-byte equality, and its comment claimed that proved
+/// "no extra slot". That claim was FALSE and the check was provably redundant: a
+/// verifier showed that given (1) the `min()` inside the parser is necessarily
+/// the next anchor, so the re-composition reproduces `detail` by construction and
+/// can never fail for a record (1) accepts - while a trailing extra `k=v` or a
+/// duplicated slot is absorbed into an adjacent value exactly as a count
+/// comparison would absorb it. Both the check and the claim were removed rather
+/// than kept as decoration.
+///
+/// STATED LIMIT, not papered over: because this parser is value-driven and the
+/// last slot's value runs to the end of the detail, a trailing NON-frozen
+/// `k=v` would still be absorbed into the last value and is not caught here.
+/// Catching it would require rejecting `=` inside a value, which is impossible
+/// because `installation` legitimately admits spaces and `=`.
+///
+/// A SECOND, OPPOSITE limit, also reachable and also not handled here: because
+/// the once-only check counts the anchor string, a VALUE that itself contains
+/// `" <key>="` would make the count 2 and fail a record production legitimately
+/// emitted. `valid_launch_identity` admits an `installation` of `x reason=y`, so
+/// that is a real false-failure path. It is latent here because every argv in this
+/// suite uses a space-free installation id, but it is a property of the parser,
+/// not of the fixture, and it is stated rather than left for the next reader to
+/// discover.
+fn assert_frozen_correlation_slots(detail: &str, keys: &[String]) {
+    let mut previous_offset = 0_usize;
+    for (index, key) in keys.iter().enumerate() {
+        let needle = if index == 0 {
+            format!("{key}=")
+        } else {
+            format!(" {key}=")
+        };
+        let offset = detail
             .find(&needle)
-            .unwrap_or_else(|| panic!("structured detail must carry {needle}: {detail}"));
-        assert!(
-            index >= previous,
-            "correlation slots must stay in the frozen order, got: {detail}"
+            .unwrap_or_else(|| panic!("a rendered detail must carry {key}=: {detail}"));
+        // The first anchor is NOT compared against the sentinel: `render` always
+        // emits `phase=` at offset 0, so asserting `offset > 0` there would fail
+        // on every well-formed record and make this helper unsatisfiable.
+        if index > 0 {
+            assert!(
+                offset > previous_offset,
+                "correlation slots must stay in the frozen order, got: {detail}"
+            );
+        }
+        previous_offset = offset + needle.len();
+        assert_eq!(
+            detail.matches(&needle).count(),
+            1,
+            "a frozen correlation key must be rendered exactly once: {detail}"
         );
-        previous = index + needle.len();
+    }
+
+    for (_key, value) in parsed_correlation_slots(detail, keys) {
+        assert!(
+            !value.is_empty(),
+            "a correlation slot must never render empty: {detail}"
+        );
     }
 }
 
@@ -415,6 +523,192 @@ fn code_of(line: &str) -> &str {
     line.split("//").next().unwrap_or(line)
 }
 
+/// Whole file with every comment removed. A retired label or a retired terminal
+/// code may still be named in prose that explains the retirement; what must not
+/// exist is the code that would emit it.
+fn code_only(source: &str) -> String {
+    source.lines().map(code_of).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether a line opens an item whose `#[cfg(...)]` predicate includes `test`,
+/// e.g. `#[cfg(test)]` or `#[cfg(all(test, windows))]`.
+fn gates_on_test(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(attribute) = trimmed.strip_prefix("#[cfg(") else {
+        return false;
+    };
+    let (predicate, _) = attribute.split_once(']').unwrap_or((attribute, ""));
+    predicate
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|term| term == "test")
+}
+
+/// Net `{`/`}` balance of one line, ignoring braces inside a string literal and
+/// everything after a `//` comment, so a `format!("{}")` cannot skew a depth.
+fn brace_balance(line: &str) -> i64 {
+    let mut balance = 0_i64;
+    let mut characters = line.chars().peekable();
+    let mut in_string = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '"' if !in_string => in_string = true,
+            '"' => in_string = false,
+            '\\' if in_string => {
+                characters.next();
+            }
+            '/' if !in_string && characters.peek() == Some(&'/') => break,
+            '{' if !in_string => balance += 1,
+            '}' if !in_string => balance -= 1,
+            _ => {}
+        }
+    }
+    balance
+}
+
+/// One entry per source line: whether that line belongs to an item gated behind
+/// `#[cfg(... test ...)]`, the attribute line included.
+///
+/// A structural guard may only judge code the compiler SHIPS. An item gated on
+/// `test` is this suite's own scaffolding: its phase-token constants and its
+/// negative assertions spell labels production never emits, and counting them as
+/// emissions would make the guard fail on its own harness. Nothing else is
+/// excluded, and the exclusion is derived from the real `#[cfg]` predicates
+/// rather than from a hand-listed line range, so a new test module cannot escape
+/// it either.
+fn test_gated_lines(source: &str) -> Vec<bool> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut gated = vec![false; lines.len()];
+    let mut remaining = 0_i64;
+    let mut inside = false;
+    for index in 0..lines.len() {
+        if inside {
+            gated[index] = true;
+            remaining += brace_balance(lines[index]);
+            if remaining <= 0 {
+                inside = false;
+            }
+            continue;
+        }
+        if !gates_on_test(lines[index]) {
+            continue;
+        }
+        gated[index] = true;
+        let own_balance = brace_balance(lines[index]);
+        // A gate attribute carries no brace, so the gated item's own block opens
+        // on the line after it; a gate in front of a single-line item owns that
+        // line alone.
+        let opens_block = lines
+            .get(index + 1)
+            .is_some_and(|next| brace_balance(next) > 0);
+        if own_balance > 0 || opens_block {
+            inside = true;
+            remaining = own_balance;
+        }
+    }
+    gated
+}
+
+/// Body of one `impl` block, from its header to its own closing brace.
+fn impl_body(source: &str, header: &str) -> String {
+    let at = source
+        .find(header)
+        .unwrap_or_else(|| panic!("owning file must declare {header}"));
+    let rest = &source[at..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |offset| offset + 3);
+    rest[..end].to_owned()
+}
+
+/// The one `HostLifecycleBoundary { ... }` entry of `source` whose `name:` is
+/// `name`.
+///
+/// Seven entries share `caller: "none (exported API; no in-repo caller)"`, so a
+/// claim about "the boundary that has no in-repo caller" is only meaningful when
+/// it is bound to the single entry it names.
+fn lifecycle_boundary_entry(source: &str, name: &str) -> String {
+    let marker = format!("name: \"{name}\"");
+    let at = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("the boundary table must still declare {marker}"));
+    let header = source[..at]
+        .rfind("HostLifecycleBoundary {")
+        .unwrap_or_else(|| {
+            panic!("{marker} must be declared inside a HostLifecycleBoundary entry")
+        });
+    let rest = &source[header..];
+    let end = rest
+        .find("\n    },")
+        .map_or(rest.len(), |offset| offset + "\n    },".len());
+    rest[..end].to_owned()
+}
+
+/// Whether a trimmed source line opens a function declaration, looking through
+/// the visibility chain so `fn`, `pub fn` and `pub(crate) fn` all match.
+fn is_fn_declaration(trimmed: &str) -> bool {
+    let mut rest = trimmed;
+    while let Some(after_pub) = rest.strip_prefix("pub") {
+        match after_pub.strip_prefix('(') {
+            // `pub(crate)`, `pub(super)`, `pub(in crate::x)`: the whole group is
+            // skipped, whatever it contains.
+            Some(after_group) => match after_group.find(')') {
+                Some(close) => rest = after_group[close + 1..].trim_start(),
+                None => return false,
+            },
+            None => rest = after_pub.trim_start(),
+        }
+    }
+    rest.starts_with("fn ")
+}
+
+/// 1-based line of the first source line carrying `needle`.
+fn source_line_of(source: &str, needle: &str) -> usize {
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .map_or_else(
+            || panic!("the owning file must still carry {needle}"),
+            |index| index + 1,
+        )
+}
+
+/// 0-based line span `(declaration, next declaration)` of `fn <function>(`, so
+/// every other claim about that function's body is derived from one place.
+fn fn_body_span(source: &str, function: &str) -> (usize, usize) {
+    let lines: Vec<&str> = source.lines().collect();
+    let needle = format!("fn {function}(");
+    let start = lines
+        .iter()
+        .position(|text| {
+            let trimmed = text.trim_start();
+            is_fn_declaration(trimmed) && trimmed.contains(&needle)
+        })
+        .unwrap_or_else(|| panic!("the owning file must still declare fn {function}("));
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, text)| is_fn_declaration(text.trim_start()))
+        .map_or(lines.len(), |(index, _)| index);
+    (start, end)
+}
+
+/// Whether 1-based `line` lies inside the body of `fn <function>(`: after that
+/// declaration and before the next function declaration.
+///
+/// The enclosing symbol is therefore read out of real source instead of trusted
+/// from prose, which is exactly how a ruling can name the wrong function without
+/// any test noticing.
+fn line_is_inside_fn(source: &str, function: &str, line: usize) -> bool {
+    let (start, end) = fn_body_span(source, function);
+    (start + 1..end).contains(&(line - 1))
+}
+
+/// Body source text of `fn <function>(`, declaration line included.
+fn fn_body(source: &str, function: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let (start, end) = fn_body_span(source, function);
+    lines[start..end].join("\n")
+}
+
 /// Every double-quoted literal of one code line.
 fn quoted_literals(code: &str) -> Vec<&str> {
     code.split('"').skip(1).step_by(2).collect()
@@ -429,6 +723,12 @@ fn is_readiness_label(literal: &str) -> bool {
 
 /// Strict structural guard: a readiness label may exist only inside the
 /// activation owner's `active` body, in exactly one of the eight files.
+///
+/// Strictness is preserved by exclusion, not by loosening: only items the
+/// compiler drops for `test` builds are skipped, so a commented-out emission
+/// still cannot satisfy the guard (`code_of` strips it first) and a label
+/// anywhere outside the owner span still fails. Two lines may therefore own the
+/// claim - the two emissions inside `DurableKernelActivationDriver::active`.
 fn assert_readiness_owned_only_by_activation_active(sources: &[(String, String)]) {
     let mut owners: Vec<String> = Vec::new();
     for (path, source) in sources {
@@ -437,7 +737,11 @@ fn assert_readiness_owned_only_by_activation_active(sources: &[(String, String)]
         } else {
             None
         };
+        let gated = test_gated_lines(source);
         for (index, line) in source.lines().enumerate() {
+            if gated[index] {
+                continue;
+            }
             for literal in quoted_literals(code_of(line)) {
                 if !is_readiness_label(literal) {
                     continue;
@@ -829,6 +1133,52 @@ fn launch_01_eight_file_denominator() {
         );
     }
 
+    // Honest reachability is pinned, not prose: every seam this target really
+    // executes, every private owner whose proof is an inline case, and every
+    // positive arm no eliot-host seam can construct.
+    assert!(
+        !fixture_list(&fixture, "reachable_seams").is_empty(),
+        "the fixture must pin the seams this target executes"
+    );
+    assert!(
+        !fixture_list(&fixture, "unreachable_positive_arms").is_empty(),
+        "the fixture must pin what no eliot-host seam can construct"
+    );
+    let inline_owners = fixture["inline_case_owners"]
+        .as_object()
+        .expect("the fixture must pin the inline case owners");
+    assert!(
+        !inline_owners.is_empty(),
+        "the fixture must name the private owners of the inline cases"
+    );
+    for (case, entries) in inline_owners {
+        let owners = entries
+            .as_array()
+            .unwrap_or_else(|| panic!("inline_case_owners.{case} must be a list"))
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .unwrap_or_else(|| panic!("inline owner entries must be strings"))
+            })
+            .collect::<Vec<_>>();
+        assert!(!owners.is_empty(), "case {case} must name an inline owner");
+        for owner in owners {
+            let (path, symbol) = owner
+                .split_once(':')
+                .unwrap_or_else(|| panic!("inline owner must be path:symbol, got {owner}"));
+            let leaf = symbol.rsplit("::").next().unwrap_or(symbol);
+            assert!(
+                manifest_source(path).contains(&format!("fn {leaf}")),
+                "case {case}: {path} must still own {symbol}"
+            );
+            assert!(
+                !path.starts_with("src/lib.rs"),
+                "case {case}: an inline owner is the private module's own file"
+            );
+        }
+    }
+
     let sibling = [
         "src/scm_launch.rs",
         "src/store_kernel_launch_sequence.rs",
@@ -837,6 +1187,14 @@ fn launch_01_eight_file_denominator() {
     ]
     .map(manifest_source)
     .join("");
+    let sibling_code = [
+        "src/scm_launch.rs",
+        "src/store_kernel_launch_sequence.rs",
+        "src/kernel_activation_driver.rs",
+        "src/kernel_front_door_client.rs",
+    ]
+    .map(|path| code_only(&manifest_source(path)))
+    .join("\n");
     for boundary in fixture_list(&fixture, "frozen_sibling_boundaries") {
         assert!(
             sibling.contains(&boundary),
@@ -871,8 +1229,8 @@ fn launch_01_eight_file_denominator() {
     }
     for token in fixture_list(&fixture, "retired_phase_tokens") {
         assert!(
-            !sibling.contains(&token),
-            "the retired token {token:?} must not come back"
+            !sibling_code.contains(&token),
+            "the retired token {token:?} must not be emitted anywhere"
         );
     }
 
@@ -1101,7 +1459,7 @@ fn launch_03_retained_identity_on_substitution() {
     );
     for record in &detail_records(&admitted_records) {
         let detail = record.detail();
-        assert_correlation_key_order(detail, &keys);
+        assert_frozen_correlation_slots(detail, &keys);
         assert!(
             !detail.contains(&synthetic_descriptor_path().display().to_string()),
             "a retained path must never enter the record: {detail}"
@@ -1353,7 +1711,7 @@ fn launch_06_store_before_kernel() {
         .expect("the fixture must pin the renamed phase tokens");
     for retired in object_list(renamed, "retired_tokens") {
         assert!(
-            !sequence.contains(&retired),
+            !code_only(&sequence).contains(&retired),
             "the false readiness token {retired:?} must stay retired"
         );
     }
@@ -1606,21 +1964,43 @@ fn launch_09_before_start_vs_timeout_disconnect_unknown() {
         phase_tokens(&detail_records(&unknown_records), &tokens)
     );
 
-    // Outcome 4, timeout and disconnect, belongs to
+    // Outcome 4 belongs to
     // `kernel_front_door_client.rs::activation_response_or_reconcile`, a
-    // `pub(super)` transport-loss path in a private module: the inline owner
-    // case there.
+    // `pub(super)` path in a private module: the inline owner case there.
+    //
+    // It is NOT the timeout/disconnect arm. A genuine transport loss and
+    // `DeliveryOutcome::UnknownOutcome` are mapped to `None` by the caller at
+    // `lib.rs:3422` BEFORE this function is invoked, and the `TransportError`
+    // variant is erased by `error.to_string()` into `HostError::RecoveryRequired`
+    // at `lib.rs:3416`/`:3419`, so this arm can never name a transport failure
+    // kind. It records only that a DELIVERED response could not be turned into a
+    // typed control response. `unusable-response` is therefore the honest phase,
+    // and `disconnect observed` + `reason=transport-lost` are retired - the old
+    // pair claimed a disconnect on the one arm that proves the opposite.
     let frontdoor = manifest_source("src/kernel_front_door_client.rs");
     for detail in [
         "host.kernel-front-door before-start observed",
-        "host.kernel-front-door timeout observed",
-        "host.kernel-front-door disconnect observed",
+        "host.kernel-front-door no-receipt reconcile observed",
+        "host.kernel-front-door unusable-response observed",
         "host.kernel-front-door unknown observed",
         "host.kernel-front-door reconcile requested",
     ] {
         assert!(
             frontdoor.contains(detail),
             "the front-door owner must pin {detail:?}"
+        );
+    }
+    // The retired pair must be gone from EMITTED code. `code_only` strips
+    // comments, so the `RETIRED here:` note that names the old label cannot
+    // satisfy this - the pin above can no longer be met by prose.
+    let frontdoor_code = code_only(&frontdoor);
+    for retired in [
+        "host.kernel-front-door disconnect observed",
+        "reason=transport-lost",
+    ] {
+        assert!(
+            !frontdoor_code.contains(retired),
+            "the retired front-door label {retired:?} must reach no emitted code"
         );
     }
 }
@@ -1662,7 +2042,7 @@ fn launch_10_one_terminal_across_nesting() {
     assert!(!subordinate.is_empty());
     for record in &subordinate {
         let detail = record.detail();
-        assert_correlation_key_order(detail, &keys);
+        assert_frozen_correlation_slots(detail, &keys);
         for key in keys.iter().filter(|key| key.as_str() != "phase") {
             let value = correlation_slot(detail, key)
                 .unwrap_or_else(|| panic!("every subordinate record must render {key}="));
@@ -1688,16 +2068,30 @@ fn launch_10_one_terminal_across_nesting() {
     assert!(admitted.is_ok());
     assert!(terminal_records(&admitted_records).is_empty());
 
-    // The physical launch guard is phase-only: the single launch terminal is
-    // `host-start-failed` in `lib.rs`, and the SCM bootstrap validation is a
-    // different operation that keeps its own terminal.
+    // The physical launch guard is phase-only: the ONE surviving terminal for a
+    // failed physical launch belongs to the outer #891 contour in `lib.rs`, and
+    // the SCM bootstrap validation is a different operation that keeps its own.
+    //
+    // Which code that outer terminal carries is NOT `host-start-failed` on the
+    // production path, and this case asserts the truth rather than the earlier
+    // claim: `start_approved_contour` (the only site arming
+    // BOUNDARY_START_TERMINAL, lib.rs:9901) has no in-repo caller, so the code
+    // that actually fires is the one armed by `HostComposition::open`
+    // (BOUNDARY_OPEN_TERMINAL, lib.rs:7423). The naming question is #891's and
+    // is raised as a contract challenge; this card does not touch `lib.rs`.
     let ruling = fixture["single_terminal_ruling"]
         .as_object()
         .expect("the fixture must pin the single-terminal ruling");
     assert_eq!(ruling["physical_launch_guard"].as_str(), Some("phase-only"));
     assert_eq!(
-        ruling["host_start_failed"].as_str(),
-        Some("host-start-failed")
+        ruling["production_path_terminal"].as_str(),
+        Some("host-open-failed"),
+        "the production path's terminal is the open contour's, not the exported-API start boundary"
+    );
+    assert_eq!(
+        ruling["exported_api_only_terminal"].as_str(),
+        Some("host-start-failed"),
+        "host-start-failed stays reachable only through the uncalled exported API"
     );
     assert_eq!(ruling["scm_bootstrap_unknown"].as_str(), Some(scm_terminal));
 }
@@ -1719,7 +2113,7 @@ fn launch_11_sink_failure_leaves_operation_identical() {
     let baseline = baseline_cell.borrow_mut().take().expect("captured");
 
     let filtered_cell = std::cell::RefCell::new(None);
-    let filtered_records = record_emit_filtered(|| {
+    let (filtered_records, offered) = record_emit_filtered(|| {
         *filtered_cell.borrow_mut() = Some(run_launch_script());
     });
     let filtered = filtered_cell.borrow_mut().take().expect("captured");
@@ -1742,9 +2136,14 @@ fn launch_11_sink_failure_leaves_operation_identical() {
         1,
         "one failed operation, one terminal record"
     );
-    assert!(
-        filtered_records.is_empty(),
-        "the filter must drop every record, got: {filtered_records:?}"
+    assert_eq!(
+        filtered_records, baseline_records,
+        "a filtered sink must change neither the call count nor the order: {filtered_records:?}"
+    );
+    assert_eq!(
+        offered,
+        baseline_records.len(),
+        "the filtering sink must be offered every emitted record and deliver none"
     );
     assert_eq!(
         failing_records, baseline_records,
@@ -1771,20 +2170,32 @@ fn launch_11_sink_failure_leaves_operation_identical() {
         "every owner-held launch value is released exactly once"
     );
 
-    // The Event Log seam answer is the typed residual it always is (#984).
-    let event_log = Err(WindowsEventLogError::EventLogUnavailable);
-    assert_eq!(event_log_sink_status(), event_log);
+    // The Event Log seam keeps the platform's own live answer. #984's safe port is
+    // available on Windows, so the seam is live there and stays typed
+    // Unavailable off Windows; either way this asserts the real answer, never a
+    // faked delivery, and never drives a real OS report from a fixture.
+    let live_event_log: Result<(), WindowsEventLogError> = event_log_sink_status();
+    #[cfg(windows)]
     assert_eq!(
-        sink_status(DiagnosticSink::WindowsEventLog),
-        Err(HostDiagnosticsError::EventLogUnavailable)
+        live_event_log,
+        Ok(()),
+        "#984's safe Event Log port is live on Windows"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        live_event_log,
+        Err(WindowsEventLogError::EventLogUnavailable),
+        "off Windows the seam stays typed-Unavailable"
     );
     assert_eq!(
-        report_event(&EventLogRecord::new(
-            AdmittedEvent::ServiceFailure,
-            "host-start-failed",
-        )),
-        Err(WindowsEventLogError::EventLogUnavailable),
-        "a failed sink never fakes Event Log delivery"
+        sink_status(DiagnosticSink::WindowsEventLog),
+        Err(HostDiagnosticsError::EventLogUnavailable),
+        "the facade routes to tracing only and must never claim an Event Log sink"
+    );
+    assert_eq!(
+        sink_status(DiagnosticSink::TracingStderr),
+        Err(HostDiagnosticsError::SetupInProgress),
+        "this target never installs the facade's process-global subscriber, so the stderr sink is honestly not certified"
     );
     assert_eq!(
         launch_fixture()["stdout_protocol_contamination"].as_bool(),
@@ -1811,15 +2222,90 @@ fn launch_12_canaries_absent_from_observations() {
     );
     let keys = fixture_list(&fixture, "correlation_keys");
 
+    // The declared absent-slot vocabulary must EQUAL what the renderer actually
+    // emits, not merely be non-empty. The absence spelling is read out of a real
+    // captured production record that genuinely leaves identities absent, so a
+    // renderer that re-spelled the marker - or a fixture that drifted from it -
+    // fails here instead of sitting unread. `phase` is excluded because the
+    // renderer always renders it.
+    let (_, marker_records) = execute_launch_parse(&args_with(
+        &valid_launch_args(),
+        1,
+        "marker-probe-auth.json",
+    ));
+    let marker_records = detail_records(&marker_records);
+    let marker_probe = marker_records.first().map_or_else(
+        || panic!("a real launch must emit at least one correlation record"),
+        CapturedRecord::detail,
+    );
+    let observed_absence = parsed_correlation_slots(marker_probe, &keys)
+        .into_iter()
+        .find(|(key, _)| key != "phase")
+        .map_or_else(
+            || panic!("a real record must leave at least one identity absent: {marker_probe}"),
+            |(_, value)| value,
+        );
+    let declared_markers = fixture_list(&fixture, "correlation_missing_markers");
+    assert_eq!(
+        declared_markers.len(),
+        keys.len() - 1,
+        "every non-phase key declares exactly one absent-slot marker: {declared_markers:?}"
+    );
+    for (index, key) in keys.iter().enumerate() {
+        if key == "phase" {
+            assert!(
+                !declared_markers
+                    .iter()
+                    .any(|marker| marker.starts_with("phase=")),
+                "phase is always rendered and can never be absent"
+            );
+            continue;
+        }
+        // `declared_markers` has ONE FEWER entry than `keys` because it omits
+        // `phase`, so it is indexed by the position among the NON-PHASE keys -
+        // not by the position in `keys`. Indexing it with `index` would compare
+        // the wrong pair and would index out of bounds on the last key.
+        let non_phase_index = keys[..index]
+            .iter()
+            .filter(|earlier| *earlier != "phase")
+            .count();
+        assert_eq!(
+            declared_markers[non_phase_index],
+            format!("{key}={observed_absence}"),
+            "the fixture's absent-slot marker must match the renderer's own spelling"
+        );
+    }
+
+    // The correlation-slot canaries come from the frozen fixture, so every
+    // declared canary is actually asserted absent instead of a hand-copied
+    // subset that could silently drop one.
+    let slot_canaries = fixture_list(&fixture, "correlation_slot_canaries");
+    assert!(
+        !slot_canaries.is_empty(),
+        "the fixture must pin the correlation-slot canaries"
+    );
+    // Each declared canary must be a real flag of an argv this case really
+    // constructs and then executes, so asserting its absence from a record
+    // cannot pass by never having built the probe.
+    let probe_argv: Vec<String> = valid_system_args()
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    for canary in &slot_canaries {
+        assert!(
+            probe_argv.iter().any(|argument| argument == canary),
+            "the declared correlation-slot canary {canary:?} must be a real flag of the executed argv: {probe_argv:?}"
+        );
+    }
+
     let forbidden: Vec<String> = canaries
         .iter()
         .cloned()
+        .chain(slot_canaries)
         .chain([
             synthetic_descriptor_path().display().to_string(),
             synthetic_state_root().display().to_string(),
             synthetic_nonce().to_string_lossy().into_owned(),
-            "--config-descriptor".to_owned(),
-            "--host-state-root".to_owned(),
         ])
         .collect();
 
@@ -1864,7 +2350,7 @@ fn launch_12_canaries_absent_from_observations() {
 
     for record in &executed {
         let detail = record.detail();
-        assert_correlation_key_order(detail, &keys);
+        assert_frozen_correlation_slots(detail, &keys);
         assert!(
             detail.len() <= MAX_DIAGNOSTIC_DETAIL_BYTES,
             "the detail must stay inside the frozen bound: {detail}"
@@ -1922,9 +2408,21 @@ fn launch_12_canaries_absent_from_observations() {
             "a pre-parse phase holds no identity, so {key} must not carry one: {}",
             first.detail()
         );
-        assert!(
-            correlation_slot(admitted_phase.detail(), key).is_some(),
-            "the admitted phase must render {key}="
+        // The admitted phase must render every frozen key. This is NOT a
+        // presence check: `correlation_slot(..).is_some()` can never fail for a
+        // record that already passed `assert_frozen_correlation_slots`, which
+        // requires each frozen anchor exactly once. What is actually worth
+        // proving here is that the admitted record renders each key DIFFERENTLY
+        // from the pre-parse record - the pre-parse record carries no identity,
+        // so a slot that still read `missing` on admission would mean the parse
+        // boundary bound nothing.
+        let admitted_value = correlation_slot(admitted_phase.detail(), key)
+            .unwrap_or_else(|| panic!("the admitted phase must render {key}="));
+        assert_ne!(
+            admitted_value,
+            value,
+            "the admitted phase must bind an identity where the pre-parse phase binds none: {}",
+            admitted_phase.detail()
         );
     }
     assert_ne!(
@@ -1994,7 +2492,7 @@ fn launch_13_deterministic_semantic_fields() {
 
     for record in &detail_records(&first_records) {
         let detail = record.detail();
-        assert_correlation_key_order(detail, &keys);
+        assert_frozen_correlation_slots(detail, &keys);
         assert_eq!(
             record.field("detail_bytes"),
             Some(detail.len().to_string().as_str())
@@ -2110,7 +2608,7 @@ fn launch_14_source_guard_stays_diagnostics_only() {
         }
         for token in &retired {
             assert!(
-                !source.contains(token),
+                !code_only(source).contains(token),
                 "{path} must keep the retired token {token:?} gone"
             );
         }
@@ -2133,15 +2631,112 @@ fn launch_14_source_guard_stays_diagnostics_only() {
         "the SCM terminal code must have exactly one owner callsite"
     );
     assert!(scm.contains("struct ScmLaunchTerminalGuard"));
+    let scm_guard = impl_body(&scm, "impl Drop for ScmLaunchTerminalGuard");
+    assert!(
+        scm_guard.contains("scm_launch_observe_terminal"),
+        "the one SCM terminal emitter must live in the SCM guard's own drop"
+    );
     let job = manifest_source("src/host_job_launch.rs");
     assert!(
-        !job.contains("host-launch-failed"),
+        !code_only(&job).contains("host-launch-failed"),
         "the physical launch guard must stay phase-only"
     );
     assert!(
-        manifest_source("src/lib.rs").contains("host-start-failed"),
-        "the single launch terminal stays owned by lib.rs"
+        job.contains("struct HostLaunchTerminalGuard"),
+        "the phase-only launch guard must still exist"
     );
+    let launch_guard = impl_body(&job, "impl Drop for HostLaunchTerminalGuard");
+    assert!(
+        launch_guard.contains("host_launch_observe"),
+        "the phase-only launch guard must emit one correlated subordinate phase record"
+    );
+    assert!(
+        !launch_guard.contains("observe_terminal_error"),
+        "the phase-only launch guard must emit no terminal: {launch_guard}"
+    );
+    // The single terminal stays owned by lib.rs. This asserts OWNERSHIP, not a
+    // particular code: the physical launch reaches `jobs.start_approved` from the
+    // contour whose armed boundary is BOUNDARY_OPEN_TERMINAL, so the code that
+    // actually fires there is `host-open-failed`.
+    // `host-start-failed` is armed only inside `start_approved_contour`, which
+    // has no in-repo caller. Asserting the text "host-start-failed" is present
+    // in lib.rs would be true either way and would detect neither fact.
+    let lib = manifest_source("src/lib.rs");
+    assert!(
+        lib.contains("HostTerminalGuard::armed(BOUNDARY_OPEN_TERMINAL)"),
+        "the production contour that reaches the physical launch must still own a terminal"
+    );
+    // A strengthening, not a loosening: seven boundary entries share
+    // `caller: "none (exported API; no in-repo caller)"`, so the claim is bound to
+    // the ONE entry it names - the start terminal - by requiring the name, the
+    // frozen terminal event and the caller to appear together inside that single
+    // table entry. It can no longer be satisfied by any other boundary keeping the
+    // same caller string.
+    let start_terminal_code = fixture["terminal_codes"]["host_start_failed"]
+        .as_str()
+        .expect("the fixture pins the start terminal code");
+    let start_entry = lifecycle_boundary_entry(&lib, "start.terminal");
+    for (field, value) in [
+        ("name", "start.terminal".to_owned()),
+        ("event", start_terminal_code.to_owned()),
+        (
+            "caller",
+            "none (exported API; no in-repo caller)".to_owned(),
+        ),
+    ] {
+        assert!(
+            start_entry.contains(&format!("{field}: \"{value}\"")),
+            "the start.terminal entry must keep {field}: {value:?}, got: {start_entry}"
+        );
+    }
+    let requested_entry = lifecycle_boundary_entry(&lib, "start.requested");
+    assert!(
+        !requested_entry.contains(&format!("event: \"{start_terminal_code}\"")),
+        "a sibling entry must not carry the start terminal event: {requested_entry}"
+    );
+
+    // The single-terminal ruling is proved against real `lib.rs` STRUCTURE, not
+    // against prose that names a symbol: which function actually encloses each
+    // arming site, and whether that function has an in-repo call site. These
+    // facts hold whatever wording the frozen ruling uses, so a re-freeze of the
+    // fixture prose cannot make this guard pass or fail by accident.
+    let open_arm = source_line_of(&lib, "HostTerminalGuard::armed(BOUNDARY_OPEN_TERMINAL)");
+    let start_arm = source_line_of(&lib, "HostTerminalGuard::armed(BOUNDARY_START_TERMINAL)");
+    assert!(
+        line_is_inside_fn(&lib, "open_for_profile", open_arm),
+        "the open terminal is armed inside HostComposition::open_for_profile"
+    );
+    assert!(
+        !line_is_inside_fn(&lib, "open", open_arm),
+        "HostComposition::open only delegates, so it is not the enclosing function of the open terminal"
+    );
+    assert!(
+        fn_body(&lib, "open_for_profile").contains("start_approved_manifest_contour("),
+        "the open contour must keep reaching the approved-start contour that owns the physical launch"
+    );
+    assert!(
+        line_is_inside_fn(&lib, "start_approved_contour", start_arm),
+        "the start terminal is armed inside HostComposition::start_approved_contour"
+    );
+    assert_eq!(
+        count_occurrences(&lib, "start_approved_contour("),
+        1,
+        "start_approved_contour must keep exactly one declaration and no in-repo call site"
+    );
+    // Both owners of the ruling must still be stated by the frozen fixture, so a
+    // re-freeze cannot quietly drop either claim.
+    let ruling = fixture["single_terminal_ruling"]
+        .as_object()
+        .expect("the fixture must pin the single-terminal ruling");
+    for owner in ["production_path_owner", "exported_api_only_owner"] {
+        let stated = ruling[owner]
+            .as_str()
+            .unwrap_or_else(|| panic!("the ruling must state {owner}"));
+        assert!(
+            !stated.trim().is_empty(),
+            "the ruling must state a non-empty {owner}"
+        );
+    }
     for other in [
         "src/credential_control.rs",
         "src/host_activation_durable.rs",

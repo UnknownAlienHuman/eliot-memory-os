@@ -9,30 +9,29 @@ use super::{
     valid_sha256_text,
 };
 
-// F-LOG-HOST-6 (#981) recovery-evidence observation helpers.
-//
-// Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
-//
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never evidence
-// bytes, digests, image paths, or arbitrary error text — so bounding limits
-// size, not sensitivity (I15.4). Missing or mismatched evidence stays
-// incomplete: absence is `None`, never a synthesized binding. These
-// primitives own no terminal: a single terminal per failed recovery
-// operation is enforced by the outermost owner boundary, while these phases
-// correlate by stage order only. Sink outcome never alters
-// result/order/cleanup.
 #[cfg(windows)]
-fn host_recovery_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
-    crate::host_diagnostics::observe_entrypoint_with_detail(
-        crate::host_diagnostics::EntrypointStage::Startup,
-        detail,
-    );
+use crate::journal_append::{
+    HostJournalDisposition, HostJournalObservation, observe_host_journal_boundary,
+};
+
+// F-LOG-HOST-6 (#981) recovery-evidence observation helper.
+//
+// The per-file seam of the family's shared closed vocabulary: it names the Store
+// recovery evidence boundary set and delegates to the one shared emitter.
+//
+// Observation-only contract: every record projects the exact identity the
+// evidence owner already read — the requested mutation digest, the read
+// evidence's own operation, request, mutation and request digests, and the
+// durable Host epoch and lineage it is bound to — and never its bytes, image
+// path, or error text, so bounding limits size, not sensitivity (I15.4). An
+// absent evidence file is now observed as the exact incomplete fact it is,
+// still returning `Ok(None)`: absence is never a synthesized binding, and a
+// later read of the same mutation can no longer be read as the first. These
+// primitives own no terminal, and the live Event Log disposition is observed
+// through the facade's canonical bounded helper rather than a discarded probe.
+#[cfg(windows)]
+fn host_recovery_observe(observation: &HostJournalObservation) {
+    observe_host_journal_boundary(observation);
 }
 
 #[cfg(windows)]
@@ -81,7 +80,17 @@ impl StoreRecoveryTerminationEvidence {
             || !self.root_reaped
             || self.restart_attempt != 1
         {
-            host_recovery_observe("host.recovery termination incomplete observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery termination incomplete observed",
+                    HostJournalDisposition::EvidenceIncomplete,
+                )
+                .with_operation(self.request_id.as_str())
+                .with_mutation(self.mutation_digest.as_str())
+                .with_request_digest(self.request_digest.as_str())
+                .with_host_epoch(self.host_epoch)
+                .with_host_lineage(self.host_lineage.as_str()),
+            );
             return Err(HostError::RecoveryRequired(
                 "Store termination evidence is not complete or is not bound to the mutation"
                     .to_owned(),
@@ -109,7 +118,15 @@ impl StoreRecoveryTerminationEvidence {
             ))
         })?;
         if expected_request.request_digest.as_str() != self.request_digest {
-            host_recovery_observe("host.recovery termination digest mismatch observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery termination digest mismatch observed",
+                    HostJournalDisposition::EvidenceMismatched,
+                )
+                .with_operation(self.request_id.as_str())
+                .with_mutation(self.mutation_digest.as_str())
+                .with_request_digest(self.request_digest.as_str()),
+            );
             return Err(HostError::RecoveryRequired(
                 "Store termination request digest does not match its mutation identity".to_owned(),
             ));
@@ -130,7 +147,18 @@ impl StoreRecoveryTerminationEvidence {
             || self.host_epoch != pending.host_epoch
             || self.host_lineage != pending.host_lineage
         {
-            host_recovery_observe("host.recovery termination cross-bind mismatch observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery termination cross-bind mismatch observed",
+                    HostJournalDisposition::EvidenceMismatched,
+                )
+                .with_operation(self.request_id.as_str())
+                .with_mutation(self.mutation_digest.as_str())
+                .with_request_digest(self.request_digest.as_str())
+                .with_host_epoch(self.host_epoch)
+                .with_host_lineage(self.host_lineage.as_str())
+                .with_recovery_binding(pending.mutation_digest.as_str()),
+            );
             return Err(HostError::RecoveryRequired(
                 "Store termination evidence is not cross-bound to the exact recovery intent"
                     .to_owned(),
@@ -154,16 +182,37 @@ pub(super) fn read_store_recovery_termination_evidence(
     let path = store_recovery_termination_path(host_state_root, mutation_digest);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery termination absent observed",
+                    HostJournalDisposition::EvidenceAbsent,
+                )
+                .with_mutation(mutation_digest),
+            );
+            return Ok(None);
+        }
         Err(error) => {
-            host_recovery_observe("host.recovery termination inspect failed observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery termination inspect failed observed",
+                    HostJournalDisposition::EvidenceUnreadable,
+                )
+                .with_mutation(mutation_digest),
+            );
             return Err(HostError::RecoveryRequired(format!(
                 "Store termination evidence cannot be inspected: {error}"
             )));
         }
     };
     if !metadata.is_file() || metadata.len() > MAX_TERMINATION_BYTES {
-        host_recovery_observe("host.recovery termination too large observed");
+        host_recovery_observe(
+            &HostJournalObservation::new(
+                "host.recovery termination too large observed",
+                HostJournalDisposition::EvidenceUnusable,
+            )
+            .with_mutation(mutation_digest),
+        );
         return Err(HostError::RecoveryRequired(
             "Store termination evidence is malformed or too large".to_owned(),
         ));
@@ -175,11 +224,27 @@ pub(super) fn read_store_recovery_termination_evidence(
     )?;
     let evidence =
         serde_json::from_slice::<StoreRecoveryTerminationEvidence>(&bytes).map_err(|error| {
-            host_recovery_observe("host.recovery termination malformed observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery termination malformed observed",
+                    HostJournalDisposition::EvidenceUnusable,
+                )
+                .with_mutation(mutation_digest),
+            );
             HostError::RecoveryRequired(format!("Store termination evidence is malformed: {error}"))
         })?;
     evidence.validate_for_digest(mutation_digest)?;
-    host_recovery_observe("host.recovery termination observed");
+    host_recovery_observe(
+        &HostJournalObservation::new(
+            "host.recovery termination observed",
+            HostJournalDisposition::EvidenceValidated,
+        )
+        .with_mutation(evidence.mutation_digest.as_str())
+        .with_request_digest(evidence.request_digest.as_str())
+        .with_operation(evidence.request_id.as_str())
+        .with_host_epoch(evidence.host_epoch)
+        .with_host_lineage(evidence.host_lineage.as_str()),
+    );
     Ok(Some(evidence))
 }
 
@@ -227,7 +292,18 @@ impl StoreRecoveryInnerBinding {
             || self.handoff.operation_id.as_str() != self.store_rebind_operation_id
             || self.handoff.request_digest != self.store_rebind_request_digest
         {
-            host_recovery_observe("host.recovery inner cross-bind mismatch observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery inner cross-bind mismatch observed",
+                    HostJournalDisposition::EvidenceMismatched,
+                )
+                .with_operation(self.request_id.as_str())
+                .with_mutation(self.external_control_mutation_digest.as_str())
+                .with_request_digest(self.external_control_request_digest.as_str())
+                .with_host_epoch(self.host_epoch)
+                .with_host_lineage(self.host_lineage.as_str())
+                .with_recovery_binding(pending.mutation_digest.as_str()),
+            );
             return Err(HostError::RecoveryRequired(
                 "Store recovery inner binding is not canonical or cross-bound".to_owned(),
             ));
@@ -250,16 +326,37 @@ pub(super) fn read_store_recovery_inner_binding(
     let path = store_recovery_inner_binding_path(host_state_root, mutation_digest);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery inner absent observed",
+                    HostJournalDisposition::EvidenceAbsent,
+                )
+                .with_mutation(mutation_digest),
+            );
+            return Ok(None);
+        }
         Err(error) => {
-            host_recovery_observe("host.recovery inner inspect failed observed");
+            host_recovery_observe(
+                &HostJournalObservation::new(
+                    "host.recovery inner inspect failed observed",
+                    HostJournalDisposition::EvidenceUnreadable,
+                )
+                .with_mutation(mutation_digest),
+            );
             return Err(HostError::RecoveryRequired(format!(
                 "Store recovery inner binding cannot be inspected: {error}"
             )));
         }
     };
     if !metadata.is_file() || metadata.len() > MAX_INNER_BINDING_BYTES {
-        host_recovery_observe("host.recovery inner too large observed");
+        host_recovery_observe(
+            &HostJournalObservation::new(
+                "host.recovery inner too large observed",
+                HostJournalDisposition::EvidenceUnusable,
+            )
+            .with_mutation(mutation_digest),
+        );
         return Err(HostError::RecoveryRequired(
             "Store recovery inner binding is malformed or too large".to_owned(),
         ));
@@ -270,11 +367,44 @@ pub(super) fn read_store_recovery_inner_binding(
         "Store recovery inner binding",
     )?;
     let binding = serde_json::from_slice::<StoreRecoveryInnerBinding>(&bytes).map_err(|error| {
-        host_recovery_observe("host.recovery inner malformed observed");
+        host_recovery_observe(
+            &HostJournalObservation::new(
+                "host.recovery inner malformed observed",
+                HostJournalDisposition::EvidenceUnusable,
+            )
+            .with_mutation(mutation_digest),
+        );
         HostError::RecoveryRequired(format!(
             "Store recovery inner binding is malformed: {error}"
         ))
     })?;
-    host_recovery_observe("host.recovery inner observed");
+    // This reader proves only that the requested mutation's inner binding is
+    // present, file-shaped, within bounds and decodable. It performs no
+    // cross-binding validation: `StoreRecoveryInnerBinding::validate_for_pending`
+    // is the fence owner's decision and is deliberately not called here. So the
+    // one fact this read already holds is whether the evidence names the
+    // requested mutation at all; anything else stays reported as unmatched
+    // rather than as validated evidence. Both operands of that comparison are
+    // therefore bound: `mutation` carries the digest the evidence itself names
+    // and `recovery` the requested mutation this read is about, so the verdict
+    // below is readable from the record itself on either arm. The inner rebind
+    // operation identity this binding also carries is reported by the fence
+    // owner's own validation records instead of duplicated here.
+    host_recovery_observe(
+        &HostJournalObservation::new(
+            "host.recovery inner observed",
+            if binding.external_control_mutation_digest == mutation_digest {
+                HostJournalDisposition::EvidenceValidated
+            } else {
+                HostJournalDisposition::EvidenceMismatched
+            },
+        )
+        .with_operation(binding.request_id.as_str())
+        .with_mutation(binding.external_control_mutation_digest.as_str())
+        .with_request_digest(binding.external_control_request_digest.as_str())
+        .with_host_epoch(binding.host_epoch)
+        .with_host_lineage(binding.host_lineage.as_str())
+        .with_recovery_binding(mutation_digest),
+    );
     Ok(Some(binding))
 }

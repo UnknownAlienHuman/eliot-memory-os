@@ -20,6 +20,11 @@ use pending_codec::{
 #[cfg(windows)]
 use super::host_durable_persistence::{sync_dir, write_durable_file};
 
+#[cfg(windows)]
+use crate::journal_append::{
+    HostJournalDisposition, HostJournalObservation, observe_host_journal_boundary,
+};
+
 #[cfg(all(test, windows))]
 use super::host_durable_persistence::ordering;
 
@@ -51,32 +56,29 @@ pub(super) fn runtime_restart_store_dir(host_state_root: &Path) -> PathBuf {
     host_state_root.join("runtime-restarts")
 }
 
-// F-LOG-HOST-6 (#981) restart-state observation helpers.
+// F-LOG-HOST-6 (#981) restart-state observation helper.
 //
-// Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// The per-file seam of the family's shared closed vocabulary: it names the
+// runtime restart boundary set and delegates to the one shared emitter.
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never digests,
-// paths, file bytes, or arbitrary error text — so bounding limits size, not
-// sensitivity (I15.4). Pending intent, durable receipt, and reconciled
-// completion stay distinct: a pending file is never a receipt, and an
-// exact-record replay is observed as readback, never as a second commit.
-// Publication failure stays primary across tmp cleanup and directory sync;
-// cleanup cannot rename it. These primitives own no terminal: a single
-// terminal per failed restart operation is enforced by the outermost owner
-// boundary, while these phases correlate by stage order only. Sink outcome
-// never alters result/order/cleanup.
+// Observation-only contract: every record travels with the exact identity the
+// restart owner already holds — the request's own mutation digest, request id
+// and request digest, the durable Host epoch and lineage the receipt is bound
+// to, and the owner's own `Created | Replay` publication disposition — never
+// file paths, file bytes, or error text, so bounding limits size, not
+// sensitivity (I15.4). Pending intent, durable receipt and reconciled completion
+// stay distinct: a pending file is never a receipt, and an exact-record replay is
+// observed as readback, never as a second commit. The create-race path
+// publishes exactly one record per outcome, so a replay can no longer be double
+// counted as a replay plus a publication. Publication failure stays primary
+// across tmp cleanup and directory sync; cleanup cannot rename it, and a cleanup
+// step that does not complete is observed as "effect committed, cleanup
+// incomplete" instead of being reported as a failure of the effect. These
+// primitives own no terminal, and the live Event Log disposition is observed
+// through the facade's canonical bounded helper rather than a discarded probe.
 #[cfg(windows)]
-fn host_restart_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
-    crate::host_diagnostics::observe_entrypoint_with_detail(
-        crate::host_diagnostics::EntrypointStage::Startup,
-        detail,
-    );
+fn host_restart_observe(observation: &HostJournalObservation) {
+    observe_host_journal_boundary(observation);
 }
 
 #[cfg(windows)]
@@ -103,7 +105,10 @@ pub(super) fn read_bounded_runtime_restart_file(
         .read_to_end(&mut bytes)
         .map_err(|error| HostError::RecoveryRequired(format!("{label} cannot be read: {error}")))?;
     if bytes.len() as u64 > max_bytes {
-        host_restart_observe("host.restart read too large observed");
+        host_restart_observe(&HostJournalObservation::new(
+            "host.restart read too large observed",
+            HostJournalDisposition::EvidenceUnusable,
+        ));
         return Err(HostError::RecoveryRequired(format!("{label} is too large")));
     }
     Ok(bytes)
@@ -117,24 +122,37 @@ pub(super) fn read_bounded_runtime_restart_file(
 fn note_unadopted_restart_budget(file_name: &str) -> bool {
     let skip = file_name == RESTART_BUDGET_FILE_NAME;
     if skip {
-        host_restart_observe("host.restart budget not adopted observed");
+        host_restart_observe(&HostJournalObservation::new(
+            "host.restart budget not adopted observed",
+            HostJournalDisposition::BoundaryReached,
+        ));
     }
     skip
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the restart-store loader keeps one exhaustive fail-closed filename, shape, bound, duplicate and cross-binding audit before it exposes any receipt, and no per-entry observation may be skipped between neighbours"
+)]
 pub(super) fn load_durable_runtime_restarts(
     host_state_root: &Path,
 ) -> Result<std::collections::HashMap<String, HostKernelRestartReceipt>, HostError> {
     const MAX_RUNTIME_RESTART_RECORD_BYTES: u64 = 16 * 1024;
     const MAX_RUNTIME_RESTART_RECORDS: usize = 1024;
     let mut map = std::collections::HashMap::new();
-    host_restart_observe("host.restart load requested");
+    host_restart_observe(&HostJournalObservation::new(
+        "host.restart load requested",
+        HostJournalDisposition::BoundaryReached,
+    ));
     let dir = runtime_restart_store_dir(host_state_root);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            host_restart_observe("host.restart store absent observed");
+            host_restart_observe(&HostJournalObservation::new(
+                "host.restart store absent observed",
+                HostJournalDisposition::EvidenceAbsent,
+            ));
             return Ok(map);
         }
         Err(error) => {
@@ -181,7 +199,10 @@ pub(super) fn load_durable_runtime_restarts(
             .filter(|digest| valid_sha256_text(digest));
         if pending_digest.is_some() {
             // Pending records go to the bounded reader below, never the adoption map.
-            host_restart_observe("host.restart pending not adopted observed");
+            host_restart_observe(&HostJournalObservation::new(
+                "host.restart pending not adopted observed",
+                HostJournalDisposition::BoundaryReached,
+            ));
             let _ = read_runtime_restart_pending_identity(&path)?;
             continue;
         }
@@ -225,7 +246,21 @@ pub(super) fn load_durable_runtime_restarts(
             )));
         }
     }
-    host_restart_observe("host.restart load observed");
+    // A store directory that exists but yielded no receipt is an empty
+    // denominator, never validated evidence: `persist_runtime_restart_pending`
+    // and `persist_restart_budget` both `create_dir_all` before this loader runs,
+    // so the zero case is reachable without any error.
+    host_restart_observe(
+        &HostJournalObservation::new(
+            "host.restart load observed",
+            if map.is_empty() {
+                HostJournalDisposition::DenominatorEmpty
+            } else {
+                HostJournalDisposition::EvidenceValidated
+            },
+        )
+        .with_cardinality(u64::try_from(map.len()).unwrap_or(u64::MAX)),
+    );
     Ok(map)
 }
 
@@ -416,12 +451,18 @@ fn restart_budget_payload(budget: &HostRestartBudget) -> serde_json::Value {
 pub(super) fn load_restart_budget(
     host_state_root: &Path,
 ) -> Result<Option<HostRestartBudget>, HostError> {
-    host_restart_observe("host.restart budget load requested");
+    host_restart_observe(&HostJournalObservation::new(
+        "host.restart budget load requested",
+        HostJournalDisposition::BoundaryReached,
+    ));
     let path = restart_budget_path(host_state_root);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            host_restart_observe("host.restart budget absent observed");
+            host_restart_observe(&HostJournalObservation::new(
+                "host.restart budget absent observed",
+                HostJournalDisposition::EvidenceAbsent,
+            ));
             return Ok(None);
         }
         Err(error) => {
@@ -455,7 +496,14 @@ pub(super) fn load_restart_budget(
     budget.validate().map_err(|error| {
         HostError::RecoveryRequired(format!("restart budget record is invalid: {error}"))
     })?;
-    host_restart_observe("host.restart budget loaded observed");
+    host_restart_observe(
+        &HostJournalObservation::new(
+            "host.restart budget loaded observed",
+            HostJournalDisposition::EvidenceValidated,
+        )
+        .with_installation(budget.installation.as_str())
+        .with_operation(budget.generation.as_str()),
+    );
     Ok(Some(budget))
 }
 
@@ -469,7 +517,13 @@ pub(super) fn persist_restart_budget(
     host_state_root: &Path,
     budget: &HostRestartBudget,
 ) -> Result<(), HostError> {
-    host_restart_observe("host.restart budget persist requested");
+    let budget_identity = HostJournalObservation::new(
+        "host.restart budget persist requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_installation(budget.installation.as_str())
+    .with_operation(budget.generation.as_str());
+    host_restart_observe(&budget_identity);
     budget.validate().map_err(HostError::Platform)?;
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|error| HostError::Platform(error.to_string()))?;
@@ -496,14 +550,28 @@ pub(super) fn persist_restart_budget(
     let cleanup = std::fs::remove_file(&tmp);
     let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
     if let Err(publication_error) = publication {
-        host_restart_observe("host.restart budget publication failed observed");
+        host_restart_observe(
+            &HostJournalObservation::new(
+                "host.restart budget publication failed observed",
+                HostJournalDisposition::BoundaryReached,
+            )
+            .with_installation(budget.installation.as_str())
+            .with_operation(budget.generation.as_str()),
+        );
         return Err(publication_error);
     }
     match cleanup {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            host_restart_observe("host.restart budget cleanup failed observed");
+            host_restart_observe(
+                &HostJournalObservation::new(
+                    "host.restart budget cleanup failed observed",
+                    HostJournalDisposition::CleanupIncomplete,
+                )
+                .with_installation(budget.installation.as_str())
+                .with_operation(budget.generation.as_str()),
+            );
             return Err(HostError::RecoveryRequired(format!(
                 "restart budget temporary cleanup failed: {error}"
             )));
@@ -520,7 +588,14 @@ pub(super) fn persist_restart_budget(
             "restart budget readback differs from the published record".to_owned(),
         ));
     }
-    host_restart_observe("host.restart budget persisted observed");
+    host_restart_observe(
+        &HostJournalObservation::new(
+            "host.restart budget persisted observed",
+            HostJournalDisposition::PublicationCreated,
+        )
+        .with_installation(budget.installation.as_str())
+        .with_operation(budget.generation.as_str()),
+    );
     Ok(())
 }
 
@@ -530,6 +605,20 @@ pub(super) enum RuntimeRestartPendingPublication {
     Created,
     Replay,
 }
+
+/// Which durable receipt publication one receipt call performed.
+///
+/// Local disposition plumbing only: it lets the create-race arm report the
+/// owner's real `Replay` outcome to the single publication record instead of
+/// publishing a second one. It carries no identity and is not durable
+/// authority.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeRestartReceiptPublication {
+    Created,
+    Replay,
+}
+
 #[cfg(windows)]
 fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
     sync_dir(dir)
@@ -556,7 +645,14 @@ fn remove_receipt_confirmed_runtime_restart_pending(
         return Ok(());
     };
     if identity.mutation_digest() != receipt.mutation_digest.as_str() {
-        host_restart_observe("host.restart pending conflict preserved observed");
+        host_restart_observe(
+            &HostJournalObservation::new(
+                "host.restart pending conflict preserved observed",
+                HostJournalDisposition::EvidenceMismatched,
+            )
+            .with_mutation(receipt.mutation_digest.as_str())
+            .with_recovery_binding(identity.mutation_digest()),
+        );
         return Err(HostError::RecoveryRequired(
             "runtime restart pending record conflicts with the durable receipt".to_owned(),
         ));
@@ -567,7 +663,13 @@ fn remove_receipt_confirmed_runtime_restart_pending(
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            host_restart_observe("host.restart pending removal failed observed");
+            host_restart_observe(
+                &HostJournalObservation::new(
+                    "host.restart pending removal failed observed",
+                    HostJournalDisposition::CleanupIncomplete,
+                )
+                .with_mutation(receipt.mutation_digest.as_str()),
+            );
             return Err(HostError::RecoveryRequired(format!(
                 "runtime restart pending cleanup failed: {error}"
             )));
@@ -588,7 +690,15 @@ pub(super) fn persist_runtime_restart_pending(
     request: &HostRuntimeControlRequest,
     host: &HostInstallationEpoch,
 ) -> Result<RuntimeRestartPendingPublication, HostError> {
-    host_restart_observe("host.restart pending requested");
+    let pending = HostJournalObservation::new(
+        "host.restart pending requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_operation(request.request_id.as_str())
+    .with_mutation(request.mutation_digest.as_str())
+    .with_request_digest(request.request_digest.as_str())
+    .with_host(host);
+    host_restart_observe(&pending);
     request.validate().map_err(HostError::RecoveryRequired)?;
     if request.operation != HostRuntimeControlOperation::RestartKernel {
         return Err(HostError::RecoveryRequired(
@@ -609,7 +719,16 @@ pub(super) fn persist_runtime_restart_pending(
             // An earlier attempt may have linked this record and then failed its
             // directory sync; confirm the entry is durable before treating it as published.
             sync_runtime_restart_store_dir(&dir)?;
-            host_restart_observe("host.restart pending replay observed");
+            host_restart_observe(
+                &HostJournalObservation::new(
+                    "host.restart pending replay observed",
+                    HostJournalDisposition::PublicationReplayed,
+                )
+                .with_operation(request.request_id.as_str())
+                .with_mutation(request.mutation_digest.as_str())
+                .with_request_digest(request.request_digest.as_str())
+                .with_host(host),
+            );
             return Ok(RuntimeRestartPendingPublication::Replay);
         }
         return Err(HostError::RecoveryRequired(
@@ -655,7 +774,11 @@ pub(super) fn persist_runtime_restart_pending(
                     // An earlier attempt may have linked this record and then failed its
                     // directory sync; confirm the entry is durable before treating it as published.
                     sync_runtime_restart_store_dir(&dir)?;
-                    host_restart_observe("host.restart pending replay observed");
+                    // Defect (6): this create-race arm publishes no record of
+                    // its own. The single publication record is emitted by the
+                    // common tail below, typed on the owner's
+                    // `Created | Replay` disposition, so a replay can no longer
+                    // be counted twice.
                     Ok(RuntimeRestartPendingPublication::Replay)
                 } else {
                     Err(HostError::RecoveryRequired(
@@ -683,7 +806,14 @@ pub(super) fn persist_runtime_restart_pending(
     }
     match publication {
         Err(publication_error) => {
-            host_restart_observe("host.restart pending publication failed observed");
+            host_restart_observe(
+                &HostJournalObservation::new(
+                    "host.restart pending publication failed observed",
+                    HostJournalDisposition::BoundaryReached,
+                )
+                .with_mutation(request.mutation_digest.as_str())
+                .with_request_digest(request.request_digest.as_str()),
+            );
             Err(publication_error)
         }
         Ok(value) => {
@@ -691,7 +821,13 @@ pub(super) fn persist_runtime_restart_pending(
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    host_restart_observe("host.restart pending cleanup failed observed");
+                    host_restart_observe(
+                        &HostJournalObservation::new(
+                            "host.restart pending cleanup failed observed",
+                            HostJournalDisposition::CleanupIncomplete,
+                        )
+                        .with_mutation(request.mutation_digest.as_str()),
+                    );
                     return Err(HostError::RecoveryRequired(format!(
                         "runtime restart pending temporary cleanup failed: {error}"
                     )));
@@ -700,7 +836,29 @@ pub(super) fn persist_runtime_restart_pending(
             sync_after_cleanup?;
             #[cfg(all(test, windows))]
             ordering::record("pending_publication_complete");
-            host_restart_observe("host.restart pending published observed");
+            // Exactly one publication record per outcome, typed on the owner's
+            // own `Created | Replay` disposition. Each arm pairs its own boundary
+            // with its own single typed disposition, and the identity the request
+            // already holds is attached once to whichever arm the owner reached,
+            // so no record names a disposition it did not reach and a replay can
+            // never be counted as a replay plus a publication.
+            let publication_record = match value {
+                RuntimeRestartPendingPublication::Created => HostJournalObservation::new(
+                    "host.restart pending published observed",
+                    HostJournalDisposition::PublicationCreated,
+                ),
+                RuntimeRestartPendingPublication::Replay => HostJournalObservation::new(
+                    "host.restart pending replay observed",
+                    HostJournalDisposition::PublicationReplayed,
+                ),
+            };
+            host_restart_observe(
+                &publication_record
+                    .with_operation(request.request_id.as_str())
+                    .with_mutation(request.mutation_digest.as_str())
+                    .with_request_digest(request.request_digest.as_str())
+                    .with_host(host),
+            );
             Ok(value)
         }
     }
@@ -712,7 +870,14 @@ pub(super) fn persist_runtime_restart_receipt(
     host_state_root: &Path,
     receipt: &HostKernelRestartReceipt,
 ) -> Result<(), HostError> {
-    host_restart_observe("host.restart receipt requested");
+    host_restart_observe(
+        &HostJournalObservation::new(
+            "host.restart receipt requested",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_mutation(receipt.mutation_digest.as_str())
+        .with_request_digest(receipt.request_digest.as_str()),
+    );
     receipt.validate().map_err(HostError::Platform)?;
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
@@ -744,7 +909,14 @@ pub(super) fn persist_runtime_restart_receipt(
             // replay re-confirms the directory entry and retries the pending
             // removal instead of reporting success with pending still present.
             remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, &existing)?;
-            host_restart_observe("host.restart receipt replay observed");
+            host_restart_observe(
+                &HostJournalObservation::new(
+                    "host.restart receipt replay observed",
+                    HostJournalDisposition::PublicationReplayed,
+                )
+                .with_mutation(receipt.mutation_digest.as_str())
+                .with_request_digest(receipt.request_digest.as_str()),
+            );
             return Ok(());
         }
         return Err(HostError::RecoveryRequired(
@@ -775,7 +947,7 @@ pub(super) fn persist_runtime_restart_receipt(
                 sync_runtime_restart_store_dir(&dir)?;
                 #[cfg(all(test, windows))]
                 ordering::record("receipt_publication_dir_sync_success");
-                Ok(())
+                Ok(RuntimeRestartReceiptPublication::Created)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let bytes =
@@ -792,8 +964,12 @@ pub(super) fn persist_runtime_restart_receipt(
                     // An earlier attempt may have linked this record and then failed its
                     // directory sync; confirm the entry is durable before treating it as published.
                     sync_runtime_restart_store_dir(&dir)?;
-                    host_restart_observe("host.restart receipt replay observed");
-                    Ok(())
+                    // Defect (6): the create-race arm publishes no record of
+                    // its own. The single publication record is emitted by the
+                    // common tail below, typed on the owner's
+                    // `Created | Replay` disposition, so a replay is never
+                    // counted as a replay plus a publication.
+                    Ok(RuntimeRestartReceiptPublication::Replay)
                 } else {
                     Err(HostError::RecoveryRequired(
                         "existing runtime restart receipt conflicts with reconstructed authority"
@@ -818,26 +994,51 @@ pub(super) fn persist_runtime_restart_receipt(
             ordering::record("receipt_tmp_cleanup_dir_sync_error");
         }
     }
-    // Publication failure is primary; cleanup cannot rename it as success.
-    let () = match publication {
-        Err(error) => return Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(HostError::RecoveryRequired(format!(
-                    "runtime restart receipt temporary cleanup failed: {error}"
-                )));
-            }
-        },
+    // Publication failure is primary; cleanup cannot rename it as success. The
+    // publication result is propagated before `cleanup` is consulted, exactly
+    // as the previous early return did.
+    let publication_value = publication?;
+    let publication_disposition = match cleanup {
+        Ok(()) => publication_value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => publication_value,
+        Err(error) => {
+            // The receipt is already durable here: the only step that did
+            // not complete is its temporary-file cleanup.
+            host_restart_observe(
+                &HostJournalObservation::new(
+                    "host.restart receipt cleanup failed observed",
+                    HostJournalDisposition::CleanupIncomplete,
+                )
+                .with_mutation(receipt.mutation_digest.as_str()),
+            );
+            return Err(HostError::RecoveryRequired(format!(
+                "runtime restart receipt temporary cleanup failed: {error}"
+            )));
+        }
     };
     sync_after_cleanup?;
     #[cfg(all(test, windows))]
     ordering::record("receipt_durable_before_pending_remove");
-    // Receipt is durable before pending removal.
-    host_restart_observe("host.restart receipt durable observed");
+    // Receipt is durable before pending removal. The one publication record is
+    // typed on the owner's own `Created | Replay` disposition: each arm pairs
+    // its own boundary with its own single typed disposition, so the durable
+    // record never names a disposition its own call did not reach.
+    let durable_record = match publication_disposition {
+        RuntimeRestartReceiptPublication::Created => HostJournalObservation::new(
+            "host.restart receipt durable observed",
+            HostJournalDisposition::PublicationCreated,
+        ),
+        RuntimeRestartReceiptPublication::Replay => HostJournalObservation::new(
+            "host.restart receipt replay observed",
+            HostJournalDisposition::PublicationReplayed,
+        ),
+    };
+    host_restart_observe(
+        &durable_record
+            .with_mutation(receipt.mutation_digest.as_str())
+            .with_request_digest(receipt.request_digest.as_str()),
+    );
     remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, receipt)?;
-    host_restart_observe("host.restart receipt published observed");
     Ok(())
 }
 
@@ -856,7 +1057,15 @@ pub(super) fn rebind_runtime_restart_receipt(
     receipt: &HostKernelRestartReceipt,
     request: &HostRuntimeControlRequest,
 ) -> Result<HostKernelRestartReceipt, HostError> {
-    host_restart_observe("host.restart rebind requested");
+    host_restart_observe(
+        &HostJournalObservation::new(
+            "host.restart rebind requested",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_operation(request.request_id.as_str())
+        .with_mutation(request.mutation_digest.as_str())
+        .with_request_digest(request.request_digest.as_str()),
+    );
     if request.operation != HostRuntimeControlOperation::ReconcileKernelRestart
         || receipt.mutation_digest != request.mutation_digest
     {
@@ -868,7 +1077,19 @@ pub(super) fn rebind_runtime_restart_receipt(
     rebound.request_digest = request.request_digest.clone();
     rebound.receipt_digest = rebound.computed_digest().map_err(HostError::Platform)?;
     rebound.validate().map_err(HostError::Platform)?;
-    host_restart_observe("host.restart rebind observed");
+    // The rebound receipt replays the exact receipt this installation already
+    // published, re-bound to this reconcile request. It publishes nothing, so
+    // its record is a replay and never a second publication.
+    host_restart_observe(
+        &HostJournalObservation::new(
+            "host.restart rebind observed",
+            HostJournalDisposition::PublicationReplayed,
+        )
+        .with_operation(request.request_id.as_str())
+        .with_mutation(rebound.mutation_digest.as_str())
+        .with_request_digest(rebound.request_digest.as_str())
+        .with_record_checksum(rebound.receipt_digest.as_str()),
+    );
     Ok(rebound)
 }
 

@@ -30,17 +30,35 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // observation carries a phase token plus the bounded identities its call site
 // already holds, rendered by `crate::host_job_launch::LaunchPhaseCorrelation`
 // through `host_diagnostics::bound_field`. A static label can classify a
-// phase; only a bound installation, plan generation, registration operation,
-// approved configuration digest, path-free process-start identity, and typed
-// cause kind say which owner operation or process incarnation produced the
-// record. Each slot is an already-held non-secret handle, counter, or typed
-// variant name: no path, image name, argv, environment value, credential,
-// nonce, connection string, descriptor payload, or arbitrary `Debug`/`Display`
-// text ever enters a slot, and no probe, lookup, second inspection, or
-// duplicate evaluation of an expression runs to obtain one. A call site that
-// holds none of them binds `LaunchPhaseCorrelation::NONE`, so a missing
-// identity stays explicitly missing instead of being invented. Bounding limits
-// size, not sensitivity (I15.4).
+// phase; only a bound installation, plan or host-epoch generation, approved
+// configuration digest, path-free process-start identity, and typed cause kind
+// say which installation generation or process incarnation produced the
+// record. `operation` names exactly one identity across the whole correlation
+// corpus - the canonical KernelRecord operation identity - and this file is
+// never handed one, so no call site below binds it. Each slot is an
+// already-held non-secret handle, counter, or typed variant name: no path,
+// image name, argv, environment value, credential, nonce, connection string,
+// descriptor payload, or arbitrary `Debug`/`Display` text ever enters a slot,
+// and no probe, lookup, second inspection, or duplicate evaluation of an
+// expression runs to obtain one. A call site that holds none of them binds
+// `LaunchPhaseCorrelation::NONE`, so a missing identity stays explicitly
+// missing instead of being invented. Bounding limits size, not sensitivity
+// (I15.4).
+//
+// Recorded loss of rendered detail (issue #978; I14.20 line 296, "Identical
+// labels in different typed machines are not interchangeable"): the Windows
+// SCM service name (`ServiceRegistrationRequest::service_name`) is a real,
+// non-secret, owner-held identity that this file always held in hand, and it
+// is no longer bound into any correlation slot. The eight-key correlation
+// vocabulary is frozen and has no service-name key, and `operation` names the
+// canonical KernelRecord operation identity corpus-wide, so binding the SCM
+// service name there gave one rendered key two unrelated identities. Every
+// record that used to carry it now renders the renderer's explicit
+// `operation=missing` marker, exactly like every other site that does not hold
+// that identity. This is a recorded loss of rendered detail, not a claim that
+// the name is unavailable, unobservable, or unimportant: the name is still
+// present in the typed `HostScmRegistrationCause::Absent` detail and in
+// `InstalledCandidateReadback::service_name`, both of which are unchanged.
 //
 // Readiness rule: an SCM request, a launched process, a PID, a start mode, and
 // a `START_PENDING` state are request/liveness observations, never readiness.
@@ -90,24 +108,24 @@ fn scm_process_start_identity(process: &ProcessIdentity) -> String {
     )
 }
 
-/// Bounded correlation of one already-held registration request and runtime
-/// inspection.
+/// Bounded correlation of one already-held runtime inspection.
 ///
-/// `operation` is the canonical registration identity the validated request
-/// already carries; `artifact` is the observed registration configuration
-/// digest a `Matching` readback already holds (never an image name or path);
-/// `reason` is the typed cause kind this observation is about, or `None` when
-/// the observation admits bootstrap and therefore fails no cause. A bare
-/// `Unknown` PID is never bound: `process_start` stays absent unless the
-/// caller already holds a real process-start identity and passes it. No probe,
+/// `artifact` is the observed registration configuration digest a `Matching`
+/// readback already holds (never an image name or path); `reason` is the typed
+/// cause kind this observation is about, or `None` when the observation admits
+/// bootstrap and therefore fails no cause. `operation` is deliberately left
+/// unbound and renders `operation=missing`: this file holds no `KernelRecord`
+/// operation identity on any path, and the SCM service name is not one (see the
+/// recorded loss of rendered detail in the F-LOG-HOST-3 header above). A bare
+/// `Unknown` PID is never bound: `process_start` stays absent unless the caller
+/// already holds a real process-start identity and passes it. No probe,
 /// lookup, or re-inspection happens inside.
 fn scm_observed_correlation<'a>(
-    request: &'a ServiceRegistrationRequest,
     inspection: &'a ServiceRegistrationRuntimeInspection,
     reason: Option<&'a str>,
     process_start: Option<&'a str>,
 ) -> LaunchPhaseCorrelation<'a> {
-    let mut correlation = LaunchPhaseCorrelation::NONE.with_operation(request.service_name());
+    let mut correlation = LaunchPhaseCorrelation::NONE;
     if let Some(reason) = reason {
         correlation = correlation.with_reason(reason);
     }
@@ -122,22 +140,18 @@ fn scm_observed_correlation<'a>(
 
 /// Bounded correlation of the admitted launch identities the caller already
 /// holds: the installation handle, its immutable transaction-plan generation,
-/// and the approved bootstrap config descriptor digest. `registration` is
-/// absent only before the canonical request is built; when present it
-/// contributes the registration operation identity. Never the config
-/// descriptor path, the registration nonce, extra argv, or the service image.
-fn scm_bootstrap_correlation<'a>(
-    launch_options: &'a HostLaunchOptions,
-    registration: Option<&'a ServiceRegistrationRequest>,
-) -> LaunchPhaseCorrelation<'a> {
-    let mut correlation = LaunchPhaseCorrelation::NONE
+/// and the approved bootstrap config descriptor digest. `operation` is
+/// deliberately left unbound and renders `operation=missing` for the recorded
+/// loss of rendered detail stated in the F-LOG-HOST-3 header above: the SCM
+/// service name this file holds is not the corpus-wide `KernelRecord` operation
+/// identity, and the frozen vocabulary has no service-name key for it. Never
+/// the config descriptor path, the registration nonce, extra argv, or the
+/// service image.
+fn scm_bootstrap_correlation(launch_options: &HostLaunchOptions) -> LaunchPhaseCorrelation<'_> {
+    LaunchPhaseCorrelation::NONE
         .with_installation(launch_options.installation().as_str())
         .with_generation(launch_options.transaction_plan_generation())
-        .with_artifact(launch_options.config_descriptor_digest().as_str());
-    if let Some(registration) = registration {
-        correlation = correlation.with_operation(registration.service_name());
-    }
-    correlation
+        .with_artifact(launch_options.config_descriptor_digest().as_str())
 }
 
 /// Single-terminal guard for one SCM bootstrap validation.
@@ -374,7 +388,7 @@ pub fn classify_host_scm_inspection(
     // process and start-identity vs PID stay distinct below.
     scm_launch_observe(
         "host.scm-launch classification requested",
-        &scm_observed_correlation(request, inspection, None, None),
+        &scm_observed_correlation(inspection, None, None),
     );
     match inspection {
         ServiceRegistrationRuntimeInspection::Matching { observation }
@@ -389,7 +403,7 @@ pub fn classify_host_scm_inspection(
             let process_start = observation.process().map(scm_process_start_identity);
             scm_launch_observe(
                 "host.scm-launch start-identity observed",
-                &scm_observed_correlation(request, inspection, None, process_start.as_deref()),
+                &scm_observed_correlation(inspection, None, process_start.as_deref()),
             );
             None
         }
@@ -403,7 +417,6 @@ pub fn classify_host_scm_inspection(
             scm_launch_observe(
                 "host.scm-launch start-identity unknown",
                 &scm_observed_correlation(
-                    request,
                     inspection,
                     Some(HOST_SCM_CAUSE_UNKNOWN),
                     process_start.as_deref(),
@@ -416,14 +429,17 @@ pub fn classify_host_scm_inspection(
         ServiceRegistrationRuntimeInspection::Absent => {
             // WORK_UNIT_CASE: 978/5 — SCM request observed: the canonical
             // registration request has no observed process. The correlation
-            // binds the same request-bound identity the cause retains, read
-            // once: the queried registration name and the admitted
-            // configuration digest. No process identity is bound because an
-            // absent registration has none.
+            // binds the admitted configuration digest the cause retains, read
+            // once. The queried registration name is retained by the returned
+            // cause but is no longer bound into any correlation slot — the
+            // recorded loss of rendered detail stated in the F-LOG-HOST-3
+            // header above — so `operation` renders `operation=missing`. No
+            // process identity is bound because an absent registration has
+            // none.
             let configuration_digest = request.expected_configuration_digest();
             scm_launch_observe(
                 "host.scm-launch request observed",
-                &scm_observed_correlation(request, inspection, Some(HOST_SCM_CAUSE_ABSENT), None)
+                &scm_observed_correlation(inspection, Some(HOST_SCM_CAUSE_ABSENT), None)
                     .with_artifact(&configuration_digest),
             );
             Some(HostScmRegistrationCause::Absent {
@@ -434,16 +450,12 @@ pub fn classify_host_scm_inspection(
         ServiceRegistrationRuntimeInspection::Mismatched => {
             // WORK_UNIT_CASE: 978/5 — observed process exists but is not the
             // requested registration. The unit variant carries no observed
-            // digest or process identity, so only the registration operation
-            // and the typed cause kind are bound.
+            // digest or process identity, so the typed cause kind is the only
+            // identity this record binds; `operation` and `process_start`
+            // render as `missing`.
             scm_launch_observe(
                 "host.scm-launch process observed",
-                &scm_observed_correlation(
-                    request,
-                    inspection,
-                    Some(HOST_SCM_CAUSE_MISMATCHED),
-                    None,
-                ),
+                &scm_observed_correlation(inspection, Some(HOST_SCM_CAUSE_MISMATCHED), None),
             );
             Some(HostScmRegistrationCause::Mismatched {
                 inspection_debug: format!("{inspection:?}"),
@@ -452,13 +464,15 @@ pub fn classify_host_scm_inspection(
         ServiceRegistrationRuntimeInspection::Unknown { detail } => {
             // WORK_UNIT_CASE: 978/5 — ephemeral PID observation; never
             // promoted into start-identity. A bare PID is never bound as a
-            // process-start identity, so `process_start` stays missing and the
-            // request-bound operation plus the typed cause kind carry the
-            // record; re-deriving the admitted configuration digest here would
-            // be a second evaluation, so it stays missing too.
+            // process-start identity, so `process_start` stays missing and only
+            // the typed cause kind carries this record; the request-bound
+            // operation identity is deliberately no longer bound (recorded loss
+            // of rendered detail, F-LOG-HOST-3 header above), and re-deriving
+            // the admitted configuration digest here would be a second
+            // evaluation, so that stays missing too.
             scm_launch_observe(
                 "host.scm-launch pid observed",
-                &scm_observed_correlation(request, inspection, Some(HOST_SCM_CAUSE_UNKNOWN), None),
+                &scm_observed_correlation(inspection, Some(HOST_SCM_CAUSE_UNKNOWN), None),
             );
             // Typed payload carry-over: preserve win32_error/stage/state/pid
             // explicitly via the typed rendering plus Debug verbatim. Both
@@ -526,9 +540,10 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
 ) -> ServiceRegistrationRuntimeInspection {
     // WORK_UNIT_CASE: 978/13 — deterministic probe schedule requested; the
     // injected inspection script drives the bounded re-read loop. The caller
-    // passes the admitted launch/registration identities it already holds, so
-    // both loop records correlate to the exact registration operation instead
-    // of to a static label alone; the loop itself never inspects extra.
+    // passes the admitted launch identities it already holds, so both loop
+    // records correlate to the exact installation generation and approved
+    // configuration digest instead of to a static label alone; the loop itself
+    // never inspects extra.
     scm_launch_observe("host.scm-launch probe requested", correlation);
     let mut current = probe.inspect();
     for _ in 1..HOST_SCM_TRANSIENT_MAX_INSPECTIONS {
@@ -603,12 +618,14 @@ pub fn validate_host_scm_bootstrap(
     //
     // The admitted installation handle, its transaction-plan generation, and
     // the approved bootstrap config descriptor digest are already in
-    // `launch_options`; the registration operation identity is not built yet
-    // at this point and therefore stays missing rather than being guessed from
-    // a constant.
+    // `launch_options`. The canonical registration request does not exist yet at
+    // this point, and even once it does this file binds no `operation` identity
+    // (recorded loss of rendered detail, F-LOG-HOST-3 header above), so every
+    // record below renders `operation=missing` rather than guessing an identity
+    // from a constant.
     scm_launch_observe(
         "host.scm-launch requested",
-        &scm_bootstrap_correlation(launch_options, None),
+        &scm_bootstrap_correlation(launch_options),
     );
     // WORK_UNIT_CASE: 978/10 — one terminal across the SCM nesting:
     // classification and probe correlate by stage order plus their bound
@@ -648,7 +665,7 @@ pub fn validate_host_scm_bootstrap(
         .ok_or_else(|| HostError::Platform("current executable has no parent".to_owned()))?;
     let platform = WindowsPlatform::new(root.to_path_buf())
         .map_err(|error| HostError::Platform(error.to_string()))?;
-    let registration_correlation = scm_bootstrap_correlation(launch_options, Some(&registration));
+    let registration_correlation = scm_bootstrap_correlation(launch_options);
     let inspection = {
         let mut probe = WindowsScmBootstrapProbe {
             platform: &platform,
@@ -1036,6 +1053,16 @@ pub fn read_installed_candidate_contour(
     // generation, and the approved candidate config descriptor digest are
     // already held in `spec`; the candidate image path, config descriptor
     // path, and state root stay unbound.
+    //
+    // The `artifact` slot of THIS record carries the approved candidate config
+    // DESCRIPTOR digest, and only that: at this point the canonical
+    // registration request does not exist yet, so no SCM configuration digest
+    // has been computed and none is guessed. The later
+    // "…readback observed" record binds the SCM configuration digest of the
+    // request it just inspected instead, so the two phases of this one
+    // candidate readback carry two different approved facts under the same
+    // frozen key rather than one silently replacing the other; see the comment
+    // at that second site.
     let candidate_correlation = LaunchPhaseCorrelation::NONE
         .with_installation(&spec.installation_id)
         .with_generation(spec.transaction_plan_generation)
@@ -1106,16 +1133,35 @@ pub fn read_installed_candidate_contour(
                 })
         }
     };
-    // The readback is bound to the exact query it made: the canonical
-    // registration operation it inspected under and the admitted configuration
-    // digest it compared against, both already computed above. This stays a
-    // read-only registration observation — it proves the registration contour,
-    // never any service readiness.
+    // The readback is bound to the admitted candidate identities and to the
+    // exact query it made: the approved configuration digest it compared
+    // against, already computed above. This stays a read-only registration
+    // observation — it proves the registration contour, never any service
+    // readiness.
+    //
+    // `operation` is deliberately left unbound here, for the recorded loss of
+    // rendered detail stated in the F-LOG-HOST-3 header above: the candidate SCM
+    // service name read at this point is a real, non-secret, owner-held identity,
+    // but it is not the corpus-wide `KernelRecord` operation identity and the
+    // frozen eight-key vocabulary has no service-name key for it. The record
+    // therefore renders `operation=missing`. The name itself is not discarded —
+    // it is returned unchanged in `InstalledCandidateReadback::service_name`
+    // below.
+    //
+    // The `artifact` slot of THIS record therefore carries the SCM
+    // configuration digest of the canonical request just built
+    // (`ServiceRegistrationRequest::expected_configuration_digest`, the digest
+    // the runtime readback compared against), not the approved candidate config
+    // descriptor digest the "…readback requested" record above carries. Those
+    // are two different approved facts of the same candidate — one hashes the
+    // descriptor, the other the whole canonical SCM registration — so the
+    // second `with_artifact` deliberately rebinds this slot instead of letting
+    // the descriptor digest stand in for a digest that was never observed here.
+    // The correlation carries one artifact slot, so the two facts stay in two
+    // records rather than in a second invented slot.
     scm_launch_observe(
         "host.scm-launch installed candidate readback observed",
-        &candidate_correlation
-            .with_operation(&service_name)
-            .with_artifact(&configuration_digest),
+        &candidate_correlation.with_artifact(&configuration_digest),
     );
     Ok(InstalledCandidateReadback {
         service_name,
@@ -1127,6 +1173,8 @@ pub fn read_installed_candidate_contour(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     fn test_registration_request() -> ServiceRegistrationRequest {
@@ -1139,6 +1187,66 @@ mod tests {
             ServiceAccount::LocalService,
         )
         .unwrap_or_else(|_| panic!("test registration request must build"))
+    }
+
+    /// In-memory sink that captures facade output without contending for the
+    /// process-global subscriber.
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `emit` under a scoped `tracing` subscriber and returns the captured
+    /// facade output.
+    ///
+    /// Timestamps are suppressed so two identical production calls produce
+    /// byte-identical captures and a determinism assertion below compares the
+    /// records themselves rather than wall-clock noise.
+    fn capture(emit: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer_sink = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = sink
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Runs the real production classifier [`classify_host_scm_inspection`] for
+    /// one inspection under a scoped subscriber and returns the records the
+    /// facade emitted for it.
+    ///
+    /// Every assertion in the case-5 and case-4/13 tests below reads this text.
+    /// No expected log record is composed by the test, no visibility is
+    /// widened, and no production algorithm is restated: the classifier, its
+    /// correlations and the facade call are the only producers of these bytes.
+    fn capture_classified(
+        request: &ServiceRegistrationRequest,
+        inspection: &ServiceRegistrationRuntimeInspection,
+    ) -> String {
+        capture(|| {
+            let _classified = classify_host_scm_inspection(request, inspection);
+        })
     }
 
     #[test]
@@ -1574,9 +1682,18 @@ mod tests {
         }
     }
 
-    /// `WORK_UNIT_CASE`: 978/5 — one PID can be reused, so the retained
-    /// process-start identity must separate two incarnations of it, and
-    /// `WORK_UNIT_CASE`: 978/12 — it must carry no image path.
+    /// Honest unit proof of the private [`scm_process_start_identity`]
+    /// projection and nothing else.
+    ///
+    /// This test deliberately carries no work-unit case marker. The
+    /// `Matching { observation }` arm of [`classify_host_scm_inspection`] — the
+    /// only production site that binds a process-start identity — needs a
+    /// `ServiceRuntimeObservation` whose fields are `pub(super)` inside
+    /// `eliot-platform-windows`, so that arm cannot be reached, let alone
+    /// observed, from any eliot-host seam. The positive two-incarnation record
+    /// therefore belongs to `eliot-platform-windows`' own owner tests; what is
+    /// Host-proved here is captured in
+    /// `classify_records_bind_typed_cause_leave_operation_missing_and_never_a_bare_pid`.
     #[test]
     fn process_start_identity_separates_two_incarnations_of_one_pid_and_hides_the_path() {
         const CANARY_IMAGE: &str = r"C:\canary\service-image.exe";
@@ -1602,80 +1719,205 @@ mod tests {
             "an image path is never a diagnostic identity: {first_identity}"
         );
         assert!(!first_identity.contains("canary"));
-        // The same projection, bound into the correlation the classifier uses,
-        // keeps the process-start slot path-free while the typed cause kind
-        // still names the registration drift.
+    }
+
+    /// `WORK_UNIT_CASE`: 978/5 — the real, reachable production path
+    /// [`classify_host_scm_inspection`] binds the typed cause kind into the
+    /// record the facade emits, renders `operation` as the explicit `missing`
+    /// marker because this file holds no `KernelRecord` operation identity, and
+    /// never promotes a bare observed PID into a process-start identity;
+    /// `WORK_UNIT_CASE`: 978/12 — those emitted records carry no image path.
+    ///
+    /// Every assertion below reads bytes captured out of a scoped `tracing`
+    /// subscriber while the production classifier ran: no expected log record
+    /// is hand-constructed here, no private visibility is widened, and no
+    /// production algorithm is restated. `Absent`, `Mismatched` and the typed
+    /// `Unknown { detail }` payload are the inspection values constructible from
+    /// outside `eliot-platform-windows`; the positive `Matching` arm requires a
+    /// `ServiceRuntimeObservation` whose fields are `pub(super)` to that crate
+    /// and is its owner tests' proof, as recorded in the sibling helper test.
+    #[test]
+    fn classify_records_bind_typed_cause_leave_operation_missing_and_never_a_bare_pid() {
         let request = test_registration_request();
-        let mismatched = ServiceRegistrationRuntimeInspection::Mismatched;
-        let detail = scm_observed_correlation(
-            &request,
-            &mismatched,
-            Some(HOST_SCM_CAUSE_MISMATCHED),
-            Some(&first_identity),
-        )
-        .render("host.scm-launch process observed");
-        assert!(detail.contains(&format!("process_start={first_identity}")));
-        assert!(detail.contains("reason=mismatched"));
-        assert!(!detail.contains(CANARY_IMAGE), "{detail}");
+        let service_name = request.service_name().to_owned();
+        let image_path = request.binary_path().display().to_string();
+
+        // `Absent`: the typed `absent` cause kind reaches the emitted record, and
+        // `operation` renders the renderer's own `missing` marker — that key
+        // names the canonical KernelRecord operation identity corpus-wide, so
+        // the SCM service name this call site holds may not fill it (recorded
+        // loss of rendered detail, F-LOG-HOST-3 header).
+        let absent_records =
+            capture_classified(&request, &ServiceRegistrationRuntimeInspection::Absent);
+        assert!(
+            absent_records.contains("operation=missing"),
+            "the unbound operation identity must render explicitly missing: {absent_records}"
+        );
+        assert!(
+            !absent_records.contains(&service_name),
+            "the SCM service name must reach no correlation slot: {absent_records}"
+        );
+        assert!(
+            absent_records.contains(&format!("reason={HOST_SCM_CAUSE_ABSENT}")),
+            "the typed absent cause kind must reach the emitted record: {absent_records}"
+        );
+        assert!(
+            absent_records.contains("process_start=missing"),
+            "an absent registration observed no process: {absent_records}"
+        );
+
+        // `Mismatched`: a different typed cause kind on the same request.
+        let mismatched_records =
+            capture_classified(&request, &ServiceRegistrationRuntimeInspection::Mismatched);
+        assert!(
+            mismatched_records.contains("operation=missing"),
+            "the unbound operation identity must render explicitly missing: {mismatched_records}"
+        );
+        assert!(
+            !mismatched_records.contains(&service_name),
+            "the SCM service name must reach no correlation slot: {mismatched_records}"
+        );
+        assert!(
+            mismatched_records.contains(&format!("reason={HOST_SCM_CAUSE_MISMATCHED}")),
+            "the typed mismatched cause kind must reach the emitted record: {mismatched_records}"
+        );
+        assert!(
+            mismatched_records.contains("process_start=missing"),
+            "the unit Mismatched variant carries no observed process: {mismatched_records}"
+        );
+        assert!(
+            !mismatched_records.contains(&format!("reason={HOST_SCM_CAUSE_UNKNOWN}")),
+            "a registration drift must never collapse into the unknown cause: {mismatched_records}"
+        );
+
+        // A transient `START_PENDING` readback carries a bare PID in the
+        // platform payload. The emitted record must name the typed `unknown`
+        // cause kind and must leave the process-start slot explicitly missing:
+        // a reusable PID is never a process-start identity.
+        let pending = ServiceRegistrationRuntimeInspection::unknown_with_status(
+            0,
+            "query-status",
+            HOST_SCM_START_PENDING_STATE,
+            987_654,
+        );
+        let pending_records = capture_classified(&request, &pending);
+        assert!(
+            pending_records.contains(&format!("reason={HOST_SCM_CAUSE_UNKNOWN}")),
+            "the typed unknown cause kind must reach the emitted record: {pending_records}"
+        );
+        assert!(
+            pending_records.contains("process_start=missing"),
+            "a bare PID must never be promoted into a process-start identity: {pending_records}"
+        );
+        assert!(
+            !pending_records.contains("987654"),
+            "a bare PID must never reach the emitted record: {pending_records}"
+        );
+
+        // Case 12: the captured production records carry no path canary, and
+        // they are real records rather than empty captures.
+        for records in [&absent_records, &mismatched_records, &pending_records] {
+            assert!(
+                records.contains("host.entrypoint_stage"),
+                "each production classification must emit facade records: {records}"
+            );
+            assert!(
+                !records.contains(&image_path),
+                "no image path may reach an emitted record: {records}"
+            );
+        }
     }
 
     /// `WORK_UNIT_CASE`: 978/4 — an SCM request and an observed status sample
     /// are request/liveness observations, never readiness and never a
-    /// process-start identity; `WORK_UNIT_CASE`: 978/13 - the emitted fields are
-    /// deterministic per held identity and differ per typed inspection; and
-    /// `WORK_UNIT_CASE`: 978/12 — no path, argv, or nonce value appears.
+    /// process-start identity; `WORK_UNIT_CASE`: 978/13 — those emitted records
+    /// are deterministic per held identity and differ per typed inspection;
+    /// and `WORK_UNIT_CASE`: 978/12 — no path value appears in them.
+    ///
+    /// Every assertion below reads records captured out of a scoped `tracing`
+    /// subscriber while the real [`classify_host_scm_inspection`] production
+    /// function ran. Nothing here renders or formats a detail string, so no
+    /// assertion can pass on a record this test composed itself.
     #[test]
     fn observed_correlation_binds_held_identity_without_path_nonce_or_bare_pid() {
         let request = test_registration_request();
-        let service_name = request.service_name();
         let image_path = request.binary_path().display().to_string();
         let configuration_digest = request.expected_configuration_digest();
-        let absent = ServiceRegistrationRuntimeInspection::Absent;
-        let pending =
-            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 4242);
+        let absent_inspection = ServiceRegistrationRuntimeInspection::Absent;
 
-        // An absent registration binds the request-bound identity the cause
-        // retains and no observed process.
-        let absent_detail =
-            scm_observed_correlation(&request, &absent, Some(HOST_SCM_CAUSE_ABSENT), None)
-                .with_artifact(&configuration_digest)
-                .render("host.scm-launch request observed");
-        assert!(absent_detail.contains("phase=host.scm-launch request observed"));
-        assert!(absent_detail.contains(&format!("operation={service_name}")));
-        assert!(absent_detail.contains(&format!("artifact={configuration_digest}")));
-        assert!(absent_detail.contains(&format!("reason={HOST_SCM_CAUSE_ABSENT}")));
-        // `LaunchPhaseCorrelation::render` spells an absent slot explicitly
-        // missing; an absent registration observed no process, so the slot
-        // must read missing rather than carry a guessed identity.
-        assert!(absent_detail.contains("process_start=missing"));
-        assert!(!absent_detail.contains(&image_path), "{absent_detail}");
-        assert!(!absent_detail.contains("ready"), "{absent_detail}");
-
-        // A transient `START_PENDING` sample carries a bare PID; it must stay
-        // unbound rather than pass as a process-start identity.
-        let pending_detail =
-            scm_observed_correlation(&request, &pending, Some(HOST_SCM_CAUSE_UNKNOWN), None)
-                .render("host.scm-launch pid observed");
-        assert!(pending_detail.contains("process_start=missing"));
+        // One real `Absent` classification emits the classifier's own request
+        // record plus its typed request observation, the latter carrying the
+        // admitted configuration digest the cause retains and no observed
+        // process. Only the latter carries that digest: `scm_observed_correlation`
+        // binds `artifact` only for a `Matching` readback, so the classifier's
+        // own request record holds no observed configuration digest and renders
+        // `artifact=missing`, which is why the digest assertion below reads the
+        // two-record window rather than one named record. The SCM service name
+        // the cause also retains is bound nowhere in the correlation (recorded
+        // loss of rendered detail, F-LOG-HOST-3 header), so `operation` renders
+        // `operation=missing` on both records.
+        let absent_records = capture_classified(&request, &absent_inspection);
         assert!(
-            !pending_detail.contains("4242"),
-            "a bare PID must never be bound: {pending_detail}"
+            absent_records.contains("phase=host.scm-launch classification requested"),
+            "the classifier must emit its own request record: {absent_records}"
         );
-        assert!(!pending_detail.contains(&image_path), "{pending_detail}");
+        assert!(
+            absent_records.contains("phase=host.scm-launch request observed"),
+            "the absent arm must emit its typed request record: {absent_records}"
+        );
+        assert!(
+            absent_records.contains(&format!("artifact={configuration_digest}")),
+            "the absent record must carry the request-bound configuration digest: {absent_records}"
+        );
+        assert!(
+            absent_records.contains("process_start=missing"),
+            "an absent registration observed no process: {absent_records}"
+        );
+        // Case 4: an SCM registration request is not readiness, so no emitted
+        // record in this path may claim it.
+        assert!(
+            !absent_records.contains("ready"),
+            "an SCM registration request is never a readiness record: {absent_records}"
+        );
 
-        // Deterministic per held inputs, and semantically different per typed
-        // inspection instead of one vacuous field set.
-        let repeated =
-            scm_observed_correlation(&request, &absent, Some(HOST_SCM_CAUSE_ABSENT), None)
-                .with_artifact(&configuration_digest)
-                .render("host.scm-launch request observed");
-        assert_eq!(absent_detail, repeated);
-        let mismatched = ServiceRegistrationRuntimeInspection::Mismatched;
-        let mismatched_detail =
-            scm_observed_correlation(&request, &mismatched, Some(HOST_SCM_CAUSE_MISMATCHED), None)
-                .render("host.scm-launch process observed");
-        assert_ne!(absent_detail, mismatched_detail);
-        assert!(mismatched_detail.contains("reason=mismatched"));
-        assert!(mismatched_detail.contains("process_start=missing"));
+        // Case 13: identical held identities and an identical typed inspection
+        // produce byte-identical production records — determinism, not a count.
+        let repeated = capture_classified(&request, &absent_inspection);
+        assert_eq!(
+            absent_records, repeated,
+            "identical held identities must produce identical production records"
+        );
+        // ... and a different typed inspection produces a different record set
+        // instead of one vacuous field set.
+        let mismatched_records =
+            capture_classified(&request, &ServiceRegistrationRuntimeInspection::Mismatched);
+        assert_ne!(
+            absent_records, mismatched_records,
+            "typed inspections must not collapse into one record set"
+        );
+        assert!(
+            mismatched_records.contains("phase=host.scm-launch process observed"),
+            "the mismatched arm must emit its own phase record: {mismatched_records}"
+        );
+        assert!(
+            mismatched_records.contains(&format!("reason={HOST_SCM_CAUSE_MISMATCHED}")),
+            "the mismatched record must name its typed cause kind: {mismatched_records}"
+        );
+        assert!(
+            mismatched_records.contains("process_start=missing"),
+            "the unit Mismatched variant carries no observed process: {mismatched_records}"
+        );
+
+        // Case 12: the captured production records carry no path canary.
+        for records in [&absent_records, &mismatched_records] {
+            assert!(
+                records.contains("host.entrypoint_stage"),
+                "each production classification must emit facade records: {records}"
+            );
+            assert!(
+                !records.contains(&image_path),
+                "no image path may reach an emitted record: {records}"
+            );
+        }
     }
 }
