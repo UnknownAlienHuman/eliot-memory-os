@@ -989,17 +989,19 @@ mod tests {
         ));
     }
 
-    /// The positive for the loader's own call site: the documented
-    /// literal-local pair is still ACCEPTED by `GovernorConfig::validate`, so
-    /// adding `self.db.surreal.validate_local_rpc_endpoint()?` did not narrow
-    /// the accepted configuration. Stated on its own rather than left to
-    /// `default_config_is_valid`, so the acceptance is attributed to the new
-    /// call site instead of to the pre-existing default fixture.
+    /// The positive for the loader: `GovernorConfig::validate` ACCEPTS a
+    /// literal-local pair that `GovernorConfig::default()` does not carry — the
+    /// leading-zero port encoding `127.0.0.1:08000` / `ws://127.0.0.1:08000/rpc`,
+    /// which the grammar admits because `"08000"` is a non-empty ASCII-digit run
+    /// that parses as `u16`. Because the values are not the default ones, this
+    /// acceptance is not a restatement of `default_config_is_valid`, and it
+    /// shows that the `validate_local_rpc_endpoint()?` call in
+    /// `GovernorConfig::validate` did not narrow the accepted configuration.
     #[test]
     fn the_loader_accepts_a_literal_local_bind_and_endpoint_pair() -> Result<(), ConfigError> {
         let mut config = GovernorConfig::default();
-        config.db.surreal.bind = ACCEPTED_BIND.to_owned();
-        config.db.surreal.endpoint = "ws://127.0.0.1:18000/rpc".to_owned();
+        config.db.surreal.bind = "127.0.0.1:08000".to_owned();
+        config.db.surreal.endpoint = "ws://127.0.0.1:08000/rpc".to_owned();
         config.validate()
     }
 }

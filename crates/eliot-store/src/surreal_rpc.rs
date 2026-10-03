@@ -391,21 +391,49 @@ mod local_endpoint_admission_tests {
         Ok(())
     }
 
-    /// #3980: the predicate deliberately still admits the case variants of
-    /// `ws://` that the previous loader check admitted. `http::Uri` keeps a
-    /// non-standard scheme exactly as written, so the transport's own agreement
-    /// check must not refuse what the types layer calls valid -- otherwise a
-    /// configuration that used to load and connect would stop working.
+    /// #3980: for each of the five endpoint forms this table names -- the
+    /// documented literal form, the leading-zero encoding, port `0`, and the two
+    /// case variants of `ws://` and `/RPC` -- the destination the transport
+    /// parses out of that endpoint agrees with what stage 1 validated. The
+    /// agreement is the whole point: stage 1 owns the grammar and `http::Uri`
+    /// owns the second reading of the same string, so a future divergence between
+    /// the two layers on any of these forms (a normalisation of `08000`, a
+    /// different reading of port `0`, a new case-folding rule) must fail here
+    /// rather than stay silent.
+    ///
+    /// The owner-reported port is read from `local_rpc_port()` rather than
+    /// repeated here, so this table tracks the single grammar owner instead of
+    /// a second copy of it. `http::Uri` keeps a non-standard scheme exactly as
+    /// written, which is why the scheme comparison has to be case-insensitive
+    /// for the case entries; and it parses the leading-zero encoding as the
+    /// same number the owner reports, which is what the port assertion below
+    /// pins.
     ///
     /// The comparison is asserted through the production function itself, so
-    /// deleting or narrowing `agrees_with_validated_local_endpoint` fails here.
+    /// deleting or narrowing the scheme half or the port half of
+    /// `agrees_with_validated_local_endpoint` fails here. The host half is pinned
+    /// by a different test, `the_transport_agreement_check_refuses_a_disagreeing_destination`:
+    /// its row `ws://192.0.2.1:18000/rpc` goes red if the host comparison is deleted.
+    /// Only the parsers run: nothing here observes a listener, a connection or
+    /// any other socket work, and nothing here proves which branch `connect`
+    /// reaches.
     #[test]
     fn the_transport_agreement_check_admits_the_declared_case_compatibility()
     -> Result<(), Box<dyn std::error::Error>> {
-        for endpoint in ["WS://127.0.0.1:18000/RPC", "Ws://127.0.0.1:18000/rpc"] {
-            let config = local_config(BIND, endpoint);
+        for (bind, endpoint) in [
+            (BIND, ENDPOINT),
+            ("127.0.0.1:08000", "ws://127.0.0.1:08000/rpc"),
+            ("127.0.0.1:0", "ws://127.0.0.1:0/rpc"),
+            (BIND, "WS://127.0.0.1:18000/RPC"),
+            (BIND, "Ws://127.0.0.1:18000/rpc"),
+        ] {
+            let config = local_config(bind, endpoint);
             config.validate_local_rpc_endpoint()?;
             let expected_port = config.local_rpc_port();
+            assert!(
+                expected_port.is_some(),
+                "{endpoint} is admitted by the grammar and must name a port"
+            );
 
             let request = endpoint.into_client_request()?;
             assert!(
@@ -414,7 +442,12 @@ mod local_endpoint_admission_tests {
                  and the transport must admit the destination it parses from it"
             );
             assert_eq!(request.uri().host(), Some("127.0.0.1"));
-            assert_eq!(expected_port, request.uri().port_u16());
+            assert_eq!(
+                expected_port,
+                request.uri().port_u16(),
+                "{endpoint}: the port the transport reads must be the port stage 1 \
+                 admitted, including the leading-zero encoding and port 0"
+            );
         }
         Ok(())
     }
