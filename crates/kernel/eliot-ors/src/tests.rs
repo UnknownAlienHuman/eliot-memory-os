@@ -2172,9 +2172,12 @@ fn process_evidence_fixture_names_canonical_current_version() -> TestResult {
     // The decoded value is compared, not the raw JSON the fixture itself wrote:
     // comparing the fixture's own wire against the constant it was built from
     // would only prove that a value equals itself. Going through the decoder
-    // binds the normalisation the owner performs at
-    // execution_evidence.rs:329, where the decoded revision is stamped from the
-    // canonical constant whatever the wire carried.
+    // binds the encoder/decoder path that carries the owner's canonical revision
+    // (execution_evidence.rs:174 `new_typed` stamps it, :241-243 exposes it).
+    // It does NOT by itself pin the stamping of a NON-current wire - for an
+    // input that already carries the current revision, "stamp from the constant"
+    // and "preserve the wire value" are indistinguishable. Case 9 is the case
+    // that pins that, because its wire carries the legacy revision.
     let wire = serde_json::to_value(&process_evidence("case-02-operation", "running")?)?;
     let decoded: eliot_process::ProcessEvidence = serde_json::from_value(wire)?;
     assert_eq!(
@@ -2402,25 +2405,78 @@ fn process_evidence_mixed_current_and_legacy_rejected() -> TestResult {
             .contains("cannot contain legacy stream references"),
         "mixed current/legacy fields must be rejected, got: {error}"
     );
-    // The mirror direction, which the current-version arm cannot see: a wire
-    // that declares the LEGACY revision while carrying typed current streams.
-    // execution_evidence.rs:290 refuses it through `has_typed ||`; with only the
-    // direction above, deleting that half of the guard would leave this case and
-    // every other one green.
-    let mut legacy_typed =
-        serde_json::to_value(&process_evidence("case-10-legacy-typed", "running")?)?;
-    let binding = legacy_typed["view"]["binding"].clone();
+    // The mirror direction, which the current-version arm cannot see: a wire that
+    // declares the LEGACY revision while ALSO carrying a legacy reference AND a
+    // fully valid typed stdout.
+    //
+    // Both terms matter. `has_legacy_value` is true only because `stdout_ref` is
+    // present, so `!has_legacy_value(...)` at execution_evidence.rs:290 does not
+    // refuse on its own; `has_typed` is true only because the typed stream is
+    // present. `has_typed ||` is therefore the only term that refuses this wire,
+    // and removing it lets the legacy arm decode it and silently drop the typed
+    // stream. With the direction above alone, that half of the guard is invisible.
+    //
+    // The typed stream is built by the same real constructor AND the same
+    // arguments as case 4, never by a hand-written literal:
+    // ProcessStreamEvidenceWire denies unknown fields and requires its full
+    // field set, so a partial object would be refused by serde at
+    // execution_evidence.rs:274 before the legacy arm is ever reached.
+    let baseline = process_evidence("case-10-legacy-typed", "running")?;
+    let stream_bytes = b"typed stdout bytes for the mixed case";
+    let digest = sha256_hex(stream_bytes);
+    let stdout = eliot_process::ProcessStreamEvidence::new_raw(
+        baseline.binding().clone(),
+        eliot_process::ProcessStreamKind::Stdout,
+        eliot_process::ProcessStreamPolicyBinding::new(
+            "policy:1",
+            "privacy:project",
+            "visibility:owner",
+            "retention:task",
+            "redaction:exact-v1",
+        )?,
+        eliot_process::StreamTransportStatus::Complete,
+        eliot_process::StreamPersistenceStatus::CompleteSource,
+        digest.clone(),
+        stream_bytes.len() as u64,
+        eliot_process::ProcessStreamPrefixPreview::from_transport_prefix(
+            stream_bytes.to_vec(),
+            stream_bytes.len() as u64,
+        )?,
+        // A `CompleteSource` stream REQUIRES an immutable locator and ready
+        // receipt: `new_raw` validates before returning, and
+        // validate_persistence refuses `CompleteSource` with no source
+        // (stream_evidence/part_04.rs). Passing `None` here therefore aborts
+        // this test at the `?` below before either assertion runs, so the
+        // source is built exactly as case 4 builds it.
+        Some(eliot_process::DurableProcessStreamSource::exact_transport(
+            eliot_process::DurableStreamLocatorKind::Blob,
+            format!("eliot://blob/{digest}"),
+            format!("receipt:blob-ready:{digest}"),
+            digest.clone(),
+            stream_bytes.len() as u64,
+        )?),
+        Vec::new(),
+    )?;
+    let typed = eliot_process::ProcessEvidence::new_typed(
+        baseline.view().clone(),
+        Some(stdout),
+        None,
+        baseline.axes(),
+    )?;
+    let mut legacy_typed = serde_json::to_value(&typed)?;
     let object = legacy_typed.as_object_mut().ok_or("expected object")?;
     object.insert(
         "schema_version".to_owned(),
         json!(eliot_process::PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION),
     );
-    let stream = json!({
-        "binding": binding,
-        "identity": null,
-        "lifecycle": "running"
-    });
-    object.insert("stdout".to_owned(), stream);
+    object.insert(
+        "stdout_ref".to_owned(),
+        json!(format!(
+            "raw:p04-stream:sha256:{}:bytes:{}:complete:true",
+            "a".repeat(64),
+            stream_bytes.len()
+        )),
+    );
     let error = serde_json::from_value::<eliot_process::ProcessEvidence>(legacy_typed)
         .err()
         .ok_or("a legacy-version wire carrying typed streams must be refused")?;
@@ -2572,29 +2628,29 @@ fn process_evidence_restart_returns_deterministic_history_order() -> TestResult 
     let operation_id = OperationIdentity::new("case-17-operation")?;
     let first = process_evidence_record(operation_id.as_str(), "running", 100)?;
     let second = process_evidence_record(operation_id.as_str(), "exited", 200)?;
-    // Persisted in REVERSE observation order on purpose. The store orders a
-    // history by observation time first (store.rs:24352-24357), so a store that
-    // simply returned insertion order would hand back [second, first] and this
-    // case would go red. Persisting time-ordered records - as the original
-    // durable scenario does - cannot tell the two orders apart.
+    // Persisted in REVERSE observation order on purpose. The reader walks the
+    // operation's physical key range (store.rs:24288-24291), so the order the
+    // durable history comes back in is the order the store's comparator produces
+    // - `observed_at_ms` first, then `evidence_digest`, then `record_key`
+    // (store.rs:24352-24357) - and NOT the order the rows were written in.
+    // Writing the 200ms row first and still expecting the 100ms row first is
+    // therefore a real discriminator: a reader that returned write order, or one
+    // whose comparator lost its primary term, hands back [second, first] and this
+    // case goes red.
     store.persist_process_evidence(&second)?;
     store.persist_process_evidence(&first)?;
-    let mut expected = vec![
+    // The expectation is the production rule itself: observation time ascending.
+    // It is NOT the canonical-key order - the canonical key is digest-shaped, so
+    // its relative order is uncorrelated with observation time and sorting by it
+    // here would be a coin flip against the store's own primary term.
+    let expected = vec![
         ProcessEvidenceReadback::Observation(Box::new(first)),
         ProcessEvidenceReadback::Observation(Box::new(second)),
     ];
-    // The reader walks the operation's physical key range, so the deterministic
-    // history order is the canonical-key order of the two observations. Naming
-    // it keeps this case exact without betting on which of two identity digests
-    // sorts first, which the observation times do not decide.
-    expected.sort_by_key(|row| match row {
-        ProcessEvidenceReadback::Observation(record) => record.canonical_record_key(),
-        ProcessEvidenceReadback::InlinePayloadNotRetained(row) => row.record_key.clone(),
-    });
     assert_eq!(
         store.load_process_evidence(&operation_id)?,
         expected,
-        "the durable history order must be the canonical-key order, not insertion order"
+        "the durable history order must be the observation-time order, not write order"
     );
     drop(store);
     let reopened = RedbRecoveryStore::open(&path)?;

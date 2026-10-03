@@ -169,7 +169,8 @@ pub struct DispatchDriveResponse {
 /// delta, next to the declared core reference's own four. A digest of an
 /// expected value, or the identity of a prior run, names a reference; it is
 /// not a comparison and never appears here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConformanceRecord {
     /// Registered component identity the comparison covers.
     pub component_id: String,
@@ -237,7 +238,7 @@ fn observed_error_class(disposition: InvocationDisposition) -> ErrorClass {
 /// Any component other than the registered conformance component yields
 /// `None` — non-corpus semantic admission stays Governor/Kernel-owned and
 /// carries no reference values here.
-fn conformance_record(
+pub(crate) fn conformance_record(
     result: &InvocationResult,
     output: &[u8],
     material: &ValidatedDispatchMaterial,
@@ -881,7 +882,7 @@ pub(crate) fn map_invocation_result(
 /// host-call count is): an observed count of zero reconciles against an
 /// explicitly empty identity list, while a nonzero count reconciles as
 /// explicit unknown rather than a fabricated list.
-fn shadow_comparator_for_record(
+pub(crate) fn shadow_comparator_for_record(
     result: &InvocationResult,
     output: &[u8],
     usage: &eliot_wasm_runtime::EngineUsage,
