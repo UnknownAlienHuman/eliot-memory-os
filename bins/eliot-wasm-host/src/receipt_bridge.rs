@@ -15,10 +15,15 @@
 //! `kit_digest` is the digest of the governing [`ModuleContractKit`] (its
 //! `digest`, which binds package/world/ABI/artifact/interface/declared
 //! imports/exports/state contract/ceiling), and `proof_ceiling` is the
-//! admitted ceiling (`ModuleContractKit::proof_ceiling`, or the admitted
-//! envelope on a kit-less lane). Kit-less lanes (the describe-only path and
+//! admitted ceiling — on the kit lane `ModuleContractKit::proof_ceiling`, which
+//! the call site admits only after proving it equal to the
+//! `TypedDomainAdmission::proof_ceiling` that call actually enforces (a kit
+//! claiming a higher ceiling fails closed instead of being projected, because
+//! kit validation does not bound it to the envelope). Kit-less lanes (the
+//! describe-only path and
 //! the unbound domain path) have no honest `kit_digest` source and must not
-//! call this projection until a kit owner binds one.
+//! call this projection until a kit owner binds one; they report `None` for
+//! the shared receipt instead of synthesizing either value.
 //!
 //! The projected receipt is validated by the shared `validate` before it is
 //! returned: exact package identity, bounded terminal, and the output
@@ -27,6 +32,18 @@
 //! observation timing stays separate from deterministic semantic identity.
 //! Projection success still means one bounded typed call, never candidate
 //! application, use, or task completion.
+//!
+//! The projection is carried outward only from the kit-owned capsule entry
+//! ([`execute_capsule_domain_experimental`]), which returns it as the `Some`
+//! third element beside the host receipt it was computed from. That host
+//! receipt stays the source of truth: the projection is additive fail-closed
+//! evidence, never a replacement, and a projection denial fails the call
+//! instead of returning a receipt the shared contract rejects. The projection
+//! is computed per call from the receipt of that call alone and nothing is
+//! cached across calls, so one failed invocation cannot poison an independent
+//! later invocation.
+//!
+//! [`execute_capsule_domain_experimental`]: crate::typed_execution::execute_capsule_domain_experimental
 //!
 //! [`ModuleContractKit`]: eliot_wasm_runtime::capsule::ModuleContractKit
 //! [`TypedReceipt`]: crate::typed_execution::TypedReceipt
@@ -74,6 +91,17 @@ pub fn project_shared_receipt(
     // The shared invariant is exact: output bytes exist exactly when an
     // output digest exists. Successful host receipts always measure output,
     // so the digest is carried; a zero-byte receipt carries no output digest.
+    //
+    // The projected output evidence covers exactly what the host receipt's
+    // `output_digest` covers, never more. On the typed domain lane that is the
+    // validated `describe` descriptor content the host measured in
+    // `validate_descriptor`, NOT the content of the domain result the same
+    // receipt reports as `terminal`: the result's own bytes are bounded and
+    // enforced against the admitted output ceiling, but no host-measured digest
+    // of that result exists on the path, so none is invented here. A
+    // guest-reported result digest, or the test capsule's declared expected
+    // output, is a claim rather than an observation and is never substituted
+    // for the measured one.
     let output_digest = if receipt.output_bytes == 0 {
         None
     } else {
