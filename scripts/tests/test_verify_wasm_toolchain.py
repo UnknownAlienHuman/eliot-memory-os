@@ -14,9 +14,11 @@ separate clean-runner execution evidence (cards/870.md DEFER).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib.util
 import io
 import json
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -36,8 +38,8 @@ FIXTURE_CHANNEL_CHANGED = TESTDATA / "channel-changed.toml"
 FIXTURE_GUEST_CHANGED = TESTDATA / "guest-target-changed.toml"
 PINNED_CHANNEL = "1.97.1"
 PINNED_COMPONENTS = b'["clippy", "rustfmt", "rust-analyzer", "rust-src"]'
-# cards/870.md declares exactly seven fixture files, so these two documents stay
-# inline bytes literals rather than becoming new fixtures.
+# #870's exclusive mutable scope admits bounded new fixtures under
+# scripts/testdata/wasm-toolchain/, so these two documents stay inline literals.
 MOVING_STABLE = (
     b'[toolchain]\nchannel = "stable"\nprofile = "default"\n'
     b'components = ' + PINNED_COMPONENTS + b"\n"
@@ -53,6 +55,30 @@ assert spec and spec.loader
 check = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = check
 spec.loader.exec_module(check)
+
+
+def snapshot_tree(root: Path) -> dict[str, tuple[str, object]]:
+    """Snapshot a tree by content, because a name listing cannot see a rewrite.
+
+    `sorted(p.name for p in root.iterdir())` is blind to bytes: a checker that
+    appends to the existing `rust-toolchain.toml` leaves the name list identical
+    while the file really changed. Each entry is therefore keyed by its path
+    relative to `root` and described by kind plus content - exact bytes for a
+    regular file, sorted child names for a directory, the resolved target string
+    for a symlink - so a creation, a deletion, a rename, a retyped entry and any
+    in-place byte change all move the snapshot. `root` itself is not an entry.
+    """
+    entries: dict[str, tuple[str, object]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries[relative] = ("symlink", str(path.resolve(strict=False)))
+        elif path.is_dir():
+            children = tuple(sorted(child.name for child in path.iterdir()))
+            entries[relative] = ("dir", children)
+        else:
+            entries[relative] = ("file", path.read_bytes())
+    return entries
 
 
 class ToolchainTests(unittest.TestCase):
@@ -168,16 +194,25 @@ class ToolchainTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 870/11
     def test_changed_guest_target_invalidates_toolchain_identity(self) -> None:
-        """A substituted guest target is refused, and no digest branch exists.
+        """Two halves: the substitution is refused, and the identity is bound to it.
 
-        `parse_declaration` raises at scripts/verify-wasm-toolchain.py:100, which
-        is before the Declaration is constructed at :103, so a refused document
-        has no digest and a digest comparison is impossible here. Identity is
-        invalidated by the gate order instead: the substituted document raises
-        GUEST_TARGET_MISSING at :100, while host+guest+an extra wasm target raises
-        UNOWNED_TARGET at :102. Two distinct reason codes from the same parser
-        prove the guest gate and the ownership gate are separate decisions.
+        (i) A substituted guest target inside a document can never produce an
+        identity at all. The guest gate raises at
+        `scripts/verify-wasm-toolchain.py:99-100` and the ownership gate at
+        `:101-102`, both before the Declaration is constructed, so the refused
+        document has no digest to compare. Two distinct reason codes from the same
+        parser prove the guest gate and the ownership gate are separate decisions.
+        (ii) The identity that IS produced is cryptographically bound to the guest
+        target: `Declaration.digest` (`scripts/verify-wasm-toolchain.py:57-60`)
+        hashes the channel, profile, components and target tuple, so replacing the
+        guest target inside an already accepted declaration moves that production
+        digest. No digest is recomputed here; `Declaration.digest` is the property
+        under test. The substituted tuple keeps the canonical sorted order
+        `tuple(sorted(...))` of `scripts/verify-wasm-toolchain.py:70` and changes
+        only the guest triple, so the moved digest cannot be credited to a
+        reordering. Both halves use the same substituted triple.
         """
+        guest_triple = "wasm32-wasip1"
         substituted = FIXTURE_GUEST_CHANGED.read_bytes()
         self.assertIn(b"wasm32-wasip1", substituted)
         self.assertNotIn(b"wasm32-wasip2", substituted)
@@ -188,43 +223,75 @@ class ToolchainTests(unittest.TestCase):
         self.assertEqual(str(guest_gate.exception), "GUEST_TARGET_MISSING")
         self.assertEqual(str(ownership_gate.exception), "UNOWNED_TARGET")
         self.assertNotEqual(str(guest_gate.exception), str(ownership_gate.exception))
+        baseline = check.parse_declaration(FIXTURE_VALID.read_bytes())
+        substituted_declaration = dataclasses.replace(
+            baseline, targets=tuple(sorted((check.HOST_TARGET, guest_triple)))
+        )
+        self.assertEqual(baseline.targets, tuple(sorted((check.HOST_TARGET, check.GUEST_TARGET))))
+        self.assertEqual(substituted_declaration.targets, tuple(sorted((check.HOST_TARGET, guest_triple))))
+        self.assertEqual(len(substituted_declaration.targets), len(baseline.targets))
+        self.assertNotEqual(substituted_declaration.targets, baseline.targets)
+        self.assertIn(guest_triple, substituted_declaration.targets)
+        self.assertNotIn(check.GUEST_TARGET, substituted_declaration.targets)
+        self.assertIn(guest_triple.encode(), substituted)
+        self.assertNotEqual(substituted_declaration.digest, baseline.digest)
 
     # WORK_UNIT_CASE: 870/12
     def test_normal_checker_has_no_network_install_or_mutation_path(self) -> None:
         """The documented invocation launches nothing, installs nothing, mutates nothing.
 
         `_run` is a tripwire here, not a CommandResult source: the normal path must
-        never reach a tool at all, so any argv recorded is itself the failure. Two
-        roots, two jobs: the real repository root proves the documented invocation
-        returns 0 on the real declaration, and a temporary root seeded with the real
-        `rust-toolchain.toml` bytes proves the listing is unchanged afterwards. The
-        repository root is never listed as a directory: it legitimately holds far
-        more entries than the single declaration file.
+        never reach a tool at all, so any argv recorded is itself the failure. The
+        socket tripwire is the honest network observer, because
+        scripts/verify-wasm-toolchain.py never imports socket: the three real
+        `socket` entry points are replaced for the duration of the two calls, so a
+        DNS lookup, a connect or a socket construction is both recorded and fatal.
+        Two roots, two jobs: the real repository root proves the documented
+        invocation returns 0 on the real declaration, and a temporary root seeded
+        with the real `rust-toolchain.toml` bytes is snapshotted by content before
+        and after, because a name-only listing cannot see an in-place rewrite. The
+        real declaration file is read either side of the calls and must be
+        byte-identical: this case points `main` at the real repository, so that file
+        is its own mutation guard.
         """
         launched: list[list[str]] = []
+        network_attempts: list[str] = []
 
         def tripwire(argv, cwd, timeout):
             launched.append(list(argv))
             raise AssertionError(f"the normal path launched a tool: {list(argv)!r}")
 
+        def forbidden_socket(entry):
+            def blocked(*args, **kwargs):
+                network_attempts.append(entry)
+                raise AssertionError(f"the normal path used socket.{entry}: {args!r}")
+            return blocked
+
         captured = io.StringIO()
+        real_toolchain = ROOT / "rust-toolchain.toml"
+        real_before = real_toolchain.read_bytes()
         with tempfile.TemporaryDirectory() as directory:
             temp_root = Path(directory)
-            (temp_root / "rust-toolchain.toml").write_bytes(
-                (ROOT / "rust-toolchain.toml").read_bytes()
-            )
-            before = sorted(p.name for p in temp_root.iterdir())
-            self.assertEqual(before, ["rust-toolchain.toml"])
+            (temp_root / "rust-toolchain.toml").write_bytes(real_before)
+            before = snapshot_tree(temp_root)
+            self.assertEqual(sorted(before), ["rust-toolchain.toml"])
+            self.assertEqual(before["rust-toolchain.toml"], ("file", real_before))
             with mock.patch.object(check.shutil, "which", lambda name: "rustup"):
                 with mock.patch.object(check, "_run", tripwire):
-                    with contextlib.redirect_stdout(captured):
-                        code = check.main(["--root", str(ROOT), "--format", "json"])
-                        temp_code = check.main(
-                            ["--root", str(temp_root), "--format", "json"]
-                        )
-            after = sorted(p.name for p in temp_root.iterdir())
+                    with contextlib.ExitStack() as offline:
+                        offline.enter_context(mock.patch("socket.socket", forbidden_socket("socket")))
+                        offline.enter_context(mock.patch("socket.create_connection", forbidden_socket("create_connection")))
+                        offline.enter_context(mock.patch("socket.getaddrinfo", forbidden_socket("getaddrinfo")))
+                        with contextlib.redirect_stdout(captured):
+                            code = check.main(["--root", str(ROOT), "--format", "json"])
+                            temp_code = check.main(
+                                ["--root", str(temp_root), "--format", "json"]
+                            )
+            after = snapshot_tree(temp_root)
         self.assertEqual(launched, [])
+        self.assertEqual(network_attempts, [])
         self.assertEqual(after, before)
+        self.assertEqual(real_toolchain.read_bytes(), real_before)
         self.assertEqual(code, 0)
         self.assertEqual(temp_code, 0)
         lines = captured.getvalue().strip().splitlines()
@@ -373,7 +440,9 @@ class ToolchainTests(unittest.TestCase):
         GUEST_TARGET_MISSING and exit 1 and never produces a `diagnose` result: the
         installation and compilation fields stay unset and no tool is launched.
         That keeps a prerequisite failure distinguishable from a guest/WIT semantic
-        verdict, which this checker never renders.
+        verdict, which this checker never renders. The temporary root is snapshotted
+        by content, so a refused declaration that is nevertheless rewritten in place
+        cannot hide behind an unchanged file name.
         """
         launched: list[list[str]] = []
 
@@ -391,7 +460,7 @@ class ToolchainTests(unittest.TestCase):
                         code = check.main(
                             ["--root", str(root), "--format", "json", "--probe"]
                         )
-            listing = sorted(p.name for p in root.iterdir())
+            listing = snapshot_tree(root)
         payload = json.loads(buffer.getvalue())
         self.assertEqual(code, 1)
         self.assertEqual(payload["status"], "FAIL")
@@ -399,7 +468,7 @@ class ToolchainTests(unittest.TestCase):
         self.assertIsNone(payload.get("installed"))
         self.assertIsNone(payload.get("compilable"))
         self.assertEqual(launched, [])
-        self.assertEqual(listing, ["rust-toolchain.toml"])
+        self.assertEqual(listing, {"rust-toolchain.toml": ("file", FIXTURE_MISSING_GUEST.read_bytes())})
 
 
 if __name__ == "__main__":
