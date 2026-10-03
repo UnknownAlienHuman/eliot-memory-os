@@ -1,28 +1,23 @@
 # Swarm continuation — #5018
 
-Start with CONTINUATION.md and PLAN.tsv. The live owning issue, its complete
-current discussion and canonical documentation define the work; these files
-are coordination records, not a replacement specification.
+**Executor:** take the row issued to you in [PLAN.tsv](PLAN.tsv), read only its
+[PLAN.md](PLAN.md) card, then your current Issue/discussion and required verified
+documentation/source bundle. Do not load the whole backlog or restart an old lane.
+No row is an actual scope claim until the controller records it.
 
-- BLOCK-MAP.tsv retains the complete 577-issue stop inventory. Its historical
-  FINISHABLE/BLOCKED/ALL-DONE values are not current dispatch states.
-- REVIEWED.tsv records bounded rechecks, their depth and evidence. A missing
-  row means not re-audited, never done or automatically ready. PRESERVE means the
-  inspected defect is already repaired: no duplicate source assignment, not fresh
-  behavioral acceptance or completion of its parent scope.
-- PLAN.tsv is the sole list of selected source assignments; PLAN.md explains
-  their scope. READY is not code-complete, accepted, claimed or running.
-- STITCH-PLAN.md records shared-file turns and exact producer/consumer handoffs.
-- BLOCKERS-AUDIT.tsv records changed findings, not a competing dispatch queue.
+**Controller:** use [CONTINUATION.md](CONTINUATION.md) for claims/integration and
+[STITCH-PLAN.md](STITCH-PLAN.md) for the applicable shared seam or PR disposition.
+Select independently eligible work; do not wait for an unrelated audit to finish.
 
-Historical HANDOFF.md, MANAGER-BRIEF.md, LANE-HANDOFFS.md and RECOMMENDATIONS.md
-remain stop records. Do not restart old queues or inherit their transient lane
-branches, quota forecasts, parked labels or code-complete claims without checking.
+Canonical Architecture/Implementation and accepted owner decisions remain authority.
+These files schedule work; they cannot change product contracts or manufacture proof.
 
-The prior 28-row replacement was not a complete blocker map. The full original
-TSV is restored at its original path; duplicate STOP-BLOCK-MAP copies are removed.
-The old rendered report remains in Git history at main b7e9e334. No issue work is
-lost by reducing duplicated reports.
+[BLOCK-MAP.tsv](BLOCK-MAP.tsv) retains the complete historical inventory.
+[REVIEWED.tsv](REVIEWED.tsv) records bounded rechecks; missing means unreviewed.
+[BLOCK-MAP.md](BLOCK-MAP.md) explains coverage. BLOCKERS-AUDIT.tsv is a finding index,
+not another queue. READY is neither claimed/running nor accepted; PRESERVE prevents
+repeating a repaired defect without claiming fresh proof.
 
-No controller session, Windows runtime, verified reader receipt or green CI is
-implied by this planning revision. The full issue-by-issue audit is not complete.
+HANDOFF, MANAGER-BRIEF, LANE-HANDOFFS and RECOMMENDATIONS remain historical stop
+records, not current assignments. Full Issue audit, actual reader/CI evidence and
+local runner state are not certified by this planning revision.

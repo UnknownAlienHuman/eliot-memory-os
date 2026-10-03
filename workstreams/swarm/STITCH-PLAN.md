@@ -1,115 +1,114 @@
-# Shared seams — ownership is not whole-issue dependency
+# Integration seams and PR dispositions
 
-No entry changes product contracts. SOURCE / SOURCE_SUBSET mean bounded source inspection, not full issue acceptance;
-BODY means the current issue partition was read but the full source/thread join is
-not verified. BODY and HISTORICAL findings are not implementation-ready certifications.
+Use only the row applicable to the selected assignment. This is coordination evidence,
+not product authority. Canonical sections are linked from PLAN.md. Source observations
+below bind main b7e9e334569639a6290baeacf82bf44941def506; refresh changed inputs before
+dispatch. No entry proves that an external writer has stopped.
 
-## Source-checked seams
+## Current selected work
 
-- #1943: authenticated admission/transition -> existing ApplicationSession role
-  policy -> issued capability and prior-context revocation -> operation enforcement.
-  M-KERNEL owns the shared IPC/Kernel turns. Role labels do not mint authority.
-- #2691: S-03 owner lifetime -> adapter maintenance entry -> existing bounded expiry
-  and retirement -> diagnostics. M-STORE preserves #2688/#2689 shared state; those
-  issues cannot independently rewrite backup_snapshot.rs concurrently.
-- #1678/#1701: the async coordinator exists, but production eliotd admission,
-  activation and dispatch ports still refuse unconditionally. Map each method to
-  the existing authenticated owner operation and retained result. The daemon-launch
-  reservation check is not proof of this native-worker attempt join. The complete
-  prospective scope includes eliotd/worker consumers, outside #1943's initial claim;
-  root must assign those paths explicitly. No second saga or whole-parent test wait.
-- #2643: CreateContext's fresh nonce -> current identity validator -> actual client
-  -> fresh State Fence -> business request. The validator currently applies the
-  incompatible business digest rule to the handshake. Keep non-handshake digest/fence
-  and legacy-recovery guards intact. Both UI read/effect callers are affected; the
-  existing tests/Eliot.Operator.Tests harness is present. Reconcile the current
-  closed wire and shared #2644/#1137 files before an implementation assignment.
-- #1884/#1888: reuse main's CPU-rate implementation. Isolate #1888 from archived
-  mixed CB work; one platform-file writer for manifest/Job cleanup integration.
-- #2701: #929 check(Path) -> strict accepted-result validation -> CheckedInventory ->
-  closure report. M-TOOLS owns the two named scripts. Root alone refreshes the global
-  generated boundary inventory on the combined source; no competing scanner/authority.
-
-## Existing PR collisions at dispatch
-
-All 26 initially open PR IDs and their complete changed-file lists were screened:
-17 owner-authored plus 9 Jules PRs. #2707 was then closed without merge because its
-sole script-registration row is already in main; the follow-up query reports 25 open.
-This is complete PR-path coverage for that read, NOT a complete issue/code audit or
-proof of live writers. PLAN.tsv carries the selected scopes' conflicting_prs and
-an explicit dispatch_gate; READY alone never authorizes a claim.
-
-| Retained candidate | Kernel-scope paths | Store-scope paths | Required reconciliation |
-|---|---:|---:|---|
-| #2369 @ f4f65557106d | 18 | 0 | Compare the old 146-file runtime join with current owner deliveries; do not reapply the whole branch. |
-| #3811 @ 0112b59c3b6b | 3 | 4 | Integration-candidate dispatch/catalogue/apply; serialize with #3812. |
-| #3812 @ f371ca8958fa | 3 | 4 | Mailbox dispatch/catalogue/apply; preserve its separate requirements. |
-| #3869 @ bce9207b52a2 | 4 | 5 | Actual diff has 44 files, including Kernel/protocol and S-03 composition/lifetime; title is not scope. |
-| #4490 @ 29d22677f26a | 5 | 0 | Restore transport and Store gateway must share their real integration owner. |
-| #4599 @ 0ea687a3fdf5 | 2 | 0 | Retain diagnostic evidence separately; compare already-delivered shutdown/source repairs. |
-| #4845 @ 8f03723f826d | 3 | 0 | Actual delta is Kernel restore/dispatch, despite its docs/Watchdog description. |
-
-No screened PR touches either selected #2701 script. That removes this PR-path
-obstruction only; actual local claims and required reads still need preflight.
-For Kernel/Store, RECONCILE_PR_SCOPE forbids issuing the current broad claim until
-root records adoption of reviewed residuals, a genuinely disjoint narrowed scope, or
-explicit old-writer release with unmatched work retained. Full historical PR closure
-is not required for disjoint work. A filename intersection is not proof that all
-hunks remain new: compare merge-base, candidate and current main before disposition.
-No author attribution of inherited hunks is inferred from a PR title or file list.
-
-Reconcile current IDs before reusing this screen; obtain actual all-page filenames,
-including old/new names for renames. Refresh a changed head or changed selected scope.
-Store the claimed candidate identity and disposition at the controller, not a count
-alone. Scope must also cover shared contracts/manifests/generated outputs; this
-filename scan is not proof that every semantic integration edge is independent.
-
-## Reviewed integration holds
-
-- #4999 @ d4dfbbe4870a is draft with REQUEST_CHANGES. Its evidence verifier fallback
-  manufactures premutation reading attestation and recognizes fixture prose to retain
-  selected negative results. Do not merge or reuse that fallback; candidate byte
-  recomputation cannot establish who read before editing. Restore uniform absent-block
-  refusal and actual author-produced evidence. Other doc corrections require their
-  own comparison with #5021/#4688, not blanket acceptance or rejection.
-  Evidence: PR #4999 review 5398877744; full gate/CI execution was not performed.
-- #3058 @ f93239dec051 is draft with a source-review hold, not a blocking self-review.
-  Its five-field materializer predates current RecordedRevocation V2. Port unmatched
-  #686 work to real commit-fence/namespace/bounds/coverage/digest producers; preserve
-  #2966 recovery decisions. Do not restore V1 or fill new coordinates with defaults.
-  Evidence: PR #3058 review 5398880483; no Rust compiler run or full #686 audit.
-
-## Body-verified cycle partitions: exact outputs before closure
-
-| Pair | Existing ownership and required handoff | Write collision to resolve |
+| Issue | Existing owner-to-consumer path | Shared-file rule |
 |---|---|---|
-| #8 / #1746 | #8 bootstrap response contract; #1746 real owner-source assembly/delivery. Reuse the existing response. A missing producer does not make the existing response undefined. Verify the emitted owner-bound response in the consumer before final integration. | Bootstrap/Bridge composition; one shared-file writer. |
-| #1229 / #3004 | #1229 dependency-policy preparation entrypoint supplies declared inputs; #3004 invokes it for the compile gate. Preparation is not a policy verdict. Release the consumer when its actual required input contract is present; CI execution is separate evidence. | Preparation scripts/profile and workflow owner; no workflow edits delegated by this plan. |
-| #1767 / #2893 | #1767 retains portfolio/denominator/accounting ownership. #2893 owns the exact no-match/source-record/evaluator-evidence join. #1762 supplies live composition; #1765 owns final release audit. Agree the existing typed input, implement the no-match check, then integrate #1767's consumer and existing release owner; never wait for the parent to close first. | evidence_portfolio.rs and shared receipt adapter; one sequential writer, separate issue deliveries. |
+| #3980 | SurrealServerConfig validator -> GovernorConfig loader / supervisor admission / RPC connect, before effects. | Four legacy files only; preserve reserved Store isolation. No modern Store or legacy-retirement dependency. |
+| #2691 | S-03 lifetime -> narrow adapter method -> existing bounded snapshot expiry/retirement -> diagnostics. | Five PLAN files; preserve #2688/#2689 state and receipts. PR disposition below. |
+| #2643 | Fresh get_context nonce -> current identity guard -> actual client -> owner fence -> business request. | Two DTO/client files; #2644/#1137 cannot write them concurrently. MainViewModel/journal/Rust stay read-only. |
+| #2701 | #929 check(Path) -> strict result validation -> CheckedInventory -> closure report. | Two scripts; root alone refreshes the global inventory on combined source. No second scanner. |
 
-The coverage pair does NOT license local evaluation receipts or I/O in the pure
-assessor. Missing vetted records, complete predicate evidence or a genuine empty-scope
-contract stays Unproven. Package Proven does not authorize release. #2893 explicitly
-states these boundaries; do not fix the cycle by bypassing them. The full current
-comments/source of these three pairs still need verification before source assignment.
+The four selected sets are mutually disjoint. The prior complete PR filename screen
+contains no contact with #3980's four files, #2643's two files or #2701's two scripts.
+That screen is an input observation, not a current runner claim or a semantic review
+of every PR. Refresh new/changed heads and the actual controller claims.
 
-## Other historical cycle groups — no guessed issue order
+## #2691: exact-file reconciliation, not whole-PR waiting
 
-#18/#2892/#2968: host wiring versus packaging/disposition versus post-assembly proof.
-#1126/#1699/#2567/#2866: exact execution/admission output and consumer-specific handoff.
-#1762/#1769: existing inquiry/source-admission producer and restricted consumer.
-#1789/#1791: authoritative transition versus plan/context projection.
-#1934/#2561/#2731/#2732, with #2729/#2730: privacy, retained event/projection,
-stream authority, bounded handoff, sequencing, acknowledgement and recovery. Use one
-writer for shared Kernel/ORS/protocol turns, not one independent writer per issue.
+The former two-subtree reservation is replaced by the five files in PLAN.tsv.
+#3811/#3812 change apply/*, not those five files. They are not snapshot prerequisites.
 
-Every real wait names consumer item, producer output, exact type/operation and
-observable release condition. Internal item order, parent acceptance and related links
-are not hard dependencies. Do not drop an unverified edge to obtain a green DAG.
+#3869 at bce9207b52a29cfa0b2439d69c4235a49fe27fd4 contacts three selected files.
+Each complete per-file patch was compared with the main source above:
 
-## Decisions to verify, not presumed missing contracts
+| Shared bin file | Relevant #3869 hunks already present in main |
+|---|---|
+| bins/eliot-store-surreal/src/lib.rs | install_compatibility_decision re-export. |
+| bins/eliot-store-surreal/src/main.rs | Imports, three compatibility input constants, typed health projection, installation/path helpers and the early run branch. |
+| bins/eliot-store-surreal/src/diagnostics.rs | CompatibilityVerdict import, CompatibilityDecision/CompatibilityHealth and project_compatibility_health. |
 
-#332 layout; #1968 pair/Blob identity boundary; #1844 R2 vocabulary; #2882 part 5;
-#238 Context-cell owner; #956 concrete purge/publication ports. Check the actual
-canonical section and current producer first. An omitted issue owner is assignment
-work, not automatically an Architecture decision. These do not hold independent scopes.
+**Disposition: PRESERVE_MAIN for those hunks only.** No merge of #3869 is needed
+before writing snapshot maintenance. PLAN retains [3869] as the observed file contact,
+with CLAIM_AFTER_PREFLIGHT. A live external writer still needs explicit transfer:
+different lines of one physical file are not independent write claims.
+Preserve compatibility behavior; never restore old whole-file bytes or reapply the
+whole branch. The other 41 paths, whole-file equality, runtime correctness and
+whole-PR supersession are not established. #3869 remains open and unaccepted.
+
+## Next Kernel work: no provisional subsystem lock
+
+#1943 is RECHECK, not a write reservation. Under I7.21, trace the authenticated policy
+supplier -> existing ApplicationSession admission/transition -> prior-context
+revocation -> enforcement. Start at ApplicationSession construction in
+bins/eliot-kernel/src/agent_bridge.rs and the existing role_lease/session_lifecycle
+methods. Return exact caller/consumer files under I2.17 before issuing a claim.
+Do not build a second capability engine or let role labels mint authority.
+
+#1678 already has the async coordinator. #1701's production eliotd admission,
+activation and dispatch ports still refuse unconditionally; bind the actual existing
+owner operations and retained results. Daemon-launch reservation gating is not proof
+of this native-worker attempt join. Include the actual eliotd/worker consumers when
+the scope is established. No second saga or whole-parent test wait.
+Neither task currently reserves all Kernel/protocol files.
+
+#1884/#1888 must reuse main's CPU-rate implementation, not the mixed archived CB
+branch. One platform-file writer owns any actual remaining manifest/Job cleanup join.
+
+## Retained PR decisions
+
+- #4999 @ d4dfbbe4870a: draft, REQUEST_CHANGES
+  [5398877744](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/4999#pullrequestreview-5398877744).
+  Reject the missing-evidence synthesizer and fixture-prose exceptions. Final-byte
+  recomputation cannot attest premutation reading. Genuine producer evidence and
+  I18.27 oracle review are required; other documentation corrections are separate.
+- #3058 @ f93239dec051: draft, COMMENTED hold
+  [5398880483](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/3058#pullrequestreview-5398880483).
+  Port unmatched #686 work to current V2 commit-fence/namespace/bounds/coverage/digest
+  producers; preserve #2966 recovery decisions. Do not restore V1 or default evidence.
+- #2707 was closed without merge because its sole script registration was already
+  in main. No source or branch deletion, no parent acceptance.
+
+The prior 26-PR filename screen and obsolete broad-scope counts remain in
+[the inspected revision](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3aa7cc157fee31ffc0c64531b00013a62dc6babf/workstreams/swarm/STITCH-PLAN.md).
+They are not today's locks: #1943 has no claim and #2691 is narrowed above.
+Titles are not scopes (#3869 had 44 paths; #4845 had three Kernel Rust paths despite
+their descriptions). Compare merge-base/candidate/main before adopting unmatched
+work; do not attribute inherited hunks to an author merely from the PR diff.
+
+## Pending historical dependency groups — review, not a launch order
+
+| Group | Boundary to resolve from current canonical contracts and code |
+|---|---|
+| #8 / #1746 | Existing bootstrap response versus real owner-source assembly/delivery. One writer for the shared Bootstrap/Bridge join. |
+| #1229 / #3004 | Dependency-policy preparation supplies declared inputs; compile profile consumes them. Preparation is not a policy verdict; execution proof remains separate. |
+| #1767 / #2893 | Portfolio/denominator owner consumes exact no-match/source-record/evaluator evidence. #1762 supplies live composition; #1765 retains final release authority. Serialize evidence_portfolio.rs and the actual adapter. |
+| #18 / #2892 / #2968 | Host wiring versus packaging/disposition versus later assembled-product proof. |
+| #1126 / #1699 / #2567 / #2866 | Exact execution/admission output and consumer-specific handoff. |
+| #1762 / #1769 | Inquiry/source-admission producer and restricted consumer. |
+| #1789 / #1791 | Authoritative transition versus plan/context projection. |
+| #1934 / #2561 / #2731 / #2732; #2729 / #2730 | Privacy, retained event/projection, stream authority, bounded handoff, sequencing, acknowledgement and recovery. |
+
+The first three partitions were body-reviewed; their full current source/thread
+joins, and the remaining groups, are not certified. Do not remove an unverified edge
+to manufacture a DAG. For the coverage group, no local fabricated evaluation receipt,
+I/O inside the pure assessor or package-verdict promotion to release authority.
+Missing vetted records, complete predicates or a real empty-scope contract stay Unproven.
+
+Decision leads also remain: #332 layout; #1968 pair/Blob identity; #1844 R2 vocabulary;
+#2882 part 5; #238 Context-cell owner; #956 purge/publication ports. Check the actual
+canonical section and producer before declaring a missing contract. An omitted
+assignment owner is not automatically an Architecture decision.
+
+## Release rule
+
+A real wait names the consumer item, producer output, exact type/operation and
+observable release condition. Internal item order, a related link and final parent
+acceptance are not interchangeable prerequisites. Record the disposition in the
+existing controller ledger; transfer physical files explicitly. After integration,
+refresh affected consumers/findings only. Independent cleared work continues.
