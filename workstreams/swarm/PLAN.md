@@ -32,7 +32,7 @@ The stop-map claim that only audit items 3 and 6 remain is false on the checked 
 _validate_checked_result still accepts Boolean counts, conflicting candidate_id/id,
 invalid digest shapes, blank base_sha and foreign proof_ceiling. An extracted-function
 reproduction confirms acceptance; it is not execution of the repository CLI/scanner.
-Read audit 5908785311 and recheck 5967019828 plus the complete issue discussion.
+Read audit 5908785311 and recheck 5963910318 plus the complete issue discussion.
 Implement all its existing items 1-7 and preserve item 9, not a fresh alternative spec.
 
 Primary file: scripts/audit-serde-boundary-closure.py. The second reserved file,
