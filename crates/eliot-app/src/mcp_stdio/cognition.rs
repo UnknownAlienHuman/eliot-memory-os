@@ -541,6 +541,9 @@ pub(super) async fn validate_cognitive_gate(
         )
         .await?
         .with_context(|| format!("cognitive gate is missing terminal call {call_number}"))?;
+        // Schema-version gate (issue #935): the decoded terminal is refused
+        // before its status or receipt is read as gate authority.
+        terminal.receipt_body.validate_schema_version()?;
         if terminal.receipt_body.status != CognitiveRunCallStatus::Succeeded
             || terminal.canonical_receipt
                 != gate.pre_gate_terminal_receipts[usize::from(call_number - 1)]
@@ -560,6 +563,10 @@ pub(super) async fn validate_cognitive_gate(
         )
         .await?
         .context("reciprocal source attempt is absent")?;
+        // Schema-version gate (issue #935): refuse an unsupported attempt
+        // version before its candidate or capability is read as source
+        // authority.
+        source_attempt.receipt_body.validate_schema_version()?;
         let source_terminal = cognitive_record_by_revision::<CognitiveRunTerminal>(
             state,
             contract.project_id,
@@ -570,6 +577,9 @@ pub(super) async fn validate_cognitive_gate(
         )
         .await?
         .context("reciprocal source terminal is absent")?;
+        // Schema-version gate (issue #935): refuse an unsupported terminal
+        // version before its candidate receipt is trusted.
+        source_terminal.receipt_body.validate_schema_version()?;
         let candidate_receipt = source_terminal
             .receipt_body
             .candidate_receipt
@@ -690,7 +700,11 @@ pub(super) async fn cognitive_run_begin(
     )
     .await?
     {
-        if cognitive_record_by_revision::<CognitiveRunTerminal>(
+        // Schema-version gate (issue #935): an existing attempt at an
+        // unsupported version is refused before its execution, shared gate,
+        // status or capability is read as begin authority.
+        existing.receipt_body.validate_schema_version()?;
+        if let Some(existing_terminal) = cognitive_record_by_revision::<CognitiveRunTerminal>(
             state,
             input.project_id,
             input.task_id,
@@ -699,8 +713,8 @@ pub(super) async fn cognitive_run_begin(
             CanonicalReceiptKind::CognitiveRunTerminal,
         )
         .await?
-        .is_some()
         {
+            existing_terminal.receipt_body.validate_schema_version()?;
             anyhow::bail!(
                 "cognitive call is already terminal; status reconciliation forbids redispatch"
             );
@@ -750,6 +764,9 @@ pub(super) async fn cognitive_run_begin(
                 input_call = input.call_number
             )
         })?;
+        // Schema-version gate (issue #935): refuse an unsupported previous
+        // terminal version before its status is read as the chain's authority.
+        previous.receipt_body.validate_schema_version()?;
         if previous.receipt_body.status != CognitiveRunCallStatus::Succeeded {
             anyhow::bail!(
                 "cognitive run is terminal after a failed or unknown prior call; redispatch is forbidden"
@@ -1011,6 +1028,12 @@ pub(super) async fn validate_cognitive_host_and_tools(
             COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT,
         )
         .await?;
+    // Schema-version gate (issue #935): every decoded tool observation is
+    // refused before it is sorted, capped, receipt-checked or reconciled
+    // against the sealed call. An unsupported version is never skipped.
+    for record in &records {
+        record.receipt_body.validate_schema_version()?;
+    }
     if records.len() >= COGNITIVE_TOOL_OBSERVATION_MAX {
         anyhow::bail!("cognitive call exceeded its canonical tool-observation cap");
     }
@@ -1195,6 +1218,9 @@ pub(super) async fn ensure_cognitive_raw_verifier(
         )
         .await?
     {
+        // Schema-version gate (issue #935): refuse an unsupported evidence
+        // version before its timestamp or body is reused as current evidence.
+        existing.receipt_body.validate_schema_version()?;
         evidence.verified_at = existing.receipt_body.verified_at;
         if existing.receipt_body != evidence {
             anyhow::bail!("cognitive raw-verifier CAS is occupied by different evidence");
@@ -1263,6 +1289,10 @@ pub(super) async fn cognitive_run_terminal(
     )
     .await?
     .context("cognitive terminal has no canonical attempt")?;
+    // Schema-version gate (issue #935): refuse an unsupported attempt version
+    // before its status, execution, call id or contract receipt is trusted as
+    // the terminal's authority.
+    attempt.receipt_body.validate_schema_version()?;
     if attempt.receipt_body.status != CognitiveRunCallStatus::Attempting
         || attempt.receipt_body.execution != input.execution
         || attempt.receipt_body.call_id != call.call_id
@@ -1313,6 +1343,10 @@ pub(super) async fn cognitive_run_terminal(
     )
     .await?
     {
+        // Schema-version gate (issue #935): refuse an unsupported terminal
+        // version before its finish time or body is reused as a current
+        // outcome.
+        existing.receipt_body.validate_schema_version()?;
         let candidate_write_id = attempt.receipt_body.candidate_write_id;
         let expected = CognitiveRunTerminal {
             schema_version: COGNITIVE_RUN_SCHEMA_VERSION.to_owned(),
@@ -1462,6 +1496,14 @@ pub(super) async fn cognitive_run_status(state: &McpState, params: Value) -> Res
         )
         .await?
         .into_iter()
+        // Schema-version gate (issue #935): refuse an unsupported attempt
+        // version before the `run_id` filter could silently skip it.
+        .map(|record| {
+            record.receipt_body.validate_schema_version()?;
+            Ok(record)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .filter(|record| record.receipt_body.run_id == input.run_id)
         .collect::<Vec<_>>();
     let mut terminals = state
@@ -1474,6 +1516,14 @@ pub(super) async fn cognitive_run_status(state: &McpState, params: Value) -> Res
             64,
         )
         .await?
+        .into_iter()
+        // Schema-version gate (issue #935): refuse an unsupported terminal
+        // version before the `run_id` filter could silently skip it.
+        .map(|record| {
+            record.receipt_body.validate_schema_version()?;
+            Ok(record)
+        })
+        .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|record| record.receipt_body.run_id == input.run_id)
         .collect::<Vec<_>>();
@@ -1543,6 +1593,10 @@ pub(super) async fn cognitive_run_status(state: &McpState, params: Value) -> Res
                 )
                 .await?
                 .context("cognitive status raw-verifier record disappeared")?;
+            // Schema-version gate (issue #935): refuse an unsupported evidence
+            // version before any of its fields are compared as the status
+            // projection.
+            raw.receipt_body.validate_schema_version()?;
             if raw.canonical_receipt != *raw_receipt
                 || raw.receipt_body.run_id != input.run_id
                 || raw.receipt_body.call_number != call_number
@@ -1737,6 +1791,11 @@ pub(super) async fn ensure_cognitive_tool_observation_capacity(
             COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT,
         )
         .await?;
+    // Schema-version gate (issue #935): visible observations at an unsupported
+    // version are refused rather than counted against the call's cap.
+    for record in &visible {
+        record.receipt_body.validate_schema_version()?;
+    }
     if visible.len() >= COGNITIVE_TOOL_OBSERVATION_MAX {
         anyhow::bail!("cognitive call exhausted its canonical tool-observation cap");
     }
@@ -1765,6 +1824,9 @@ pub(super) async fn write_cognitive_tool_observation(
     )
     .await?
     .context("cognitive tool observation has no canonical attempt")?;
+    // Schema-version gate (issue #935): refuse an unsupported attempt version
+    // before its status or capability is read as a live observation authority.
+    attempt.receipt_body.validate_schema_version()?;
     if attempt.canonical_receipt != claims.attempt_receipt
         || attempt.receipt_body.status != CognitiveRunCallStatus::Attempting
         || attempt.receipt_body.capability.as_ref() != Some(capability)

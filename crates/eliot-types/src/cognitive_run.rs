@@ -3,12 +3,49 @@ use crate::{
     SessionId, TaskId, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const COGNITIVE_RUN_SCHEMA_VERSION: &str = "eliot-cognitive-run-v2";
 pub const COGNITIVE_RUN_EXACT_CALLS: usize = 18;
 pub const COGNITIVE_RUN_RAW_VERIFIER_CALLS: usize = 16;
+
+/// A schema-bearing cognitive-run record declares a `schema_version` that is not
+/// the one supported version.
+///
+/// `COGNITIVE_RUN_SCHEMA_VERSION` is the complete accepted set: there is no
+/// legacy cognitive-run version, no alias, and no named migration, so any other
+/// value — including an empty string — is refused rather than trusted as current
+/// authority.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error(
+    "{record} declares unsupported cognitive-run schema_version `{found}`; supported version is `{supported}`"
+)]
+pub struct CognitiveRunSchemaVersionError {
+    /// The cognitive-run record that carried the unsupported version.
+    pub record: &'static str,
+    /// The offending value as it appeared in the record.
+    pub found: String,
+    /// The single supported version.
+    pub supported: &'static str,
+}
+
+/// Shared exact-match check behind each record's `validate_schema_version`.
+fn require_cognitive_run_schema_version(
+    record: &'static str,
+    found: &str,
+) -> Result<(), CognitiveRunSchemaVersionError> {
+    if found == COGNITIVE_RUN_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(CognitiveRunSchemaVersionError {
+            record,
+            found: found.to_owned(),
+            supported: COGNITIVE_RUN_SCHEMA_VERSION,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +238,13 @@ pub struct CognitiveToolObservation {
     pub observed_at: OffsetDateTime,
 }
 
+impl CognitiveToolObservation {
+    /// Accepts only `COGNITIVE_RUN_SCHEMA_VERSION`.
+    pub fn validate_schema_version(&self) -> Result<(), CognitiveRunSchemaVersionError> {
+        require_cognitive_run_schema_version("CognitiveToolObservation", &self.schema_version)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveRunCallStatus {
@@ -232,6 +276,13 @@ pub struct CognitiveRunAttempt {
     pub created_at: OffsetDateTime,
 }
 
+impl CognitiveRunAttempt {
+    /// Accepts only `COGNITIVE_RUN_SCHEMA_VERSION`.
+    pub fn validate_schema_version(&self) -> Result<(), CognitiveRunSchemaVersionError> {
+        require_cognitive_run_schema_version("CognitiveRunAttempt", &self.schema_version)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRunTerminal {
@@ -259,6 +310,13 @@ pub struct CognitiveRunTerminal {
     pub finished_at: OffsetDateTime,
 }
 
+impl CognitiveRunTerminal {
+    /// Accepts only `COGNITIVE_RUN_SCHEMA_VERSION`.
+    pub fn validate_schema_version(&self) -> Result<(), CognitiveRunSchemaVersionError> {
+        require_cognitive_run_schema_version("CognitiveRunTerminal", &self.schema_version)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRawVerifierEvidence {
@@ -281,4 +339,11 @@ pub struct CognitiveRawVerifierEvidence {
     pub passed: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub verified_at: OffsetDateTime,
+}
+
+impl CognitiveRawVerifierEvidence {
+    /// Accepts only `COGNITIVE_RUN_SCHEMA_VERSION`.
+    pub fn validate_schema_version(&self) -> Result<(), CognitiveRunSchemaVersionError> {
+        require_cognitive_run_schema_version("CognitiveRawVerifierEvidence", &self.schema_version)
+    }
 }
