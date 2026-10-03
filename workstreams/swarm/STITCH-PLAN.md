@@ -1,69 +1,58 @@
-# Shared seams and release conditions
+# Shared seams — ownership is not whole-issue dependency
 
-These are integration boundaries, not a second product specification. Keep all
-requirements in their existing owning issues and canonical docs. A missing caller
-under an existing contract is source work; a genuinely unspecified contract gets
-one precise proposal in its owning issue, not a fabricated implementation.
+No entry changes product contracts. SOURCE means a bounded source inspection;
+BODY means the current issue partition was read but the full source/thread join is
+not verified. BODY and HISTORICAL findings are not implementation-ready certifications.
 
-## Initial assignments and their shared boundaries
+## Source-checked seams
 
-**#1943, M-KERNEL:** authenticated admission / explicit role transition → existing
-ApplicationSession role-capability compilation → issued context/token + revocation of
-old context + independence update → existing operation authorisation. All source
-sides are in the single Kernel/IPC assignment. No other manager changes these protocol
-or composition files concurrently. Acceptance remains Controller→Worker restriction
-and explicit Verifier downgrade; declarations alone do not release this seam.
+- #1943: authenticated admission/transition -> existing ApplicationSession role
+  policy -> issued capability and prior-context revocation -> operation enforcement.
+  M-KERNEL owns the shared IPC/Kernel turns. Role labels do not mint authority.
+- #2691: S-03 owner lifetime -> adapter maintenance entry -> existing bounded expiry
+  and retirement -> diagnostics. M-STORE preserves #2688/#2689 shared state; those
+  issues cannot independently rewrite backup_snapshot.rs concurrently.
+- #1678/#1701: the async admission_reservation_saga.rs coordinator already exists.
+  Verify the exact current active-reservation output needed by #1701. A missing
+  currentness check in planning is RECHECK, not proof of an unavailable dependency.
+  Reuse the owner verifier; don't recreate the coordinator or wait for all #1678 tests.
+- #1884/#1888: reuse main's CPU-rate implementation. Isolate #1888 from archived
+  mixed CB work; one platform-file writer for manifest/Job cleanup integration.
+- #2701: #929 check(Path) -> strict accepted-result validation -> CheckedInventory ->
+  closure report. M-TOOLS owns the two named scripts. Root alone refreshes the global
+  generated boundary inventory on the combined source; no competing scanner/authority.
 
-**#2691, M-STORE:** S-03 StoreComposition lifetime → narrow adapter maintenance method
-→ snapshot_owner_maintenance_tick → existing expiry/retirement accounting → bounded
-diagnostics. The same owner starts/stops the no-client wake. #2688/#2689 identity,
-incarnation, interruption and retained receipt semantics are preserved. Shared snapshot
-files are not assigned to those issues simultaneously. No new Store API is needed
-merely to expose an internal maintenance method; any discovered cross-owner need is
-recorded before expanding the scope.
+## Body-verified cycle partitions: exact outputs before closure
 
-**#1678 → #1701:** reservation owner → exact active owner-verifiable evidence → launch
-consumers. #1678 already contains an asynchronous coordinator, canonical receipt
-readback and recovery module on this baseline; recheck its missing producer/application
-join instead of recreating it. Release #1701 when its actual required evidence/API and
-current caller contract are present in main, not when all product tests for #1678 close.
-The Kernel manager owns the shared source turns sequentially. #1679 capacity and #1680
-attempt history retain their own semantics; no second scheduler/state machine.
-
-**#1884 → #1888:** use the main process_job.rs CPU-rate implementation from #5019.
-The old CB branch is not a clean #1888 delivery. Compare per-issue residuals before
-carrying code; do not reintroduce a second CPU-rate mechanism. Launch/manifest and
-Job cleanup changes must share one platform-file writer when this work is selected.
-
-## Historical cycle review groups
-
-The published stop graph contained the groups below. These are NOT approved hard
-dependencies or executable issue orders. Root gives each group one read-only review;
-source changes wait for explicit item-level ownership and a scope claim. Even separate
-groups may share Kernel/ORS/protocol files, so group separation is not write isolation.
-
-| Group | Issues | Required output before source scheduling |
+| Pair | Existing ownership and required handoff | Write collision to resolve |
 |---|---|---|
-| bootstrap | #8, #1746 | Separate bootstrap contract/response from real owner producer/transport; identify exact release output. |
-| front door | #18, #2892, #2968 | Separate host wiring, release packaging/disposition and post-assembly host proof. |
-| execution | #1126, #1699, #2567, #2866 | Name the one execution/admission owner and consumer-specific result; preserve identity, no mutual whole-issue wait. |
-| dependency preparation | #1229, #3004 | Distinguish preparation entrypoint from compile-gate consumer and runtime proof; no waiting on repeated issue closure. |
-| source admission | #1762, #1769 | Identify admission producer and restricted proposal consumer; determine real contract decision separately. |
-| coverage | #1767, #2893 | Identify the denominator/receipt producer versus verification; no self-issued complete coverage. |
-| scope/plan transition | #1789, #1791 | Distinguish transition-owner output from downstream projection and parent acceptance. |
-| host events | #1934, #2561, #2731, #2732; related #2729/#2730 | Map privacy admission, immutable source+normalisation/disposition, bounded handoff, acknowledgement and replay. One writer for shared Kernel/ORS/protocol turns; no second event database. |
+| #8 / #1746 | #8 bootstrap response contract; #1746 real owner-source assembly/delivery. Reuse the existing response. A missing producer does not make the existing response undefined. Verify the emitted owner-bound response in the consumer before final integration. | Bootstrap/Bridge composition; one shared-file writer. |
+| #1229 / #3004 | #1229 dependency-policy preparation entrypoint supplies declared inputs; #3004 invokes it for the compile gate. Preparation is not a policy verdict. Release the consumer when its actual required input contract is present; CI execution is separate evidence. | Preparation scripts/profile and workflow owner; no workflow edits delegated by this plan. |
+| #1767 / #2893 | #1767 retains portfolio/denominator/accounting ownership. #2893 owns the exact no-match/source-record/evaluator-evidence join. #1762 supplies live composition; #1765 owns final release audit. Agree the existing typed input, implement the no-match check, then integrate #1767's consumer and existing release owner; never wait for the parent to close first. | evidence_portfolio.rs and shared receipt adapter; one sequential writer, separate issue deliveries. |
 
-Review output is one exact relation: consumer issue/item → producer issue/item and
-output → existing type/operation → owning paths → release observation. If an edge is
-only a reference, internal step, old proof or stale state, record that classification
-and do not import it as an implementation dependency. If a genuine cycle remains,
-resolve the existing contract ownership first; no arbitrary topological ordering.
+The coverage pair does NOT license local evaluation receipts or I/O in the pure
+assessor. Missing vetted records, complete predicate evidence or a genuine empty-scope
+contract stays Unproven. Package Proven does not authorize release. #2893 explicitly
+states these boundaries; do not fix the cycle by bypassing them. The full current
+comments/source of these three pairs still need verification before source assignment.
 
-## Single decision list
+## Other historical cycle groups — no guessed issue order
 
-Unresolved candidates (not approved design changes): #332 non-Windows install layout;
-#1968 external pair/generation identity boundary; #1844 R2 event vocabulary; #2882
-part 5; #238 Context-cell ownership; #956 concrete publication/purge ports. Confirm
-silence in their actual governing sections before escalating. A code owner missing
-from an issue is an assignment repair, not automatically an Architecture decision.
-None of these candidates blocks the two selected source assignments.
+#18/#2892/#2968: host wiring versus packaging/disposition versus post-assembly proof.
+#1126/#1699/#2567/#2866: exact execution/admission output and consumer-specific handoff.
+#1762/#1769: existing inquiry/source-admission producer and restricted consumer.
+#1789/#1791: authoritative transition versus plan/context projection.
+#1934/#2561/#2731/#2732, with #2729/#2730: privacy, retained event/projection,
+stream authority, bounded handoff, sequencing, acknowledgement and recovery. Use one
+writer for shared Kernel/ORS/protocol turns, not one independent writer per issue.
+
+Every real wait names consumer item, producer output, exact type/operation and
+observable release condition. Internal item order, parent acceptance and related links
+are not hard dependencies. Do not drop an unverified edge to obtain a green DAG.
+
+## Decisions to verify, not presumed missing contracts
+
+#332 layout; #1968 pair/Blob identity boundary; #1844 R2 vocabulary; #2882 part 5;
+#238 Context-cell owner; #956 concrete purge/publication ports. Check the actual
+canonical section and current producer first. An omitted issue owner is assignment
+work, not automatically an Architecture decision. These do not hold independent scopes.

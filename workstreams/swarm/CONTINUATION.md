@@ -1,90 +1,62 @@
 # Continuation of #5018
 
-Owner order, 2026-10-02: familiarise, re-audit blockers, refine issues, plan work
-without overlaps, define stitching/contract ownership, recheck, then start swarm.
-Goal: finish product code and production wiring first; product tests follow assembly.
+Finish product code and production wiring first; behavioral acceptance follows
+assembly. This is the continuation of the owner's 2026-10-02 work order, not a
+new product specification or a claim that the complete backlog has been audited.
 
-## Start, without waiting for a complete backlog audit
+## Execution
 
-The controller reads README.md, PLAN.tsv and STITCH-PLAN.md. M-KERNEL starts #1943;
-M-STORE starts #2691 after the preflight below. Both are implementation assignments,
-not permission to mark the whole issue complete. Existing code is retained; the
-assignment covers all remaining source obligations, not a separate PR per item.
-In parallel, read-only reviewers process RECHECK rows. An unrelated undecided
-contract or invalid historical row does not stop these two assignments.
+The selected source assignments are #1943 / M-KERNEL, #2691 / M-STORE and
+#2701 / M-TOOLS. Read PLAN.md and claim their PLAN.tsv scopes only after root has
+checked current main, live PRs, stopped FIN/old runners and actual path ownership.
+The inspected baseline is b7e9e334569639a6290baeacf82bf44941def506. READY is a planning
+state, not a real claim or a running session. Do not assume #5021 has merged.
 
-Before issuing writes, the controller must establish the actual machine state:
-FIN cleanup and old runners are stopped; no previous writer still owns a claimed
-path; current main and open PRs are refreshed once and the authority SHA published.
-The checked baseline is b7e9e334569639a6290baeacf82bf44941def506. Revalidate affected
-rows if source, issue comments or shared interfaces changed. PR #5021 is an external
-writer: re-read its current six-file delta, not just its old head SHA.
+One manager uses one worktree and a fresh issue branch for each coherent issue
+delivery. Root owns upstream synchronization and main integration. Subagents may
+read freely or write disjoint assigned files inside that manager's scope; no extra
+worktrees, independent shared-file writers or mixed lane-branch deliveries.
+This follows the user's one-worktree-per-manager instruction and current WORKFLOW;
+old main-only or reuse-lane notes are not authority to mutate another checkout.
 
-## One manager, one worktree, one issue delivery
+Read the live issue, every comment and nearest AGENTS, then route and read the
+complete verified bundle for actual changed paths before mutation. Existing tests,
+merged PR titles, enum declarations and unconditional refusal are not evidence that
+a positive production path works. Never manufacture a documentation read receipt.
 
-Each mutating manager uses one isolated worktree and one fresh issue-numbered branch
-from the published main SHA. After delivery, retire the issue branch before the next
-assignment. Do not reuse lane branches carrying unrelated commits. Only the root
-controller synchronises upstream and integrates main. Old issue instructions saying
-`main only, no worktrees` and stopped-run lane-branch instructions do not govern
-this parallel continuation; current WORKFLOW and this explicit assignment do.
+## Finish the full issue review, independently of source writers
 
-The manager is accountable for the whole claimed scope. Subagents get disjoint files
-or read-only questions inside it; they do not create extra worktrees or touch another
-manager's paths. Do not count a reviewer as an additional writer. Use actual available
-models; a historical quota forecast is not a launch prerequisite.
+Retain all BLOCK-MAP.tsv issue IDs and add every current open GitHub issue ID.
+Root reconciles the ID sets; search counts alone do not establish coverage.
+Read-only reviewers R0-R3 take their exact modulo-4 partitions. Every issue review
+covers body, all paginated comments, linked active PR deltas, relevant current code
+and required documentation; it returns residual items, true producer outputs,
+complete prospective write paths, release conditions and evidence at a source SHA.
+Reviewers do not reserve those prospective code paths or change shared planning.
 
-Claim all write paths together, including tests, manifests and generated outputs.
-PLAN path entries ending `/` reserve a subtree; other entries reserve an exact file.
-Claims last until explicit integration/transfer/abort, not until a wave number changes.
-New shared paths require one controller amendment before mutation. Root Cargo files
-and the six #5021 files are not included in either initial implementation scope.
-No acquire-one-file-then-wait-for-another cycle; no silent scope expansion.
+Test-only work stays visible but is not scheduled ahead of unfinished product code.
+An absent caller is WIRING, not a deferred test. No generic OSP1 parking or closed
+issue number may silently block all remaining source work. Real accepted owner
+restrictions remain explicit; genuinely missing semantics are not invented.
 
-## Work and evidence
+Root integrates reviewed findings and selects independent complete issue deliveries
+in PLAN.tsv. No raw FINISHABLE import, no extra task for every checklist item, and
+no global wait for every historical cycle or unrelated contract decision. Shared
+paths include manifests, dispatch roots, generated outputs and tests. Claims last
+until integration/explicit transfer/abort, not until the nominal wave changes.
 
-Read the live issue body, all comments, nearest AGENTS and the mandatory routed bundle
-for actual mutable paths. Existing declarations are not proof of a production caller.
-An existing contract with absent code/caller is implementation, not MISSING-CONTRACT.
-An absent measurement/run is not absent code. A closed owner issue or merged PR is
-not by itself the release condition for a consumer.
+On a real wait, preserve the issue checkpoint, release or transfer scope explicitly,
+and take independent work. After two same-cause failures, perform a bounded cause
+audit and change the approach. Repeating unchanged BLOCKED or tool calls is not work.
 
-Scoped formatting, minimal Clippy/compile for touched packages and affected consumers,
-and diff checks cover delivery. No workspace-wide test campaign in this phase.
-Record unexecuted acceptance separately; a named test is not an executed test.
-One issue produces one coherent source delivery; any genuine remaining external
-obligation stays explicit and does not become a false code-complete claim.
+## Delivery
 
-## Maintain one active queue
+Use scoped formatting, minimal Clippy/compile and diff checks for source delivery;
+record post-assembly acceptance separately. Generated whole-tree inventories receive
+one integration-owner refresh against the combined source, not concurrent refreshes
+from every branch. A clean source check does not establish runtime acceptance.
 
-BLOCK-MAP.tsv owns the checked/recheck disposition; PLAN.tsv contains its READY issue
-assignments exactly once. BLOCKERS-AUDIT.tsv records why a historical claim changed;
-it is evidence, not a second mutable status authority. STOP-BLOCK-MAP.* is historical.
-For every new candidate, check the actual source and discussion, name one owner and
-complete write scope, type each real dependency and give its exact release condition;
-then promote the whole source assignment into PLAN. Do not import FINISHABLE by regex.
-
-Review the grouped seams in STITCH-PLAN before scheduling their dependent code.
-Each historical cycle is a review finding until its item-level edges are established;
-internal steps and proof-after-assembly are not cross-issue implementation blockers.
-Use the same manager sequentially for shared-owner work, but keep separate issue
-branches/deliveries. Never remove a genuine dependency merely to produce a DAG.
-
-After a merge, root updates affected records and consumers, not all 577 issues.
-On a real wait, preserve the issue checkpoint, explicitly release/transfer scope,
-and take independent ready work. After two identical failures, inspect the cause;
-retry only after changed inputs or a different remedy. Do not churn BLOCKED reports.
-
-## Delivery gate and completion
-
-Do not disable the documentation-evidence gate. The local Make-PR2.sh emitter is
-outside this repository and has not been changed here. Before first delivery, root
-must emit the real v2 read evidence required by scripts/work_unit_gate/doc_read_evidence.py
-from the executor's actual receipt and validate one representative PR. A skipped
-MergeCompile is not a successful compile. This operational check does not forbid
-reading/preparing an otherwise independent assignment.
-
-This revision provides a bounded checked source-work queue and preserves the full
-stop inventory. It does not assert a completed 577-issue audit, independent model
-review, green CI, or running Windows agents. Root records those facts only after
-they occur. Keep #5018 draft until its review/evidence obligations are actually met.
+The local Make-PR2.sh/v2 evidence emission and runner state were not inspected or
+changed here. Validate a real v2 receipt through the existing doc_read_evidence.py
+before declaring delivery checked; do not disable CI or call a skipped compile PASS.
+Do not claim this PR merged or the swarm running until those events actually occur.

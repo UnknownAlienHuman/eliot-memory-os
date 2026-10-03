@@ -1,46 +1,38 @@
-# Active continuation map
+# Blocker map: complete inventory, explicit review coverage
 
-Source baseline: `b7e9e334569639a6290baeacf82bf44941def506`. Machine-readable state: [BLOCK-MAP.tsv](BLOCK-MAP.tsv).
+BLOCK-MAP.tsv is the complete retained stop inventory: 577 issue rows, original
+blob f16503f83db9b3ab31a56c9458867623817eddc2. The original 455 FINISHABLE, 83 BLOCKED,
+36 ALL-DONE and 3 DISPUTED values are historical lane judgments, not a new audit.
 
-This revision contains 28 issue records: two READY source assignments, one WAIT
-consumer and 25 RECHECK records. It is not a refreshed 577-issue completion count.
-The complete historical inventory is preserved in STOP-BLOCK-MAP.tsv, unchanged.
-Unlisted issues remain unreviewed and can be considered next; none is implicitly READY,
-DONE, or blocked on the completion of this entire audit.
+A live GitHub issue search returned 573 open issues with incomplete_results=false.
+That count is not a reconciled issue-ID inventory and is not 573 source reviews.
+The difference from 577 remains a set-reconciliation task; do not silently delete
+four rows, assume which four closed, or treat PRs as issues.
 
-## Ready to implement after live preflight
+## Effective reading
 
-| Issue | Manager | Remaining source obligation |
-|---|---|---|
-| #1943 | M-KERNEL | Connect existing role-capability policy to authenticated admission/transition; no second engine. |
-| #2691 | M-STORE | Supervised no-client snapshot expiry and bounded budget diagnostics. |
+1. Read the issue and all comments on current source. Use the old row only to find
+   evidence; do not turn every #number in prose into a hard dependency.
+2. Apply REVIEWED.tsv's explicit finding where present. Other rows are not
+   re-audited; historical corrections do not automatically become READY either.
+3. Only PLAN.tsv selects source assignments. A dependency is released by the
+   exact required owner output on current main, not whole-issue test closure.
 
-The scopes in PLAN.tsv are disjoint, including direct tests/manifests. Root-only and
-#5021 paths are excluded. These are assignment checks, not runtime proof.
+REVIEWED.tsv has 29 records: 3 READY and 26 RECHECK. SOURCE_AND_DISCUSSION means
+bounded source/discussion inspection, not full acceptance. HISTORICAL rows carry
+no checked source SHA. #1701's earlier WAIT was not justified by a current missing
+output check and is now RECHECK. #2701's residual expands to the full existing audit.
 
-## What is no longer an executable blocker
+## Coverage without losing the backlog
 
-`t-`, numeric counters, missing-document placeholders and historical issue mentions
-are not dependency edges. OR corrections were review input; only the explicit
-current rows above are source-work assignments. In particular, #1678 must not be
-assigned from the old assertion that an async coordinator is absent: current main
-already contains admission_reservation_saga.rs. Its actual remaining producer/receipt
-join requires inspection. #11's closed state is not a future event to wait for.
+For full re-audit, use the union of every retained issue ID and the current open
+GitHub issue IDs. Classify current closed/superseded records as tracker state only;
+closure is not code proof. Four read-only review queues partition that union by
+issue_number % 4 = 0, 1, 2, 3. This partitions issue review, NOT source ownership.
+No reviewer independently edits the shared map, schemas or code. Root integrates
+one issue result at a time, retaining unresolved rows instead of dropping them.
 
-The eight historical cycle groups are held as bounded ownership-review work in
-STITCH-PLAN.md, not imported into the scheduler. Their edges must be classified,
-not deleted merely to claim an acyclic architecture. Every active `depends_on` is
-explicit; no parser infers dependencies from prose or from the evidence URL.
-
-## Data contract
-
-`state`: READY = source assignment selected; WAIT = named deliverable not released;
-RECHECK = inspect current evidence/ownership before assigning source changes.
-`kind`: WIRING, PROOF or REVIEW. `items` refer to the issue's existing requirements,
-not separately delivered mini-issues. `depends_on` is a JSON string array; the current
-consumer #1701 waits on `1678:active-owner-evidence`, not on closure of all #1678 tests.
-
-Only root updates this map and its READY projection in PLAN.tsv. A new READY row must
-have a matching assignment, full scope and current evidence. A source change, new
-comment or altered dependency invalidates only affected entries. No automatic issue
-closure follows from these planning states.
+Counts and all-ready claims require exact enumerated ID sets with no missing or
+duplicate issue, every comment page, source SHA and review depth. A selected source
+assignment need not wait for unrelated review queues to finish. The existing
+controller/validator must consume the chosen plan; no new scheduler is introduced.

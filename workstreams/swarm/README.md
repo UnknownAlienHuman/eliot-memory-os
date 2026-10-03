@@ -1,28 +1,26 @@
-# Swarm continuation: start here
+# Swarm continuation — #5018
 
-Current work order: [CONTINUATION.md](CONTINUATION.md). Assignments:
-[PLAN.tsv](PLAN.tsv). Checked residuals and review queue: [BLOCK-MAP.tsv](BLOCK-MAP.tsv).
-Shared-owner boundaries: [STITCH-PLAN.md](STITCH-PLAN.md).
+Start with CONTINUATION.md and PLAN.tsv. The live owning issue, its complete
+current discussion and canonical documentation define the work; these files
+are coordination records, not a replacement specification.
 
-The active map is a bounded continuation queue, **not a claim that all 577 issues
-have been re-audited**. Only `READY` implementation rows in PLAN may be dispatched,
-after the controller's live preflight. `RECHECK` means investigation, not a product
-blocker and not permission to implement. Issues absent from the active map remain
-unreviewed; they have not been dropped or declared complete.
+- BLOCK-MAP.tsv retains the complete 577-issue stop inventory. Its historical
+  FINISHABLE/BLOCKED/ALL-DONE values are not current dispatch states.
+- REVIEWED.tsv records bounded rechecks, their depth and evidence. A missing
+  row means not re-audited, never done or automatically ready.
+- PLAN.tsv is the sole list of selected source assignments; PLAN.md explains
+  their scope. READY is not code-complete, accepted, claimed or running.
+- STITCH-PLAN.md records shared-file turns and exact producer/consumer handoffs.
+- BLOCKERS-AUDIT.tsv records changed findings, not a competing dispatch queue.
 
-The original 577-row stop map is preserved byte-for-byte as
-[STOP-BLOCK-MAP.tsv](STOP-BLOCK-MAP.tsv), with its original rendering in
-[STOP-BLOCK-MAP.md](STOP-BLOCK-MAP.md). These are read-only historical input.
-Their FINISHABLE counts, inferred dependency graph, and OR corrections are not an
-execution queue. Do not run the old `blockmap_build.py` over the new active files.
-Read the selected issue's old row only, then its live body, all comments and docs.
+Historical HANDOFF.md, MANAGER-BRIEF.md, LANE-HANDOFFS.md and RECOMMENDATIONS.md
+remain stop records. Do not restart old queues or inherit their transient lane
+branches, quota forecasts, parked labels or code-complete claims without checking.
 
-HANDOFF.md, LANE-HANDOFFS.md, MANAGER-BRIEF.md and RECOMMENDATIONS.md describe the
-stopped run. They do not override current AGENTS.md/WORKFLOW.md, the owner's current
-order or CONTINUATION.md. No archived branch is merged wholesale. Historical
-provider quotas, watchdog/cleanup orders and lane states are not live observations.
+The prior 28-row replacement was not a complete blocker map. The full original
+TSV is restored at its original path; duplicate STOP-BLOCK-MAP copies are removed.
+The old rendered report remains in Git history at main b7e9e334. No issue work is
+lost by reducing duplicated reports.
 
-These files are non-normative work records under the owner's #5017/#5018 order;
-they grant no product capability, change no Architecture contract, and establish
-no runtime acceptance. Current source baseline for this revision:
-`b7e9e334569639a6290baeacf82bf44941def506`.
+No controller session, Windows runtime, verified reader receipt or green CI is
+implied by this planning revision. The full issue-by-issue audit is not complete.

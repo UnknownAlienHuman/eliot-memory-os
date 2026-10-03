@@ -1,65 +1,60 @@
-# Initial source-work assignments
+# Selected source assignments
 
-Two independent issue assignments are selected in PLAN.tsv. READY means source work
-can proceed after live controller preflight, not that tests passed or the entire
-backlog has been checked. The reserved subtrees are conservative exclusion ceilings;
-edit only files causally required by the assigned issue. They may be narrowed after
-a manager records the concrete diff, never silently widened.
+PLAN.tsv selects three independent issue deliveries, not a complete sprint schedule.
+Subtrees are conservative exclusion ceilings: edit only causally necessary files.
+READY remains conditional on a current controller scope claim and the required read.
 
 ## M-KERNEL — #1943
 
-Reuse eliot-ipc's role_lease.rs and ApplicationSession admission/transition methods.
-Connect them to the real authenticated server admission and role-transition paths;
-compile the current owner's role/WorkScope/delegation limits, do not trust a role label
-or a caller-created permissive policy. Preserve exact task/route/profile/fence/epoch/
-expiry binding, revoke the old context, and update independence on transitions.
-Do not implement a second capability engine. The two existing acceptance scenarios
-remain the behavioral discriminators; test execution follows product assembly.
-
-Read issue #1943 and all five pre-continuation comments, I7.21, the relevant IPC and
-Kernel instructions, and the complete routed bundle. The source recheck on the baseline
-found admit_role_capability in session_lifecycle.rs only; PR #4880's title is not proof
-that a live caller exists. Resolve the actual production boundary before mutation.
-The Kernel/protocol subtrees stay with this manager; #1678/#1701 and other Kernel
-issues are not simultaneous writers. #1678 first receives a residual recheck: its
-async admission_reservation_saga.rs coordinator already exists on current main.
+Reuse eliot-ipc role_lease.rs and ApplicationSession's admission/transition methods.
+Connect real authenticated admission and explicit role transitions, using actual
+WorkScope/delegation policy rather than caller-selected authority. Bind task, route,
+profile, fence, epoch and expiry; revoke the old context and update independence.
+Do not build a second capability engine. Keep both existing acceptance scenarios.
+Issue comment 5963617714 records the source boundary; read the current full thread,
+I7.21 and routed bundle. #1678/#1701 cannot mutate the same Kernel/IPC scope in parallel.
 
 ## M-STORE — #2691
 
-Complete W5 and W7 in the existing snapshot owner. The current hook is pub(crate) in
-backup_snapshot.rs and the source search found no caller outside that module; Charge
-retains dimension/limit/charged, not a high-water observation. Expose a narrow owner
-method and drive it from StoreComposition's supervised lifetime even with no clients;
-stop/join that work with the owner. Reuse the existing bounded expiry transitions,
-clock domain and diagnostics. No detached task, second database, reset-to-zero
-accounting or silent evidence eviction. Preserve #2688/#2689 identity/retirement work.
+Finish W5/W7 and A6's source obligation: the supervised S-03 owner must drive bounded
+snapshot expiry when clients disappear and publish bounded high-water/remaining-budget
+diagnostics. Own the start/stop lifecycle, clock and error reporting. No detached
+maintenance service, silent eviction, reset-to-zero accounting or new database.
+Preserve #2688/#2689 handle/incarnation, interruption and terminal-receipt semantics.
+The existing producer is in backup_snapshot.rs; StoreComposition and main.rs own the
+composition and lifetime. Recheck those actual boundaries before editing. Earlier
+cleanup-charge and duplicate-begin defects have already changed; do not replay old
+patches. Read comments 5931062575/5963619581, the full issue and routed bundle.
 
-The actual S-03 composition is bins/eliot-store-surreal/src/lib.rs, which owns
-SurrealStoreAdapter and CanonicalSnapshotPort; main.rs owns its process lifecycle and
-existing diagnostics installation. Both are included in this assignment. Do not
-expand Store API/protocol or change another process without an explicit scope amendment.
-Read issue #2691, all six pre-continuation comments, A13.5/I14.3/I5.16/I5.27 and the
-mandatory bundle. The latest correction is comment 5931062575; earlier saturation
-and duplicate-begin findings must be checked against their already-merged fixes.
+## M-TOOLS — #2701
 
-## Controller-only shared changes and external work
+The stop-map claim that only audit items 3 and 6 remain is false on the checked SHA.
+_validate_checked_result still accepts Boolean counts, conflicting candidate_id/id,
+invalid digest shapes, blank base_sha and foreign proof_ceiling. An extracted-function
+reproduction confirms acceptance; it is not execution of the repository CLI/scanner.
+Read audit 5908785311 and recheck 5967019828 plus the complete issue discussion.
+Implement all its existing items 1-7 and preserve item 9, not a fresh alternative spec.
 
-Cargo.toml/Cargo.lock, routing/workflow inputs and active planning files remain root-owned.
-No new dependency is pre-authorised. #5021 remains an external writer on:
+Primary file: scripts/audit-serde-boundary-closure.py. The second reserved file,
+scripts/serde_boundary_inventory.py, is only for a genuinely needed change to its
+accepted #929 API; discovery is not reimplemented. Keep exactly one check(Path) call,
+no sync/fallback during ordinary checking, distinct inventory/closure digests, and
+valid unknown/needs-repair findings. Reject malformed identity/count/vocabulary/shape
+before constructing CheckedInventory. Existing item-8 regressions remain acceptance.
+Do not edit Rust, workflows or the global generated TOML from this manager.
 
-- bins/eliot-watchdog/src/health_projection.rs
-- config/doc-code-conformance.toml
-- crates/foundation/eliot-bootstrap/src/capture.rs
-- crates/kernel/eliot-ors/src/status.rs
-- crates/smart/cognitive-rev12-contract-schema-freeze.toml
-- scripts/README.md
+## Integration and external paths
 
-Refresh the PR before dispatch; a terminated writer does not reserve paths forever.
-Its last observed head was 0a64bbfb31b87dfa0c87e50a825f906ed76dda14. Do not copy its
-changes or declare them accepted merely because its body says checks pass.
+Root owns Cargo.toml/Cargo.lock, shared planning and generated whole-tree refreshes.
+New paths require a scope amendment before writing. Child tests/fixtures must also
+be explicitly claimed; unexecuted tests are never reported as passing.
 
-Read-only reviewers may examine RECHECK issues concurrently. They return one bounded
-finding to root with issue/item, source SHA, exact owner/output, paths and release
-condition; they do not edit the shared map or create duplicate implementation branches.
-Root integrates planning updates one at a time. Full stop inventory remains available
-for subsequent candidates, without requiring every worker to ingest it.
+#5021 is still open at the last read, head 0a64bbfb31b87dfa0c87e50a825f906ed76dda14:
+  bins/eliot-watchdog/src/health_projection.rs
+  config/doc-code-conformance.toml
+  crates/foundation/eliot-bootstrap/src/capture.rs
+  crates/kernel/eliot-ors/src/status.rs
+  crates/smart/cognitive-rev12-contract-schema-freeze.toml
+  scripts/README.md
+These exact paths are excluded from all selected assignments. Refresh the PR delta
+before claiming; neither a stale PR nor a historical wave is a permanent lock.
