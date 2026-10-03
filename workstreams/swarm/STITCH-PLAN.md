@@ -1,114 +1,200 @@
 # Integration seams and PR dispositions
 
-Use only the row applicable to the selected assignment. This is coordination evidence,
-not product authority. Canonical sections are linked from PLAN.md. Source observations
-below bind main b7e9e334569639a6290baeacf82bf44941def506; refresh changed inputs before
-dispatch. No entry proves that an external writer has stopped.
+This file records only cross-assignment joins and candidate dispositions. It is not
+product authority and not a second dispatch queue. Canonical sections are linked from
+`PLAN.md`. Source observations below bind
+`main@b7e9e334569639a6290baeacf82bf44941def506`; refresh changed inputs before
+dispatch. No row proves that a local or external writer has stopped.
 
-## Current selected work
+## READY set — no shared files
 
-| Issue | Existing owner-to-consumer path | Shared-file rule |
+| Issue | Owner -> consumer path | Exact-file rule |
 |---|---|---|
-| #3980 | SurrealServerConfig validator -> GovernorConfig loader / supervisor admission / RPC connect, before effects. | Four legacy files only; preserve reserved Store isolation. No modern Store or legacy-retirement dependency. |
-| #2691 | S-03 lifetime -> narrow adapter method -> existing bounded snapshot expiry/retirement -> diagnostics. | Five PLAN files; preserve #2688/#2689 state and receipts. PR disposition below. |
-| #2643 | Fresh get_context nonce -> current identity guard -> actual client -> owner fence -> business request. | Two DTO/client files; #2644/#1137 cannot write them concurrently. MainViewModel/journal/Rust stay read-only. |
-| #2701 | #929 check(Path) -> strict result validation -> CheckedInventory -> closure report. | Two scripts; root alone refreshes the global inventory on combined source. No second scanner. |
+| #3980 | `SurrealServerConfig` validator -> Governor config / supervisor / RPC client, before effects | Four legacy files only; no modern Store or retirement dependency |
+| #2691 | S-03 lifetime -> adapter maintenance owner -> expiry/retirement -> diagnostics | Five PLAN files; preserve #2688/#2689 and compatibility code |
+| #2643 | fresh `get_context` nonce -> current identity guard -> client -> owner fence -> business request | Two C# files; MainViewModel/journal/Rust remain read-only |
+| #2701 | #929 `check(Path)` -> strict result validator -> `CheckedInventory` -> closure report | Two scripts; root alone refreshes combined generated inventory |
 
-The four selected sets are mutually disjoint. The prior complete PR filename screen
-contains no contact with #3980's four files, #2643's two files or #2701's two scripts.
-That screen is an input observation, not a current runner claim or a semantic review
-of every PR. Refresh new/changed heads and the actual controller claims.
+All 13 selected paths are pairwise disjoint. The prior complete PR filename screen
+contained no contact with #3980, #2643 or #2701. That is an observed snapshot, not a
+current runner claim. Recheck new/changed heads and actual controller claims.
 
-## #2691: exact-file reconciliation, not whole-PR waiting
+## #2691 — exact-file reconciliation, not whole-PR waiting
 
-The former two-subtree reservation is replaced by the five files in PLAN.tsv.
-#3811/#3812 change apply/*, not those five files. They are not snapshot prerequisites.
+The former two-subtree reservation is replaced by the five files in `PLAN.tsv`.
+#3811/#3812 change `apply/*`, not those five files, and are not snapshot prerequisites.
 
-#3869 at bce9207b52a29cfa0b2439d69c4235a49fe27fd4 contacts three selected files.
-Each complete per-file patch was compared with the main source above:
+#3869 at `bce9207b52a29cfa0b2439d69c4235a49fe27fd4` contacts three selected files.
+Every hunk in those files was compared with the checked `main`:
 
-| Shared bin file | Relevant #3869 hunks already present in main |
+| Shared file | #3869 material already present in main |
 |---|---|
-| bins/eliot-store-surreal/src/lib.rs | install_compatibility_decision re-export. |
-| bins/eliot-store-surreal/src/main.rs | Imports, three compatibility input constants, typed health projection, installation/path helpers and the early run branch. |
-| bins/eliot-store-surreal/src/diagnostics.rs | CompatibilityVerdict import, CompatibilityDecision/CompatibilityHealth and project_compatibility_health. |
+| `bins/eliot-store-surreal/src/lib.rs` | `install_compatibility_decision` re-export |
+| `bins/eliot-store-surreal/src/main.rs` | imports, compatibility input constants, typed health projection, installation/path helpers and early run branch |
+| `bins/eliot-store-surreal/src/diagnostics.rs` | `CompatibilityVerdict` import, decision/health types and projection |
 
-**Disposition: PRESERVE_MAIN for those hunks only.** No merge of #3869 is needed
-before writing snapshot maintenance. PLAN retains [3869] as the observed file contact,
-with CLAIM_AFTER_PREFLIGHT. A live external writer still needs explicit transfer:
-different lines of one physical file are not independent write claims.
-Preserve compatibility behavior; never restore old whole-file bytes or reapply the
-whole branch. The other 41 paths, whole-file equality, runtime correctness and
-whole-PR supersession are not established. #3869 remains open and unaccepted.
+**Disposition: `PRESERVE_MAIN` for those hunks only.** No #3869 merge is required
+before snapshot maintenance. Do not replay old whole-file bytes. A live writer still
+requires explicit transfer because different lines of one file are not independent
+claims. The other 41 paths, whole-file equivalence, runtime correctness and whole-PR
+supersession were not established; #3869 remains open and unaccepted.
 
-## Next Kernel work: no provisional subsystem lock
+## #1943 — canonical producer missing; no Kernel reservation
 
-#1943 is RECHECK, not a write reservation. Under I7.21, trace the authenticated policy
-supplier -> existing ApplicationSession admission/transition -> prior-context
-revocation -> enforcement. Start at ApplicationSession construction in
-bins/eliot-kernel/src/agent_bridge.rs and the existing role_lease/session_lifecycle
-methods. Return exact caller/consumer files under I2.17 before issuing a claim.
-Do not build a second capability engine or let role labels mint authority.
+### Existing source that must be preserved
 
-#1678 already has the async coordinator. #1701's production eliotd admission,
-activation and dispatch ports still refuse unconditionally; bind the actual existing
-owner operations and retained results. Daemon-launch reservation gating is not proof
-of this native-worker attempt join. Include the actual eliotd/worker consumers when
-the scope is established. No second saga or whole-parent test wait.
-Neither task currently reserves all Kernel/protocol files.
+- `crates/kernel/eliot-ipc/src/role_lease.rs` contains a local closed role policy and
+  in-memory capability context.
+- `ApplicationSession` can admit/transition/clear that context.
+- the real agent-bridge activation creates and attaches `ApplicationSession`.
+- canonical authority already flows through Governor compilation,
+  `MechanicalAuthoritySubset`, Kernel activation/revocation and current
+  GovernanceProfile publication.
 
-#1884/#1888 must reuse main's CPU-rate implementation, not the mixed archived CB
-branch. One platform-file writer owns any actual remaining manifest/Job cleanup join.
+### Confirmed missing join
+
+No current owner operation supplies the local `WorkScopePolicy`,
+`DelegatedAuthority`, role transition or `IndependenceDowngrade`; searches find those
+types only in `eliot-ipc` and its tests. No production caller invokes
+`admit_role_capability` / `transition_role_capability`, and no real plan/work/evaluation
+boundary calls the local authorization method. `AgentActivationResolvedBinding` and
+free-form swarm `assigned_role` do not carry or prove this authority.
+
+### Required producer output
+
+Before a #1943 writer claim, the canonical owner path must expose one current activated
+role assignment/transition projection containing:
+
+```text
+principal/session/task/work-item/WorkScope/route;
+role and narrowed operation set;
+GovernanceProfile revision;
+State Fence and authority/lease epoch;
+issue/expiry/current revocation;
+canonical source/content commitment;
+prior-context supersession;
+explicit verifier-to-mutating-role independence downgrade when applicable;
+Kernel activation receipt.
+```
+
+This is a narrow owner output, not a wait for every #1794 acceptance test. It must be
+compiled through the existing mechanical-authority path, not minted from a role label
+inside Kernel.
+
+### Release
+
+After that exact output exists, root may assign the finite consumer closure:
+authenticated projection read -> `ApplicationSession` bind/transition -> prior-context
+revocation -> real operation enforcement. Publish exact files only then. Until release,
+#1943 is `RECHECK`, owns no paths and does not block unrelated Kernel work.
+
+## #1701 — existing saga, incompatible/missing Fabric owner legs
+
+### Existing source that must be preserved
+
+- `bins/eliot-kernel/src/admission_reservation_saga.rs` is the canonical
+  receipt-readback, admit/activate and recovery owner for an already staged reservation.
+- daemon frame dispatch admits `admission_reservation.admit`.
+- the native-worker path already refuses rejected/revoked claims before start and
+  retains unknown process-start outcomes instead of blanket reset/release.
+
+### Confirmed missing join
+
+The production `eliotd` Fabric ports still report `Missing`:
+
+```text
+ProductionAdmissionAuthorityPort::stage_reservation
+ProductionAdmissionAuthorityPort::commit_admission
+ProductionActivationAuthorityPort::activate
+ProductionDispatchEgressPort::emit
+```
+
+This is not solved by calling the saga from a unit struct:
+
+- Fabric asks synchronously to stage from `SwarmDefinition`;
+- Kernel admit/activate accepts only an exact reservation already staged and bound to
+  work item plus proposed attempt;
+- the owner call is authenticated and asynchronous;
+- dispatch has no accepted retention/executor owner operation.
+
+The daemon-launch reservation guard covers a different contour. A local `Bound`
+constant, copied `Active` snapshot, injected success or `block_on` wrapper would create
+false authority.
+
+### Required outputs
+
+Freeze these existing-owner interfaces before assigning code:
+
+```text
+A. durable stage request/result binding definition, work item, proposed attempt,
+   claim/executable/route/resource identities, deadline, epoch/fence and reservation;
+B. daemon authenticated client result for admission_reservation.admit, including
+   canonical receipt/outbox proof and activation receipt;
+C. dispatch-egress operation retaining the original dispatch identity and consuming
+   the same active reservation/attempt, with unknown-outcome reconciliation;
+D. accepted asynchronous composition boundary for A-C.
+```
+
+When A-D exist, assign exact `eliotd` adapter files and actual Kernel/native-worker
+consumers in one serialized turn. A producer output can release the consumer before
+#1678/#1679/#1680 close, but absent owner state cannot be fabricated locally.
+#1701 remains `RECHECK`, owns no broad subtree and does not stop Store/tools work.
+
+## Other reviewed seams
+
+- #1678: the async coordinator exists. Recheck the actual stage/receipt/activation
+  producer join; do not create another saga.
+- #1884/#1888: reuse main's CPU-rate implementation. One platform-file writer owns
+  any remaining manifest/Job cleanup join.
+- #686/#3058: current `RecordedRevocation` is V2. Do not restore the old five-field
+  materializer or default new provenance coordinates.
+- #818: its current Valid/READY output is not dispatch clearance; repair the existing
+  oracle, not a second scheduler/checker.
 
 ## Retained PR decisions
 
-- #4999 @ d4dfbbe4870a: draft, REQUEST_CHANGES
-  [5398877744](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/4999#pullrequestreview-5398877744).
-  Reject the missing-evidence synthesizer and fixture-prose exceptions. Final-byte
-  recomputation cannot attest premutation reading. Genuine producer evidence and
-  I18.27 oracle review are required; other documentation corrections are separate.
-- #3058 @ f93239dec051: draft, COMMENTED hold
-  [5398880483](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/3058#pullrequestreview-5398880483).
-  Port unmatched #686 work to current V2 commit-fence/namespace/bounds/coverage/digest
-  producers; preserve #2966 recovery decisions. Do not restore V1 or default evidence.
-- #2707 was closed without merge because its sole script registration was already
-  in main. No source or branch deletion, no parent acceptance.
+- **#4999 @ `d4dfbbe4870a` — REQUEST_CHANGES.** Reject the missing-evidence
+  synthesizer and fixture-prose exceptions. Final-byte recomputation cannot attest
+  premutation reading. Genuine producer evidence plus I18.27 oracle review remain
+  required; unrelated documentation corrections are separate.
+- **#3058 @ `f93239dec051` — source-review hold.** Port unmatched #686 work to
+  current V2 commit-fence/namespace/bounds/coverage/digest producers; preserve #2966
+  recovery decisions. Do not restore V1 or fill evidence with defaults.
+- **#2707 — closed without merge.** Its only registration row already exists on
+  `main`; no source or parent acceptance follows from closure.
 
-The prior 26-PR filename screen and obsolete broad-scope counts remain in
+The previous 26-PR filename screen and obsolete broad-scope counts remain in
 [the inspected revision](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3aa7cc157fee31ffc0c64531b00013a62dc6babf/workstreams/swarm/STITCH-PLAN.md).
-They are not today's locks: #1943 has no claim and #2691 is narrowed above.
-Titles are not scopes (#3869 had 44 paths; #4845 had three Kernel Rust paths despite
-their descriptions). Compare merge-base/candidate/main before adopting unmatched
-work; do not attribute inherited hunks to an author merely from the PR diff.
+They are evidence of that read, not current locks. Compare merge-base, candidate and
+current `main` before adopting unmatched work; titles and author identity do not define
+scope.
 
-## Pending historical dependency groups — review, not a launch order
+## Historical dependency groups — review, not launch order
 
-| Group | Boundary to resolve from current canonical contracts and code |
+| Group | Boundary still requiring current source/thread verification |
 |---|---|
-| #8 / #1746 | Existing bootstrap response versus real owner-source assembly/delivery. One writer for the shared Bootstrap/Bridge join. |
-| #1229 / #3004 | Dependency-policy preparation supplies declared inputs; compile profile consumes them. Preparation is not a policy verdict; execution proof remains separate. |
-| #1767 / #2893 | Portfolio/denominator owner consumes exact no-match/source-record/evaluator evidence. #1762 supplies live composition; #1765 retains final release authority. Serialize evidence_portfolio.rs and the actual adapter. |
-| #18 / #2892 / #2968 | Host wiring versus packaging/disposition versus later assembled-product proof. |
-| #1126 / #1699 / #2567 / #2866 | Exact execution/admission output and consumer-specific handoff. |
-| #1762 / #1769 | Inquiry/source-admission producer and restricted consumer. |
-| #1789 / #1791 | Authoritative transition versus plan/context projection. |
-| #1934 / #2561 / #2731 / #2732; #2729 / #2730 | Privacy, retained event/projection, stream authority, bounded handoff, sequencing, acknowledgement and recovery. |
+| #8 / #1746 | existing bootstrap response vs real owner-source assembly/delivery |
+| #1229 / #3004 | dependency-policy preparation inputs vs compile-gate consumer |
+| #1767 / #2893 | portfolio/denominator owner vs exact no-match/source/evaluator evidence |
+| #18 / #2892 / #2968 | host wiring vs packaging/disposition vs assembled-product proof |
+| #1126 / #1699 / #2567 / #2866 | exact execution/admission output and consumer handoff |
+| #1762 / #1769 | inquiry/source-admission producer and restricted consumer |
+| #1789 / #1791 | authoritative transition vs plan/context projection |
+| #1934 / #2561 / #2731 / #2732; #2729 / #2730 | privacy/event/stream/handoff/ack/recovery sequencing |
 
-The first three partitions were body-reviewed; their full current source/thread
-joins, and the remaining groups, are not certified. Do not remove an unverified edge
-to manufacture a DAG. For the coverage group, no local fabricated evaluation receipt,
-I/O inside the pure assessor or package-verdict promotion to release authority.
-Missing vetted records, complete predicates or a real empty-scope contract stay Unproven.
+The first three groups were body-reviewed; their complete current source/thread joins
+are not certified. Do not delete an unverified edge to manufacture a DAG. For coverage,
+no fabricated evaluation receipt, I/O inside the pure assessor, or promotion of package
+verdict to release authority.
 
-Decision leads also remain: #332 layout; #1968 pair/Blob identity; #1844 R2 vocabulary;
-#2882 part 5; #238 Context-cell owner; #956 purge/publication ports. Check the actual
-canonical section and producer before declaring a missing contract. An omitted
-assignment owner is not automatically an Architecture decision.
+Decision leads remain #332 layout, #1968 pair/Blob identity, #1844 R2 vocabulary,
+#2882 part 5, #238 Context-cell owner and #956 purge/publication ports. Check canonical
+sections and current producers before declaring a missing contract.
 
 ## Release rule
 
-A real wait names the consumer item, producer output, exact type/operation and
-observable release condition. Internal item order, a related link and final parent
-acceptance are not interchangeable prerequisites. Record the disposition in the
-existing controller ledger; transfer physical files explicitly. After integration,
-refresh affected consumers/findings only. Independent cleared work continues.
+A real wait names the consumer item, exact producer output/type/operation and observable
+release condition. Issue linkage, internal checklist order and final parent acceptance
+are not interchangeable prerequisites. Record disposition in the existing controller
+ledger; transfer physical files explicitly. After integration, refresh only affected
+consumers/findings. Independent cleared work continues.

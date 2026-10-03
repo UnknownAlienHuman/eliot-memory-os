@@ -1,86 +1,282 @@
 # Selected source work
 
-Use your PLAN.tsv row and the matching card below. Its write_paths are exact files,
-not permission to edit their directories. Read your live Issue/discussion, nearest
-AGENTS and the complete verified changed-path bundle; the links below identify the
-load-bearing canonical sections, not a smaller substitute bundle. Root owns integration.
-Wave 1 is an eligible pool, not a barrier or an instruction to launch every manager.
-The controller's existing resource/concurrency limits still apply.
+`PLAN.tsv` is the machine-readable selection. This file is the human execution packet.
+Use **one row and one matching card only**. Do not load the other cards, the full
+BLOCK-MAP, or unrelated Issue history into the worker context.
+
+## Controller preflight — before giving a card to a manager
+
+1. Re-read current `main`, the selected Issue/thread, its PLAN row and applicable PR heads.
+2. Check only the row's exact files against selected-but-unstarted work, live claims and PR
+   deltas. Transfer or stop an intersecting writer explicitly; unrelated runners continue.
+3. Create one manager worktree and one fresh Issue branch from the published base.
+4. Route all exact mutable paths together with `scripts/docs_read.py`; the manager reads the
+   complete verified bundle and nearest `AGENTS.md` before mutation.
+5. Record the claim in the existing controller ledger: Issue, manager/session, worktree,
+   branch, base SHA and exact files. `READY` alone is not a claim or launch receipt.
+
+A manager edits only `EDIT`. `READ ONLY` identifies the smallest consumers needed to keep
+the product path intact; it is not extra write scope. A newly discovered path requires a
+root scope amendment before writing.
+
+## Executor return — one compact handoff
+
+Return exactly:
+
+```text
+issue / manager:
+base SHA / candidate SHA:
+changed files:
+entry -> owner -> consumer path:
+implemented residual:
+preserved invariants:
+commands actually run and exits:
+deferred post-assembly acceptance:
+remaining exact blocker or NONE:
+```
+
+Do not paste the Issue, documentation bundle, test logs or a diary into the repository.
+Code and production wiring come first. Passing format/compile/Clippy is source evidence,
+not behavioral acceptance.
+
+---
 
 ## M-LEGACY — #3980
 
-Canonical: [I15.4 secrets](../../docs/architecture/I15-04-secrets.md#i154-secrets);
+**Canonical:** [I15.4 secrets](../../docs/architecture/I15-04-secrets.md#i154-secrets);
 [Appendix P boundaries](../../docs/architecture/APPENDIX-P-rust-public-boundary-interfaces.md#appendix-p-rust-public-boundary-interfaces).
-**Residual:** current GovernorConfig accepts loopback-looking prefixes, while the
-supervisor checks only Store collision and the RPC client performs no local-only check.
-**Implement:** one full-grammar validator on SurrealServerConfig; call it from
-GovernorConfig::validate, SurrealServerSupervisor::validate_admission and
-SurrealRpcTransport::connect before credentials, paths, process or socket effects.
-Consume the whole existing literal-loopback/bind/port/rpc grammar, not a prefix.
-**Preserve:** reserved Store collision, existing accepted encoding/case policy and
-typed bounded failures. Reject userinfo/path/query/fragment tricks without logging
-the rejected URI. No new dependency, Store daemon, credential owner or legacy revival.
-**Handoff:** all three real entrypoints use that predicate; scoped eliot-types /
-eliot-store formatting and minimal Clippy. Original negative/valid-route acceptance
-stays in #3980 after assembly. eliot-app's loader is read-only unless scope is amended.
+
+**EDIT — exactly four files**
+
+```text
+crates/eliot-types/src/config.rs
+crates/eliot-types/src/error.rs
+crates/eliot-store/src/surreal_server.rs
+crates/eliot-store/src/surreal_rpc.rs
+```
+
+**READ ONLY:** `crates/eliot-app/src/config.rs` and the current callers of
+`SurrealServerConfig`.
+
+**START:** `GovernorConfig::validate`,
+`SurrealServerSupervisor::validate_admission`, and `SurrealRpcTransport::connect`.
+The first accepts loopback-looking prefixes; the other two do not enforce the complete
+local-only grammar before effects.
+
+**MAKE:** one reusable full-grammar validator on `SurrealServerConfig`; all three
+entrypoints call it before credentials, paths, process or socket work. Accept only the
+already-documented literal bind and `ws://127.0.0.1:<valid-port>/rpc` form. Reject
+userinfo, alternate host, trailing path, query, fragment, controls, whitespace and
+missing/invalid/out-of-range ports.
+
+**DO NOT:** add a dependency, normalize an external address to loopback, weaken the
+reserved Store collision guard, revive legacy runtime, touch the modern Store daemon,
+or echo the rejected URI/bind value in diagnostics.
+
+**CHECK NOW:** scoped format, minimal Clippy for `eliot-types` / `eliot-store`, and
+`git diff --check`. State every command and exit honestly.
+
+**DEFER:** the existing valid-route and negative connection/secret-canary acceptance
+from #3980 until product assembly. Do not close the whole Issue from source checks.
+
+**DONE FOR INTEGRATION WHEN:** one predicate is consumed at all three real pre-effect
+boundaries, reserved Store isolation is unchanged, and the four-file diff has no
+unexplained changes.
+
+---
 
 ## M-STORE — #2691
 
-Canonical: [I14.3 reserve](../../docs/architecture/I14-03-control-reserve.md#i143-control-reserve);
+**Canonical:** [I14.3 reserve](../../docs/architecture/I14-03-control-reserve.md#i143-control-reserve);
 [I5.16 evidence](../../docs/architecture/I05-16-common-durable-fields.md#i516-common-durable-fields);
 [I5.13 backup](../../docs/architecture/I05-13-backup-and-restore.md#i513-backup-and-restore);
 [I5.27 identity](../../docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity).
-**Residual:** private snapshot_owner_maintenance_tick has no external caller;
-budget diagnostics still lack the requested high-water/remaining accounting.
-**Implement:** S-03 run/StoreComposition lifetime -> narrow adapter method -> existing
-bounded expiry/retirement -> existing diagnostics. Drive it during idle pipe waits,
-not only after requests; preserve in-flight framing/cancellation and clock rules.
-Every exit must stop/join the driver before its owner is dropped.
-**Preserve:** #2688/#2689 incarnation, exact replay, charge transfer, interruption and
-terminal receipts; no second registry/service, detached task, silent eviction or
-reset-to-zero recovery. Existing global state is not durable restart evidence.
-**Handoff:** complete W5/W7 and A6's source obligations in the five named files;
-scoped adapter/S-03 checks, then the original bounded acceptance after assembly.
-No apply/*, Store API, compatibility policy, manifests or Cargo changes are assigned.
-The old PR waits are resolved for these files only; see STITCH-PLAN's #2691 entry.
+
+**EDIT — exactly five files**
+
+```text
+crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs
+crates/storage/eliot-store-surreal-adapter/src/lib.rs
+bins/eliot-store-surreal/src/lib.rs
+bins/eliot-store-surreal/src/main.rs
+bins/eliot-store-surreal/src/diagnostics.rs
+```
+
+**READ ONLY:** current snapshot API/receipt contracts and #2688/#2689 implementation
+spans. `apply/*`, Store API, Cargo, manifests and compatibility policy are outside scope.
+
+**START:** private `snapshot_owner_maintenance_tick` already performs bounded
+expiry/retirement but has no supervised caller when clients disappear. Existing budget
+accounting does not expose the requested bounded high-water and remaining-capacity view.
+
+**MAKE:** S-03 process lifetime -> `StoreComposition` -> one narrow adapter method ->
+the existing bounded expiry/retirement owner -> bounded diagnostics. Drive it while the
+pipe is idle as well as after requests. The owner starts it, supplies the established
+clock domain, and stops/joins it on every exit before dependent state is dropped.
+Expose high-water/remaining values for the already-accounted dimensions without
+turning estimates into claimed RSS/heap measurement.
+
+**DO NOT:** add a detached service/task, second registry, new database, full-map scan on
+every tick, silent eviction, reset-to-zero recovery, widened capacity, or a second
+writer for #2688/#2689 state. Do not reapply #3869 compatibility hunks.
+
+**CHECK NOW:** scoped format, minimal Clippy for the adapter/S-03 packages, and
+`git diff --check`. Verify the five-file diff preserves the compatibility code already
+on `main`.
+
+**DEFER:** bounded idle-expiry, cancellation, retained-receipt and diagnostic behavior
+proofs until assembly. An absent lifecycle caller is implementation work, not
+`TEST-PHASE`.
+
+**DONE FOR INTEGRATION WHEN:** idle lifetime reaches the existing maintenance owner,
+shutdown cannot leave the driver detached, diagnostics are bounded, and exact
+incarnation/replay/interruption/terminal-receipt semantics remain intact.
+
+---
 
 ## M-OPERATOR — #2643
 
-Canonical: [I11.12 UserAutomation](../../docs/architecture/I11-12-userautomation.md#i1112-userautomation);
+**Canonical:** [I11.12 UserAutomation](../../docs/architecture/I11-12-userautomation.md#i1112-userautomation);
 [I7.20 failure identity](../../docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract);
 [I5.27 identity](../../docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity).
-**Residual:** CreateContext's fresh nonce is compared with the business-operation
-hash by ValidateCurrentIdentity before GovernorPipeClient sends it.
-**Implement:** distinguish only the existing closed UserAutomationGetContextOperation
-at that validation boundary. Keep nonce/key syntax and absent-fence checks; correct
-the adjacent client contract comment without removing its validation call.
-**Preserve:** every business request's digest and original expected_state_fence,
-one prepared journal/send identity, exact withheld legacy bytes and strict decoding.
-Do not replace the nonce with a constant digest or exempt all read operations.
-**Handoff:** both UI read/effect paths can obtain context without the incompatible
-local guard. MainViewModel, pending journal and Rust owner are read-only consumers.
-Use the existing locked Operator build profile, not Clippy or a new harness.
-Original cross-language/recovery acceptance remains pending; this repair does not
-certify the full UserAutomation runtime or replace its current wire with the old table.
+
+**EDIT — exactly two files**
+
+```text
+apps/Eliot.Operator/Protocol/UserAutomationContracts.cs
+apps/Eliot.Operator/Services/GovernorPipeClient.cs
+```
+
+**READ ONLY:** `MainViewModel`, pending journal and current Rust UserAutomation owner
+contracts.
+
+**START:** `CreateContext()` intentionally mints a fresh nonce, but
+`ValidateCurrentIdentity()` applies the business-operation digest rule before the
+client can send that closed `get_context` request.
+
+**MAKE:** distinguish only `UserAutomationGetContextOperation` at the existing
+validation boundary. It still requires valid key syntax, a fresh nonce and no
+`expected_state_fence`. Every business operation still requires
+`idempotency_key == DeriveIdempotencyKey(operation)` and the original closed fence.
+Keep the client validation call; correct only its adjacent contract comment.
+
+**DO NOT:** replace the nonce with a constant/hash, exempt every read operation, relax
+strict decoding, re-encode retained legacy bytes, recompute pending identities, or
+change MainViewModel/journal/Rust production files.
+
+**CHECK NOW:** the repository's existing locked Operator build/format command and
+`git diff --check`. This is C# work; do not substitute Clippy or create a harness.
+
+**DEFER:** cross-language field-set and retained-recovery behavioral acceptance until
+assembly. The narrow fix does not certify the whole UserAutomation runtime.
+
+**DONE FOR INTEGRATION WHEN:** both UI read/effect flows can obtain the owner context,
+business/current-recovery identity checks are unchanged, and superseded records remain
+withheld under their exact original bytes and keys.
+
+---
 
 ## M-TOOLS — #2701
 
-Canonical: [I18.27 oracle ownership](../../docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance).
-Read existing audit 5908785311 and recheck 5963910318; #929 owns check(Path)'s contract.
-**Implement:** its full repair 1-7, preserving item 9, in the existing validator.
-The second file is only for a genuinely needed accepted-API change, not a new scanner.
-**Preserve:** one check(Path), no normal-check sync/fallback, separate inventory and
-closure digests, valid unknown/needs-repair findings and original failure causes.
-**Handoff:** syntax/scoped CLI checks on the named scripts; item-8 regressions remain
-later acceptance. Root alone refreshes global generated inventories after integration.
-No Rust, workflow, generated TOML or evidence-attestation fallback is assigned.
+**Canonical:** [I18.27 oracle ownership](../../docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance).
 
-## Next root review — #1943, not a broad write reservation
+**EDIT — exactly two files**
 
-[I7.21](../../docs/architecture/I07-21-default-agent-role-capability-profiles.md#i721-default-agent-role-capability-profiles)
-requires actual role issuance/revocation, not labels. Follow ApplicationSession
-construction in bins/eliot-kernel/src/agent_bridge.rs into the existing role_lease.rs /
-session_lifecycle.rs methods; identify the authenticated policy supplier, transition
-entry and direct enforcement consumers. Return exact files and the required owner
-output. Do not rebuild the role engine or claim four subtrees while choosing a caller.
-#1943 stays visible in REVIEWED.tsv as RECHECK. It does not hold unrelated work.
+```text
+scripts/audit-serde-boundary-closure.py
+scripts/serde_boundary_inventory.py
+```
+
+The second file changes only if the accepted #929 API itself must change.
+
+**READ ONLY:** audit comment `5908785311`, recheck `5963910318`, the #929 result
+contract and existing fixtures.
+
+**START:** the current accepted-result validator still permits malformed identity,
+counts, digest/ceiling/vocabulary and row shapes.
+
+**MAKE:** implement the existing audit items 1–7 and preserve item 9 in the existing
+validator. Keep exactly one `check(Path)` call. Validate closed identity/count/digest/
+vocabulary/row shape before constructing `CheckedInventory`; retain valid
+`unknown`/`needs-repair` findings and distinct inventory/closure digests.
+
+**DO NOT:** create a second scanner, sync/fallback during ordinary checking, edit Rust,
+workflows or generated TOML, refresh the global inventory from this branch, or
+synthesize documentation evidence.
+
+**CHECK NOW:** Python syntax, the existing scoped CLI/self-checks applicable to these
+two scripts, and `git diff --check`. Report commands and exits.
+
+**DEFER:** item-8 regression acceptance and the single combined-source global generated
+inventory refresh to the root integration owner.
+
+**DONE FOR INTEGRATION WHEN:** malformed accepted #929 results fail before
+`CheckedInventory`, valid findings survive, and the two-file diff does not introduce
+another acquisition or authority path.
+
+---
+
+# Not dispatchable yet — exact release outputs
+
+These entries reserve no code files and do not block the four READY cards above.
+
+## #1943 — role capability admission and transition
+
+The local `eliot-ipc::role_lease` engine and `ApplicationSession` methods exist, but
+current production source has no owner-issued role assignment/transition record feeding
+them and no operation boundary consuming `role_capability().authorize(...)`. The local
+`WorkScopePolicy`, `DelegatedAuthority` and downgrade structs are not canonical owner
+evidence. A role label, `assigned_role`, or caller-built allow set must not mint
+authority.
+
+**Release output required before a writer claim:**
+
+```text
+owner-issued role assignment or role-transition identity;
+exact principal/session/task/work-item/WorkScope/route binding;
+current GovernanceProfile revision and State Fence;
+authority/lease epoch, issue/expiry and current revocation state;
+role-default operation set narrowed by owner WorkScope and delegation;
+prior-context revocation/supersession;
+explicit IndependenceProfile downgrade record for verifier -> mutating role;
+canonical source/content commitment and Kernel activation receipt.
+```
+
+The output must be represented by the existing canonical authority path
+(`eliotd` mechanical compilation -> `MechanicalAuthoritySubset` -> Kernel activation),
+not by a second token engine or an `eliot-ipc` self-assertion. Once that producer exists,
+split a narrow consumer unit: attach the activated projection to the exact
+`ApplicationSession`, revoke the prior context on transition, and enforce it at the real
+plan/work/evaluation operation boundaries. Until then #1943 remains `RECHECK`; it
+holds no Kernel subtree.
+
+## #1701 — fabric admission to native-worker dispatch
+
+Preserve `admission_reservation_saga.rs`: it already performs canonical receipt
+readback plus admit/activate for an **already staged** reservation. Preserve the merged
+native-worker unknown-outcome/default-reset repair.
+
+The current Fabric seams still do not line up with those owners:
+`stage_reservation(&SwarmDefinition)` is a synchronous definition-level request, while
+the Kernel saga requires an exact durable reservation already bound to work item and
+proposed attempt; `admission_reservation.admit` is an authenticated asynchronous owner
+operation; dispatch egress has no accepted owner binding. Trait presence or a local
+`Bound` constant cannot bridge these facts.
+
+**Release outputs to freeze before a writer claim:**
+
+```text
+1. exact owner stage request/result that binds definition/work item/proposed attempt,
+   claim/executable/route/resource identities, epoch/fence/deadline and reservation id;
+2. daemon-side authenticated client projection for the existing
+   admission_reservation.admit result, including canonical and activation receipts;
+3. dispatch-egress owner operation that durably retains the original dispatch identity,
+   consumes the same active reservation/attempt binding, and preserves unknown outcome;
+4. explicit async composition boundary or accepted async port revision—never
+   block_on inside a synchronous port or a copied active snapshot.
+```
+
+After those outputs exist, assign exact `eliotd` adapters plus the actual Kernel/worker
+consumer files in one serialized turn. Do not wait for whole #1678/#1679/#1680 test
+closure, but do not fabricate their missing owner state either. #1701 remains
+`RECHECK` and holds no broad `eliotd`/Kernel/native-worker reservation.

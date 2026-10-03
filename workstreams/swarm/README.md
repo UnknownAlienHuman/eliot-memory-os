@@ -1,23 +1,36 @@
 # Swarm continuation — #5018
 
-**Executor:** take the row issued to you in [PLAN.tsv](PLAN.tsv), read only its
-[PLAN.md](PLAN.md) card, then your current Issue/discussion and required verified
-documentation/source bundle. Do not load the whole backlog or restart an old lane.
-No row is an actual scope claim until the controller records it.
+**Executor:** take the single row issued to you in [PLAN.tsv](PLAN.tsv) and only the
+matching [PLAN.md](PLAN.md) card. The card is deliberately operational:
+
+```text
+EDIT -> READ ONLY -> START -> MAKE -> DO NOT -> CHECK NOW -> DEFER -> DONE
+```
+
+Then read the current Issue/thread, nearest `AGENTS.md` and the complete verified
+documentation/source bundle for the exact editable paths. Do not load other cards, the
+whole backlog or an old lane. Return the compact handoff specified at the top of
+`PLAN.md`; do not commit a diary or duplicate documentation bundle.
 
 **Controller:** use [CONTINUATION.md](CONTINUATION.md) for claims/integration and
-[STITCH-PLAN.md](STITCH-PLAN.md) for the applicable shared seam or PR disposition.
-Select independently eligible work; do not wait for an unrelated audit to finish.
+[STITCH-PLAN.md](STITCH-PLAN.md) only for the selected assignment's shared seam or PR
+disposition. Resolve exact-file overlaps, record one manager/worktree/branch claim and
+let unrelated work continue. A `READY` row is not a claim, running session or accepted
+result.
+
+The `Not dispatchable yet` section in `PLAN.md` names exact missing owner outputs and
+release conditions. Those entries reserve no files and do not stop the four independent
+READY cards.
 
 Canonical Architecture/Implementation and accepted owner decisions remain authority.
 These files schedule work; they cannot change product contracts or manufacture proof.
 
 [BLOCK-MAP.tsv](BLOCK-MAP.tsv) retains the complete historical inventory.
 [REVIEWED.tsv](REVIEWED.tsv) records bounded rechecks; missing means unreviewed.
-[BLOCK-MAP.md](BLOCK-MAP.md) explains coverage. BLOCKERS-AUDIT.tsv is a finding index,
-not another queue. READY is neither claimed/running nor accepted; PRESERVE prevents
-repeating a repaired defect without claiming fresh proof.
+[BLOCK-MAP.md](BLOCK-MAP.md) explains coverage. `BLOCKERS-AUDIT.tsv` is a finding
+index, not another queue. `PRESERVE` prevents repeating an inspected repair without
+claiming fresh runtime acceptance.
 
-HANDOFF, MANAGER-BRIEF, LANE-HANDOFFS and RECOMMENDATIONS remain historical stop
-records, not current assignments. Full Issue audit, actual reader/CI evidence and
-local runner state are not certified by this planning revision.
+`HANDOFF.md`, `MANAGER-BRIEF.md`, `LANE-HANDOFFS.md` and `RECOMMENDATIONS.md` remain
+historical stop records, not current assignments. Full Issue coverage, genuine reader/
+CI evidence and local runner state are not certified by this planning revision.
