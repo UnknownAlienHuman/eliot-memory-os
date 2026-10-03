@@ -1,0 +1,1089 @@
+{
+  "contract": "F-LOG-KERNEL-3 instrument Kernel process execution and supervision boundaries",
+  "issue": 901,
+  "target": "eliot_kernel::diagnostics",
+  "terminal_event": "kernel.terminal_error",
+  "files": [
+    "bins/eliot-kernel/src/process_execution.rs",
+    "bins/eliot-kernel/src/daemon_process_launch.rs",
+    "bins/eliot-kernel/src/daemon_live_receipt.rs",
+    "bins/eliot-kernel/src/daemon_supervision.rs",
+    "bins/eliot-kernel/src/supervision_lease_authority.rs"
+  ],
+  "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+  "events": {
+    "daemon.launch_committed": "kernel.daemon.launch_committed",
+    "daemon.launch_failed": "kernel.daemon.launch_failed",
+    "daemon.launch_identity_observed": "kernel.daemon.launch_identity_observed",
+    "daemon.launch_requested": "kernel.daemon.launch_requested",
+    "live_receipt.publication_rejected": "kernel.live_receipt.publication_rejected",
+    "live_receipt.publication_replayed": "kernel.live_receipt.publication_replayed",
+    "live_receipt.publication_requested": "kernel.live_receipt.publication_requested",
+    "live_receipt.published": "kernel.live_receipt.published",
+    "live_receipt.readiness_proven": "kernel.live_receipt.readiness_proven",
+    "live_receipt.readiness_rejected": "kernel.live_receipt.readiness_rejected",
+    "live_receipt.readiness_requested": "kernel.live_receipt.readiness_requested",
+    "live_receipt.store_availability_refused": "kernel.live_receipt.store_availability_refused",
+    "live_receipt.validation_observed": "kernel.live_receipt.validation_observed",
+    "live_receipt.validation_requested": "kernel.live_receipt.validation_requested",
+    "process.cancel_acknowledged": "kernel.process.cancel_acknowledged",
+    "process.cancel_failed": "kernel.process.cancel_failed",
+    "process.cancel_rejected": "kernel.process.cancel_rejected",
+    "process.cancel_replayed": "kernel.process.cancel_replayed",
+    "process.cancel_requested": "kernel.process.cancel_requested",
+    "process.cancel_unrecorded": "kernel.process.cancel_unrecorded",
+    "process.descendant_close_failed": "kernel.process.descendant_close_failed",
+    "process.descendant_close_observed": "kernel.process.descendant_close_observed",
+    "process.descendant_close_rejected": "kernel.process.descendant_close_rejected",
+    "process.descendant_close_requested": "kernel.process.descendant_close_requested",
+    "process.effect_baseline_unavailable": "kernel.process.effect_baseline_unavailable",
+    "process.effect_external_transition": "kernel.process.effect_external_transition",
+    "process.effect_ingest_failed": "kernel.process.effect_ingest_failed",
+    "process.effect_observed": "kernel.process.effect_observed",
+    "process.effect_operation_lease_issued": "kernel.process.effect_operation_lease_issued",
+    "process.effect_operation_lease_refused": "kernel.process.effect_operation_lease_refused",
+    "process.effect_readback_deleted": "kernel.process.effect_readback_deleted",
+    "process.effect_readback_failed": "kernel.process.effect_readback_failed",
+    "process.effect_replay_denied": "kernel.process.effect_replay_denied",
+    "process.grant_reconcile_failed": "kernel.process.grant_reconcile_failed",
+    "process.grant_reconcile_rejected": "kernel.process.grant_reconcile_rejected",
+    "process.grant_reconcile_replayed": "kernel.process.grant_reconcile_replayed",
+    "process.grant_reconcile_requested": "kernel.process.grant_reconcile_requested",
+    "process.grant_reconcile_unknown": "kernel.process.grant_reconcile_unknown",
+    "process.inspect_failed": "kernel.process.inspect_failed",
+    "process.inspect_rejected": "kernel.process.inspect_rejected",
+    "process.inspect_reported": "kernel.process.inspect_reported",
+    "process.inspect_requested": "kernel.process.inspect_requested",
+    "process.owner_admitted": "kernel.process.owner_admitted",
+    "process.owner_rejected": "kernel.process.owner_rejected",
+    "process.read_rebuild_manifest_admitted": "kernel.process.read_rebuild_manifest_admitted",
+    "process.reconcile_rejected": "kernel.process.reconcile_rejected",
+    "process.reconcile_reported": "kernel.process.reconcile_reported",
+    "process.reconcile_requested": "kernel.process.reconcile_requested",
+    "process.reconcile_unknown": "kernel.process.reconcile_unknown",
+    "process.request_admitted": "kernel.process.request_admitted",
+    "process.request_failed": "kernel.process.request_failed",
+    "process.request_received": "kernel.process.request_received",
+    "process.request_rejected": "kernel.process.request_rejected",
+    "process.start_committed": "kernel.process.start_committed",
+    "process.start_failed": "kernel.process.start_failed",
+    "process.start_handoff": "kernel.process.start_handoff",
+    "process.start_identity_observed": "kernel.process.start_identity_observed",
+    "process.start_registration": "kernel.process.start_registration",
+    "process.start_replay_observed": "kernel.process.start_replay_observed",
+    "process.start_requested": "kernel.process.start_requested",
+    "supervision.commit_committed": "kernel.supervision.commit_committed",
+    "supervision.commit_failed": "kernel.supervision.commit_failed",
+    "supervision.commit_requested": "kernel.supervision.commit_requested",
+    "supervision.expire_committed": "kernel.supervision.expire_committed",
+    "supervision.expire_failed": "kernel.supervision.expire_failed",
+    "supervision.expire_requested": "kernel.supervision.expire_requested",
+    "supervision.receipt_rejected": "kernel.supervision.receipt_rejected",
+    "supervision.receipt_replaced": "kernel.supervision.receipt_replaced",
+    "supervision.receipt_replayed": "kernel.supervision.receipt_replayed",
+    "supervision.reconciliation_required": "kernel.supervision.reconciliation_required",
+    "supervision.renewal_missed": "kernel.supervision.renewal_missed",
+    "supervision.renewal_recorded": "kernel.supervision.renewal_recorded",
+    "supervision.terminal_committed": "kernel.supervision.terminal_committed",
+    "supervision.terminal_failed": "kernel.supervision.terminal_failed",
+    "supervision.terminal_requested": "kernel.supervision.terminal_requested"
+  },
+  "terminal_codes": {
+    "process": [
+      "process_contract",
+      "process_not_found",
+      "process_unavailable",
+      "process_evidence_sink",
+      "process_unknown_outcome",
+      "WATCHDOG_COVERAGE_UNAVAILABLE"
+    ],
+    "daemon_launch": [
+      "PLATFORM",
+      "TRANSPORT",
+      "RUNTIME",
+      "ORS",
+      "CORE",
+      "SERVICE",
+      "STORE_BOOTSTRAP_REQUIRED",
+      "STORE_ALREADY_CONNECTED",
+      "PRINCIPAL"
+    ],
+    "live_receipt": [
+      "LIVE_INVALID_FIELD",
+      "LIVE_ILLEGAL_TRANSITION",
+      "LIVE_HANDSHAKE_MISMATCH",
+      "LIVE_MISSING_CONTAINMENT",
+      "READINESS_NOT_PROVEN",
+      "LIVE_ADMISSION_CLOSED",
+      "LIVE_GENERATION_FENCED",
+      "LIVE_RESTART_BUDGET_EXHAUSTED",
+      "LIVE_CONTROL_RESERVE_EXHAUSTED",
+      "LIVE_PLATFORM",
+      "LIVE_CORE"
+    ],
+    "supervision": [
+      "SUPERVISION_CONFIGURATION",
+      "SUPERVISION_KEY_UNAVAILABLE",
+      "SUPERVISION_CONTRACT",
+      "SUPERVISION_IDENTITY_CONFLICT",
+      "SUPERVISION_STALE_REVISION",
+      "SUPERVISION_TICKET_EXPIRED",
+      "SUPERVISION_ORS"
+    ]
+  },
+  "boundaries": [
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "record_process_start_receipt_identity",
+      "stage": "handle/PID/start/image observation",
+      "detail_prefix": "kernel.process.start_identity_observed",
+      "event": "kernel.process.start_identity_observed",
+      "covering_case": 10
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "new",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_baseline_unavailable",
+      "event": "kernel.process.effect_baseline_unavailable",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "check_retained_external_transition",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_external_transition",
+      "event": "kernel.process.effect_external_transition",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "check_retained_external_transition",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_external_transition",
+      "event": "kernel.process.effect_external_transition",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "check_retained_external_transition",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_external_transition",
+      "event": "kernel.process.effect_external_transition",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "admit_host_event_hint",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "record_proven_target_transition",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "record_proven_target_transition",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "capture_before",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_baseline_unavailable",
+      "event": "kernel.process.effect_baseline_unavailable",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "capture_before",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_baseline_unavailable",
+      "event": "kernel.process.effect_baseline_unavailable",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "capture_before",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "capture_before",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "read_after",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_readback_failed",
+      "event": "kernel.process.effect_readback_failed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "read_after",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_readback_deleted",
+      "event": "kernel.process.effect_readback_deleted",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "read_after",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_readback_failed",
+      "event": "kernel.process.effect_readback_failed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "read_after",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_readback_failed",
+      "event": "kernel.process.effect_readback_failed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "read_after",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_readback_failed",
+      "event": "kernel.process.effect_readback_failed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 3
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_origin_grant_effect",
+      "stage": "reattachment",
+      "detail_prefix": "kernel.process.grant_reconcile_requested",
+      "event": "kernel.process.grant_reconcile_requested",
+      "covering_case": 24
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_origin_grant_effect",
+      "stage": "reattachment",
+      "detail_prefix": "kernel.process.grant_reconcile_replayed",
+      "event": "kernel.process.grant_reconcile_replayed",
+      "covering_case": 24
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_origin_grant_effect",
+      "stage": "response loss",
+      "detail_prefix": "kernel.process.grant_reconcile_",
+      "event": "",
+      "covering_case": 20
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "capture_governed_effect_baseline",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_baseline_unavailable",
+      "event": "kernel.process.effect_baseline_unavailable",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest_governed_effect_observation",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest_governed_effect_observation",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_observed",
+      "event": "kernel.process.effect_observed",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest_governed_effect_observation",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_ingest_failed",
+      "event": "kernel.process.effect_ingest_failed",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "ingest_governed_effect_observation",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_readback_failed",
+      "event": "kernel.process.effect_readback_failed",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "require_effect_replay_authority",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.effect_replay_denied",
+      "event": "kernel.process.effect_replay_denied",
+      "covering_case": 8
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "require_new_effect_operation_authority",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.read_rebuild_manifest_admitted",
+      "event": "kernel.process.read_rebuild_manifest_admitted",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "require_new_effect_operation_authority",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.effect_operation_lease_issued",
+      "event": "kernel.process.effect_operation_lease_issued",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "require_new_effect_operation_authority",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.effect_operation_lease_refused",
+      "event": "kernel.process.effect_operation_lease_refused",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "start_in_context",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.start_requested",
+      "event": "kernel.process.start_requested",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "start_in_context",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.start_failed",
+      "event": "kernel.process.start_failed",
+      "covering_case": 4
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "start_in_context",
+      "stage": "attempted launch",
+      "detail_prefix": "kernel.process.start_committed",
+      "event": "kernel.process.start_committed",
+      "covering_case": 6
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "start_in_context",
+      "stage": "attempted launch",
+      "detail_prefix": "kernel.process.start_failed",
+      "event": "kernel.process.start_failed",
+      "covering_case": 7
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "inspect_inner",
+      "stage": "exit",
+      "detail_prefix": "kernel.process.inspect_requested",
+      "event": "kernel.process.inspect_requested",
+      "covering_case": 21
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "inspect_inner",
+      "stage": "exit",
+      "detail_prefix": "kernel.process.inspect_rejected",
+      "event": "kernel.process.inspect_rejected",
+      "covering_case": 21
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "inspect_inner",
+      "stage": "exit",
+      "detail_prefix": "kernel.process.inspect_reported",
+      "event": "kernel.process.inspect_reported",
+      "covering_case": 21
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "inspect_inner",
+      "stage": "response loss",
+      "detail_prefix": "kernel.process.inspect_failed",
+      "event": "kernel.process.inspect_failed",
+      "covering_case": 20
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_in_context",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_rejected",
+      "event": "kernel.process.cancel_rejected",
+      "covering_case": 18
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_requested",
+      "event": "kernel.process.cancel_requested",
+      "covering_case": 18
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_rejected",
+      "event": "kernel.process.cancel_rejected",
+      "covering_case": 18
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_rejected",
+      "event": "kernel.process.cancel_rejected",
+      "covering_case": 18
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_rejected",
+      "event": "kernel.process.cancel_rejected",
+      "covering_case": 18
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_replayed",
+      "event": "kernel.process.cancel_replayed",
+      "covering_case": 8
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_failed",
+      "event": "kernel.process.cancel_failed",
+      "covering_case": 19
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_acknowledged",
+      "event": "kernel.process.cancel_acknowledged",
+      "covering_case": 19
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_rejected",
+      "event": "kernel.process.cancel_rejected",
+      "covering_case": 18
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_failed",
+      "event": "kernel.process.cancel_failed",
+      "covering_case": 19
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_unrecorded",
+      "event": "kernel.process.cancel_unrecorded",
+      "covering_case": 19
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "cancel_with_origin_grant_inner",
+      "stage": "cancellation",
+      "detail_prefix": "kernel.process.cancel_acknowledged",
+      "event": "kernel.process.cancel_acknowledged",
+      "covering_case": 19
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_registered_descendant_in_context",
+      "stage": "descendant accounting",
+      "detail_prefix": "kernel.process.descendant_close_requested",
+      "event": "kernel.process.descendant_close_requested",
+      "covering_case": 22
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_registered_descendant_in_context",
+      "stage": "descendant accounting",
+      "detail_prefix": "kernel.process.descendant_close_rejected",
+      "event": "kernel.process.descendant_close_rejected",
+      "covering_case": 22
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_registered_descendant_in_context",
+      "stage": "descendant accounting",
+      "detail_prefix": "kernel.process.descendant_close_observed",
+      "event": "kernel.process.descendant_close_observed",
+      "covering_case": 22
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_registered_descendant_in_context",
+      "stage": "cleanup",
+      "detail_prefix": "kernel.process.descendant_close_failed",
+      "event": "kernel.process.descendant_close_failed",
+      "covering_case": 23
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_all_registered_descendants",
+      "stage": "cleanup",
+      "detail_prefix": "kernel.process.descendant_close_failed",
+      "event": "kernel.process.descendant_close_failed",
+      "covering_case": 23
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_all_registered_descendants",
+      "stage": "cleanup",
+      "detail_prefix": "kernel.process.descendant_close_failed",
+      "event": "kernel.process.descendant_close_failed",
+      "covering_case": 23
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "close_all_registered_descendants",
+      "stage": "cleanup",
+      "detail_prefix": "kernel.process.descendant_close_failed",
+      "event": "kernel.process.descendant_close_failed",
+      "covering_case": 23
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_in_context",
+      "stage": "reattachment",
+      "detail_prefix": "kernel.process.reconcile_requested",
+      "event": "kernel.process.reconcile_requested",
+      "covering_case": 24
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_in_context",
+      "stage": "reattachment",
+      "detail_prefix": "kernel.process.reconcile_rejected",
+      "event": "kernel.process.reconcile_rejected",
+      "covering_case": 24
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_in_context",
+      "stage": "reattachment",
+      "detail_prefix": "kernel.process.reconcile_reported",
+      "event": "kernel.process.reconcile_reported",
+      "covering_case": 24
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reconcile_in_context",
+      "stage": "response loss",
+      "detail_prefix": "kernel.process.reconcile_unknown",
+      "event": "kernel.process.reconcile_unknown",
+      "covering_case": 20
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "run_process_start",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.start_registration",
+      "event": "kernel.process.start_registration",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "run_process_start",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.start_registration",
+      "event": "kernel.process.start_registration",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "run_process_start",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.start_registration",
+      "event": "kernel.process.start_registration",
+      "covering_case": 5
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "run_process_start",
+      "stage": "operation registration",
+      "detail_prefix": "kernel.process.start_replay_observed",
+      "event": "kernel.process.start_replay_observed",
+      "covering_case": 8
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "run_process_start",
+      "stage": "attempted launch",
+      "detail_prefix": "kernel.process.start_handoff",
+      "event": "kernel.process.start_handoff",
+      "covering_case": 6
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "authorize_process_owner_in_context",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.owner_rejected",
+      "event": "kernel.process.owner_rejected",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "authorize_process_owner_in_context",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.owner_admitted",
+      "event": "kernel.process.owner_admitted",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "reject_process_start_without_material_coverage_in_context",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 4
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_received",
+      "event": "kernel.process.request_received",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_admitted",
+      "event": "kernel.process.request_admitted",
+      "covering_case": 2
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 4
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution.rs",
+      "function": "execute_process_request",
+      "stage": "response loss",
+      "detail_prefix": "kernel.process.request_failed",
+      "event": "kernel.process.request_failed",
+      "covering_case": 7
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_process_launch.rs",
+      "function": "launch_eliotd_in_context",
+      "stage": "attempted launch",
+      "detail_prefix": "kernel.daemon.launch_requested",
+      "event": "kernel.daemon.launch_requested",
+      "covering_case": 6
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_process_launch.rs",
+      "function": "launch_eliotd_in_context",
+      "stage": "attempted launch",
+      "detail_prefix": "kernel.daemon.launch_committed",
+      "event": "kernel.daemon.launch_committed",
+      "covering_case": 6
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_process_launch.rs",
+      "function": "launch_eliotd_in_context",
+      "stage": "attempted launch",
+      "detail_prefix": "kernel.daemon.launch_failed",
+      "event": "kernel.daemon.launch_failed",
+      "covering_case": 7
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_process_launch.rs",
+      "function": "launch_eliotd_inner",
+      "stage": "handle/PID/start/image observation",
+      "detail_prefix": "kernel.daemon.launch_identity_observed",
+      "event": "kernel.daemon.launch_identity_observed",
+      "covering_case": 10
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "publish_eliotd_live_receipt",
+      "stage": "daemon receipt request",
+      "detail_prefix": "kernel.live_receipt.publication_requested",
+      "event": "kernel.live_receipt.publication_requested",
+      "covering_case": 12
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "publish_eliotd_live_receipt",
+      "stage": "daemon receipt publication",
+      "detail_prefix": "kernel.live_receipt.publication_replayed",
+      "event": "kernel.live_receipt.publication_replayed",
+      "covering_case": 12
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "publish_eliotd_live_receipt",
+      "stage": "daemon receipt publication",
+      "detail_prefix": "kernel.live_receipt.published",
+      "event": "kernel.live_receipt.published",
+      "covering_case": 12
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "publish_eliotd_live_receipt",
+      "stage": "daemon receipt publication",
+      "detail_prefix": "kernel.live_receipt.publication_rejected",
+      "event": "kernel.live_receipt.publication_rejected",
+      "covering_case": 13
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "verify_published_eliotd_live_receipt",
+      "stage": "daemon receipt validation",
+      "detail_prefix": "kernel.live_receipt.validation_requested",
+      "event": "kernel.live_receipt.validation_requested",
+      "covering_case": 12
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "verify_published_eliotd_live_receipt",
+      "stage": "daemon receipt validation",
+      "detail_prefix": "kernel.live_receipt.validation_observed",
+      "event": "kernel.live_receipt.validation_observed",
+      "covering_case": 12
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "validate_daemon_process_readiness_in_context",
+      "stage": "readiness",
+      "detail_prefix": "kernel.live_receipt.readiness_requested",
+      "event": "kernel.live_receipt.readiness_requested",
+      "covering_case": 14
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "validate_daemon_process_readiness_in_context",
+      "stage": "readiness",
+      "detail_prefix": "kernel.live_receipt.readiness_proven",
+      "event": "kernel.live_receipt.readiness_proven",
+      "covering_case": 14
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "validate_daemon_process_readiness_in_context",
+      "stage": "readiness",
+      "detail_prefix": "kernel.live_receipt.readiness_rejected",
+      "event": "kernel.live_receipt.readiness_rejected",
+      "covering_case": 13
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "self_authored_ready_receipt_in_context",
+      "stage": "readiness",
+      "detail_prefix": "kernel.live_receipt.store_availability_refused",
+      "event": "kernel.live_receipt.store_availability_refused",
+      "covering_case": 13
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "function": "self_authored_ready_receipt_in_context",
+      "stage": "readiness",
+      "detail_prefix": "kernel.live_receipt.store_availability_refused",
+      "event": "kernel.live_receipt.store_availability_refused",
+      "covering_case": 13
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "classify_eliotd_live_receipt_transition_in_context",
+      "stage": "daemon receipt validation",
+      "detail_prefix": "kernel.supervision.receipt_replayed",
+      "event": "kernel.supervision.receipt_replayed",
+      "covering_case": 12
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "classify_eliotd_live_receipt_transition_in_context",
+      "stage": "daemon receipt validation",
+      "detail_prefix": "kernel.supervision.receipt_replaced",
+      "event": "kernel.supervision.receipt_replaced",
+      "covering_case": 17
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "classify_eliotd_live_receipt_transition_in_context",
+      "stage": "daemon receipt validation",
+      "detail_prefix": "kernel.supervision.receipt_replaced",
+      "event": "kernel.supervision.receipt_replaced",
+      "covering_case": 17
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "classify_eliotd_live_receipt_transition_in_context",
+      "stage": "daemon receipt validation",
+      "detail_prefix": "kernel.supervision.receipt_rejected",
+      "event": "kernel.supervision.receipt_rejected",
+      "covering_case": 13
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "note_missed_renewal_in_context",
+      "stage": "supervision lease renew",
+      "detail_prefix": "kernel.supervision.renewal_missed",
+      "event": "kernel.supervision.renewal_missed",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "record_renewed_in_context",
+      "stage": "supervision lease renew",
+      "detail_prefix": "kernel.supervision.renewal_recorded",
+      "event": "kernel.supervision.renewal_recorded",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_supervision.rs",
+      "function": "note_reconciliation_pending_in_context",
+      "stage": "supervision lease renew",
+      "detail_prefix": "kernel.supervision.reconciliation_required",
+      "event": "kernel.supervision.reconciliation_required",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "commit_active_in_context",
+      "stage": "supervision lease acquire",
+      "detail_prefix": "kernel.supervision.commit_requested",
+      "event": "kernel.supervision.commit_requested",
+      "covering_case": 15
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "commit_active_in_context",
+      "stage": "supervision lease acquire",
+      "detail_prefix": "kernel.supervision.commit_committed",
+      "event": "kernel.supervision.commit_committed",
+      "covering_case": 15
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "commit_active_in_context",
+      "stage": "supervision lease acquire",
+      "detail_prefix": "kernel.supervision.commit_failed",
+      "event": "kernel.supervision.commit_failed",
+      "covering_case": 15
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "commit_terminal_in_context",
+      "stage": "supervision lease revoke",
+      "detail_prefix": "kernel.supervision.terminal_requested",
+      "event": "kernel.supervision.terminal_requested",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "commit_terminal_in_context",
+      "stage": "supervision lease revoke",
+      "detail_prefix": "kernel.supervision.terminal_committed",
+      "event": "kernel.supervision.terminal_committed",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "commit_terminal_in_context",
+      "stage": "supervision lease revoke",
+      "detail_prefix": "kernel.supervision.terminal_failed",
+      "event": "kernel.supervision.terminal_failed",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "expire_past_due_lease_with_context",
+      "stage": "supervision lease revoke",
+      "detail_prefix": "kernel.supervision.expire_failed",
+      "event": "kernel.supervision.expire_failed",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "expire_past_due_lease_inner_with_context",
+      "stage": "supervision lease revoke",
+      "detail_prefix": "kernel.supervision.expire_requested",
+      "event": "kernel.supervision.expire_requested",
+      "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/supervision_lease_authority.rs",
+      "function": "expire_past_due_lease_inner_with_context",
+      "stage": "supervision lease revoke",
+      "detail_prefix": "kernel.supervision.expire_committed",
+      "event": "kernel.supervision.expire_committed",
+      "covering_case": 16
+    }
+  ],
+  "canaries": {
+    "command": "CANARY_COMMAND_901",
+    "argument": "CANARY_ARGUMENT_901",
+    "environment": "CANARY_ENVIRONMENT_901",
+    "credential": "CANARY_CREDENTIAL_901",
+    "token": "CANARY_TOKEN_901",
+    "working_path": "CANARY_WORKING_PATH_901",
+    "data_path": "CANARY_DATA_PATH_901",
+    "stream": "CANARY_STREAM_BYTES_901",
+    "provider": "CANARY_PROVIDER_CONTENT_901",
+    "model": "CANARY_MODEL_OUTPUT_901",
+    "user": "CANARY_USER_CONTENT_901",
+    "nested": "{\"level1\":{\"level2\":{\"CANARY_NESTED_901\":[\"CANARY_NESTED_901\",\"CANARY_NESTED_901\"]}}}",
+    "lease_signature": "CANARY_SIGNED_LEASE_901",
+    "process_memory": "CANARY_PROCESS_MEMORY_901",
+    "error_debug": "CANARY_FULL_DEBUG_ERROR_901",
+    "oversized": "CANARY_OVERSIZED_901_oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-"
+  },
+  "inline_tests": [
+    "process_execution_diagnostics_tests",
+    "daemon_supervision_diagnostics_tests"
+  ],
+  "max_field_bytes": 256,
+  "max_detail_bytes": 1024,
+  "note": "Pins the exact five-module production boundary inventory of issue #901 as measured on origin/main@8fb0a426f: git diff 5eac63dc7..8fb0a426f -- bins/eliot-kernel/src/ is empty for these five paths, so the inventory is unchanged from the base where they were last touched (5eac63dc7, #1884), and the two commits origin/main gained after 8fb0a426f (0ec97e52b, f5cc5d2bb) touch neither these five paths nor src/kernel_diagnostics.rs, so the bounds pinned below still hold. Every entry of boundaries is one citable PRODUCTION callsite of observe_process/observe_process_in_context (process_execution.rs), observe_daemon_launch (daemon_process_launch.rs), observe_live_receipt (daemon_live_receipt.rs), observe_supervision (daemon_supervision.rs) or observe_supervision_lease (supervision_lease_authority.rs) in the five files listed by files: 85 in process_execution.rs, 4 in daemon_process_launch.rs, 11 in daemon_live_receipt.rs, 7 in daemon_supervision.rs and 9 in supervision_lease_authority.rs, 116 in total, against 117 measured production callsites. Exactly one of those 117 carries no row: the observe_process forwarder at src/process_execution.rs:67, inside fn observe_process (src/process_execution.rs:65-68), which builds the all-\"unavailable\" operation span at :66 and forwards to observe_process_in_context at :67 instead of instrumenting a boundary of its own; it is still present and is still only a forwarder, so no row is fabricated for it. detail_prefix is the exact fixed event literal that the named callsite passes to the observer and event carries that same literal under the sibling fixture's key name, so the two keys are deliberately redundant, with exactly one exception: at src/process_execution.rs:2403 reconcile_origin_grant_effect passes the local event selected at src/process_execution.rs:2397, :2399 and :2401, so that row's event is the empty string and its detail_prefix is the shared literal prefix kernel.process.grant_reconcile_. The 7 excluded callsites are exactly the ones behind the two test gates: #[cfg(test)] mod process_execution_diagnostics_tests (src/process_execution.rs:4827-4828) holds :4923, :4924 and :4925, and #[cfg(all(test, windows))] mod daemon_supervision_diagnostics_tests (src/daemon_supervision.rs:802-803) holds 4 callsites, :918, :919, :924 and :925. inline_tests names those same two pre-existing diagnostics modules and no other: process_execution_diagnostics_tests holds its single #[test] at src/process_execution.rs:4887 and daemon_supervision_diagnostics_tests holds its single #[test] at src/daemon_supervision.rs:872; both PRE-DATE this delivery, and this work unit authors NO inline test because cards/901.md:14 places the five owned modules under READ ONLY and cards/901.md:20 lists them under DO NOT. stage values are the frozen boundary names of issue-901-body.md:35 rather than tokens carried in the modules' records, because the five observation helpers emit only event and outcome and no detail field at all (src/process_execution.rs:81-87, src/daemon_process_launch.rs:59-65, src/daemon_live_receipt.rs:42-48, src/daemon_supervision.rs:56-62, src/supervision_lease_authority.rs:59-65). covering_case maps each callsite to the issue-901-body.md:49-80 matrix case that observes it, so many callsites share one case; cases 1, 9, 11, 25, 26, 27, 28, 29 and 30 are cross-cutting - the five-file denominator, the changed-payload conflict branch, the PID-reuse branch, one-terminal-per-operation, the typed-code rule, the two canary cases, sink noninterference and the diagnostic-only diff - and therefore own no boundary row. max_field_bytes is the real MAX_DIAGNOSTIC_FIELD_BYTES (src/kernel_diagnostics.rs:59) and is the operative bound for every record these five modules emit, because both the observation helpers and the terminal funnel reach it through bound_field (src/kernel_diagnostics.rs:347-349 and :699-712). max_detail_bytes is the real MAX_DIAGNOSTIC_DETAIL_BYTES (src/kernel_diagnostics.rs:61) but it is NOT the operative limit here: bound_detail is never called from any of the five owned modules, no boundary in them emits a detail field, and observe_terminal_error_in_context bounds its code with bound_field, so no record from these five modules is ever screened against the 1024-byte detail bound. terminal_codes pins the exact static vocabulary of each of the four mappers: process_terminal_code (src/process_execution.rs:236-244) yields process_contract, process_not_found, process_unavailable, process_evidence_sink and process_unknown_outcome; daemon_launch_terminal_code (src/daemon_process_launch.rs:79-91) yields PLATFORM, TRANSPORT, RUNTIME, ORS, CORE, SERVICE, STORE_BOOTSTRAP_REQUIRED, STORE_ALREADY_CONNECTED and PRINCIPAL; live_receipt_terminal_code (src/daemon_live_receipt.rs:95-109) yields LIVE_INVALID_FIELD, LIVE_ILLEGAL_TRANSITION, LIVE_HANDSHAKE_MISMATCH, LIVE_MISSING_CONTAINMENT, READINESS_NOT_PROVEN, LIVE_ADMISSION_CLOSED, LIVE_GENERATION_FENCED, LIVE_RESTART_BUDGET_EXHAUSTED, LIVE_CONTROL_RESERVE_EXHAUSTED, LIVE_PLATFORM and LIVE_CORE; supervision_authority_terminal_code (src/supervision_lease_authority.rs:233-249) yields SUPERVISION_CONFIGURATION, SUPERVISION_KEY_UNAVAILABLE, SUPERVISION_CONTRACT, SUPERVISION_IDENTITY_CONFLICT, SUPERVISION_STALE_REVISION, SUPERVISION_TICKET_EXPIRED and SUPERVISION_ORS. It additionally pins exactly one code emitted on kernel.terminal_error DIRECTLY from these five modules outside any mapper, WATCHDOG_COVERAGE_UNAVAILABLE, passed as a plain local at src/process_execution.rs:4590 from the binding at :4583-4584 whose string literal is ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE (crates/kernel/eliot-kernel-service/src/protocol.rs:2644); it is filed under process because its emitter is process_execution.rs. Every other observe_terminal_error call in the five modules passes one of the four mappers, and src/daemon_supervision.rs emits no terminal error at all, which is why the supervision family maps to supervision_lease_authority.rs. One production gap is recorded here rather than fixed: issue-901-body.md:35 freezes the boundary list \"daemon receipt request/publication/validation/expiry\", but src/daemon_live_receipt.rs contains no expiry observation at all - its 11 production callsites are publication (:146, :163, :169, :182), validation (:456, :462), readiness (:577, :587, :591) and store availability (:829, :902) - so receipt-expiry is a production instrumentation gap in issue #901 rather than a fixture omission, and no fixture row can exist for it until that module gains one, which cards/901.md:14 and cards/901.md:20 forbid here. The canaries are secret-shaped strings a test plants in the admission payload's own fields (executable, argv, working_directory, environment, secret_refs) and then asserts absent from the captured diagnostic bytes, so each can reach the payload if a caller passed it and none of them is emitted by production code; canaries.nested embeds the token inside a three-level nested envelope and canaries.oversized is 320 bytes, strictly longer than the 256-byte max_field_bytes. This fixture pins the boundary inventory only; the 30-case WORK_UNIT_CASE: 901/1..30 matrix belongs to test_file (cards/901.md:18)."
+}
