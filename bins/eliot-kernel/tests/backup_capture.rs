@@ -697,8 +697,11 @@ fn admitted_full_recovery_capture_completes_and_binds_archive() {
         published.bundle_sha256().expect("published digest"),
         report.archive_sha256
     );
-    // No suspended frontier: the receipt identity is the operation itself.
+    // The receipt identity is this capture's own verified publication operation
+    // even though the ORS fence carries one pending operation: a bounded
+    // frontier is reported in its own field, never as a marker in the identity.
     assert_eq!(report.receipt_identity, Some(report.operation_id.clone()));
+    assert_eq!(report.suspended_operation_count, 1);
     // One `captured` disposition per expected member across every domain.
     assert_eq!(
         report_disposition_keys(&report.member_dispositions),
@@ -935,8 +938,8 @@ fn timestamps_alone_fail_and_no_global_transaction_assumed() {
 // WORK_UNIT_CASE: 959/7
 #[test]
 fn controlled_concurrent_mutation_excluded_or_represented() {
-    // Immutable handle: no pending frontier, capture passes clean with the
-    // receipt identity bound to the operation itself.
+    // Immutable handle: no pending frontier, so the observed suspended-operation
+    // count is zero and the receipt identity is bound to the operation itself.
     let mut clean_input = valid_full_input();
     clean_input.ors_snapshot = Some(ors_fence(&base_fence(), Vec::new()));
     let clean_request = to_request(&clean_input, 0);
@@ -947,9 +950,14 @@ fn controlled_concurrent_mutation_excluded_or_represented() {
     assert_eq!(clean.state, CaptureState::Complete);
     assert_eq!(clean.class, BackupClass::FullRecovery);
     assert_eq!(clean.receipt_identity, Some(clean.operation_id.clone()));
+    assert_eq!(clean.suspended_operation_count, 0);
     // Represented frontier: two bounded pending operations recorded exactly;
-    // the capture still completes as FullRecovery and the receipt identity
-    // carries the suspended marker with the declared count.
+    // the capture still completes as FullRecovery, the receipt identity is the
+    // verified PUBLICATION OPERATION IDENTITY — the same shape the clean leg
+    // above proves, because a capture with suspended entries must reference
+    // itself exactly as one without them does — and the observed frontier is
+    // reported separately, as a count in its own typed field rather than as an
+    // identifier invented in place of one.
     let mut frontier_input = valid_full_input();
     frontier_input.ors_snapshot = Some(ors_fence(
         &base_fence(),
@@ -962,7 +970,20 @@ fn controlled_concurrent_mutation_excluded_or_represented() {
         .expect("frontier-recorded capture passes");
     assert_eq!(frontier.state, CaptureState::Complete);
     assert_eq!(frontier.class, BackupClass::FullRecovery);
-    assert_eq!(frontier.receipt_identity, Some("suspended:2".to_owned()));
+    assert_eq!(
+        frontier.receipt_identity,
+        Some(frontier.operation_id.clone())
+    );
+    assert_eq!(frontier.suspended_operation_count, 2);
+    // The receipt identity is the publication reference this capture really
+    // issued — never a marker spelled from the frontier — and a verified
+    // publication is not redefined by a bounded suspended frontier.
+    assert!(
+        !frontier
+            .receipt_identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with("suspended:"))
+    );
 }
 
 // WORK_UNIT_CASE: 959/8
@@ -1155,8 +1176,10 @@ fn references_and_residency_closure_preserved() {
 #[test]
 fn suspended_unresolved_distinguished_from_incoherent() {
     // Bounded unresolved operations with coherent evidence still complete as
-    // FullRecovery and record the suspended marker; unresolved operations are
-    // not archive corruption.
+    // FullRecovery: unresolved operations are not archive corruption, and the
+    // capture keeps its own verified publication operation identity as the
+    // receipt reference. The observed suspended frontier is reported beside it
+    // in its own field, not smuggled into the identity as a marker string.
     let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher::default();
     let report = virgin_coordinator("case")
@@ -1164,7 +1187,8 @@ fn suspended_unresolved_distinguished_from_incoherent() {
         .expect("bounded unresolved with full evidence completes");
     assert_eq!(report.state, CaptureState::Complete);
     assert_eq!(report.class, BackupClass::FullRecovery);
-    assert_eq!(report.receipt_identity, Some("suspended:1".to_owned()));
+    assert_eq!(report.receipt_identity, Some(report.operation_id.clone()));
+    assert_eq!(report.suspended_operation_count, 1);
     // Incoherent ORS material blocks through the fence relation, never as
     // corruption: the error vocabulary carries no corruption flavor.
     let mut incoherent = valid_full_input();
