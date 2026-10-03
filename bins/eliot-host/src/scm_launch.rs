@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use eliot_installation::InstallationProfile;
 use eliot_platform::ServiceState;
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ServiceAccount,
+    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ProcessIdentity, ServiceAccount,
     ServiceBootstrapArguments, ServiceInspectionUnknownDetail, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, WindowsPlatform,
 };
@@ -16,6 +16,7 @@ use uuid::Uuid;
 #[cfg(windows)]
 use super::host_durable_persistence::{sync_dir, write_durable_file};
 use super::{HostError, HostLaunchOptions};
+use crate::host_job_launch::LaunchPhaseCorrelation;
 
 // F-LOG-HOST-3 (#978) SCM launch observation helpers.
 //
@@ -25,31 +26,118 @@ use super::{HostError, HostLaunchOptions};
 // (`super::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open).
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never service
-// names, digests, paths, PIDs, start-times, nonces, or arbitrary error text —
-// so bounding limits size, not sensitivity (I15.4). Sink outcome never alters
-// result/order/status/cleanup. There is no mutable global dedup cache: one
-// terminal emission per failed SCM bootstrap is enforced by the single
-// outermost guard in `validate_host_scm_bootstrap`; `classify_*` and
-// `resolve_*` correlate by stage order only and never emit a terminal. This
-// mirrors the `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891)
-// without touching it.
+// Structured correlation (audit 5910159678, defects 3 and 5): every
+// observation carries a phase token plus the bounded identities its call site
+// already holds, rendered by `crate::host_job_launch::LaunchPhaseCorrelation`
+// through `host_diagnostics::bound_field`. A static label can classify a
+// phase; only a bound installation, plan generation, registration operation,
+// approved configuration digest, path-free process-start identity, and typed
+// cause kind say which owner operation or process incarnation produced the
+// record. Each slot is an already-held non-secret handle, counter, or typed
+// variant name: no path, image name, argv, environment value, credential,
+// nonce, connection string, descriptor payload, or arbitrary `Debug`/`Display`
+// text ever enters a slot, and no probe, lookup, second inspection, or
+// duplicate evaluation of an expression runs to obtain one. A call site that
+// holds none of them binds `LaunchPhaseCorrelation::NONE`, so a missing
+// identity stays explicitly missing instead of being invented. Bounding limits
+// size, not sensitivity (I15.4).
+//
+// Readiness rule: an SCM request, a launched process, a PID, a start mode, and
+// a `START_PENDING` state are request/liveness observations, never readiness.
+// No record in this file claims readiness; semantic readiness stays with the
+// owner that validates the activation receipt.
+//
+// Single terminal: `ScmLaunchTerminalGuard` below keeps owning the one
+// terminal record of one SCM bootstrap validation, because this validation has
+// no outer terminal owner of its own — `main.rs` projects the stop receipt
+// without its own diagnostics terminal, unlike `lib.rs`, which already owns
+// the `host-start-failed` terminal of the launch contour. It therefore stays
+// code-bearing rather than phase-only. `classify_*` and `resolve_*` correlate
+// by order plus the bound identities and never emit a terminal. There is no
+// mutable global dedup cache, and sink outcome never alters
+// result/order/status/cleanup.
 fn scm_launch_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
 }
 
-fn scm_launch_observe(detail: &str) {
+fn scm_launch_observe(phase: &str, correlation: &LaunchPhaseCorrelation<'_>) {
     scm_launch_note_event_log_unavailable();
+    let detail = correlation.render(phase);
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::ScmDispatch,
-        detail,
+        &detail,
     );
 }
 
 fn scm_launch_observe_terminal(code: &str) {
     scm_launch_note_event_log_unavailable();
     super::host_diagnostics::observe_terminal_error(code);
+}
+
+/// Path-free process-start identity of one already-held [`ProcessIdentity`].
+///
+/// A bare PID is reusable, so the process-start identity carries the
+/// handle-observed creation time with it and stays distinguishable across two
+/// incarnations of the same PID. The process `image_path` is deliberately
+/// excluded: a path is never a diagnostic identity (I15.4). Pure projection of
+/// fields the caller already holds — no probe, handle open, or second process
+/// observation runs here.
+fn scm_process_start_identity(process: &ProcessIdentity) -> String {
+    format!(
+        "windows-pid:{pid}:start:{start}",
+        pid = process.process_id,
+        start = process.start_time_100ns
+    )
+}
+
+/// Bounded correlation of one already-held registration request and runtime
+/// inspection.
+///
+/// `operation` is the canonical registration identity the validated request
+/// already carries; `artifact` is the observed registration configuration
+/// digest a `Matching` readback already holds (never an image name or path);
+/// `reason` is the typed cause kind this observation is about, or `None` when
+/// the observation admits bootstrap and therefore fails no cause. A bare
+/// `Unknown` PID is never bound: `process_start` stays absent unless the
+/// caller already holds a real process-start identity and passes it. No probe,
+/// lookup, or re-inspection happens inside.
+fn scm_observed_correlation<'a>(
+    request: &'a ServiceRegistrationRequest,
+    inspection: &'a ServiceRegistrationRuntimeInspection,
+    reason: Option<&'a str>,
+    process_start: Option<&'a str>,
+) -> LaunchPhaseCorrelation<'a> {
+    let mut correlation = LaunchPhaseCorrelation::NONE.with_operation(request.service_name());
+    if let Some(reason) = reason {
+        correlation = correlation.with_reason(reason);
+    }
+    if let ServiceRegistrationRuntimeInspection::Matching { observation } = inspection {
+        correlation = correlation.with_artifact(observation.configuration_digest());
+    }
+    if let Some(process_start) = process_start {
+        correlation = correlation.with_process_start(process_start);
+    }
+    correlation
+}
+
+/// Bounded correlation of the admitted launch identities the caller already
+/// holds: the installation handle, its immutable transaction-plan generation,
+/// and the approved bootstrap config descriptor digest. `registration` is
+/// absent only before the canonical request is built; when present it
+/// contributes the registration operation identity. Never the config
+/// descriptor path, the registration nonce, extra argv, or the service image.
+fn scm_bootstrap_correlation<'a>(
+    launch_options: &'a HostLaunchOptions,
+    registration: Option<&'a ServiceRegistrationRequest>,
+) -> LaunchPhaseCorrelation<'a> {
+    let mut correlation = LaunchPhaseCorrelation::NONE
+        .with_installation(launch_options.installation().as_str())
+        .with_generation(launch_options.transaction_plan_generation())
+        .with_artifact(launch_options.config_descriptor_digest().as_str());
+    if let Some(registration) = registration {
+        correlation = correlation.with_operation(registration.service_name());
+    }
+    correlation
 }
 
 /// Single-terminal guard for one SCM bootstrap validation.
@@ -130,14 +218,25 @@ pub enum HostScmRegistrationCause {
     Unknown { inspection_debug: String },
 }
 
+/// Stable secret-free name of the `absent` cause kind, shared by
+/// [`HostScmRegistrationCause::cause`] and the bounded diagnostic correlation
+/// so a record can never spell a cause the error detail does not.
+const HOST_SCM_CAUSE_ABSENT: &str = "absent";
+/// Stable secret-free name of the `mismatched` cause kind; see
+/// [`HOST_SCM_CAUSE_ABSENT`].
+const HOST_SCM_CAUSE_MISMATCHED: &str = "mismatched";
+/// Stable secret-free name of the `unknown` cause kind; see
+/// [`HOST_SCM_CAUSE_ABSENT`].
+const HOST_SCM_CAUSE_UNKNOWN: &str = "unknown";
+
 impl HostScmRegistrationCause {
     /// Stable machine-readable cause name for stderr/capsule grepability.
     #[must_use]
     pub const fn cause(&self) -> &'static str {
         match self {
-            Self::Absent { .. } => "absent",
-            Self::Mismatched { .. } => "mismatched",
-            Self::Unknown { .. } => "unknown",
+            Self::Absent { .. } => HOST_SCM_CAUSE_ABSENT,
+            Self::Mismatched { .. } => HOST_SCM_CAUSE_MISMATCHED,
+            Self::Unknown { .. } => HOST_SCM_CAUSE_UNKNOWN,
         }
     }
 
@@ -273,46 +372,94 @@ pub fn classify_host_scm_inspection(
 ) -> Option<HostScmRegistrationCause> {
     // WORK_UNIT_CASE: 978/5 — classification requested; request vs observed
     // process and start-identity vs PID stay distinct below.
-    scm_launch_observe("host.scm-launch classification requested");
+    scm_launch_observe(
+        "host.scm-launch classification requested",
+        &scm_observed_correlation(request, inspection, None, None),
+    );
     match inspection {
         ServiceRegistrationRuntimeInspection::Matching { observation }
             if host_runtime_bootstrap_state_is_admissible(observation.state()) =>
         {
             // WORK_UNIT_CASE: 978/5 — start-identity observed: the admissible
             // service identity + state accepts bootstrap; the ephemeral PID is
-            // never identity.
-            scm_launch_observe("host.scm-launch start-identity observed");
+            // never identity. The observed configuration digest and, where a
+            // live process identity is present, its path-free process-start
+            // identity are already held by this readback, so both are bound;
+            // no cause exists, so `reason` stays missing.
+            let process_start = observation.process().map(scm_process_start_identity);
+            scm_launch_observe(
+                "host.scm-launch start-identity observed",
+                &scm_observed_correlation(request, inspection, None, process_start.as_deref()),
+            );
             None
         }
-        ServiceRegistrationRuntimeInspection::Matching { .. } => {
+        ServiceRegistrationRuntimeInspection::Matching { observation } => {
             // WORK_UNIT_CASE: 978/5 — admissible start-identity absent; the
-            // observed state cannot bootstrap.
-            scm_launch_observe("host.scm-launch start-identity unknown");
+            // observed state cannot bootstrap, so this is a fail-closed
+            // liveness observation and never a readiness claim. The same
+            // observed identities plus the typed `unknown` cause kind are
+            // bound from what this readback already holds.
+            let process_start = observation.process().map(scm_process_start_identity);
+            scm_launch_observe(
+                "host.scm-launch start-identity unknown",
+                &scm_observed_correlation(
+                    request,
+                    inspection,
+                    Some(HOST_SCM_CAUSE_UNKNOWN),
+                    process_start.as_deref(),
+                ),
+            );
             Some(HostScmRegistrationCause::Unknown {
                 inspection_debug: format!("{inspection:?}"),
             })
         }
         ServiceRegistrationRuntimeInspection::Absent => {
             // WORK_UNIT_CASE: 978/5 — SCM request observed: the canonical
-            // registration request has no observed process.
-            scm_launch_observe("host.scm-launch request observed");
+            // registration request has no observed process. The correlation
+            // binds the same request-bound identity the cause retains, read
+            // once: the queried registration name and the admitted
+            // configuration digest. No process identity is bound because an
+            // absent registration has none.
+            let configuration_digest = request.expected_configuration_digest();
+            scm_launch_observe(
+                "host.scm-launch request observed",
+                &scm_observed_correlation(request, inspection, Some(HOST_SCM_CAUSE_ABSENT), None)
+                    .with_artifact(&configuration_digest),
+            );
             Some(HostScmRegistrationCause::Absent {
                 service_name: request.service_name().to_owned(),
-                configuration_digest: request.expected_configuration_digest(),
+                configuration_digest,
             })
         }
         ServiceRegistrationRuntimeInspection::Mismatched => {
             // WORK_UNIT_CASE: 978/5 — observed process exists but is not the
-            // requested registration.
-            scm_launch_observe("host.scm-launch process observed");
+            // requested registration. The unit variant carries no observed
+            // digest or process identity, so only the registration operation
+            // and the typed cause kind are bound.
+            scm_launch_observe(
+                "host.scm-launch process observed",
+                &scm_observed_correlation(
+                    request,
+                    inspection,
+                    Some(HOST_SCM_CAUSE_MISMATCHED),
+                    None,
+                ),
+            );
             Some(HostScmRegistrationCause::Mismatched {
                 inspection_debug: format!("{inspection:?}"),
             })
         }
         ServiceRegistrationRuntimeInspection::Unknown { detail } => {
             // WORK_UNIT_CASE: 978/5 — ephemeral PID observation; never
-            // promoted into start-identity.
-            scm_launch_observe("host.scm-launch pid observed");
+            // promoted into start-identity. A bare PID is never bound as a
+            // process-start identity, so `process_start` stays missing and the
+            // request-bound operation plus the typed cause kind carry the
+            // record; re-deriving the admitted configuration digest here would
+            // be a second evaluation, so it stays missing too.
+            scm_launch_observe(
+                "host.scm-launch pid observed",
+                &scm_observed_correlation(request, inspection, Some(HOST_SCM_CAUSE_UNKNOWN), None),
+            );
             // Typed payload carry-over: preserve win32_error/stage/state/pid
             // explicitly via the typed rendering plus Debug verbatim. Both
             // stay bounded through truncate_host_scm_cause downstream.
@@ -369,12 +516,20 @@ trait HostScmBootstrapProbe {
 /// returned as-is so the caller maps it through the existing fail-closed
 /// `Unknown` cause (1066/3). Classification itself stays in
 /// [`classify_host_scm_inspection`], the sole inspection-to-cause mapping site.
+///
+/// `correlation` carries only identities the caller already holds; the loop
+/// borrows it for its two observations and neither inspects extra nor changes
+/// the bounded inspection count.
 fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
     probe: &mut P,
+    correlation: &LaunchPhaseCorrelation<'_>,
 ) -> ServiceRegistrationRuntimeInspection {
     // WORK_UNIT_CASE: 978/13 — deterministic probe schedule requested; the
-    // injected inspection script drives the bounded re-read loop.
-    scm_launch_observe("host.scm-launch probe requested");
+    // injected inspection script drives the bounded re-read loop. The caller
+    // passes the admitted launch/registration identities it already holds, so
+    // both loop records correlate to the exact registration operation instead
+    // of to a static label alone; the loop itself never inspects extra.
+    scm_launch_observe("host.scm-launch probe requested", correlation);
     let mut current = probe.inspect();
     for _ in 1..HOST_SCM_TRANSIENT_MAX_INSPECTIONS {
         let transient = matches!(
@@ -388,9 +543,12 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
         probe.sleep_ms(HOST_SCM_TRANSIENT_RETRY_SLEEP_MS);
         current = probe.inspect();
     }
-    // WORK_UNIT_CASE: 978/5 — settled PID observation; start-identity
-    // admission stays with the classifier, never invented here.
-    scm_launch_observe("host.scm-launch pid observed");
+    // WORK_UNIT_CASE: 978/5 — settled status observation; the observed
+    // configuration digest and process-start identity of this settled
+    // readback, and its typed cause kind, are bound by the classifier, which
+    // is the sole inspection-to-cause mapping site. A bare PID is never bound
+    // here, so a reusable PID cannot masquerade as a start identity.
+    scm_launch_observe("host.scm-launch pid observed", correlation);
     current
 }
 
@@ -441,11 +599,20 @@ pub fn validate_host_scm_bootstrap(
     // WORK_UNIT_CASE: 978/5 — SCM bootstrap requested; the single outermost
     // contour owns the one terminal below (#891 owns nothing here; main.rs
     // ServiceMain projects the stop receipt without its own diagnostics
-    // terminal).
-    scm_launch_observe("host.scm-launch requested");
+    // terminal, so this guard keeps owning it).
+    //
+    // The admitted installation handle, its transaction-plan generation, and
+    // the approved bootstrap config descriptor digest are already in
+    // `launch_options`; the registration operation identity is not built yet
+    // at this point and therefore stays missing rather than being guessed from
+    // a constant.
+    scm_launch_observe(
+        "host.scm-launch requested",
+        &scm_bootstrap_correlation(launch_options, None),
+    );
     // WORK_UNIT_CASE: 978/10 — one terminal across the SCM nesting:
-    // classification and probe correlate by stage order only; only this guard
-    // may emit the SCM unknown code.
+    // classification and probe correlate by stage order plus their bound
+    // identities; only this guard may emit the SCM unknown code.
     let mut scm_terminal = ScmLaunchTerminalGuard::armed("host-scm-launch-unknown");
     let registration_nonce = launch_options.registration_nonce().ok_or_else(|| {
         HostError::Platform("SystemService requires the registration nonce pair".to_owned())
@@ -481,20 +648,24 @@ pub fn validate_host_scm_bootstrap(
         .ok_or_else(|| HostError::Platform("current executable has no parent".to_owned()))?;
     let platform = WindowsPlatform::new(root.to_path_buf())
         .map_err(|error| HostError::Platform(error.to_string()))?;
+    let registration_correlation = scm_bootstrap_correlation(launch_options, Some(&registration));
     let inspection = {
         let mut probe = WindowsScmBootstrapProbe {
             platform: &platform,
             registration: &registration,
         };
-        resolve_host_scm_inspection_with_probe(&mut probe)
+        resolve_host_scm_inspection_with_probe(&mut probe, &registration_correlation)
     };
     if let Some(cause) = classify_host_scm_inspection(&registration, &inspection) {
         return Err(HostError::Platform(cause.detail()));
     }
     scm_terminal.disarm();
     // WORK_UNIT_CASE: 978/5 — SCM request admitted against the observed
-    // start-identity; exact error propagation above is unchanged.
-    scm_launch_observe("host.scm-launch admitted");
+    // start-identity; exact error propagation above is unchanged. Admission is
+    // a registration/liveness fact, never readiness: the observed process
+    // identity and configuration digest of this inspection were already bound
+    // by the classifier record for the same readback.
+    scm_launch_observe("host.scm-launch admitted", &registration_correlation);
     Ok(ValidatedHostScmLaunch {
         bootstrap,
         registration,
@@ -653,7 +824,17 @@ pub fn publish_supervision_record_table(
     host_state_root: &Path,
     table: &SupervisionRecordTable,
 ) -> Result<(), HostError> {
-    scm_launch_observe("host.scm-launch supervision record publish requested");
+    // The publishing installation identity and the Host epoch sequence are
+    // already held in the table; the state root below is a path and stays
+    // unbound, and the five per-component approved digests are the table's own
+    // content rather than one artifact identity of this operation.
+    let record_correlation = LaunchPhaseCorrelation::NONE
+        .with_installation(table.installation.as_str())
+        .with_generation(table.host_epoch_sequence);
+    scm_launch_observe(
+        "host.scm-launch supervision record publish requested",
+        &record_correlation,
+    );
     table.validate().map_err(|error| {
         HostError::Platform(format!("supervision record is not publishable: {error}"))
     })?;
@@ -683,7 +864,10 @@ pub fn publish_supervision_record_table(
     let cleanup = std::fs::remove_file(&tmp);
     let sync_after_cleanup = sync_dir(host_state_root);
     if let Err(publication_error) = publication {
-        scm_launch_observe("host.scm-launch supervision record publication failed");
+        scm_launch_observe(
+            "host.scm-launch supervision record publication failed",
+            &record_correlation,
+        );
         return Err(publication_error);
     }
     match cleanup {
@@ -702,7 +886,10 @@ pub fn publish_supervision_record_table(
             "supervision record readback differs from the published table".to_owned(),
         ));
     }
-    scm_launch_observe("host.scm-launch supervision record published");
+    scm_launch_observe(
+        "host.scm-launch supervision record published",
+        &record_correlation,
+    );
     Ok(())
 }
 
@@ -845,7 +1032,18 @@ pub struct InstalledCandidateReadback {
 pub fn read_installed_candidate_contour(
     spec: &InstalledCandidateSpec,
 ) -> Result<InstalledCandidateReadback, HostError> {
-    scm_launch_observe("host.scm-launch installed candidate readback requested");
+    // The candidate installation identity, its immutable transaction-plan
+    // generation, and the approved candidate config descriptor digest are
+    // already held in `spec`; the candidate image path, config descriptor
+    // path, and state root stay unbound.
+    let candidate_correlation = LaunchPhaseCorrelation::NONE
+        .with_installation(&spec.installation_id)
+        .with_generation(spec.transaction_plan_generation)
+        .with_artifact(&spec.config_descriptor_digest);
+    scm_launch_observe(
+        "host.scm-launch installed candidate readback requested",
+        &candidate_correlation,
+    );
     let bootstrap = ServiceBootstrapArguments::new(
         spec.config_descriptor_path.clone(),
         spec.config_descriptor_digest.clone(),
@@ -908,7 +1106,17 @@ pub fn read_installed_candidate_contour(
                 })
         }
     };
-    scm_launch_observe("host.scm-launch installed candidate readback observed");
+    // The readback is bound to the exact query it made: the canonical
+    // registration operation it inspected under and the admitted configuration
+    // digest it compared against, both already computed above. This stays a
+    // read-only registration observation — it proves the registration contour,
+    // never any service readiness.
+    scm_launch_observe(
+        "host.scm-launch installed candidate readback observed",
+        &candidate_correlation
+            .with_operation(&service_name)
+            .with_artifact(&configuration_digest),
+    );
     Ok(InstalledCandidateReadback {
         service_name,
         configuration_digest,
@@ -1247,7 +1455,8 @@ mod tests {
             ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 4242),
             ServiceRegistrationRuntimeInspection::Absent,
         ]);
-        let settled = resolve_host_scm_inspection_with_probe(&mut probe);
+        let settled =
+            resolve_host_scm_inspection_with_probe(&mut probe, &LaunchPhaseCorrelation::NONE);
         assert_eq!(settled, ServiceRegistrationRuntimeInspection::Absent);
         assert!(
             probe.inspections <= HOST_SCM_TRANSIENT_MAX_INSPECTIONS,
@@ -1295,7 +1504,8 @@ mod tests {
             ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 300),
             ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 4242),
         ]);
-        let settled = resolve_host_scm_inspection_with_probe(&mut exhaust);
+        let settled =
+            resolve_host_scm_inspection_with_probe(&mut exhaust, &LaunchPhaseCorrelation::NONE);
         assert_eq!(exhaust.inspections, HOST_SCM_TRANSIENT_MAX_INSPECTIONS);
         assert_eq!(exhaust.inspections, 5);
         assert_eq!(
@@ -1339,7 +1549,8 @@ mod tests {
             ),
         ] {
             let mut probe = RecordingProbe::with_script([inspection]);
-            let settled = resolve_host_scm_inspection_with_probe(&mut probe);
+            let settled =
+                resolve_host_scm_inspection_with_probe(&mut probe, &LaunchPhaseCorrelation::NONE);
             assert_eq!(
                 probe.inspections, 1,
                 "{expected_cause} must settle with zero retries"
@@ -1361,5 +1572,110 @@ mod tests {
                 "{expected_cause} detail must stay bounded"
             );
         }
+    }
+
+    /// `WORK_UNIT_CASE`: 978/5 — one PID can be reused, so the retained
+    /// process-start identity must separate two incarnations of it, and
+    /// `WORK_UNIT_CASE`: 978/12 — it must carry no image path.
+    #[test]
+    fn process_start_identity_separates_two_incarnations_of_one_pid_and_hides_the_path() {
+        const CANARY_IMAGE: &str = r"C:\canary\service-image.exe";
+        let first = ProcessIdentity {
+            process_id: 4242,
+            start_time_100ns: 133_000_000_000_000_001,
+            image_path: CANARY_IMAGE.to_owned(),
+        };
+        let second = ProcessIdentity {
+            start_time_100ns: 133_000_000_000_000_002,
+            ..first.clone()
+        };
+        let first_identity = scm_process_start_identity(&first);
+        let second_identity = scm_process_start_identity(&second);
+        assert_ne!(
+            first_identity, second_identity,
+            "one reused PID must never yield one process-start identity"
+        );
+        assert!(first_identity.contains("4242"));
+        assert!(first_identity.contains("133000000000000001"));
+        assert!(
+            !first_identity.contains(CANARY_IMAGE),
+            "an image path is never a diagnostic identity: {first_identity}"
+        );
+        assert!(!first_identity.contains("canary"));
+        // The same projection, bound into the correlation the classifier uses,
+        // keeps the process-start slot path-free while the typed cause kind
+        // still names the registration drift.
+        let request = test_registration_request();
+        let mismatched = ServiceRegistrationRuntimeInspection::Mismatched;
+        let detail = scm_observed_correlation(
+            &request,
+            &mismatched,
+            Some(HOST_SCM_CAUSE_MISMATCHED),
+            Some(&first_identity),
+        )
+        .render("host.scm-launch process observed");
+        assert!(detail.contains(&format!("process_start={first_identity}")));
+        assert!(detail.contains("reason=mismatched"));
+        assert!(!detail.contains(CANARY_IMAGE), "{detail}");
+    }
+
+    /// `WORK_UNIT_CASE`: 978/4 — an SCM request and an observed status sample
+    /// are request/liveness observations, never readiness and never a
+    /// process-start identity; `WORK_UNIT_CASE`: 978/13 - the emitted fields are
+    /// deterministic per held identity and differ per typed inspection; and
+    /// `WORK_UNIT_CASE`: 978/12 — no path, argv, or nonce value appears.
+    #[test]
+    fn observed_correlation_binds_held_identity_without_path_nonce_or_bare_pid() {
+        let request = test_registration_request();
+        let service_name = request.service_name();
+        let image_path = request.binary_path().display().to_string();
+        let configuration_digest = request.expected_configuration_digest();
+        let absent = ServiceRegistrationRuntimeInspection::Absent;
+        let pending =
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 4242);
+
+        // An absent registration binds the request-bound identity the cause
+        // retains and no observed process.
+        let absent_detail =
+            scm_observed_correlation(&request, &absent, Some(HOST_SCM_CAUSE_ABSENT), None)
+                .with_artifact(&configuration_digest)
+                .render("host.scm-launch request observed");
+        assert!(absent_detail.contains("phase=host.scm-launch request observed"));
+        assert!(absent_detail.contains(&format!("operation={service_name}")));
+        assert!(absent_detail.contains(&format!("artifact={configuration_digest}")));
+        assert!(absent_detail.contains(&format!("reason={HOST_SCM_CAUSE_ABSENT}")));
+        // `LaunchPhaseCorrelation::render` spells an absent slot explicitly
+        // missing; an absent registration observed no process, so the slot
+        // must read missing rather than carry a guessed identity.
+        assert!(absent_detail.contains("process_start=missing"));
+        assert!(!absent_detail.contains(&image_path), "{absent_detail}");
+        assert!(!absent_detail.contains("ready"), "{absent_detail}");
+
+        // A transient `START_PENDING` sample carries a bare PID; it must stay
+        // unbound rather than pass as a process-start identity.
+        let pending_detail =
+            scm_observed_correlation(&request, &pending, Some(HOST_SCM_CAUSE_UNKNOWN), None)
+                .render("host.scm-launch pid observed");
+        assert!(pending_detail.contains("process_start=missing"));
+        assert!(
+            !pending_detail.contains("4242"),
+            "a bare PID must never be bound: {pending_detail}"
+        );
+        assert!(!pending_detail.contains(&image_path), "{pending_detail}");
+
+        // Deterministic per held inputs, and semantically different per typed
+        // inspection instead of one vacuous field set.
+        let repeated =
+            scm_observed_correlation(&request, &absent, Some(HOST_SCM_CAUSE_ABSENT), None)
+                .with_artifact(&configuration_digest)
+                .render("host.scm-launch request observed");
+        assert_eq!(absent_detail, repeated);
+        let mismatched = ServiceRegistrationRuntimeInspection::Mismatched;
+        let mismatched_detail =
+            scm_observed_correlation(&request, &mismatched, Some(HOST_SCM_CAUSE_MISMATCHED), None)
+                .render("host.scm-launch process observed");
+        assert_ne!(absent_detail, mismatched_detail);
+        assert!(mismatched_detail.contains("reason=mismatched"));
+        assert!(mismatched_detail.contains("process_start=missing"));
     }
 }

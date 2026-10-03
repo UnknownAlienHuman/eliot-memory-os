@@ -2,7 +2,7 @@
   "contract": "F-LOG-HOST-3 launch + retained-artifact diagnostics",
   "issue": 978,
   "target": "eliot_host::diagnostics",
-  "note": "Writer-AB slice (launch + options + artifact lease + descriptor validation) through the #889 facade. Inner launch phases are Writer-AB owned; sibling CD files (scm_launch, store_kernel_launch_sequence, kernel_activation_driver, kernel_front_door_client) are pinned only by frozen boundary shapes, never diagnostic strings. Production callsites pass static literals only; sink outcome never alters result/order/status/cleanup. Package fixtures never claim live launch. Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the seam is typed-Unavailable, never FFI, never faked.",
+  "note": "Every case in tests/host_launch_diagnostics.rs is an execution of instrumented production code through an existing public seam of the eliot_host library target (HostLaunchOptions::{parse,parse_system_service,validate_service_main_argv}, classify_host_scm_inspection, validate_host_scm_bootstrap driven to its pre-SCM refusal). The facade is never called directly from the test target, so no expected log record is hand-constructed and no case compares the facade to itself. Records are read back out of a scoped tracing subscriber after real production code ran. Boundaries whose owner is a private module behind pub(super) items (host_job_launch, launch_artifact_lease, launch_descriptor_validation, store_kernel_launch_sequence, kernel_activation_driver, kernel_front_door_client) are proven by inline #[cfg(test)] cases in their owning file; the integration case names the owner and asserts the private source binding. Audit 5910159678: the two false readiness phase tokens are retired (see renamed_phase_tokens) and the frozen structured correlation now carries the owner-held identities. Sink outcome never alters result/order/status/cleanup. Package fixtures never claim live launch. Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the seam is typed-Unavailable, never FFI, never faked.",
   "stages": {
     "startup": "startup",
     "launch_config": "launch_config"
@@ -10,8 +10,48 @@
   "entrypoint_event": "host.entrypoint_stage",
   "terminal_event": "host.terminal_error",
   "terminal_codes": {
-    "launch_failed": "host-launch-failed"
+    "host_start_failed": "host-start-failed",
+    "scm_bootstrap_unknown": "host-scm-launch-unknown"
   },
+  "single_terminal_ruling": {
+    "physical_launch_guard": "phase-only",
+    "host_start_failed": "host-start-failed",
+    "host_start_failed_owner": "lib.rs HostTerminalGuard (BOUNDARY_START_TERMINAL), the single terminal for one failed physical launch",
+    "scm_bootstrap_unknown": "host-scm-launch-unknown",
+    "scm_bootstrap_unknown_owner": "scm_launch.rs ScmLaunchTerminalGuard, the single terminal for one failed SCM bootstrap validation, a different operation from a physical launch",
+    "note": "The former host-launch-failed code is gone: HostLaunchTerminalGuard in host_job_launch.rs became phase-only so one failed launch emits exactly one host.terminal_error record. Exactly one of the eight instrumented files may still call observe_terminal_error."
+  },
+  "correlation_keys": [
+    "phase",
+    "installation",
+    "generation",
+    "operation",
+    "artifact",
+    "process_start",
+    "fence",
+    "reason"
+  ],
+  "correlation_missing_markers": [
+    "installation=missing",
+    "generation=missing",
+    "operation=missing",
+    "artifact=missing",
+    "process_start=missing",
+    "fence=missing",
+    "reason=missing"
+  ],
+  "correlation_contract": "Every phase detail is rendered by LaunchPhaseCorrelation::render(phase) as single-space separated key=value pairs in correlation_keys order, phase first. Each &str value is bounded by host_diagnostics::bound_field; an identity the call site does not hold renders as the shared 'missing' value, so the emitted text carries exactly the markers listed in correlation_missing_markers ('<slot>=missing'), and is never invented, guessed from a constant, or left empty. The vocabulary has no pid slot: a reusable process id can never be recorded as a process-start identity.",
+  "renamed_phase_tokens": {
+    "store_liveness": "host.store-launch store-liveness-proven observed",
+    "kernel_launched": "host.kernel-launch kernel-launched observed",
+    "retired_tokens": [
+      "host.store-launch store-ready observed",
+      "host.kernel-launch kernel-ready observed"
+    ],
+    "readiness_owner": "src/kernel_activation_driver.rs DurableKernelActivationDriver::active is the only path allowed to emit a readiness claim",
+    "note": "The Store barrier is the caller's StoreLivenessEvidence (exact Job membership plus a running process) and the Kernel record fires right after launch_kernel returned a child handle. Both are physical liveness, never semantic readiness."
+  },
+  "readiness_owner_file": "src/kernel_activation_driver.rs",
   "launch_options_details": [
     "host.launch-options parse requested",
     "host.launch-options parse admitted",
@@ -35,13 +75,23 @@
     "host.launch retained lease bound",
     "host.launch image identity preserved",
     "host.launch image identity admitted",
+    "host.launch process identity unobservable",
+    "host.launch retained child identity degenerate",
     "host.launch admitted",
     "host.launch typed rejection",
     "host.launch working directories requested",
     "host.launch working directories admitted",
     "host.launch working directory typed rejection",
     "host.launch start requested",
-    "host.launch start admitted"
+    "host.launch start admitted",
+    "host.launch start failed observed",
+    "host.launch profile roots rejected",
+    "host.launch store endpoint configuration rejected",
+    "host.launch store endpoint free",
+    "host.launch store endpoint collision observed",
+    "host.launch store endpoint owner unobservable",
+    "host.launch store endpoint owner unreadable",
+    "host.launch retained store endpoint owner observed"
   ],
   "launch_artifact_details": [
     "host.launch-artifact locator requested",
@@ -74,6 +124,49 @@
     "host.launch-descriptor eliotd admitted",
     "host.launch-descriptor eliotd typed rejection"
   ],
+  "sibling_phase_details": [
+    "host.scm-launch requested",
+    "host.scm-launch admitted",
+    "host.scm-launch classification requested",
+    "host.scm-launch start-identity observed",
+    "host.scm-launch start-identity unknown",
+    "host.scm-launch pid observed",
+    "host.scm-launch request observed",
+    "host.scm-launch process observed",
+    "host.scm-launch probe requested",
+    "host.store-launch requested",
+    "host.store-launch store-dead observed",
+    "host.store-launch store-unknown observed",
+    "host.store-launch store-liveness-proven observed",
+    "host.kernel-launch requested",
+    "host.kernel-launch kernel-launched observed",
+    "host.kernel-activation resume requested",
+    "host.kernel-activation bind requested",
+    "host.kernel-activation candidate observed",
+    "host.kernel-activation nonce requested",
+    "host.kernel-activation nonce issued",
+    "host.kernel-activation activating requested",
+    "host.kernel-activation readiness requested",
+    "host.kernel-activation readiness observed",
+    "host.kernel-activation activation observed",
+    "host.kernel-activation fail observed",
+    "host.kernel-front-door handshake requested",
+    "host.kernel-front-door handshake observed",
+    "host.kernel-front-door auth requested",
+    "host.kernel-front-door authenticated peer observed",
+    "host.kernel-front-door control requested",
+    "host.kernel-front-door activation observed",
+    "host.kernel-front-door reconcile requested",
+    "host.kernel-front-door before-start observed",
+    "host.kernel-front-door timeout observed",
+    "host.kernel-front-door disconnect observed",
+    "host.kernel-front-door unknown observed"
+  ],
+  "retired_phase_tokens": [
+    "host.store-launch store-ready observed",
+    "host.kernel-launch kernel-ready observed",
+    "host-launch-failed"
+  ],
   "frozen_sibling_boundaries": [
     "fn validate_host_scm_bootstrap",
     "fn classify_host_scm_inspection",
@@ -98,21 +191,26 @@
     "Debug",
     "env="
   ],
+  "correlation_slot_canaries": [
+    "--config-descriptor",
+    "--host-state-root",
+    "--registration-nonce"
+  ],
   "cases": {
-    "1": "eight-file callsite/propagation/terminal-boundary denominator",
-    "2": "options/descriptor typed rejection vs admitted launch",
-    "3": "retained identity on substitution failure",
-    "4": "launch request vs process identity vs readiness distinct",
-    "5": "SCM request vs observed process; start-identity vs PID distinct",
-    "6": "Store-before-Kernel observed separately (Store-ready vs Kernel-ready)",
-    "7": "nonce/handshake/auth vs activation distinct with no secrets",
-    "8": "readiness needs owner evidence, never liveness alone",
-    "9": "before-start vs timeout/disconnect/unknown distinct",
-    "10": "one terminal across nesting, outermost contour only",
-    "11": "sink failure/drop leaves operation identical",
-    "12": "secret/argv/env canaries absent",
-    "13": "deterministic semantic fields under injected schedules",
-    "14": "actual-path and diff guard (integrator)"
+    "1": "complete eight-file source/terminal-boundary/test mapping bound to real source and to the executed public seams",
+    "2": "options/descriptor typed rejection vs admitted launch, with the exact typed reason per argv defect",
+    "3": "retained identity preserved exactly across a substitution failure, with no path value in the record",
+    "4": "SCM request vs observed process vs readiness, each from its own executed inspection",
+    "5": "SCM request identity vs reusable pid, proved from two executed classifications",
+    "6": "Store-before-Kernel order read from emitted records; the private sequence order is the inline owner case",
+    "7": "nonce/handshake/auth vs activation distinct with no secret output; the nonce boundary is executed",
+    "8": "readiness never claimed by an executed launch or SCM boundary; only the activation owner may claim it",
+    "9": "before-start refusal vs possible-start unsettled vs settled failure, each from its own execution",
+    "10": "exactly one terminal record per failed operation across the nested SCM caller propagation",
+    "11": "sink drop and sink failure leave call count, order, result, retained handles and cleanup identical",
+    "12": "argv/env/credential/path/nonce/source/user canaries absent from every emitted record and every source literal",
+    "13": "deterministic semantic correlation fields under two identical injected inspection schedules",
+    "14": "actual-path and diff guard: no unsafe, no direct logging facade, no second terminal emitter, no readiness outside its owner"
   },
   "event_log_sink": "unavailable",
   "event_log_source": "EliotHost",
@@ -126,6 +224,8 @@
     "no_mutable_global_dedup": true,
     "single_terminal_per_failed_op": true,
     "no_new_logging_subsystem": true,
-    "no_unowned_file_changes": true
+    "no_unowned_file_changes": true,
+    "no_readiness_outside_activation_owner": true,
+    "no_hand_constructed_expected_records": true
   }
 }
