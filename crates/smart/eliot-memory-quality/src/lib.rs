@@ -1126,14 +1126,14 @@ pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-s
 
 /// Freeze identity this consumer package builds against.
 ///
-/// Repointed to the r12 candidate under `CC-W2-CONSUMER-REPIN`, which
+/// Repointed to the r13 candidate under `CC-W2-CONSUMER-REPIN`, which
 /// enumerates this exact constant together with "its self-comparison assertion"
 /// as a pin that must move in the same work unit as any freeze byte change.
 /// The string alone proves nothing about the bytes, so it is only ever read
 /// next to [`CONSUMED_FREEZE_DIGEST`]; the previous r8 pin and its
 /// identical-literal self-comparison were removed because a constant compared
 /// with itself can never detect the freeze moving under it.
-pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12";
+pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r13";
 
 /// Lowercase sha256 over the exact [`FREEZE_BYTES`] this consumer is bound to.
 ///
@@ -1148,7 +1148,7 @@ pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-202
 /// string pins without the byte digest pin" as a forbidden workaround, which is
 /// why this constant exists next to [`CONSUMED_FREEZE_ID`].
 pub const CONSUMED_FREEZE_DIGEST: &str =
-    "eeb5449712a373c1087496005b97007f8632a885952c812152c46ea537857596";
+    "8a1205fbfac8f1e8a597181ebca6d788d00f5fbe5c5e8fe6bf1051604ed45fe6";
 
 /// Read the single column-0 `freeze_id` the freeze bytes declare.
 ///
