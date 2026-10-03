@@ -78,6 +78,7 @@ use eliot_store_api::{
     StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, WriteReceipt,
     WriteReceiptStatus,
 };
+use eliot_store_surreal_adapter::SnapshotBudgetDiagnostics;
 
 use crate::{CompatibilityVerdict, Request, Response, SERVICE_NAME};
 
@@ -1334,5 +1335,254 @@ pub fn report_events(log: &BoundedEventLog) {
     }
     for event in log {
         let _ = writeln!(std::io::stderr(), "{SERVICE_NAME}: {event}");
+    }
+}
+
+/// Closed vocabulary and order of the snapshot budget's accounted
+/// dimensions. The projection compares adapter-provided labels against this
+/// list and never renders those public strings directly.
+const SNAPSHOT_BUDGET_FIELDS: [&str; 8] = [
+    "snapshot.budget.v1.begins_in_progress",
+    "snapshot.budget.v1.live_captures",
+    "snapshot.budget.v1.retained_bytes",
+    "snapshot.budget.v1.terminal_entries",
+    "snapshot.budget.v1.terminal_bytes",
+    "snapshot.budget.v1.enumeration_bytes",
+    "snapshot.budget.v1.active_page_calls",
+    "snapshot.budget.v1.cleanup_steps",
+];
+const SNAPSHOT_BUDGET_BYTE_LABEL: &str =
+    "byte values are conservative snapshot.budget.v1 charges, not actual RSS/heap measurements; ";
+
+/// Fixed, bounded view of the adapter's snapshot-budget counters. Byte values
+/// are conservative `snapshot.budget.v1` charges, not RSS or heap measurements.
+///
+/// Unusable accounting and inconsistent numeric values retain only fixed-order
+/// recorded counters, with every remaining value unknown. A label/order mismatch
+/// produces a fixed marker so counters cannot be attributed to another dimension.
+/// Caller-provided field strings are never rendered.
+enum SnapshotBudgetProjection<'a> {
+    AccountingUnusable(&'a SnapshotBudgetDiagnostics),
+    Inconsistent(&'a SnapshotBudgetDiagnostics),
+    DimensionLabelsInvalid(bool),
+    Dimensions(&'a SnapshotBudgetDiagnostics),
+}
+
+impl<'a> SnapshotBudgetProjection<'a> {
+    fn from_diagnostics(diagnostics: &'a SnapshotBudgetDiagnostics) -> Self {
+        for (field, dimension) in SNAPSHOT_BUDGET_FIELDS
+            .iter()
+            .zip(diagnostics.dimensions.iter())
+        {
+            if dimension.field != *field {
+                return Self::DimensionLabelsInvalid(diagnostics.accounting_usable);
+            }
+        }
+
+        for dimension in &diagnostics.dimensions {
+            if dimension.charged > dimension.limit
+                || dimension.high_water < dimension.charged
+                || dimension.high_water > dimension.limit
+            {
+                return Self::Inconsistent(diagnostics);
+            }
+        }
+
+        if !diagnostics.accounting_usable {
+            return Self::AccountingUnusable(diagnostics);
+        }
+
+        for dimension in &diagnostics.dimensions {
+            if let Some(remaining) = dimension.remaining
+                && dimension.limit.checked_sub(dimension.charged) != Some(remaining)
+            {
+                return Self::Inconsistent(diagnostics);
+            }
+        }
+
+        Self::Dimensions(diagnostics)
+    }
+}
+
+impl fmt::Display for SnapshotBudgetProjection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AccountingUnusable(diagnostics) => {
+                write_recorded_dimensions(formatter, diagnostics, "unknown")
+            }
+            Self::Inconsistent(diagnostics) => {
+                write_recorded_dimensions(formatter, diagnostics, "inconsistent")
+            }
+            Self::DimensionLabelsInvalid(accounting_usable) => {
+                formatter.write_str(SNAPSHOT_BUDGET_BYTE_LABEL)?;
+                write!(
+                    formatter,
+                    "accounting_usable={accounting_usable} state=inconsistent"
+                )
+            }
+            Self::Dimensions(diagnostics) => {
+                let state = if diagnostics
+                    .dimensions
+                    .iter()
+                    .any(|dimension| dimension.remaining.is_none())
+                {
+                    "partial"
+                } else {
+                    "healthy"
+                };
+                formatter.write_str(SNAPSHOT_BUDGET_BYTE_LABEL)?;
+                write!(formatter, "accounting_usable=true state={state}")?;
+                for (field, dimension) in SNAPSHOT_BUDGET_FIELDS
+                    .iter()
+                    .zip(diagnostics.dimensions.iter())
+                {
+                    write!(
+                        formatter,
+                        " {field}{{limit={},charged={},high_water={},remaining=",
+                        dimension.limit, dimension.charged, dimension.high_water
+                    )?;
+                    match dimension.remaining {
+                        Some(remaining) => write!(formatter, "{remaining}")?,
+                        None => formatter.write_str("unknown")?,
+                    }
+                    formatter.write_str("}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn write_recorded_dimensions(
+    formatter: &mut fmt::Formatter<'_>,
+    diagnostics: &SnapshotBudgetDiagnostics,
+    state: &str,
+) -> fmt::Result {
+    formatter.write_str(SNAPSHOT_BUDGET_BYTE_LABEL)?;
+    write!(
+        formatter,
+        "accounting_usable={} state={state}; recorded charges",
+        diagnostics.accounting_usable
+    )?;
+    for (field, dimension) in SNAPSHOT_BUDGET_FIELDS
+        .iter()
+        .zip(diagnostics.dimensions.iter())
+    {
+        write!(
+            formatter,
+            " {field}{{limit_recorded={},charged_recorded={},high_water_recorded={},remaining=unknown}}",
+            dimension.limit, dimension.charged, dimension.high_water
+        )?;
+    }
+    Ok(())
+}
+
+/// Reports the bounded snapshot-budget projection to the installed startup
+/// diagnostic sink. The output contains only fixed dimension labels and
+/// numeric values; it retains no capture payload or identity.
+pub fn report_snapshot_budget(diagnostics: &SnapshotBudgetDiagnostics) {
+    if !startup_subscriber_installed() {
+        return;
+    }
+    let projection = SnapshotBudgetProjection::from_diagnostics(diagnostics);
+    let _ = writeln!(std::io::stderr(), "{SERVICE_NAME}: {projection}");
+}
+
+#[cfg(test)]
+mod snapshot_budget_tests {
+    use super::{SNAPSHOT_BUDGET_FIELDS, SnapshotBudgetProjection};
+    use eliot_store_surreal_adapter::{SnapshotBudgetDiagnostics, SnapshotBudgetDimension};
+
+    fn healthy_diagnostics() -> SnapshotBudgetDiagnostics {
+        SnapshotBudgetDiagnostics {
+            accounting_usable: true,
+            dimensions: std::array::from_fn(|index| SnapshotBudgetDimension {
+                field: SNAPSHOT_BUDGET_FIELDS[index],
+                limit: 8,
+                charged: 3,
+                high_water: 5,
+                remaining: Some(5),
+            }),
+        }
+    }
+
+    #[test]
+    fn healthy_budget_projection_keeps_the_fixed_order_and_values() {
+        let rendered =
+            SnapshotBudgetProjection::from_diagnostics(&healthy_diagnostics()).to_string();
+
+        assert!(rendered.contains("accounting_usable=true state=healthy"));
+        assert!(rendered.contains(
+            "byte values are conservative snapshot.budget.v1 charges, not actual RSS/heap measurements"
+        ));
+        assert!(rendered.contains(
+            "snapshot.budget.v1.begins_in_progress{limit=8,charged=3,high_water=5,remaining=5}"
+        ));
+        let positions = SNAPSHOT_BUDGET_FIELDS.map(|field| rendered.find(field));
+        assert!(positions.iter().all(Option::is_some));
+        assert!(positions.windows(2).all(|window| window[0] < window[1]));
+    }
+
+    #[test]
+    fn unusable_accounting_projects_unknown_without_zero_headroom() {
+        let mut diagnostics = healthy_diagnostics();
+        diagnostics.accounting_usable = false;
+        diagnostics.dimensions[0].remaining = Some(0);
+
+        let rendered = SnapshotBudgetProjection::from_diagnostics(&diagnostics).to_string();
+
+        assert!(rendered.contains("accounting_usable=false state=unknown; recorded charges"));
+        assert!(rendered.contains(
+            "snapshot.budget.v1.begins_in_progress{limit_recorded=8,charged_recorded=3,high_water_recorded=5,remaining=unknown}"
+        ));
+        assert!(!rendered.contains("remaining=0"));
+    }
+
+    #[test]
+    fn unknown_remaining_is_not_projected_as_zero() {
+        let mut diagnostics = healthy_diagnostics();
+        diagnostics.dimensions[0].remaining = None;
+
+        let rendered = SnapshotBudgetProjection::from_diagnostics(&diagnostics).to_string();
+
+        assert!(rendered.contains("accounting_usable=true state=partial"));
+        assert!(rendered.contains(
+            "snapshot.budget.v1.begins_in_progress{limit=8,charged=3,high_water=5,remaining=unknown}"
+        ));
+    }
+
+    #[test]
+    fn inconsistent_numeric_accounting_is_not_projected_as_headroom() {
+        let mut diagnostics = healthy_diagnostics();
+        diagnostics.dimensions[0].remaining = Some(0);
+
+        let rendered = SnapshotBudgetProjection::from_diagnostics(&diagnostics).to_string();
+
+        assert!(rendered.contains("accounting_usable=true state=inconsistent"));
+        assert!(!rendered.contains("remaining=0"));
+
+        let mut impossible_peak = healthy_diagnostics();
+        impossible_peak.dimensions[0].high_water = 9;
+
+        let rendered_peak =
+            SnapshotBudgetProjection::from_diagnostics(&impossible_peak).to_string();
+
+        assert!(rendered_peak.contains("accounting_usable=true state=inconsistent"));
+        assert!(rendered_peak.contains("high_water_recorded=9,remaining=unknown"));
+        assert!(!rendered_peak.contains("remaining=0"));
+    }
+
+    #[test]
+    fn unusable_accounting_with_forged_dimension_is_not_attributed() {
+        let mut diagnostics = healthy_diagnostics();
+        diagnostics.accounting_usable = false;
+        diagnostics.dimensions[0].field = "captured payload or forged field";
+
+        let rendered = SnapshotBudgetProjection::from_diagnostics(&diagnostics).to_string();
+
+        assert!(rendered.contains("accounting_usable=false state=inconsistent"));
+        assert!(!rendered.contains("captured payload or forged field"));
+        assert!(!rendered.contains("charged_recorded="));
+        assert!(!rendered.contains("remaining=0"));
     }
 }

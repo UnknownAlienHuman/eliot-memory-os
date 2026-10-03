@@ -275,19 +275,9 @@ impl GovernorConfig {
             });
         }
 
-        let bind = self.db.surreal.bind.to_ascii_lowercase();
-        if !bind.starts_with("127.0.0.1:") {
-            return Err(ConfigError::ForbiddenDbBind {
-                bind: self.db.surreal.bind.clone(),
-            });
-        }
-
-        let endpoint = self.db.surreal.endpoint.to_ascii_lowercase();
-        if !endpoint.starts_with("ws://127.0.0.1:") || !endpoint.ends_with("/rpc") {
-            return Err(ConfigError::ForbiddenDbEndpoint {
-                endpoint: self.db.surreal.endpoint.clone(),
-            });
-        }
+        // #3980: one whole-grammar predicate, shared with the supervisor and the
+        // RPC transport, runs here before the storage/capability effects below.
+        self.db.surreal.validate_local_rpc_endpoint()?;
 
         let storage = self.db.surreal.storage.to_ascii_lowercase();
         if !storage.starts_with("rocksdb:") || storage.starts_with("rocksdb://") {
@@ -353,6 +343,86 @@ impl SurrealServerConfig {
         }
         Ok(())
     }
+
+    /// #3980: the closed local-only grammar for `bind` and `endpoint`. This is
+    /// the single owner of the allowed form, and it parses the **whole** input
+    /// rather than matching a prefix and a suffix.
+    ///
+    /// The accepted grammar is exactly:
+    ///
+    /// * `bind` == `127.0.0.1:<port>`
+    /// * `endpoint` == `ws://127.0.0.1:<port>/rpc`
+    ///
+    /// where `<port>` is a non-empty run of ASCII digits `0`..=`9` that parses
+    /// as `u16` (leading zeros are an accepted encoding; `0` is a valid port;
+    /// runs that overflow `u16` are out of range). Nothing remains after the
+    /// literal `/rpc`, so userinfo/`@`, any other address or hostname, extra
+    /// path components, a query, a fragment, whitespace or control characters,
+    /// and an empty/non-numeric/signed port are all refused rather than
+    /// normalised. A rejected external address is never rewritten to loopback:
+    /// this repair adds no DNS, no alternate loopback alias, and no second
+    /// transport.
+    ///
+    /// Declared accepted compatibility, preserved exactly and not broadened:
+    /// the grammar is matched against an ASCII-lowercased copy, so `WS://`
+    /// and `/RPC` spellings remain accepted exactly as the previous
+    /// lowercasing check accepted them.
+    ///
+    /// The rejected value is never echoed (a refused userinfo component can
+    /// carry secret material), so the two variants are payload-free.
+    pub fn validate_local_rpc_endpoint(&self) -> Result<(), ConfigError> {
+        if local_bind_port(&self.bind).is_none() {
+            return Err(ConfigError::ForbiddenDbBind);
+        }
+        if local_rpc_endpoint_port(&self.endpoint).is_none() {
+            return Err(ConfigError::ForbiddenDbEndpoint);
+        }
+        Ok(())
+    }
+
+    /// #3980: the port this endpoint actually names, when it satisfies
+    /// `validate_local_rpc_endpoint`; `None` otherwise. Single owner of the
+    /// grammar's parse, so the transport never re-parses it.
+    #[must_use]
+    pub fn local_rpc_port(&self) -> Option<u16> {
+        local_rpc_endpoint_port(&self.endpoint)
+    }
+}
+
+/// The one literal IPv4 socket address the grammar admits. A hostname, another
+/// loopback alias, or any other address is not resolved and not substituted.
+const LOCAL_BIND_ADDRESS: &str = "127.0.0.1";
+
+/// #3980: the single `<port>` grammar both shapes share: a non-empty run of
+/// ASCII digits that also parses as `u16`.
+fn local_port(port: &str) -> Option<u16> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// #3980: parses `127.0.0.1:<port>` and returns the port. The address must be
+/// the whole literal prefix, so `127.0.0.1.example.com`, `127.0.0.2`,
+/// `[::1]`, a scheme, and userinfo all fail here rather than being normalised.
+fn local_bind_port(bind: &str) -> Option<u16> {
+    let bind = bind.to_ascii_lowercase();
+    let port = bind.strip_prefix(LOCAL_BIND_ADDRESS)?.strip_prefix(':')?;
+    local_port(port)
+}
+
+/// #3980: parses `ws://127.0.0.1:<port>/rpc` and returns the port. The scheme
+/// and address are consumed, then the exact final `/rpc` is consumed with no
+/// permitted remainder, so a query, a fragment, extra path components, and any
+/// userinfo before the address are all refused.
+fn local_rpc_endpoint_port(endpoint: &str) -> Option<u16> {
+    let endpoint = endpoint.to_ascii_lowercase();
+    let rest = endpoint.strip_prefix("ws://")?;
+    let port = rest
+        .strip_prefix(LOCAL_BIND_ADDRESS)?
+        .strip_prefix(':')?
+        .strip_suffix("/rpc")?;
+    local_port(port)
 }
 
 impl Default for GovernorConfig {
@@ -560,5 +630,378 @@ mod tests {
         let explicit: CredentialProviderKind = serde_json::from_str("\"legacy_password_file\"")?;
         assert_eq!(explicit, CredentialProviderKind::LegacyPasswordFile);
         Ok(())
+    }
+
+    /// #3980 fixture: the default local socket pair with only `bind` and
+    /// `endpoint` substituted, so each case below varies one field and nothing
+    /// else.
+    fn local_server_config(bind: &str, endpoint: &str) -> SurrealServerConfig {
+        let mut config = GovernorConfig::default();
+        config.db.surreal.bind = bind.to_owned();
+        config.db.surreal.endpoint = endpoint.to_owned();
+        config.db.surreal
+    }
+
+    const ACCEPTED_BIND: &str = "127.0.0.1:18000";
+
+    #[test]
+    fn local_endpoint_grammar_accepts_the_documented_literal_forms() {
+        // The `Default` pair, the leading-zero encoding the existing
+        // `loopback_port` already admitted, and port `0`, which is inside
+        // `u16` and is deliberately not a new rejection.
+        for (bind, endpoint, port) in [
+            ("127.0.0.1:18000", "ws://127.0.0.1:18000/rpc", 18000),
+            ("127.0.0.1:08000", "ws://127.0.0.1:08000/rpc", 8000),
+            ("127.0.0.1:0", "ws://127.0.0.1:0/rpc", 0),
+        ] {
+            let config = local_server_config(bind, endpoint);
+            assert!(
+                config.validate_local_rpc_endpoint().is_ok(),
+                "{bind} / {endpoint} must stay accepted"
+            );
+            assert_eq!(
+                config.local_rpc_port(),
+                Some(port),
+                "{endpoint} names {port}"
+            );
+        }
+
+        assert!(
+            GovernorConfig::default()
+                .db
+                .surreal
+                .validate_local_rpc_endpoint()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_endpoint_grammar_preserves_the_declared_case_compatibility() {
+        // The previous check lowercased before matching, so `WS://` and `/RPC`
+        // were accepted. That exact case set is preserved and nothing is
+        // broadened: casing only, never extra structure.
+        let mixed = local_server_config(ACCEPTED_BIND, "WS://127.0.0.1:18000/RPC");
+        assert!(mixed.validate_local_rpc_endpoint().is_ok());
+        assert_eq!(mixed.local_rpc_port(), Some(18000));
+
+        assert!(matches!(
+            local_server_config(ACCEPTED_BIND, "WS://127.0.0.1:18000/RPC?a=1")
+                .validate_local_rpc_endpoint(),
+            Err(ConfigError::ForbiddenDbEndpoint)
+        ));
+        assert!(matches!(
+            local_server_config(ACCEPTED_BIND, "WS://127.0.0.1:18000/RP")
+                .validate_local_rpc_endpoint(),
+            Err(ConfigError::ForbiddenDbEndpoint)
+        ));
+    }
+
+    /// The issue's counterexample: `ws://127.0.0.1:18000@192.0.2.1:18000/rpc`
+    /// satisfied both the old prefix check and the old suffix check while
+    /// naming a foreign host after an `@`. It must now fail, and the failure
+    /// must not echo the rejected input back into diagnostics.
+    #[test]
+    fn userinfo_in_the_authority_is_not_a_loopback_endpoint() {
+        for endpoint in [
+            "ws://127.0.0.1:18000@192.0.2.1:18000/rpc",
+            "ws://user:pass@127.0.0.1:18000/rpc",
+            "ws://127.0.0.1@192.0.2.1/rpc",
+            "ws://127.0.0.1:18000@192.0.2.1/rpc",
+        ] {
+            let Err(error) =
+                local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint()
+            else {
+                panic!("{endpoint} must be refused");
+            };
+            assert!(
+                matches!(error, ConfigError::ForbiddenDbEndpoint),
+                "{endpoint} must be refused as an endpoint"
+            );
+            assert!(
+                !error.to_string().contains("pass"),
+                "{endpoint} must not be echoed into diagnostics"
+            );
+        }
+    }
+
+    #[test]
+    fn a_different_address_or_hostname_is_refused() {
+        for endpoint in [
+            "ws://192.0.2.1:18000/rpc",
+            "ws://localhost:18000/rpc",
+            "ws://127.0.0.2:18000/rpc",
+            "ws://[::1]:18000/rpc",
+            "ws://0.0.0.0:18000/rpc",
+            "ws://127.0.0.1.example.com:18000/rpc",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{endpoint} must be refused, never normalised to loopback"
+            );
+        }
+
+        for bind in [
+            "192.0.2.1:18000",
+            "localhost:18000",
+            "127.0.0.2:18000",
+            "[::1]:18000",
+            "0.0.0.0:18000",
+            "127.0.0.1.example.com:18000",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(bind, "ws://127.0.0.1:18000/rpc")
+                        .validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbBind)
+                ),
+                "{bind} must be refused, never normalised to loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_path_components_are_refused() {
+        for endpoint in [
+            "ws://127.0.0.1:18000/rpc/extra",
+            "ws://127.0.0.1:18000/extra/rpc",
+            "ws://127.0.0.1:18000/",
+            "ws://127.0.0.1:18000/rpcrpc",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{endpoint} must leave no permitted remainder after /rpc"
+            );
+        }
+    }
+
+    #[test]
+    fn query_and_fragment_are_refused() {
+        for endpoint in [
+            "ws://127.0.0.1:18000/rpc?a=1",
+            "ws://127.0.0.1:18000?a=1/rpc",
+            "ws://127.0.0.1:18000/rpc#f",
+            "ws://127.0.0.1:18000#f/rpc",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{endpoint} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn control_characters_and_whitespace_are_refused() {
+        for endpoint in [
+            "ws://127.0.0.1:18000 /rpc",
+            "ws://127.0.0.1:18000/rpc\n",
+            "ws://127.0.0.1: 18000/rpc",
+            "ws://127.0.0.1:18000/rpc\u{0}",
+            "ws://127.0.0.1:18000\t/rpc",
+            " ws://127.0.0.1:18000/rpc",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{endpoint:?} must be refused"
+            );
+        }
+
+        for bind in [
+            "127.0.0.1: 18000",
+            "127.0.0.1:18000 ",
+            "127.0.0.1:18000\n",
+            "127.0.0.1:\u{0}18000",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(bind, "ws://127.0.0.1:18000/rpc")
+                        .validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbBind)
+                ),
+                "{bind:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_nonnumeric_signed_or_out_of_range_port_is_refused() {
+        for endpoint in [
+            "ws://127.0.0.1:/rpc",
+            "ws://127.0.0.1:abc/rpc",
+            "ws://127.0.0.1:+18000/rpc",
+            "ws://127.0.0.1:-1/rpc",
+            "ws://127.0.0.1:65536/rpc",
+            "ws://127.0.0.1:99999/rpc",
+            "ws://127.0.0.1:123456/rpc",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{endpoint} must be refused"
+            );
+        }
+
+        for bind in [
+            "127.0.0.1:",
+            "127.0.0.1:abc",
+            "127.0.0.1:+18000",
+            "127.0.0.1:-1",
+            "127.0.0.1:65536",
+            "127.0.0.1:99999",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(bind, "ws://127.0.0.1:18000/rpc")
+                        .validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbBind)
+                ),
+                "{bind} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_scheme_or_a_scheme_on_bind_is_refused() {
+        for endpoint in [
+            "http://127.0.0.1:18000/rpc",
+            "wss://127.0.0.1:18000/rpc",
+            "ws:/127.0.0.1:18000/rpc",
+            "//127.0.0.1:18000/rpc",
+            "ws://127.0.0.1:18000",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(ACCEPTED_BIND, endpoint).validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{endpoint} must be refused"
+            );
+        }
+
+        for bind in [
+            "ws://127.0.0.1:18000",
+            "wss://127.0.0.1:18000",
+            "http:127.0.0.1:18000",
+        ] {
+            assert!(
+                matches!(
+                    local_server_config(bind, "ws://127.0.0.1:18000/rpc")
+                        .validate_local_rpc_endpoint(),
+                    Err(ConfigError::ForbiddenDbBind)
+                ),
+                "{bind} must be refused"
+            );
+        }
+    }
+
+    /// Both fields are checked by the one predicate, and `bind` is refused
+    /// first so a caller cannot smuggle a non-local socket behind a
+    /// well-formed endpoint.
+    #[test]
+    fn validate_local_rpc_endpoint_checks_both_bind_and_endpoint() {
+        assert!(matches!(
+            local_server_config("192.0.2.1:18000", "ws://192.0.2.1:18000/rpc")
+                .validate_local_rpc_endpoint(),
+            Err(ConfigError::ForbiddenDbBind)
+        ));
+        assert!(matches!(
+            local_server_config(ACCEPTED_BIND, "ws://192.0.2.1:18000/rpc")
+                .validate_local_rpc_endpoint(),
+            Err(ConfigError::ForbiddenDbEndpoint)
+        ));
+        assert!(
+            local_server_config(ACCEPTED_BIND, "ws://127.0.0.1:18000/rpc")
+                .validate_local_rpc_endpoint()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_rpc_port_reports_the_validated_port_and_none_otherwise() {
+        assert_eq!(
+            local_server_config(ACCEPTED_BIND, "ws://127.0.0.1:18000/rpc").local_rpc_port(),
+            Some(18000)
+        );
+        // Leading zeros parse to the port they name.
+        assert_eq!(
+            local_server_config(ACCEPTED_BIND, "ws://127.0.0.1:08000/rpc").local_rpc_port(),
+            Some(8000)
+        );
+        assert_eq!(
+            local_server_config("127.0.0.1:0", "ws://127.0.0.1:0/rpc").local_rpc_port(),
+            Some(0)
+        );
+        // Anything outside the grammar reports nothing rather than a guess,
+        // and the two agree because one function owns the parse.
+        for endpoint in [
+            "ws://127.0.0.1:18000@192.0.2.1:18000/rpc",
+            "ws://127.0.0.1:/rpc",
+            "ws://127.0.0.1:18000/rpc?a=1",
+            "ws://localhost:18000/rpc",
+            "wss://127.0.0.1:18000/rpc",
+            "ws://127.0.0.1:65536/rpc",
+        ] {
+            let config = local_server_config(ACCEPTED_BIND, endpoint);
+            assert!(config.validate_local_rpc_endpoint().is_err());
+            assert_eq!(config.local_rpc_port(), None, "{endpoint} names no port");
+        }
+    }
+
+    /// The loader path reaches the predicate: the counterexample endpoint and a
+    /// foreign bind are refused by `GovernorConfig::validate` itself, in the
+    /// bind/endpoint position, before the storage and capability checks.
+    ///
+    /// What this test does NOT establish is ordering with respect to
+    /// credential, path or process effects. `GovernorConfig::validate` is
+    /// entirely pure (it reads no credential, resolves no executable path and
+    /// spawns no process anywhere in its body), so no assertion here can carry
+    /// that claim. The "before any credential access" ordering is established
+    /// by the supervisor admission test in `surreal_server.rs` and the
+    /// transport test in `surreal_rpc.rs`, which own the paths where those
+    /// effects actually happen.
+    #[test]
+    fn the_loader_refuses_a_userinfo_endpoint_and_a_foreign_bind() {
+        let mut config = GovernorConfig::default();
+        config.db.surreal.endpoint = "ws://127.0.0.1:18000@192.0.2.1:18000/rpc".to_owned();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ForbiddenDbEndpoint)
+        ));
+
+        let mut bad_bind = GovernorConfig::default();
+        bad_bind.db.surreal.bind = "192.0.2.1:18000".to_owned();
+        assert!(matches!(
+            bad_bind.validate(),
+            Err(ConfigError::ForbiddenDbBind)
+        ));
+    }
+
+    /// The positive for the loader: `GovernorConfig::validate` ACCEPTS a
+    /// literal-local pair that `GovernorConfig::default()` does not carry — the
+    /// leading-zero port encoding `127.0.0.1:08000` / `ws://127.0.0.1:08000/rpc`,
+    /// which the grammar admits because `"08000"` is a non-empty ASCII-digit run
+    /// that parses as `u16`. Because the values are not the default ones, this
+    /// acceptance is not a restatement of `default_config_is_valid`, and it
+    /// shows that the `validate_local_rpc_endpoint()?` call in
+    /// `GovernorConfig::validate` did not narrow the accepted configuration.
+    #[test]
+    fn the_loader_accepts_a_literal_local_bind_and_endpoint_pair() -> Result<(), ConfigError> {
+        let mut config = GovernorConfig::default();
+        config.db.surreal.bind = "127.0.0.1:08000".to_owned();
+        config.db.surreal.endpoint = "ws://127.0.0.1:08000/rpc".to_owned();
+        config.validate()
     }
 }

@@ -14,11 +14,15 @@ pub enum ConfigError {
     #[error("{field} must be non-zero")]
     ZeroField { field: &'static str },
 
-    #[error("SurrealDB bind address must stay on 127.0.0.1, got {bind}")]
-    ForbiddenDbBind { bind: String },
+    // #3980: the rejected value can itself be secret-bearing userinfo, and per
+    // docs/architecture/I15-04-secrets.md diagnostics record the reference, never the value.
+    #[error("SurrealDB bind address must be the literal loopback socket 127.0.0.1:<port>")]
+    ForbiddenDbBind,
 
-    #[error("SurrealDB endpoint must be ws://127.0.0.1:<port>/rpc, got {endpoint}")]
-    ForbiddenDbEndpoint { endpoint: String },
+    // #3980: the rejected URI can itself be secret-bearing userinfo, and per
+    // docs/architecture/I15-04-secrets.md diagnostics record the reference, never the value.
+    #[error("SurrealDB endpoint must be exactly ws://127.0.0.1:<port>/rpc")]
+    ForbiddenDbEndpoint,
 
     #[error("SurrealDB storage must be a local rocksdb:<path> URI, got {storage}")]
     ForbiddenDbStorage { storage: String },
