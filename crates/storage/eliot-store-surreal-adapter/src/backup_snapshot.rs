@@ -1404,6 +1404,34 @@ enum BudgetDimension {
     CleanupSteps,
 }
 
+/// One modeled snapshot-owner accounting dimension.
+///
+/// `charged` and `high_water` report this owner's bounded accounting model;
+/// they are not measurements of process RSS or heap usage. `remaining` is
+/// unknown when the owner can no longer trust its accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotBudgetDimension {
+    /// The stable, versioned field name for this resource dimension.
+    pub field: &'static str,
+    /// The finite owner-issued ceiling for this dimension.
+    pub limit: u64,
+    /// The currently recorded charge.
+    pub charged: u64,
+    /// The greatest successful charge recorded since this owner was created.
+    pub high_water: u64,
+    /// Remaining modeled capacity, or `None` when accounting is unusable.
+    pub remaining: Option<u64>,
+}
+
+/// Bounded diagnostics for the snapshot owner's eight accounted dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotBudgetDiagnostics {
+    /// Whether the owner can still reconcile its recorded charges.
+    pub accounting_usable: bool,
+    /// Dimensions in the snapshot owner's canonical accounting order.
+    pub dimensions: [SnapshotBudgetDimension; 8],
+}
+
 impl BudgetDimension {
     /// The exact exhausted dimension named in the bounded error surface.
     const fn field(self) -> &'static str {
@@ -1472,6 +1500,8 @@ struct Charge {
     dimension: BudgetDimension,
     limit: u64,
     charged: u64,
+    /// Maximum successful charge; releases and settlements never reduce it.
+    high_water: u64,
 }
 
 impl Charge {
@@ -1480,6 +1510,7 @@ impl Charge {
             dimension,
             limit,
             charged: 0,
+            high_water: 0,
         }
     }
 
@@ -1496,6 +1527,7 @@ impl Charge {
             return Err(budget_refusal(self.dimension));
         }
         self.charged = next;
+        self.high_water = self.high_water.max(next);
         Ok(())
     }
 
@@ -1523,8 +1555,26 @@ impl Charge {
             actual <= reserved,
             "a settled charge may only shrink below its worst-case reservation"
         );
-        self.charged = self.charged.saturating_sub(reserved);
-        self.charged = self.charged.saturating_add(actual.min(reserved));
+        let next = self
+            .charged
+            .saturating_sub(reserved)
+            .saturating_add(actual.min(reserved));
+        self.charged = next;
+        self.high_water = self.high_water.max(next);
+    }
+
+    fn diagnostics(&self, accounting_usable: bool) -> SnapshotBudgetDimension {
+        SnapshotBudgetDimension {
+            field: self.dimension.field(),
+            limit: self.limit,
+            charged: self.charged,
+            high_water: self.high_water,
+            remaining: if accounting_usable {
+                self.limit.checked_sub(self.charged)
+            } else {
+                None
+            },
+        }
     }
 }
 
@@ -1581,6 +1631,7 @@ impl CaptureBudget {
 
     /// Reserves `units` against one dimension.
     fn reserve(&mut self, dimension: BudgetDimension, units: u64) -> Result<(), StoreError> {
+        self.refuse_if_unusable()?;
         self.charge_mut(dimension).reserve(units)
     }
 
@@ -1615,6 +1666,24 @@ impl CaptureBudget {
             BudgetDimension::EnumerationBytes => &mut self.enumeration_bytes,
             BudgetDimension::ActivePageCalls => &mut self.active_page_calls,
             BudgetDimension::CleanupSteps => &mut self.cleanup_steps,
+        }
+    }
+
+    fn diagnostics(&self) -> SnapshotBudgetDiagnostics {
+        // Keep the sticky status and all eight charges in one owner snapshot.
+        let accounting_usable = !self.unusable;
+        SnapshotBudgetDiagnostics {
+            accounting_usable,
+            dimensions: [
+                self.begins_in_progress.diagnostics(accounting_usable),
+                self.live_captures.diagnostics(accounting_usable),
+                self.retained_bytes.diagnostics(accounting_usable),
+                self.terminal_entries.diagnostics(accounting_usable),
+                self.terminal_bytes.diagnostics(accounting_usable),
+                self.enumeration_bytes.diagnostics(accounting_usable),
+                self.active_page_calls.diagnostics(accounting_usable),
+                self.cleanup_steps.diagnostics(accounting_usable),
+            ],
         }
     }
 }
@@ -1669,6 +1738,8 @@ struct CaptureRegistry {
     /// Ordered deadlines so a maintenance pass is bounded by the work that is
     /// actually due, not by the size of the registry.
     expiry: std::collections::BTreeSet<ExpiryDeadline>,
+    /// Last trusted owner-clock observation; zero and regressions never rebase it.
+    last_trusted_owner_observation: Option<u64>,
 }
 
 impl std::ops::Deref for CaptureRegistry {
@@ -1694,6 +1765,7 @@ fn registry() -> &'static Mutex<CaptureRegistry> {
             begins_in_progress: HashMap::new(),
             budget: CaptureBudget::owner_default(),
             expiry: std::collections::BTreeSet::new(),
+            last_trusted_owner_observation: None,
         })
     })
 }
@@ -1789,7 +1861,15 @@ fn reserve_capture_units(budget: &mut CaptureBudget) -> Result<(), StoreError> {
     }
     // Terminal-record space is reserved *before* the capture is opened, so full
     // normal capacity can never be the reason a cleanup cannot proceed.
-    budget.reserve(BudgetDimension::TerminalEntries, 1)?;
+    if let Err(error) = budget.reserve(BudgetDimension::TerminalEntries, 1) {
+        budget.release(
+            BudgetDimension::EnumerationBytes,
+            RESERVED_ENUMERATION_BYTES,
+        );
+        budget.release(BudgetDimension::RetainedBytes, RESERVED_CAPTURE_BYTES);
+        budget.release(BudgetDimension::LiveCaptures, 1);
+        return Err(error);
+    }
     if let Err(error) = budget.reserve(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES) {
         budget.release(BudgetDimension::TerminalEntries, 1);
         budget.release(
@@ -2048,6 +2128,9 @@ fn is_retired(
     max_duration_ms: u64,
     now_ms: u64,
 ) -> bool {
+    if now_ms == 0 {
+        return true;
+    }
     if expires_at_unix_ms <= 0 {
         return true;
     }
@@ -3775,10 +3858,58 @@ fn capture_is_retired(state: &SnapshotState, now_ms: u64) -> bool {
 /// it when clients have disappeared and no request arrives at all. It is
 /// fail-closed and idempotent — ticking it twice, or racing it with a request,
 /// applies the same accounted transitions at most once each.
-pub(crate) fn snapshot_owner_maintenance_tick(now_ms: u64) -> Result<(), StoreError> {
+pub(crate) fn snapshot_owner_maintenance_tick() -> Result<(), StoreError> {
     let mut states = lock_registry()?;
     states.budget.refuse_if_unusable()?;
-    run_expiry_pass(&mut states, now_ms, None);
+    run_expiry_pass(&mut states, crate::write_execution::current_time_ms(), None)?;
+    Ok(())
+}
+
+/// Runs the bounded owner pass and returns its charge projection under the same
+/// registry lock. Unusable accounting remains observable with unknown remaining
+/// capacity; it is never converted into an error that hides the recorded charge.
+pub(crate) fn snapshot_owner_maintenance_diagnostics()
+-> Result<SnapshotBudgetDiagnostics, StoreError> {
+    let mut states = lock_registry()?;
+    if !states.budget.unusable {
+        run_expiry_pass(&mut states, crate::write_execution::current_time_ms(), None)?;
+    }
+    Ok(states.budget.diagnostics())
+}
+
+/// Finds the next ordered due deadline after the last one visited this pass.
+///
+/// `ExpiryDeadline` orders by `at_ms` first, so checking the first item returned
+/// by the ordered frontier is enough to stop before every future deadline.
+fn next_due_expiry_deadline(
+    expiry: &std::collections::BTreeSet<ExpiryDeadline>,
+    after: Option<&ExpiryDeadline>,
+    now_ms: u64,
+) -> Option<ExpiryDeadline> {
+    let next = match after {
+        Some(last) => expiry
+            .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+            .next(),
+        None => expiry.iter().next(),
+    };
+    next.filter(|deadline| deadline.at_ms <= now_ms).cloned()
+}
+
+/// Records one trusted owner-clock observation while the caller holds the
+/// snapshot registry lock. Zero and regressing readings leave the previous
+/// trusted value untouched and refuse the operation as unavailable.
+fn observe_trusted_owner_clock(
+    states: &mut CaptureRegistry,
+    now_ms: u64,
+) -> Result<(), StoreError> {
+    if now_ms == 0
+        || states
+            .last_trusted_owner_observation
+            .is_some_and(|last| now_ms < last)
+    {
+        return Err(StoreError::Unavailable);
+    }
+    states.last_trusted_owner_observation = Some(now_ms);
     Ok(())
 }
 
@@ -3786,11 +3917,18 @@ pub(crate) fn snapshot_owner_maintenance_tick(now_ms: u64) -> Result<(), StoreEr
 ///
 /// The pass is bounded twice over, and both bounds are owner-issued: it visits
 /// only deadlines that have actually come due in the [`CaptureRegistry::expiry`]
-/// index, never the whole registry, and it performs at most
-/// [`BUDGET_MAX_CLEANUP_STEPS`] accounted steps. A capture with a live call
-/// claim is skipped — no claim may lose the payload it is currently serving —
-/// and its deadline stays in the index, so skipping never forgets it.
-fn run_expiry_pass(states: &mut CaptureRegistry, now_ms: u64, keep: Option<&str>) {
+/// index, never the whole registry, and it visits at most
+/// [`BUDGET_MAX_CLEANUP_STEPS`] frontier entries. The per-pass cursor advances
+/// past skipped or unresolved deadlines while each one stays in the index for
+/// retry on the next pass. Unknown or regressing owner-clock observations return
+/// `Unavailable` before the frontier or its accounting is touched.
+fn run_expiry_pass(
+    states: &mut CaptureRegistry,
+    now_ms: u64,
+    keep: Option<&str>,
+) -> Result<(), StoreError> {
+    observe_trusted_owner_clock(states, now_ms)?;
+
     // The work this pass performs is itself a charged dimension, so an
     // unbounded sweep cannot hide inside the accounting: the whole
     // allowance is taken before any step and the whole allowance is
@@ -3810,34 +3948,35 @@ fn run_expiry_pass(states: &mut CaptureRegistry, now_ms: u64, keep: Option<&str>
         .reserve(BudgetDimension::CleanupSteps, BUDGET_MAX_CLEANUP_STEPS)
         .is_err()
     {
-        return;
+        return Ok(());
     }
+    let mut after: Option<ExpiryDeadline> = None;
     let mut steps = 0_u64;
     while steps < BUDGET_MAX_CLEANUP_STEPS {
-        let due = states
-            .expiry
-            .iter()
-            .find(|deadline| deadline.at_ms <= now_ms && keep != Some(deadline.digest.as_str()))
-            .cloned();
-        let Some(deadline) = due else {
+        let Some(deadline) = next_due_expiry_deadline(&states.expiry, after.as_ref(), now_ms)
+        else {
             break;
         };
-        // The entry is removed from the frontier only once the accounted step
-        // for it is taken; a step that declines to act re-arms the deadline, so
-        // unresolved evidence is retried instead of being forgotten or evicted.
-        states.expiry.remove(&deadline);
+        // Advance the local cursor before any exclusion or transition. A kept or
+        // unresolved deadline remains untouched in the index, but cannot consume
+        // this pass repeatedly and starve the next due entry.
+        after = Some(deadline.clone());
         steps = steps.saturating_add(1);
+        if keep == Some(deadline.digest.as_str()) {
+            continue;
+        }
         let settled = match deadline.stage {
             ExpiryStage::Retire => account_expiry(states, &deadline.digest, now_ms),
             ExpiryStage::Release => release_terminal_record(states, &deadline.digest, now_ms),
         };
-        if !settled {
-            states.expiry.insert(deadline);
+        if settled {
+            states.expiry.remove(&deadline);
         }
     }
     states
         .budget
         .release(BudgetDimension::CleanupSteps, BUDGET_MAX_CLEANUP_STEPS);
+    Ok(())
 }
 
 /// Performs the accounted payload-to-terminal transition for one retired
@@ -4237,7 +4376,7 @@ pub(crate) async fn begin_snapshot(
     // never pages and never closes still reaches, so expiry progresses on
     // begin-only traffic. The supervised owner can drive the same pass through
     // [`snapshot_owner_maintenance_tick`] when no request arrives at all.
-    snapshot_owner_maintenance_tick(started_at_ms)?;
+    snapshot_owner_maintenance_tick()?;
     let snapshot_digest = request.compute_digest().map_err(redact_snapshot_error)?;
     // Resolve the exact logical begin AND reserve its whole allowance and its
     // single-owner claim under one acquisition of the one registry lock. An exact
@@ -4270,20 +4409,6 @@ pub(crate) async fn begin_snapshot(
     let ordered_members = enumeration.members;
     let evidence = enumeration.evidence;
     let scope_digest = enumeration.scope.digest;
-    // Recheck the lifetime budget before publishing. A begin that spent its whole
-    // window inside enumeration must not be installed as a fresh capture with a
-    // new full duration; the reservation is returned by `Drop` on this path.
-    if is_retired(
-        request.expires_at_unix_ms,
-        started_at_ms,
-        request.bounds.max_duration_ms,
-        crate::write_execution::current_time_ms(),
-    ) {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.bounds.max_duration_ms",
-            reason: "capture window elapsed during source enumeration",
-        });
-    }
     // The actual retained charge: the observed content denominator plus the
     // worst-case allowance for the one retained page response this owner will
     // hold. It is always at most the reserved worst case, so settling the
@@ -4314,6 +4439,22 @@ pub(crate) async fn begin_snapshot(
     // returns that successor's retained handle and releases only its own
     // reservation — units and in-progress claim — through `Drop`.
     let mut states = lock_registry()?;
+    let publish_now_ms = crate::write_execution::current_time_ms();
+    observe_trusted_owner_clock(&mut states, publish_now_ms)?;
+    // Recheck the exact requested lifetime under the publish lock. Enumeration
+    // cannot give the capture a fresh window, and a regressing owner clock above
+    // cannot authorize publication using the older observation.
+    if is_retired(
+        request.expires_at_unix_ms,
+        started_at_ms,
+        request.bounds.max_duration_ms,
+        publish_now_ms,
+    ) {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.bounds.max_duration_ms",
+            reason: "capture window elapsed during source enumeration",
+        });
+    }
     states.budget.refuse_if_unusable()?;
     if let Some(state) = states.captures.get(&snapshot_digest) {
         // Another begin for the same logical request claimed this capture while
@@ -4648,14 +4789,14 @@ fn prepare_page(
     presented: &SnapshotHandle,
     ctx: &RequestMeta,
     cursor: &SnapshotCursor,
-    now_ms: u64,
 ) -> Result<PageAdmission, StoreError> {
     let Some(state) = states.get(digest) else {
         return Err(unknown_snapshot_handle());
     };
     require_retained_handle(state, presented)?;
     let incarnation = state.incarnation;
-    run_expiry_pass(states, now_ms, Some(digest));
+    let now_ms = crate::write_execution::current_time_ms();
+    run_expiry_pass(states, now_ms, Some(digest))?;
     let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
     if state.terminal.is_some() {
         // The capture is closed and retains only its terminal receipt. New page
@@ -4762,17 +4903,15 @@ fn finish_page(
     cursor: SnapshotCursor,
 ) -> Result<SnapshotPage, StoreError> {
     let mut states = lock_registry()?;
-    let (moved, retired, interrupted) = {
+    let (moved, interrupted) = {
         let state = states
             .get(&claim.digest)
             .ok_or_else(unknown_snapshot_handle)?;
         resolve_claim(state, claim)?;
-        (
-            observed != &state.point,
-            capture_is_retired(state, crate::write_execution::current_time_ms()),
-            state.interruption.is_some(),
-        )
+        (observed != &state.point, state.interruption.is_some())
     };
+    let now_ms = crate::write_execution::current_time_ms();
+    let clock_result = observe_trusted_owner_clock(&mut states, now_ms);
     if interrupted {
         // The capture was already interrupted between the pre-await validation
         // and this observation; the recorded evidence stands and this call
@@ -4790,6 +4929,13 @@ fn finish_page(
             StoreError::Unavailable,
         ));
     }
+    clock_result?;
+    let retired = {
+        let state = states
+            .get(&claim.digest)
+            .ok_or_else(unknown_snapshot_handle)?;
+        capture_is_retired(state, now_ms)
+    };
     if retired {
         return Err(interrupt_capture(
             &mut states,
@@ -4825,14 +4971,7 @@ pub(crate) async fn read_snapshot_page(
     let digest = handle.snapshot_digest.clone();
     let admission = {
         let mut states = lock_registry()?;
-        prepare_page(
-            &mut states,
-            &digest,
-            &handle,
-            ctx,
-            &cursor,
-            crate::write_execution::current_time_ms(),
-        )?
+        prepare_page(&mut states, &digest, &handle, ctx, &cursor)?
     };
     let mut claim = match admission {
         // The retained response answers an exact repeated cursor without any
@@ -4883,16 +5022,43 @@ fn close_capture(
     observed: Option<&CapturePoint>,
 ) -> Result<SnapshotEndReceipt, StoreError> {
     let mut states = lock_registry()?;
-    let (expired, moved) = {
+    let (moved, admission_window_closed) = {
         let state = states
             .get(&claim.digest)
             .ok_or_else(unknown_snapshot_handle)?;
         resolve_claim(state, claim)?;
         (
-            observed.is_none()
-                || capture_is_retired(state, crate::write_execution::current_time_ms()),
             observed.is_some_and(|point| point != &state.point),
+            observed.is_none(),
         )
+    };
+    let now_ms = crate::write_execution::current_time_ms();
+    let clock_result = observe_trusted_owner_clock(&mut states, now_ms);
+    if let Err(error) = clock_result {
+        if admission_window_closed {
+            merge_interruption(
+                &mut states,
+                &claim.digest,
+                claim.incarnation,
+                InterruptionReason::WindowClosed,
+            );
+        } else if moved {
+            merge_interruption(
+                &mut states,
+                &claim.digest,
+                claim.incarnation,
+                InterruptionReason::PointMoved,
+            );
+        }
+        return Err(error);
+    }
+    let expired = if admission_window_closed {
+        true
+    } else {
+        let state = states
+            .get(&claim.digest)
+            .ok_or_else(unknown_snapshot_handle)?;
+        capture_is_retired(state, now_ms)
     };
     if expired {
         merge_interruption(
@@ -4959,14 +5125,14 @@ fn prepare_close(
     digest: &str,
     presented: &SnapshotHandle,
     ctx: &RequestMeta,
-    now_ms: u64,
 ) -> Result<CloseAdmission, StoreError> {
     let Some(state) = states.get(digest) else {
         return Err(unknown_snapshot_handle());
     };
     require_retained_handle(state, presented)?;
     let incarnation = state.incarnation;
-    run_expiry_pass(states, now_ms, Some(digest));
+    let now_ms = crate::write_execution::current_time_ms();
+    run_expiry_pass(states, now_ms, Some(digest))?;
     let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
     if let Some(closed) = state.terminal.as_ref() {
         if now_ms > closed.retained_until_ms {
@@ -5038,13 +5204,7 @@ pub(crate) async fn end_snapshot(
         // handle before any maintenance runs, so a mismatched handle accounts
         // nothing, interrupts nothing and closes nothing. The claim acquired
         // here is carried across the provider await.
-        prepare_close(
-            &mut states,
-            &digest,
-            &handle,
-            ctx,
-            crate::write_execution::current_time_ms(),
-        )?
+        prepare_close(&mut states, &digest, &handle, ctx)?
     };
     let (mut claim, window_closed) = match admission {
         CloseAdmission::Replay(receipt) => return Ok(receipt),
@@ -5087,4 +5247,300 @@ pub(crate) async fn end_snapshot(
         }
     };
     close_capture(&mut claim, observed.as_ref())
+}
+
+#[cfg(test)]
+mod snapshot_budget_tests {
+    use super::*;
+
+    fn empty_registry() -> CaptureRegistry {
+        CaptureRegistry {
+            captures: HashMap::new(),
+            begins_in_progress: HashMap::new(),
+            budget: CaptureBudget::owner_default(),
+            expiry: std::collections::BTreeSet::new(),
+            last_trusted_owner_observation: None,
+        }
+    }
+
+    #[test]
+    fn diagnostics_keep_high_water_across_release_settlement_and_refusal() {
+        let mut budget = CaptureBudget::owner_default();
+        assert!(budget.reserve(BudgetDimension::RetainedBytes, 8).is_ok());
+        budget.release(BudgetDimension::RetainedBytes, 3);
+        budget.retained_bytes.settle_to(2, 1);
+
+        let before_refusal = budget.diagnostics().dimensions[2];
+        assert_eq!(before_refusal.charged, 4);
+        assert_eq!(before_refusal.high_water, 8);
+        assert_eq!(
+            before_refusal.remaining,
+            Some(before_refusal.limit - before_refusal.charged)
+        );
+
+        let refusal = budget.reserve(BudgetDimension::RetainedBytes, before_refusal.limit);
+        assert!(matches!(
+            refusal,
+            Err(StoreError::InvalidField {
+                field: "snapshot.budget.v1.retained_bytes",
+                ..
+            })
+        ));
+        let after_refusal = budget.diagnostics().dimensions[2];
+        assert_eq!(after_refusal.charged, before_refusal.charged);
+        assert_eq!(after_refusal.high_water, before_refusal.high_water);
+        assert_eq!(after_refusal.remaining, before_refusal.remaining);
+    }
+
+    #[test]
+    fn unusable_diagnostics_preserve_charges_and_hide_remaining_capacity() {
+        let mut budget = CaptureBudget::owner_default();
+        assert!(budget.reserve(BudgetDimension::BeginsInProgress, 1).is_ok());
+        budget.release(BudgetDimension::BeginsInProgress, u64::MAX);
+
+        let diagnostics = budget.diagnostics();
+        assert!(!diagnostics.accounting_usable);
+        assert!(
+            diagnostics
+                .dimensions
+                .iter()
+                .all(|dimension| dimension.remaining.is_none())
+        );
+        assert_eq!(diagnostics.dimensions[0].charged, 1);
+        assert_eq!(diagnostics.dimensions[0].high_water, 1);
+    }
+
+    #[test]
+    fn unusable_accounting_refuses_new_page_call_reservations() {
+        let mut budget = CaptureBudget::owner_default();
+        assert!(budget.reserve(BudgetDimension::RetainedBytes, 7).is_ok());
+        budget.release(BudgetDimension::RetainedBytes, u64::MAX);
+        let before = budget.diagnostics();
+
+        assert!(matches!(
+            budget.reserve(BudgetDimension::ActivePageCalls, 1),
+            Err(StoreError::InvalidField {
+                field: "snapshot.budget.v1.accounting",
+                reason: "capture accounting could not be reconciled; new admission stays closed and the recorded charges are unchanged",
+            })
+        ));
+
+        let after = budget.diagnostics();
+        assert!(!after.accounting_usable);
+        assert!(
+            after
+                .dimensions
+                .iter()
+                .all(|dimension| dimension.remaining.is_none())
+        );
+        assert_eq!(after.dimensions[6].charged, before.dimensions[6].charged);
+        assert_eq!(
+            after.dimensions[6].high_water,
+            before.dimensions[6].high_water
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn terminal_entry_refusal_rolls_back_prior_capture_unit_charges() {
+        let mut states = empty_registry();
+        states.budget.terminal_entries.limit = 0;
+        let refusal = reserve_capture_units(&mut states.budget);
+        assert!(matches!(
+            refusal,
+            Err(StoreError::InvalidField {
+                field: "snapshot.budget.v1.terminal_entries",
+                ..
+            })
+        ));
+
+        let diagnostics = states.budget.diagnostics();
+        assert!(diagnostics.accounting_usable);
+        assert_eq!(diagnostics.dimensions[0].charged, 0);
+        assert_eq!(diagnostics.dimensions[1].high_water, 1);
+        assert_eq!(diagnostics.dimensions[1].charged, 0);
+        assert_eq!(diagnostics.dimensions[2].high_water, RESERVED_CAPTURE_BYTES);
+        assert_eq!(diagnostics.dimensions[2].charged, 0);
+        assert_eq!(
+            diagnostics.dimensions[5].high_water,
+            RESERVED_ENUMERATION_BYTES
+        );
+        assert_eq!(diagnostics.dimensions[5].charged, 0);
+        assert_eq!(diagnostics.dimensions[3].high_water, 0);
+        assert_eq!(diagnostics.dimensions[3].charged, 0);
+        assert_eq!(diagnostics.dimensions[4].high_water, 0);
+        assert_eq!(diagnostics.dimensions[4].charged, 0);
+    }
+
+    #[test]
+    fn expiry_pass_stops_at_the_first_future_deadline() {
+        let mut states = empty_registry();
+        let due = ExpiryDeadline {
+            at_ms: 10,
+            stage: ExpiryStage::Retire,
+            digest: "due".to_owned(),
+        };
+        let future = ExpiryDeadline {
+            at_ms: 11,
+            stage: ExpiryStage::Retire,
+            digest: "future".to_owned(),
+        };
+        states.expiry.insert(due.clone());
+        states.expiry.insert(future.clone());
+
+        assert!(run_expiry_pass(&mut states, 10, None).is_ok());
+
+        assert!(!states.expiry.contains(&due));
+        assert!(states.expiry.contains(&future));
+    }
+
+    #[test]
+    fn expiry_pass_advances_past_a_kept_deadline_to_later_due_work() {
+        let mut states = empty_registry();
+        let kept = ExpiryDeadline {
+            at_ms: 10,
+            stage: ExpiryStage::Retire,
+            digest: "a-kept".to_owned(),
+        };
+        let later = ExpiryDeadline {
+            at_ms: 10,
+            stage: ExpiryStage::Retire,
+            digest: "b-later".to_owned(),
+        };
+        states.expiry.insert(kept.clone());
+        states.expiry.insert(later.clone());
+
+        assert!(run_expiry_pass(&mut states, 10, Some(&kept.digest)).is_ok());
+
+        assert!(states.expiry.contains(&kept));
+        assert!(!states.expiry.contains(&later));
+    }
+
+    #[test]
+    fn expiry_pass_is_bounded_and_returns_full_cleanup_allowance() {
+        let mut states = empty_registry();
+        for index in 0..=BUDGET_MAX_CLEANUP_STEPS {
+            states.expiry.insert(ExpiryDeadline {
+                at_ms: 10,
+                stage: ExpiryStage::Retire,
+                digest: format!("stale-{index}"),
+            });
+        }
+
+        assert!(run_expiry_pass(&mut states, 10, None).is_ok());
+
+        assert_eq!(states.expiry.len(), 1);
+        assert_eq!(
+            states.budget.cleanup_steps.charged, 0,
+            "the full pass allowance must be returned after the pass"
+        );
+        assert_eq!(
+            states.budget.cleanup_steps.high_water,
+            BUDGET_MAX_CLEANUP_STEPS
+        );
+
+        assert!(run_expiry_pass(&mut states, 10, None).is_ok());
+
+        assert!(states.expiry.is_empty());
+        assert_eq!(states.budget.cleanup_steps.charged, 0);
+        assert_eq!(
+            states.budget.cleanup_steps.high_water,
+            BUDGET_MAX_CLEANUP_STEPS
+        );
+    }
+
+    #[test]
+    fn unknown_initial_observation_refuses_a_new_lease() {
+        assert!(is_retired(100, 0, 50, 0));
+        assert!(!is_retired(100, 1, 50, 1));
+
+        let mut states = empty_registry();
+        assert!(matches!(
+            run_expiry_pass(&mut states, 0, None),
+            Err(StoreError::Unavailable)
+        ));
+        assert_eq!(states.last_trusted_owner_observation, None);
+        assert_eq!(states.budget.diagnostics().dimensions[7].charged, 0);
+    }
+
+    #[test]
+    fn trusted_owner_clock_rejects_a_regression_that_would_extend_a_lease() {
+        assert!(!is_retired(150, 100, 50, 140));
+        let mut states = empty_registry();
+
+        assert!(observe_trusted_owner_clock(&mut states, 200).is_ok());
+        assert!(matches!(
+            observe_trusted_owner_clock(&mut states, 140),
+            Err(StoreError::Unavailable)
+        ));
+
+        assert_eq!(states.last_trusted_owner_observation, Some(200));
+    }
+
+    #[test]
+    fn trusted_owner_clock_accepts_same_and_forward_observations() {
+        let mut states = empty_registry();
+
+        assert!(observe_trusted_owner_clock(&mut states, 200).is_ok());
+        assert!(observe_trusted_owner_clock(&mut states, 200).is_ok());
+        assert!(observe_trusted_owner_clock(&mut states, 201).is_ok());
+
+        assert_eq!(states.last_trusted_owner_observation, Some(201));
+    }
+
+    #[test]
+    fn backward_maintenance_refuses_without_changing_charges_or_deadlines() {
+        let mut states = empty_registry();
+        states.last_trusted_owner_observation = Some(20);
+        assert!(
+            states
+                .budget
+                .reserve(BudgetDimension::RetainedBytes, 7)
+                .is_ok()
+        );
+        let due = ExpiryDeadline {
+            at_ms: 19,
+            stage: ExpiryStage::Retire,
+            digest: "must-remain-on-unavailable-clock".to_owned(),
+        };
+        states.expiry.insert(due.clone());
+        let budget_before = states.budget.diagnostics();
+
+        assert!(matches!(
+            run_expiry_pass(&mut states, 19, None),
+            Err(StoreError::Unavailable)
+        ));
+
+        assert_eq!(states.last_trusted_owner_observation, Some(20));
+        assert_eq!(states.budget.diagnostics(), budget_before);
+        assert!(states.expiry.contains(&due));
+    }
+
+    #[test]
+    fn trusted_same_and_forward_observations_resume_expiry_progress() {
+        let mut states = empty_registry();
+        let first = ExpiryDeadline {
+            at_ms: 10,
+            stage: ExpiryStage::Retire,
+            digest: "first".to_owned(),
+        };
+        let later = ExpiryDeadline {
+            at_ms: 11,
+            stage: ExpiryStage::Retire,
+            digest: "later".to_owned(),
+        };
+        states.expiry.insert(first.clone());
+        states.expiry.insert(later.clone());
+
+        assert!(run_expiry_pass(&mut states, 10, None).is_ok());
+        assert!(!states.expiry.contains(&first));
+        assert!(states.expiry.contains(&later));
+
+        assert!(run_expiry_pass(&mut states, 10, None).is_ok());
+        assert!(states.expiry.contains(&later));
+
+        assert!(run_expiry_pass(&mut states, 11, None).is_ok());
+        assert!(states.expiry.is_empty());
+        assert_eq!(states.last_trusted_owner_observation, Some(11));
+    }
 }
