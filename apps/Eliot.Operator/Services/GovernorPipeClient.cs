@@ -247,14 +247,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         // these exact operation bytes, so a corrupted or edited journal entry
         // cannot travel under an identity that names a different operation.
         // For the read-only get_context handshake
-        // (UserAutomationGetContextOperation) that validator requires the
-        // operation shape, a syntactically valid key and the absent
-        // expected_state_fence, and deliberately does NOT require digest
+        // (UserAutomationGetContextOperation) that validator requires a
+        // syntactically valid key and the absent expected_state_fence, and
+        // deliberately does NOT require digest
         // equality: UserAutomationOperatorRequest.CreateContext() mints a
         // fresh nonce per call, so that identity is not a digest of its own
         // bytes. The key is checked, never re-derived into the request:
         // rewriting it would rename a pending request's identity to match
-        // today's serializer instead of honouring the retained one.
+        // today's serializer instead of honouring the retained one. That
+        // handshake operation's shape is pinned by the closed decoder's `kind`
+        // mapping, not by this validator.
         request.ValidateCurrentIdentity();
         using var budget = new OperationBudget($"automation:{request.IdempotencyKey}", cancellationToken, _closing.Token);
         // Kernel/Host authenticates this route and supplies RequestMetadata,
