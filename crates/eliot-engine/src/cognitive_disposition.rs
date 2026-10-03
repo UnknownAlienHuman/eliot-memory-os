@@ -166,6 +166,15 @@ async fn require_raw_verifiers(
     contract: &CognitiveRunContract,
     terminal: &CanonicalRecord<CognitiveRunTerminal>,
 ) -> Result<Vec<String>, EngineError> {
+    // Schema-version gate (issue #935): the terminal carries the call identity
+    // and receipt chain every verifier fact below is joined against. An
+    // unsupported declared version is refused as this function's own
+    // `EngineError` before any verifier, receipt or count fact is read, so a
+    // refused terminal contributes no authority.
+    terminal
+        .receipt_body
+        .validate_schema_version()
+        .map_err(|error| rejected(error.to_string()))?;
     if terminal.receipt_body.raw_verifier_receipts.is_empty() {
         return Err(rejected(
             "canonical disposition has no raw verifier evidence",
@@ -183,6 +192,14 @@ async fn require_raw_verifiers(
             )
             .await?
             .ok_or_else(|| rejected("canonical raw verifier record is absent"))?;
+        // Schema-version gate (issue #935): raw verifier evidence is admitted
+        // only when it declares the one supported version. The check precedes
+        // every binding, pass and count fact read below, so refused evidence
+        // yields no verifier reference at all.
+        verifier
+            .receipt_body
+            .validate_schema_version()
+            .map_err(|error| rejected(error.to_string()))?;
         if verifier.canonical_receipt != *verifier_receipt
             || !verifier.receipt_body.passed
             || verifier.receipt_body.run_id != contract.run_id
@@ -226,6 +243,15 @@ async fn canonical_source_candidate(
         )
         .await?
         .ok_or_else(|| rejected("source attempt is absent"))?;
+    // Schema-version gate (issue #935): the source attempt identifies which
+    // candidate this disposition selects. An unsupported declared version is
+    // refused through this function's existing `EngineError` before any
+    // binding field is read, so a refused attempt selects no candidate and
+    // contributes no authority fact.
+    attempt
+        .receipt_body
+        .validate_schema_version()
+        .map_err(|error| rejected(error.to_string()))?;
     if attempt.canonical_receipt != terminal.receipt_body.attempt_receipt
         || attempt.receipt_body.run_id != contract.run_id
         || attempt.receipt_body.call_id != call.call_id
@@ -435,6 +461,16 @@ pub async fn resolve_canonical_case_dispositions(
             64,
         )
         .await?;
+    // Schema-version gate (issue #935): every loaded source terminal is
+    // validated before any of them is inspected, retained or matched. This
+    // precedes the `run_id` filter below deliberately: an unsupported version
+    // must be refused, never silently skipped by that filter.
+    for record in &terminals {
+        record
+            .receipt_body
+            .validate_schema_version()
+            .map_err(|error| rejected(error.to_string()))?;
+    }
     terminals.retain(|record| record.receipt_body.run_id == contract.run_id);
     let mut dispositions = Vec::with_capacity(2);
     for source_call in [5_u8, 7_u8] {
