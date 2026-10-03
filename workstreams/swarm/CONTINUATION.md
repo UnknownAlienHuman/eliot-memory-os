@@ -11,6 +11,11 @@ The selected source assignments are #1943 / M-KERNEL, #2691 / M-STORE and
 checked current main, live PRs, stopped FIN/old runners and actual path ownership.
 The inspected baseline is b7e9e334569639a6290baeacf82bf44941def506. READY is a planning
 state, not a real claim or a running session. Do not assume #5021 has merged.
+Screen the complete current open-PR set, not just #5021. For each intersecting
+candidate, bind its head and actual changed paths to a root disposition: integrate
+or adopt the reviewed residual, narrow disjoint claims, or explicitly release the
+old writer while retaining unmatched work. Open/draft/conflicted alone proves neither
+an active writer nor safe retirement. See the concrete collisions in STITCH-PLAN.md.
 
 One manager uses one worktree and a fresh issue branch for each coherent issue
 delivery. Root owns upstream synchronization and main integration. Subagents may

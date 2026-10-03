@@ -7,7 +7,9 @@ are coordination records, not a replacement specification.
 - BLOCK-MAP.tsv retains the complete 577-issue stop inventory. Its historical
   FINISHABLE/BLOCKED/ALL-DONE values are not current dispatch states.
 - REVIEWED.tsv records bounded rechecks, their depth and evidence. A missing
-  row means not re-audited, never done or automatically ready.
+  row means not re-audited, never done or automatically ready. PRESERVE means the
+  inspected defect is already repaired: no duplicate source assignment, not fresh
+  behavioral acceptance or completion of its parent scope.
 - PLAN.tsv is the sole list of selected source assignments; PLAN.md explains
   their scope. READY is not code-complete, accepted, claimed or running.
 - STITCH-PLAN.md records shared-file turns and exact producer/consumer handoffs.

@@ -12,15 +12,38 @@ not verified. BODY and HISTORICAL findings are not implementation-ready certific
 - #2691: S-03 owner lifetime -> adapter maintenance entry -> existing bounded expiry
   and retirement -> diagnostics. M-STORE preserves #2688/#2689 shared state; those
   issues cannot independently rewrite backup_snapshot.rs concurrently.
-- #1678/#1701: the async admission_reservation_saga.rs coordinator already exists.
-  Verify the exact current active-reservation output needed by #1701. A missing
-  currentness check in planning is RECHECK, not proof of an unavailable dependency.
-  Reuse the owner verifier; don't recreate the coordinator or wait for all #1678 tests.
+- #1678/#1701: the async coordinator exists, but production eliotd admission,
+  activation and dispatch ports still refuse unconditionally. Map each method to
+  the existing authenticated owner operation and retained result. The daemon-launch
+  reservation check is not proof of this native-worker attempt join. The complete
+  prospective scope includes eliotd/worker consumers, outside #1943's initial claim;
+  root must assign those paths explicitly. No second saga or whole-parent test wait.
+- #2643: CreateContext's fresh nonce -> current identity validator -> actual client
+  -> fresh State Fence -> business request. The validator currently applies the
+  incompatible business digest rule to the handshake. Keep non-handshake digest/fence
+  and legacy-recovery guards intact. Both UI read/effect callers are affected; the
+  existing tests/Eliot.Operator.Tests harness is present. Reconcile the current
+  closed wire and shared #2644/#1137 files before an implementation assignment.
 - #1884/#1888: reuse main's CPU-rate implementation. Isolate #1888 from archived
   mixed CB work; one platform-file writer for manifest/Job cleanup integration.
 - #2701: #929 check(Path) -> strict accepted-result validation -> CheckedInventory ->
   closure report. M-TOOLS owns the two named scripts. Root alone refreshes the global
   generated boundary inventory on the combined source; no competing scanner/authority.
+
+## Existing PR collisions at dispatch
+
+The continuation read found 26 open PRs, not just #5021; the complete ID/delta audit
+is still incomplete. Checking the six #5021 paths was only a subset check.
+The actual changed-file lists of #3811 (head 0112b59c) and #3812 (head f371ca89)
+include bins/eliot-kernel/src/lib.rs and daemon_request_dispatch.rs, plus the Store
+adapter's apply.rs, apply/atomic_write.rs and apply/read_boundary.rs. They intersect
+both selected Kernel and Store exclusion scopes and each other. Their old bodies or
+conflict flags are not permission to discard the changes or resume another writer.
+Root resolves these concrete overlaps and every other relevant open-PR delta before
+claiming the affected paths; it records adoption, narrower disjoint scope or explicit
+release with unmatched requirements preserved. This is path/integration coordination,
+not an invented architectural dependency or a reason to stop unrelated tools work.
+No current runner liveness or full PR semantic review was established here.
 
 ## Body-verified cycle partitions: exact outputs before closure
 
