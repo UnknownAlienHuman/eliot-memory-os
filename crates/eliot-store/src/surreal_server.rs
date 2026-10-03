@@ -198,7 +198,12 @@ impl SurrealServerSupervisor {
     /// can read credentials, touch runtime files, connect, or manage a
     /// process. All effectful supervisor entrypoints share this admission
     /// check so policy cannot be bypassed by a lifecycle helper.
+    ///
+    /// #3980: the shared local-only endpoint grammar check now precedes the
+    /// reserved-store collision check, so an off-loopback endpoint is refused
+    /// before any effectful work and the collision guard stays independent.
     pub fn validate_admission(&self) -> Result<(), StoreError> {
+        self.config.validate_local_rpc_endpoint()?;
         self.config
             .reject_store_collision(
                 RUNTIME_LIVE_STORE_BIND,
@@ -1618,8 +1623,8 @@ mod security_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::{
-        SurrealServerSupervisor, SurrealShutdown, cleanup_stale_client_leases, lease_owner_pid,
-        process_is_alive,
+        StoreError, SurrealServerSupervisor, SurrealShutdown, cleanup_stale_client_leases,
+        lease_owner_pid, process_is_alive,
     };
     use eliot_types::{CredentialProviderKind, SurrealCapabilities, SurrealServerConfig};
     use std::fs;
@@ -1721,6 +1726,144 @@ mod lifecycle_tests {
             pid_path.is_file(),
             "collision guard must preserve pid receipt"
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// #3980: the issue's own counterexample. A userinfo component carrying a
+    /// different address used to pass the old prefix/suffix check, so the
+    /// collision diagnostic -- whose text carries `bind=` and `endpoint=` --
+    /// could describe an address that was never local. Admission must refuse
+    /// it first, and must not echo the rejected value.
+    #[tokio::test]
+    async fn an_off_loopback_endpoint_is_refused_before_executable_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("off-loopback-lookup")?;
+        let mut config = supervisor_for("definitely-not-a-provider", &root).config;
+        config.endpoint = "ws://127.0.0.1:18000@192.0.2.1:18000/rpc".to_owned();
+        let supervisor = SurrealServerSupervisor::new(config);
+        let Err(error) = supervisor.start_or_connect().await else {
+            let _ = fs::remove_dir_all(&root);
+            return Err(std::io::Error::other(
+                "off-loopback endpoint must be refused by admission",
+            )
+            .into());
+        };
+        let text = error.to_string();
+        // Assert the refusal IS the new admission refusal. Without this the test
+        // also passes when admission lets the endpoint through and the very next
+        // line fails on the missing executable instead, which proves nothing
+        // about #3980.
+        assert!(
+            matches!(
+                error,
+                StoreError::Config(eliot_types::ConfigError::ForbiddenDbEndpoint)
+            ),
+            "admission must refuse the off-loopback endpoint itself, got: {text}"
+        );
+        assert!(
+            !text.contains("192.0.2.1"),
+            "refusal must not echo the rejected address: {text}"
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// #3980: the same counterexample through the entrypoint that reads
+    /// credentials first, so the refusal is shown to precede the credential
+    /// read and not merely the executable lookup.
+    #[tokio::test]
+    async fn an_off_loopback_endpoint_is_refused_before_credential_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("off-loopback-credential")?;
+        let mut config = supervisor_for("definitely-not-a-provider", &root).config;
+        config.endpoint = "ws://127.0.0.1:18000@192.0.2.1:18000/rpc".to_owned();
+        let pid_path = root.join("tmp").join("surreal.pid");
+        fs::write(&pid_path, "not-a-pid")?;
+        let supervisor = SurrealServerSupervisor::new(config);
+
+        let failures = [
+            (
+                "start_or_connect",
+                supervisor.start_or_connect().await.map(|_| ()),
+            ),
+            ("status", supervisor.status().await.map(|_| ())),
+            ("stop", supervisor.stop().await.map(|_| ())),
+        ];
+        for (operation, result) in failures {
+            let Err(error) = result else {
+                let _ = fs::remove_dir_all(&root);
+                return Err(format!("off-loopback endpoint was accepted by {operation}").into());
+            };
+            let text = error.to_string();
+            assert!(
+                !text.contains("192.0.2.1"),
+                "{operation} refusal must not echo the rejected address: {text}"
+            );
+        }
+        assert!(
+            pid_path.is_file(),
+            "off-loopback refusal must precede pid effects"
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// #3980: the remaining shapes the old prefix/suffix check accepted --
+    /// userinfo, an extra path component, and a query/fragment. Each is
+    /// refused by the same shared predicate.
+    #[tokio::test]
+    async fn off_loopback_endpoint_shapes_are_each_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("off-loopback-shapes")?;
+        let rejected = [
+            "ws://127.0.0.1:18000@192.0.2.1:18000/rpc",
+            "ws://127.0.0.1:18000/rpc/extra",
+            "ws://127.0.0.1:18000/rpc?token=x",
+            "ws://127.0.0.1:18000/rpc#fragment",
+        ];
+        for endpoint in rejected {
+            let mut config = supervisor_for("definitely-not-a-provider", &root).config;
+            config.endpoint = endpoint.to_owned();
+            let Err(error) = SurrealServerSupervisor::new(config).validate_admission() else {
+                fs::remove_dir_all(&root)?;
+                return Err(std::io::Error::other(format!(
+                    "{endpoint} must be refused by admission"
+                ))
+                .into());
+            };
+            let text = error.to_string();
+            assert!(
+                !text.contains(endpoint),
+                "refusal must state the accepted grammar, not the rejected input: {text}"
+            );
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// #3980: the shared predicate is an addition to the existing guard, not a
+    /// replacement. An existing-valid literal local endpoint still passes
+    /// admission, and the reserved canonical store still fails it.
+    #[test]
+    fn an_existing_valid_local_endpoint_passes_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("local-admission")?;
+        let supervisor = supervisor_for("definitely-not-a-provider", &root);
+        if let Err(error) = supervisor.validate_admission() {
+            fs::remove_dir_all(&root)?;
+            return Err(error.into());
+        }
+
+        let mut config = supervisor.config;
+        config.bind = "127.0.0.1:8000".to_owned();
+        config.endpoint = "ws://127.0.0.1:8000/rpc".to_owned();
+        config.ns = "eliot".to_owned();
+        let Err(error) = SurrealServerSupervisor::new(config).validate_admission() else {
+            fs::remove_dir_all(&root)?;
+            return Err(std::io::Error::other("reserved canonical store must be refused").into());
+        };
+        assert!(error.to_string().contains("runtime-live"));
         fs::remove_dir_all(root)?;
         Ok(())
     }
