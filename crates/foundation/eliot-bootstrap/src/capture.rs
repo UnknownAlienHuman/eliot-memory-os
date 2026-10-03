@@ -926,43 +926,19 @@ const WORKSPACE_SOURCE_DOCUMENT_PATHS: [(&str, WorkspaceSourceDocumentKind); 31]
         WorkspaceSourceDocumentKind::SupportingReference,
     ),
     (
-        "docs/AGENTS.md",
-        WorkspaceSourceDocumentKind::AgentInstruction,
-    ),
-    (
-        "docs/ARCHITECTURE.md",
+        "docs/ARCHITECTURE_CONTRACT.md",
         WorkspaceSourceDocumentKind::Architecture,
     ),
     (
-        "docs/IMPLEMENTATION.md",
-        WorkspaceSourceDocumentKind::Implementation,
-    ),
-    (
-        "docs/BUILD.md",
-        WorkspaceSourceDocumentKind::BuildTestContract,
-    ),
-    (
-        "docs/TESTING.md",
-        WorkspaceSourceDocumentKind::BuildTestContract,
-    ),
-    (
-        "docs/SCHEMA.md",
+        "docs/CODE_NAVIGATION.md",
         WorkspaceSourceDocumentKind::SupportingReference,
     ),
     (
-        "docs/CHANGELOG.md",
-        WorkspaceSourceDocumentKind::SupportingReference,
+        "docs/DEPENDENCY_POLICY.md",
+        WorkspaceSourceDocumentKind::DomainPolicy,
     ),
     (
-        "docs/architecture/README.md",
-        WorkspaceSourceDocumentKind::Architecture,
-    ),
-    (
-        "docs/implementation/README.md",
-        WorkspaceSourceDocumentKind::Implementation,
-    ),
-    (
-        "schemas/README.md",
+        "docs/PROJECT_MAP.md",
         WorkspaceSourceDocumentKind::SupportingReference,
     ),
 ];
