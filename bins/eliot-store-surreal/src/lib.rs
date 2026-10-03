@@ -358,6 +358,18 @@ impl std::fmt::Debug for StoreComposition {
 }
 
 impl StoreComposition {
+    /// Runs the adapter's bounded snapshot-owner expiry maintenance.
+    ///
+    /// The process lifecycle owns when this hook is called; the adapter owns
+    /// the clock, expiry state, and typed store failure.
+    pub fn maintain_snapshot_owner(
+        &self,
+    ) -> Result<eliot_store_surreal_adapter::SnapshotBudgetDiagnostics, StoreCompositionError> {
+        self.store
+            .maintain_snapshot_owner()
+            .map_err(StoreCompositionError::Store)
+    }
+
     /// Builds the adapter from the explicit target launch configuration.
     /// Credential bytes are read only inside this process from the configured
     /// Windows Credential Manager reference and are retained only by the

@@ -14,7 +14,7 @@ use eliot_protocol::MessageType;
 use eliot_store_surreal::diagnostics::{
     BoundedEventLog, BridgeBoundary, BridgeIdentity, CompatibilityDecision, emit_dispatch_outcome,
     emit_lifecycle, emit_received, emit_validation_rejected, install_startup_subscriber,
-    project_compatibility_health, report_events,
+    project_compatibility_health, report_events, report_snapshot_budget,
 };
 use eliot_store_surreal::{
     CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
@@ -23,6 +23,8 @@ use eliot_store_surreal::{
     observed_identity_verdict, parse_compatibility_bytes, require_semantic_ready_for_pipe,
     resolve_compatibility_verdict, store_bootstrap_descriptor, validate_request_frame_with_log,
 };
+#[cfg(any(windows, test))]
+use eliot_store_surreal_adapter::SnapshotBudgetDiagnostics;
 
 mod launch_mode;
 use launch_mode::{LaunchMode, control_frame, parse_launch_mode, prepare_launch};
@@ -482,7 +484,20 @@ fn bind_observed_identity_inner(
 async fn serve_handshake_loop(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
+    mut owner_quiesce: tokio::sync::watch::Receiver<Option<String>>,
 ) -> Result<(), String> {
+    if let Some(error) = owner_quiesce_reason(&owner_quiesce) {
+        let mut events = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut events,
+            BridgeBoundary::Shutdown,
+            "shutdown",
+            &BridgeIdentity::new(),
+            None,
+        );
+        report_events(&events);
+        return Err(error);
+    }
     let limits = TransportLimits::default();
     let expectation = match eliot_platform_windows::NamedPipePeerExpectation::new(
         config.expected_client_sid.clone(),
@@ -515,20 +530,32 @@ async fn serve_handshake_loop(
             return Err(error);
         }
     };
-    if let Err(error) = server
-        .wait_for_authenticated_client(
+    let client_admission = tokio::select! {
+        result = server.wait_for_authenticated_client(
             Duration::from_millis(config.connect_timeout_ms),
             &expectation,
-        )
-        .await
-        .map_err(|error| format!("authenticated client admission failed: {error}"))
-    {
+        ) => result.map_err(|error| format!("authenticated client admission failed: {error}")),
+        _ = owner_quiesce.changed() => Err(owner_quiesce_reason(&owner_quiesce)
+            .unwrap_or_else(|| "snapshot owner quiescence signal closed".to_owned())),
+    };
+    if let Err(error) = client_admission {
         report_stage_outcome(
             BridgeBoundary::PipeBind,
             "pipe_bind",
             &BridgeIdentity::new(),
             false,
         );
+        if owner_quiesce_reason(&owner_quiesce).is_some() {
+            let mut events = BoundedEventLog::new();
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::Shutdown,
+                "shutdown",
+                &BridgeIdentity::new(),
+                None,
+            );
+            report_events(&events);
+        }
         return Err(error);
     }
     report_stage_outcome(
@@ -537,11 +564,26 @@ async fn serve_handshake_loop(
         &BridgeIdentity::new(),
         true,
     );
-    let hello_frame = match server
-        .receive_frame(limits)
-        .await
-        .map_err(|error| format!("EBP hello receive failed: {error}"))
-    {
+    if let Some(error) = owner_quiesce_reason(&owner_quiesce) {
+        let mut events = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut events,
+            BridgeBoundary::Shutdown,
+            "shutdown",
+            &BridgeIdentity::new(),
+            None,
+        );
+        report_events(&events);
+        return Err(error);
+    }
+    let hello_receive = tokio::select! {
+        result = server.receive_frame(limits) => {
+            result.map_err(|error| format!("EBP hello receive failed: {error}"))
+        }
+        _ = owner_quiesce.changed() => Err(owner_quiesce_reason(&owner_quiesce)
+            .unwrap_or_else(|| "snapshot owner quiescence signal closed".to_owned())),
+    };
+    let hello_frame = match hello_receive {
         Ok(frame) => frame,
         Err(error) => {
             report_stage_outcome(
@@ -550,9 +592,38 @@ async fn serve_handshake_loop(
                 &BridgeIdentity::new(),
                 false,
             );
+            if owner_quiesce_reason(&owner_quiesce).is_some() {
+                let mut events = BoundedEventLog::new();
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::Shutdown,
+                    "shutdown",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+                report_events(&events);
+            }
             return Err(error);
         }
     };
+    if let Some(error) = owner_quiesce_reason(&owner_quiesce) {
+        report_stage_outcome(
+            BridgeBoundary::HandshakeAdmit,
+            "handshake",
+            &BridgeIdentity::new(),
+            false,
+        );
+        let mut events = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut events,
+            BridgeBoundary::Shutdown,
+            "shutdown",
+            &BridgeIdentity::new(),
+            None,
+        );
+        report_events(&events);
+        return Err(error);
+    }
     let handshake_identity = StoreHandshakeIdentity::new(
         composition.operation_manifest_digest().to_owned(),
         serde_json::json!({
@@ -600,11 +671,15 @@ async fn serve_handshake_loop(
         serde_json::to_value(server_hello)
             .map_err(|error| format!("serialize ServerHello: {error}"))?,
     );
-    if let Err(error) = server
+    let handshake_send = server
         .send_frame(&handshake_frame, negotiated_limits)
         .await
-        .map_err(|error| format!("EBP handshake response failed: {error}"))
-    {
+        .map_err(|error| format!("EBP handshake response failed: {error}"));
+    let maintenance = maintain_and_report_snapshot_owner(composition).and_then(|diagnostics| {
+        require_snapshot_owner_accounting(&diagnostics)?;
+        Ok(diagnostics)
+    });
+    if let Err(error) = handshake_send {
         // Transport loss only: a failed send records the loss, never delivery.
         // A successful send stays silent because transport acceptance proves
         // no delivery.
@@ -617,15 +692,57 @@ async fn serve_handshake_loop(
             None,
         );
         report_events(&events);
+        return match maintenance {
+            Ok(_) => Err(error),
+            Err(maintenance_error) => Err(format!("{error}; {maintenance_error}")),
+        };
+    }
+    if let Err(error) = maintenance {
+        let mut events = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut events,
+            BridgeBoundary::Shutdown,
+            "shutdown",
+            &BridgeIdentity::new(),
+            None,
+        );
+        report_events(&events);
         return Err(error);
     }
 
     loop {
-        let frame = match server
-            .receive_frame(negotiated_limits)
-            .await
-            .map_err(|error| format!("EBP frame rejected: {error}"))
-        {
+        if let Some(error) = owner_quiesce_reason(&owner_quiesce) {
+            let mut events = BoundedEventLog::new();
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::Shutdown,
+                "shutdown",
+                &BridgeIdentity::new(),
+                None,
+            );
+            report_events(&events);
+            return Err(error);
+        }
+        let frame_receive = tokio::select! {
+            result = server.receive_frame(negotiated_limits) => {
+                result.map_err(|error| format!("EBP frame rejected: {error}"))
+            }
+            _ = owner_quiesce.changed() => {
+                let error = owner_quiesce_reason(&owner_quiesce)
+                    .unwrap_or_else(|| "snapshot owner quiescence signal closed".to_owned());
+                let mut events = BoundedEventLog::new();
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::Shutdown,
+                    "shutdown",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+                report_events(&events);
+                return Err(error);
+            }
+        };
+        let frame = match frame_receive {
             Ok(frame) => frame,
             Err(error) => {
                 let mut events = BoundedEventLog::new();
@@ -647,6 +764,18 @@ async fn serve_handshake_loop(
                 return Err(error);
             }
         };
+        if let Some(error) = owner_quiesce_reason(&owner_quiesce) {
+            let mut events = BoundedEventLog::new();
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::Shutdown,
+                "shutdown",
+                &BridgeIdentity::new(),
+                None,
+            );
+            report_events(&events);
+            return Err(error);
+        }
         let mut round = BoundedEventLog::new();
         let (request_identity, response) =
             match validate_request_frame_with_log(&mut session, &frame, &mut round) {
@@ -700,11 +829,15 @@ async fn serve_handshake_loop(
                 return Err(error);
             }
         };
-        if let Err(error) = server
+        let response_send = server
             .send_frame(&response_frame, negotiated_limits)
             .await
-            .map_err(|error| format!("EBP response failed: {error}"))
-        {
+            .map_err(|error| format!("EBP response failed: {error}"));
+        let maintenance = maintain_and_report_snapshot_owner(composition).and_then(|diagnostics| {
+            require_snapshot_owner_accounting(&diagnostics)?;
+            Ok(diagnostics)
+        });
+        if let Err(error) = response_send {
             // Response loss after mutation: the recorded dispatch outcome
             // stands with the same operation identity. Delivery and outcome
             // stay unknown here, never re-decided into commit or rollback.
@@ -724,6 +857,36 @@ async fn serve_handshake_loop(
                 None,
             );
             report_events(&events);
+            return match maintenance {
+                Ok(_) => Err(error),
+                Err(maintenance_error) => Err(format!("{error}; {maintenance_error}")),
+            };
+        }
+        // Run the same bounded retirement pass at the completed-request
+        // boundary, including begin-only traffic. The supervised interval
+        // remains responsible for idle periods with no client requests.
+        if let Err(error) = maintenance {
+            let mut events = BoundedEventLog::new();
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::Shutdown,
+                "shutdown",
+                &identity,
+                None,
+            );
+            report_events(&events);
+            return Err(error);
+        }
+        if let Some(error) = owner_quiesce_reason(&owner_quiesce) {
+            let mut events = BoundedEventLog::new();
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::Shutdown,
+                "shutdown",
+                &identity,
+                None,
+            );
+            report_events(&events);
             return Err(error);
         }
     }
@@ -731,10 +894,6 @@ async fn serve_handshake_loop(
 
 #[cfg(windows)]
 #[allow(clippy::print_stdout)]
-// This standalone service has no initialized telemetry sink before startup;
-// stderr is the only fail-closed launch diagnostic available to its supervisor,
-// and the visible non-writer readiness state must be reported there.
-#[allow(clippy::print_stderr)]
 async fn run() -> Result<(), String> {
     // I5.9 (issue #1932): the one-shot compatibility decision installation runs
     // before any launch-mode decode, so the installation / release owner can
@@ -791,7 +950,7 @@ async fn run() -> Result<(), String> {
     // recorded at every stage, and a maintenance verdict does not abort
     // startup: the installation comes up as a running, queryable non-writer
     // whose canonical mutations are refused on the mutation path itself.
-    let mut compatibility = enforce_store_compatibility(&config);
+    let compatibility = enforce_store_compatibility(&config);
     let composed = StoreComposition::new(&config);
     report_stage_outcome(
         BridgeBoundary::Startup,
@@ -800,64 +959,220 @@ async fn run() -> Result<(), String> {
         composed.is_ok(),
     );
     let composition = composed?;
-    let connected = composition.connect().await;
-    report_stage_outcome(
-        BridgeBoundary::Startup,
-        "startup",
-        &BridgeIdentity::new(),
-        connected.is_ok(),
-    );
-    connected?;
-    // Post-connect re-verification (issue #1932): the adapter has now proved
-    // spawned-artifact identity, listener ownership and server major over its
-    // ownership-verified channel. Re-resolve the installation-visible decision
-    // before serving: a record swapped, revoked or drifted across the
-    // provider-startup window keeps the installation non-writer here, never at
-    // the first canonical write. `combine` is fail-closed, so an admitted
-    // earlier stage can never re-admit a maintenance verdict.
-    compatibility = compatibility.combine(enforce_store_compatibility(&config));
-    // Observed-identity binding (issue #1932, backend handoff §3): the
-    // adapter proved the live version and spawn-validated digest over its
-    // ownership-verified channel during connect. Bind the record echo to
-    // that observation before serving: a rotated binary or drifted record is
-    // visible maintenance here, never an accepted write.
-    compatibility = compatibility.combine(bind_observed_identity(&composition, &config)?);
-    if !compatibility.is_writer_admitted() {
-        // Visible non-writer readiness: the store is up and answers
-        // health/readiness, and every canonical mutation is refused. The
-        // refusal is enforced on the mutation path, not by refusing to serve.
-        eprintln!(
-            "{SERVICE_NAME}: serving non-writer readiness: {}",
-            compatibility
-                .maintenance_reason()
-                .unwrap_or("unqualified decision")
+    supervise_composed_store_lifetime(&composition, &config, compatibility).await
+}
+
+#[cfg(windows)]
+// This standalone service has no initialized telemetry sink before startup;
+// stderr is the only fail-closed launch diagnostic available to its supervisor,
+// and the visible non-writer readiness state must be reported there.
+#[allow(clippy::print_stderr)]
+async fn supervise_composed_store_lifetime(
+    composition: &StoreComposition,
+    config: &eliot_store_surreal::StoreLaunchConfig,
+    mut compatibility: CompatibilityVerdict,
+) -> Result<(), String> {
+    let (owner_quiesce_tx, owner_quiesce_rx) = tokio::sync::watch::channel(None);
+    let service = Box::pin(async move {
+        let connected = composition.connect().await;
+        report_stage_outcome(
+            BridgeBoundary::Startup,
+            "startup",
+            &BridgeIdentity::new(),
+            connected.is_ok(),
         );
-    }
-    let readiness = match composition.readiness().await {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            report_stage_outcome(
-                BridgeBoundary::SemanticReadinessGate,
-                "semantic_readiness_gate",
-                &BridgeIdentity::new(),
-                false,
+        connected?;
+        // Post-connect re-verification (issue #1932): the adapter has now
+        // proved spawned-artifact identity, listener ownership and server
+        // major over its ownership-verified channel. Re-resolve the
+        // installation-visible decision before serving: a record swapped,
+        // revoked or drifted across the provider-startup window keeps the
+        // installation non-writer here, never at the first canonical write.
+        // `combine` is fail-closed, so an admitted earlier stage can never
+        // re-admit a maintenance verdict.
+        compatibility = compatibility.combine(enforce_store_compatibility(config));
+        // Observed-identity binding (issue #1932, backend handoff §3): the
+        // adapter proved the live version and spawn-validated digest over its
+        // ownership-verified channel during connect. Bind the record echo to
+        // that observation before serving: a rotated binary or drifted record
+        // is visible maintenance here, never an accepted write.
+        compatibility = compatibility.combine(bind_observed_identity(composition, config)?);
+        if !compatibility.is_writer_admitted() {
+            // Visible non-writer readiness: the store is up and answers
+            // health/readiness, and every canonical mutation is refused. The
+            // refusal is enforced on the mutation path, not by refusing to
+            // serve.
+            eprintln!(
+                "{SERVICE_NAME}: serving non-writer readiness: {}",
+                compatibility
+                    .maintenance_reason()
+                    .unwrap_or("unqualified decision")
             );
-            return Err(format!("semantic Store readiness failed: {error}"));
         }
-    };
-    let mut gate_identity = BridgeIdentity::new();
-    if let Some(generation) = readiness.observed_generation.as_deref() {
-        gate_identity = gate_identity.with_generation(generation);
+        let readiness = match composition.readiness().await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                report_stage_outcome(
+                    BridgeBoundary::SemanticReadinessGate,
+                    "semantic_readiness_gate",
+                    &BridgeIdentity::new(),
+                    false,
+                );
+                return Err(format!("semantic Store readiness failed: {error}"));
+            }
+        };
+        let mut gate_identity = BridgeIdentity::new();
+        if let Some(generation) = readiness.observed_generation.as_deref() {
+            gate_identity = gate_identity.with_generation(generation);
+        }
+        let gated = require_semantic_ready_for_pipe(&readiness, &config.schema_generation);
+        report_stage_outcome(
+            BridgeBoundary::SemanticReadinessGate,
+            "semantic_readiness_gate",
+            &gate_identity,
+            gated.is_ok(),
+        );
+        gated?;
+        serve_handshake_loop(composition, config, owner_quiesce_rx).await
+    });
+    // `query_timeout_ms` is already validated as non-zero. Reuse it as the
+    // owner wake cadence; the adapter supplies maintenance's established clock.
+    supervise_with_snapshot_owner_tick(
+        std::time::Duration::from_millis(config.query_timeout_ms),
+        service,
+        || maintain_and_report_snapshot_owner(composition),
+        owner_quiesce_tx,
+    )
+    .await
+}
+
+#[cfg(windows)]
+fn maintain_and_report_snapshot_owner(
+    composition: &StoreComposition,
+) -> Result<SnapshotBudgetDiagnostics, String> {
+    let budget = composition
+        .maintain_snapshot_owner()
+        .map_err(|error| format!("snapshot owner maintenance failed: {error}"))?;
+    report_snapshot_budget(&budget);
+    Ok(budget)
+}
+
+#[cfg(any(windows, test))]
+const SNAPSHOT_OWNER_DIMENSION_FIELDS: [&str; 8] = [
+    "snapshot.budget.v1.begins_in_progress",
+    "snapshot.budget.v1.live_captures",
+    "snapshot.budget.v1.retained_bytes",
+    "snapshot.budget.v1.terminal_entries",
+    "snapshot.budget.v1.terminal_bytes",
+    "snapshot.budget.v1.enumeration_bytes",
+    "snapshot.budget.v1.active_page_calls",
+    "snapshot.budget.v1.cleanup_steps",
+];
+
+#[cfg(any(windows, test))]
+fn snapshot_owner_accounting_is_usable(diagnostics: &SnapshotBudgetDiagnostics) -> bool {
+    diagnostics.accounting_usable
+        && SNAPSHOT_OWNER_DIMENSION_FIELDS
+            .iter()
+            .zip(diagnostics.dimensions.iter())
+            .all(|(field, dimension)| {
+                dimension.field == *field
+                    && dimension.charged <= dimension.limit
+                    && dimension.high_water >= dimension.charged
+                    && dimension.high_water <= dimension.limit
+                    && dimension.remaining == dimension.limit.checked_sub(dimension.charged)
+            })
+}
+
+#[cfg(any(windows, test))]
+fn snapshot_owner_is_drained(diagnostics: &SnapshotBudgetDiagnostics) -> bool {
+    snapshot_owner_accounting_is_usable(diagnostics)
+        && diagnostics
+            .dimensions
+            .iter()
+            .all(|dimension| dimension.charged == 0)
+}
+
+#[cfg(windows)]
+fn require_snapshot_owner_accounting(
+    diagnostics: &SnapshotBudgetDiagnostics,
+) -> Result<(), String> {
+    if snapshot_owner_accounting_is_usable(diagnostics) {
+        Ok(())
+    } else {
+        Err("snapshot owner accounting is unusable".to_owned())
     }
-    let gated = require_semantic_ready_for_pipe(&readiness, &config.schema_generation);
-    report_stage_outcome(
-        BridgeBoundary::SemanticReadinessGate,
-        "semantic_readiness_gate",
-        &gate_identity,
-        gated.is_ok(),
-    );
-    gated?;
-    serve_handshake_loop(&composition, &config).await
+}
+
+#[cfg(any(windows, test))]
+fn owner_quiesce_reason(receiver: &tokio::sync::watch::Receiver<Option<String>>) -> Option<String> {
+    receiver.borrow().clone()
+}
+
+/// Pins one owner service future while bounded expiry maintenance runs beside
+/// it. A timer wake keeps the same future alive, including a partially read
+/// frame. Fatal owner failure quiesces only pre-dispatch reads; a received
+/// request remains in this future through dispatch and send reconciliation.
+#[cfg(any(windows, test))]
+async fn supervise_with_snapshot_owner_tick<T, F, M>(
+    cadence: std::time::Duration,
+    service: F,
+    mut maintain_snapshot_owner: M,
+    owner_quiesce: tokio::sync::watch::Sender<Option<String>>,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+    M: FnMut() -> Result<SnapshotBudgetDiagnostics, String>,
+{
+    let mut interval = tokio::time::interval(cadence);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(service);
+    let mut service_result = None;
+    let mut owner_failure: Option<String> = None;
+    loop {
+        if let Some(error) = owner_failure.take() {
+            let _ = owner_quiesce.send_replace(Some(error.clone()));
+            let service_result = match service_result.take() {
+                Some(result) => result,
+                None => (&mut service).await,
+            };
+            return combine_service_and_owner_failure(service_result, error);
+        }
+
+        tokio::select! {
+            result = &mut service, if service_result.is_none() => {
+                service_result = Some(result);
+            }
+            _ = interval.tick() => {
+                match maintain_snapshot_owner() {
+                    Ok(diagnostics) if !snapshot_owner_accounting_is_usable(&diagnostics) => {
+                        owner_failure = Some("snapshot owner accounting is unusable".to_owned());
+                    }
+                    Ok(diagnostics) => {
+                        if let Some(result) = service_result.take() {
+                            if snapshot_owner_is_drained(&diagnostics) {
+                                return result;
+                            }
+                            service_result = Some(result);
+                        }
+                    }
+                    Err(error) => owner_failure = Some(error),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn combine_service_and_owner_failure<T>(
+    service_result: Result<T, String>,
+    owner_failure: String,
+) -> Result<T, String> {
+    match service_result {
+        Ok(_) => Err(owner_failure),
+        Err(service_error) if service_error == owner_failure => Err(service_error),
+        Err(service_error) => Err(format!("{service_error}; {owner_failure}")),
+    }
 }
 
 #[cfg(not(windows))]
@@ -869,8 +1184,189 @@ async fn run() -> Result<(), String> {
 #[allow(clippy::expect_used)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use eliot_store_surreal_adapter::SnapshotBudgetDimension;
 
     use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn owner_diagnostics(
+        live_capture_charge: u64,
+        accounting_usable: bool,
+    ) -> SnapshotBudgetDiagnostics {
+        let mut dimensions = std::array::from_fn(|index| SnapshotBudgetDimension {
+            field: SNAPSHOT_OWNER_DIMENSION_FIELDS[index],
+            limit: 1,
+            charged: 0,
+            high_water: 0,
+            remaining: Some(1),
+        });
+        dimensions[1] = SnapshotBudgetDimension {
+            field: SNAPSHOT_OWNER_DIMENSION_FIELDS[1],
+            limit: 1,
+            charged: live_capture_charge,
+            high_water: 1,
+            remaining: Some(1 - live_capture_charge),
+        };
+        SnapshotBudgetDiagnostics {
+            accounting_usable,
+            dimensions,
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_tick_keeps_an_incomplete_service_future_pinned() {
+        // The first poll models an incomplete frame read. It only completes on
+        // the next poll of the same future after a timer wake.
+        let maintenance_calls = Arc::new(AtomicUsize::new(0));
+        let calls_during_partial_read = Arc::clone(&maintenance_calls);
+        let mut partial_read_tick = None;
+        let service = std::future::poll_fn(move |_| {
+            let calls = calls_during_partial_read.load(Ordering::SeqCst);
+            match partial_read_tick {
+                None => {
+                    partial_read_tick = Some(calls);
+                    std::task::Poll::Pending
+                }
+                Some(previous_calls) if calls > previous_calls => {
+                    std::task::Poll::Ready(Ok::<(), String>(()))
+                }
+                Some(_) => std::task::Poll::Pending,
+            }
+        });
+        let calls_during_maintenance = Arc::clone(&maintenance_calls);
+        let (owner_quiesce, _owner_quiesce_receiver) = tokio::sync::watch::channel(None);
+        let result = supervise_with_snapshot_owner_tick(
+            std::time::Duration::from_millis(1),
+            service,
+            || {
+                calls_during_maintenance.fetch_add(1, Ordering::SeqCst);
+                Ok(owner_diagnostics(0, true))
+            },
+            owner_quiesce,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(maintenance_calls.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn completed_service_drains_snapshot_work_without_a_client() {
+        let maintenance_calls = Arc::new(AtomicUsize::new(0));
+        let calls_during_maintenance = Arc::clone(&maintenance_calls);
+        let (owner_quiesce, _owner_quiesce_receiver) = tokio::sync::watch::channel(None);
+        let result = supervise_with_snapshot_owner_tick(
+            std::time::Duration::from_millis(1),
+            async { Err::<(), _>("session ended after client loss".to_owned()) },
+            move || {
+                let call = calls_during_maintenance.fetch_add(1, Ordering::SeqCst);
+                let live_capture_charge = u64::from(call == 0);
+                Ok(owner_diagnostics(live_capture_charge, true))
+            },
+            owner_quiesce,
+        )
+        .await;
+
+        assert_eq!(result, Err("session ended after client loss".to_owned()));
+        assert!(maintenance_calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn owner_tick_refusal_quiesces_after_inflight_service_reconciles() {
+        let maintenance_refused = Arc::new(AtomicBool::new(false));
+        let service_reconciled = Arc::new(AtomicBool::new(false));
+        let service_was_dropped = Arc::new(AtomicBool::new(false));
+        let refused = Arc::clone(&maintenance_refused);
+        let refused_for_maintenance = Arc::clone(&maintenance_refused);
+        let reconciled = Arc::clone(&service_reconciled);
+        let drop_flag = DropFlag(Arc::clone(&service_was_dropped));
+        let service = std::future::poll_fn(move |_| {
+            let _drop_flag = &drop_flag;
+            if refused.load(Ordering::SeqCst) {
+                reconciled.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(Err::<(), _>("dispatch outcome reconciled".to_owned()))
+            } else {
+                std::task::Poll::Pending
+            }
+        });
+        let (owner_quiesce, _owner_quiesce_receiver) = tokio::sync::watch::channel(None);
+        let result = supervise_with_snapshot_owner_tick(
+            std::time::Duration::from_millis(1),
+            service,
+            move || {
+                refused_for_maintenance.store(true, Ordering::SeqCst);
+                Err("snapshot owner maintenance refused".to_owned())
+            },
+            owner_quiesce,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err("dispatch outcome reconciled; snapshot owner maintenance refused".to_owned())
+        );
+        assert!(service_reconciled.load(Ordering::SeqCst));
+        assert!(service_was_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn latched_owner_failure_blocks_a_ready_frame_at_admission_boundary() {
+        let maintenance_refused = Arc::new(AtomicBool::new(false));
+        let frame_was_admitted = Arc::new(AtomicBool::new(false));
+        let refused = Arc::clone(&maintenance_refused);
+        let admitted = Arc::clone(&frame_was_admitted);
+        let (owner_quiesce, owner_quiesce_receiver) = tokio::sync::watch::channel(None);
+        let service = std::future::poll_fn(move |_| {
+            if !refused.load(Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+
+            // The frame is ready here; the production admission boundary
+            // checks the latched fatal owner state before validating or
+            // dispatching it.
+            if let Some(error) = owner_quiesce_reason(&owner_quiesce_receiver) {
+                return std::task::Poll::Ready(Err(error));
+            }
+            admitted.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        });
+        let refused_for_maintenance = Arc::clone(&maintenance_refused);
+        let result = supervise_with_snapshot_owner_tick(
+            std::time::Duration::from_millis(1),
+            service,
+            move || {
+                refused_for_maintenance.store(true, Ordering::SeqCst);
+                Err("snapshot owner maintenance refused".to_owned())
+            },
+            owner_quiesce,
+        )
+        .await;
+
+        assert_eq!(result, Err("snapshot owner maintenance refused".to_owned()));
+        assert!(!frame_was_admitted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unknown_or_unusable_snapshot_accounting_never_claims_drain() {
+        let mut diagnostics = owner_diagnostics(0, false);
+        assert!(!snapshot_owner_is_drained(&diagnostics));
+
+        diagnostics.accounting_usable = true;
+        diagnostics.dimensions[1].remaining = None;
+        assert!(!snapshot_owner_is_drained(&diagnostics));
+    }
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()

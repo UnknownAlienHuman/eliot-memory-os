@@ -45,7 +45,8 @@ pub use backup_restore::{
     validate_restore_batch,
 };
 pub use backup_snapshot::{
-    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, capture_ecxf_source,
+    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, SnapshotBudgetDiagnostics,
+    SnapshotBudgetDimension, capture_ecxf_source,
 };
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
@@ -152,6 +153,17 @@ impl fmt::Debug for SurrealStoreAdapter {
 }
 
 impl SurrealStoreAdapter {
+    /// Runs one bounded snapshot-owner maintenance pass when accounting is
+    /// usable, and returns its charge diagnostics for the supervised owner loop.
+    ///
+    /// This hook performs no provider I/O and does not retain captured data in
+    /// the diagnostics. Its clock observation and the expiry transitions use
+    /// the existing write-execution clock domain, sampled after the registry
+    /// lock has been acquired.
+    pub fn maintain_snapshot_owner(&self) -> Result<SnapshotBudgetDiagnostics, StoreError> {
+        crate::backup_snapshot::snapshot_owner_maintenance_diagnostics()
+    }
+
     /// Builds an adapter with the given connection and generation settings.
     ///
     /// Construction binds the instance to the active generated operation
