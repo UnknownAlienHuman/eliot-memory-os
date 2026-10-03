@@ -1126,14 +1126,14 @@ pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-s
 
 /// Freeze identity this consumer package builds against.
 ///
-/// Repointed to the r12 candidate under `CC-W2-CONSUMER-REPIN`, which
-/// enumerates this exact constant together with "its self-comparison assertion"
-/// as a pin that must move in the same work unit as any freeze byte change.
+/// Repointed in the same work unit as any freeze byte change, per
+/// `CC-W2-CONSUMER-REPIN`, which enumerates this exact constant together with
+/// its [`CONSUMED_FREEZE_DIGEST`] byte pin as one pair of pins that must move.
 /// The string alone proves nothing about the bytes, so it is only ever read
 /// next to [`CONSUMED_FREEZE_DIGEST`]; the previous r8 pin and its
 /// identical-literal self-comparison were removed because a constant compared
 /// with itself can never detect the freeze moving under it.
-pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12";
+pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r14";
 
 /// Lowercase sha256 over the exact [`FREEZE_BYTES`] this consumer is bound to.
 ///
@@ -1148,7 +1148,7 @@ pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-202
 /// string pins without the byte digest pin" as a forbidden workaround, which is
 /// why this constant exists next to [`CONSUMED_FREEZE_ID`].
 pub const CONSUMED_FREEZE_DIGEST: &str =
-    "eeb5449712a373c1087496005b97007f8632a885952c812152c46ea537857596";
+    "566dd79d42f11c55530774268db671d3681af009c16498b063d15a3d9ae62a16";
 
 /// Read the single column-0 `freeze_id` the freeze bytes declare.
 ///
@@ -1176,15 +1176,15 @@ fn declared_freeze_id(source: &str) -> Option<&str> {
 /// Fail closed unless these exact bytes are the freeze revision this package
 /// pins.
 ///
-/// Takes the bytes as an argument so the comparison is over a document rather
-/// than over a constant compared with itself; [`check_consumed_freeze`] is the
-/// production entry and passes [`FREEZE_BYTES`]. Both sides are read from the
-/// given bytes: the declared `freeze_id` against [`CONSUMED_FREEZE_ID`], and the
-/// sha256 of the same bytes against [`CONSUMED_FREEZE_DIGEST`]. Divergence is
-/// the existing typed [`QualityError::VersionMismatch`] -- never a boolean --
-/// and never echoes the observed identity or digest, because this crate's
-/// error contract states that errors name only the failing field and the
-/// violated rule.
+/// Takes the bytes as an argument so the comparison is over a document
+/// rather than over a constant compared with itself; [`check_consumed_freeze`]
+/// is the production entry and passes [`FREEZE_BYTES`]. Both observed values
+/// are read from the same given bytes: the declared `freeze_id` against
+/// [`CONSUMED_FREEZE_ID`], and the sha256 of those bytes against
+/// [`CONSUMED_FREEZE_DIGEST`]. Divergence is the existing typed
+/// [`QualityError::VersionMismatch`] -- never a boolean -- and never echoes
+/// the observed identity or digest, because this crate's error contract states
+/// that errors name only the failing field and the violated rule.
 fn verify_consumed_freeze(bytes: &[u8]) -> Result<(), QualityError> {
     let source = std::str::from_utf8(bytes).map_err(|_| QualityError::VersionMismatch)?;
     let observed_id = declared_freeze_id(source).ok_or(QualityError::VersionMismatch)?;
@@ -1204,9 +1204,9 @@ fn check_consumed_freeze() -> Result<(), QualityError> {
 
 #[cfg(test)]
 mod freeze_binding {
-    //! The freeze pin is a byte binding, so both cases are measured against
-    //! real documents: the delivered bytes pass, and any other freeze identity
-    //! is refused with the existing typed error.
+    //! Refusal is `QualityError::VersionMismatch`. The delivered bytes meet both
+    //! pins; a moved identity and edited bytes are refused; five inputs are refused:
+    //! four declare no single column-0 `freeze_id`, while one is not UTF-8.
 
     #![allow(clippy::expect_used)]
 
