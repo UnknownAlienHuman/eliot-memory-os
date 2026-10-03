@@ -702,22 +702,59 @@ public sealed record UserAutomationOperatorRequest(
         }
     }
 
-    /// Validates the CURRENT-shape identity binding: the operation decodes
-    /// through today's closed contract, the key is syntactically valid, and
-    /// the key is exactly the digest today's serializer derives from those
-    /// same canonical operation bytes.
+    /// Validates the CURRENT-shape identity binding. `Validate()` runs first for
+    /// both classes and supplies the class-independent claims: key syntax
+    /// through `OperatorIntentContract.RequireOperationId(IdempotencyKey)`,
+    /// the same 32-character lowercase-hex rule every other operation identity
+    /// obeys, and the class-specific fence rule (the absent fence for the
+    /// handshake, one closed fence otherwise). Operation shape is not a
+    /// class-independent claim. For a business operation `Operation.Validate()`
+    /// enforces that operation's own member rules; for
+    /// `UserAutomationGetContextOperation` that body is deliberately empty
+    /// (:56) because the record carries no members, so its shape is pinned
+    /// solely by the closed decoder's `kind` mapping (:16-18) refusing an
+    /// unmapped or unknown discriminator. What follows is the one claim that
+    /// is true only of a business operation.
     ///
-    /// This is the sendable-identity invariant. It is required of fresh
-    /// `Create` output, at the live transport boundary and for current-shape
-    /// recovery, so a corrupted or edited journal entry cannot travel under
-    /// an identity that names a different operation. It must never be
-    /// applied to a superseded-shape retained record: that key was derived
-    /// from bytes that included the old local classifier, so recomputing it
-    /// under today's serializer names a different request commitment, and
-    /// the record stays withheld under its exact retained key.
+    /// Business operation: the key is exactly the digest today's serializer
+    /// derives from those same canonical operation bytes
+    /// (`IdempotencyKey == DeriveIdempotencyKey(Operation)`), so a corrupted
+    /// or edited journal entry cannot travel under an identity that names a
+    /// different operation. This is the sendable-identity invariant required of
+    /// fresh `Create` output, at the live transport boundary and for
+    /// current-shape recovery, so changed operation bytes under an old key
+    /// are still rejected. It must never be applied to a superseded-shape
+    /// retained record: that key was derived from bytes that included the old
+    /// local classifier, so recomputing it under today's serializer names a
+    /// different request commitment, and the record stays withheld under its
+    /// exact retained key.
+    ///
+    /// `UserAutomationGetContextOperation` handshake: the read-only
+    /// `get_context` request is validated for shape, key syntax and the absent
+    /// fence ONLY. Its identity is deliberately a fresh per-call nonce minted by
+    /// `CreateContext()` as `Guid.NewGuid().ToString("N")`, because `get_context`
+    /// carries no distinguishing field — a digest of its canonical bytes would
+    /// be one constant for the lifetime of the contract and would name the
+    /// earlier handshake rather than this call, restoring exactly the
+    /// stale-context identity reuse the factory prevents. The nonce already
+    /// satisfies `RequireOperationId` (a 32-character lowercase-hex GUID), so
+    /// syntax validation is unaffected; it carries `ExpectedStateFence: null`
+    /// and `Validate()` already refuses any fence on it, so the absent-fence
+    /// rule is unaffected. Distinguishing the handshake here adds no parameter,
+    /// no request-class label, no caller-supplied flag, no new type and no new
+    /// bound, and leaves every other operation — including owner
+    /// normalization/migration — on the unchanged digest-equality check and
+    /// its existing refusal sentence. Authentication stays with the transport
+    /// route and response/request correlation stays with the issued identity;
+    /// nothing here is caught and ignored.
     public void ValidateCurrentIdentity()
     {
         Validate();
+        if (Operation is UserAutomationGetContextOperation)
+        {
+            return;
+        }
+
         if (!string.Equals(IdempotencyKey, DeriveIdempotencyKey(Operation), StringComparison.Ordinal))
         {
             throw new InvalidOperationException("idempotency_key does not name the retained typed operation.");
