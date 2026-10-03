@@ -280,3 +280,16 @@ After those outputs exist, assign exact `eliotd` adapters plus the actual Kernel
 consumer files in one serialized turn. Do not wait for whole #1678/#1679/#1680 test
 closure, but do not fabricate their missing owner state either. #1701 remains
 `RECHECK` and holds no broad `eliotd`/Kernel/native-worker reservation.
+
+
+---
+
+## Review of 2026-10-03 15:22 (root + lanes OR, W4, CB, K1, K2; main cac8ef382)
+
+Reviewed 445 issues: READY 187, WAIT 159, PRESERVE 43, ESCALATE 43, CLOSE-CANDIDATE 13.
+126 READY rows were added to `PLAN.tsv` with a card each in `cards/<issue>.md` (the same card format: EDIT / READ ONLY / START / MAKE / DO NOT / CHECK NOW / DEFER / DONE). Waves: wave 1: 90, wave 2: 22, wave 3: 8, wave 4: 2, wave 5: 1, wave 6: 2, wave 7: 1. Inside a wave no two rows share a write path, and the four cards already in flight (#3980, #2691, #2643, #2701) hold their files through wave 1; a row's open dependencies sit in earlier waves. Mechanical checks done by root: card present, write_paths a JSON list and present on main (NEW paths are listed in the merge), dependencies READY or closed. Cards were written by the reviewing lanes and are NOT root-verified line by line: the controller preflight of CONTINUATION.md still applies to every row.
+
+- Not dispatchable yet: `WAIT.tsv` (missing producer output or MISSING-CONTRACT with the release condition).
+- Owner decisions: `ESCALATE.tsv` (43 issues).
+- Close candidates (every item shown done; root closes with evidence after a check): #259 #481 #862 #976 #990 #1376 #1754 #1779 #1903 #1963 #2613 #2699 #4634.
+- Seams: `STITCH-20261003.tsv`; files shared by several READY rows: `OVERLAPS-20261003.tsv`.

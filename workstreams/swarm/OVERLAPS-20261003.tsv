@@ -1,0 +1,38 @@
+path	issues
+crates/kernel/eliot-ors/src/store.rs	#269 #1953 #2627 #2763 #2764 #2798 #2863 #2885
+bins/eliot-host/src/lib.rs	#891 #961 #1953 #2737
+crates/governor/eliot-governor/src/composition.rs	#1191 #2380 #2663 #2962
+bins/eliot-agent-bridge/src/lib.rs	#1939 #2570 #2799 #2800
+crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml	#88 #1025 #2738
+bins/eliot-host/src/backup_cutover.rs	#961 #2737 #2738
+crates/kernel/eliot-installation/src/tests.rs	#1138 #1148 #3001
+crates/governor/eliot-authority/src/grants.rs	#1142 #2962 #2976
+crates/governor/eliot-governor/src/owner_closure_provider.rs	#1142 #2962 #2976
+bins/eliotd/src/lib.rs	#1191 #1910 #2663
+bins/eliot-wasm-host/src/request_loop.rs	#1956 #2786 #2896
+bins/eliotd/src/daemon_runtime.rs	#2559 #2560 #2647
+crates/kernel/eliot-kernel-service/src/store_gateway.rs	#2763 #2764 #2971
+crates/governor/eliot-canonical/src/lib.rs	#63 #2570
+crates/storage/eliot-store-memory/src/lib.rs	#63 #2859
+bins/eliot-kernel/src/lib.rs	#88 #2627
+bins/eliot-watchdog/tests/spool_backup.rs	#458 #955
+crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs	#673 #2870
+bins/eliot-store-surreal/src/lib.rs	#742 #1933
+crates/storage/eliot-store-api/src/lib.rs	#950 #2859
+crates/kernel/eliot-ors/tests/restore_journal.rs	#957 #2653
+bins/eliot-kernel/src/backup_capture.rs	#959 #2863
+Cargo.lock	#974 #2857
+crates/storage/eliot-store-surreal-adapter/src/apply.rs	#989 #1933
+crates/governor/eliot-skill/src/lib.rs	#1191 #2663
+crates/governor/eliot-skill/src/activation.rs	#1191 #2663
+bins/eliotd/src/skill_dispatch.rs	#1191 #2663
+crates/surfaces/eliot-agent-bridge-core/src/lib.rs	#1191 #2799
+bins/eliot-agent-bridge/src/hook_intake.rs	#1219 #4601
+bins/eliot-kernel/src/daemon_request_dispatch.rs	#1905 #2875
+bins/eliotd/src/startup_readiness.rs	#2560 #2647
+crates/kernel/eliot-kernel-service/src/wasm_dispatch.rs	#2568 #2786
+crates/storage/eliot-store-surreal-adapter/src/backup_restore.rs	#2666 #2859
+crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs	#2688 #2689
+crates/kernel/eliot-kernel-service/src/commit_recovery.rs	#2763 #2764
+crates/kernel/eliot-ors/src/store/backup_snapshot.rs	#2885 #2967
+crates/governor/eliot-governor/src/owner_closure_feed.rs	#2962 #2976
