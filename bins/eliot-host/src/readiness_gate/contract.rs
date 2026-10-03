@@ -115,6 +115,27 @@ pub(crate) enum ReadinessFailureKind {
 }
 
 #[cfg(windows)]
+impl ReadinessFailureKind {
+    /// Stable closed name of this failure kind.
+    ///
+    /// Pure classification for bounded projection: it reads no runtime state,
+    /// allocates nothing, and emits nothing, so this module stays the explicit
+    /// non-boundary it has always been. The name reports the retained kind
+    /// itself; it is never a readiness lifecycle state and never a repair
+    /// directive (I14.20).
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContourUnavailable => "contour_unavailable",
+            Self::ProbeRejected => "probe_rejected",
+            Self::DeliveryUnknown => "delivery_unknown",
+            Self::JournalRejected => "journal_rejected",
+            Self::JournalOutcomeUnknown => "journal_outcome_unknown",
+        }
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind {
     match error {
         HostError::RecoveryRequired(_) => ReadinessFailureKind::DeliveryUnknown,

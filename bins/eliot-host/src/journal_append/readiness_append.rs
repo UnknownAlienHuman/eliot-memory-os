@@ -24,8 +24,11 @@ use super::super::watchdog_publication::supervision_publication_identity;
 use super::super::{
     AuthenticatedKernelReadiness, PublishedSupervisionIdentity, fresh_identity, operation,
 };
+use crate::journal_append::{
+    HostJournalDisposition, HostJournalObservation, observe_host_journal_boundary,
+};
 use eliot_host_state::{
-    AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
+    AppendDisposition, AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
     KernelReadinessObservationRecord, ReadinessApprovedContour,
 };
 #[cfg(windows)]
@@ -41,26 +44,32 @@ use eliot_runtime_contracts::{
 // F-LOG-HOST-6 (#981) readiness-append observation helpers.
 //
 // Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`crate::host_diagnostics::info!` on `HOST_DIAGNOSTICS_TARGET`, and
+// `crate::host_diagnostics::note_event_log_sink_status()` as the canonical
+// bounded observer of the live Event Log disposition); the
+// `windows_event_log` wrapper stays the only OS seam and no Event Log FFI is
+// acquired here.
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never evidence
-// refs, digests, or arbitrary error text — so bounding limits size, not
-// sensitivity (I15.4). Appended evidence and granted readiness stay
-// distinct: this child observes the evidence funnel; the readiness grant
-// stays with the gate owner (I1.10). These primitives own no terminal: a
-// single terminal per failed readiness operation is enforced by the
-// outermost owner boundary, while these phases correlate by stage order
-// only. Sink outcome never alters result/order/cleanup.
-fn host_readiness_append_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
-    crate::host_diagnostics::observe_entrypoint_with_detail(
-        crate::host_diagnostics::EntrypointStage::Startup,
-        detail,
-    );
+// Observation-only contract: every helper projects facts the semantic owner has
+// already produced. Arguments are a frozen boundary literal plus the
+// already-owned nonsecret identities this child already holds — the readiness
+// record's own operation, fence and checksum, the approved contour's fence and
+// config digest, the proof's own operation and candidate identity, the
+// supervision identity's own lease, `ORS` receipt and publication digests, and
+// the journal's own receipt — never evidence refs, records, digests of caller
+// content, or arbitrary error text — so bounding limits size, not sensitivity
+// (I15.4). Appended evidence and granted readiness stay distinct: this child
+// observes the evidence funnel; the readiness grant stays with the gate owner
+// (I1.10). Requested evidence, a durable append, an exact replay readback, a
+// known noncommit and an unknown outcome stay distinct (I14.21). These
+// primitives own no terminal: a single terminal per failed readiness operation
+// is enforced by the outermost owner boundary. Each site emits one record, and
+// a chain calls one builder per shared slot because the shared vocabulary is
+// last write wins, so no correlated lower-stage detail is counted twice and no
+// identity is silently discarded. Sink outcome never alters
+// result/order/cleanup.
+fn host_readiness_append_observe(observation: &HostJournalObservation) {
+    observe_host_journal_boundary(observation);
 }
 
 fn append_reconciled_readiness<B: JournalBackend>(
@@ -68,18 +77,66 @@ fn append_reconciled_readiness<B: JournalBackend>(
     observation: KernelReadinessObservationRecord,
     expected: &ReadinessApprovedContour,
 ) -> Result<AppendReceipt, HostError> {
-    host_readiness_append_observe("host.readiness append requested");
+    let requested = HostJournalObservation::new(
+        "host.readiness append requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_operation(observation.operation.operation_id.as_str())
+    .with_record_fence(&observation.fence)
+    .with_record_checksum(observation.active_kernel_record_checksum.as_str())
+    .with_request_digest(observation.probe_request_digest.as_str())
+    .with_fence(expected.store_fence.as_str())
+    .with_contour(expected.config_digest.as_str());
+    host_readiness_append_observe(&requested);
     match journal.append_readiness_observation(observation.clone(), expected) {
         Ok(receipt) => {
-            host_readiness_append_observe("host.readiness append durable observed");
+            // The journal owner alone knows whether this call committed a new
+            // readiness frame or returned the exact existing one; the record
+            // names that disposition instead of labelling both a durable append.
+            let disposition = super::append_disposition(receipt.disposition());
+            let boundary = match receipt.disposition() {
+                AppendDisposition::Applied => "host.readiness append durable observed",
+                AppendDisposition::Replayed => "host.readiness append replay observed",
+            };
+            let observed =
+                HostJournalObservation::new(boundary, disposition).with_receipt(&receipt);
+            host_readiness_append_observe(&observed);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
-            host_readiness_append_observe("host.readiness append outcome unknown observed");
+            let observed = HostJournalObservation::new(
+                "host.readiness append outcome unknown observed",
+                HostJournalDisposition::ReconcileStillUnknown,
+            )
+            .with_transaction(&transaction_id)
+            .with_fence(expected.store_fence.as_str());
+            host_readiness_append_observe(&observed);
             if super::reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal
-                    .append_readiness_observation(observation, expected)
-                    .map_err(HostError::Journal)
+                // The commit is known; this call only reads the exact original
+                // transaction back. Both answers are observed separately, so a
+                // failed readback can never read as an unknown commit and never
+                // reads as a second evidence append.
+                match journal.append_readiness_observation(observation, expected) {
+                    Ok(receipt) => {
+                        let observed = HostJournalObservation::new(
+                            "host.readiness reconcile readback observed",
+                            HostJournalDisposition::ReconcileReadbackVerified,
+                        )
+                        .with_receipt(&receipt);
+                        host_readiness_append_observe(&observed);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        let observed = HostJournalObservation::new(
+                            "host.readiness reconcile readback failed observed",
+                            HostJournalDisposition::ReconcileReadbackFailed,
+                        )
+                        .with_transaction(&transaction_id)
+                        .with_fence(expected.store_fence.as_str());
+                        host_readiness_append_observe(&observed);
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical
@@ -90,7 +147,10 @@ fn append_reconciled_readiness<B: JournalBackend>(
             }
         }
         Err(error) => {
-            host_readiness_append_observe("host.readiness append rejected observed");
+            host_readiness_append_observe(&HostJournalObservation::new(
+                "host.readiness append rejected observed",
+                HostJournalDisposition::BoundaryReached,
+            ));
             Err(HostError::Journal(error))
         }
     }
@@ -181,7 +241,15 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
 /// watchdog-branch ref (transport1750 step 8). Empty refs preserve the
 /// pre-transport record exactly; callers pass refs admitted from a fresh
 /// derived Host observation, never raw pipe material.
+///
+/// One owner transaction on purpose: admission, contour comparison, evidence
+/// assembly, record construction and the durable append stay in one body
+/// because splitting them would move an owner error across a boundary.
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one owner transaction: admission, contour comparison, evidence assembly, record construction and the durable append stay in one body so no owner error crosses a boundary; remove with the boundary-check extraction"
+)]
 pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     proof: &AuthenticatedKernelReadiness,
@@ -190,7 +258,17 @@ pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBac
     watchdog_template: &WatchdogAdmissionTemplate,
     heartbeat_refs: &[PlatformHandle],
 ) -> Result<(AppendReceipt, PublishedSupervisionIdentity), HostError> {
-    host_readiness_append_observe("host.readiness authenticated requested");
+    let requested = HostJournalObservation::new(
+        "host.readiness authenticated requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_installation(proof.request.candidate.installation_id.as_str())
+    .with_host_epoch(proof.request.candidate.host_epoch.value())
+    .with_operation(proof.ready.activation_operation_id.as_str())
+    .with_request_digest(&proof.request.payload_digest)
+    .with_fence(proof.store_fence.as_str())
+    .with_contour(approved_config.as_str());
+    host_readiness_append_observe(&requested);
     let snapshot = journal.snapshot()?;
     let active = snapshot.kernel.as_ref().ok_or_else(|| {
         HostError::ProcessContour("readiness admission has no active Kernel record".to_owned())
@@ -221,7 +299,21 @@ pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBac
         || active_job.root_volume_serial_number != job.root.executable.volume_serial_number
         || active_job.root_file_index != job.root.executable.file_index
     {
-        host_readiness_append_observe("host.readiness contour mismatch observed");
+        // Builder precedence is last write wins, so this chain carries one contour:
+        // `with_record_fence` writes `installation`, `host_epoch` and
+        // `host_lineage` from the active kernel record's own fence. A second
+        // `with_host(&snapshot.host)` or `with_installation(candidate...)` here
+        // would be silently discarded by it, and the candidate identity the
+        // comparison above used has no slot of its own in this vocabulary.
+        let refused = HostJournalObservation::new(
+            "host.readiness contour mismatch observed",
+            HostJournalDisposition::ReadinessRefused,
+        )
+        .with_record_fence(&active.fence)
+        .with_operation(proof.ready.activation_operation_id.as_str())
+        .with_fence(proof.store_fence.as_str())
+        .with_contour(approved_config.as_str());
+        host_readiness_append_observe(&refused);
         return Err(HostError::ProcessContour(
             "Kernel readiness proof is not bound to the active journal contour".to_owned(),
         ));
@@ -282,6 +374,17 @@ pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBac
         },
         &expected,
     )?;
-    host_readiness_append_observe("host.readiness evidence appended");
+    let observed = HostJournalObservation::new(
+        "host.readiness evidence appended",
+        super::append_disposition(receipt.disposition()),
+    )
+    .with_record_fence(&active.fence)
+    .with_contour(approved_config.as_str())
+    .with_fence(proof.store_fence.as_str())
+    .with_lease(supervision.lease_id.as_str())
+    .with_ors_receipt(supervision.ors_receipt_digest.as_str())
+    .with_watchdog(supervision.publication_digest.as_str())
+    .with_receipt(&receipt);
+    host_readiness_append_observe(&observed);
     Ok((receipt, supervision))
 }
