@@ -132,7 +132,7 @@ use std::time::{Duration, Instant};
 
 use eliot_contracts::sha256_hex;
 use eliot_wasm_runtime::lifecycle::{
-    DIVERGENCE_REASON_CODE, DivergenceReport, InFlightDisposition,
+    DIVERGENCE_REASON_CODE, DivergenceReport, InFlightDisposition, ShadowComparatorOutcome,
 };
 use eliot_wasm_runtime::{
     EngineBinding, GuestInterruptHandle, InvocationRequest, InvocationResult, Sha256Digest,
@@ -142,8 +142,8 @@ use eliot_wasm_runtime::{
 use crate::WasmHostRunner;
 use crate::admission::LiveAuthority;
 use crate::dispatch_drive::{
-    DriveError, LifecycleVerdicts, SeatedVerdicts, evaluate_lifecycle_verdicts,
-    evaluate_seated_verdicts,
+    ConformanceRecord, DriveError, LifecycleVerdicts, SeatedVerdicts, conformance_record,
+    evaluate_lifecycle_verdicts, evaluate_seated_verdicts, shadow_comparator_for_record,
 };
 use crate::dispatch_material::{
     ControlAckPhase, ControlFileClass, ExpectedControlBinding, MaterialError,
@@ -1026,6 +1026,31 @@ pub struct WasmHostResultFrame {
     /// Explicit leg-level divergence report, present exactly when the
     /// sealed execution disagreed with its declared reference.
     pub divergence: Option<DivergenceReport>,
+    /// The WASM-versus-declared-reference conformance comparison established
+    /// for this result: the observed and the declared result bytes, error
+    /// classes, proposed effects, and observed state delta of the same run.
+    ///
+    /// A value can only exist when that comparison held, because the
+    /// comparison's own producer refuses a comparison that does not hold, so
+    /// this field never carries a disagreeing pair of sides.
+    ///
+    /// `None` means this result carries no established comparison. Absence
+    /// stays absence: it is never a fabricated, zeroed, or
+    /// default-constructed comparison, and it is not a claim that the
+    /// component conformed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conformance: Option<ConformanceRecord>,
+    /// The reconciled isolated no-effect shadow comparator outcome for the
+    /// same run, when one was built.
+    ///
+    /// `None` means no comparator outcome was established for this result:
+    /// there was no conformance comparison to reconcile its legs over, or no
+    /// executor metering to reconcile. Absence stays absence — it is never a
+    /// fabricated, zeroed, or default-constructed outcome, and a resource
+    /// observation that was not made stays explicitly unknown rather than
+    /// zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_comparator: Option<ShadowComparatorOutcome>,
 }
 
 fn disposition_text(disposition: eliot_wasm_runtime::InvocationDisposition) -> String {
@@ -1090,11 +1115,19 @@ fn usage_frames(result: &InvocationResult) -> (Option<u64>, Option<u64>, Option<
 /// The explicit divergence report travels separately from the typed error:
 /// the error keeps its stable classification while the report carries the
 /// leg-level evidence and the canonical divergence reason code.
+///
+/// `material` is the validated dispatch material this loop was built from,
+/// and it is the only reference source: the conformance comparison and the
+/// comparator legs reconciled from it are the existing dispatch-drive
+/// owner's own (`conformance_record` / `shadow_comparator_for_record`), so
+/// no second semantic core exists here and the declared reference is never
+/// derived from the observed guest output.
 fn project_result(
     binding: &AdmittedBinding,
     engine: &EngineBinding,
     command: WorkerCommand,
     result: &InvocationResult,
+    material: &ValidatedDispatchMaterial,
     divergence: Option<DivergenceReport>,
 ) -> WasmHostResultFrame {
     let (shadow, canary, rollback, cutover) = lifecycle_frame(evaluate_lifecycle_verdicts(result));
@@ -1104,6 +1137,40 @@ fn project_result(
     let divergence_code = divergence
         .as_ref()
         .map(|_| DIVERGENCE_REASON_CODE.to_owned());
+    // The conformance comparison, over this retained result and the
+    // validated material, through the existing owner's own call.
+    //
+    // A missing observation is not an empty observation: with no retained
+    // output bytes there are no observed result bytes to compare, so
+    // `conformance_record` is never called with a substitute slice and no
+    // comparison is carried. The producer's own outcome is what this field
+    // reports: a comparison it established, or none. A comparison it refused
+    // is reported as no established comparison, which is what a record of a
+    // held comparison can honestly be; a reader learns agreement only from a
+    // value that is actually present.
+    let conformance: Result<Option<ConformanceRecord>, DriveError> = match result.output.as_deref()
+    {
+        Some(output) => conformance_record(result, output, material),
+        None => Ok(None),
+    };
+    // The comparator reconciles the same run against the comparison's own
+    // declared reference values, so it is built only over an established
+    // comparison and over the executor's own metering. Without metering there
+    // is no metering leg to reconcile, so no comparator outcome is carried;
+    // the isolated no-effect shadow comparison, the unknown resource
+    // observations, and the producer's own refusals all stay exactly as that
+    // owner defines them.
+    let established = conformance.as_ref().ok().and_then(|record| record.as_ref());
+    let shadow_comparator = match (
+        result.output.as_deref(),
+        result.receipt.usage.as_ref(),
+        established,
+    ) {
+        (Some(output), Some(usage), Some(record)) => {
+            shadow_comparator_for_record(result, output, usage, Some(record))
+        }
+        _ => None,
+    };
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID.to_owned(),
         wire_version: WASM_HOST_RESULT_WIRE_VERSION,
@@ -1152,6 +1219,10 @@ fn project_result(
         rollback_candidate,
         divergence_code,
         divergence,
+        // `Option`'s own default IS `None`: a refusal yields no established
+        // comparison rather than a fabricated one, so nothing is invented here.
+        conformance: conformance.unwrap_or_default(),
+        shadow_comparator,
     }
 }
 
@@ -1437,6 +1508,24 @@ pub fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     {
         return Err(invalid("denial-evidence"));
     }
+    // Carried comparison re-proved by the owner's OWN predicate, not by a
+    // re-derivation: `Deserialize` bypasses every construction-site refusal in
+    // `conformance_record` (component gate, promotion-digest binding, the four
+    // digest checks, the missing-state-delta refusal and `!record.holds()`), so a
+    // retained frame could otherwise carry two sides that disagree. The frame
+    // carries none of `material.input_bytes`, none of the promotion digests and
+    // none of the ceilings, so re-deriving the declared reference here is
+    // impossible by construction — it is not a weaker second core, it is the same
+    // single verdict function the owner exposes, called once more. `None` means
+    // no comparison was carried, which is absence and not disagreement, so it is
+    // unaffected. Deliberately no presence parity with `shadow_comparator`:
+    // `shadow_comparator_for_record` is `Some` only when this comparison, an
+    // observed state delta and a usage reading are all `Some`, so a correct
+    // frame legitimately carries one without the other.
+    match frame.conformance.as_ref() {
+        Some(record) if !record.holds() => return Err(invalid("conformance-comparison")),
+        Some(_) | None => {}
+    }
     validate_lifecycle_vocabulary(frame)
 }
 
@@ -1668,6 +1757,11 @@ fn denial_frame(
         rollback_candidate: false,
         divergence_code: None,
         divergence: None,
+        // No comparison was established: a frame with no engine observation
+        // measured nothing, so it compares nothing either and invents
+        // neither a conformance record nor a comparator outcome.
+        conformance: None,
+        shadow_comparator: None,
     }
 }
 
@@ -1731,6 +1825,11 @@ fn unknown_frame(
         rollback_candidate: true,
         divergence_code: None,
         divergence: None,
+        // No comparison was established: an unresolved outcome has no
+        // declared-reference comparison and no metering to reconcile, and
+        // inventing either would claim evidence the observation does not have.
+        conformance: None,
+        shadow_comparator: None,
     }
 }
 
@@ -3625,6 +3724,14 @@ pub struct BoundedRequestLoop {
     /// when the engine offers none; the deadline machinery still bounds the
     /// wait then.
     interrupt: Option<Arc<dyn GuestInterruptHandle>>,
+    /// The validated dispatch material this loop was built from, retained
+    /// exactly as [`binding`](Self::binding) and [`engine`](Self::engine)
+    /// were derived from it. It is the only reference source the result
+    /// projection has: the conformance comparison and its comparator legs are
+    /// built from this material over the retained result by the existing
+    /// dispatch-drive owner, never re-derived here and never taken from the
+    /// observed guest output. Retained once at construction, not per result.
+    material: ValidatedDispatchMaterial,
 }
 
 impl BoundedRequestLoop {
@@ -3642,6 +3749,7 @@ impl BoundedRequestLoop {
         live: Arc<LiveAuthority>,
         drain_deadline: Duration,
         retention: ObservedResultRetention,
+        material: &ValidatedDispatchMaterial,
     ) -> Self {
         Self {
             binding,
@@ -3670,6 +3778,7 @@ impl BoundedRequestLoop {
             shutdown_request_won: None,
             residual: None,
             interrupt: None,
+            material: material.clone(),
         }
     }
 
@@ -4034,7 +4143,14 @@ impl BoundedRequestLoop {
             shutdown_request_won: _,
         } = outcome;
         let mut frame = match result {
-            Ok(result) => project_result(&self.binding, &self.engine, command, &result, divergence),
+            Ok(result) => project_result(
+                &self.binding,
+                &self.engine,
+                command,
+                &result,
+                &self.material,
+                divergence,
+            ),
             Err(code) if self.admission.follow_up != FollowUp::None => unknown_frame(
                 &self.binding,
                 command_operation(command),
@@ -4552,6 +4668,7 @@ pub fn run_request_loop(
         Arc::clone(&runtime.live),
         drain_bound(material),
         retention,
+        material,
     );
     state = install_interrupt_handle(state, &runtime.runner);
     // The operation-bound process-termination projection is read on this
