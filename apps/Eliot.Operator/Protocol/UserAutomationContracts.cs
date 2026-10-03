@@ -712,9 +712,11 @@ public sealed record UserAutomationOperatorRequest(
     /// enforces that operation's own member rules; for
     /// `UserAutomationGetContextOperation` that body is deliberately empty
     /// (:56) because the record carries no members, so its shape is pinned
-    /// solely by the closed decoder's `kind` mapping (:16-18) refusing an
-    /// unmapped or unknown discriminator. What follows is the one claim that
-    /// is true only of a business operation.
+    /// solely by the closed decoder's `kind` mapping (:16-30) — the
+    /// `[JsonPolymorphic]` declaration at :16-17 plus the complete
+    /// derived-type list at :18-30 — refusing a discriminator value that is
+    /// unmapped or unknown. What follows is the one claim that is true only
+    /// of a business operation.
     ///
     /// Business operation: the key is exactly the digest today's serializer
     /// derives from those same canonical operation bytes
@@ -730,7 +732,7 @@ public sealed record UserAutomationOperatorRequest(
     /// exact retained key.
     ///
     /// `UserAutomationGetContextOperation` handshake: the read-only
-    /// `get_context` request is validated for shape, key syntax and the absent
+    /// `get_context` request is validated for key syntax and the absent
     /// fence ONLY. Its identity is deliberately a fresh per-call nonce minted by
     /// `CreateContext()` as `Guid.NewGuid().ToString("N")`, because `get_context`
     /// carries no distinguishing field — a digest of its canonical bytes would

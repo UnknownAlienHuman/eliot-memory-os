@@ -75,13 +75,19 @@ var viewModel = new MainViewModel(client)
 // One closed owner State Fence witness, written with exactly the members
 // `UserAutomationOutcomeClassifier.IsClosedStateFence` reads: a closed
 // authority epoch carrying a lowercase UUID lineage and a positive sequence,
-// a positive resource generation, and the three optional positive revisions.
+// a positive resource generation, and the three revision members, each of which
+// must be present and either null or a positive integer: `HasExactProperties`
+// names all three (:2849-2855), so a fence missing one is refused, while
+// `IsOptionalPositiveUInt64` (:2872-2874) admits either kind of value.
 // The harness mints no other fence. Every BUSINESS case below carries this one
 // witness, both when admitted and when refused, so the operation or the key is
 // the only thing under test; the single handshake case that pins key syntax
 // carries `ExpectedStateFence: null`, which is the only value that operation
-// admits (`Validate` refuses any fence on a get_context request), so in no case
-// here is the fence the discriminating variable. The lineage is written out as
+// admits (`Validate` refuses any fence on a get_context request), so the fence is
+// not the discriminating variable in any BUSINESS case here. The one handshake
+// case that deliberately carries a fence is the stated exception: that request
+// is well formed in every other respect, so there the fence it carries is
+// exactly what makes it refused. The lineage is written out as
 // a literal rather than derived because the contract reads it as bounded text
 // and then parses it as a lowercase UUID (`TryReadBoundedText(..., 36, ...)`
 // followed by `IsLowercaseUuid`), which a computed value would have to
@@ -98,9 +104,11 @@ var userAutomationFence = JsonSerializer.SerializeToElement(new
     policy_revision = 1,
     integration_revision = 1
 });
-// The fake owner is a nested class and cannot see this top-level local, so it
-// is handed the SAME witness here instead of carrying a second literal: the
-// fence is defined exactly once in this file. That matters because the fence
+// The fake owner is a type declared at file scope beside these top-level
+// statements -- a sibling of them, not a nested type -- so it cannot capture
+// this top-level local. It is handed the SAME witness here instead of carrying
+// a second literal: the fence is defined exactly once in this file. That matters
+// because the fence
 // the fake answers the handshake with and the fence every business request
 // carries must be the same BYTES, not two fixtures that merely look alike --
 // `ReadContextStateFence` returns the envelope fence it admitted
@@ -129,8 +137,12 @@ await viewModel.RunUserAutomationAsync();
 // Before the fake could answer the closed handshake envelope this branch
 // aborted at `ReadFreshUserAutomationStateFenceAsync` and only one request was
 // ever sent; the count below is the observation of that order. The count of 2 is
-// the stronger claim over the old count of 1: it proves the handshake really
-// travelled BEFORE the business request, which a business-only count could not.
+// the stronger claim over the old count of 1. On its own it proves a COUNT, not
+// an order; what pins the ORDER -- the handshake really travelling BEFORE the
+// business request, which a business-only count could not -- is this assertion
+// together with the preserved-operation assertion below and the production
+// ordering at MainViewModel.cs:743-744, where the fresh context is read before
+// the business read is minted.
 Equal(2, client.UserAutomationCount, "typed UserAutomation caller submitted the handshake and its one business read");
 True(client.LastUserAutomation is UserAutomationListOperation, "UserAutomation caller preserved typed operation");
 // UI READ PATH, end to end through the real view model: the request the client
@@ -878,9 +890,13 @@ sealed class FakeGovernorClient : IGovernorClient
 
         LastBusinessStateFence = request.ExpectedStateFence?.Clone();
 
-        // The business answer is the owner's `not_retained` disposition, the
-        // one closed `status: "known"` value `ReadKnownEnvelope` accepts for a
-        // non-normalizing operation without any owner-minted digest:
+        // The business answer is the owner's `not_retained` disposition, one of
+        // the closed `status: "known"` values `ReadKnownEnvelope` accepts for a
+        // non-normalizing operation without any owner-minted digest: the others
+        // on that path are `outcome_settled` (:1419), `rejected` (:1441) and
+        // `identity_conflict` (:1461), and `not_retained` is the one this harness
+        // answers with because it is the disposition that needs no owner-issued
+        // commit or ledger recovery object:
         // `value` with exactly `accepted`/`outcome`/`reason`, `accepted` false,
         // `outcome` "not_retained" (a member of the generated
         // USER_AUTOMATION_RESULT_VALUE_OUTCOMES), a bounded reason, and a
@@ -888,9 +904,15 @@ sealed class FakeGovernorClient : IGovernorClient
         // The branches that WOULD answer a `list` or a `pause` as success are
         // not reachable here: the normalization value is gated on
         // `ExpectedOperationKind` being `normalize_schedule` or
-        // `migrate_legacy_schedule` (:1521-1527), and the transition value
-        // demands a Store canonical request hash, a write receipt and a full
-        // bounded schedule revision that this harness cannot mint. The envelope
+        // `migrate_legacy_schedule` (:1521-1527), the `outcome_settled`
+        // disposition on this same non-normalizing `status: "known"` path needs
+        // `accepted` TRUE and a `recovery` object carrying
+        // `kind: "ledger_read_owed"` with its own reason, while this harness
+        // answers `accepted` false, `outcome` "not_retained" and a JSON-null
+        // `recovery` (UserAutomationScheduleContract.cs:1415-1433), and the
+        // transition value demands a Store canonical request hash, a write
+        // receipt and a full bounded schedule revision that this harness cannot
+        // mint. The envelope
         // fence still echoes the submitted fence, which `HasCurrentResultEnvelope`
         // requires (:1811-1815).
         return Task.FromResult(JsonSerializer.SerializeToElement(new
