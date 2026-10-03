@@ -129,27 +129,58 @@ fn kernel_diagnostics_owner_install_outcome_is_recorded_once_and_event_log_is_ab
         Err(KernelDiagnosticsError::EventLogUnavailable)
     );
 
-    // Truncation honesty: an oversized detail keeps a bounded prefix and
-    // records its original length. (Supports 895/19 sizing.)
+    // Screening honesty: an oversized detail keeps NOTHING of its own bytes and
+    // records the length that was actually presented. (Supports 895/19 sizing.)
+    //
+    // WHY THERE IS NO TRUNCATION ASSERTION HERE, AND WHY NONE MUST BE ADDED:
+    // `bound_detail` calls `bounded_value`, whose first branch is the shared
+    // field policy's fail-closed screen. `requires_evidence_handle(value)` is
+    // `looks_like_secret(value) || value.chars().count() > MAX_LABEL_VALUE_CHARS`
+    // and `MAX_LABEL_VALUE_CHARS` is 256 CHARACTERS, which is stricter than this
+    // facade's own `MAX_DIAGNOSTIC_DETAIL_BYTES` of 1024 bytes. So a detail
+    // longer than 256 characters - including the 1024-byte detail this case used
+    // to assert on - is SCREENED to an immutable evidence handle and returned
+    // with `truncated: false`; the 1024-byte truncation branch of `bounded_value`
+    // is unreachable through `bound_detail`. Do not "restore" a truncating
+    // assertion here: it asserts a branch no input can reach, so it would be
+    // red on correct production code.
     let oversized = "x".repeat(8 * MAX_DIAGNOSTIC_DETAIL_BYTES);
     let bounded = bound_detail(&oversized);
     assert_eq!(bounded.original_bytes(), oversized.len());
     assert!(
-        bounded.truncated(),
-        "oversized input must report truncation"
+        bounded.redaction_status().is_some(),
+        "the shared field policy must screen an over-long detail to a handle"
+    );
+    assert!(
+        !bounded.truncated(),
+        "a screened detail never reaches the bounding path"
+    );
+    assert!(
+        !bounded.text().contains('x'),
+        "no fragment of the oversized detail may reach the operational surface"
     );
     assert!(
         bounded.text().len() <= MAX_DIAGNOSTIC_DETAIL_BYTES,
-        "retained prefix must stay bounded, got {} bytes",
+        "the emitted detail must stay inside the owner's byte bound, got {} bytes",
         bounded.text().len()
     );
-    let exact = "y".repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
+
+    // The byte-identical pass-through path is only reachable at or below the
+    // shared policy's 256-character ceiling, which is the stricter of the two
+    // bounds, so an admitted value is sized by `MAX_DIAGNOSTIC_FIELD_BYTES`.
+    // This proves the pass-through the 1024-byte case can never reach.
+    let exact = "y".repeat(MAX_DIAGNOSTIC_FIELD_BYTES);
     let kept = bound_detail(&exact);
     assert!(
         !kept.truncated(),
         "in-bound input must not report truncation"
     );
+    assert!(
+        kept.redaction_status().is_none(),
+        "an admitted detail must carry no redaction status"
+    );
     assert_eq!(kept.text(), exact);
+    assert_eq!(kept.original_bytes(), exact.len());
 }
 
 // WORK_UNIT_CASE: 895/3
@@ -165,6 +196,22 @@ fn kernel_diagnostics_facade_installs_no_global_subscriber_of_its_own() {
     // `kernel_front_door_diagnostics.rs`. Reading the facade source is
     // compile-time-bound and installs nothing.
     let source = include_str!("../src/kernel_diagnostics.rs");
+    // Only REAL CODE is scanned. A line whose first non-whitespace characters
+    // are `//` is a comment (`//`, `///` or `//!`), and prose is not an
+    // initialization: this module's own doc comment has to be able to NAME the
+    // initializer it forbids in order to explain why it is absent. Dropping
+    // whole-line comments therefore keeps the property this case proves (the
+    // facade initializes no process-global subscriber OF ITS OWN) while the
+    // needles below stay whole: a reintroduced
+    // `let _ = tracing_subscriber::fmt().try_init();` written as a code line is
+    // not a comment, so it is still scanned and still turns this red.
+    let mut code = String::with_capacity(source.len());
+    for line in source.lines() {
+        if !line.trim_start().starts_with("//") {
+            code.push_str(line);
+            code.push('\n');
+        }
+    }
     // Every needle is assembled at compile time from literal fragments so
     // this assertion cannot match its own literal in the source it scans.
     for needle in [
@@ -173,7 +220,7 @@ fn kernel_diagnostics_facade_installs_no_global_subscriber_of_its_own() {
         concat!("SetGlobalDefault", "Error"),
     ] {
         assert!(
-            !source.contains(needle),
+            !code.contains(needle),
             "the diagnostics facade must perform no process-global subscriber \
              initialization of its own, but src/kernel_diagnostics.rs contains \
              {needle:?}"

@@ -13,11 +13,11 @@
 //! This module owns the bounded, nonsecret field helpers and the frozen
 //! entrypoint observation vocabulary used by Kernel process entry. It installs
 //! no process-global subscriber of its own: `eliot-observability-runtime` is
-//! the one subscriber owner (issue #895 residual), and records emitted after
-//! that owner answered travel through the dispatch it established. The facade
-//! reports that owner's real install outcome, and reports its own stderr sink
-//! unavailable whenever it did not observe the accepted owner establish global
-//! dispatch, so a refused or unobserved install is never relabelled success.
+//! the one subscriber owner (issue #895 residual). The facade records the
+//! install outcome that owner reported, and, when no such outcome was
+//! reported, answers that its own stderr sink is unavailable. Whether the
+//! owner's own global layer was accepted, or a foreign subscriber already held
+//! the process, is not observable from this module.
 //!
 //! DELIVERY IS NOT UNIVERSAL, and this module does not pretend otherwise. The
 //! accepted owner can only be installed once the launch funnel has the roots it
@@ -226,11 +226,14 @@ pub fn sink_status(sink: DiagnosticSink) -> Result<(), KernelDiagnosticsError> {
 /// `eliot_observability_runtime::install`, the one subscriber owner; this
 /// facade emits through that owner and performs no global initialization of
 /// its own. The answer therefore mirrors exactly what the accepted owner
-/// reported: [`DiagnosticSubscriberOwner::Installed`] established the global
-/// dispatch this facade emits through, while
+/// reported: [`DiagnosticSubscriberOwner::Installed`] is that owner's own
+/// report that this process's configuration established its subscriber, while
 /// [`DiagnosticSubscriberOwner::AlreadyInstalled`] means the accepted owner
 /// already stood, and this facade answers
-/// [`KernelDiagnosticsError::AlreadyOwned`] instead of claiming it.
+/// [`KernelDiagnosticsError::AlreadyOwned`] instead of claiming it. Whether
+/// the accepted owner's global layer was actually accepted, or a foreign
+/// subscriber was already in place, is not observable from this module; that
+/// residual is recorded as blocked in the issue checklist, not solved here.
 ///
 /// Diagnostics never gate startup: the answer is informational for the caller,
 /// never a panic, a retry, a replacement, or a second global install. It
@@ -613,8 +616,9 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
 ///
 /// Non-terminal by contract: a metrics install refusal never gates startup
 /// (A13.10), so this observation carries the degraded disposition and no
-/// `kernel.terminal_error`. The single terminal record of a failed launch
-/// remains `exit_error`'s [`observe_terminal_error`]. The code is a stable
+/// `kernel.terminal_error`. On this entrypoint funnel `exit_error` is the sole
+/// `kernel.terminal_error` emitter ([`observe_terminal_error`]); the library
+/// modules keep their own per-operation terminal records. The code is a stable
 /// owner-issued value from [`observability_install_refused_code`], screened
 /// against the shared telemetry field policy and bounded like every other
 /// short field here, so a recognised secret would leave the record as an

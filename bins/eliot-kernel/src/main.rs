@@ -628,17 +628,12 @@ mod entry_funnel_diagnostics_tests {
         }
 
         // A refused observability install is not the terminal event, and this
-        // funnel's one terminal record comes from `exit_error` alone: no other
-        // entrypoint callsite emits it.
-        assert_ne!(
-            contract
-                .get("observability_refusal_event")
-                .and_then(serde_json::Value::as_str),
-            contract
-                .get("terminal_event")
-                .and_then(serde_json::Value::as_str),
-            "a refused observability install must stay off the terminal event"
-        );
+        // funnel's one terminal record comes from `exit_error` alone. That is
+        // asserted against PRODUCTION SOURCE below, not against the pinned
+        // fixture: two strings read out of the fixture compare the fixture with
+        // itself, so no mutation of this crate - a refusal that starts emitting
+        // a terminal record, a moved call site, an emptied body - could ever
+        // turn them red.
         let source = include_str!("main.rs");
         // The needle is assembled at compile time so this assertion cannot
         // match its own literal in the source it scans.
@@ -657,6 +652,35 @@ mod entry_funnel_diagnostics_tests {
         assert!(
             !write_error_body.contains(terminal_call),
             "`write_error` is not a terminal boundary and must never emit a terminal record"
+        );
+
+        // The refusal emitter is held to the same contract, in its OWN owner's
+        // source. It does not live in this file: `main.rs` only imports and
+        // calls it, so scanning this file's source can never see a regression
+        // that adds a terminal record inside the facade function that emits
+        // `kernel.observability_install_refused`.
+        let refusal_source = include_str!("kernel_diagnostics.rs");
+        let refusal_body = function_body(
+            refusal_source,
+            "pub fn observe_observability_install_refused",
+        );
+        // The needle is the BARE emitter name, not the call form: the facade
+        // also owns `observe_terminal_error_in_context`, and a needle ending at
+        // `(` would miss a terminal emission made through that variant. The
+        // function's own doc comment is above its signature, so it is outside
+        // the sliced body and cannot produce a false positive here.
+        let terminal_name = concat!("observe_terminal", "_error");
+        assert!(
+            !refusal_body.contains(terminal_name),
+            "a refused install is non-terminal: its emitter must not emit a terminal record"
+        );
+        // The positive, so the negative above cannot be satisfied by a body
+        // that is empty, stubbed or deleted: the emitter must still make the
+        // one degraded observation it exists to make.
+        let refusal_warn = concat!("tracing::warn", "!");
+        assert!(
+            refusal_body.contains(refusal_warn),
+            "the refusal emitter must still emit its own non-terminal observation"
         );
     }
 
@@ -722,8 +746,20 @@ mod entry_funnel_diagnostics_tests {
         );
     }
 
-    /// Returns one function's body by slicing this file's own source between its
-    /// signature and the start of the next top-level `fn`.
+    /// Returns one function's body by slicing its owner's source between its
+    /// signature and the EARLIEST boundary that follows it: the start of the
+    /// next top-level item - a free `fn`, a `pub fn`, a `pub(crate) fn`, or any
+    /// attribute line such as `#[must_use]`, `#[cfg(test)]` or the `#[test]`
+    /// block this module ends with.
+    ///
+    /// The attribute boundary is load-bearing, not decoration: a LAST
+    /// top-level item has no next `fn` to stop at, so without it the slice ran
+    /// to end-of-file and swallowed `#[cfg(test)] mod
+    /// entry_funnel_diagnostics_tests` - the very text these assertions scan,
+    /// which would let a future needle match the assertion that uses it. It
+    /// also keeps the NEXT item's doc comment out of this item's body, so a
+    /// neighbouring doc that merely names an emitter cannot turn a negative
+    /// assertion red.
     ///
     /// The needles used against the result are assembled with `concat!` by the
     /// caller, so an assertion can never match its own literal in the text it
@@ -733,9 +769,11 @@ mod entry_funnel_diagnostics_tests {
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} must be declared in this file"));
         let rest = &source[start..];
-        let end = rest
-            .find("\nfn ")
-            .or_else(|| rest.find("\npub(crate) fn "))
+        let end = ["\nfn ", "\npub fn ", "\npub(crate) fn ", "\n#["]
+            .iter()
+            .copied()
+            .filter_map(|boundary| rest.find(boundary))
+            .min()
             .unwrap_or(rest.len());
         rest[..end].to_owned()
     }
