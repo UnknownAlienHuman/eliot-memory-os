@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Eliot.Operator.Protocol;
+using Eliot.Operator.Protocol.Generated;
 using Eliot.Operator.Services;
 using Eliot.Operator.ViewModels;
 
@@ -71,14 +72,190 @@ var viewModel = new MainViewModel(client)
     ProjectId = "00000000-0000-0000-0000-000000000001",
     TaskId = "00000000-0000-0000-0000-000000000002"
 };
+// One closed owner State Fence witness, written with exactly the members
+// `UserAutomationOutcomeClassifier.IsClosedStateFence` reads: a closed
+// authority epoch carrying a lowercase UUID lineage and a positive sequence,
+// a positive resource generation, and the three optional positive revisions.
+// The harness mints no other fence. Every BUSINESS case below carries this one
+// witness, both when admitted and when refused, so the operation or the key is
+// the only thing under test; the single handshake case that pins key syntax
+// carries `ExpectedStateFence: null`, which is the only value that operation
+// admits (`Validate` refuses any fence on a get_context request), so in no case
+// here is the fence the discriminating variable. The lineage is written out as
+// a literal rather than derived because the contract reads it as bounded text
+// and then parses it as a lowercase UUID (`TryReadBoundedText(..., 36, ...)`
+// followed by `IsLowercaseUuid`), which a computed value would have to
+// reproduce by hand anyway.
+var userAutomationFence = JsonSerializer.SerializeToElement(new
+{
+    authority_epoch = new
+    {
+        lineage_id = "00000000-0000-0000-0000-000000000007",
+        sequence = 7
+    },
+    resource_generation = 7,
+    task_revision = 7,
+    policy_revision = 1,
+    integration_revision = 1
+});
+// The fake owner is a nested class and cannot see this top-level local, so it
+// is handed the SAME witness here instead of carrying a second literal: the
+// fence is defined exactly once in this file. That matters because the fence
+// the fake answers the handshake with and the fence every business request
+// carries must be the same BYTES, not two fixtures that merely look alike --
+// `ReadContextStateFence` returns the envelope fence it admitted
+// (UserAutomationScheduleContract.cs:1268) and `Create(operation, fence)`
+// clones it onto the next request (UserAutomationContracts.cs:659), so what is
+// compared below is one value that travelled, not two that agreed.
+client.UserAutomationFence = userAutomationFence;
+// The read path mints its request through the same `Create(operation, fence)`
+// overload the UI effect path uses: `Create(operation)` is the handshake-only
+// mint and its FACTORY refuses a business operation outright, so that is the
+// overload every minted business request here goes through. The refusals below
+// construct `UserAutomationOperatorRequest` directly instead, because a
+// direct construction is the only way to reach a refusal the validator makes:
+// the record is a public positional one and such a request is built fine, then
+// refused by `Validate`.
 var userAutomationWire = JsonSerializer.Serialize(
-    UserAutomationOperatorRequest.Create(new UserAutomationListOperation(false)));
+    UserAutomationOperatorRequest.Create(new UserAutomationListOperation(false), userAutomationFence));
 True(!userAutomationWire.Contains("\"command\"", StringComparison.Ordinal), "UserAutomation has no generic command envelope");
 True(userAutomationWire.Contains("\"kind\":\"list\"", StringComparison.Ordinal), "closed UserAutomation operation kind");
 True(userAutomationWire.Contains("\"idempotency_key\"", StringComparison.Ordinal), "retry-stable UserAutomation identity");
 await viewModel.RunUserAutomationAsync();
-Equal(1, client.UserAutomationCount, "typed UserAutomation caller submitted once");
+// The read branch of `SubmitUserAutomationAsync` (MainViewModel.cs:738-749)
+// ALWAYS reads a fresh context first and only then sends the business read, so
+// a successful typed read is TWO requests, not one: the `get_context`
+// handshake, then the `list` that carries the fence the handshake returned.
+// Before the fake could answer the closed handshake envelope this branch
+// aborted at `ReadFreshUserAutomationStateFenceAsync` and only one request was
+// ever sent; the count below is the observation of that order. The count of 2 is
+// the stronger claim over the old count of 1: it proves the handshake really
+// travelled BEFORE the business request, which a business-only count could not.
+Equal(2, client.UserAutomationCount, "typed UserAutomation caller submitted the handshake and its one business read");
 True(client.LastUserAutomation is UserAutomationListOperation, "UserAutomation caller preserved typed operation");
+// UI READ PATH, end to end through the real view model: the request the client
+// received for the BUSINESS operation carries exactly the fence the client
+// itself returned in the `get_context` answer one call earlier. That round trip
+// is the whole reason the handshake exists, and it is only observable where the
+// request actually lands, so it is pinned here rather than only at the
+// mint-level `Create(operation, fence)` assertion below.
+True(
+    client.LastBusinessStateFence is { } readFence
+        && JsonElement.DeepEquals(readFence, userAutomationFence),
+    "UI read path business request carries the exact fence the get_context answer returned");
+
+// The narrow identity split, pinned on both halves at once. The read-only
+// `get_context` handshake is a per-session route read whose result supplies
+// the fence every later request carries, so its identity is a fresh per-call
+// nonce and NOT the digest of its own bytes; requiring that digest of it would
+// refuse every context read before it reached the transport and no business
+// request could ever obtain its fence. Business operations are the opposite
+// case and must keep the exact binding: `idempotency_key` is the digest of
+// their own canonical operation bytes, because that key is what makes a retry,
+// a reconnect and a resend the SAME logical mutation rather than a second one.
+// Both halves are asserted together so neither can be widened without failing.
+var contextRequest = UserAutomationOperatorRequest.CreateContext();
+// A fresh context request is admitted by the same validator the transport
+// boundary calls, so the UI read path reaches the real client transport
+// instead of being refused for a business-digest relation it never had. This
+// is the assertion that would fail on a validator still demanding the digest
+// of the handshake's own bytes: `Validate()` succeeds, `ValidateCurrentIdentity`
+// does not, and the context read dies before it can return the fence every
+// later request carries.
+True(AcceptsCurrentIdentity(contextRequest), "fresh get_context handshake passes the current identity validator");
+var repeatedContextRequest = UserAutomationOperatorRequest.CreateContext();
+// This one is true on origin/main as well: two independent
+// `Guid.NewGuid().ToString("N")` draws at `UserAutomationContracts.cs:640` are
+// always different, so it is not evidence that the split happened. Its force is
+// the substitution issue #2643, audit comment 5964149245 forbids. If
+// `CreateContext` were "fixed" by minting `DeriveIdempotencyKey(Operation)`
+// instead of a fresh nonce, both keys
+// would be the SAME constant and this assertion would fail — the handshake must
+// keep a distinct per-call identity.
+True(
+    !string.Equals(
+        contextRequest.IdempotencyKey,
+        repeatedContextRequest.IdempotencyKey,
+        StringComparison.Ordinal),
+    "repeated fresh context handshake retains its fresh per-call identity");
+// Likewise a guard against the same forbidden constant-hash substitution, and
+// the direct statement of what `CreateContext()` must never return: its key is
+// the per-call nonce, not the digest of the handshake's operation bytes, which
+// are constant because the get_context operation carries no fields. It passes
+// on origin/main too and is not evidence that the split happened.
+True(
+    !string.Equals(
+        contextRequest.IdempotencyKey,
+        UserAutomationOperatorRequest.DeriveIdempotencyKey(contextRequest.Operation),
+        StringComparison.Ordinal),
+    "get_context handshake identity is a per-call nonce, not the constant digest of its operation bytes");
+// The UI read path at the MINT level: `list` is a business request (it is not
+// the handshake), so it carries a closed fence AND the digest-derived key and is
+// admitted. This case pins the mint and the validator gate with the harness
+// witness `userAutomationFence`, which STANDS IN for the fence a handshake
+// returns; the fence that a `get_context` answer actually returns is proven
+// end to end by "UI read path business request carries the exact fence the
+// get_context answer returned".
+True(
+    AcceptsCurrentIdentity(
+        UserAutomationOperatorRequest.Create(new UserAutomationListOperation(false), userAutomationFence)),
+    "UI read path business request minted with the harness State Fence witness passes identity validation");
+// The UI effect path at the same level: `pause` is an owner mutation, so it must
+// clear the same invariant as the read, and both UI paths mint through
+// `Create(operation, fence)` and are gated by the same validator at the
+// transport boundary, so proving only the read would leave the mutation path
+// unproven. This case likewise pins the mint and the validator gate with the
+// harness witness, and the fence a handshake actually returns on the effect
+// path is proven end to end by "UI effect path business request carries the
+// exact fence the get_context answer returned".
+True(
+    AcceptsCurrentIdentity(
+        UserAutomationOperatorRequest.Create(
+            new UserAutomationPauseOperation("00000000-0000-0000-0000-000000000003", "rev-1"),
+            userAutomationFence)),
+    "UI effect path business request minted with the harness State Fence witness passes identity validation");
+// The split must not weaken the business side. A syntactically valid key that
+// is not this operation's digest -- the exact shape an edited or corrupted
+// journal entry carries -- names a DIFFERENT logical mutation, so it is
+// refused here and can never reach the transport under that identity. The
+// refusal must be the digest check itself (`UserAutomationContracts.cs:760`),
+// which is reachable only because the key passes `RequireOperationId` first.
+True(
+    RefusesCurrentIdentity(
+        new UserAutomationOperatorRequest(
+            new UserAutomationListOperation(false),
+            Guid.NewGuid().ToString("N"),
+            userAutomationFence),
+        "idempotency_key does not name the retained typed operation."),
+    "business request whose key is not its operation digest is refused");
+// The handshake half of the split is narrow, not absent. The handshake exists
+// precisely to obtain the fence, so a get_context request that already carries
+// one is not the read this route defines. The expected sentence is the one at
+// `UserAutomationContracts.cs:694`, so this case cannot pass on the key-syntax
+// or digest rule instead: the key handed here is syntactically valid and the
+// digest rule is skipped for the handshake.
+True(
+    RefusesCurrentIdentity(
+        new UserAutomationOperatorRequest(
+            new UserAutomationGetContextOperation(),
+            Guid.NewGuid().ToString("N"),
+            userAutomationFence),
+        "get_context must omit expected_state_fence"),
+    "get_context request carrying an expected_state_fence is still refused");
+// ...and the handshake key is still checked for syntax. The split relaxed the
+// DIGEST relation for the handshake, never the operation-identity rule that
+// every key in this application is 32 lowercase hex characters; this literal is
+// neither 32 characters nor hex, so `RequireOperationId`
+// (`OperatorIntent.cs:86`, reached from `UserAutomationContracts.cs:689`)
+// refuses it, and the expected sentence below names exactly that check.
+True(
+    RefusesCurrentIdentity(
+        new UserAutomationOperatorRequest(
+            new UserAutomationGetContextOperation(),
+            "not-a-32-hex-operation-id",
+            ExpectedStateFence: null),
+        "Operator intent requires one 32-character hex operation identity."),
+    "get_context request with a syntactically invalid key is still refused");
 await viewModel.SelectSectionAsync("autonomy");
 Equal("autonomy", client.LastQuery?.Projection, "typed projection selection");
 Equal(1, viewModel.ItemCount, "first bounded page");
@@ -261,6 +438,37 @@ True(record.Length <= OperatorDiagnostics.MaxRecordChars, "diagnostic record bou
 True(OperatorDiagnostics.ShouldRotate(OperatorDiagnostics.MaxLogBytes + 1), "log rotates at the cap");
 True(!OperatorDiagnostics.ShouldRotate(0), "empty log does not rotate");
 
+// UI EFFECT PATH, end to end through the real view model. `pause` is the
+// production entry point for a UserAutomation mutation:
+// `BuildUserAutomationOperation` maps it to `UserAutomationPauseOperation`
+// (MainViewModel.cs:1201) and that operation's `IsEffect()` is true
+// (UserAutomationContracts.cs:162), so `SubmitUserAutomationAsync` takes the
+// effect branch at MainViewModel.cs:802-845 -- fresh context fence, one
+// retry-stable identity, journal that exact request, transmit it. That branch
+// needs no live pipe: the only two gates before the send are the command grant,
+// which `CanIssueCommands` reports true for an unauthenticated client because
+// `_roleBinding is null` (MainViewModel.cs:302), and the pending journal, which
+// this fixture does not construct, so `TryPersistPendingState` returns true
+// (MainViewModel.cs:2023). Nothing private is called and no production member
+// was added to reach it. It sits after every other conformance assertion
+// because the effect deliberately leaves one retained operation behind.
+// Production entry point: `MainViewModel.RunUserAutomationAsync` selects this
+// closed kind through its `UserAutomationOperation` property and builds the
+// operation in `BuildUserAutomationOperation`, so nothing below is a
+// hand-built request.
+viewModel.UserAutomationOperation = "pause";
+viewModel.UserAutomationId = "00000000-0000-0000-0000-000000000003";
+viewModel.UserAutomationRevision = "rev-1";
+await viewModel.RunUserAutomationAsync();
+True(
+    client.LastUserAutomation is UserAutomationPauseOperation pauseOperation
+        && pauseOperation.IsEffect(),
+    "UI effect path submitted an operation whose IsEffect() is true");
+True(
+    client.LastBusinessStateFence is { } effectFence
+        && JsonElement.DeepEquals(effectFence, userAutomationFence),
+    "UI effect path business request carries the exact fence the get_context answer returned");
+
 // The live probe runs AFTER every conformance assertion, and its failure is
 // bounded to one typed line. A run that reaches here has already executed and
 // passed every assertion above; a live probe that throws must not turn that
@@ -327,6 +535,57 @@ bool RefusesCapabilities(IReadOnlyList<string> capabilities)
     return false;
 }
 
+// Not an assertion and neither helper moves a counter; only the `True` and
+// `Equal` helpers above touch it. They report only whether
+// `UserAutomationOperatorRequest.ValidateCurrentIdentity` — the exact validator
+// `GovernorPipeClient.UserAutomationAsync` calls at the transport boundary —
+// admitted or refused the supplied request.
+//
+// `RefusesCurrentIdentity` mirrors `RefusesCapabilities` above in two ways and
+// they are both load-bearing. It catches only the typed
+// `InvalidOperationException` that validator throws, so every other exception
+// type propagates and can never be read as a refusal. And it compares the WHOLE
+// message against the exact production sentence supplied by the call site:
+// without that filter a refusal for the WRONG reason would pass silently, so
+// each case pins WHICH check refused rather than merely that something refused.
+//
+// The comparison is an ordinal whole-message equality. That is deliberately
+// stricter than the prefix tests the framing cases above use
+// (`error.Reason.StartsWith("unknown:")` and `StartsWith("duplicate:")`,
+// which admit any reason under those prefixes); the closer precedent in this
+// file is `RefusesCapabilities`' `error.Code == "endpoint_invalid"` below.
+//
+// A case passes only when production throws exactly the sentence named at that
+// call site, and the three literals are byte-exact copies of the production
+// sentences at `UserAutomationContracts.cs:760` (digest mismatch),
+// `UserAutomationContracts.cs:694` (fence on the handshake) and
+// `OperatorIntent.cs:86` (key syntax). As a secondary note the three are also
+// neither substrings nor prefixes of one another, but that is not what makes the
+// filter sound: under whole-string equality the literals must simply equal the
+// production prose.
+//
+// The filter lives in the `when` clause, so a refusal carrying a DIFFERENT
+// sentence is not returned as false — it propagates and the run dies on the raw
+// `InvalidOperationException` instead of a labelled assertion failure. That is
+// deliberate: a mismatched sentence means production prose changed and has to be
+// looked at, not absorbed into a passing run.
+bool AcceptsCurrentIdentity(UserAutomationOperatorRequest request)
+{
+    request.ValidateCurrentIdentity();
+    return true;
+}
+
+bool RefusesCurrentIdentity(UserAutomationOperatorRequest request, string expectedRefusal)
+{
+    try { request.ValidateCurrentIdentity(); }
+    catch (InvalidOperationException error) when (string.Equals(error.Message, expectedRefusal, StringComparison.Ordinal))
+    {
+        return true;
+    }
+
+    return false;
+}
+
 sealed class FakeGovernorClient : IGovernorClient
 {
     private static readonly TaskContractView CanonicalTask = new(
@@ -350,6 +609,23 @@ sealed class FakeGovernorClient : IGovernorClient
     public int ReconcileCount { get; private set; }
     public int UserAutomationCount { get; private set; }
     public UserAutomationOperation? LastUserAutomation { get; private set; }
+
+    // The one closed owner State Fence witness, assigned by the top-level code
+    // from its own local so the fence is defined exactly once in this file.
+    public JsonElement? UserAutomationFence { get; set; }
+
+    // The `expected_state_fence` the client OBSERVED on the most recent
+    // BUSINESS request; a `get_context` handshake leaves it untouched. It is a
+    // capture point and deliberately not an assertion of its own: on its own it
+    // would only restate that a business request arrived. Each of the two
+    // end-to-end assertions compares this OBSERVED fence against the witness
+    // the fake ADMITTED in its own handshake answer, byte for byte. Those two
+    // values are the same object today by construction -- the fake hands back
+    // its `UserAutomationFence` property -- so the comparison is not two
+    // independent owner values happening to agree; what it proves is the round
+    // trip, that the fence the handshake answer admitted is the fence the view
+    // model then carried into the business request.
+    public JsonElement? LastBusinessStateFence { get; private set; }
     public string? LastIdempotencyKey { get; private set; }
     public string? LastReconciledKey { get; private set; }
     public bool DelayQueries { get; set; }
@@ -552,11 +828,89 @@ sealed class FakeGovernorClient : IGovernorClient
         request.Validate();
         UserAutomationCount++;
         LastUserAutomation = request.Operation;
+
+        // Both answers below are the CLOSED seven-member result envelope
+        // `OperatorScheduleContract.USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS`
+        // generates, because both production readers demand it:
+        // `UserAutomationOutcomeClassifier.ReadContextStateFence` for the
+        // handshake (UserAutomationScheduleContract.cs:1238) and
+        // `HasCurrentResultEnvelope` for every business answer (:1801). A
+        // three-member answer is not "admitted but degraded": the handshake
+        // reader throws, `ReadFreshUserAutomationStateFenceAsync` (MainViewModel.cs:855)
+        // propagates it and the read is abandoned at MainViewModel.cs:766.
+
+        if (request.Operation is UserAutomationGetContextOperation)
+        {
+            var contextFence = UserAutomationFence
+                ?? throw new InvalidOperationException("the fake owner has no State Fence witness to admit");
+            // ReadContextStateFence requires, in order: the exact envelope
+            // members; `wire_id`/`wire_version` equal to the current result
+            // contract (:1239-1244); `status` == "known" (:1245-1246); a
+            // `correlation` object with exactly the two generated members whose
+            // `operation_id` is the Kernel-prefixed pending operation id and
+            // whose `idempotency_key` is this request's key (:1247-1249,
+            // MatchesResultCorrelation :1823-1829); a JSON-null `recovery`
+            // (:1250-1251); a closed envelope `state_fence` (:1252-1253); and a
+            // `value` with exactly the generated context members whose `outcome`
+            // is "context" and whose nested `state_fence` is the SAME fence
+            // (:1254-1262, SameStateFence :2703). `UserAutomationResultValidationContext.FromRequest`
+            // (:1087-1095) is what mints the expected `user-automation-operation:{key}`
+            // correlation id, so it is reproduced rather than spelled differently.
+            return Task.FromResult(JsonSerializer.SerializeToElement(new
+            {
+                wire_id = OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
+                wire_version = OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
+                status = "known",
+                correlation = new
+                {
+                    operation_id = $"user-automation-operation:{request.IdempotencyKey}",
+                    idempotency_key = request.IdempotencyKey
+                },
+                state_fence = contextFence,
+                value = new
+                {
+                    outcome = "context",
+                    state_fence = contextFence
+                },
+                recovery = (object?)null
+            }));
+        }
+
+        LastBusinessStateFence = request.ExpectedStateFence?.Clone();
+
+        // The business answer is the owner's `not_retained` disposition, the
+        // one closed `status: "known"` value `ReadKnownEnvelope` accepts for a
+        // non-normalizing operation without any owner-minted digest:
+        // `value` with exactly `accepted`/`outcome`/`reason`, `accepted` false,
+        // `outcome` "not_retained" (a member of the generated
+        // USER_AUTOMATION_RESULT_VALUE_OUTCOMES), a bounded reason, and a
+        // JSON-null `recovery` (UserAutomationScheduleContract.cs:1398-1404).
+        // The branches that WOULD answer a `list` or a `pause` as success are
+        // not reachable here: the normalization value is gated on
+        // `ExpectedOperationKind` being `normalize_schedule` or
+        // `migrate_legacy_schedule` (:1521-1527), and the transition value
+        // demands a Store canonical request hash, a write receipt and a full
+        // bounded schedule revision that this harness cannot mint. The envelope
+        // fence still echoes the submitted fence, which `HasCurrentResultEnvelope`
+        // requires (:1811-1815).
         return Task.FromResult(JsonSerializer.SerializeToElement(new
         {
-            accepted = true,
-            executed = false,
-            outcome = "typed_user_automation_operation_admitted"
+            wire_id = OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
+            wire_version = OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
+            status = "known",
+            correlation = new
+            {
+                operation_id = $"user-automation-operation:{request.IdempotencyKey}",
+                idempotency_key = request.IdempotencyKey
+            },
+            state_fence = request.ExpectedStateFence!.Value,
+            value = new
+            {
+                accepted = false,
+                outcome = "not_retained",
+                reason = "the fake owner retains no Store record for this typed operation"
+            },
+            recovery = (object?)null
         }));
     }
 }
