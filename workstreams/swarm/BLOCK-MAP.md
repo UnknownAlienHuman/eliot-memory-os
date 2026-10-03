@@ -1,38 +1,38 @@
-# Blocker map: complete inventory, explicit review coverage
+# Blocker map: retained inventory and explicit review coverage
 
-BLOCK-MAP.tsv is the complete retained stop inventory: 577 issue rows, original
-blob f16503f83db9b3ab31a56c9458867623817eddc2. The original 455 FINISHABLE, 83 BLOCKED,
-36 ALL-DONE and 3 DISPUTED values are historical lane judgments, not a new audit.
+BLOCK-MAP.tsv retains the original 577-row stop inventory, blob
+f16503f83db9b3ab31a56c9458867623817eddc2. Its FINISHABLE/BLOCKED/ALL-DONE/DISPUTED
+values are historical lane judgments, not current dispatch decisions.
 
-A live GitHub issue search returned 573 open issues with incomplete_results=false.
-That count is not a reconciled issue-ID inventory and is not 573 source reviews.
-The difference from 577 remains a set-reconciliation task; do not silently delete
-four rows, assume which four closed, or treat PRs as issues.
+The earlier 573-open-issue search was a historical count, not an ID census.
+Reconcile actual sets; never infer which rows closed from a difference in totals.
+Reopened or newly created issues also belong in the current review population.
 
 ## Effective reading
 
-1. Read the issue and all comments on current source. Use the old row only to find
-   evidence; do not turn every #number in prose into a hard dependency.
-2. Apply REVIEWED.tsv's explicit finding where present. Other rows are not
-   re-audited; historical corrections do not automatically become READY either.
-3. Only PLAN.tsv selects source assignments. A dependency is released by the
-   exact required owner output on current main, not whole-issue test closure.
+1. Read the current issue and complete discussion. Use the retained row only to
+   locate evidence; a number in prose is not automatically a hard dependency.
+2. REVIEWED.tsv owns the current bounded finding and review depth. Do not duplicate
+   its changing row/state totals manually in Markdown. Missing rows are unreviewed.
+3. PLAN.tsv alone selects source assignments. Its dispatch_gate and actual scope
+   claim still apply; READY is not claimed, running, code-complete or accepted.
 
-REVIEWED.tsv has 29 records: 3 READY and 26 RECHECK. SOURCE_AND_DISCUSSION means
-bounded source/discussion inspection, not full acceptance. HISTORICAL rows carry
-no checked source SHA. #1701's earlier WAIT was not justified by a current missing
-output check and is now RECHECK. #2701's residual expands to the full existing audit.
+SOURCE_AND_DISCUSSION and SOURCE_SUBSET are bounded inspections, not acceptance.
+HISTORICAL rows have no checked source SHA. PRESERVE prevents repeating the inspected
+repair; it does not grant current runtime proof or close the parent obligation.
+A required owner output can release a consumer before whole-issue test closure.
 
-## Coverage without losing the backlog
+## Complete coverage, without duplicate authority
 
-For full re-audit, use the union of every retained issue ID and the current open
-GitHub issue IDs. Classify current closed/superseded records as tracker state only;
-closure is not code proof. Four read-only review queues partition that union by
-issue_number % 4 = 0, 1, 2, 3. This partitions issue review, NOT source ownership.
-No reviewer independently edits the shared map, schemas or code. Root integrates
-one issue result at a time, retaining unresolved rows instead of dropping them.
+Root indexes the union of retained and current open issue IDs. Review relevant
+closed prerequisites against their actual source/output evidence, not a closed label.
+Read-only queues partition review by issue_number % 4; they do not claim code paths.
+Keep raw snapshots and pagination evidence in local/CI artifacts. Bind source SHA,
+body/comment identities, missing sections and review depth; parse the corpus rather
+than loading every issue into every worker. No complete ID reconciliation is claimed
+by this revision. Independent verified assignments do not await unrelated reviews.
 
-Counts and all-ready claims require exact enumerated ID sets with no missing or
-duplicate issue, every comment page, source SHA and review depth. A selected source
-assignment need not wait for unrelated review queues to finish. The existing
-controller/validator must consume the chosen plan; no new scheduler is introduced.
+The existing assignment oracle is itself under repair in #818 (recheck 5966026795).
+Its Valid/READY output cannot replace the explicit preflight: missing inputs can be
+called complete, and scope/serialization checks have source-confirmed gaps. Repair
+the existing owner; no new scheduler or automatic whole-backlog pause is introduced.

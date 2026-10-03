@@ -39,6 +39,12 @@ a positive production path works. Never manufacture a documentation read receipt
 
 Retain all BLOCK-MAP.tsv issue IDs and add every current open GitHub issue ID.
 Root reconciles the ID sets; search counts alone do not establish coverage.
+Keep the bounded raw collection and page-completeness evidence in local/CI
+artifacts, not another committed copy of every issue. Index IDs and content
+digests programmatically; open each assigned body/thread from that index.
+Bind Git source separately from issue/body/comment revisions and revalidate
+changed inputs before dispatch. Review actual prerequisite evidence even when
+its tracker is closed; do not infer acceptance or a future wait from that state.
 Read-only reviewers R0-R3 take their exact modulo-4 partitions. Every issue review
 covers body, all paginated comments, linked active PR deltas, relevant current code
 and required documentation; it returns residual items, true producer outputs,
@@ -59,6 +65,18 @@ until integration/explicit transfer/abort, not until the nominal wave changes.
 On a real wait, preserve the issue checkpoint, release or transfer scope explicitly,
 and take independent work. After two same-cause failures, perform a bounded cause
 audit and change the approach. Repeating unchanged BLOCKED or tool calls is not work.
+
+## Assignment-oracle recheck — #818
+
+The current audit-work-unit-assignments.py cannot supply dispatch clearance by
+itself: source recheck 5966026795 found incomplete-input, scope, serialization,
+parent/matrix and result-identity defects. #818 is reopened; preserve its existing
+script/fixture owner and repair it there, not in a second checker or scheduler.
+Until repaired, root checks complete inputs and every selected write claim against
+both unstarted selections and actual live claims/PR deltas. A numeric dependency
+is not a file-lock transfer. Attribute PR-level failures to their owning assignments;
+unknown scope/authority holds only affected claims, not independent verified work.
+Do not create empty PRs to force an unstarted task into an overlap check.
 
 ## Delivery
 
