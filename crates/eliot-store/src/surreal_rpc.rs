@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
 
@@ -65,25 +65,7 @@ impl SurrealRpcTransport {
         request
             .headers_mut()
             .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("json"));
-        // The observed destination must agree with the address stage 1 admitted.
-        // `127.0.0.1` here is the host parsed out of this request URI compared
-        // against the validated config, not a second validator, and `expected_port`
-        // stays an `Option` so a request URI carrying no port is refused too.
-        //
-        // The scheme is compared case-insensitively because `http::Uri` keeps a
-        // non-standard scheme exactly as written (`ws` is not one of its two
-        // standard protocols), while the predicate deliberately still admits the
-        // case variants of `ws://` that the previous loader check admitted. An
-        // exact `== "ws"` comparison here would refuse a configuration the
-        // types layer calls valid. This matches the two layers; it does not
-        // broaden the grammar, which only ever yields `ws`.
-        if !request
-            .uri()
-            .scheme_str()
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
-            || request.uri().host() != Some("127.0.0.1")
-            || expected_port != request.uri().port_u16()
-        {
+        if !agrees_with_validated_local_endpoint(request.uri(), expected_port) {
             return Err(StoreError::PolicyViolation(
                 "surreal rpc transport destination must be exactly \
                  ws://127.0.0.1:<port>/rpc and must agree with the validated \
@@ -205,6 +187,37 @@ impl SurrealRpcTransport {
     }
 }
 
+/// #3980 stage 2: the observed destination must agree with the address stage 1
+/// admitted. The scheme and the port are read from this parsed request URI and
+/// compared against the validated endpoint -- `expected_port` is exactly the
+/// port `validate_local_rpc_endpoint` already accepted, and `127.0.0.1` is the
+/// single literal address the shared grammar admits, not a value read out of the
+/// configuration here. `expected_port` stays an `Option` so a request URI
+/// carrying no port is refused too, rather than vacuously satisfying the port
+/// half of the comparison.
+///
+/// Defence in depth, not a second validator: with stage 1 in place this
+/// disagreement is not reachable through `connect`, because stage 1 admits only
+/// `ws://127.0.0.1:<digits>/rpc` and `http::Uri` then yields exactly that
+/// scheme, host and port. The comparison stays because the checked address and
+/// the transport's parsed destination must agree; it fails closed if a future
+/// parser, case-folding rule or `http::Uri` behaviour ever makes the two layers
+/// disagree.
+///
+/// The scheme is compared case-insensitively because `http::Uri` keeps a
+/// non-standard scheme exactly as written (`ws` is not one of its two standard
+/// protocols), while the predicate deliberately still admits the case variants
+/// of `ws://` that the previous loader check admitted. An exact `== "ws"`
+/// comparison here would refuse a configuration the types layer calls valid.
+/// This matches the two layers; it does not broaden the grammar, which only
+/// ever yields `ws`.
+fn agrees_with_validated_local_endpoint(uri: &Uri, expected_port: Option<u16>) -> bool {
+    uri.scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
+        && uri.host() == Some("127.0.0.1")
+        && expected_port == uri.port_u16()
+}
+
 fn parse_response(text: &str) -> Result<RpcResponse, StoreError> {
     serde_json::from_str(text).map_err(|error| StoreError::Decode(error.to_string()))
 }
@@ -231,7 +244,7 @@ fn millis_u64(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod local_endpoint_admission_tests {
-    use super::SurrealRpcTransport;
+    use super::{SurrealRpcTransport, agrees_with_validated_local_endpoint};
     use crate::StoreError;
     use eliot_types::{CredentialProviderKind, SurrealCapabilities, SurrealServerConfig};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -383,6 +396,9 @@ mod local_endpoint_admission_tests {
     /// non-standard scheme exactly as written, so the transport's own agreement
     /// check must not refuse what the types layer calls valid -- otherwise a
     /// configuration that used to load and connect would stop working.
+    ///
+    /// The comparison is asserted through the production function itself, so
+    /// deleting or narrowing `agrees_with_validated_local_endpoint` fails here.
     #[test]
     fn the_transport_agreement_check_admits_the_declared_case_compatibility()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -393,14 +409,40 @@ mod local_endpoint_admission_tests {
 
             let request = endpoint.into_client_request()?;
             assert!(
-                request
-                    .uri()
-                    .scheme_str()
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws")),
-                "{endpoint} must keep its scheme comparable with the accepted grammar"
+                agrees_with_validated_local_endpoint(request.uri(), expected_port),
+                "{endpoint} must keep its scheme comparable with the accepted grammar, \
+                 and the transport must admit the destination it parses from it"
             );
             assert_eq!(request.uri().host(), Some("127.0.0.1"));
             assert_eq!(expected_port, request.uri().port_u16());
+        }
+        Ok(())
+    }
+
+    /// #3980: the other direction of the same stage-2 path. A destination that
+    /// disagrees with what stage 1 admitted is refused: a foreign host, a port
+    /// other than the validated one, and a request URI that carries no port at
+    /// all, which must be refused rather than vacuously satisfying the port half
+    /// of the comparison. `expected_port` is the port the predicate itself
+    /// exposes, not a hardcoded list. No socket work is involved.
+    #[test]
+    fn the_transport_agreement_check_refuses_a_disagreeing_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = local_config(BIND, ENDPOINT);
+        config.validate_local_rpc_endpoint()?;
+        let expected_port = config.local_rpc_port();
+        assert_eq!(expected_port, Some(18000));
+
+        for uri in [
+            "ws://192.0.2.1:18000/rpc",
+            "ws://127.0.0.1:18001/rpc",
+            "ws://127.0.0.1/rpc",
+        ] {
+            let request = uri.into_client_request()?;
+            assert!(
+                !agrees_with_validated_local_endpoint(request.uri(), expected_port),
+                "{uri} must be refused: it disagrees with the endpoint stage 1 admitted"
+            );
         }
         Ok(())
     }

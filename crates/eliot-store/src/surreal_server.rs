@@ -1796,6 +1796,17 @@ mod lifecycle_tests {
                 return Err(format!("off-loopback endpoint was accepted by {operation}").into());
             };
             let text = error.to_string();
+            // Every entrypoint must refuse the endpoint itself. Without this the
+            // loop also holds when admission lets the endpoint through and each
+            // operation fails later for an unrelated reason, which proves
+            // nothing about #3980.
+            assert!(
+                matches!(
+                    error,
+                    StoreError::Config(eliot_types::ConfigError::ForbiddenDbEndpoint)
+                ),
+                "{operation} must refuse the off-loopback endpoint itself, got: {text}"
+            );
             assert!(
                 !text.contains("192.0.2.1"),
                 "{operation} refusal must not echo the rejected address: {text}"
@@ -1833,6 +1844,13 @@ mod lifecycle_tests {
                 .into());
             };
             let text = error.to_string();
+            assert!(
+                matches!(
+                    error,
+                    StoreError::Config(eliot_types::ConfigError::ForbiddenDbEndpoint)
+                ),
+                "admission must refuse the rejected shape as a forbidden local endpoint, got: {text}"
+            );
             assert!(
                 !text.contains(endpoint),
                 "refusal must state the accepted grammar, not the rejected input: {text}"

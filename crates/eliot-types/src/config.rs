@@ -960,11 +960,20 @@ mod tests {
         }
     }
 
-    /// The loader path reaches the predicate: the counterexample endpoint is
-    /// refused by `GovernorConfig::validate` itself, in the bind/endpoint
-    /// position, before the storage and capability checks.
+    /// The loader path reaches the predicate: the counterexample endpoint and a
+    /// foreign bind are refused by `GovernorConfig::validate` itself, in the
+    /// bind/endpoint position, before the storage and capability checks.
+    ///
+    /// What this test does NOT establish is ordering with respect to
+    /// credential, path or process effects. `GovernorConfig::validate` is
+    /// entirely pure (it reads no credential, resolves no executable path and
+    /// spawns no process anywhere in its body), so no assertion here can carry
+    /// that claim. The "before any credential access" ordering is established
+    /// by the supervisor admission test in `surreal_server.rs` and the
+    /// transport test in `surreal_rpc.rs`, which own the paths where those
+    /// effects actually happen.
     #[test]
-    fn the_loader_refuses_a_userinfo_endpoint_before_any_credential_or_path_effect() {
+    fn the_loader_refuses_a_userinfo_endpoint_and_a_foreign_bind() {
         let mut config = GovernorConfig::default();
         config.db.surreal.endpoint = "ws://127.0.0.1:18000@192.0.2.1:18000/rpc".to_owned();
         assert!(matches!(
@@ -978,5 +987,19 @@ mod tests {
             bad_bind.validate(),
             Err(ConfigError::ForbiddenDbBind)
         ));
+    }
+
+    /// The positive for the loader's own call site: the documented
+    /// literal-local pair is still ACCEPTED by `GovernorConfig::validate`, so
+    /// adding `self.db.surreal.validate_local_rpc_endpoint()?` did not narrow
+    /// the accepted configuration. Stated on its own rather than left to
+    /// `default_config_is_valid`, so the acceptance is attributed to the new
+    /// call site instead of to the pre-existing default fixture.
+    #[test]
+    fn the_loader_accepts_a_literal_local_bind_and_endpoint_pair() -> Result<(), ConfigError> {
+        let mut config = GovernorConfig::default();
+        config.db.surreal.bind = ACCEPTED_BIND.to_owned();
+        config.db.surreal.endpoint = "ws://127.0.0.1:18000/rpc".to_owned();
+        config.validate()
     }
 }
