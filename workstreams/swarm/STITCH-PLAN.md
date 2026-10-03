@@ -243,3 +243,51 @@ The lanes recorded 559 seams in `STITCH-20261003.tsv` (seam, issues, shared file
 | `crates/kernel/eliot-kernel-service/src/commit_recovery.rs` | #2763 #2764 |
 | `crates/kernel/eliot-ors/src/store/backup_snapshot.rs` | #2885 #2967 |
 | `crates/governor/eliot-governor/src/owner_closure_feed.rs` | #2962 #2976 |
+
+
+## Seams from the review of 2026-10-03 17:13
+
+The lanes recorded 1122 seams in `STITCH-20261003.tsv` (seam, issues, shared files or outputs, PR, disposition, evidence). Files written by several READY rows (sequenced into different waves):
+
+| file | issues |
+|---|---|
+| `bins/eliotd/src/daemon_runtime.rs` | #1680 #1688 #1694 #1695 #1699 #1731 #1734 #1739 #1778 #2559 #2560 #2647 |
+| `bins/eliot-kernel/src/lib.rs` | #88 #1679 #1681 #1685 #1689 #1691 #1750 #1818 #1872 #1878 #2627 |
+| `crates/kernel/eliot-ors/src/store.rs` | #269 #1681 #1690 #1795 #1953 #2627 #2763 #2764 #2798 #2863 #2885 |
+| `bins/eliotd/src/lib.rs` | #1191 #1730 #1731 #1733 #1773 #1784 #1787 #1791 #1863 #1910 #2663 |
+| `bins/eliot-kernel/src/daemon_request_dispatch.rs` | #1679 #1681 #1694 #1713 #1734 #1784 #1818 #1820 #1846 #1905 #2875 |
+| `crates/governor/eliot-governor/src/composition.rs` | #1191 #1689 #1693 #1787 #1791 #2380 #2663 #2962 |
+| `bins/eliot-host/src/lib.rs` | #891 #961 #1750 #1801 #1953 #2737 |
+| `crates/kernel/eliot-kernel-service/src/store_gateway.rs` | #1690 #1713 #1846 #2763 #2764 #2971 |
+| `crates/storage/eliot-store-api/src/lib.rs` | #950 #1784 #1818 #1820 #2859 |
+| `bins/eliotd/src/kernel_context_read_client.rs` | #1724 #1725 #1726 #1728 #1784 |
+| `bins/eliot-kernel/src/host_request_route.rs` | #1734 #1743 #1807 #1853 #1861 |
+| `bins/eliot-kernel/src/frame_dispatch.rs` | #1739 #1784 #1818 #1878 #2875 |
+| `bins/eliot-agent-bridge/src/main.rs` | #1743 #1745 #1880 #1881 #1939 |
+| `bins/eliot-agent-bridge/src/lib.rs` | #1880 #1939 #2570 #2799 #2800 |
+| `crates/kernel/eliot-ipc/src/lib.rs` | #791 #1807 #1878 #1881 |
+| `crates/kernel/eliot-installation/src/tests.rs` | #1138 #1148 #1810 #3001 |
+| `bins/eliot-kernel/src/composition_bootstrap.rs` | #1679 #1681 #1772 #1953 |
+| `bins/eliot-watchdog/src/watchdog_composition.rs` | #1755 #1757 #1761 #1840 |
+| `crates/storage/eliot-store-memory/src/lib.rs` | #63 #1784 #2859 |
+| `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml` | #88 #1025 #2738 |
+| `bins/eliot-kernel/src/main.rs` | #895 #1685 #1840 |
+| `bins/eliot-host/src/backup_cutover.rs` | #961 #2737 #2738 |
+| `Cargo.lock` | #974 #1806 #2857 |
+| `crates/storage/eliot-store-surreal-adapter/src/apply.rs` | #989 #1818 #1933 |
+| `crates/kernel/eliot-installation/src/lib.rs` | #1138 #1810 #1857 |
+| `crates/kernel/eliot-installation/src/redb_state.rs` | #1138 #1772 #1857 |
+| `crates/governor/eliot-authority/src/grants.rs` | #1142 #2962 #2976 |
+| `crates/governor/eliot-governor/src/owner_closure_provider.rs` | #1142 #2962 #2976 |
+| `crates/surfaces/eliot-agent-bridge-core/src/lib.rs` | #1191 #1745 #2799 |
+| `bins/eliot-kernel/src/front_door_driver.rs` | #1679 #1807 #1881 |
+| `crates/kernel/eliot-kernel-service/src/commit_recovery.rs` | #1690 #2763 #2764 |
+| `bins/eliotd/src/task_binding_admission.rs` | #1702 #1787 #1791 |
+| `scripts/build-eliot-windows-x64-release.ps1` | #1719 #1858 #1923 |
+| `bins/eliotd/src/context_reconstruction_route.rs` | #1729 #1735 #2857 |
+| `bins/eliotd/src/daemon_kernel_client.rs` | #1739 #1807 #2570 |
+| `crates/storage/eliot-store-api/src/operation_catalogue.rs` | #1784 #1818 #1820 |
+| `crates/storage/eliot-store-api/src/operation_parameters.rs` | #1784 #1818 #1820 |
+| `crates/storage/eliot-store-surreal-adapter/src/apply/atomic_write.rs` | #1784 #1818 #1820 |
+| `crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs` | #1784 #1818 #2859 |
+| `bins/eliot-wasm-host/src/request_loop.rs` | #1956 #2786 #2896 |
