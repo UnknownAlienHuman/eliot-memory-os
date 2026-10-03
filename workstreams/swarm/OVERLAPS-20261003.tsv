@@ -1,0 +1,101 @@
+path	issues
+bins/eliotd/src/daemon_runtime.rs	#1680 #1688 #1694 #1695 #1699 #1731 #1734 #1739 #1778 #2559 #2560 #2647
+bins/eliot-kernel/src/lib.rs	#88 #1679 #1681 #1685 #1689 #1691 #1750 #1818 #1872 #1878 #2627
+crates/kernel/eliot-ors/src/store.rs	#269 #1681 #1690 #1795 #1953 #2627 #2763 #2764 #2798 #2863 #2885
+bins/eliotd/src/lib.rs	#1191 #1730 #1731 #1733 #1773 #1784 #1787 #1791 #1863 #1910 #2663
+bins/eliot-kernel/src/daemon_request_dispatch.rs	#1679 #1681 #1694 #1713 #1734 #1784 #1818 #1820 #1846 #1905 #2875
+crates/governor/eliot-governor/src/composition.rs	#1191 #1689 #1693 #1787 #1791 #2380 #2663 #2962
+bins/eliot-host/src/lib.rs	#891 #961 #1750 #1801 #1953 #2737
+crates/kernel/eliot-kernel-service/src/store_gateway.rs	#1690 #1713 #1846 #2763 #2764 #2971
+crates/storage/eliot-store-api/src/lib.rs	#950 #1784 #1818 #1820 #2859
+bins/eliotd/src/kernel_context_read_client.rs	#1724 #1725 #1726 #1728 #1784
+bins/eliot-kernel/src/host_request_route.rs	#1734 #1743 #1807 #1853 #1861
+bins/eliot-kernel/src/frame_dispatch.rs	#1739 #1784 #1818 #1878 #2875
+bins/eliot-agent-bridge/src/main.rs	#1743 #1745 #1880 #1881 #1939
+bins/eliot-agent-bridge/src/lib.rs	#1880 #1939 #2570 #2799 #2800
+crates/kernel/eliot-ipc/src/lib.rs	#791 #1807 #1878 #1881
+crates/kernel/eliot-installation/src/tests.rs	#1138 #1148 #1810 #3001
+bins/eliot-kernel/src/composition_bootstrap.rs	#1679 #1681 #1772 #1953
+bins/eliot-watchdog/src/watchdog_composition.rs	#1755 #1757 #1761 #1840
+crates/storage/eliot-store-memory/src/lib.rs	#63 #1784 #2859
+crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml	#88 #1025 #2738
+bins/eliot-kernel/src/main.rs	#895 #1685 #1840
+bins/eliot-host/src/backup_cutover.rs	#961 #2737 #2738
+Cargo.lock	#974 #1806 #2857
+crates/storage/eliot-store-surreal-adapter/src/apply.rs	#989 #1818 #1933
+crates/kernel/eliot-installation/src/lib.rs	#1138 #1810 #1857
+crates/kernel/eliot-installation/src/redb_state.rs	#1138 #1772 #1857
+crates/governor/eliot-authority/src/grants.rs	#1142 #2962 #2976
+crates/governor/eliot-governor/src/owner_closure_provider.rs	#1142 #2962 #2976
+crates/surfaces/eliot-agent-bridge-core/src/lib.rs	#1191 #1745 #2799
+bins/eliot-kernel/src/front_door_driver.rs	#1679 #1807 #1881
+crates/kernel/eliot-kernel-service/src/commit_recovery.rs	#1690 #2763 #2764
+bins/eliotd/src/task_binding_admission.rs	#1702 #1787 #1791
+scripts/build-eliot-windows-x64-release.ps1	#1719 #1858 #1923
+bins/eliotd/src/context_reconstruction_route.rs	#1729 #1735 #2857
+bins/eliotd/src/daemon_kernel_client.rs	#1739 #1807 #2570
+crates/storage/eliot-store-api/src/operation_catalogue.rs	#1784 #1818 #1820
+crates/storage/eliot-store-api/src/operation_parameters.rs	#1784 #1818 #1820
+crates/storage/eliot-store-surreal-adapter/src/apply/atomic_write.rs	#1784 #1818 #1820
+crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs	#1784 #1818 #2859
+bins/eliot-wasm-host/src/request_loop.rs	#1956 #2786 #2896
+crates/governor/eliot-canonical/src/lib.rs	#63 #2570
+crates/storage/eliot-store-api/src/request_hash.rs	#63 #1796
+bins/eliot-kernel/src/daemon_supervision.rs	#88 #1682
+crates/foundation/eliot-bootstrap/src/lib.rs	#216 #1857
+crates/smart/cognitive-contract-challenges.toml	#261 #1722
+bins/eliot-watchdog/tests/spool_backup.rs	#458 #955
+crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs	#673 #2870
+bins/eliot-store-surreal/src/lib.rs	#742 #1933
+crates/kernel/eliot-ors/src/tests.rs	#844 #1795
+bins/eliot-kernel/src/control_plane.rs	#903 #1750
+bins/eliot-kernel/src/daemon_runtime.rs	#903 #1682
+bins/eliot-kernel/src/generation_control.rs	#903 #1795
+bins/eliot-kernel/src/generation_recovery.rs	#903 #1795
+crates/kernel/eliot-ors/tests/restore_journal.rs	#957 #2653
+bins/eliot-kernel/src/backup_capture.rs	#959 #2863
+bins/eliot-host/src/host_job_launch.rs	#978 #1685
+bins/eliot-host/src/runtime_restart_state.rs	#981 #1801
+crates/agent/eliot-agent-claude/src/execution.rs	#1112 #1797
+bins/eliot/src/main.rs	#1138 #1857
+crates/instrument/eliot-instrument-runner/src/lib.rs	#1140 #1805
+crates/instrument/eliot-testd-core/src/lib.rs	#1140 #1806
+crates/storage/eliot-ecxf/tests/disposition.rs	#1141 #1716
+crates/storage/eliot-backup/tests/disposition.rs	#1141 #1716
+scripts/migration_inventory_1860.py	#1142 #1716
+docs/migration/1860-dispositions.md	#1142 #1716
+crates/kernel/eliot-installation/src/transaction.rs	#1148 #1857
+crates/governor/eliot-skill/src/lib.rs	#1191 #2663
+crates/governor/eliot-skill/src/activation.rs	#1191 #2663
+bins/eliotd/src/skill_dispatch.rs	#1191 #2663
+bins/eliot-agent-bridge/src/hook_intake.rs	#1219 #4601
+docs/release/WINDOWS_X64_RELEASE.md	#1227 #1719
+bins/eliotd/src/dreamer_admission.rs	#1680 #1778
+bins/eliot-kernel/src/startup_coordinator.rs	#1681 #1750
+crates/kernel/eliot-kernel-service/src/lifecycle.rs	#1682 #1691
+crates/kernel/eliot-ors/src/lib.rs	#1684 #2967
+crates/kernel/eliot-kernel-service/src/store_exchange.rs	#1690 #1846
+bins/eliot-kernel/src/shutdown_drain.rs	#1691 #2627
+bins/eliot-kernel/src/kernel_audit.rs	#1691 #1807
+bins/eliotd/src/maintenance_trigger_evaluator.rs	#1693 #1694
+bins/eliotd/src/maintenance_family_catalog.rs	#1693 #1778
+crates/smart/eliot-context-admission/src/lib.rs	#1724 #1725
+bins/eliotd/src/campaign_packet.rs	#1724 #1728
+bins/eliotd/src/negative_memory_action_gate.rs	#1726 #1731
+bins/eliotd/Cargo.toml	#1733 #2857
+bins/eliotd/hot-path.toml	#1733 #1734
+crates/surfaces/eliot-mcp/src/core.rs	#1743 #1744
+bins/eliot-agent-bridge/src/kernel_host_request_client.rs	#1743 #2570
+bins/eliot-watchdog/src/watchdog_spool.rs	#1761 #2651
+crates/research/eliot-researcher/src/source_admissibility.rs	#1769 #2894
+bins/eliot-kernel/src/process_execution.rs	#1775 #1812
+crates/storage/eliot-store-api/src/write_admission.rs	#1784 #1818
+bins/eliot-kernel/src/host_request_route/daemon_claim_queue.rs	#1807 #2570
+bins/eliot-kernel/src/tests/local_read_claim.rs	#1853 #1861
+bins/eliot-kernel/src/tests.rs	#1861 #1881
+bins/eliotd/src/startup_readiness.rs	#2560 #2647
+crates/kernel/eliot-kernel-service/src/wasm_dispatch.rs	#2568 #2786
+crates/storage/eliot-store-surreal-adapter/src/backup_restore.rs	#2666 #2859
+crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs	#2688 #2689
+crates/kernel/eliot-ors/src/store/backup_snapshot.rs	#2885 #2967
+crates/governor/eliot-governor/src/owner_closure_feed.rs	#2962 #2976
