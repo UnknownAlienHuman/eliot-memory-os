@@ -1050,10 +1050,10 @@ pub fn execute_describe_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
-    // STITCH(#758-P10.1): the describe-only lane is kit-less — no governing
-    // kit binds this call, so no honest `kit_digest` source exists here.
-    // This site stays on the host receipt and must not call the shared
-    // projection until a kit owner binds one.
+    // P10.1 (#758): the describe-only lane is kit-less — no governing kit
+    // binds this call, so no honest `kit_digest` source exists here. This site
+    // stays on the host receipt and must not call the shared projection until a
+    // kit owner binds one (see `crate::receipt_bridge`).
     Ok((receipt, descriptor))
 }
 
@@ -1253,6 +1253,32 @@ fn resource_limit_error(hit: ResourceLimitHit) -> TypedExecutionError {
     TypedExecutionError::Engine(format!("{termination:?}"))
 }
 
+/// Owner-typed terminal cause for one trapped guest execution, taken from the
+/// real engine trap code and never from the engine message text. `None` means
+/// the engine error is not a trap at all, so the caller keeps its own
+/// untyped stage vocabulary.
+///
+/// `unreachable` — the instruction a guest panic lowers to — and every other
+/// fault code are guest traps, never guest errors: the owner-typed
+/// `Trap(GuestTrap)` cause keeps them distinct from
+/// `TypedDomainResult::GuestError` and from fuel, deadline, stack, and resource
+/// terminations.
+///
+/// One classifier, both untrusted-execution legs (issue #758 case 13): a
+/// component's own initialization and the descriptor/domain call after it run
+/// under the same guarded envelope, so a fuel or epoch termination on either
+/// leg carries the same typed cause.
+fn trap_termination(error: &wasmtime::Error) -> Option<EngineTermination> {
+    let trap = error.downcast_ref::<wasmtime::Trap>()?;
+    let termination = match *trap {
+        wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
+        wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
+        wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
+        wasmtime::Trap::UnreachableCodeReached | _ => EngineTermination::Trap(TrapClass::GuestTrap),
+    };
+    Some(termination)
+}
+
 fn map_call_error(
     call: &str,
     error: &wasmtime::Error,
@@ -1261,23 +1287,14 @@ fn map_call_error(
     if let Some(hit) = limit_hit {
         return resource_limit_error(hit);
     }
-    let Some(trap) = error.downcast_ref::<wasmtime::Trap>() else {
-        return TypedExecutionError::Engine(format!("{call}:component-call"));
-    };
-    let termination = match *trap {
-        wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
-        wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
-        wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
-        // `unreachable` — the instruction a guest panic lowers to — and every
-        // other fault code are guest traps, never guest errors: the
-        // owner-typed `Trap(GuestTrap)` cause keeps them distinct from
-        // `TypedDomainResult::GuestError` and from fuel, deadline, stack, and
-        // resource terminations. The staged `Invoke` wrapper records the
-        // terminal stage without claiming success, and the single invocation
-        // is never retried on another world.
-        wasmtime::Trap::UnreachableCodeReached | _ => EngineTermination::Trap(TrapClass::GuestTrap),
-    };
-    TypedExecutionError::Engine(format!("{termination:?}"))
+    // A trapped leg reports the owner-typed cause; only a non-trap engine error
+    // falls back to this stage's untyped code. The staged `Invoke` wrapper
+    // records the terminal stage without claiming success, and the single
+    // invocation is never retried on another world.
+    match trap_termination(error) {
+        Some(termination) => TypedExecutionError::Engine(format!("{termination:?}")),
+        None => TypedExecutionError::Engine(format!("{call}:component-call")),
+    }
 }
 
 fn map_instantiate_error(
@@ -1292,6 +1309,17 @@ fn map_instantiate_error(
     // lane reports the same typed `InstanceLimit` denial.
     if is_instance_limit_error(error) {
         return TypedExecutionError::Engine(format!("{:?}", EngineTermination::InstanceLimit));
+    }
+    // Component initialization is untrusted execution too, and it runs inside
+    // the same guarded envelope as the descriptor call: an instantiation the
+    // engine terminates with a real trap carries the same owner-typed fuel,
+    // epoch, stack or guest-trap cause the domain leg already reports, instead
+    // of the untyped `instantiate:component-error` string a pinned trap message
+    // can never be told apart from any other unknown fault. The stage stays
+    // `TypedStage::Instantiate`; only the cause becomes typed. The cause is
+    // read from the real engine trap code, never from the message text.
+    if let Some(termination) = trap_termination(error) {
+        return TypedExecutionError::Engine(format!("{termination:?}"));
     }
     let lowered = error.to_string().to_ascii_lowercase();
     if lowered.contains("import") {
@@ -1958,16 +1986,31 @@ impl TypedDomainResult {
     }
 }
 
-/// Executes the admitted typed domain operation for one world through the real
-/// Wasmtime component engine: the same bounded buffer is hashed and compiled,
-/// the exact component type is inspected before instantiation, the component
-/// is instantiated on the existing empty linker inside the existing guarded
-/// envelope, the registered descriptor is called and its identity validated,
-/// and the domain export is then called EXACTLY ONCE with the generated
-/// request type of the selected world. That single invocation is terminal:
-/// a staged failure or otherwise unknown outcome is returned as-is and never
-/// retried on another world or second invocation. Bound #760 capsule
-/// provenance validates first, then delegates back unbound.
+/// Executes the admitted typed domain operation for one world and returns the
+/// host receipt, the retained typed domain result, and the projected #760
+/// shared receipt for the same call when one can honestly exist.
+///
+/// Bound #760 capsule provenance selects the kit-owned lane. With provenance
+/// the call runs [`execute_capsule_domain_experimental`], which validates the
+/// kit and capsule, executes the one bounded typed call, and projects the host
+/// receipt it produced onto the shared contract; this entry forwards that
+/// projection unchanged. Without provenance the call runs the same bounded
+/// typed call through the kit-less interior lane [`execute_domain_lane`] and
+/// returns `None` for the shared receipt: `kit_digest` and `proof_ceiling` are
+/// sourced only from a validated [`ModuleContractKit`], so a lane that holds no
+/// kit reports `None` rather than inventing either value.
+///
+/// The caller's world selection is compared against the request's own world
+/// here, before any preflight, engine, or delegation work: the capsule entry
+/// derives its world from the request, so without this guard a caller could
+/// select one world and execute another world's component. Both lanes are
+/// covered, and the mismatch is the owned typed
+/// [`TypedExecutionError::WorldSelection`] denial (`request-world`), the same
+/// denial the kit-less interior applies to the same condition.
+///
+/// The host receipt stays the source of truth; the projection is additive
+/// fail-closed evidence, never a replacement. Projected success still means one
+/// bounded typed call, never candidate application, use, or task completion.
 pub fn execute_domain_experimental(
     world: TypedWorld,
     artifact: &[u8],
@@ -1975,14 +2018,61 @@ pub fn execute_domain_experimental(
     request: &TypedDomainRequest,
     admitted: &TypedDomainAdmission,
     provenance: Option<(&ModuleContractKit, &ModuleTestCapsule)>,
+) -> Result<
+    (
+        TypedReceipt,
+        TypedDomainResult,
+        Option<eliot_wasm_runtime::TypedReceipt>,
+    ),
+    TypedExecutionError,
+> {
+    // P5.1/P5.3 (#758): the selected world is compared against the request's
+    // own world before anything is acquired, compiled, or delegated, so no
+    // caller can select one world and execute another world's component.
+    if request.world() != world {
+        return Err(TypedExecutionError::WorldSelection {
+            reason: "request-world".to_owned(),
+        });
+    }
+    let Some((kit, capsule)) = provenance else {
+        // P10.1 (#758): the shared receipt binds the governing kit digest and
+        // the admitted ceiling, and both are sourced only from a validated
+        // `ModuleContractKit`. This kit-less lane holds no kit, so it executes
+        // the one bounded typed call through the shared interior and reports
+        // `None` for the shared receipt instead of synthesizing either value.
+        let (receipt, result) = execute_domain_lane(world, artifact, limits, request, admitted)?;
+        return Ok((receipt, result, None));
+    };
+    execute_capsule_domain_experimental(kit, capsule, artifact, limits, request, admitted)
+}
+
+/// Runs the one bounded typed domain call for one world through the real
+/// Wasmtime component engine: the same bounded buffer is hashed and compiled,
+/// the exact component type is inspected before instantiation, the component
+/// is instantiated on the existing empty linker inside the existing guarded
+/// envelope, the registered descriptor is called and its identity validated,
+/// and the domain export is then called EXACTLY ONCE with the generated
+/// request type of the selected world. That single invocation is terminal:
+/// a staged failure or otherwise unknown outcome is returned as-is and never
+/// retried on another world or second invocation.
+///
+/// This is the kit-less interior lane. It owns no kit and never projects: the
+/// host receipt it returns is projected at the kit-owned call site in
+/// [`execute_capsule_domain_experimental`], the only place that holds an
+/// honest governing kit.
+fn execute_domain_lane(
+    world: TypedWorld,
+    artifact: &[u8],
+    limits: &InvocationLimits,
+    request: &TypedDomainRequest,
+    admitted: &TypedDomainAdmission,
 ) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
     let start = Instant::now();
-    if let Some((kit, capsule)) = provenance {
-        return execute_capsule_domain_experimental(
-            kit, capsule, artifact, limits, request, admitted,
-        );
-    }
     admitted.validate()?;
+    // The same request/world agreement enforced at the public entry, re-checked
+    // here as the execution-site invariant: this interior is private, so the
+    // check is kept at the point where the selected world would otherwise be
+    // compiled and invoked, and it runs before any preflight or engine work.
     if request.world() != world {
         return Err(TypedExecutionError::WorldSelection {
             reason: "request-world".to_owned(),
@@ -2061,11 +2151,11 @@ pub fn execute_domain_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
-    // STITCH(#758-P10.1): the unbound domain lane is kit-less — `provenance`
-    // is `None` at this shared constructor, so no honest `kit_digest` source
-    // exists here. The kit-bound capsule lane projects after return in
-    // `execute_capsule_domain_experimental`; this site stays on the host
-    // receipt and never synthesizes a digest.
+    // P10.1 (#758): this lane holds no kit and never synthesizes a
+    // `kit_digest`. Its host receipt is projected onto #760's shared contract
+    // at the kit-owned call site in `execute_capsule_domain_experimental`,
+    // which is the only site that binds an honest governing kit digest and
+    // admitted ceiling.
     Ok((receipt, result))
 }
 
@@ -2145,8 +2235,9 @@ fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
 /// digest and length. A governed kit is refused on this lane: the experimental receipt
 /// is `NON_GOVERNED_EXPERIMENTAL` and can never satisfy governed proof.
 ///
-/// The single invocation itself runs through [`execute_domain_experimental`]
-/// with the caller's typed request and admitted envelope: the same bounded
+/// The single invocation itself runs through the kit-less interior lane
+/// (`execute_domain_lane`) with the
+/// caller's typed request and admitted envelope: the same bounded
 /// buffer is compiled, the exact component type is preflighted (including
 /// the generated export-signature typecheck) before instantiation, the
 /// descriptor and the domain export are each called exactly once under the
@@ -2155,6 +2246,30 @@ fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
 /// is retained verbatim. The typed request arrives as generated WIT types;
 /// the capsule fixture bytes are bounds evidence only, never parsed into a
 /// request, and there is no legacy byte-runner fallback.
+///
+/// The third returned element is `Some` of the projected #760 shared receipt
+/// for this exact call, produced from the host receipt this function just
+/// emitted: the host receipt remains the source of truth and the projection is
+/// additive fail-closed evidence, never a replacement. A projection denial
+/// fails the call with `?` instead of returning a receipt the shared contract
+/// rejects. The projection is computed per call from this receipt alone —
+/// nothing is cached across calls, so a failed invocation cannot poison an
+/// independent later one — and its success still means one bounded typed call,
+/// never candidate application, use, or task completion.
+///
+/// This kit-owned entry is the only place the shared receipt is projected:
+/// `kit_digest` and `proof_ceiling` are taken here from the validated
+/// [`ModuleContractKit`] above — the ceiling only after it has been proved
+/// equal to the ceiling this call enforces — and a kit-less lane has no honest
+/// source for either value, so it reports `None` rather than inventing them.
+///
+/// The projected output evidence covers exactly what the host receipt's
+/// `output_digest` covers — the validated `describe` descriptor content from
+/// `validate_descriptor` — and not the domain result's content, for which no
+/// host-measured digest exists on this path. `execute_domain_lane` keeps that
+/// receipt honest by counting the result separately and enforcing it against
+/// the admitted ceiling without folding it into the descriptor digest; see
+/// `crate::receipt_bridge` for the shared-side statement of the same coverage.
 pub fn execute_capsule_domain_experimental(
     kit: &ModuleContractKit,
     capsule: &ModuleTestCapsule,
@@ -2162,7 +2277,14 @@ pub fn execute_capsule_domain_experimental(
     limits: &InvocationLimits,
     request: &TypedDomainRequest,
     admitted: &TypedDomainAdmission,
-) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
+) -> Result<
+    (
+        TypedReceipt,
+        TypedDomainResult,
+        Option<eliot_wasm_runtime::TypedReceipt>,
+    ),
+    TypedExecutionError,
+> {
     kit.validate().map_err(map_contract_error)?;
     capsule.validate(kit).map_err(map_contract_error)?;
     if kit.governed {
@@ -2203,18 +2325,38 @@ pub fn execute_capsule_domain_experimental(
     // from the validated `kit` above; nothing is synthesized. Bound before
     // delegation so a kit-digest failure denies before any engine work.
     let kit_digest = kit.digest().map_err(map_contract_error)?;
-    // Delegation re-enters the direct lane: capsule provenance is consumed.
-    let (receipt, result) =
-        execute_domain_experimental(world, artifact, limits, request, admitted, None)?;
-    // Resolve the emitted host receipt through #760's shared contract. The
-    // host receipt stays the source of truth: the projection is additive
-    // fail-closed evidence, never a replacement. A projection denial fails
-    // the call instead of emitting a receipt the shared contract rejects.
-    // STITCH(#758-P10.1): the projected shared receipt is validated but not
-    // yet carried outward; returning or emitting it is follow-up outside
-    // this receipt-assembly slice.
-    crate::receipt_bridge::project_shared_receipt(&receipt, &kit_digest, kit.proof_ceiling)?;
-    Ok((receipt, result))
+    // P10.1 (#758) proof/authority/effect escalation, rejected (item 20): the
+    // shared receipt's `proof_ceiling` must be the ceiling this call actually
+    // enforced, and the enforced ceiling is `admitted.proof_ceiling`, which
+    // `check_ceiling` applies to the guest's echoed ceiling on every world
+    // result. `ModuleContractKit::validate` binds package/ABI/artifact/import/
+    // export identity but never bounds `kit.proof_ceiling` to the admitted
+    // envelope, so a kit claiming a higher ceiling (for example `Handler` on a
+    // `context-admission` call the host admitted at `Observation`) would
+    // otherwise be projected verbatim into shared evidence the host never
+    // enforced. The two are therefore bound to each other here, exactly like
+    // the `kit.artifact_digest`/`kit.artifact_len` comparisons above: a
+    // disagreement is the owned typed denial before delegation, so no engine
+    // work runs. Neither value is preferred, clamped, or reconciled here — a
+    // kit and an admission that disagree fail closed instead.
+    if kit.proof_ceiling != admitted.proof_ceiling {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "proof-ceiling".to_owned(),
+        ));
+    }
+    // Delegation re-enters the kit-less interior lane: capsule provenance is
+    // consumed here and its receipt is projected at this call site below.
+    let (receipt, result) = execute_domain_lane(world, artifact, limits, request, admitted)?;
+    // Resolve the emitted host receipt through #760's shared contract and carry
+    // it out with the host receipt it was computed from. The host receipt stays
+    // the source of truth: the projection is additive fail-closed evidence,
+    // never a replacement. A projection denial fails the call instead of
+    // returning a receipt the shared contract rejects. The projected ceiling is
+    // `kit.proof_ceiling`, which the check above proved equal to the ceiling
+    // enforced on this call by `admitted.proof_ceiling`.
+    let shared =
+        crate::receipt_bridge::project_shared_receipt(&receipt, &kit_digest, kit.proof_ceiling)?;
+    Ok((receipt, result, Some(shared)))
 }
 
 /// Digest of the admitted operation envelope plus the measured request bound.
@@ -3883,4 +4025,821 @@ fn call_dreamer_cycle(
         };
         Ok((descriptor, domain))
     })
+}
+
+/// Six frozen worlds driven through their own real domain export and the
+/// #760 neutral capsule pair (issue #758 case 3).
+///
+/// This drive lives inside the crate on purpose and changes no production
+/// line above it. `TypedDomainRequest`'s payloads are the generated bindgen
+/// types behind the crate-private `crate::typed_bindings`, so no `tests/`
+/// target can construct one and no visibility is expanded for this proof.
+/// What this module adds is only the real per-world driver the issue's matrix
+/// requires: the checked-in per-world component fixture is parsed with `wat`,
+/// preflighted, bound into a real [`ModuleContractKit`] and a real
+/// [`ModuleTestCapsule`], and executed once per world by the real Wasmtime
+/// provider through both domain entries. No mock engine, no second engine, no
+/// legacy byte-runner fallback.
+///
+/// FIXTURE VALUES: every string written into a request record below is a test
+/// fixture value owned by this module and is never production data. Each is
+/// bounded, printable and non-empty; every leaf that is not an admitted
+/// identity echo is exactly one printable byte, so the whole measured record
+/// stays inside the admitted input ceiling [`default_experimental_limits`]
+/// sets. That ceiling is the real one and is not widened, relaxed or tuned
+/// here. Only the five admitted identity leaves are meaningful to the host:
+/// they are copied verbatim out of the [`TypedDomainAdmission`] the same call
+/// enforces, so the guest echo checks compare values the guest really read.
+///
+/// What this module is evidence of is exactly one thing: the real engine
+/// executed each world's real domain export once through the neutral capsule.
+/// The request contents are test inputs, not evidence of any admission,
+/// activation, screening, handling or cycle semantics.
+#[cfg(test)]
+mod six_world_capsule_drive {
+    use super::{
+        ExecutionMode, ModuleContractKit, ModuleTestCapsule, ProofCeiling, Sha256Digest,
+        TypedDomainAdmission, TypedDomainOutcome, TypedDomainRequest, TypedDomainResult,
+        TypedExecutionError, TypedReceipt, TypedStage, TypedWorld, default_experimental_limits,
+        execute_capsule_domain_experimental, execute_describe_experimental,
+        execute_domain_experimental, preflight_bytes, typed_wit_digest,
+    };
+    use crate::typed_bindings::TYPED_PACKAGE_ID;
+    use crate::typed_bindings::context_admission::exports::eliot::current::admission as admission_wit;
+    use crate::typed_bindings::context_assembly::exports::eliot::current::assembly as assembly_wit;
+    use crate::typed_bindings::cue_activation::exports::eliot::current::activation as activation_wit;
+    use crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle as cycle_wit;
+    use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler as handler_wit;
+    use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen as screen_wit;
+    use eliot_wasm_runtime::component_contract::{AbiDescriptor, TypedWorld as NeutralWorld};
+    use eliot_wasm_runtime::{CapabilityId, InvocationLimits, ProofStage};
+
+    /// Admitted identity leaves. Two printable bytes each; every request record
+    /// copies these verbatim from the admitted envelope.
+    const OPERATION_ID: &str = "op";
+    const TASK_ID: &str = "tk";
+    const SCOPE_ID: &str = "sc";
+    const FENCE_EPOCH: &str = "fe";
+    const POLICY_ID: &str = "pl";
+
+    /// One-byte bounded fixture leaves, named after the field they carry.
+    const ATTEMPT: &str = "a";
+    const DECISION: &str = "d";
+    const REVISION: &str = "r";
+    const FLOOR: &str = "i";
+    const DIGEST: &str = "g";
+    const RULE: &str = "u";
+    const PRIORITY: &str = "o";
+    const PROFILE: &str = "p";
+    const SERIALIZER: &str = "z";
+    const SERIALIZER_VERSION: &str = "y";
+    const OPTIONS: &str = "x";
+    const ROUTE: &str = "w";
+    const MODEL: &str = "m";
+    const QUALIFICATION: &str = "q";
+    const RULE_EVIDENCE: &str = "e";
+    const SNAPSHOT: &str = "n";
+    const NORMALIZATION: &str = "v";
+    const SOURCE: &str = "s";
+    const PRINCIPAL: &str = "h";
+    const SESSION: &str = "j";
+    const SUMMARY: &str = "t";
+    const BUNDLE: &str = "b";
+    const RECEIPT: &str = "k";
+    const STATE_DIGEST: &str = "c";
+
+    /// Unwraps a real construction result with an explicit failure message.
+    fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => {
+                panic!("#758/3 typed capsule drive could not build a real value: {error:?}")
+            }
+        }
+    }
+
+    /// Maps a host world selection onto the neutral #760 world it is bound to.
+    const fn neutral_world(world: TypedWorld) -> NeutralWorld {
+        match world {
+            TypedWorld::ContextAdmission => NeutralWorld::ContextAdmission,
+            TypedWorld::ContextAssembly => NeutralWorld::ContextAssembly,
+            TypedWorld::CueActivation => NeutralWorld::CueActivation,
+            TypedWorld::DreamerHandler => NeutralWorld::DreamerHandler,
+            TypedWorld::MemoryCurationScreen => NeutralWorld::MemoryCurationScreen,
+            TypedWorld::DreamerCycle => NeutralWorld::DreamerCycle,
+        }
+    }
+
+    /// Checked-in per-world component fixture for this world.
+    fn load_fixture(world: TypedWorld) -> Vec<u8> {
+        let path = format!("tests/data/typed-components/{}.wat", world.world_name());
+        match wat::parse_file(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("#758/3 fixture {path} must be a parseable component: {error}"),
+        }
+    }
+
+    /// The exact frozen WIT bytes that declare this world's exported
+    /// interface, measured for the kit's interface identity.
+    fn world_interface_bytes(world: TypedWorld) -> &'static [u8] {
+        match world {
+            TypedWorld::ContextAdmission => include_bytes!("../wit/typed/context-admission.wit"),
+            TypedWorld::ContextAssembly => include_bytes!("../wit/typed/context-assembly.wit"),
+            TypedWorld::CueActivation => include_bytes!("../wit/typed/cue-activation.wit"),
+            TypedWorld::DreamerHandler => include_bytes!("../wit/typed/dreamer-handler.wit"),
+            TypedWorld::MemoryCurationScreen => {
+                include_bytes!("../wit/typed/memory-curation-screen.wit")
+            }
+            TypedWorld::DreamerCycle => include_bytes!("../wit/typed/dreamer-cycle.wit"),
+        }
+    }
+
+    /// Real #760 contract kit for one world, bound to that world's measured
+    /// fixture bytes.
+    ///
+    /// Every field satisfies a real comparison the capsule entry performs:
+    /// package identity and the ABI descriptor (`ModuleContractKit::validate`),
+    /// `artifact_digest`/`artifact_len` against the same buffer's preflight
+    /// (`execute_capsule_domain_experimental`'s "artifact-digest" /
+    /// "artifact-length" checks), empty `declared_imports` and exactly
+    /// `[world.interface_name()]` in `declared_exports`, and
+    /// `governed: false` for this explicitly selected local experiment.
+    fn world_kit(world: TypedWorld, artifact: &[u8]) -> ModuleContractKit {
+        let preflight = must(preflight_bytes(artifact));
+        let neutral = neutral_world(world);
+        ModuleContractKit {
+            package_id: TYPED_PACKAGE_ID.to_owned(),
+            world: neutral,
+            abi: must(AbiDescriptor::new(
+                neutral,
+                format!("758/3-fixture-native/{}", world.world_name()),
+                "758/3-fixture-native-revision-1".to_owned(),
+                // The frozen WIT digest the guest `describe` export must report.
+                typed_wit_digest(),
+            )),
+            artifact_digest: preflight.digest,
+            artifact_len: preflight.byte_len,
+            interface_digest: Sha256Digest::of_bytes(world_interface_bytes(world)),
+            declared_imports: Vec::new(),
+            declared_exports: vec![neutral.interface_name().to_owned()],
+            // No frozen typed world declares a state contract: each interface
+            // is a pure per-call function over its own request/result records.
+            // The field is still bound to an exact measured digest of that
+            // frozen fact rather than left unset.
+            state_contract_digest: Sha256Digest::of_bytes(
+                format!("758/3-no-state-contract/{}/v1", world.world_name()).as_bytes(),
+            ),
+            // Bound below to the ceiling this call actually enforces; a kit
+            // that claims a higher ceiling is denied, not projected.
+            proof_ceiling: ProofCeiling::Observation,
+            governed: false,
+        }
+    }
+
+    /// Real #760 test capsule for one world's kit, on the same admitted
+    /// envelope the call enforces. `fixture`/`expected` are bounded size
+    /// evidence only — exactly as `execute_capsule_domain_experimental`
+    /// documents, they are never parsed into a request and are not an engine
+    /// report.
+    fn world_capsule(
+        world: TypedWorld,
+        kit: &ModuleContractKit,
+        limits: &InvocationLimits,
+    ) -> ModuleTestCapsule {
+        ModuleTestCapsule {
+            kit_digest: must(kit.digest()),
+            component: must(CapabilityId::new(format!(
+                "758/3-typed-fixture/{}",
+                world.world_name()
+            ))),
+            world: neutral_world(world),
+            operation: world.domain_func().to_owned(),
+            stage: ProofStage::Invocation,
+            fixture: format!(
+                "758/3-capsule-fixture/{}/{}",
+                world.world_name(),
+                world.domain_func()
+            )
+            .into_bytes(),
+            expected: format!(
+                "758/3-capsule-expected/{}/{}",
+                world.world_name(),
+                world.domain_func()
+            )
+            .into_bytes(),
+            // Declared bounds are the admitted envelope's own ceilings, never
+            // above them: the capsule entry denies a capsule above them.
+            max_input_bytes: limits.max_input_bytes,
+            max_output_bytes: limits.max_output_bytes,
+            max_work: limits.max_fuel,
+            oracle: format!("758/3-capsule-oracle/{}", world.world_name()),
+        }
+    }
+
+    /// The admitted envelope every world is driven under. Its `proof_ceiling`
+    /// equals the governing kit's, which is the binding the capsule entry
+    /// enforces before delegation.
+    fn admitted_record() -> TypedDomainAdmission {
+        TypedDomainAdmission {
+            operation_id: OPERATION_ID.to_owned(),
+            task_id: TASK_ID.to_owned(),
+            scope_id: SCOPE_ID.to_owned(),
+            fence_epoch: FENCE_EPOCH.to_owned(),
+            policy_id: POLICY_ID.to_owned(),
+            proof_ceiling: ProofCeiling::Observation,
+        }
+    }
+
+    fn capacity_limits() -> admission_wit::CapacityLimits {
+        admission_wit::CapacityLimits {
+            total_capacity: 0,
+            fixed_overhead: 0,
+            output_reserve: 0,
+            review_reserve: 0,
+        }
+    }
+
+    fn decision_revision() -> admission_wit::DecisionRevision {
+        admission_wit::DecisionRevision {
+            decision_id: DECISION.to_owned(),
+            recipe_revision: REVISION.to_owned(),
+            policy_sha256: DIGEST.to_owned(),
+        }
+    }
+
+    fn context_binding(admitted: &TypedDomainAdmission) -> admission_wit::ContextBinding {
+        admission_wit::ContextBinding {
+            task_id: admitted.task_id.clone(),
+            attempt_id: ATTEMPT.to_owned(),
+            scope_id: admitted.scope_id.clone(),
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            decision_id: DECISION.to_owned(),
+            operation_id: None,
+        }
+    }
+
+    /// The world's own generated request record, built from its own WIT
+    /// surface only (`wit/typed/context-admission.wit::admission-request`).
+    fn admission_request(admitted: &TypedDomainAdmission) -> admission_wit::AdmissionRequest {
+        admission_wit::AdmissionRequest {
+            schema_revision: 1,
+            operation_id: admitted.operation_id.clone(),
+            task_id: admitted.task_id.clone(),
+            attempt_id: ATTEMPT.to_owned(),
+            scope_id: admitted.scope_id.clone(),
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            binding: context_binding(admitted),
+            candidates: Vec::new(),
+            recipe_digest: DIGEST.to_owned(),
+            recipe_revision: REVISION.to_owned(),
+            provider_denominator: Vec::new(),
+            capacity: capacity_limits(),
+            floor: admission_wit::SafetyFloorIdentity {
+                floor_id: FLOOR.to_owned(),
+                decision: decision_revision(),
+                floor: admission_wit::SafetyFloor {
+                    binding: context_binding(admitted),
+                    mandatory_atoms: Vec::new(),
+                    mandatory_roles: Vec::new(),
+                    providers: admission_wit::ProviderDenominator {
+                        requested: Vec::new(),
+                        dispositions: Vec::new(),
+                    },
+                    members: Vec::new(),
+                    interpretation_dependencies: Vec::new(),
+                    rule_evidence: RULE_EVIDENCE.to_owned(),
+                    capacity: capacity_limits(),
+                },
+            },
+            priority: admission_wit::PriorityPolicy {
+                policy_id: PRIORITY.to_owned(),
+                decision: decision_revision(),
+                priorities: Vec::new(),
+            },
+            rule: admission_wit::AdmissionRule {
+                rule_id: RULE.to_owned(),
+                decision: decision_revision(),
+                rule_sha256: DIGEST.to_owned(),
+            },
+            measurement_profile: admission_wit::MeasurementCompositionProfile {
+                profile_id: PROFILE.to_owned(),
+                schema_version: 1,
+                serializer_id: SERIALIZER.to_owned(),
+                serializer_version: SERIALIZER_VERSION.to_owned(),
+                serializer_options_digest: OPTIONS.to_owned(),
+                route_id: ROUTE.to_owned(),
+                model_id: MODEL.to_owned(),
+                unit: admission_wit::MeasurementUnit::Utf8Bytes,
+                aggregation: admission_wit::MeasurementAggregation::QualifiedUtf8Contribution,
+                qualification: QUALIFICATION.to_owned(),
+                capacity: capacity_limits(),
+            },
+            supplied_omissions: Vec::new(),
+            measurements: Vec::new(),
+            learning_tickets: Vec::new(),
+            deadline_ms: None,
+            cancelled: false,
+            predecessor_digest: None,
+            invalidation: None,
+        }
+    }
+
+    /// `wit/typed/context-assembly.wit::assembly-request`.
+    fn assembly_request(admitted: &TypedDomainAdmission) -> assembly_wit::AssemblyRequest {
+        assembly_wit::AssemblyRequest {
+            schema_revision: 1,
+            operation_id: admitted.operation_id.clone(),
+            task_id: admitted.task_id.clone(),
+            scope_id: admitted.scope_id.clone(),
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            admitted: Vec::new(),
+            admitted_digest: DIGEST.to_owned(),
+            recipe_digest: DIGEST.to_owned(),
+            measurement: assembly_wit::SerializedMeasurement {
+                byte_count: 0,
+                stu_estimate: None,
+                exact_token_count: None,
+                serializer: SERIALIZER.to_owned(),
+                schema_revision: REVISION.to_owned(),
+                input_digest: DIGEST.to_owned(),
+                output_digest: DIGEST.to_owned(),
+                proof_ceiling: assembly_wit::ProofCeiling::Observation,
+            },
+            deadline_ms: None,
+            cancelled: false,
+            predecessor_digest: None,
+        }
+    }
+
+    /// `wit/typed/cue-activation.wit::activation-request`. This world echoes
+    /// its WIT `request-id` as the admitted operation identity and carries no
+    /// task or scope field.
+    fn activation_request(admitted: &TypedDomainAdmission) -> activation_wit::ActivationRequest {
+        activation_wit::ActivationRequest {
+            schema_revision: 1,
+            request_id: admitted.operation_id.clone(),
+            seeds: Vec::new(),
+            snapshot_id: SNAPSHOT.to_owned(),
+            relation_edges: Vec::new(),
+            bounds: activation_wit::ActivationBounds {
+                max_depth: 0,
+                max_fanout: 0,
+                max_results: 0,
+                max_nodes: 0,
+                max_edges: 0,
+                max_work: 0,
+                max_path_len: 0,
+                max_seeds: 0,
+                max_direct: 0,
+                max_derived: 0,
+                max_trace_steps: 0,
+                max_output_bytes: 0,
+                activation_threshold: 0,
+            },
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            normalization_profile: NORMALIZATION.to_owned(),
+            observed_at_ms: 0,
+            deadline_ms: None,
+            cancelled: false,
+        }
+    }
+
+    /// `wit/typed/dreamer-handler.wit::validated-candidate`, carrying the
+    /// orientation subtype payload its own WIT variant declares.
+    fn handler_request(admitted: &TypedDomainAdmission) -> handler_wit::ValidatedCandidate {
+        handler_wit::ValidatedCandidate {
+            schema_revision: 1,
+            operation_id: admitted.operation_id.clone(),
+            job: handler_wit::JobClass::Orientation,
+            requester: handler_wit::Requester {
+                principal: PRINCIPAL.to_owned(),
+                origin: handler_wit::RequesterOrigin::Human,
+                session: SESSION.to_owned(),
+            },
+            task_id: admitted.task_id.clone(),
+            attempt_id: ATTEMPT.to_owned(),
+            scope_id: admitted.scope_id.clone(),
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            bundle_digest: BUNDLE.to_owned(),
+            manifest_digest: DIGEST.to_owned(),
+            grounding_digest: DIGEST.to_owned(),
+            validation_receipt: RECEIPT.to_owned(),
+            subtype: handler_wit::HandlerSubtype::Orientation(handler_wit::OrientationPayload {
+                summary: SUMMARY.to_owned(),
+                findings: Vec::new(),
+                unknowns: Vec::new(),
+            }),
+            budget: handler_wit::BudgetLimits {
+                max_input_bytes: 0,
+                max_output_bytes: 0,
+                max_candidates: 0,
+                max_work: 0,
+                max_depth: 0,
+            },
+            preservation: handler_wit::PreservationReport {
+                verdicts: Vec::new(),
+            },
+            deadline_ms: None,
+            cancelled: false,
+        }
+    }
+
+    /// `wit/typed/memory-curation-screen.wit::screen-request`.
+    fn screen_request(admitted: &TypedDomainAdmission) -> screen_wit::ScreenRequest {
+        screen_wit::ScreenRequest {
+            schema_revision: 1,
+            operation_id: admitted.operation_id.clone(),
+            task_id: admitted.task_id.clone(),
+            scope_id: admitted.scope_id.clone(),
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            source_id: SOURCE.to_owned(),
+            snapshot_revision: REVISION.to_owned(),
+            members: Vec::new(),
+            availability: screen_wit::SourceAvailability::Available,
+            profile_id: PROFILE.to_owned(),
+            rule_ids: Vec::new(),
+            deadline_ms: None,
+            cancelled: false,
+            predecessor_digest: None,
+        }
+    }
+
+    /// `wit/typed/dreamer-cycle.wit::cycle-step-input`. Its result echoes the
+    /// request's own `state.fence-epoch`, so both carry the admitted fence.
+    fn cycle_request(admitted: &TypedDomainAdmission) -> cycle_wit::CycleStepInput {
+        cycle_wit::CycleStepInput {
+            schema_revision: 1,
+            operation_id: admitted.operation_id.clone(),
+            task_id: admitted.task_id.clone(),
+            scope_id: admitted.scope_id.clone(),
+            fence_epoch: admitted.fence_epoch.clone(),
+            fence_generation: 0,
+            state: cycle_wit::DreamerState {
+                schema_version: 1,
+                phase: cycle_wit::CyclePhase::Validated,
+                revision: 0,
+                state_digest: STATE_DIGEST.to_owned(),
+                pending: Vec::new(),
+                observed: Vec::new(),
+                fence_epoch: admitted.fence_epoch.clone(),
+                fence_generation: 0,
+            },
+            policy: cycle_wit::CyclePolicy {
+                schema_version: 1,
+                policy_revision: REVISION.to_owned(),
+                max_records: 0,
+                max_requests: 0,
+                max_canonical_bytes: 0,
+            },
+            deadline_ms: None,
+            cancelled: false,
+            predecessor_digest: None,
+        }
+    }
+
+    /// The one generated request value for this world, in its own typed
+    /// carrier. Each world's record is built by its own builder above, so a
+    /// world can never be driven with another world's payload.
+    fn world_request(world: TypedWorld, admitted: &TypedDomainAdmission) -> TypedDomainRequest {
+        match world {
+            TypedWorld::ContextAdmission => {
+                TypedDomainRequest::Admission(Box::new(admission_request(admitted)))
+            }
+            TypedWorld::ContextAssembly => {
+                TypedDomainRequest::Assembly(Box::new(assembly_request(admitted)))
+            }
+            TypedWorld::CueActivation => {
+                TypedDomainRequest::CueActivation(Box::new(activation_request(admitted)))
+            }
+            TypedWorld::DreamerHandler => {
+                TypedDomainRequest::DreamerHandler(Box::new(handler_request(admitted)))
+            }
+            TypedWorld::MemoryCurationScreen => {
+                TypedDomainRequest::MemoryCurationScreen(Box::new(screen_request(admitted)))
+            }
+            TypedWorld::DreamerCycle => {
+                TypedDomainRequest::DreamerCycle(Box::new(cycle_request(admitted)))
+            }
+        }
+    }
+
+    /// True when the retained terminal result is this world's own typed
+    /// outcome variant. A guest error, a foreign world's payload or a lifted
+    /// trap terminal all fail this.
+    fn is_world_outcome(world: TypedWorld, result: &TypedDomainResult) -> bool {
+        let TypedDomainResult::Outcome(outcome) = result else {
+            return false;
+        };
+        matches!(
+            (world, outcome.as_ref()),
+            (
+                TypedWorld::ContextAdmission,
+                TypedDomainOutcome::Admission(_)
+            ) | (TypedWorld::ContextAssembly, TypedDomainOutcome::Assembly(_))
+                | (
+                    TypedWorld::CueActivation,
+                    TypedDomainOutcome::CueActivation(_)
+                )
+                | (
+                    TypedWorld::DreamerHandler,
+                    TypedDomainOutcome::DreamerHandler(_)
+                )
+                | (
+                    TypedWorld::MemoryCurationScreen,
+                    TypedDomainOutcome::MemoryCurationScreen(_)
+                )
+                | (
+                    TypedWorld::DreamerCycle,
+                    TypedDomainOutcome::DreamerCycle(_)
+                )
+        )
+    }
+
+    /// Everything one world's drive binds, so every assertion helper below sees
+    /// the exact measured values this world's own fixture produced rather than
+    /// a hand-copied subset of them.
+    struct WorldDrive {
+        world: TypedWorld,
+        artifact: Vec<u8>,
+        digest: Sha256Digest,
+        byte_len: u64,
+        limits: InvocationLimits,
+        kit: ModuleContractKit,
+        kit_digest: Sha256Digest,
+        capsule: ModuleTestCapsule,
+        admitted: TypedDomainAdmission,
+        request: TypedDomainRequest,
+    }
+
+    /// Builds one world's drive from its checked-in fixture: the same bounded
+    /// buffer is preflighted, the kit and the capsule are bound to its measured
+    /// bytes, and the request is that world's own generated record.
+    fn world_drive(world: TypedWorld) -> WorldDrive {
+        let artifact = load_fixture(world);
+        let preflight = must(preflight_bytes(&artifact));
+        let limits = default_experimental_limits(preflight.digest.clone());
+        let kit = world_kit(world, &artifact);
+        let kit_digest = must(kit.digest());
+        let capsule = world_capsule(world, &kit, &limits);
+        let admitted = admitted_record();
+        let request = world_request(world, &admitted);
+        WorldDrive {
+            world,
+            artifact,
+            digest: preflight.digest,
+            byte_len: preflight.byte_len,
+            limits,
+            kit,
+            kit_digest,
+            capsule,
+            admitted,
+            request,
+        }
+    }
+
+    /// The pair is bound to this fixture's measured bytes and to the ceiling
+    /// this call enforces; nothing is pasted from elsewhere.
+    fn assert_kit_capsule_binding(drive: &WorldDrive) {
+        assert_eq!(drive.kit.artifact_digest, drive.digest);
+        assert_eq!(drive.kit.artifact_len, drive.byte_len);
+        assert_eq!(
+            drive.kit.declared_exports,
+            vec![drive.world.interface_name().to_owned()]
+        );
+        assert!(drive.kit.declared_imports.is_empty());
+        assert!(!drive.kit.governed);
+        assert!(drive.kit.validate().is_ok());
+        assert_eq!(drive.capsule.kit_digest, drive.kit_digest);
+        assert!(drive.capsule.validate(&drive.kit).is_ok());
+        assert_eq!(drive.capsule.world, drive.kit.world);
+        assert_eq!(drive.capsule.operation.as_str(), drive.world.domain_func());
+        assert_eq!(drive.admitted.proof_ceiling, drive.kit.proof_ceiling);
+    }
+
+    /// The host receipt the one real typed invocation actually produced, bound
+    /// to this world's own artifact, ABI and admitted identity.
+    fn assert_host_receipt(drive: &WorldDrive, receipt: &TypedReceipt, result: &TypedDomainResult) {
+        assert_eq!(receipt.world, drive.world.world_name());
+        assert_eq!(receipt.package_id, TYPED_PACKAGE_ID);
+        assert_eq!(receipt.proof, ExecutionMode::LocalExperimental.proof());
+        assert_eq!(receipt.artifact_digest, drive.digest);
+        assert_eq!(receipt.artifact_bytes, drive.byte_len);
+        assert_eq!(receipt.engine_version, super::ENGINE_VERSION);
+        assert_eq!(receipt.wit_digest, typed_wit_digest());
+        assert!(receipt.actual_imports.is_empty());
+        assert_eq!(
+            receipt.actual_exports,
+            vec![format!(
+                "{TYPED_PACKAGE_ID}/{}",
+                drive.world.interface_name()
+            )]
+        );
+        assert_eq!(receipt.instances, 1);
+        assert_eq!(receipt.stage, TypedStage::Cleanup.as_str());
+        assert_eq!(receipt.operation_id.as_deref(), Some(OPERATION_ID));
+        assert_eq!(receipt.task_id.as_deref(), Some(TASK_ID));
+        assert_eq!(receipt.fence_epoch.as_deref(), Some(FENCE_EPOCH));
+        assert_eq!(receipt.policy_id.as_deref(), Some(POLICY_ID));
+        assert_eq!(receipt.terminal, result.terminal());
+        assert_eq!(receipt.terminal, "Completed");
+        assert!(receipt.input_bytes > 0);
+        assert!(receipt.output_bytes > 0);
+        assert_ne!(
+            receipt.semantic_digest,
+            Sha256Digest::of_bytes(b"typed-semantic-pending")
+        );
+    }
+
+    /// The projected #760 shared receipt for that same call, bound to the
+    /// governing kit digest and to the ceiling that call enforced.
+    fn assert_shared_projection(
+        drive: &WorldDrive,
+        receipt: &TypedReceipt,
+        shared: &eliot_wasm_runtime::TypedReceipt,
+    ) {
+        assert_eq!(shared.kit_digest, drive.kit_digest);
+        assert_eq!(shared.world, neutral_world(drive.world));
+        assert_eq!(shared.package_id, TYPED_PACKAGE_ID);
+        assert_eq!(shared.artifact_digest, drive.digest);
+        assert_eq!(shared.input_digest, receipt.input_digest);
+        assert_eq!(shared.output_digest.as_ref(), Some(&receipt.output_digest));
+        assert_eq!(shared.output_bytes, receipt.output_bytes);
+        assert_eq!(shared.stage, ProofStage::Receipt);
+        assert_eq!(shared.proof_ceiling, drive.kit.proof_ceiling);
+        assert_eq!(shared.terminal, "Completed");
+        assert!(shared.validate().is_ok());
+    }
+
+    /// Negative half of the ceiling binding: a kit claiming a higher proof
+    /// ceiling than the admission this call enforces is denied instead of being
+    /// projected. Kit validation never bounds the ceiling, so the capsule is
+    /// re-bound to the raised kit's own digest and the denial is the host's own
+    /// comparison.
+    fn assert_raised_ceiling_denial(drive: &WorldDrive) {
+        let mut raised = drive.kit.clone();
+        raised.proof_ceiling = ProofCeiling::CandidateOnly;
+        let raised_digest = must(raised.digest());
+        let raised_capsule = world_capsule(drive.world, &raised, &drive.limits);
+        assert!(raised.validate().is_ok());
+        assert_eq!(raised_capsule.kit_digest, raised_digest);
+        assert!(raised_capsule.validate(&raised).is_ok());
+        assert_ne!(raised_digest, drive.kit_digest);
+        assert_ne!(raised.proof_ceiling, drive.admitted.proof_ceiling);
+        match execute_capsule_domain_experimental(
+            &raised,
+            &raised_capsule,
+            &drive.artifact,
+            &drive.limits,
+            &drive.request,
+            &drive.admitted,
+        ) {
+            Ok(_) => panic!("#758/3 a kit above the enforced proof ceiling must be denied"),
+            Err(TypedExecutionError::AdmissionMismatch(reason)) => {
+                assert_eq!(reason, "proof-ceiling");
+            }
+            Err(other) => panic!("#758/3 a raised kit ceiling denied as {other}"),
+        }
+    }
+
+    /// Drives ONE world end to end: its real component executes once through
+    /// the kit-owned entry, once through the forwarding entry, and the raised
+    /// kit ceiling is denied for the same kit/capsule pair.
+    fn drive_world(world: TypedWorld) {
+        let drive = world_drive(world);
+        assert_eq!(drive.request.world(), drive.world);
+        assert_kit_capsule_binding(&drive);
+
+        // The one real typed invocation of this world's real domain export,
+        // through the real Wasmtime provider, with the projected #760 shared
+        // receipt for the same call.
+        let (receipt, result, shared) = must(
+            execute_capsule_domain_experimental(
+                &drive.kit,
+                &drive.capsule,
+                &drive.artifact,
+                &drive.limits,
+                &drive.request,
+                &drive.admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+
+        assert_host_receipt(&drive, &receipt, &result);
+        // The retained terminal result is this world's own typed outcome.
+        assert!(is_world_outcome(world, &result));
+
+        let Some(shared_receipt) = shared else {
+            panic!("#758/3 the kit-owned lane must project a shared receipt");
+        };
+        assert_shared_projection(&drive, &receipt, &shared_receipt);
+
+        // The second domain entry forwards the same projection unchanged.
+        let (forwarded, forwarded_result, forwarded_shared) = must(
+            execute_domain_experimental(
+                world,
+                &drive.artifact,
+                &drive.limits,
+                &drive.request,
+                &drive.admitted,
+                Some((&drive.kit, &drive.capsule)),
+            )
+            .map_err(|error| error.to_string()),
+        );
+        assert_eq!(forwarded_shared, Some(shared_receipt));
+        assert_eq!(forwarded.semantic_digest, receipt.semantic_digest);
+        assert_eq!(forwarded_result.terminal(), result.terminal());
+        assert!(is_world_outcome(world, &forwarded_result));
+
+        assert_raised_ceiling_denial(&drive);
+    }
+
+    // No `WORK_UNIT_CASE` marker here on purpose: case 3 of #758 is marked once,
+    // in the acceptance file `tests/typed_execution.rs`, so the declared
+    // denominator stays exactly 1..26 with one marker per case. This in-crate
+    // test is the half an integration test cannot reach: `mod typed_bindings`
+    // is private in `src/lib.rs`, so only code inside this crate can build the
+    // generated per-world request types and actually invoke
+    // `execute_capsule_domain_experimental`.
+    #[test]
+    fn every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule() {
+        let worlds = TypedWorld::all();
+        let mut driven: Vec<&str> = Vec::new();
+
+        for world in worlds {
+            drive_world(world);
+            driven.push(world.world_name());
+        }
+
+        // Denominator: all six frozen worlds ran, in contract order, once per
+        // entry. No world is skipped, retried on another world, or served from
+        // a cached compilation.
+        assert_eq!(driven, worlds.map(TypedWorld::world_name).to_vec());
+    }
+
+    /// Real engine, real CHECKED-IN input: `instantiation-start-loop.wat` is a
+    /// real `dreamer-cycle` component whose core module declares a
+    /// `(start $init)` whose loop has no exit. Component initialization is
+    /// untrusted execution and runs inside the same guarded envelope as the
+    /// descriptor call, so the engine genuinely terminates this instantiation
+    /// and the denial carries the SAME owner-typed terminal cause the later
+    /// domain leg reports — not the untyped `instantiate:component-error`
+    /// string the pinned trap message could never be told apart from any other
+    /// unknown instantiation fault.
+    #[test]
+    fn nonterminating_component_initialization_denies_with_the_typed_fuel_cause() {
+        let path = "tests/data/typed-components/instantiation-start-loop.wat";
+        let spinner = match wat::parse_file(path) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("#758/13 fixture {path} must be a parseable component: {error}"),
+        };
+        let limits = default_experimental_limits(Sha256Digest::of_bytes(&spinner));
+
+        // Which typed cause is asserted is decided by the admitted policy, not
+        // forced by the test. The default experimental envelope selects
+        // `EpochAndFuel` (`default_experimental_limits`), so
+        // `typed_fuel_budget` arms the Store's fuel meter with `max_fuel` on
+        // the fuel-meters engine leg, and the engine raises
+        // `wasmtime::Trap::OutOfFuel`. The epoch driver also runs here, but its
+        // 100-tick deadline needs 100ms of wall clock while a tight non-arming
+        // loop burns the whole 50_000-fuel budget in a tiny fraction of that, so
+        // fuel is what terminates this instantiation.
+        assert_eq!(
+            limits.epoch.cancellation,
+            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel
+        );
+
+        let Err(denial) =
+            execute_describe_experimental(TypedWorld::DreamerCycle, &spinner, &limits)
+        else {
+            panic!("#758/13 a non-terminating start function must be denied");
+        };
+
+        // The staged attribution is unchanged: the call really did reach
+        // instantiation and never reached `describe`.
+        let TypedExecutionError::Staged { stage, cause } = &denial else {
+            panic!("#758/13 the denial must be staged, got {denial}");
+        };
+        assert_eq!(*stage, TypedStage::Instantiate);
+        assert_eq!(
+            **cause,
+            TypedExecutionError::Engine(format!(
+                "{:?}",
+                eliot_wasm_runtime::EngineTermination::FuelExhausted
+            ))
+        );
+        assert_eq!(denial.to_string(), "STAGE:instantiate:ENGINE:FuelExhausted");
+
+        // The untyped catch-all this used to produce is not reachable for a
+        // fuel-terminated instantiation any more.
+        assert_ne!(
+            denial.to_string(),
+            "STAGE:instantiate:ENGINE:instantiate:component-error"
+        );
+    }
 }

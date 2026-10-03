@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r13"
-revision = 13
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
-supersedes_freeze_digest = "sha256:eeb5449712a373c1087496005b97007f8632a885952c812152c46ea537857596"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r14"
+revision = 14
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r13"
+supersedes_freeze_digest = "sha256:07d31f2806603459a6cf44578a9f5894c50eb5beb3fbc90867b57a7fac8b8e5b"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -140,10 +140,10 @@ issue = "#261"
 # ratified by silently editing a row to look right.
 #
 # THE DRIFT IS REAL AND MEASURED, NOT INFERRED. A machine comparison of every
-# [[frozen_type]].fields list against the current struct declaration found
-# exactly two lists that no longer match, and both are recorded as
+# [[frozen_type]].fields list against the current struct declaration found, at
+# r12, exactly two lists that no longer matched, and both were recorded as
 # [[disagreement]] rows DIS-CTX-VIEW-EXECUTION-POLICY and
-# DIS-LEA-ACTIVATION-SURFACE rather than corrected here. The freeze is a
+# DIS-LEA-ACTIVATION-SURFACE rather than corrected at r12. The freeze is a
 # description of the owner; where the description and the owner disagree, the
 # issue's W5 clause requires recording both references and proposing a repair,
 # not editing the freeze to agree with the code. A drift corrected in the freeze
@@ -151,6 +151,22 @@ issue = "#261"
 # decisions -- what the r6 row said, and what the code now says -- unreconciled.
 # Both repairs are rust_change_needed = false and manifest-side or freeze-side
 # only; see the two rows for which owner takes each.
+#
+# THE PARAGRAPH ABOVE IS THE r12-ERA RECORD AND IS NOT THE CURRENT STATE, IN THE
+# SAME WAY AND FOR THE SAME REASON THAT THE r14 BLOCK BELOW MARKS THE r8-ERA PROSE
+# ABOVE IT. What r12 measured is not retracted: the first pass did find exactly
+# two drifted lists, and the first pass did leave them uncorrected. What is
+# historical is the tense and the disposition, not the measurement. Revision 13
+# has since measured both lists field-for-field against the current declarations
+# and repaired both [[frozen_type]].fields arrays, and both rows now carry status
+# CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE rather than OPEN_OWNED; a second pass
+# inside revision 14 then found two further drifted rows, so the disagreement
+# register holds twelve rows where this block says two. The measured facts, the
+# W5 reasoning and the r12 decision not to edit the freeze to match the code are
+# all left as r12 wrote them, because they are the true record of what r12 saw;
+# DIS-CTX-VIEW-EXECUTION-POLICY, DIS-LEA-ACTIVATION-SURFACE and the r14 block
+# below name the current rule and the repair, so no reader has to guess which of
+# the two is live.
 #
 # THE REMAINING FAMILIES ARE ADDED, NOT GUESSED. r11 covered cue, curation,
 # memory-selection, failure-observation and provider-contribution. It did not
@@ -170,34 +186,156 @@ unchanged = "every pre-existing [[frozen_type]] row and its field list -- INCLUD
 rust_change = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs only, and only the FREEZE_ID and REQUIRED_FREEZE_DIGEST constants together, because verify_freeze_binding compares declared_freeze_id against FREEZE_ID BEFORE it compares the digest, so moving only the digest would fail closed with FreezeIdDivergence rather than admit the new candidate. No contract crate source is edited by this revision; the two drift repairs are assigned to their named owners and are not performed here."
 issue = "#261"
 
+[revision_note_r13]
+revision = 13
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
+changed = "two owner-performed summary-list repairs: the [[frozen_type]].fields list for eliot_context_contracts::ActiveUnderstandingView from nine to eleven fields, and the [[frozen_type]].fields list for eliot_learning_contracts::HarnessActivationReceiptCandidate from fifteen to thirty-three fields, both taken field-for-field from the current struct declaration and both additive except that canonical_digest was ALREADY the last entry of the r6 array as well as the last declared field, so nothing moved: only its position index in the array changed, from 15 to 33, which is its true source position at field 33. Also FIVE document reference corrections on THREE [[disagreement]] rows -- four I5.22 -> I05-22 and one I5.16 -> I05-16 -- the recorded thirty-two to thirty-three field-count correction, and a status change on DIS-CTX-VIEW-EXECUTION-POLICY and DIS-LEA-ACTIVATION-SURFACE from OPEN_OWNED to CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE. THE THREE DOCUMENT-REFERENCE ROWS ARE NAMED RATHER THAN ONLY COUNTED: the I5.22 -> I05-22 correction is one each on DIS-SEL-DENOMINATOR-NAMING and on DIS-REMOVED-PATH-STILL-NAMED and TWO on DIS-VR-DENY-UNKNOWN-SCOPE, which mentions that document twice, once in the citation and once in the later sentence 'I05-22 in particular'. THE FIFTH CORRECTION, WHICH NO EARLIER ACCOUNT OF THIS REVISION DISCLOSED, IS THE I5.16 -> I05-16 ONE INSIDE THAT SAME DIS-VR-DENY-UNKNOWN-SCOPE ROW: its document_reference cited I5.16-common-durable-fields.md and now cites I05-16-common-durable-fields.md, the same zero-padded spelling as its I05-22 citation. This revision ALSO reconciled the file's own stale prose about those two drifts, which had been written while the drift was live and would otherwise have kept asserting, after the repair, either that the drift still existed or that the repair had deliberately not been performed: the [[field_contract]] row for eliot_context_contracts::ActiveUnderstandingView had its recorded_field_list_disagreement and wire_naming values reworded, the [[field_contract_field]] rows for that type's execution and policy_sha256 fields had their none_meaning values reworded, the [[coverage_accounting]] row for family eliot-context-contracts-binding-view-omission had its incomplete_reason and recheck_procedure values reworded, and the known_gap values of the two [[assignment_binding]] rows for the context assignment and for AB-LEA-BINDING-DENOMINATOR were reworded. That reconciliation added, removed and renamed NO field, enum, denominator, id, cell binding, count or row; only prose that had become false was reworded into historical or present-tense-correct form, and the recorded value is still locatable on the [[disagreement]] rows: the r6 nine-field list is verbatim in DIS-CTX-VIEW-EXECUTION-POLICY.recorded_reference, and the r6 thirty-two count is named there as an explicitly RECORDED value rather than left to be inferred, on DIS-LEA-ACTIVATION-SURFACE.actual_source_reference, immediately beside the corrected thirty-three. The SAME PROSE RECONCILIATION ALSO REWORDED THE TWO [[disagreement]] ROWS THEMSELVES, ENUMERATED PER ROW BECAUSE THE TWO ROWS WERE NOT TOUCHED IN THE SAME PLACES: on DIS-CTX-VIEW-EXECUTION-POLICY the recorded_reference, measured_fact, proposed_repair and why_no_rust_change values were reworded, and its note and its actual_source_reference were NOT touched and remain byte-identical; on DIS-LEA-ACTIVATION-SURFACE the recorded_reference, actual_source_reference, measured_fact, proposed_repair and note values were reworded, and its why_no_rust_change was NOT touched and remains byte-identical. The DIS-LEA-ACTIVATION-SURFACE actual_source_reference edit IS the thirty-two to thirty-three correction named above and is the most consequential single edit of this revision, because it changes a field COUNT rather than only a tense; an earlier account of this revision omitted that key from the enumeration entirely. Each reworded value had been written while the drift was live and would otherwise have kept asserting, after the repair, that the drift still existed, that the repair had deliberately not been performed, or a field count that was a miscount. NO RECORDED VALUE WAS DELETED to make those corrections: the r6 nine-name list remains verbatim in the context row's recorded_reference, and the r6 thirty-two count is preserved AS A RECORDED VALUE on the learning row's actual_source_reference, which now states in one sentence that the r12-era record said THIRTY-TWO, that fifteen recorded names plus the eighteen names in exact_fields_in_dispute is thirty-three, and that revision 13 measured the declaration itself and corrected the count to THIRTY-THREE."
+reason = "Both lists were MEASURED field-for-field against current source, so the recorded summary arrays no longer understate their structs. The recorded thirty-two count for the activation receipt was a miscount of thirty-three, which is why the recorded value, the measured value and the repair are all kept on the disagreement rows rather than edited away: a reader must be able to see what r12 recorded, what the source actually declares, and what this revision did about the difference."
+unchanged = "No [[field_contract]] row, no [[field_contract_field]] row and no contract row was added, removed or renamed by this revision -- a summary repair adds no contract row -- and every [[bound]] row, every [[cell_binding]] order, every [[not_frozen]] row, the r9, r10, r11 and r12 revision notes, proof_ceiling, implementation_support and evidence_execution_status are unchanged, as is every [[frozen_type]] row other than the two repaired arrays. WHAT IS NOT UNCHANGED IS PROSE, AND IT IS NAMED HERE rather than claimed away: this revision reworded values IN PLACE inside rows that already existed, and every reworded value is declared in the changed key above. Inside [[coverage_accounting]] the ONE row touched is the family eliot-context-contracts-binding-view-omission, whose incomplete_reason and recheck_procedure were reworded because both had been written while the nine-field summary drift was live and would otherwise have continued to describe it as live after the repair; nothing else in that table moved, so the number of [[coverage_accounting]] rows, the per-family declared_member_denominator and measured_member_denominator values, the members lists and every owner_is_complete value are unchanged, and the still-open gaps are unchanged and are still NOT counted as coverage -- the context crate's reactive-path types, which its own denominator_note holds out of scope as a deliberate scope boundary, and the six candidate families in the learning crate, to which that row still contributes ZERO coverage. The [[field_contract]] and [[field_contract_field]] contract CONTENT is unchanged as well: no id, type_rust_path, disposition, requiredness, bound_or_variants, validator, wire name or field row count was altered, and only the recorded_field_list_disagreement, wire_naming and none_meaning prose named in the changed key was reworded into historical or present-tense-correct form, with the r6 nine-field list still verbatim in DIS-CTX-VIEW-EXECUTION-POLICY.recorded_reference and the r6 thirty-two count no longer verbatim anywhere, because revision 13 rewrote the sentence that carried it: it is preserved as an explicitly labelled RECORDED value in DIS-LEA-ACTIVATION-SURFACE.actual_source_reference, which states the recorded THIRTY-TWO and the corrected THIRTY-THREE side by side, so nothing is claimed here about a verbatim thirty-two that this file no longer contains."
+rust_change = "No contract crate source is edited by this revision. The freeze id and digest constants in the consumer crates move TOGETHER in this same work unit, and that requirement is NOT in the [readback] rule: [readback].rule states only that the reproducible digest is sha256 over the exact file bytes and that any byte change creates a new freeze candidate whose prior verdicts are invalidated rather than edited, and it says nothing about consumer-crate constants. The requirement is carried instead by the rust_change value of [revision_note_r12] above, which records that verify_freeze_binding compares declared_freeze_id against FREEZE_ID BEFORE it compares the digest, so moving only the digest would fail closed with FreezeIdDivergence rather than admit the new candidate; that is the rule this revision follows for the same reason."
+issue = "#261"
+
 # ---------------------------------------------------------------------------
-# r13 performs the two field-list repairs that r12 measured and deliberately did
-# NOT perform, and corrects three document references. Both repairs are
-# owner-performed here: the integrator who owns this freeze is the owning_task
-# named on both [[disagreement]] rows, so there is no other owner to defer to.
+# r14 performs TWO owner-performed repairs to recorded [[frozen_type]] values
+# and corrects NO document reference on any row. The TWO repairs are
+# eliot_memory_projection_provider::ProjectionRequest from four to seven fields
+# AND its denominator_note, and
+# eliot_memory_projection_contracts::ExclusionReason from eleven to twelve wire
+# names by a single insertion rather than a change of order. BOTH ARE
+# OWNER-PERFORMED HERE: the integrator who owns this freeze is the owning_task
+# named on both [[disagreement]] rows, DIS-PRJ-REQUEST-FIELD-LIST and
+# DIS-PRJ-EXCLUSION-REASON, so there is no other owner to defer to.
 #
-# THE DISAGREEMENT ROWS SURVIVE THE REPAIR. r12 left them OPEN_OWNED and left
-# both lists stale, because a byte edit alone would erase the record that the
-# r6 list and the current code ever disagreed. That record is kept by keeping the
-# rows: each still carries its recorded reference, its measured fact, the exact
-# disputed field names and the proposed repair. What changed is only the status
-# -- now CLOSED, following the r11 precedent for a typo the owner fixed -- and
-# the trailing sentence of each proposed_repair, which had to stop saying the
-# repair is "NOT performed" once this revision performs it. The recorded value is
-# NOT edited away, so a reader of an r12-era verdict still sees what was recorded.
+# THE FIRST PAIR BELONGS TO REVISION 13 AND IS NOT REPEATED HERE. r13 repaired
+# eliot_context_contracts::ActiveUnderstandingView from nine to eleven fields
+# and eliot_learning_contracts::HarnessActivationReceiptCandidate from fifteen
+# to thirty-three fields, and BOTH OF THOSE REPAIRS ARE INSIDE THE PUBLISHED
+# r13: both published r13 byte sets, at commit d8d3f7066 and at commit
+# 596afde5c, already record eleven and thirty-three respectively. r14 therefore
+# repairs two arrays, not four, and the two r13 rows keep their
+# CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE status because that label is TRUE
+# OF HISTORY rather than of this candidate.
+#
+# r13 ALSO CORRECTED FOUR DOCUMENT REFERENCES, AND r14 CORRECTS NONE. All four
+# I5.22 -> I05-22 corrections are r13's work and are already visible in both
+# published r13 byte sets, which record zero unpadded I5.22 in any
+# [[disagreement]].document_reference value, where r12 at commit 522a13126
+# recorded four across DIS-SEL-DENOMINATOR-NAMING, DIS-VR-DENY-UNKNOWN-SCOPE and
+# DIS-REMOVED-PATH-STILL-NAMED. r14 changes no document_reference value on any
+# row, and the I5.16 -> I05-16 claim in the published r13 changed value is
+# REFUTED rather than repeated: see [revision_note_r14].reason.
+#
+# REVISION 13's DISAGREEMENT ROWS SURVIVED ITS REPAIR, BUT MORE VALUES MOVED
+# THAN THE STATUS ALONE, AND NOT THE SAME SET ON EITHER ROW. r12 left them
+# OPEN_OWNED and left both of those two lists stale, because a byte edit alone
+# would erase the record that the r6 list and the current code ever disagreed.
+# That record is kept by keeping the rows: each still carries its recorded
+# reference, its measured fact, the exact disputed field names and the proposed
+# repair. On DIS-CTX-VIEW-EXECUTION-POLICY FIVE values were reworded by r13 --
+# recorded_reference, measured_fact, proposed_repair, why_no_rust_change and
+# status -- while its note and its actual_source_reference were left
+# byte-identical, because both were already correct and neither mentioned the
+# repair. On DIS-LEA-ACTIVATION-SURFACE SIX values were reworded by r13 --
+# recorded_reference, actual_source_reference, measured_fact, proposed_repair,
+# status and note -- while its why_no_rust_change was left byte-identical,
+# because it was already correct. The status moved on both of those rows to
+# CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE, following the r11 precedent for a
+# typo the owner fixed, and the trailing sentence of each proposed_repair had to
+# stop saying the repair is "NOT performed" once revision 13 performed it. NO
+# RECORDED VALUE WAS DELETED to make those corrections: the r6 nine-name
+# list is verbatim in the context row's recorded_reference, and the r6
+# thirty-two count is named as a RECORDED value on the learning row's
+# actual_source_reference beside the corrected thirty-three, so a reader of an
+# r12-era verdict still sees what was recorded.
 #
 # THE THIRTY-TWO WAS A MISCOUNT, NOT A DIFFERENT STRUCT. The recorded prose said
 # the struct declares thirty-two fields while exact_fields_in_dispute already
 # listed eighteen names; fifteen plus eighteen is thirty-three, and the current
 # declaration confirms thirty-three. The prose is corrected, not the dispute.
+# r14 ALSO COMPARED EACH [[frozen_type]].denominator_note AGAINST THE OWNER'S OWN
+# RULE, AND FOUND ONE ROW WRONG IN BOTH VALUES. r13 compared and repaired
+# [[frozen_type]].fields arrays; the denominator_note prose was not in its scope.
+# r14 compared it and found eliot_memory_projection_provider::ProjectionRequest
+# wrong twice: it recorded four fields where the declaration carries seven, and
+# it recorded a denominator rule -- the supplied observation count -- that the
+# owner's doc comment and its validate() both contradict, because the owner
+# counts the supplied CONTINUITY observation count too. A recorded rule that
+# inverts the owner's rule is worse than a missing one, because a reader who
+# trusts it computes a wrong denominator and is refused with a typed
+# DenominatorContradiction rather than being told the freeze is behind. The same
+# pass found eliot_memory_projection_contracts::ExclusionReason recording eleven
+# wire names where the declaration carries twelve, the missing one being the
+# owner's own influence prohibition. Both rows are repaired from source here and
+# both keep a [[disagreement]] row, so the r12-era statement above that a first
+# pass found "exactly two" drifted lists is a true record of what that pass
+# found and is not retracted here; this second pair is recorded in the second
+# BLOCK of [[disagreement]] rows -- DIS-PRJ-REQUEST-FIELD-LIST and
+# DIS-PRJ-EXCLUSION-REASON, which r14 ADDED to the same table, so that one table
+# holds TWELVE rows where it held TEN at r12 and where it held TEN in BOTH
+# published r13 byte sets -- and in the [revision_note_r14].changed key.
+#
+# THE R8-ERA PROSE ABOVE IS LEFT AS IT WAS, AND IS NOT THE CURRENT RULE. The
+# comment above [revision_note] says, in the past tense, that the producer
+# required request.denominator_total == observations.len(). That was what r8
+# measured. The current owner sums the continuity count as well, so the sentence
+# is HISTORICAL rather than current, and it is left byte-identical because it is
+# the true record of what r8 saw; DIS-PRJ-REQUEST-FIELD-LIST names the current
+# rule and says so explicitly, so no reader has to guess which of the two is
+# live.
+#
+# FROZEN AT TYPE LEVEL IS NOT FROZEN AT FIELD LEVEL, AND THE THIRTY-TWO THAT
+# DIFFER IS NOW COUNTED RATHER THAN ABSENT. A [[frozen_type]] row states the
+# fields and the denominator rule read from the owner's declaration. A
+# [[field_contract]] row and its [[field_contract_field]] rows state, per field,
+# the owner type, the wire spelling, the requiredness and the meaning of an
+# absent optional, the bound or closed variant set, the identity, scope, fence
+# and revision binding, a resolving validator anchor and a typed error. Of the
+# seventy-six [[frozen_type]] rows here, forty-four have a [[field_contract]] row
+# with the same type_rust_path and thirty-two do not, across eight crates. That
+# difference was invisible in this file until now, and an invisible omission is
+# exactly what A1 refuses to accept as frozen. The [[field_contract_backlog]]
+# table therefore exists to COUNT and OWN those thirty-two, and
+# [field_contract_backlog_rule] states what it deliberately does NOT do: it adds
+# no contract row, no denominator, no id and no cell binding, it changes no count
+# in any existing table, and per [field_contract_rule].validator_column every
+# type it lists contributes ZERO to field-level coverage, because a type with no
+# field row has no resolving validator anchor. It does not claim any of the
+# thirty-two is field-frozen and it does not claim this revision closes them.
+#
+# THE COUNT IS NOT SIMPLY THIRTY-TWO TYPES. Six of the thirty-two rows are
+# BUNDLE rows naming several types in one fields array, so the row count and the
+# type count differ, and one of them -- the curation vocabulary bundle -- already
+# has field rows under FC-CUR-VOCABULARIES, so for that crate the omission is a
+# LINKAGE question rather than an absence. Both facts are stated on their rows
+# rather than left for a reader to discover, because a count that overstates the
+# gap is as untrue as one that hides it. THE FORTY-FOUR AND THE THIRTY-TWO COME
+# FROM ONE JOIN, NOT TWO, AND THE SECOND JOIN CHECKS A DIFFERENT THING. The
+# forty-four and the thirty-two are the result of joining [[frozen_type]] to
+# [[field_contract]] on the rust path string each one carries: a [[frozen_type]]
+# row states it as rust_path and the [[field_contract]] row states the same
+# string as type_rust_path, because a [[frozen_type]] row carries no type_id of
+# its own and no other key on which the two tables could be joined. The second
+# join, [[field_contract_field]] to [[field_contract]] by the field_id prefix
+# before its final dot resolved against type_id, CANNOT answer that question at
+# all: an uncovered [[frozen_type]] row has no [[field_contract]] row and
+# therefore no field_id prefix, so all thirty-two of them are invisible to it.
+# What that second join does establish is a different pair of facts: every field
+# row's prefix resolves to exactly one declared type_id -- sixty-seven distinct
+# prefixes, all sixty-seven of them declared, so no field row is orphaned -- and
+# all forty-four of the covered [[field_contract]] rows carry at least one field
+# row, so the forty-four is not inflated by an empty type row. The one
+# [[field_contract]] row in the whole file with no field row at all is
+# FC-CUR-MEMBER-EVIDENCE, which is REFERENCED_NOT_FROZEN and therefore not one
+# of the forty-four.
 # ---------------------------------------------------------------------------
-[revision_note_r13]
-revision = 13
-supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
-changed = "two owner-performed summary-list repairs: the [[frozen_type]].fields list for eliot_context_contracts::ActiveUnderstandingView from nine to eleven fields, and the [[frozen_type]].fields list for eliot_learning_contracts::HarnessActivationReceiptCandidate from fifteen to thirty-three fields, both taken field-for-field from the current struct declaration and both additive except that canonical_digest was ALREADY the last entry of the r6 array as well as the last declared field, so nothing moved: only its position index in the array changed, from 15 to 33, which is its true source position at field 33. Also three I5.22 -> I05-22 document reference corrections, the recorded thirty-two to thirty-three field-count correction, and a status change on DIS-CTX-VIEW-EXECUTION-POLICY and DIS-LEA-ACTIVATION-SURFACE from OPEN_OWNED to CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE. This revision ALSO reconciled the file's own stale prose about those two drifts, which had been written while the drift was live and would otherwise have kept asserting, after the repair, either that the drift still existed or that the repair had deliberately not been performed: the [[field_contract]] row for eliot_context_contracts::ActiveUnderstandingView had its recorded_field_list_disagreement and wire_naming values reworded, the [[field_contract_field]] rows for that type's execution and policy_sha256 fields had their none_meaning values reworded, the [[coverage_accounting]] row for family eliot-context-contracts-binding-view-omission had its incomplete_reason and recheck_procedure values reworded, and the known_gap values of the two [[assignment_binding]] rows for the context assignment and for AB-LEA-BINDING-DENOMINATOR were reworded. That reconciliation added, removed and renamed NO field, enum, denominator, id, cell binding, count or row; only prose that had become false was reworded into historical or present-tense-correct form, and the recorded value is still visible on the [[disagreement]] rows, so a reader of an r12-era verdict still sees the r6 nine-field list and the r6 thirty-two count exactly as they were recorded. The SAME PROSE RECONCILIATION ALSO REWORDED THE TWO [[disagreement]] ROWS THEMSELVES, which the preceding enumeration did not declare: on DIS-CTX-VIEW-EXECUTION-POLICY and on DIS-LEA-ACTIVATION-SURFACE the recorded_reference, measured_fact, proposed_repair, why_no_rust_change and note values were ALL FIVE reworded, for the same reason as the rows above, namely that each had been written while the drift was live and would otherwise have kept asserting, after the repair, that the drift still existed, that the repair had deliberately not been performed, or a field count that was a miscount. NO RECORDED VALUE WAS DELETED to make that correction: the r6 nine-name list and the r6 thirty-two count remain visible on those two rows exactly as they were recorded."
-reason = "Both lists were MEASURED field-for-field against current source, so the recorded summary arrays no longer understate their structs. The recorded thirty-two count for the activation receipt was a miscount of thirty-three, which is why the recorded value, the measured value and the repair are all kept on the disagreement rows rather than edited away: a reader must be able to see what r12 recorded, what the source actually declares, and what this revision did about the difference."
-unchanged = "No [[field_contract]] row, no [[field_contract_field]] row and no contract row was added, removed or renamed by this revision -- a summary repair adds no contract row -- and every [[bound]] row, every [[cell_binding]] order, every [[not_frozen]] row, the r9, r10, r11 and r12 revision notes, proof_ceiling, implementation_support and evidence_execution_status are unchanged, as is every [[frozen_type]] row other than the two repaired arrays. WHAT IS NOT UNCHANGED IS PROSE, AND IT IS NAMED HERE rather than claimed away: this revision reworded values IN PLACE inside rows that already existed, and every reworded value is declared in the changed key above. Inside [[coverage_accounting]] the ONE row touched is the family eliot-context-contracts-binding-view-omission, whose incomplete_reason and recheck_procedure were reworded because both had been written while the nine-field summary drift was live and would otherwise have continued to describe it as live after the repair; nothing else in that table moved, so the number of [[coverage_accounting]] rows, the per-family declared_member_denominator and measured_member_denominator values, the members lists and every owner_is_complete value are unchanged, and the still-open gaps are unchanged and are still NOT counted as coverage -- the context crate's reactive-path types, which its own denominator_note holds out of scope as a deliberate scope boundary, and the six candidate families in the learning crate, to which that row still contributes ZERO coverage. The [[field_contract]] and [[field_contract_field]] contract CONTENT is unchanged as well: no id, type_rust_path, disposition, requiredness, bound_or_variants, validator, wire name or field row count was altered, and only the recorded_field_list_disagreement, wire_naming and none_meaning prose named in the changed key was reworded into historical or present-tense-correct form, with the r6 nine-field list and the r6 thirty-two count still visible on the [[disagreement]] rows exactly as they were recorded."
-rust_change = "No contract crate source is edited by this revision. The freeze id and digest constants in the consumer crates move in this same work unit, as required by the [readback] rule for any byte change to this file."
+
+[revision_note_r14]
+revision = 14
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r13"
+changed = "TWO owner-performed repairs to recorded [[frozen_type]] values, and NO document-reference correction on any row. THE FIRST is eliot_memory_projection_provider::ProjectionRequest: its fields array from four to seven fields -- binding, projection_revision, denominator_total, observations, continuity, workflow_view, workflow_continuity -- taken field-for-field from the struct declaration at crates/governor/eliot-memory-projection-provider/src/lib.rs, AND its denominator_note, which recorded the supplied observation count alone where the owner's doc comment and its validate() require the supplied observation count PLUS the supplied continuity observation count. THE SECOND is eliot_memory_projection_contracts::ExclusionReason: its fields array from eleven to twelve wire names, by inserting INFLUENCE_INELIGIBLE at its true source position BETWEEN PROTECTED and NEGATIVE_MEMORY rather than appending it, measured from the declaration at crates/foundation/eliot-memory-projection-contracts/src/contracts/set.rs. THE TWO OTHER REPAIRS IN THIS CANDIDATE HAPPENED IN REVISION 13 AND ARE NOT REPEATED HERE: eliot_context_contracts::ActiveUnderstandingView from nine to eleven fields and eliot_learning_contracts::HarnessActivationReceiptCandidate from fifteen to thirty-three fields are r13's work, both published r13 byte sets already record eleven and thirty-three, and r14 rewrites neither array. TWO [[disagreement]] ROWS ADDED, DIS-PRJ-REQUEST-FIELD-LIST and DIS-PRJ-EXCLUSION-REASON, each retained rather than absorbed into a byte edit and each carrying its recorded value verbatim, its measured value with the file it was read from, the exact disputed names and the repair named; NEITHER ROW EXISTS IN EITHER PUBLISHED r13 BYTE SET, where each identifier occurs ZERO times. ONE NEW ACCOUNTING TABLE, [[field_contract_backlog]] with eight crate rows plus [field_contract_backlog_rule], recording the thirty-two [[frozen_type]] rows that are frozen at type level and carry no [[field_contract]] row; it adds NO contract row, NO denominator, NO id and NO cell binding, and it changes no count in any existing table. A REFUTATION RECORDED RATHER THAN APPLIED: the published r13 changed value claims a FIFTH document-reference correction, an I5.16 -> I05-16 edit on DIS-VR-DENY-UNKNOWN-SCOPE, and that claim is FALSE; r14 does not edit the published r13 claim, which is left byte-identical to the published text, and records the refutation in the reason key instead."
+reason = "Two reasons, and they are independent. FIRST, THE TWO REPAIRS NAMED ABOVE EXISTED IN NO PUBLISHED REVISION: both published r13 byte sets still record ProjectionRequest at four fields and ExclusionReason at eleven wire names, so a candidate that carried them under the r13 token would assert work that the r13 it claimed to be had not done, and the token r13 does not identify a file because three distinct byte sets have declared it. SECOND, A PUBLISHED REVISION'S ACCOUNT OF ITSELF IS HISTORY AND IS NOT EDITED BY A LATER REVISION. The published r13 changed value claims a fifth document-reference correction and an I5.16 -> I05-16 edit on DIS-VR-DENY-UNKNOWN-SCOPE, and that claim is FALSE, because that row's document_reference already read the zero-padded I05-16-common-durable-fields.md at r12 at commit 522a13126 and reads it identically now, and because the only unpadded I5.16 anywhere in the published r13 is the sentence asserting this very correction. Correcting the false sentence in place would have destroyed the r12 -> r13 record and left one identity carrying a true statement and a false statement about the same event, so the claim is left standing and refuted here. A READER HOLDING THE REFUTED DOCUMENT RESOLVES IT BY DIGEST, NOT BY REVISION TOKEN: the published r13 this note supersedes is the 762421-byte byte set at commit 596afde5c, sha256:07d31f2806603459a6cf44578a9f5894c50eb5beb3fbc90867b57a7fac8b8e5b, which is the newest PUBLISHED r13; the other published r13 byte set, 757919 bytes at commit d8d3f7066, sha256:8a1205fbfac8f1e8a597181ebca6d788d00f5fbe5c5e8fe6bf1051604ed45fe6, is an ancestor of it and is therefore superseded by it rather than by this note."
+unchanged = "No row count changes except the two tables named in the changed key: [[disagreement]] goes from ten rows in either published r13 to twelve, and [[field_contract_backlog]] is new at eight. EVERY OTHER TABLE KEEPS ITS ROW COUNT: [[frozen_type]] 76, [[field_contract]] 68, [[field_contract_field]] 416, [[completeness_rule]] 28, [[version_rule]] 14, [[bound]] 32, [[cell_binding]] 11, [[assignment_binding]] 12, [[coverage_accounting]] 10, [[denominator]] 10, [[family_disposition]] 7, [[not_frozen]] 3, [[challenge_closure]] 7, [[upstream_crate]] 9, [[lane_prototype]] 3, [[rejected]] 3, [[fence]] 5, [[omission_reason]] 2 and [[removed_package]] 1. Every [[cell_binding]] order, every [[not_frozen]] row, [[field_contract_rule]], [field_contract_rule_r12_amendment], [cell_number_note], [readback], the r9, r10, r11, r12 and r13 revision notes, schema_version, status, base_commit, normative_pair_key, purpose, proof_ceiling, implementation_support, evidence_execution_status and integration_owner are unchanged. PROSE THAT REFERS TO r13 IS ALSO UNCHANGED AND IS NOT MOVED TO r14: every sentence on DIS-CTX-VIEW-EXECUTION-POLICY and DIS-LEA-ACTIVATION-SURFACE that says revision 13 repaired the array or corrected the count to thirty-three is TRUE, because both published r13 byte sets already record eleven and thirty-three, so those two rows keep status CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE and the label is true of history. THE ONLY [[frozen_type]] VALUES r14 REWRITES ARE THE TWO NAMED IN THE changed KEY ABOVE; every other [[frozen_type]] row keeps its fields array and its denominator_note."
+rust_change = "No contract crate source is edited by this revision. The TWO CONSUMER ID PINS MOVE from cognitive-rev12-contract-schema-freeze-2026-09-22-r13 to cognitive-rev12-contract-schema-freeze-2026-09-22-r14 and BOTH DIGEST PINS MOVE TO THIS CANDIDATE'S BYTE DIGEST IN THE SAME WORK UNIT: FREEZE_ID and REQUIRED_FREEZE_DIGEST in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, compared together by verify_freeze_binding, and CONSUMED_FREEZE_ID and CONSUMED_FREEZE_DIGEST in crates/smart/eliot-memory-quality/src/lib.rs, compared together by verify_consumed_freeze. BOTH PAIRS MUST MOVE TOGETHER BECAUSE EACH CONSUMER COMPARES THE DECLARED IDENTITY BEFORE THE DIGEST: verify_freeze_binding returns FreezeIdDivergence as soon as observed_id differs from FREEZE_ID, and verify_consumed_freeze short-circuits on observed_id != CONSUMED_FREEZE_ID before it ever computes sha256_hex, so moving only the digest would fail closed rather than admit this candidate. THE DIGEST VALUE IS DELIBERATELY NOT WRITTEN HERE: it is a sha256 over this file's own bytes and is computed by scripts/read_freeze_digest.py after this file is final, because a self-referential digest cannot live inside the bytes it digests."
 issue = "#261"
 
 # ---------------------------------------------------------------------------
@@ -373,7 +511,7 @@ denominator_note = "Denominator, truncation, and revalidation echo the evaluated
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
 rust_path = "eliot_memory_projection_contracts::ExclusionReason"
-fields = ["STALE", "CONFLICTED", "REJECTED", "EPISTEMICALLY_UNKNOWN", "PROTECTED", "NEGATIVE_MEMORY", "PRECONDITION_FAILED{id}", "PRECONDITION_UNASSESSED{id}", "LIFECYCLE_INACTIVE", "FENCE_MISMATCH", "SCOPE_MISMATCH"]
+fields = ["STALE", "CONFLICTED", "REJECTED", "EPISTEMICALLY_UNKNOWN", "PROTECTED", "INFLUENCE_INELIGIBLE", "NEGATIVE_MEMORY", "PRECONDITION_FAILED{id}", "PRECONDITION_UNASSESSED{id}", "LIFECYCLE_INACTIVE", "FENCE_MISMATCH", "SCOPE_MISMATCH"]
 denominator_note = "No cue-hit variant exists: cue activation is advisory evidence, never an applicability rule."
 
 [[frozen_type]]
@@ -424,8 +562,8 @@ role = "Governor-owned bounded projection of admitted observations into one batc
 [[frozen_type]]
 crate = "eliot-memory-projection-provider"
 rust_path = "eliot_memory_projection_provider::ProjectionRequest"
-fields = ["binding", "projection_revision", "denominator_total", "observations"]
-denominator_note = "Single-read contract: denominator_total must equal the supplied observation count; intake is bounded by MAX_INTAKE_OBSERVATIONS."
+fields = ["binding", "projection_revision", "denominator_total", "observations", "continuity", "workflow_view", "workflow_continuity"]
+denominator_note = "Single-read contract: denominator_total must equal the supplied observation count PLUS the supplied continuity observation count. That is the owner's own rule, stated in its doc comment on the field and computed as observations.len() + continuity.len() at crates/governor/eliot-memory-projection-provider/src/lib.rs::ProjectionRequest::validate; the single-list wording recorded through r12 did not say so and is kept as the RECORDED value on [[disagreement]] DIS-PRJ-REQUEST-FIELD-LIST. Intake is bounded by MAX_INTAKE_OBSERVATIONS, and continuity intake separately by MAX_INTAKE_CONTINUITY_OBSERVATIONS. workflow_view and workflow_continuity travel with the read and are NOT added to denominator_total: the owner's field comment records workflow continuity as attestation about the same workflow position the view describes, accounted exactly like the view rather than counted as a separately observed item, and admission refuses a workflow_continuity that travels without an attested view."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-provider"
@@ -3630,6 +3768,127 @@ bound_or_variants = "every entry must be non-blank and control-character-free, c
 identity_binding = "the exact retired field names that did not survive the migration, so a loss is a recorded value and never a silent omission"
 validator = "crates/smart/eliot-memory-curation-contracts/src/legacy.rs::LegacyMigrationDescriptor::validate"
 validation_error = "ContractError::Blank"
+
+# ---------------------------------------------------------------------------
+# r14 FIELD CONTRACT BACKLOG. This table is ACCOUNTING, not contract. It exists
+# because the issue's W1 requires unresolved rows to stay VISIBLE and its A1
+# forbids an unexplained omission being presented as frozen, and because a count
+# nobody has to recheck is a claim rather than a measurement.
+#
+# EVERY [[frozen_type]] ROW IS FROZEN AT TYPE LEVEL. FROZEN AT TYPE LEVEL IS NOT
+# THE SAME CLAIM AS FROZEN AT FIELD LEVEL, and this table draws that line where
+# it is actually crossed: a [[frozen_type]] row carries a fields array and a
+# denominator_note read from the owner's declaration, and a [[field_contract]]
+# row plus its [[field_contract_field]] rows carry, per field, the owner type,
+# wire spelling, requiredness and None meaning, bound or closed variant set,
+# identity/scope/fence/revision binding, a resolving path.rs::symbol validator
+# anchor and a typed validation error. Of the [[frozen_type]] rows in this file,
+# 76 in total, 44 have a [[field_contract]] row with the SAME type_rust_path and
+# 32 do not. Those 32 are listed below, one row per owning crate.
+#
+# NOTHING HERE IS FROZEN, COMPLETE, ADOPTED OR COVERED. Every row below is an
+# admission that a field-level contract is MISSING and an owner for producing it.
+# No row is a claim that the family is done, and per [field_contract_rule]
+# validator_column a type listed here contributes ZERO to field-level coverage
+# because it has no field row with a resolving validator anchor. The
+# [[coverage_accounting]] rows keep their own denominators and their own
+# owner_is_complete values; nothing in this table changes them.
+# ---------------------------------------------------------------------------
+[[field_contract_backlog]]
+crate = "eliot-memory-projection-contracts"
+uncovered_row_count = 8
+total_recorded_fields = 21
+members = ["eliot_memory_projection_contracts::MemoryProjectionRecord", "eliot_memory_projection_contracts::MemoryScopeBinding", "eliot_memory_projection_contracts::MemoryProjectionBatch", "eliot_memory_projection_contracts::ProjectionCoverage", "eliot_memory_projection_contracts::DenominatorState", "eliot_memory_projection_contracts::ApplicableMemorySet", "eliot_memory_projection_contracts::ExclusionReason", "eliot_memory_projection_contracts enums"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. The 21 recorded field rows belong to the SELECTION sub-family alone (MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, SelectionEntry, SelectionCoverage, SelectionDisposition), so the whole bounded read set this crate exists to own -- record, binding, batch, coverage, denominator, applicable set, exclusion reason and the three closed vocabularies -- has no field row at all. ONE OF THE EIGHT MEMBERS IS A BUNDLE ROW, NOT A SINGLE TYPE: 'eliot_memory_projection_contracts enums' names three closed enums in one fields array (MemoryKind, MemoryRole, FreshnessState), so the eight members stand for TEN types, not eight. ExclusionReason is a closed enum whose twelve recorded wire names are type-level text, not per-variant rows with a wire spelling, requiredness and typed error. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit the bounded read set as [[field_contract]] rows measured field-for-field from the current declarations in crates/foundation/eliot-memory-projection-contracts, starting with MemoryProjectionRecord and MemoryProjectionBatch because their denominator and coverage rules are the ones a completeness reading depends on. The ONE summary repair revision 14 performed on THIS crate -- the ExclusionReason fields array -- is recorded at [[disagreement]] DIS-PRJ-EXCLUSION-REASON and does NOT close this gap: a corrected type-level array is not a field contract."
+owning_owner = "the integrator declared at crates/foundation/eliot-memory-projection-contracts/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/foundation/eliot-memory-projection-contracts/** and whose module.toml::agent_order is 44"
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-memory-projection-provider"
+uncovered_row_count = 2
+total_recorded_fields = 0
+members = ["eliot_memory_projection_provider::ProjectionRequest", "eliot_memory_projection_provider::AdmittedMemoryObservation"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. This crate contributes ZERO [[field_contract]] type rows and ZERO [[field_contract_field]] rows in total, so its recorded field count is zero and there is nothing to compare the two uncovered rows against. Both members are single types, not bundles. This is the sharpest gap in the table, because this crate owns the provider intake port and the bounded batch: a downstream implementer has the type-level field lists and the corrected denominator_note but no per-field requiredness, intake bound, identity binding, validator anchor or typed error for any of the twenty-six recorded field names across the two rows. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit the provider intake port as [[field_contract]] rows measured from crates/governor/eliot-memory-projection-provider/src/lib.rs, where validate() already enforces the binding shape, both intake bounds and the summed denominator, so a resolving validator anchor exists per field. [[disagreement]] DIS-PRJ-REQUEST-FIELD-LIST records the revision 14 repair to this type's summary array and denominator_note and states on that row that the repair does not constitute a field contract."
+owning_owner = "the integrator declared at crates/governor/eliot-memory-projection-provider/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/governor/eliot-memory-projection-provider/** and whose module.toml::agent_order is 46"
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-observation-contracts"
+uncovered_row_count = 13
+total_recorded_fields = 36
+members = ["eliot_observation_contracts::SystemObservationJournalRecord", "eliot_observation_contracts::CoverageEvidence", "eliot_observation_contracts::CoverageGap", "eliot_observation_contracts::CoverageDisposition", "eliot_observation_contracts::SourceRevisionHandle", "eliot_observation_contracts::ExperienceSourceFamily", "eliot_observation_contracts::ExperienceRecordRef", "eliot_observation_contracts::ProjectionOmissionClass", "eliot_observation_contracts::ProjectionOmission", "eliot_observation_contracts::ProjectionCoverage", "eliot_observation_contracts::JournalProjection", "eliot_observation_contracts::BankProjection", "eliot_observation_contracts::FeedbackProjection"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. The 36 recorded field rows belong to the FAILURE sub-family alone (FailureObservation, MemoryRevisionEvidence, FailureOmission, FailureOmissionClass), so the entire journal, bank and feedback projection surface plus the coverage vocabulary has no field row. This is the LARGEST measured omission in the table at thirteen rows, and it includes the omission axis and the coverage evidence of the projection itself: ProjectionOmission, ProjectionOmissionClass and ProjectionCoverage are exactly the types a completeness reading would consult, and all three are type-level only. CoverageDisposition is a closed seven-member enum recorded as variant names rather than as per-variant rows. All thirteen members are single types, not bundles. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit the projection and coverage surface as [[field_contract]] rows measured from crates/foundation/eliot-observation-contracts, and admit CoverageDisposition as a closed-variant row so its seven members each carry a wire spelling and a bound. This crate has no module.toml on this base commit, so the admitting owner is the freeze owner named above rather than a per-crate agent_task."
+owning_owner = "the cognitive-wave integrator named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner. This crate has NO module.toml on this base commit, so there is no per-crate agent_task, write_scope or agent_order to defer to and the freeze owner is the named owner; this is stated rather than papered over with an invented manifest field."
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-context-contracts"
+uncovered_row_count = 3
+total_recorded_fields = 37
+members = ["eliot_context_contracts::CanonicalProjectionSet", "eliot_context_contracts canonical projections", "eliot_context_contracts reactive/view types"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. The 37 recorded field rows belong to the binding, role, omission and view sub-family (ContextBinding, SemanticRole, ProviderRole, OmissionRecord, ActiveUnderstandingView), so the canonical projection set has no field row even though it is the aggregate those projections travel in. TWO OF THE THREE MEMBERS ARE BUNDLE ROWS, NOT SINGLE TYPES: 'eliot_context_contracts canonical projections' names four projection structs with their fields inline, and 'eliot_context_contracts reactive/view types' names NINE types by bare name with no field list at all, so the three members stand for FOURTEEN types, not three. CanonicalProjectionSet is the one single-type member. The existing [[coverage_accounting]] row for this family records the reactive-path types as a deliberate scope boundary rather than an oversight, which is a stated reason and not a field contract. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit CanonicalProjectionSet and the four canonical projection structs as [[field_contract]] rows measured from crates/smart/eliot-context-contracts, and decide the nine reactive/view types explicitly as either admitted rows or a [[not_frozen]] entry with a reason, rather than leaving them named in a summary array only."
+owning_owner = "the integrator declared at crates/smart/eliot-context-contracts/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/smart/eliot-context-contracts/** and whose module.toml::agent_order is 15"
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-learning-contracts"
+uncovered_row_count = 2
+total_recorded_fields = 12
+members = ["eliot_learning_contracts::HarnessActivationReceiptCandidate", "eliot_learning_contracts candidate types"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. The 12 recorded field rows belong to the binding and denominator sub-family (ContractBinding and SourceDenominator) only, so the whole candidate surface has no field row. ONE OF THE TWO MEMBERS IS A BUNDLE ROW, NOT A SINGLE TYPE: 'eliot_learning_contracts candidate types' names six candidate types by bare name with no field list, so the two members stand for SEVEN types, not two. HarnessActivationReceiptCandidate is the one single-type member, and it is the largest recorded summary array in this file at thirty-three fields, all of which are type-level only: [[disagreement]] DIS-LEA-ACTIVATION-SURFACE records both that repair and the fact that this family contributes ZERO coverage for it. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit the candidate families and the activation receipt as [[field_contract]] rows measured from crates/smart/eliot-learning-contracts. The receipt is the right first row because its member_denominator and receipt_completeness_and_missing_fields are the fields a completeness reading would consult, and no such row exists for it today."
+owning_owner = "the integrator declared at crates/smart/eliot-learning-contracts/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/smart/eliot-learning-contracts/** and whose module.toml::agent_order is 32"
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-epistemic-contracts"
+uncovered_row_count = 2
+total_recorded_fields = 13
+members = ["eliot_epistemic_contracts::CurrentEpistemicPosition", "eliot_epistemic_contracts enums"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. The 13 recorded field rows belong to ProviderContribution alone, which is a NESTED owner of CurrentEpistemicPosition rather than the position itself, so the family's central type has no field row of its own. ONE OF THE TWO MEMBERS IS A BUNDLE ROW, NOT A SINGLE TYPE: 'eliot_epistemic_contracts enums' names two closed enums (AdmittedKind, Currentness) with their members inline, so the two members stand for THREE types, not two. CurrentEpistemicPosition is the one single-type member, and its recorded six fields include a digest and a supersession fact, neither of which carries a requiredness, a bound, an identity binding or a typed error at field level. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit CurrentEpistemicPosition and its two closed vocabularies as [[field_contract]] rows measured from crates/smart/eliot-epistemic-contracts, so the position type a provider contributes into is frozen as a contract in its own right rather than only as a field of the contribution."
+owning_owner = "the integrator declared at crates/smart/eliot-epistemic-contracts/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/smart/eliot-epistemic-contracts/** and whose module.toml::agent_order is 6"
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-dreamer-contracts"
+uncovered_row_count = 1
+total_recorded_fields = 54
+members = ["eliot_dreamer_contracts::self_query::SelfQueryInput"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT. The 54 recorded field rows belong to the self-query SOURCE CLOSURE sub-family (NormativePairBinding, ArchitectureSourceSnapshot, ArchitectureAnchor, ArchitectureDependencyDenominator, AcceptedSourceRef, AcceptedSourceProjection, ArchitectureSourceStatus), and this member is the INPUT to that closure rather than a member of it: a request type with no field row while its own outputs do have one. The single member is a single type, not a bundle. Its thirteen recorded fields include the usage, preservation and invalidation_conditions facts that decide whether a self-query may run and what it may carry, and none of the thirteen carries a requiredness, a bound, an identity binding, a validator anchor or a typed error at field level. These types are frozen at type level by an earlier revision and were never given a field-level contract; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Admit SelfQueryInput as a [[field_contract]] row measured from crates/smart/eliot-dreamer-contracts, so the input and the source closure it produces are frozen symmetrically rather than the closure alone."
+owning_owner = "the integrator declared at crates/smart/eliot-dreamer-contracts/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/smart/eliot-dreamer-contracts/** and whose module.toml::agent_order is 3"
+admitted_in_revision = 14
+
+[[field_contract_backlog]]
+crate = "eliot-memory-curation-contracts"
+uncovered_row_count = 1
+total_recorded_fields = 76
+members = ["eliot_memory_curation_contracts enums"]
+why_not_field_frozen = "FROZEN AT TYPE LEVEL ONLY, AND NEVER GIVEN A FIELD-LEVEL CONTRACT AS A ROW OF ITS OWN. The single member is a BUNDLE ROW, NOT A SINGLE TYPE: it names five closed enums with their members inline (CurationDimension, DimensionOutcome, MemberDisposition, ResultState, ProtectionClass), so one uncovered row stands for five named enums. This is ALSO THE ONE PLACE IN THIS TABLE WHERE THE OMISSION IS A LINKAGE RATHER THAN A TOTAL ABSENCE, and saying so is the point of recording it: all five named enums ALREADY carry [[field_contract_field]] rows under the FC-CUR-VOCABULARIES bundle type row, so they are not un-fielded; what is missing is a [[field_contract]] type row whose type_rust_path equals this bundle rust_path, which is the same exempt shape [field_contract_rule].vocabulary_bundle_rule already declares for field rows and is why this count is larger than the number of genuinely un-fielded types. The summary row is therefore not evidence that the five enums lack a contract. These types are frozen at type level by an earlier revision and were never given a field-level contract row of their own; this row exists so the omission is counted and owned rather than silent. It does NOT claim they are field-frozen and does NOT claim this family is complete."
+next_action = "Decide the linkage explicitly rather than by counting: either add a [[field_contract]] type row for the curation vocabulary bundle whose type_rust_path matches this summary row, or record the row as exempt from the coverage join on the same terms [field_contract_rule].vocabulary_bundle_rule already grants field rows. Either way the decision is written down rather than left to a reader's guess at the join rule."
+owning_owner = "the integrator declared at crates/smart/eliot-memory-curation-contracts/module.toml::integration_owner, over the crate whose module.toml::write_scope is crates/smart/eliot-memory-curation-contracts/** and whose module.toml::agent_order is 19"
+admitted_in_revision = 14
+
+# ---------------------------------------------------------------------------
+# [field_contract_backlog_rule] governs the table above. It is stated in prose
+# because every claim the table makes is a NEGATIVE claim -- what the table does
+# NOT add, does NOT count and does NOT prove -- and a negative claim that is only
+# implied by a table's shape is not recheckable.
+# ---------------------------------------------------------------------------
+[field_contract_backlog_rule]
+admitted_in_revision = 14
+table_kind = "ACCOUNTING ONLY. The [[field_contract_backlog]] table counts and owns omissions; it is not a contract surface."
+adds_no_row = "It adds NO [[field_contract]] row, NO [[field_contract_field]] row, NO [[frozen_type]] row, NO [[completeness_rule]] row, NO [[coverage_accounting]] row, NO [[disagreement]] row, NO [[bound]] row, NO denominator and NO cell binding. A member listed in it is named, counted and owned, and that is all."
+changes_no_existing_value = "It changes NO count and NO value in any existing table. The [[frozen_type]] row count, the [[field_contract]] row count, the [[field_contract_field]] row count, the [[completeness_rule]] row count, the [[assignment_binding]] row count, the [[coverage_accounting]] row count, every per-family declared_member_denominator and measured_member_denominator, every members list and every owner_is_complete value are exactly what they were before this table was added. total_recorded_fields on a backlog row restates, beside the omission, the field_rows figure its crate's [[coverage_accounting]] row already states -- on SEVEN of the table's eight rows, because seven of those eight crates have a [[coverage_accounting]] row -- curation 76, the selection sub-family 21, observation-contracts failure 36, epistemic 13, dreamer 54, context 37 and learning 12, and is not a new denominator and does not supersede any coverage row. THE TWO [[coverage_accounting]] FAMILY ROWS THAT ARE NOT RESTATED ARE eliot-cue-contracts at 103 and eliot-observation-governor-classification at 64, and NEITHER CRATE HAS A [[field_contract_backlog]] ROW AT ALL, so no backlog row claims either figure: eliot-cue-contracts has no backlog row because EVERY one of its [[frozen_type]] rows already carries a [[field_contract]] row, and its 103 is a coverage fact rather than a backlog value. THE CROSS-CHECK IS THE SUM: the nine non-total [[coverage_accounting]] family rows are 103, 76, 21, 36, 13, 64, 54, 37 and 12, which sum to 416, the whole-file [[field_contract_field]] row count, so the figure on every family row is accounted for exactly once; the seven figures restated above sum to 249, and 249 plus the two non-backlog figures 103 and 64 is the same 416. eliot-memory-projection-provider has NO [[coverage_accounting]] row at all, so its total_recorded_fields of zero is its own measurement rather than a copy, and that absence is itself part of what this table records."
+adds_no_claim_of_completeness = "It asserts NO completeness. It does not claim any listed type is field-frozen, does not claim any family is complete, does not claim any gap is closed, and does not move a type from NOT_FROZEN or from type-level-frozen into field-level-frozen. Per [field_contract_rule].validator_column a type listed here is NOT counted as field-frozen, because it has no field row carrying a resolving path.rs::symbol validator anchor, and it contributes ZERO to field-level coverage."
+coverage_interaction = "Per [field_contract_rule].coverage_claim_rule a row that cannot state a declared member denominator, an omission axis and an unknown behaviour contributes zero to every count. This table states none of the three for any listed member and therefore contributes zero to every count, exactly as a [[not_frozen]] row does. It is bookkeeping about omissions, not a completeness claim, and it must never be read as raising the [[coverage_accounting]] SEVEN-FAMILY-TOTAL row, whose own recheck_note already refuses to treat a count as coverage."
+recomputation = "Every number in this table is recomputable from this file alone, with no external state. Parse the file with Python tomllib, build the set S of type_rust_path values carried by [[field_contract]] rows, then for each [[frozen_type]] row whose rust_path is NOT in S group by its crate: that grouping is the members list and its size is uncovered_row_count. To recompute total_recorded_fields, take each [[field_contract_field]] row's field_id prefix before the final dot, resolve it to the [[field_contract]] type_id it names, and count per that row's crate; every field row resolves to exactly one parent type_id, so the per-crate totals sum to the whole-file [[field_contract_field]] row count and no row is double-counted. Both joins were checked and agree: the rust_path join and the field_id-prefix join identify the SAME forty-four covered and the SAME thirty-two uncovered [[frozen_type]] rows."
+owning_gap = "The gap this table records is NOT CLOSED by this revision. Each row's next_action names what a later revision has to admit, and each row's owning_owner names who admits it. Nothing in this table is deferred silently: a gap with no owner would be an unexplained omission, which is the outcome A1 forbids."
 
 # --- completeness accounting ----------------------------------------------
 [[completeness_rule]]
@@ -7922,8 +8181,12 @@ validation_error = "LearningContractError::IncompleteCoverage"
 # r12 COVERAGE ACCOUNTING for the four families admitted at r12. Same row shape
 # as the r11 table above and the same rules: a declared member denominator, an
 # omission axis, an unknown behaviour, and a recheck procedure that a reader
-# can actually run. Two of these four rows are deliberately NOT complete, and
-# the reason is stated rather than smoothed over.
+# can actually run. THREE of these four rows are deliberately NOT complete --
+# eliot-dreamer-contracts-self-query-source, eliot-context-contracts-binding-
+# view-omission and eliot-learning-contracts-binding-denominator each carry
+# owner_is_complete = false -- and only eliot-observation-governor-
+# classification is complete; the reason is stated on each of the three rather
+# than smoothed over.
 # ===========================================================================
 
 [[coverage_accounting]]
@@ -8104,7 +8367,7 @@ note = "The r12 field contract rows for this type DO state all eleven current fi
 id = "DIS-LEA-ACTIVATION-SURFACE"
 crate = "eliot-learning-contracts"
 recorded_reference = "the [[frozen_type]] row for eliot_learning_contracts::HarnessActivationReceiptCandidate in this file, which RECORDED FIFTEEN fields: binding, activation_id, target, view_digest, delta_id, overlay_id, admission_receipt, activation_request_receipt, stages, member_denominator, metrics, attrition, confounders, independent_evaluator_receipt, canonical_digest. Revision 13 corrected that recorded array from the current struct declaration, so the value kept here is the RECORDED value rather than the current one, and a reader of an older verdict still sees exactly what this row was written against."
-actual_source_reference = "crates/smart/eliot-learning-contracts/src/activation.rs::HarnessActivationReceiptCandidate, which declares THIRTY-THREE fields: the same fifteen plus eighteen more."
+actual_source_reference = "crates/smart/eliot-learning-contracts/src/activation.rs::HarnessActivationReceiptCandidate, which declares THIRTY-THREE fields: the same fifteen plus eighteen more. THE THIRTY-TWO IS THE RECORDED VALUE AND IS KEPT HERE DELIBERATELY, BESIDE THE THIRTY-THREE RATHER THAN UNDERNEATH IT: through r12 this row's prose read that the struct declares THIRTY-TWO fields, while exact_fields_in_dispute on this same row already listed eighteen names, so fifteen recorded names plus eighteen is thirty-three. That THIRTY-TWO was therefore a MISCOUNT OF THE DECLARATION, not a different struct. Revision 13 measured the declaration itself rather than reasoning from the prose, found thirty-three, and corrected the count above to THIRTY-THREE; the fifteen recorded names in recorded_reference and the eighteen disputed names in exact_fields_in_dispute are both carried forward unchanged, so a reader of an r12-era verdict can see on this one row what was RECORDED as THIRTY-TWO, what is TRUE as THIRTY-THREE, and the eighteen-name arithmetic that separates them."
 exact_fields_in_dispute = ["compiled_view_ref", "context_compiler_revision", "render_profile_revision", "stable_harness_refs", "task_family_harness_refs", "skill_refs", "memory_refs", "procedure_refs", "preserved_success_ref", "eligibility_and_retrieval_reason", "retrieval", "delivery", "activation", "adherence", "conflicts_suppression_or_compaction_loss", "downstream_decision_action_artifact_and_verifier_refs", "receipt_completeness_and_missing_fields", "invalidation_expiry_and_missingness"]
 measured_fact = "Found by the same mechanical comparison and this is the second and larger of the two drifted lists. The recorded list is not merely stale by a field or two: it omits EIGHTEEN of thirty-three fields, including the four orthogonal section records retrieval, delivery, activation and adherence that the crate's own module invariant names as orthogonal, and including receipt_completeness_and_missing_fields and invalidation_expiry_and_missingness, which are precisely the two fields a completeness reading would look to. A reader relying on the recorded fifteen would conclude the receipt has no per-section breakdown and no missingness accounting, which is the opposite of what the code says."
 proposed_repair = "UPDATE THE RECORDED LIST to the current thirty-three fields, and treat this as a PRIORITY over DIS-CTX-VIEW-EXECUTION-POLICY because the gap is large enough to invert a reader's conclusion about the type rather than merely leave it incomplete. Still a FREEZE-SIDE documentation repair with no Rust change. It WAS performed in revision 13: the [[frozen_type]].fields array for this type now lists THIRTY-THREE fields, taken field-for-field from the current struct declaration. This row is retained, and its recorded value, measured value and repair are all kept, because the disagreement must stay visible as a recorded disagreement rather than being absorbed into a byte edit."
@@ -8113,6 +8376,65 @@ rust_change_needed = false
 why_no_rust_change = "The Rust struct is the intended shape; the recorded summary is what fell behind it."
 status = "CLOSED_R13_FIELD_LIST_REPAIRED_FROM_SOURCE"
 note = "This row is the concrete reason the issue's A6 condition -- known contract gaps have exact owners and prevent completion of those rows -- is satisfied rather than asserted: this is a real, measured, named gap with a named owner, and it is explicitly NOT counted as coverage anywhere in this file. The r12 field contract does NOT freeze this type; the learning family rows at r12 cover ContractBinding and SourceDenominator only, and [[coverage_accounting]] for that family records that the six candidate families and the activation module are NOT re-frozen there and contribute ZERO coverage to it, naming the activation module GENERICALLY rather than by type name. The recorded list WAS stale as measured, and revision 13 repaired it to the current declaration arity of thirty-three fields. This row is retained rather than deleted so that a reader of an older verdict still sees what was recorded, what the source declares, and why the gap was reported rather than absorbed."
+
+# ===========================================================================
+# r14 DISAGREEMENTS, SECOND REGISTER. The two rows below are the SAME KIND of
+# measured record-versus-source drift as the two rows above, found by a second
+# mechanical comparison of [[frozen_type]].fields lists and
+# [[frozen_type]].denominator_note prose against the current declarations. They
+# are placed here, after the repaired rows, rather than merged into them, so each
+# register states which revision found what. The r12 register above keeps its two
+# rows, but it does NOT keep them unchanged: as [revision_note_r13].changed
+# records and the paragraph above enumerates, revision 13 reworded FIVE values on
+# DIS-CTX-VIEW-EXECUTION-POLICY -- recorded_reference, measured_fact,
+# proposed_repair, why_no_rust_change and status -- and SIX on
+# DIS-LEA-ACTIVATION-SURFACE -- recorded_reference, actual_source_reference,
+# measured_fact, proposed_repair, status and note. What those two rows were kept
+# unchanged in is their RECORDED content, not their wording: each still carries
+# the r6 value it was written against, and the rewordings are the ones that make
+# that recorded value explicit rather than implied.
+#
+# BOTH REPAIRS WERE PERFORMED IN REVISION 14 AND NOT IN REVISION 13. Neither of
+# these two identifiers occurs in either published r13 byte set at all, at commit
+# d8d3f7066 or at commit 596afde5c, and both of them still record four fields and
+# eleven wire names there, so an R13 label on either row would be false of every
+# published r13 and both now carry status
+# CLOSED_R14_FIELD_LIST_REPAIRED_FROM_SOURCE. Both keep the recorded value on the
+# row rather than deleting it, for the reason the block below [revision_note_r14]
+# states: a byte edit alone would erase the record that the recorded list and the
+# current code ever disagreed. Each row's recorded_reference carries the RECORDED
+# array verbatim, its actual_source_reference carries the measured declaration
+# with the file it was read from, and its proposed_repair says the repair was
+# performed by this revision.
+# ===========================================================================
+
+[[disagreement]]
+id = "DIS-PRJ-REQUEST-FIELD-LIST"
+crate = "eliot-memory-projection-provider"
+recorded_reference = "the [[frozen_type]] row for eliot_memory_projection_provider::ProjectionRequest in this file, which RECORDED FOUR fields as carried unchanged from r6 through r12: binding, projection_revision, denominator_total, observations. The same row RECORDED a denominator_note reading 'Single-read contract: denominator_total must equal the supplied observation count; intake is bounded by MAX_INTAKE_OBSERVATIONS.' Revision 14 corrected both that recorded array and that recorded note from the current declaration, so the values kept here are the RECORDED ones rather than the current ones, and a reader of an older verdict still sees exactly what this row was written against."
+actual_source_reference = "crates/governor/eliot-memory-projection-provider/src/lib.rs::ProjectionRequest, whose struct declaration occupies lines 182 to 215 and declares SEVEN fields: the same four, plus continuity: Vec<ContinuityObservation> at line 198, workflow_view: Option<WorkflowStateView> at line 204 and workflow_continuity: Option<WorkflowContinuity> at line 214. The SAME file states the recorded denominator rule at lines 187 to 189 in the doc comment on denominator_total: it must equal the supplied observation count plus the supplied continuity observation count, single-read contract. The counted rule is enforced at crates/governor/eliot-memory-projection-provider/src/lib.rs::ProjectionRequest::validate, where line 239 computes observations.len() + continuity.len() and line 240 refuses any other total with ProjectionError::DenominatorContradiction."
+exact_fields_in_dispute = ["continuity", "workflow_view", "workflow_continuity", "denominator_total"]
+measured_fact = "Found by comparing every [[frozen_type]].fields array and every denominator_note against the current declaration, which identified this row and DIS-PRJ-EXCLUSION-REASON as no longer matching their owner. The recorded four-name list is not stale by a cosmetic margin: it omits THREE of seven fields, and two of the three are the reason the request exists as a single value. The crate's own doc comment on the struct says continuity evidence travels WITH the memory records it was captured beside so that gating one and dropping the other at the boundary is NOT EXPRESSIBLE; a reader relying on the recorded four would conclude the provider intake port carries no continuity material at all, and would then read the recorded denominator rule -- observation count only -- as complete, when the owner counts continuity as well. A reader relying on the recorded note would compute the wrong denominator and be refused with a typed DenominatorContradiction on every read that carries continuity, so the recorded note inverted the owner's actual rule rather than merely omitting detail."
+proposed_repair = "UPDATE THE RECORDED LIST and the recorded denominator_note to the current declaration, and only those two values: bring the array to seven fields in source order and state the owner's own single-read rule, which counts observations plus continuity and keeps the MAX_INTAKE_OBSERVATIONS intake bound. This is a FREEZE-SIDE documentation repair and needs no Rust change, because the code is already correct and already enforces both the counted denominator and the intake bound. It WAS performed in revision 14: the [[frozen_type]].fields array for this type now lists SEVEN fields taken field-for-field from the current declaration, and the denominator_note now states the owner's rule, names MAX_INTAKE_CONTINUITY_OBSERVATIONS beside MAX_INTAKE_OBSERVATIONS, and records that workflow_view and workflow_continuity are accounted like the view rather than added to the total. This row is retained, and its recorded value, measured value and repair are all kept, because a byte change to that row is exactly the kind of silent reconciliation W5 forbids."
+owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner over the freeze file itself, together with the integrator declared at crates/governor/eliot-memory-projection-provider/module.toml::integration_owner over the crate whose module.toml::write_scope is crates/governor/eliot-memory-projection-provider/** and whose module.toml::agent_order is 46; the provider side needs no other owner because nothing in crates/governor/eliot-memory-projection-provider is wrong"
+rust_change_needed = false
+why_no_rust_change = "The Rust struct and its validation are correct: the seven declared fields are the intended shape, and validate() already computes the summed denominator the doc comment describes. The defect was confined to this file's summary array and its recorded note, which were stale as recorded and have now been repaired in revision 14 from the current declaration."
+status = "CLOSED_R14_FIELD_LIST_REPAIRED_FROM_SOURCE"
+note = "THIS TYPE HAS NO FIELD CONTRACT, AND SAYING SO IS PART OF THE ROW. There is no [[field_contract]] row whose type_rust_path is eliot_memory_projection_provider::ProjectionRequest: the crate contributes zero [[field_contract]] type rows and zero [[field_contract_field]] rows in total, and it is listed as uncovered in [[field_contract_backlog]]. So a downstream implementer is NOT misled by this repair, and equally is NOT served by it: the repaired summary array and its corrected denominator_note are a type-level description, not a field-level contract, and they carry no per-field requiredness, bound, binding, validator anchor or typed error. Separately, the r8-era comment above [revision_note] describes an EARLIER state of this same rule in the past tense, when the producer required request.denominator_total == observations.len(); that comment is left byte-identical as the true record of what r8 measured, and the current rule is the one this row measures."
+
+[[disagreement]]
+id = "DIS-PRJ-EXCLUSION-REASON"
+crate = "eliot-memory-projection-contracts"
+recorded_reference = "the [[frozen_type]] row for eliot_memory_projection_contracts::ExclusionReason in this file, which RECORDED ELEVEN wire names as carried unchanged from r6 through r12: STALE, CONFLICTED, REJECTED, EPISTEMICALLY_UNKNOWN, PROTECTED, NEGATIVE_MEMORY, PRECONDITION_FAILED{id}, PRECONDITION_UNASSESSED{id}, LIFECYCLE_INACTIVE, FENCE_MISMATCH, SCOPE_MISMATCH. Revision 14 inserted the missing name into that recorded array from the current declaration, so the eleven-name value kept here is the RECORDED one rather than the current twelve-name array, and a reader of an older verdict still sees exactly what this row was written against."
+actual_source_reference = "crates/foundation/eliot-memory-projection-contracts/src/contracts/set.rs::ExclusionReason, whose enum declaration begins at line 58 and declares TWELVE variants, each carrying its own serde rename attribute under the enum-level tag attribute at line 57: STALE, CONFLICTED, REJECTED, EPISTEMICALLY_UNKNOWN, PROTECTED, INFLUENCE_INELIGIBLE, NEGATIVE_MEMORY, PRECONDITION_FAILED, PRECONDITION_UNASSESSED, LIFECYCLE_INACTIVE, FENCE_MISMATCH and SCOPE_MISMATCH. THE ELEVEN RECORDED NAMES ARE ELEVEN OF THOSE TWELVE RENAMES IN THE SAME RELATIVE ORDER, so exactly one wire name was missing: INFLUENCE_INELIGIBLE, whose Rust variant is InfluenceIneligible at line 83 and which sits BETWEEN PROTECTED at line 73 and NEGATIVE_MEMORY at line 86 in the declaration. Revision 14 inserted it at that source position rather than appending it, so the array order matches the declaration order field for field. THE BRACES IN THE TWO RECORDED PRECONDITION ENTRIES ARE RECORDED PROSE, NOT PART OF A SERDE RENAME, AND REVISION 14 KEPT THEM AS RECORDED: the owner writes the rename PRECONDITION_FAILED on the struct variant PreconditionFailed { id: String } at lines 88 to 92 and the rename PRECONDITION_UNASSESSED on PreconditionUnassessed { id: String } at lines 94 to 98, so the wire tag is exactly PRECONDITION_FAILED and exactly PRECONDITION_UNASSESSED and the {id} names the single struct-variant field each variant carries. The recorded spelling was therefore NOT wrong as a name and was not silently rewritten; the distinction between the wire tag and the payload field is recorded here instead."
+exact_fields_in_dispute = ["INFLUENCE_INELIGIBLE"]
+measured_fact = "Found by the same comparison that produced DIS-PRJ-REQUEST-FIELD-LIST, and this is the smaller of the two gaps. The recorded eleven omitted exactly one of twelve renames, but the one omitted is a first-class owner decision rather than a rare spelling: the enum's own doc comment at lines 46 to 55 of the same file states that InfluenceIneligible is the owner's own prohibition read from the record's influence_eligible flag, that it is a first-class reason, and that it is NEVER a spelling of Protected, Rejected or LifecycleInactive because those three name a different owner fact. The record field it reports on is real and is declared at crates/governor/eliot-memory-projection-provider/src/lib.rs::AdmittedMemoryObservation as influence_eligible: bool. A reader relying on the recorded eleven would conclude the closed reason set has no member for a record the projecting owner marked ineligible for downstream influence at all, and would therefore have to report such a record under one of the three neighbouring reasons or under none at all. That is the exact inversion the owner forbids, and the recorded denominator_note on this very row already asserts the neighbouring half of the same rule, namely that there is deliberately no cue-hit variant: so the file stated the cue-hit prohibition while omitting the influence prohibition the same owner added."
+proposed_repair = "UPDATE THE RECORDED LIST by inserting INFLUENCE_INELIGIBLE between PROTECTED and NEGATIVE_MEMORY, so the array carries TWELVE names in source order, and leave the two PRECONDITION entries exactly as recorded because their spelling is accurate as a name-and-payload notation. This is a FREEZE-SIDE documentation repair and needs no Rust change, because the twelve renames are the intended wire surface and the doc comment already forbids the substitutions a reader of eleven names would have made. It WAS performed in revision 14: the [[frozen_type]].fields array for this type now lists TWELVE wire names in declaration order, and the recorded brace notation is unchanged. This row is retained, and its recorded value, measured value and repair are all kept, because the disagreement must stay visible as a recorded disagreement rather than being absorbed into a byte edit."
+owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner over the freeze file itself, together with the integrator declared at crates/foundation/eliot-memory-projection-contracts/module.toml::integration_owner over the crate whose module.toml::write_scope is crates/foundation/eliot-memory-projection-contracts/** and whose module.toml::agent_order is 44; the contracts crate needs no other owner because nothing in crates/foundation/eliot-memory-projection-contracts is wrong"
+rust_change_needed = false
+why_no_rust_change = "The enum, its twelve serde renames and its doc comment are correct and were changed together with the documentation elsewhere; the defect was confined to this file's summary array, which WAS stale as recorded and has now been repaired in revision 14 from the current declaration."
+status = "CLOSED_R14_FIELD_LIST_REPAIRED_FROM_SOURCE"
+note = "This row is recorded rather than deleted for the same reason as the two rows above, and its status follows the same owner-performed-repair precedent rather than any new vocabulary value. AS WITH THE PROVIDER ROW, THIS TYPE HAS NO FIELD CONTRACT: no [[field_contract]] row carries type_rust_path eliot_memory_projection_contracts::ExclusionReason, because the field contract for this crate covers the SELECTION sub-family only -- MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, SelectionEntry, SelectionCoverage and SelectionDisposition, twenty-one field rows -- and [[coverage_accounting]] for that family already records its own scope boundary. ExclusionReason is listed as uncovered in [[field_contract_backlog]], so the repaired array is a type-level description and contributes zero to field-level coverage. A downstream implementer therefore learns from this row that the closed reason set has twelve members, and learns from [[field_contract_backlog]] that the per-member wire spelling, requiredness and typed error are still not frozen, which is a real residual gap with a named owner and is NOT claimed complete here."
 
 # ===========================================================================
 # r12 ASSIGNMENT BINDINGS (W4). One per r12 family, stating the concrete input

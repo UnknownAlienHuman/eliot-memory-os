@@ -1,7 +1,28 @@
 use crate::{MemoryRevision, ProjectId};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub const PROJECT_UNDERSTANDING_SCHEMA_VERSION: &str = "project-understanding-v1";
+
+/// A schema-bearing project-understanding record declares a `schema_version`
+/// that is not the one supported version.
+///
+/// `PROJECT_UNDERSTANDING_SCHEMA_VERSION` is the complete accepted set: there is
+/// no legacy project-understanding version, no alias, and no named migration, so
+/// any other value — including an empty string — is refused rather than trusted
+/// as current authority.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error(
+    "{record} declares unsupported project-understanding schema_version `{found}`; supported version is `{supported}`"
+)]
+pub struct ProjectUnderstandingSchemaVersionError {
+    /// The project-understanding record that carried the unsupported version.
+    pub record: &'static str,
+    /// The offending value as it appeared in the record.
+    pub found: String,
+    /// The single supported version.
+    pub supported: &'static str,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,4 +152,26 @@ pub struct ProjectUnderstandingModel {
     pub expected_observable: String,
     pub verifier_ref: String,
     pub stop_condition: String,
+}
+
+impl ProjectUnderstandingModel {
+    /// Refuses a model whose own `schema_version` is not the single supported
+    /// constant.
+    ///
+    /// This is the record's only admission check: a deserialized model may carry
+    /// any `String`, so an unsupported or misselected version is indistinguishable
+    /// from a current one until the owner refuses it here. The comparison is an
+    /// exact match, so a prefix, a legacy value, or an empty string is refused
+    /// rather than upgraded.
+    pub fn validate_schema_version(&self) -> Result<(), ProjectUnderstandingSchemaVersionError> {
+        if self.schema_version == PROJECT_UNDERSTANDING_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(ProjectUnderstandingSchemaVersionError {
+                record: "ProjectUnderstandingModel",
+                found: self.schema_version.clone(),
+                supported: PROJECT_UNDERSTANDING_SCHEMA_VERSION,
+            })
+        }
+    }
 }

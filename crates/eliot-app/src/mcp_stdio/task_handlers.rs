@@ -1203,6 +1203,22 @@ fn active_packet_latest_path(state: &McpState, task_id: &str) -> PathBuf {
         .join("latest.json")
 }
 
+/// Schema-version admission gate for a decoded packet's project understanding
+/// (issue #935).
+///
+/// `ContextPacketL3.project_understanding` is the model a consumer reads as the
+/// current understanding and its verifier/stop proof. A decoded model whose
+/// `schema_version` is not the one supported version is refused here, at the
+/// decode boundary, before any packet field is inspected. A packet without a
+/// model is unchanged: the `None` path validates nothing and stays
+/// byte-identical.
+fn validate_packet_project_understanding_schema_version(packet: &ContextPacketL3) -> Result<()> {
+    if let Some(model) = packet.project_understanding.as_ref() {
+        model.validate_schema_version()?;
+    }
+    Ok(())
+}
+
 fn read_active_packet_authority(
     state: &McpState,
     task_id: &str,
@@ -1234,6 +1250,10 @@ fn read_active_packet_authority(
                 path.display()
             )
         })?;
+    // Schema-version admission gate (issue #935): both decoded packets are
+    // refused before any packet field is compared or handed back as current.
+    validate_packet_project_understanding_schema_version(&response_packet)?;
+    validate_packet_project_understanding_schema_version(&authority.packet)?;
     anyhow::ensure!(
         canonical_struct_hash(&response_packet)? == canonical_struct_hash(&authority.packet)?,
         "active packet authority packet/response mismatch at {}",
@@ -1472,6 +1492,10 @@ fn validate_packet_post_commit_intent(intent: &PacketPostCommitIntent) -> Result
     );
     let packet: ContextPacketL3 = serde_json::from_value(intent.response.clone())
         .context("packet post-commit response does not contain a ContextPacketL3")?;
+    // Schema-version admission gate (issue #935): refuse a decoded packet whose
+    // project understanding declares an unsupported version, before its
+    // material binding or operation identity is trusted.
+    validate_packet_project_understanding_schema_version(&packet)?;
     anyhow::ensure!(
         packet.project_id == intent.material.project_id
             && packet.task_id == intent.material.task_id
@@ -3038,6 +3062,10 @@ fn task_packet_key(task_id: &str) -> String {
 
 fn latest_task_packet(state: &McpState, task_id: TaskId) -> Result<Option<ContextPacketL3>> {
     if let Some(authority) = read_active_packet_authority(state, &task_id.to_string())? {
+        // Schema-version admission gate (issue #935): refuse an unsupported
+        // project-understanding version before the packet is handed back as
+        // the task's current understanding.
+        validate_packet_project_understanding_schema_version(&authority.packet)?;
         return Ok((authority.packet.task_id == task_id.to_string()).then_some(authority.packet));
     }
     let task_path = active_packet_latest_path(state, &task_id.to_string());
@@ -3045,6 +3073,10 @@ fn latest_task_packet(state: &McpState, task_id: TaskId) -> Result<Option<Contex
         return Ok(None);
     }
     let packet: ContextPacketL3 = serde_json::from_reader(std::fs::File::open(task_path)?)?;
+    // Schema-version admission gate (issue #935): same admission for the
+    // legacy latest-packet read. The absent-file `None` path above is
+    // unchanged.
+    validate_packet_project_understanding_schema_version(&packet)?;
     Ok((packet.task_id == task_id.to_string()).then_some(packet))
 }
 
