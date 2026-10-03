@@ -26,32 +26,29 @@ use super::super::{
     PlatformHandle, valid_sha256_text,
 };
 use super::read_bounded_runtime_restart_file;
+use crate::journal_append::{
+    HostJournalDisposition, HostJournalObservation, observe_host_journal_boundary,
+};
 
-// F-LOG-HOST-6 (#981) pending-codec observation helpers.
+// F-LOG-HOST-6 (#981) pending-codec observation helper.
 //
-// Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// The per-file seam of the family's shared closed vocabulary: it names the
+// pending codec boundary set and delegates to the one shared emitter.
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never file bytes,
-// digests, or arbitrary error text — so bounding limits size, not
-// sensitivity (I15.4). Corrupt records keep their exact typed failure with
-// no payload bytes in the record. Pure construction
+// Observation-only contract: every record travels with the exact identity the
+// codec already holds — the pending record's own request identity, mutation
+// digest, request digest, and durable Host epoch and lineage — never its bytes
+// and never error text, so bounding limits size, not sensitivity (I15.4). A
+// corrupt record keeps its exact typed failure with no payload bytes in the
+// record, and an absent record is observed as the exact incomplete fact it is
+// while the return value stays `Ok(None)`. Pure construction
 // (`runtime_restart_pending_identity`, `runtime_restart_pending_payload`)
-// is an explicit non-boundary and never logs. These primitives own no
-// terminal: a single terminal per failed restart operation is enforced by
-// the outermost owner boundary, while these phases correlate by stage order
-// only. Sink outcome never alters result/order/cleanup.
+// remains an explicit non-boundary and never logs. These primitives own no
+// terminal, and the live Event Log disposition is observed through the facade's
+// canonical bounded helper rather than a discarded probe.
 #[cfg(windows)]
-fn host_restart_pending_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
-    crate::host_diagnostics::observe_entrypoint_with_detail(
-        crate::host_diagnostics::EntrypointStage::Startup,
-        detail,
-    );
+fn host_restart_pending_observe(observation: &HostJournalObservation) {
+    observe_host_journal_boundary(observation);
 }
 
 #[cfg(windows)]
@@ -106,7 +103,10 @@ pub(super) fn runtime_restart_pending_identity(
 #[cfg(windows)]
 fn runtime_restart_created_at(now: SystemTime) -> Result<String, HostError> {
     let millis = now.duration_since(UNIX_EPOCH).map_err(|error| {
-        host_restart_pending_observe("host.restart clock before epoch observed");
+        host_restart_pending_observe(&HostJournalObservation::new(
+            "host.restart clock before epoch observed",
+            HostJournalDisposition::EvidenceUnusable,
+        ));
         HostError::RecoveryRequired(format!(
             "runtime restart pending clock precedes Unix epoch: {error}"
         ))
@@ -137,7 +137,13 @@ fn runtime_restart_pending_identity_from_bytes(
     expected_mutation_digest: &str,
 ) -> Result<RuntimeRestartPendingIdentity, HostError> {
     let record = serde_json::from_slice::<RuntimeRestartPendingRecord>(bytes).map_err(|e| {
-        host_restart_pending_observe("host.restart pending malformed observed");
+        host_restart_pending_observe(
+            &HostJournalObservation::new(
+                "host.restart pending malformed observed",
+                HostJournalDisposition::EvidenceUnusable,
+            )
+            .with_recovery_binding(expected_mutation_digest),
+        );
         HostError::RecoveryRequired(format!("runtime restart pending record is malformed: {e}"))
     })?;
     let identity = RuntimeRestartPendingIdentity {
@@ -162,7 +168,17 @@ fn runtime_restart_pending_identity_from_bytes(
         || record.created_at.chars().any(char::is_control)
         || identity.mutation_digest != expected_mutation_digest
     {
-        host_restart_pending_observe("host.restart pending identity malformed observed");
+        host_restart_pending_observe(
+            &HostJournalObservation::new(
+                "host.restart pending identity malformed observed",
+                HostJournalDisposition::EvidenceUnusable,
+            )
+            .with_operation(identity.request_id.as_str())
+            .with_mutation(identity.mutation_digest.as_str())
+            .with_request_digest(identity.request_digest.as_str())
+            .with_host_epoch(identity.host_epoch)
+            .with_host_lineage(identity.host_lineage.as_str()),
+        );
         return Err(HostError::RecoveryRequired(
             "runtime restart pending record identity is malformed".to_owned(),
         ));
@@ -189,7 +205,16 @@ fn runtime_restart_pending_identity_from_bytes(
         ))
     })?;
     if expected_request.request_digest.as_str() != identity.request_digest {
-        host_restart_pending_observe("host.restart pending digest mismatch observed");
+        host_restart_pending_observe(
+            &HostJournalObservation::new(
+                "host.restart pending digest mismatch observed",
+                HostJournalDisposition::EvidenceMismatched,
+            )
+            .with_operation(identity.request_id.as_str())
+            .with_mutation(identity.mutation_digest.as_str())
+            .with_request_digest(identity.request_digest.as_str())
+            .with_recovery_binding(expected_mutation_digest),
+        );
         return Err(HostError::RecoveryRequired(
             "runtime restart pending request_digest does not match its operation and mutation"
                 .to_owned(),
@@ -203,18 +228,45 @@ pub(super) fn read_runtime_restart_pending_identity(
     path: &Path,
 ) -> Result<Option<RuntimeRestartPendingIdentity>, HostError> {
     const MAX_PENDING_BYTES: u64 = 16 * 1024;
+    // This record's own durable file name carries the requested mutation, so
+    // its absence below is observed against that exact identity. Reading a
+    // path name is not reading the record and recomputing no digest.
+    let requested_mutation = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".pending.json"))
+        .filter(|digest| valid_sha256_text(digest));
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // An absent pending record is the exact incomplete fact the restart
+            // owner needs: observed here, and still returned as `Ok(None)`.
+            let absent = HostJournalObservation::new(
+                "host.restart pending absent observed",
+                HostJournalDisposition::EvidenceAbsent,
+            );
+            let absent = match requested_mutation {
+                Some(mutation) => absent.with_mutation(mutation),
+                None => absent,
+            };
+            host_restart_pending_observe(&absent);
+            return Ok(None);
+        }
         Err(error) => {
-            host_restart_pending_observe("host.restart pending inspect failed observed");
+            host_restart_pending_observe(&HostJournalObservation::new(
+                "host.restart pending inspect failed observed",
+                HostJournalDisposition::EvidenceUnreadable,
+            ));
             return Err(HostError::RecoveryRequired(format!(
                 "runtime restart pending record cannot be inspected: {error}"
             )));
         }
     };
     if !metadata.is_file() || metadata.len() > MAX_PENDING_BYTES {
-        host_restart_pending_observe("host.restart pending too large observed");
+        host_restart_pending_observe(&HostJournalObservation::new(
+            "host.restart pending too large observed",
+            HostJournalDisposition::EvidenceUnusable,
+        ));
         return Err(HostError::RecoveryRequired(
             "runtime restart pending record is malformed or too large".to_owned(),
         ));
@@ -224,20 +276,27 @@ pub(super) fn read_runtime_restart_pending_identity(
         MAX_PENDING_BYTES,
         "runtime restart pending record",
     )?;
-    let expected_mutation_digest = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".pending.json"))
-        .filter(|digest| valid_sha256_text(digest))
-        .ok_or_else(|| {
-            host_restart_pending_observe("host.restart pending path unbound observed");
-            HostError::RecoveryRequired(
-                "runtime restart pending path is not bound to a lowercase sha256 mutation"
-                    .to_owned(),
-            )
-        })?;
+    let expected_mutation_digest = requested_mutation.ok_or_else(|| {
+        host_restart_pending_observe(&HostJournalObservation::new(
+            "host.restart pending path unbound observed",
+            HostJournalDisposition::EvidenceUnusable,
+        ));
+        HostError::RecoveryRequired(
+            "runtime restart pending path is not bound to a lowercase sha256 mutation".to_owned(),
+        )
+    })?;
     let identity = runtime_restart_pending_identity_from_bytes(&bytes, expected_mutation_digest)?;
-    host_restart_pending_observe("host.restart pending read observed");
+    host_restart_pending_observe(
+        &HostJournalObservation::new(
+            "host.restart pending read observed",
+            HostJournalDisposition::EvidenceValidated,
+        )
+        .with_operation(identity.request_id.as_str())
+        .with_mutation(identity.mutation_digest.as_str())
+        .with_request_digest(identity.request_digest.as_str())
+        .with_host_epoch(identity.host_epoch)
+        .with_host_lineage(identity.host_lineage.as_str()),
+    );
     Ok(Some(identity))
 }
 
