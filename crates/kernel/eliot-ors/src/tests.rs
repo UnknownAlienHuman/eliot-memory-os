@@ -1948,6 +1948,7 @@ fn process_start_receipt(
     }))?)
 }
 
+// WORK_UNIT_CASE: 844/16
 #[test]
 fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> TestResult {
     let path = database_path("process-evidence-history");
@@ -2056,6 +2057,7 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     Ok(())
 }
 
+// WORK_UNIT_CASE: 844/20
 #[test]
 fn process_evidence_readback_rejects_noncanonical_raw_key_suffix() -> TestResult {
     let path = database_path("process-evidence-canonical-key");
@@ -2074,6 +2076,7 @@ fn process_evidence_readback_rejects_noncanonical_raw_key_suffix() -> TestResult
     Ok(())
 }
 
+// WORK_UNIT_CASE: 844/21
 #[test]
 fn process_evidence_raw_wire_handles_colon_percent_siblings_mixed_rows_and_endpoint() -> TestResult
 {
@@ -2125,6 +2128,619 @@ fn process_evidence_raw_wire_handles_colon_percent_siblings_mixed_rows_and_endpo
         Err(OrsError::IntegrityProblem { .. })
     ));
     cleanup(&endpoint_path);
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/1
+#[test]
+fn process_evidence_historical_fixture_without_version_fails_decoder() -> TestResult {
+    // Historical pre-v2 shape: no schema_version with legacy stream
+    // references. The wire decoder must fail closed on the missing version
+    // instead of guessing a default or falling back to a legacy trial.
+    let mut wire = serde_json::to_value(&process_evidence("case-01-operation", "running")?)?;
+    let object = wire.as_object_mut().ok_or("expected object")?;
+    object.remove("schema_version");
+    object.insert("stdout_ref".to_owned(), json!("legacy-stdout"));
+    object.insert("stderr_ref".to_owned(), json!("legacy-stderr"));
+    let error = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)
+        .err()
+        .ok_or("historical pre-v2 fixture must be refused by the decoder")?;
+    assert!(
+        error.to_string().contains("explicit schema version"),
+        "historical fixture must fail on the missing version, got: {error}"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/2
+#[test]
+fn process_evidence_fixture_names_canonical_current_version() -> TestResult {
+    // The fixture must name the canonical owner constant, never a second
+    // current-version literal, and the legacy boundary must stay distinct.
+    // No literal spelling of the current revision appears here or anywhere in
+    // this module: a bump of the owner constant moves the fixture with it and
+    // this case keeps proving the binding rather than pinning a stale string.
+    assert_ne!(
+        eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION,
+        eliot_process::PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION
+    );
+    // The absence of any spelled-out current revision is asserted by the
+    // acceptance wrapper's check_fixture_names_canonical_constant, which parses
+    // this fixture item; this case proves the binding through the real decoder.
+    //
+    // The decoded value is compared, not the raw JSON the fixture itself wrote:
+    // comparing the fixture's own wire against the constant it was built from
+    // would only prove that a value equals itself. Going through the decoder
+    // binds the encoder/decoder path that carries the owner's canonical revision
+    // (execution_evidence.rs:174 `new_typed` stamps it, :241-243 exposes it).
+    // It does NOT by itself pin the stamping of a NON-current wire - for an
+    // input that already carries the current revision, "stamp from the constant"
+    // and "preserve the wire value" are indistinguishable. Case 9 is the case
+    // that pins that, because its wire carries the legacy revision.
+    let wire = serde_json::to_value(&process_evidence("case-02-operation", "running")?)?;
+    let decoded: eliot_process::ProcessEvidence = serde_json::from_value(wire)?;
+    assert_eq!(
+        decoded.schema_version(),
+        eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/3
+#[test]
+fn process_evidence_fixture_carries_explicit_current_schema() -> TestResult {
+    let evidence = process_evidence("case-03-operation", "running")?;
+    assert_eq!(
+        evidence.schema_version(),
+        eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
+    );
+    // The explicit current schema survives a full wire round-trip: the encoder
+    // writes it and the decoder reads back the same revision. A type-only check
+    // ("is_string") would stay green if the decoder stopped carrying the
+    // revision at all.
+    let wire = serde_json::to_value(&evidence)?;
+    assert_eq!(
+        wire["schema_version"],
+        json!(eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION)
+    );
+    let decoded: eliot_process::ProcessEvidence = serde_json::from_value(wire)?;
+    assert_eq!(decoded, evidence);
+    assert_eq!(
+        decoded.schema_version(),
+        eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/4
+#[test]
+fn process_evidence_typed_constructor_rebuilds_fixture_view() -> TestResult {
+    // The current path is the typed constructor: rebuild the fixture from
+    // its own view and observation-only axes with typed streams.
+    let evidence = process_evidence("case-04-operation", "running")?;
+    let rebuilt = eliot_process::ProcessEvidence::new_typed(
+        evidence.view().clone(),
+        None,
+        None,
+        evidence.axes(),
+    )?;
+    assert_eq!(rebuilt, evidence);
+
+    // The same current constructor with an independently typed stdout stream:
+    // the v2 contract carries typed streams, so the typed path is exercised for
+    // real and the decoder must read the stream back, never a legacy reference.
+    let bytes = b"typed stdout bytes";
+    let digest = sha256_hex(bytes);
+    let stdout = eliot_process::ProcessStreamEvidence::new_raw(
+        evidence.binding().clone(),
+        eliot_process::ProcessStreamKind::Stdout,
+        eliot_process::ProcessStreamPolicyBinding::new(
+            "policy:1",
+            "privacy:project",
+            "visibility:owner",
+            "retention:task",
+            "redaction:exact-v1",
+        )?,
+        eliot_process::StreamTransportStatus::Complete,
+        eliot_process::StreamPersistenceStatus::CompleteSource,
+        digest.clone(),
+        bytes.len() as u64,
+        eliot_process::ProcessStreamPrefixPreview::from_transport_prefix(
+            bytes.to_vec(),
+            bytes.len() as u64,
+        )?,
+        Some(eliot_process::DurableProcessStreamSource::exact_transport(
+            eliot_process::DurableStreamLocatorKind::Blob,
+            format!("eliot://blob/{digest}"),
+            format!("receipt:blob-ready:{digest}"),
+            digest.clone(),
+            bytes.len() as u64,
+        )?),
+        Vec::new(),
+    )?;
+    let typed = eliot_process::ProcessEvidence::new_typed(
+        evidence.view().clone(),
+        Some(stdout.clone()),
+        None,
+        evidence.axes(),
+    )?;
+    assert_eq!(
+        typed.schema_version(),
+        eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
+    );
+    assert_eq!(typed.stdout(), Some(&stdout));
+    assert_eq!(typed.stderr(), None);
+    let wire = serde_json::to_value(&typed)?;
+    assert!(wire.get("stdout_ref").is_none());
+    assert!(wire.get("stderr_ref").is_none());
+    let decoded: eliot_process::ProcessEvidence = serde_json::from_value(wire)?;
+    assert_eq!(decoded, typed);
+    let decoded_stdout = decoded.stdout().ok_or("missing decoded stdout")?;
+    assert_eq!(decoded_stdout.observed_sha256(), digest);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/5
+#[test]
+fn process_evidence_current_wire_has_no_legacy_keys() -> TestResult {
+    let evidence = process_evidence("case-05-operation", "running")?;
+    let wire = serde_json::to_value(&evidence)?;
+    assert!(wire.get("stdout_ref").is_none());
+    assert!(wire.get("stderr_ref").is_none());
+    assert!(evidence.stdout_ref().is_none());
+    assert!(evidence.stderr_ref().is_none());
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/6
+#[test]
+fn process_evidence_missing_schema_version_rejected() -> TestResult {
+    let mut wire = serde_json::to_value(&process_evidence("case-06-operation", "running")?)?;
+    wire.as_object_mut()
+        .ok_or("expected object")?
+        .remove("schema_version");
+    let error = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)
+        .err()
+        .ok_or("a wire without a schema version must be refused by the decoder")?;
+    assert!(
+        error.to_string().contains("explicit schema version"),
+        "missing version must be rejected, got: {error}"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/7
+#[test]
+fn process_evidence_null_schema_version_rejected() -> TestResult {
+    let mut wire = serde_json::to_value(&process_evidence("case-07-operation", "running")?)?;
+    wire["schema_version"] = Value::Null;
+    let error = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)
+        .err()
+        .ok_or("a null schema version must be refused by the decoder")?;
+    assert!(
+        error.to_string().contains("cannot be null"),
+        "null version must be rejected, got: {error}"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/8
+#[test]
+fn process_evidence_unknown_schema_version_rejected() -> TestResult {
+    let mut wire = serde_json::to_value(&process_evidence("case-08-operation", "running")?)?;
+    wire["schema_version"] = json!("eliot-process-evidence-v99");
+    let error = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)
+        .err()
+        .ok_or("an unknown schema version must be refused by the decoder")?;
+    assert!(
+        error
+            .to_string()
+            .contains(eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION),
+        "unknown version must name the accepted revision, got: {error}"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/9
+#[test]
+fn process_evidence_explicit_legacy_version_uses_legacy_path() -> TestResult {
+    // The explicit legacy version enters only its legacy path: a quarantined
+    // legacy reference decodes, normalizes to the current revision, and never
+    // re-encodes legacy keys.
+    let mut wire = serde_json::to_value(&process_evidence("case-09-operation", "running")?)?;
+    let object = wire.as_object_mut().ok_or("expected object")?;
+    object.insert(
+        "schema_version".to_owned(),
+        json!(eliot_process::PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION),
+    );
+    object.insert(
+        "stdout_ref".to_owned(),
+        json!(format!(
+            "raw:p04-stream:sha256:{}:bytes:7:complete:true",
+            "a".repeat(64)
+        )),
+    );
+    let evidence = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)?;
+    assert!(evidence.stdout_ref().is_some());
+    assert!(evidence.stderr_ref().is_none());
+    // The legacy branch is the only branch that ran, and it quarantines the
+    // reference as an unresolved source instead of reading it back as complete
+    // evidence.
+    let stdout = evidence
+        .stdout()
+        .ok_or("the legacy reference did not enter its legacy stream")?;
+    assert_eq!(stdout.stream(), eliot_process::ProcessStreamKind::Stdout);
+    assert_eq!(
+        stdout.persistence(),
+        eliot_process::StreamPersistenceStatus::SourceUnavailable
+    );
+    assert_eq!(
+        stdout.transport(),
+        eliot_process::StreamTransportStatus::UnknownOutcome
+    );
+    assert_eq!(stdout.source(), None);
+    assert_eq!(stdout.observed_bytes(), 0);
+    assert_eq!(
+        evidence.schema_version(),
+        eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
+    );
+    let reencoded = serde_json::to_value(&evidence)?;
+    assert!(reencoded.get("stdout_ref").is_none());
+    assert!(reencoded.get("stderr_ref").is_none());
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/10
+#[test]
+fn process_evidence_mixed_current_and_legacy_rejected() -> TestResult {
+    let mut wire = serde_json::to_value(&process_evidence("case-10-operation", "running")?)?;
+    wire["stdout_ref"] = json!("legacy-stdout");
+    let error = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)
+        .err()
+        .ok_or("mixed current/legacy fields must be refused by the decoder")?;
+    assert!(
+        error
+            .to_string()
+            .contains("cannot contain legacy stream references"),
+        "mixed current/legacy fields must be rejected, got: {error}"
+    );
+    // The mirror direction, which the current-version arm cannot see: a wire that
+    // declares the LEGACY revision while ALSO carrying a legacy reference AND a
+    // fully valid typed stdout.
+    //
+    // Both terms matter. `has_legacy_value` is true only because `stdout_ref` is
+    // present, so `!has_legacy_value(...)` at execution_evidence.rs:290 does not
+    // refuse on its own; `has_typed` is true only because the typed stream is
+    // present. `has_typed ||` is therefore the only term that refuses this wire,
+    // and removing it lets the legacy arm decode it and silently drop the typed
+    // stream. With the direction above alone, that half of the guard is invisible.
+    //
+    // The typed stream is built by the same real constructor as case 4, never by
+    // a hand-written literal: ProcessStreamEvidenceWire denies unknown fields and
+    // requires its full field set, so a partial object would be refused by serde
+    // at execution_evidence.rs:274 before the legacy arm is ever reached.
+    let baseline = process_evidence("case-10-legacy-typed", "running")?;
+    let stream_bytes = b"typed stdout bytes for the mixed case";
+    let stdout = eliot_process::ProcessStreamEvidence::new_raw(
+        baseline.binding().clone(),
+        eliot_process::ProcessStreamKind::Stdout,
+        eliot_process::ProcessStreamPolicyBinding::new(
+            "policy:1",
+            "privacy:project",
+            "visibility:owner",
+            "retention:task",
+            "redaction:exact-v1",
+        )?,
+        eliot_process::StreamTransportStatus::Complete,
+        eliot_process::StreamPersistenceStatus::CompleteSource,
+        sha256_hex(stream_bytes),
+        stream_bytes.len() as u64,
+        eliot_process::ProcessStreamPrefixPreview::from_transport_prefix(
+            stream_bytes.to_vec(),
+            stream_bytes.len() as u64,
+        )?,
+        None,
+        Vec::new(),
+    )?;
+    let typed = eliot_process::ProcessEvidence::new_typed(
+        baseline.view().clone(),
+        Some(stdout),
+        None,
+        baseline.axes(),
+    )?;
+    let mut legacy_typed = serde_json::to_value(&typed)?;
+    let object = legacy_typed.as_object_mut().ok_or("expected object")?;
+    object.insert(
+        "schema_version".to_owned(),
+        json!(eliot_process::PROCESS_EVIDENCE_LEGACY_SCHEMA_VERSION),
+    );
+    object.insert(
+        "stdout_ref".to_owned(),
+        json!(format!(
+            "raw:p04-stream:sha256:{}:bytes:{}:complete:true",
+            "a".repeat(64),
+            stream_bytes.len()
+        )),
+    );
+    let error = serde_json::from_value::<eliot_process::ProcessEvidence>(legacy_typed)
+        .err()
+        .ok_or("a legacy-version wire carrying typed streams must be refused")?;
+    assert!(
+        error
+            .to_string()
+            .contains("requires at least one legacy stream reference"),
+        "legacy version with typed fields must be rejected, got: {error}"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/11
+#[test]
+fn process_evidence_observation_only_axes_preserved() -> TestResult {
+    let path = database_path("process-evidence-axes-844-11");
+    let store = RedbRecoveryStore::open(&path)?;
+    let evidence = process_evidence("case-11-operation", "running")?;
+    let axes = serde_json::to_value(evidence.axes())?;
+    assert_eq!(axes["status"], json!("OBSERVED"));
+    assert_eq!(axes["assertability"], json!("NON_ASSERTABLE_UNVERIFIED"));
+    // Preservation is a durable claim, so it is proved where ORS keeps the
+    // axes: the observation row must carry them verbatim and hand the same
+    // observation-only axes back on readback.
+    let owner = eliot_process::ProcessOwnerBinding::new(
+        "testd",
+        "aa".repeat(32),
+        test_epoch(1),
+        eliot_process::Generation::new(1)?,
+    )?;
+    let record = ProcessEvidenceRecord::from_evidence(&evidence, owner, 100)?;
+    assert_eq!(record.evidence.axes, axes);
+    store.persist_process_evidence(&record)?;
+    let operation_id = OperationIdentity::new("case-11-operation")?;
+    let history = store.load_process_evidence(&operation_id)?;
+    let Some(ProcessEvidenceReadback::Observation(readback)) = history.first() else {
+        return Err(format!("observation row read back as {history:?}").into());
+    };
+    assert_eq!(readback.evidence.axes, axes);
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/12
+#[test]
+fn process_evidence_authority_escalation_rejected_at_observation() -> TestResult {
+    let mut wire = serde_json::to_value(&process_evidence("case-12-operation", "running")?)?;
+    wire["axes"]["status"] = json!("VERIFIED");
+    let escalated = serde_json::from_value::<eliot_process::ProcessEvidence>(wire)?;
+    let owner = eliot_process::ProcessOwnerBinding::new(
+        "testd",
+        "aa".repeat(32),
+        test_epoch(1),
+        eliot_process::Generation::new(1)?,
+    )?;
+    assert!(matches!(
+        ProcessEvidenceRecord::from_evidence(&escalated, owner, 100),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/13
+#[test]
+fn process_evidence_operation_and_process_bindings_preserved() -> TestResult {
+    let record = process_evidence_record("case-13-operation", "running", 100)?;
+    assert_eq!(record.operation_id.as_str(), "case-13-operation");
+    assert_eq!(record.request_digest, "11".repeat(32));
+    assert_eq!(record.process_tree_id.as_str(), "tree-1");
+    assert_eq!(record.job_id.as_str(), "job-1");
+    assert_eq!(record.image_id.as_str(), "image-1");
+    assert_eq!(record.session_id.as_str(), "session-1");
+    // Preservation is proved against the retained view's own binding, which is
+    // where every one of those projections comes from, and against the digest
+    // that binds the whole contour (request, permit and effect included).
+    let evidence = process_evidence("case-13-operation", "running")?;
+    let binding = evidence.binding();
+    assert_eq!(record.request_digest, binding.request_digest());
+    assert_eq!(
+        record.process_tree_id.as_str(),
+        binding.process_tree_id().as_str()
+    );
+    assert_eq!(record.job_id.as_str(), binding.job_id().as_str());
+    assert_eq!(record.image_id.as_str(), binding.image_id().as_str());
+    assert_eq!(record.session_id.as_str(), binding.session_id().as_str());
+    assert_eq!(
+        record.binding_digest,
+        sha256_hex(&serde_json::to_vec(binding)?)
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/14
+#[test]
+fn process_evidence_owner_epoch_generation_fence_preserved() -> TestResult {
+    let record = process_evidence_record("case-14-operation", "running", 100)?;
+    assert_eq!(record.owner.module_id(), "testd");
+    assert_eq!(record.owner.principal_digest(), "aa".repeat(32));
+    assert_eq!(record.owner.authority_epoch(), &test_epoch(1));
+    assert_eq!(record.authority_epoch, test_epoch(1));
+    assert_eq!(record.owner.generation().get(), 1);
+    assert_eq!(record.generation, 1);
+    assert_eq!(record.state_fence_digest.len(), 64);
+    // The fence claim is the retained fence's own identity, not a digest of the
+    // right length: re-derive the recorded digest from the retained view and
+    // bind the fence to the record's exact epoch and generation.
+    let fence = record.evidence.view.binding().state_fence();
+    assert_eq!(
+        record.state_fence_digest,
+        sha256_hex(&serde_json::to_vec(fence)?)
+    );
+    assert!(fence.authorizes_canonical(&record.authority_epoch));
+    assert_eq!(fence.generation().get(), record.generation);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/15
+#[test]
+fn process_evidence_distinct_observations_have_distinct_keys() -> TestResult {
+    // Two observations of the SAME operation at the SAME observation time, so
+    // the observation time cannot be what separates the two canonical keys.
+    // Only the evidence content can, and the key identity binds it: with
+    // `evidence_digest` dropped from ProcessEvidenceRecordIdentity the two keys
+    // would collide and this case would go red.
+    let first = process_evidence_record("case-15-operation", "running", 100)?;
+    let second = process_evidence_record("case-15-operation", "exited", 100)?;
+    assert_ne!(first.record_key()?, second.record_key()?);
+    // And the distinctness survives the durable path, not only the key builder.
+    let path = database_path("process-evidence-distinct-keys-844-15");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("case-15-operation")?;
+    store.persist_process_evidence(&first)?;
+    store.persist_process_evidence(&second)?;
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?.len(),
+        2,
+        "both distinct observations must be retained under their own key"
+    );
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/17
+#[test]
+fn process_evidence_restart_returns_deterministic_history_order() -> TestResult {
+    let path = database_path("process-evidence-restart-order");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("case-17-operation")?;
+    let first = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    let second = process_evidence_record(operation_id.as_str(), "exited", 200)?;
+    // Persisted in REVERSE observation order on purpose. The reader walks the
+    // operation's physical key range (store.rs:24288-24291), so the order the
+    // durable history comes back in is the order the store's comparator produces
+    // - `observed_at_ms` first, then `evidence_digest`, then `record_key`
+    // (store.rs:24352-24357) - and NOT the order the rows were written in.
+    // Writing the 200ms row first and still expecting the 100ms row first is
+    // therefore a real discriminator: a reader that returned write order, or one
+    // whose comparator lost its primary term, hands back [second, first] and this
+    // case goes red.
+    store.persist_process_evidence(&second)?;
+    store.persist_process_evidence(&first)?;
+    // The expectation is the production rule itself: observation time ascending.
+    // It is NOT the canonical-key order - the canonical key is digest-shaped, so
+    // its relative order is uncorrelated with observation time and sorting by it
+    // here would be a coin flip against the store's own primary term.
+    let expected = vec![
+        ProcessEvidenceReadback::Observation(Box::new(first)),
+        ProcessEvidenceReadback::Observation(Box::new(second)),
+    ];
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?,
+        expected,
+        "the durable history order must be the observation-time order, not write order"
+    );
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert_eq!(reopened.load_process_evidence(&operation_id)?, expected);
+    drop(reopened);
+    let restarted_again = RedbRecoveryStore::open(&path)?;
+    assert_eq!(
+        restarted_again.load_process_evidence(&operation_id)?,
+        expected
+    );
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/18
+#[test]
+fn process_evidence_changed_owner_rejected_for_same_key() -> TestResult {
+    let path = database_path("process-evidence-owner-conflict");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("case-18-operation")?;
+    let first = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    store.persist_process_evidence(&first)?;
+    let mut conflicting = first.clone();
+    conflicting.owner = eliot_process::ProcessOwnerBinding::new(
+        "native",
+        conflicting.owner.principal_digest(),
+        conflicting.owner.authority_epoch().clone(),
+        conflicting.owner.generation(),
+    )?;
+    assert_eq!(conflicting.record_key()?, first.record_key()?);
+    assert!(matches!(
+        store.persist_process_evidence(&conflicting),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?,
+        vec![ProcessEvidenceReadback::Observation(Box::new(first))]
+    );
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/19
+#[test]
+fn process_evidence_changed_operation_projection_rejected() -> TestResult {
+    let path = database_path("process-evidence-operation-projection");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("case-19-operation")?;
+    let first = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    store.persist_process_evidence(&first)?;
+    let mut mismatched = first.clone();
+    mismatched.operation_id = OperationIdentity::new("case-19-other-operation")?;
+    assert!(matches!(
+        store.persist_process_evidence(&mismatched),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?,
+        vec![ProcessEvidenceReadback::Observation(Box::new(first))]
+    );
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/22
+#[test]
+fn process_evidence_encoded_raw_mixed_row_rejected() -> TestResult {
+    let path = database_path("process-evidence-encoded-mixed-844-22");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("process:evidence%case-22")?;
+    let record = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    store.persist_process_evidence(&record)?;
+    let canonical_key = record.record_key()?;
+    let raw_prefix = format!("{}::", operation_id.as_str());
+    let suffix = canonical_key
+        .strip_prefix(raw_prefix.as_str())
+        .ok_or("raw process-evidence key prefix")?;
+    let encoded_operation = operation_id
+        .as_str()
+        .replace('%', "%25")
+        .replace(':', "%3A");
+    let encoded_key = format!("{encoded_operation}::{suffix}");
+    store.write_process_evidence_raw_for_test(&encoded_key, &record)?;
+    assert!(matches!(
+        store.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    cleanup(&path);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 844/23
+#[test]
+fn process_evidence_prefix_endpoint_row_rejected() -> TestResult {
+    let path = database_path("process-evidence-prefix-endpoint-844-23");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("case-23-operation")?;
+    let record = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    let endpoint_key = format!("{}::\u{10ffff}", operation_id.as_str());
+    store.write_process_evidence_raw_for_test(&endpoint_key, &record)?;
+    assert!(matches!(
+        store.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
     cleanup(&path);
     Ok(())
 }
