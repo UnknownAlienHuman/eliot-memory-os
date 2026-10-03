@@ -3,7 +3,7 @@
 //! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose),
 //! ARCH-WDG-01, ARCH-WDG-02.
 //! Implementation: I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes),
-//! I8.3 (docs/architecture/I08-03-supervision-decisions-and-containment.md#i83-supervision-decisions-and-containment),
+//! I8.3 (docs/architecture/I08-03-deterministic-supervision-loop.md#i83-deterministic-supervision-loop),
 //! I8.18 (docs/architecture/I08-18-system-feedback-memorycontext-health-and-maintenance-debt.md#i818-system-feedback-memorycontext-health-and-maintenance-debt).
 //! Issue #2381 steps 1, 2, 3 and 4.
 //!
