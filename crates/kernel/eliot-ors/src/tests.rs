@@ -2416,12 +2416,14 @@ fn process_evidence_mixed_current_and_legacy_rejected() -> TestResult {
     // and removing it lets the legacy arm decode it and silently drop the typed
     // stream. With the direction above alone, that half of the guard is invisible.
     //
-    // The typed stream is built by the same real constructor as case 4, never by
-    // a hand-written literal: ProcessStreamEvidenceWire denies unknown fields and
-    // requires its full field set, so a partial object would be refused by serde
-    // at execution_evidence.rs:274 before the legacy arm is ever reached.
+    // The typed stream is built by the same real constructor AND the same
+    // arguments as case 4, never by a hand-written literal:
+    // ProcessStreamEvidenceWire denies unknown fields and requires its full
+    // field set, so a partial object would be refused by serde at
+    // execution_evidence.rs:274 before the legacy arm is ever reached.
     let baseline = process_evidence("case-10-legacy-typed", "running")?;
     let stream_bytes = b"typed stdout bytes for the mixed case";
+    let digest = sha256_hex(stream_bytes);
     let stdout = eliot_process::ProcessStreamEvidence::new_raw(
         baseline.binding().clone(),
         eliot_process::ProcessStreamKind::Stdout,
@@ -2434,13 +2436,25 @@ fn process_evidence_mixed_current_and_legacy_rejected() -> TestResult {
         )?,
         eliot_process::StreamTransportStatus::Complete,
         eliot_process::StreamPersistenceStatus::CompleteSource,
-        sha256_hex(stream_bytes),
+        digest.clone(),
         stream_bytes.len() as u64,
         eliot_process::ProcessStreamPrefixPreview::from_transport_prefix(
             stream_bytes.to_vec(),
             stream_bytes.len() as u64,
         )?,
-        None,
+        // A `CompleteSource` stream REQUIRES an immutable locator and ready
+        // receipt: `new_raw` validates before returning, and
+        // validate_persistence refuses `CompleteSource` with no source
+        // (stream_evidence/part_04.rs). Passing `None` here therefore aborts
+        // this test at the `?` below before either assertion runs, so the
+        // source is built exactly as case 4 builds it.
+        Some(eliot_process::DurableProcessStreamSource::exact_transport(
+            eliot_process::DurableStreamLocatorKind::Blob,
+            format!("eliot://blob/{digest}"),
+            format!("receipt:blob-ready:{digest}"),
+            digest.clone(),
+            stream_bytes.len() as u64,
+        )?),
         Vec::new(),
     )?;
     let typed = eliot_process::ProcessEvidence::new_typed(
