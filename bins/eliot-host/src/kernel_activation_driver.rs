@@ -8,6 +8,7 @@ use super::{
     nonce_after_activation_failure, operation, prove_candidate_owner_held, record_fence,
     sha256_json,
 };
+use crate::host_job_launch::LaunchPhaseCorrelation;
 
 // F-LOG-HOST-3 (#978) Kernel-activation observation helpers.
 //
@@ -17,26 +18,62 @@ use super::{
 // (`super::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open). No terminal is owned here: the single terminal for a
 // failed activation stays with the outermost #891 contour (e.g.
-// `host-start-failed` / `host-resume-pending-failed` in `lib.rs`); nonce,
-// handshake, auth, activation, and readiness correlate by stage order only.
-// This coordinates the "one terminal across nesting" rule with #891.
+// `host-start-failed` / `host-resume-pending-failed` in `lib.rs`). This
+// coordinates the "one terminal across nesting" rule with #891.
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never nonces,
-// digests, operation ids, pipe identities, evidence refs, or arbitrary error
-// text — so bounding limits size, not sensitivity (I15.4). Sink outcome never
-// alters result/order/status/cleanup. There is no mutable global dedup cache.
+// Bounded identities, not stage order alone (audit 5910159678 defects 3 and 5):
+// a call site passes a static phase token plus a
+// `LaunchPhaseCorrelation` built only from identities this driver already
+// holds — the KernelRecord operation identity, the approved artifact hash
+// handle, the installation handle and activation id on the record fence, the
+// Kernel Job root process start identity at bind time, and the issued permit's
+// authority epoch where a permit already exists. `generation` carries the
+// approved runtime generation where a permit, receipt or request holds one, and
+// the record's activation-generation sequence otherwise. Nothing is re-derived,
+// re-read, re-verified or probed to obtain a field: an absent identity renders
+// as the renderer's own explicit absence marker instead of being invented.
+//
+// Secrets and payloads never cross this boundary. The one-use permit secret is
+// never bound or observed in any form, and neither is the nonce state value,
+// receipt or health payload text, evidence reference handles, pipe identities,
+// credential material, or arbitrary error text — including the owner-supplied
+// failure evidence label, which stays owner-supplied. An authority epoch is
+// rendered as the owner's own lineage id plus sequence pair, and a process
+// start identity as the owner's own pid/start pair, so a record names the
+// contour that produced it without naming a payload. Bounding limits size, not
+// sensitivity (I15.4). Sink outcome never alters result/order/status/cleanup.
+// There is no mutable global dedup cache.
+//
+// The final Kernel acceptance claim stays owned here: only this file's
+// owner-evidence path may make it, and only after the exclusive owner probe,
+// the permit, the activation receipt and the ready receipt are validated and
+// the `Active` transition is committed.
 #[cfg(windows)]
 fn kernel_activation_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
 }
 
+/// Renders one held authority epoch as its owner's lineage id plus sequence.
 #[cfg(windows)]
-fn kernel_activation_observe(detail: &str) {
+fn authority_epoch_identity(lineage_id: &str, sequence: u64) -> String {
+    format!("{lineage_id}:{sequence}")
+}
+
+/// Renders the Kernel Job root process start identity in the owner's own
+/// `pid`/`start` shape, so a record distinguishes this process incarnation from
+/// a reusable PID.
+#[cfg(windows)]
+fn kernel_process_start_identity(root_pid: u32, root_start_time_100ns: u64) -> String {
+    format!("pid:{root_pid}:start:{root_start_time_100ns}")
+}
+
+#[cfg(windows)]
+fn kernel_activation_observe(phase: &str, correlation: &LaunchPhaseCorrelation<'_>) {
     kernel_activation_note_event_log_unavailable();
+    let detail = correlation.render(phase);
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::Startup,
-        detail,
+        &detail,
     );
 }
 
@@ -55,9 +92,16 @@ pub(super) struct DurableKernelActivationDriver<'a, B: JournalBackend> {
 #[cfg(windows)]
 impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
     pub(super) fn resume(journal: &'a HostStateJournalService<B>, current: KernelRecord) -> Self {
-        // WORK_UNIT_CASE: 978/10 — resume correlates by stage order only;
-        // no terminal here, the outermost #891 contour owns it.
-        kernel_activation_observe("host.kernel-activation resume requested");
+        // WORK_UNIT_CASE: 978/10 — resume observes the retained record's own
+        // identities, not stage order alone; no terminal here, the outermost
+        // #891 contour owns it.
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(current.fence.host.installation.as_str())
+            .with_generation(current.fence.activation_generation.current.sequence.get())
+            .with_operation(current.operation.operation_id.as_str())
+            .with_artifact(current.approved_artifact_hash.as_str())
+            .with_fence(current.fence.activation_id.as_str());
+        kernel_activation_observe("host.kernel-activation resume requested", &correlation);
         Self {
             journal,
             current,
@@ -83,8 +127,20 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         process: ServiceProcessRecord,
     ) -> Result<Self, HostError> {
         // WORK_UNIT_CASE: 978/7 — candidate bind requested; handshake/auth
-        // material is distinct from nonce/activation, no secrets observed.
-        kernel_activation_observe("host.kernel-activation bind requested");
+        // material is distinct from nonce/activation, no secrets observed. The
+        // exact Job root process start identity and the activation fence are
+        // already in hand as parameters, so both are named.
+        let process_start = kernel_process_start_identity(
+            candidate_job_binding.root_pid,
+            candidate_job_binding.root_start_time_100ns,
+        );
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(host.installation.as_str())
+            .with_generation(activation_generation.current.sequence.get())
+            .with_artifact(approved_artifact_hash.as_str())
+            .with_process_start(&process_start)
+            .with_fence(activation_id.as_str());
+        kernel_activation_observe("host.kernel-activation bind requested", &correlation);
         // I14.16 step 7 (issue #1953 W6): the candidate generation must be
         // the strict direct child of the retired contour's generation. The
         // journal reducer pins this on first bind, but a same-activation
@@ -120,8 +176,17 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         };
         append_reconciled(journal, HostStateRecord::Kernel(current.clone()))?;
         // WORK_UNIT_CASE: 978/7 — candidate observed; still distinct from
-        // nonce issuance and activation below.
-        kernel_activation_observe("host.kernel-activation candidate observed");
+        // nonce issuance and activation below. The committed record now carries
+        // the operation identity this append established, and the same Job root
+        // process start identity observed at bind time.
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(current.fence.host.installation.as_str())
+            .with_generation(current.fence.activation_generation.current.sequence.get())
+            .with_operation(current.operation.operation_id.as_str())
+            .with_artifact(current.approved_artifact_hash.as_str())
+            .with_process_start(&process_start)
+            .with_fence(current.fence.activation_id.as_str());
+        kernel_activation_observe("host.kernel-activation candidate observed", &correlation);
         Ok(Self {
             journal,
             current,
@@ -237,9 +302,20 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         candidate: &HostKernelCandidateBinding,
         generation: ResourceGeneration,
     ) -> Result<KernelActivationPermit, HostError> {
-        // WORK_UNIT_CASE: 978/7 — nonce requested; the nonce value itself is
-        // never observed, only this static literal (no secrets).
-        kernel_activation_observe("host.kernel-activation nonce requested");
+        // WORK_UNIT_CASE: 978/7 — nonce requested; the one-use secret is
+        // never observed, and the authority epoch this permit will bind plus the
+        // approved runtime generation are named from the held candidate.
+        let requested_epoch = authority_epoch_identity(
+            candidate.kernel_epoch.lineage_id.as_str(),
+            candidate.kernel_epoch.sequence.get(),
+        );
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(self.current.fence.host.installation.as_str())
+            .with_generation(generation.value())
+            .with_operation(self.current.operation.operation_id.as_str())
+            .with_artifact(self.current.approved_artifact_hash.as_str())
+            .with_fence(&requested_epoch);
+        kernel_activation_observe("host.kernel-activation nonce requested", &correlation);
         if self.current.state != KernelActivationState::OldTerminated {
             return Err(HostError::ProcessContour(
                 "activation nonce cannot be issued before prior disposition commit".to_owned(),
@@ -273,15 +349,53 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         self.issued_permit = Some(permit.clone());
         // WORK_UNIT_CASE: 978/7 — nonce issued distinctly from handshake/auth
-        // and activation; exact permit propagates unchanged.
-        kernel_activation_observe("host.kernel-activation nonce issued");
+        // and activation; exact permit propagates unchanged. The issued permit's
+        // operation identity, journal generation and validated authority epoch
+        // are named; its one-use secret and the committed journal transaction
+        // identity stay unobserved because no bound field carries them.
+        let issued_epoch = authority_epoch_identity(
+            permit.authority_epoch.lineage_id.as_str(),
+            permit.authority_epoch.sequence.get(),
+        );
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(self.current.fence.host.installation.as_str())
+            .with_generation(permit.generation.value())
+            .with_operation(permit.operation_id.as_str())
+            .with_artifact(self.current.approved_artifact_hash.as_str())
+            .with_fence(&issued_epoch);
+        kernel_activation_observe("host.kernel-activation nonce issued", &correlation);
         Ok(permit)
     }
 
     pub(super) fn activating(&mut self) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 978/7 — activating requested; forbidden before the
-        // committed NonceIssued receipt, distinct from nonce issuance.
-        kernel_activation_observe("host.kernel-activation activating requested");
+        // committed NonceIssued receipt, distinct from nonce issuance. Where the
+        // permit already exists its validated authority epoch is named; before
+        // one exists the record keeps the fence's own activation identity
+        // instead, and no epoch is invented.
+        let permit_authority_epoch: Option<String> = self.issued_permit.as_ref().map(|permit| {
+            authority_epoch_identity(
+                permit.authority_epoch.lineage_id.as_str(),
+                permit.authority_epoch.sequence.get(),
+            )
+        });
+        let mut correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(self.current.fence.host.installation.as_str())
+            .with_generation(
+                self.current
+                    .fence
+                    .activation_generation
+                    .current
+                    .sequence
+                    .get(),
+            )
+            .with_operation(self.current.operation.operation_id.as_str())
+            .with_artifact(self.current.approved_artifact_hash.as_str())
+            .with_fence(self.current.fence.activation_id.as_str());
+        if let Some(epoch) = permit_authority_epoch.as_deref() {
+            correlation = correlation.with_fence(epoch);
+        }
+        kernel_activation_observe("host.kernel-activation activating requested", &correlation);
         if self.issued_permit.is_none() {
             return Err(HostError::ProcessContour(
                 "Activate is forbidden before a committed NonceIssued receipt".to_owned(),
@@ -295,6 +409,13 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         Ok(())
     }
 
+    /// The owner-evidence path of `DurableKernelActivationDriver::active`.
+    ///
+    /// This is the only place that may claim Kernel readiness: the exclusive
+    /// owner probe, the issued permit, the activation receipt and the ready
+    /// receipt are validated and the `Active` transition is committed before
+    /// either record below is emitted. A running process, a returned launch
+    /// child or an IPC acknowledgement never produces this claim.
     pub(super) fn active(
         &mut self,
         candidate: &HostKernelCandidateBinding,
@@ -303,8 +424,21 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 978/8 — readiness requested; positive activation
         // requires actual owner evidence (permit + receipts), never liveness
-        // alone.
-        kernel_activation_observe("host.kernel-activation readiness requested");
+        // alone. The record names the exact contour this request concerns
+        // before validation, because the validation below is what decides
+        // whether readiness may ever be claimed for it.
+        let requested_epoch = authority_epoch_identity(
+            candidate.kernel_epoch.lineage_id.as_str(),
+            candidate.kernel_epoch.sequence.get(),
+        );
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(candidate.installation_id.as_str())
+            .with_generation(activation_receipt.generation.value())
+            .with_operation(activation_receipt.operation_id.as_str())
+            .with_artifact(candidate.artifact_hash.as_str())
+            .with_process_start(ready.process.process_id.as_str())
+            .with_fence(&requested_epoch);
+        kernel_activation_observe("host.kernel-activation readiness requested", &correlation);
         // I14.16 step 7/8: the candidate must hold exclusive ownership of its
         // own contour before Host publishes it. This runs before the permit,
         // receipt and nonce checks so a candidate that never took the owner
@@ -339,17 +473,34 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         })?;
         // WORK_UNIT_CASE: 978/7 — activation observed distinctly from nonce/
         // handshake/auth; WORK_UNIT_CASE: 978/8 — readiness observed only on
-        // exact owner evidence above, exact errors propagate unchanged.
-        kernel_activation_observe("host.kernel-activation activation observed");
-        kernel_activation_observe("host.kernel-activation readiness observed");
+        // exact owner evidence above, exact errors propagate unchanged. Both
+        // records carry the same validated identities, and no receipt payload
+        // text is ever bound.
+        kernel_activation_observe("host.kernel-activation activation observed", &correlation);
+        kernel_activation_observe("host.kernel-activation readiness observed", &correlation);
         Ok(())
     }
 
     pub(super) fn fail(&mut self, evidence: &str) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 978/10 — failure observed without owning a terminal;
-        // the outermost #891 contour emits the single terminal. The evidence
-        // label stays owner-supplied; only this static literal is observed.
-        kernel_activation_observe("host.kernel-activation fail observed");
+        // the outermost #891 contour emits the single terminal. The record
+        // names the contour identities held on the record; the owner-supplied
+        // evidence label stays owner-supplied and is never bound, and no typed
+        // reason kind exists on this path to name.
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(self.current.fence.host.installation.as_str())
+            .with_generation(
+                self.current
+                    .fence
+                    .activation_generation
+                    .current
+                    .sequence
+                    .get(),
+            )
+            .with_operation(self.current.operation.operation_id.as_str())
+            .with_artifact(self.current.approved_artifact_hash.as_str())
+            .with_fence(self.current.fence.activation_id.as_str());
+        kernel_activation_observe("host.kernel-activation fail observed", &correlation);
         if self.current.state == KernelActivationState::Failed {
             return Ok(());
         }
@@ -372,6 +523,166 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
                 Ok(())
             },
         )?;
+        Ok(())
+    }
+}
+
+/// Inline proof for this file's own observation seam (F-LOG-HOST-3, #978).
+///
+/// The cases below execute the real instrumented driver through the real #889
+/// facade under a scoped subscriber, so what is asserted is what the retained
+/// record actually renders — never a hand-constructed detail. Only paths that
+/// need no live contour are covered here: `resume` merely retains a record, so
+/// it needs no owner object, no Job, no process and no committed append. The
+/// owner-evidence path (`active`) and every appending step keep their existing
+/// journal-level proof in `journal_tests`/`tests.rs`, where a complete durable
+/// activation contour is already built.
+#[cfg(all(test, windows))]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use eliot_host_state::MemoryBackend;
+
+    use super::*;
+    use crate::TestResult;
+
+    /// Non-sensitive marker held by the retained candidate pipe identity. A
+    /// pipe name is a name, not an identity, so it must never be rendered.
+    const PIPE_CANARY: &str = "canary-candidate-pipe-978";
+
+    /// Bounded facade output captured from the live instrumented driver.
+    #[derive(Clone, Default)]
+    struct CapturedRecords {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CapturedRecords {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `driver_step` under a scoped subscriber and returns what the #889
+    /// facade actually emitted while it executed.
+    fn captured(driver_step: impl FnOnce()) -> String {
+        let records = CapturedRecords::default();
+        let writer = records.clone();
+        let bytes = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, driver_step);
+            records
+                .bytes
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .clone()
+        };
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    /// One retained activation record exactly as a restarted Host finds it:
+    /// an unissued nonce, no active pipe, no Job binding and no process record.
+    fn retained_record() -> Result<(HostInstallationEpoch, KernelRecord), crate::TestError> {
+        let host = crate::fresh_host_epoch(handle("driver-resume-installation"), None)?;
+        let activation_id = handle("driver-resume-activation");
+        let activation_generation = crate::root_epoch(crate::fresh_lineage_id()?);
+        let record = KernelRecord {
+            fence: crate::record_fence(&host, &activation_id, &activation_generation),
+            operation: crate::operation("kernel-resume-fixture")?,
+            activation_identity: activation_id,
+            approved_artifact_hash: handle(&"a".repeat(64)),
+            active_pipe_identity: None,
+            candidate_pipe_identity: Some(handle(PIPE_CANARY)),
+            candidate_job_binding: None,
+            prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
+            kernel_generation: crate::root_epoch(crate::fresh_lineage_id()?),
+            one_time_nonce: OneTimeNonceState::unissued(),
+            state: KernelActivationState::ShadowNoAuthority,
+            process: None,
+            readiness_evidence: Vec::new(),
+            disposition_evidence: Vec::new(),
+        };
+        Ok((host, record))
+    }
+
+    // WORK_UNIT_CASE: 978/7 — the live driver names the identities the retained
+    // record already holds, so concurrent and restarted activation contours
+    // produce distinguishable records, and it names no secret: not the one-use
+    // nonce, not the candidate pipe name, not a receipt payload.
+    #[test]
+    fn resume_record_names_retained_identities_and_no_secret() -> TestResult {
+        let (host, record) = retained_record()?;
+        let operation_id = record.operation.operation_id.clone();
+        let generation = record.fence.activation_generation.current.sequence.get();
+        let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host)?;
+        let first = captured(|| {
+            let _driver = DurableKernelActivationDriver::resume(&journal, record.clone());
+        });
+        // WORK_UNIT_CASE: 978/13 — the same retained record rendered twice is
+        // byte-identical: the fields are deterministic, not order-dependent.
+        let second = captured(|| {
+            let _driver = DurableKernelActivationDriver::resume(&journal, record.clone());
+        });
+
+        assert!(
+            first.contains("phase=host.kernel-activation resume requested"),
+            "got: {first}"
+        );
+        assert!(
+            first.contains("installation=driver-resume-installation"),
+            "got: {first}"
+        );
+        assert!(
+            first.contains(&format!("generation={generation}")),
+            "got: {first}"
+        );
+        assert!(
+            first.contains(&format!("operation={}", operation_id.as_str())),
+            "got: {first}"
+        );
+        assert!(
+            first.contains(&format!("artifact={}", "a".repeat(64))),
+            "got: {first}"
+        );
+        assert!(
+            first.contains("fence=driver-resume-activation"),
+            "got: {first}"
+        );
+        // A resume holds no process start identity and computes no typed
+        // outcome, so both slots render the renderer's own explicit absence
+        // marker instead of an invented identity. The absence itself is what
+        // this proves, so the assertion stays independent of that marker's
+        // spelling: no `pid:` start identity and no outcome kind may appear.
+        assert!(first.contains("process_start="), "got: {first}");
+        assert!(first.contains("reason="), "got: {first}");
+        assert!(
+            !first.contains("pid:"),
+            "no start identity may be invented: {first}"
+        );
+        assert!(!first.contains(PIPE_CANARY), "got: {first}");
+        assert!(
+            !first.contains("nonce"),
+            "no nonce may be observed: {first}"
+        );
+        // Only the owner-evidence path may claim readiness, and a resumed
+        // contour has published none.
+        assert!(!first.contains("readiness"), "got: {first}");
+        assert_eq!(first, second, "one retained record must render one record");
         Ok(())
     }
 }

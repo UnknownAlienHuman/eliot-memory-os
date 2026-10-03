@@ -82,7 +82,7 @@ use super::backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
     MEMBER_DOMAIN_PROJECTION, SnapshotRelation, owner_fence_dispositions,
     owner_residency_key_digest, owner_suspended_recovery_refs, require_capture_admitted,
-    validate_disposition_identities,
+    require_suspended_claim_matches_owner_frontier, validate_disposition_identities,
 };
 
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
@@ -143,11 +143,12 @@ pub struct CaptureRequest {
     /// Count of suspended recovery entries derived from the ORS snapshot.
     ///
     /// This is the PRODUCER'S CLAIM, never this owner's authority. The
-    /// unresolved-effect frontier that decides the capture state and the
-    /// suspended marker is read from the ORS owner's own
-    /// `ors_snapshot.pending_operation_ids` (see `observed_unresolved_frontier`);
-    /// this field only has to agree with that evidence, and a disagreement
-    /// refuses the capture instead of silently preferring one of the two.
+    /// unresolved-effect frontier that decides the capture state and that
+    /// `CaptureReport::suspended_operation_count` reports is read from the ORS
+    /// owner's own `ors_snapshot.pending_operation_ids` (see
+    /// `observed_unresolved_frontier`); this field only has to agree with that
+    /// evidence, and a disagreement refuses the capture instead of silently
+    /// preferring one of the two.
     pub suspended_count: u64,
     /// Checksummed config, policy, module, and build manifest artifacts.
     pub artifacts: Vec<BackupArtifact>,
@@ -176,9 +177,15 @@ pub struct CaptureRequest {
 pub fn request_from_ports(
     ports: &CapturePorts<'_>,
     plan: FrozenCapturePlan,
-    suspended_count: u64,
 ) -> Result<CaptureRequest, KernelCaptureError> {
     ports.validate_shapes()?;
+    // ONE suspended-state source: the bundle's claim is checked against the ORS
+    // owner's own derivation BEFORE the request exists, so no value can pass
+    // source validation here while a different one decides the report
+    // disposition downstream. The count that crossed this boundary is the
+    // bundle's own claim, which `capture` then re-checks against the same owner
+    // frontier through `require_suspended_claim_matches_frontier`.
+    require_suspended_claim_matches_owner_frontier(ports)?;
     Ok(CaptureRequest {
         caller: ports.caller.clone(),
         plan,
@@ -190,7 +197,7 @@ pub fn request_from_ports(
         blobs: ports.blobs.to_vec(),
         purge_ledger: ports.purge_ledger.to_vec(),
         ors_snapshot: ports.ors_snapshot.cloned(),
-        suspended_count,
+        suspended_count: ports.suspended_count,
         artifacts: ports.artifacts.to_vec(),
         watchdog_spool: ports.watchdog_spool.cloned(),
         host_audit: ports.host_audit.cloned(),
@@ -579,10 +586,54 @@ pub struct CaptureReport {
     pub archived_state_fence_digest: String,
     /// Exactly one disposition per expected source member.
     pub member_dispositions: Vec<(String, String)>,
-    /// Publication receipt identity, or the suspended-operations marker. It is
-    /// absent on the verification-only path because no retained-artifact owner
-    /// issues a receipt there, and absence stays explicit rather than inferred.
+    /// The VERIFIED PUBLICATION OPERATION IDENTITY, or `None` on the paths
+    /// where no owner issued a receipt.
+    ///
+    /// On the capture path this is the operation identity the publication owner
+    /// returned in its own receipt, after this owner compared that receipt's
+    /// `operation_id` against this operation's identity, its `archive_sha256`
+    /// against this archive's digest, and its durability flag. So the value is
+    /// an owner-issued reference to these exact bytes, not a spelling composed
+    /// here (I5.27: idempotency is defined over canonical operation identity,
+    /// never over caller spelling or an unversioned hash).
+    ///
+    /// It is NEVER a suspended-operations marker. A bounded unresolved frontier
+    /// is reported in [`Self::suspended_operation_count`] and nowhere else: a
+    /// coordinator-computed count string in this field would substitute an
+    /// invented value for an owner-issued receipt, which is the substitution
+    /// [`ArchiveFenceProof::CaptureOwnerProven`] exists to make impossible. It
+    /// would also lose the validated publication identity on exactly the
+    /// captures I5.13 allows to carry suspended unresolved operations.
+    ///
+    /// It is absent on the verification-only path because no retained-artifact
+    /// owner issues a receipt there, and absent on the cancelled path because
+    /// that capture published nothing; both absences stay explicit rather than
+    /// inferred, and neither is replaced by a placeholder identity.
     pub receipt_identity: Option<String>,
+    /// Length of the OBSERVED ORS pending-operation frontier this result
+    /// covers, reported separately from [`Self::receipt_identity`].
+    ///
+    /// On the capture path it is read from the ORS owner's own
+    /// `ors_snapshot.pending_operation_ids` through `observed_unresolved_frontier`
+    /// — that is, through `owner_suspended_recovery_refs`, which validates the
+    /// ORS fence before counting it — and a producer's asserted
+    /// `CaptureRequest::suspended_count` must already have agreed with it
+    /// (`require_suspended_claim_matches_frontier`). A caller-asserted integer
+    /// never reaches this field. On the verification-only path it is the
+    /// frontier retained in the decoded archive's own ORS snapshot, because
+    /// that contour observes an archive and not an installation.
+    ///
+    /// It is a count of observed owner evidence, never an identifier, a receipt
+    /// or a second identity for this capture. It also RETAINS the recovery
+    /// obligation a bounded unresolved frontier implies: a complete
+    /// `full_recovery` archive may legitimately carry suspended unresolved
+    /// operations, they restore suspended and are reconciled before replay, and
+    /// neither [`CaptureState::Complete`] nor
+    /// [`ArchiveFenceProof::CaptureOwnerProven`] is proof that those effects
+    /// settled. I5.13 keeps unresolved operations distinct from archive
+    /// corruption and archive validity distinct from completed effect
+    /// reconciliation; this count is where that distinction stays inspectable.
+    pub suspended_operation_count: u64,
 }
 
 /// Kernel-owned cross-owner backup capture coordinator.
@@ -638,8 +689,10 @@ impl KernelBackupCapture {
     /// `publish_once` under the operation identity and idempotency key, with a
     /// lost response reconciled by identity through `reconcile` (never a
     /// second publish). Bounded unresolved operations are not corruption: a
-    /// `full_recovery` capture with suspended entries still completes and
-    /// records the suspended marker as its receipt identity.
+    /// `full_recovery` capture with suspended entries still completes, reports
+    /// the observed frontier length in `suspended_operation_count`, and keeps
+    /// the verified publication operation identity in `receipt_identity`
+    /// exactly as a capture with an empty frontier does.
     ///
     /// The frozen `max_duration_ms` is enforced as a real bound at every stage
     /// boundary. A capture that spends its admitted duration before publication
@@ -715,6 +768,10 @@ impl KernelBackupCapture {
                 operation_id,
                 member_dispositions,
                 &bundle.export_fence.state_fence,
+                // The frontier observed at admission is what this capture
+                // covered; publication never happened, so this report keeps no
+                // receipt identity but still reports that observed frontier.
+                unresolved_count,
             );
         }
         let receipt = match publisher.publish_once(&operation_id, &idempotency_key, &bytes) {
@@ -741,28 +798,28 @@ impl KernelBackupCapture {
         // The frontier is the OBSERVED unresolved-effect count read from the ORS
         // owner's own pending-operation identities, cross-checked against the
         // producer's claim above. A caller-asserted integer never decides this.
-        let (state, receipt_identity) =
+        // The decision returns the terminal state, the report's publication
+        // identity and the frontier length; the frontier travels to
+        // `suspended_operation_count`, never into the receipt field.
+        let (state, receipt_identity, suspended_operation_count) =
             terminal_capture_decision(request, unresolved_count, &operation_id);
-        // The provenance qualifier is bound to the OWNER-ISSUED receipt, never to
-        // the report's `receipt_identity`. That field is documented as "publication
-        // receipt identity, or the suspended-operations marker", so on a capture
-        // with an unresolved frontier it holds a coordinator-computed
-        // `suspended:<count>` string. Naming the qualifier from it would let a
-        // string this owner invented stand in for an owner receipt, which is
-        // precisely the substitution `ArchiveFenceProof::CaptureOwnerProven` is
-        // supposed to make impossible. The value bound here is the operation
-        // identity the OWNER returned, and the two comparisons above already
-        // proved it equals this operation's identity AND that the same receipt
-        // names this operation's archive digest, so the receipt is bound to this
-        // operation's content and not merely to a predictable name.
+        // The provenance qualifier is bound to the OWNER-ISSUED receipt and to
+        // nothing this owner can compose. The three comparisons above already
+        // proved that the receipt the owner returned names THIS operation and
+        // THIS archive's digest and is durable, so `receipt.operation_id` is
+        // bound to this operation's content and not merely to a predictable
+        // name — which is exactly the property `CaptureOwnerProven` claims and
+        // is why a coordinator-invented string must never be substituted for
+        // it here.
         let archived_fence_proof = ArchiveFenceProof::CaptureOwnerProven {
             capture_receipt: receipt.operation_id.clone(),
         };
-        // The report's own `receipt_identity` keeps its documented two-way
-        // meaning (the operation identity, or the suspended-operations marker
-        // when the archive carries a bounded unresolved frontier), so a reader of
-        // the report can tell which of the two it is looking at. It is NOT what
-        // the provenance qualifier is named from, for the reason above.
+        // The report's `receipt_identity` is that same verified publication
+        // operation identity on every capture, whatever the frontier held, so
+        // the qualifier is named from the same owner-issued reference the report
+        // publishes. `suspended_operation_count` carries the unresolved frontier
+        // separately: it is observed owner evidence, not an identifier, and it
+        // is not proof that those suspended effects settled.
         Ok(CaptureReport {
             backup_id: identities.backup_id,
             class: request.plan.class,
@@ -798,6 +855,7 @@ impl KernelBackupCapture {
             )?,
             member_dispositions,
             receipt_identity,
+            suspended_operation_count,
             archived_fence_proof,
         })
     }
@@ -994,6 +1052,18 @@ impl KernelBackupCapture {
             )?,
             member_dispositions,
             receipt_identity: None,
+            // This contour observes an ARCHIVE, and the archive retains its own
+            // ORS snapshot fence, so the pending-operation frontier it covers is
+            // counted here through the same validated owner derivation the
+            // capture contour uses. The result is the frontier the archive
+            // carries, not this installation's live frontier, and it keeps the
+            // archive's suspended recovery obligation visible on verification.
+            suspended_operation_count: match bundle.ors_snapshot.as_ref() {
+                Some(snapshot) => owner_suspended_recovery_refs(snapshot)?.len() as u64,
+                // No ORS snapshot in the archive means an empty owner frontier,
+                // which is the same absence the capture contour reads.
+                None => 0,
+            },
             archived_fence_proof,
         })
     }
@@ -1449,15 +1519,24 @@ fn require_suspended_claim_matches_frontier(
     Ok(())
 }
 
-/// The terminal state and the report's receipt identity, decided from the
-/// OBSERVED unresolved-effect frontier.
+/// The terminal state, the report's publication identity, and the observed
+/// frontier length it reports, decided from the OBSERVED unresolved-effect
+/// frontier.
 ///
 /// A bounded frontier is not corruption: a `full_recovery` capture with
-/// suspended operations still completes and records the suspended marker as its
-/// receipt identity, which is what I5.13 requires for a legitimate independent
-/// snapshot with bounded unresolved operations. A degraded class that cannot
-/// carry them reports an explicit incomplete result instead of over-claiming,
-/// and an empty frontier reports the publication operation identity.
+/// suspended operations still completes, which is what I5.13 requires for a
+/// legitimate independent snapshot with bounded unresolved operations. Those
+/// operations keep their recovery obligation, reported as the third returned
+/// value for `CaptureReport::suspended_operation_count`. A degraded class that
+/// cannot carry them reports an explicit incomplete result instead of
+/// over-claiming.
+///
+/// The publication identity is the VERIFIED operation identity on every one of
+/// these results — an empty frontier and a bounded one alike. It is the value
+/// the publication owner itself returned and this owner already compared
+/// against this operation and this archive's digest, so nothing here composes
+/// a receipt-like string, and no suspended marker is ever minted into a receipt
+/// field.
 ///
 /// `unresolved_count` is the observed frontier length, already cross-checked
 /// against the producer's claim; nothing here reads `CaptureRequest::
@@ -1466,7 +1545,7 @@ fn terminal_capture_decision(
     request: &CaptureRequest,
     unresolved_count: u64,
     operation_id: &str,
-) -> (CaptureState, Option<String>) {
+) -> (CaptureState, Option<String>, u64) {
     let state = if unresolved_count > 0 && request.plan.class != BackupClass::FullRecovery {
         CaptureState::Incomplete {
             reason: "bounded suspended operations exceed degraded class ceiling".to_owned(),
@@ -1474,12 +1553,10 @@ fn terminal_capture_decision(
     } else {
         CaptureState::Complete
     };
-    let receipt_identity = if unresolved_count > 0 {
-        Some(format!("suspended:{unresolved_count}"))
-    } else {
-        Some(operation_id.to_owned())
-    };
-    (state, receipt_identity)
+    // One meaning only: the verified publication operation identity, whatever
+    // the frontier held. The suspended count is reported beside it, never in it.
+    let receipt_identity = Some(operation_id.to_owned());
+    (state, receipt_identity, unresolved_count)
 }
 
 /// The exact per-owner evidence one snapshot relation is derived from.
@@ -1585,13 +1662,24 @@ impl ArchiveIdentities {
 /// operation in flight — so the structural relation is exact over the complete
 /// value. Its proof stays [`ArchiveFenceProof::StructuralOnly`]: publication
 /// never happened, so no owner issued a receipt for those bytes and this owner
-/// cannot claim more than structural evidence.
+/// cannot claim more than structural evidence. That is also why
+/// `receipt_identity` stays `None` here: this capture owns no owner-issued
+/// publication receipt, and the identity it would otherwise report is the
+/// identity of an operation that was never published.
+///
+/// `suspended_operation_count` still reports the frontier this capture observed
+/// before it stopped. The frontier was read from the ORS owner's own pending
+/// operations at admission time, and nothing about spending the duration budget
+/// unsettled those operations or withdrew their recovery obligation — the
+/// observed count is exactly that, an observation, with no second identifier
+/// and no claim that the suspended effects settled.
 fn cancelled_report(
     identities: &ArchiveIdentities,
     class: BackupClass,
     operation_id: String,
     member_dispositions: Vec<(String, String)>,
     archived_fence: &StateFence,
+    suspended_operation_count: u64,
 ) -> Result<CaptureReport, KernelCaptureError> {
     let archived_fence_proof = ArchiveFenceProof::StructuralOnly;
     let archived_fence_restrictions =
@@ -1614,6 +1702,7 @@ fn cancelled_report(
         archived_state_fence_digest: archived_state_fence_digest(archived_fence)?,
         member_dispositions,
         receipt_identity: None,
+        suspended_operation_count,
     })
 }
 

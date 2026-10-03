@@ -11,7 +11,7 @@
 //!
 //! Host owns physical Kernel process lifecycle and authenticated connection
 //! mechanics only. This module never owns Kernel or Governor semantic
-//! readiness, transition, or authority; it preserves those decisions in the
+//! acceptance, transition, or authority; it preserves those decisions in the
 //! existing Host composition root.
 
 use std::path::Path;
@@ -49,6 +49,7 @@ use eliot_runtime_contracts::{
 };
 
 use super::{HostError, LOCAL_SERVICE_SID};
+use crate::host_job_launch::LaunchPhaseCorrelation;
 
 // F-LOG-HOST-3 (#978) Kernel front-door observation helpers.
 //
@@ -57,27 +58,74 @@ use super::{HostError, LOCAL_SERVICE_SID};
 // seam stays typed-Unavailable
 // (`super::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open). No terminal is owned here: the single terminal for a
-// failed front-door/activation stays with the outermost #891 contour;
-// handshake, auth, activation, before-start, timeout, disconnect, and unknown
-// correlate by stage order only.
+// failed front-door/activation stays with the outermost #891 contour.
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never pipe
-// identities, PIDs, start-times, image paths, SIDs, digests, message ids, or
-// arbitrary error text — so bounding limits size, not sensitivity (I15.4).
-// Sink outcome never alters result/order/status/cleanup. There is no mutable
-// global dedup cache.
+// Bounded identities, not stage order alone (audit 5910159678 defects 3 and
+// 5): a call site passes a static phase token plus a `LaunchPhaseCorrelation`
+// built only from identities this closure already holds — the candidate
+// activation, installation, approved artifact and authority epoch handles, the
+// expected activation message identity at reconcile time, and the retained
+// Kernel process start identity (PID plus start time) at handshake and
+// authentication time. Nothing is re-derived, re-read or probed to obtain a
+// field: an absent identity renders as the renderer's own explicit absence
+// marker instead of being invented.
+//
+// Handshake, authentication, admission and activation stay distinct phases,
+// and `reason` carries the stable secret-free name of the classification this
+// file already computed by branch, so a before-start refusal never shares a
+// record with a possible-start timeout, disconnect or unknown outcome. Only
+// that kind name is bound — never the Kernel's rejection text, a pipe or
+// connection identity, a peer address, credential material, the activation
+// nonce, an evidence handle, or arbitrary error text. A path is not an
+// identity: neither the candidate pipe identity nor the approved or observed
+// image path is ever bound (case 978/12). An authority epoch is rendered as the
+// owner's own lineage id plus sequence pair, and a process start identity as the
+// owner's own pid/start pair, so a record distinguishes this process
+// incarnation from a reusable PID. Bounding limits size, not sensitivity
+// (I15.4). Sink outcome never alters result/order/status/cleanup. There is no
+// mutable global dedup cache.
 #[cfg(windows)]
 fn kernel_front_door_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
 }
 
+/// Renders one held Kernel authority epoch as its owner's lineage id plus
+/// sequence.
 #[cfg(windows)]
-fn kernel_front_door_observe(detail: &str) {
+fn front_door_authority_epoch_identity(lineage_id: &str, sequence: u64) -> String {
+    format!("{lineage_id}:{sequence}")
+}
+
+/// Renders one held process start identity in the owner's own `pid`/`start`
+/// shape.
+#[cfg(windows)]
+fn front_door_process_start_identity(process_id: u32, start_time_100ns: u64) -> String {
+    format!("pid:{process_id}:start:{start_time_100ns}")
+}
+
+/// The bounded identity of one reconcile decision: the exact expected
+/// activation message identity, plus the secret-free kind name of the outcome
+/// this file already computed. `None` marks a decision that has not computed an
+/// outcome yet, and no outcome kind is then invented for it.
+#[cfg(windows)]
+fn front_door_reconcile_correlation<'a>(
+    expected_message_id: &'a PlatformHandle,
+    reason: Option<&'static str>,
+) -> LaunchPhaseCorrelation<'a> {
+    let correlation = LaunchPhaseCorrelation::NONE.with_operation(expected_message_id.as_str());
+    match reason {
+        Some(kind) => correlation.with_reason(kind),
+        None => correlation,
+    }
+}
+
+#[cfg(windows)]
+fn kernel_front_door_observe(phase: &str, correlation: &LaunchPhaseCorrelation<'_>) {
     kernel_front_door_note_event_log_unavailable();
+    let detail = correlation.render(phase);
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::ScmDispatch,
-        detail,
+        &detail,
     );
 }
 
@@ -89,8 +137,22 @@ pub(super) fn kernel_control_request(
     sequence: u64,
 ) -> Result<KernelControlRequest, HostError> {
     // WORK_UNIT_CASE: 978/7 — control request built; handshake/auth material
-    // stays distinct from activation, no secrets observed.
-    kernel_front_door_observe("host.kernel-front-door control requested");
+    // stays distinct from activation, no secrets observed. The candidate
+    // activation, installation, approved artifact and authority epoch are
+    // already in hand, and the requested generation is named; the command
+    // variant has no stable name accessor in its owner, so no reason kind is
+    // claimed for it.
+    let authority_epoch = front_door_authority_epoch_identity(
+        candidate.kernel_epoch.lineage_id.as_str(),
+        candidate.kernel_epoch.sequence.get(),
+    );
+    let correlation = LaunchPhaseCorrelation::NONE
+        .with_installation(candidate.installation_id.as_str())
+        .with_generation(generation.value())
+        .with_operation(candidate.activation_id.as_str())
+        .with_artifact(candidate.artifact_hash.as_str())
+        .with_fence(&authority_epoch);
+    kernel_front_door_observe("host.kernel-front-door control requested", &correlation);
     KernelControlRequest {
         wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
         wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -115,12 +177,20 @@ pub(super) fn activation_response_or_reconcile(
 ) -> Result<Option<KernelActivationReceipt>, HostError> {
     // WORK_UNIT_CASE: 978/9 — reconcile decision requested; transport loss
     // (timeout/disconnect/unknown) reconciles as None without inventing
-    // evidence, distinct from a before-start rejection below.
-    kernel_front_door_observe("host.kernel-front-door reconcile requested");
+    // evidence, distinct from a before-start rejection below. The exact
+    // expected activation message identity is in hand and is named; no
+    // outcome exists yet, so no reason kind is claimed.
+    kernel_front_door_observe(
+        "host.kernel-front-door reconcile requested",
+        &front_door_reconcile_correlation(expected_message_id, None),
+    );
     let Ok(response) = response else {
         // WORK_UNIT_CASE: 978/9 — disconnect/unknown observed as reconcile;
         // no invented receipt, exact None propagates.
-        kernel_front_door_observe("host.kernel-front-door disconnect observed");
+        kernel_front_door_observe(
+            "host.kernel-front-door disconnect observed",
+            &front_door_reconcile_correlation(expected_message_id, Some("transport-lost")),
+        );
         return Ok(None);
     };
     if response.message_id != *expected_message_id
@@ -128,13 +198,22 @@ pub(super) fn activation_response_or_reconcile(
     {
         // WORK_UNIT_CASE: 978/9 — unknown binding observed as reconcile;
         // mismatched identity never promotes into activation.
-        kernel_front_door_observe("host.kernel-front-door unknown observed");
+        kernel_front_door_observe(
+            "host.kernel-front-door unknown observed",
+            &front_door_reconcile_correlation(expected_message_id, Some("unknown-binding")),
+        );
         return Ok(None);
     }
     if let Some(error) = response.error {
         // WORK_UNIT_CASE: 978/9 — before-start rejection observed; exact
-        // rejection propagates, no secrets observed.
-        kernel_front_door_observe("host.kernel-front-door before-start observed");
+        // rejection propagates, no secrets observed. This refusal happened
+        // before any possible start, which is why it never shares a record with
+        // the transport-loss arms; the Kernel's rejection text stays out of the
+        // record.
+        kernel_front_door_observe(
+            "host.kernel-front-door before-start observed",
+            &front_door_reconcile_correlation(expected_message_id, Some("before-start-refusal")),
+        );
         return Err(HostError::ProcessContour(format!(
             "Kernel rejected Activate: {error}"
         )));
@@ -142,9 +221,18 @@ pub(super) fn activation_response_or_reconcile(
     // WORK_UNIT_CASE: 978/9 — timeout observed as reconcile when no receipt
     // is carried; a carried receipt is activation evidence, not a timeout.
     if response.activation_receipt.is_none() {
-        kernel_front_door_observe("host.kernel-front-door timeout observed");
+        kernel_front_door_observe(
+            "host.kernel-front-door timeout observed",
+            &front_door_reconcile_correlation(expected_message_id, Some("no-receipt-carried")),
+        );
     } else {
-        kernel_front_door_observe("host.kernel-front-door activation observed");
+        kernel_front_door_observe(
+            "host.kernel-front-door activation observed",
+            &front_door_reconcile_correlation(
+                expected_message_id,
+                Some("activation-receipt-carried"),
+            ),
+        );
     }
     Ok(response.activation_receipt)
 }
@@ -157,8 +245,13 @@ pub(super) fn validate_authenticated_kernel_peer(
     expected_image: &Path,
 ) -> Result<(), HostError> {
     // WORK_UNIT_CASE: 978/7 — auth requested; peer authentication stays
-    // distinct from nonce/handshake/activation, no secrets observed.
-    kernel_front_door_observe("host.kernel-front-door auth requested");
+    // distinct from nonce/handshake/activation, no secrets observed. The
+    // retained expected process start identity is already in hand and is named;
+    // the expected image is a path, not an identity, so it is never bound.
+    let expected_process_start =
+        front_door_process_start_identity(expected_pid, expected_start_time_100ns);
+    let correlation = LaunchPhaseCorrelation::NONE.with_process_start(&expected_process_start);
+    kernel_front_door_observe("host.kernel-front-door auth requested", &correlation);
     let peer = peer.process_binding().ok_or_else(|| {
         HostError::ProcessContour("Kernel peer identity is unavailable".to_owned())
     })?;
@@ -175,8 +268,13 @@ pub(super) fn validate_authenticated_kernel_peer(
         ));
     }
     // WORK_UNIT_CASE: 978/7 — authenticated peer observed; start-identity
-    // (PID + start-time + image) matched, distinct from activation.
-    kernel_front_door_observe("host.kernel-front-door authenticated peer observed");
+    // (PID + start-time + image) matched, distinct from activation. The image
+    // comparison proved the same retained process start identity, so the
+    // record names that identity and never the image path itself.
+    kernel_front_door_observe(
+        "host.kernel-front-door authenticated peer observed",
+        &correlation,
+    );
     Ok(())
 }
 
@@ -240,8 +338,25 @@ pub(super) async fn connect_authenticated_kernel_front_door(
     kernel_process: &ProcessIdentity,
 ) -> Result<NamedPipeTransport, HostError> {
     // WORK_UNIT_CASE: 978/7 — handshake requested; authenticated connect is
-    // distinct from nonce issuance and activation, no secrets observed.
-    kernel_front_door_observe("host.kernel-front-door handshake requested");
+    // distinct from nonce issuance and activation, no secrets observed. The
+    // candidate activation, installation, approved artifact and authority epoch
+    // plus the retained Kernel process start identity are in hand and named;
+    // the pipe identity is a name, not an identity, so it is never bound.
+    let authority_epoch = front_door_authority_epoch_identity(
+        candidate.kernel_epoch.lineage_id.as_str(),
+        candidate.kernel_epoch.sequence.get(),
+    );
+    let kernel_process_start = front_door_process_start_identity(
+        kernel_process.process_id,
+        kernel_process.start_time_100ns,
+    );
+    let correlation = LaunchPhaseCorrelation::NONE
+        .with_installation(candidate.installation_id.as_str())
+        .with_operation(candidate.activation_id.as_str())
+        .with_artifact(candidate.artifact_hash.as_str())
+        .with_process_start(&kernel_process_start)
+        .with_fence(&authority_epoch);
+    kernel_front_door_observe("host.kernel-front-door handshake requested", &correlation);
     let expected_extra_sid = candidate
         .agent_bridge_admission
         .as_ref()
@@ -261,13 +376,14 @@ pub(super) async fn connect_authenticated_kernel_front_door(
         (None, None) => {
             // WORK_UNIT_CASE: 978/7 — handshake observed; exact transport
             // propagates unchanged.
-            kernel_front_door_observe("host.kernel-front-door handshake observed");
+            kernel_front_door_observe("host.kernel-front-door handshake observed", &correlation);
             Ok(transport)
         }
         (Some(observed), Some(expected)) if observed == expected => {
             // WORK_UNIT_CASE: 978/7 — handshake observed; exact transport
-            // propagates unchanged.
-            kernel_front_door_observe("host.kernel-front-door handshake observed");
+            // propagates unchanged. The observed extra SID matched the retained
+            // bridge policy; the SID itself stays out of the record.
+            kernel_front_door_observe("host.kernel-front-door handshake observed", &correlation);
             Ok(transport)
         }
         _ => Err(HostError::ProcessContour(
@@ -647,5 +763,222 @@ fn classify_kernel_owner_error(reason: String) -> HostDurableJobOwnerError {
         owner_unavailable(reason)
     } else {
         HostDurableJobOwnerError::Rejected(reason)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use eliot_kernel_service::{KernelControlResponse, KernelServiceState};
+
+    use super::{HostError, PlatformHandle, activation_response_or_reconcile};
+
+    /// Non-sensitive marker the Kernel would have returned as its rejection
+    /// text; it must never reach a diagnostic record.
+    const REJECTION_CANARY: &str = "canary-rejection-payload-978";
+    /// Non-sensitive marker carried by a lost-transport error.
+    const TRANSPORT_CANARY: &str = "canary-transport-payload-978";
+
+    /// Bounded facade output captured from the live instrumented closure.
+    #[derive(Clone, Default)]
+    struct CapturedRecords {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CapturedRecords {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `closure` under a scoped subscriber and returns what the #889
+    /// facade actually emitted while it executed.
+    fn captured(closure: impl FnOnce()) -> String {
+        let records = CapturedRecords::default();
+        let writer = records.clone();
+        let bytes = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, closure);
+            records
+                .bytes
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .clone()
+        };
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    /// One authenticated Kernel control response carrying no optional receipt.
+    fn response(
+        message_id: PlatformHandle,
+        request_digest: &str,
+        error: Option<String>,
+    ) -> KernelControlResponse {
+        KernelControlResponse {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id,
+            request_digest: request_digest.to_owned(),
+            state: KernelServiceState::Activating,
+            receipt: None,
+            runtime_health: None,
+            activation_receipt: None,
+            store_rebind_receipt: None,
+            supervision_lease: None,
+            runtime_lease_census: None,
+            introduction_rows: None,
+            error,
+            payload_digest: String::new(),
+        }
+    }
+
+    // WORK_UNIT_CASE: 978/9
+    #[test]
+    fn reconcile_records_separate_before_start_refusal_from_possible_start_loss() {
+        let message = handle("activate-message-978");
+        let digest = "a".repeat(64);
+
+        let transport_lost = captured(|| {
+            let outcome = activation_response_or_reconcile(
+                Err(HostError::RecoveryRequired(TRANSPORT_CANARY.to_owned())),
+                &message,
+                &digest,
+            );
+            assert!(matches!(outcome, Ok(None)));
+        });
+        let mismatched = captured(|| {
+            let outcome = activation_response_or_reconcile(
+                Ok(response(
+                    handle("other-message-978"),
+                    &digest,
+                    Some(REJECTION_CANARY.to_owned()),
+                )),
+                &message,
+                &digest,
+            );
+            assert!(matches!(outcome, Ok(None)));
+        });
+        let refused = captured(|| {
+            let outcome = activation_response_or_reconcile(
+                Ok(response(
+                    message.clone(),
+                    &digest,
+                    Some(REJECTION_CANARY.to_owned()),
+                )),
+                &message,
+                &digest,
+            );
+            assert!(outcome.is_err());
+        });
+        let no_receipt = captured(|| {
+            let outcome = activation_response_or_reconcile(
+                Ok(response(message.clone(), &digest, None)),
+                &message,
+                &digest,
+            );
+            assert!(matches!(outcome, Ok(None)));
+        });
+
+        // A refusal that provably happened before any possible start never
+        // shares a record kind with transport loss after a start may have
+        // occurred.
+        assert!(
+            transport_lost.contains("reason=transport-lost"),
+            "got: {transport_lost}"
+        );
+        assert!(
+            mismatched.contains("reason=unknown-binding"),
+            "got: {mismatched}"
+        );
+        assert!(
+            refused.contains("reason=before-start-refusal"),
+            "got: {refused}"
+        );
+        assert!(
+            no_receipt.contains("reason=no-receipt-carried"),
+            "got: {no_receipt}"
+        );
+        assert!(!refused.contains("reason=transport-lost"), "got: {refused}");
+        assert!(
+            !transport_lost.contains("reason=before-start-refusal"),
+            "got: {transport_lost}"
+        );
+        // Every record names the exact expected activation message identity.
+        for records in [&transport_lost, &mismatched, &refused, &no_receipt] {
+            assert!(
+                records.contains("operation=activate-message-978"),
+                "got: {records}"
+            );
+            assert!(
+                records.contains("phase=host.kernel-front-door reconcile requested"),
+                "got: {records}"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 978/12
+    #[test]
+    fn reconcile_records_carry_no_payload_or_error_text() {
+        let message = handle("activate-message-978");
+        let digest = "c".repeat(64);
+        let refused = captured(|| {
+            let outcome = activation_response_or_reconcile(
+                Ok(response(
+                    message.clone(),
+                    &digest,
+                    Some(REJECTION_CANARY.to_owned()),
+                )),
+                &message,
+                &digest,
+            );
+            assert!(outcome.is_err());
+        });
+        let transport_lost = captured(|| {
+            let outcome = activation_response_or_reconcile(
+                Err(HostError::RecoveryRequired(TRANSPORT_CANARY.to_owned())),
+                &message,
+                &digest,
+            );
+            assert!(matches!(outcome, Ok(None)));
+        });
+        for (records, canary) in [
+            (&refused, REJECTION_CANARY),
+            (&transport_lost, TRANSPORT_CANARY),
+        ] {
+            assert!(
+                !records.contains(canary),
+                "returned error text must stay out of the record: {records}"
+            );
+            assert!(
+                !records.contains("Kernel rejected Activate"),
+                "returned error text must stay out of the record: {records}"
+            );
+            assert!(!records.contains(digest.as_str()), "got: {records}");
+        }
+        assert!(
+            refused.contains("phase=host.kernel-front-door before-start observed"),
+            "got: {refused}"
+        );
+        assert!(
+            transport_lost.contains("phase=host.kernel-front-door disconnect observed"),
+            "got: {transport_lost}"
+        );
     }
 }

@@ -392,6 +392,12 @@ pub(super) async fn dispatch_agent_candidate_submit(
         )
         .await?
         .context("cognitive candidate has no canonical attempt")?;
+        // Schema-version gate (issue #935): a record whose declared version is
+        // not the one supported version is not the current attempt contract, so
+        // it is refused before its status, capability or write identity can
+        // authorize a candidate submission. This runs ahead of every admission
+        // comparison below and never downgrades to a warning.
+        attempt.receipt_body.validate_schema_version()?;
         if attempt.canonical_receipt != claims.attempt_receipt
             || attempt.receipt_body.status != CognitiveRunCallStatus::Attempting
             || attempt.receipt_body.capability.as_ref() != Some(capability)
