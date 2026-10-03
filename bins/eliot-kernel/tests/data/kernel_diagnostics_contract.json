@@ -2,7 +2,7 @@
   "contract": "F-LOG-KERNEL-0 kernel structured diagnostics facade",
   "issue": 895,
   "target": "eliot_kernel::diagnostics",
-  "note": "Pins the entrypoint observation vocabulary exercised by the focused contract tests. The full 24-case matrix (complete entrypoint/error/propagation inventory, per-stage failure distinctions, canary sweeps) is deferred to the owning follow-ups; this fixture covers only the facade-init and single-observation proofs.",
+  "note": "Pins the entrypoint observation vocabulary and the non-terminal observability-install refusal vocabulary exercised by the focused contract tests. A refused metrics install records kernel.observability_install_refused carrying one static owner-issued code and never a kernel.terminal_error; exit_error stays the sole kernel.terminal_error emitter ON THE ENTRYPOINT FUNNEL; the library modules keep their own per-operation terminal records and are out of this card scope. Codes are fixed vocabulary only: no dynamic Display prose, no raw paths, frames or whole-error strings. Both observability_refusal_codes keys are looked up by name through pinned.get(variant_path) in the inline test in src/main.rs, so a renamed KernelObservabilityError variant or a changed code is red there and this fixture cannot drift away from the Rust mapping silently. The full 24-case matrix (complete entrypoint/error/propagation inventory, per-stage failure distinctions, canary sweeps) is deferred to the owning follow-ups, as are the markers outside 895/2,/3,/4; this fixture covers only the facade-init, single-observation and install-refusal proofs.",
   "stages": {
     "startup": "startup",
     "launch_config": "launch_config"
@@ -10,6 +10,11 @@
   "entrypoint_event": "kernel.entrypoint_stage",
   "terminal_event": "kernel.terminal_error",
   "terminal_code_sample": "INVALID_CONFIGURATION",
+  "observability_refusal_event": "kernel.observability_install_refused",
+  "observability_refusal_codes": {
+    "KernelObservabilityError::Config": "OBSERVABILITY_INSTALL_CONFIG_REFUSED",
+    "KernelObservabilityError::EndpointNotLoopback": "OBSERVABILITY_INSTALL_ENDPOINT_NOT_LOOPBACK"
+  },
   "max_field_bytes": 256,
   "max_detail_bytes": 1024,
   "event_log_sink": "unavailable",

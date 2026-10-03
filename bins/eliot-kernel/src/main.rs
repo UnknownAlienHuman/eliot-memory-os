@@ -38,9 +38,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use eliot_kernel::kernel_diagnostics::{
-    EntrypointStage, install_kernel_diagnostics, observe_entrypoint,
-    observe_entrypoint_with_detail, observe_terminal_error,
+    EntrypointStage, bound_detail, observability_install_refused_code, observe_entrypoint,
+    observe_entrypoint_with_detail, observe_observability_install_refused, observe_terminal_error,
 };
+// F-LOG-KERNEL-0 (#895): the facade install and the projection of the accepted
+// owner's real outcome are reached only where the observability owner can
+// produce one (the Windows launch contour below), so both imports are gated
+// with their only call site. There is no second, private subscriber behind them
+// on any target.
+#[cfg(windows)]
+use eliot_kernel::kernel_diagnostics::{DiagnosticSubscriberOwner, install_kernel_diagnostics};
 use eliot_kernel::{
     AuditAnchorBinding, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
     KernelConfig, KernelDoctorRecoveryLedger, compose_dispatch_contour,
@@ -151,11 +158,11 @@ fn observability_config(
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
-    // F-LOG-KERNEL-0 (#895): install the process-global diagnostics
-    // subscriber before any entrypoint observation. Best-effort by
-    // contract: diagnostics never gate startup, so both the first install
-    // and an AlreadyOwned re-init continue into the launch funnel.
-    let _ = install_kernel_diagnostics();
+    // F-LOG-KERNEL-0 (#895): the one process-global `tracing` subscriber owner
+    // in this process is `eliot_observability_runtime::install` (issue #1836),
+    // not this binary. The facade no longer performs any `try_init` of its own;
+    // it is told the real owner outcome once that owner answered, below, so
+    // two components can never both claim the one global subscriber.
     observe_entrypoint(EntrypointStage::Startup);
     let options = match startup_binding::parse_launch_options(std::env::args_os().skip(1)) {
         Ok(options) => options,
@@ -187,15 +194,41 @@ async fn main() {
     // Issue #1836 (W1): install the shared observability runtime from the
     // roots the Host injected, before the store bootstrap, the launch
     // contract, the composition, and the front-door loop start. Best-effort
-    // by the same contract as the subscriber above: a refused configuration
+    // by the same contract as the diagnostics below: a refused configuration
     // leaves the launch funnel untouched and is never turned into a startup
     // failure.
+    //
+    // F-LOG-KERNEL-0 (#895): this is the first and only process-global
+    // subscriber attempt, so the facade is told the real owner outcome
+    // immediately after it instead of preempting it. A refused configuration
+    // produces no owner outcome at all, and the facade is simply not installed
+    // on that path rather than being handed a fabricated one.
+    //
+    // The facade emits through the owner this process already established; it
+    // never installs a competing subscriber. Its answer is non-gating by
+    // contract: both the first install and an `AlreadyInstalled` re-init
+    // continue into the launch funnel and neither result exits the process.
+    // Protocol stdout is untouched.
+    //
+    // Non-Windows targets install no observability owner at all, so there is no
+    // real outcome to project there and no facade install either; that target is
+    // not a first-line supported one (I1.7) and its funnel still terminates
+    // through the single `exit_error` boundary.
     #[cfg(windows)]
-    let _observability = eliot_observability_runtime::install(&observability_config(
+    let _observability = match eliot_observability_runtime::install(&observability_config(
         &startup_binding.receipt_root,
         &startup_binding.kernel_ors_root,
         &authority_contour,
-    ));
+    )) {
+        Ok(outcome) => {
+            let _ = install_kernel_diagnostics(DiagnosticSubscriberOwner::observed(&outcome));
+            Some(outcome)
+        }
+        // A refused configuration is not a startup failure: there is no
+        // accepted owner outcome to project, so the facade is not installed
+        // and the funnel continues exactly as before.
+        Err(_) => None,
+    };
     let prepared_store = match startup_binding::prepare_store_bootstrap(&options) {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
@@ -345,7 +378,22 @@ async fn main() {
             observability.publish_runtime_counters();
             observe_entrypoint_with_detail(EntrypointStage::Composition, observability.describe());
         }
-        Err(error) => observe_terminal_error(&error.to_string()),
+        // F-LOG-KERNEL-0 (#895): a refused observability install is documented
+        // as never gating startup, so it is a non-terminal degraded observation
+        // carrying one fixed owner-issued static code, projected from the typed
+        // error by the facade's single owner of that vocabulary. The owner
+        // requires that "only `exit_error` may emit the process terminal
+        // record", so this arm emits no terminal record at all: it can no
+        // longer produce the second `kernel.terminal_error` for one launch
+        // attempt that defect 4 named, and the code is never the failure's
+        // `Display` prose. Within this entrypoint funnel `exit_error` is
+        // therefore the sole terminal emitter; the library modules keep their
+        // own per-operation terminal records and stay the deferred leaves'
+        // scope. The arm still falls through into composition and the
+        // front-door launch.
+        Err(error) => {
+            observe_observability_install_refused(observability_install_refused_code(error));
+        }
     }
     #[cfg(windows)]
     if let Some(leases) = &profile_root_leases {
@@ -482,8 +530,213 @@ pub(crate) fn write_error(code: &str, detail: &str) {
     // F-LOG-KERNEL-0 (#895 W2): no-event reason — stderr is the terminal
     // sink itself, so a failed write here is unobservable by design and,
     // per W5, must not fail the process. No behavior change.
+    //
+    // F-LOG-KERNEL-0 (#895 residual): `detail` reaches this funnel as a whole
+    // error `Display` string, so it is bound here — once, at the only in-file
+    // lever — through the facade's existing detail owner, `bound_detail`. No
+    // second bound, truncation scheme or validator is introduced here; the raw
+    // protected evidence stays with its owner. The receipt shape (`error`,
+    // `detail`), the escaped `{:?}` string form, the stderr write and its
+    // deliberately ignored result are unchanged.
+    //
+    // WHICH limit actually binds here, measured rather than assumed: the shared
+    // telemetry field policy screens any value longer than
+    // `MAX_LABEL_VALUE_CHARS` (256 characters) to an immutable redacted
+    // evidence handle, and that threshold is reached first, so at this call
+    // site the POLICY is the operative limit and the detail is redacted rather
+    // than truncated. `MAX_DIAGNOSTIC_DETAIL_BYTES` (1024) is the owner's
+    // ceiling and `bound_detail` still applies it, but this funnel never
+    // reaches it. Both are the existing owner's; neither is redefined here.
+    let bounded = bound_detail(detail);
+    let bounded_detail = bounded.text();
     let _ = writeln!(
         io::stderr().lock(),
-        "{{\"error\":\"{code}\",\"detail\":{detail:?}}}"
+        "{{\"error\":\"{code}\",\"detail\":{bounded_detail:?}}}"
     );
+}
+
+/// F-LOG-KERNEL-0 (#895) private inline proof for the two entrypoint-funnel
+/// diagnostics this binary owns.
+///
+/// `exit_error` and `write_error` are `pub(crate)` items of a binary target, so
+/// no file under `tests/` can reach them; this module is the only honest place
+/// to prove the refused-install code mapping and the bounded receipt detail. It
+/// asserts through the facade's exported owners and the pinned contract fixture
+/// rather than restating their vocabulary, so nothing here can drift into a
+/// second refusal code, a second bound, or a second validator.
+#[cfg(test)]
+mod entry_funnel_diagnostics_tests {
+    use eliot_kernel::execution_metrics::KernelObservabilityError;
+    use eliot_kernel::kernel_diagnostics::{
+        MAX_DIAGNOSTIC_DETAIL_BYTES, bound_detail, observability_install_refused_code,
+    };
+
+    /// The pinned #895 contract fixture, compiled in so this proof and the
+    /// fixture can never drift apart silently.
+    const CONTRACT_FIXTURE: &str = include_str!("../tests/data/kernel_diagnostics_contract.json");
+
+    /// A refused metrics install records one fixed non-terminal code and never
+    /// a terminal record; the codes are the pinned static vocabulary, not the
+    /// failure's own `Display` prose.
+    #[test]
+    fn refused_observability_install_maps_to_the_pinned_static_codes() {
+        let Ok(contract) = serde_json::from_str::<serde_json::Value>(CONTRACT_FIXTURE) else {
+            panic!("the pinned kernel diagnostics contract fixture must parse");
+        };
+        let Some(pinned) = contract
+            .get("observability_refusal_codes")
+            .and_then(serde_json::Value::as_object)
+        else {
+            panic!("the pinned contract fixture must carry observability_refusal_codes");
+        };
+
+        for (variant_path, variant) in [
+            (
+                "KernelObservabilityError::Config",
+                KernelObservabilityError::Config,
+            ),
+            (
+                "KernelObservabilityError::EndpointNotLoopback",
+                KernelObservabilityError::EndpointNotLoopback,
+            ),
+        ] {
+            let Some(expected) = pinned.get(variant_path).and_then(serde_json::Value::as_str)
+            else {
+                panic!("the pinned contract fixture must pin {variant_path}");
+            };
+            let code = observability_install_refused_code(variant);
+            assert_eq!(
+                code, expected,
+                "the Rust mapping and the pinned fixture must agree for {variant_path}"
+            );
+            // A code is fixed vocabulary, never a failure rendering: no
+            // whitespace and no lowercase word can come from `Display`, so
+            // neither typed variant can project prose as its code.
+            assert!(
+                !code.chars().any(char::is_whitespace),
+                "{variant_path} must project a whitespace-free code"
+            );
+            assert!(
+                !code.chars().any(char::is_lowercase),
+                "{variant_path} must project an upper-case code"
+            );
+            assert_ne!(
+                code,
+                variant.to_string(),
+                "{variant_path} must never project its own Display rendering"
+            );
+        }
+
+        // A refused observability install is not the terminal event, and this
+        // funnel's one terminal record comes from `exit_error` alone: no other
+        // entrypoint callsite emits it.
+        assert_ne!(
+            contract
+                .get("observability_refusal_event")
+                .and_then(serde_json::Value::as_str),
+            contract
+                .get("terminal_event")
+                .and_then(serde_json::Value::as_str),
+            "a refused observability install must stay off the terminal event"
+        );
+        let source = include_str!("main.rs");
+        // The needle is assembled at compile time so this assertion cannot
+        // match its own literal in the source it scans.
+        let terminal_call = concat!("observe_terminal_error", "(");
+        // Uniqueness alone proves nothing about POSITION: moving the call from
+        // `exit_error` into `write_error` would keep the count at 1 and make
+        // every non-terminal driver failure emit a terminal record. So slice
+        // the two function bodies out of this file's own source and require the
+        // call to sit inside the designated boundary and nowhere else.
+        let exit_error_body = function_body(source, "pub(crate) fn exit_error");
+        let write_error_body = function_body(source, "pub(crate) fn write_error");
+        assert!(
+            exit_error_body.contains(terminal_call),
+            "`exit_error` is the designated terminal boundary and must emit the record"
+        );
+        assert!(
+            !write_error_body.contains(terminal_call),
+            "`write_error` is not a terminal boundary and must never emit a terminal record"
+        );
+    }
+
+    /// The stderr receipt detail is bounded by the facade's existing owner, so
+    /// no whole-error `Display` string reaches the operational surface.
+    #[test]
+    fn terminal_receipt_detail_is_bounded_by_the_facade_owner() {
+        let in_bound = "launch descriptor digest mismatch";
+        let admitted = bound_detail(in_bound);
+        assert_eq!(
+            admitted.text(),
+            in_bound,
+            "an in-bound detail must pass through byte-identical"
+        );
+        assert!(!admitted.truncated());
+        assert!(admitted.redaction_status().is_none());
+        assert_eq!(admitted.original_bytes(), in_bound.len());
+
+        let oversized = "x".repeat(8 * MAX_DIAGNOSTIC_DETAIL_BYTES);
+        let screened = bound_detail(&oversized);
+        assert!(
+            screened.text().len() <= MAX_DIAGNOSTIC_DETAIL_BYTES,
+            "the emitted detail must stay inside the owner's byte bound"
+        );
+        assert!(
+            !screened.text().contains('x'),
+            "no fragment of the oversized detail may reach the operational surface"
+        );
+        // Screening is first and fail-closed in the shared field policy, so an
+        // over-long detail becomes an immutable evidence handle rather than a
+        // truncated prefix: nothing of the input survives, while the honesty
+        // record keeps the byte length that was actually presented.
+        assert!(
+            screened.redaction_status().is_some(),
+            "the shared field policy must screen an over-long detail to a handle"
+        );
+        assert!(
+            !screened.truncated(),
+            "a screened detail never reaches the bounding path"
+        );
+        assert_eq!(screened.original_bytes(), oversized.len());
+
+        let source = include_str!("main.rs");
+        // Proving that `bound_detail` is CALLED proves nothing about what the
+        // receipt actually emits: the bound value can be computed, bound to an
+        // unused local, and the raw `Display` detail interpolated anyway. So
+        // pin the emitting line itself - the receipt must interpolate the
+        // BOUND value and must no longer interpolate the raw one.
+        let write_error_body = function_body(source, "pub(crate) fn write_error");
+        let raw_detail = concat!("{detail", ":?}");
+        // The emitting literal is matched as TEXT in the scanned source, so the
+        // needle is assembled at compile time; naming `bounded_detail` in a
+        // format! here would look the variable up in this test, not in the
+        // slice being scanned.
+        let bounded_detail_interpolation = concat!("{bounded_detail", ":?}");
+        assert!(
+            !write_error_body.contains(raw_detail),
+            "the terminal receipt must not interpolate the raw `Display` detail"
+        );
+        assert!(
+            write_error_body.contains(bounded_detail_interpolation),
+            "the terminal receipt must interpolate the BOUND detail value"
+        );
+    }
+
+    /// Returns one function's body by slicing this file's own source between its
+    /// signature and the start of the next top-level `fn`.
+    ///
+    /// The needles used against the result are assembled with `concat!` by the
+    /// caller, so an assertion can never match its own literal in the text it
+    /// scans.
+    fn function_body(source: &str, signature: &str) -> String {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must be declared in this file"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\nfn ")
+            .or_else(|| rest.find("\npub(crate) fn "))
+            .unwrap_or(rest.len());
+        rest[..end].to_owned()
+    }
 }
