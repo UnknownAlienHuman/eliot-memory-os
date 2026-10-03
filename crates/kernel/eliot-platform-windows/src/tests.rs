@@ -3502,6 +3502,111 @@ fn job_assignment_identity_termination_and_kill_on_close_are_real() {
     assert!(wait_for_child_exit(&mut child));
 }
 
+/// Reads the CPU rate control the kernel reports for the Job named `name`.
+///
+/// `I1.6` requires that CPU limits are set by the Module Manifest, so the
+/// installed cap is proved by asking the kernel for it rather than by reading
+/// back what this crate intended to write.
+#[cfg(windows)]
+fn observed_cpu_rate_control(name: &str) -> u32 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JobObjectCpuRateControlInformation,
+        QueryInformationJobObject,
+    };
+    const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
+    let wide = nul_terminated_wide(std::ffi::OsStr::new(name))
+        .unwrap_or_else(|error| panic!("Job name is not representable: {error}"));
+    // SAFETY: `wide` is NUL-terminated and the call returns a fresh handle.
+    let handle = unsafe {
+        windows_sys::Win32::System::JobObjects::OpenJobObjectW(
+            JOB_OBJECT_QUERY_ACCESS,
+            0,
+            wide.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        panic!("query-only reopen of {name} failed");
+    }
+    let mut information = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+    let length = u32::try_from(std::mem::size_of_val(&information))
+        .unwrap_or_else(|_| panic!("Job rate control structure size is unrepresentable"));
+    let mut returned = 0_u32;
+    // SAFETY: the handle is live, `information` is writable for exactly the
+    // declared byte length of this information class, and the union member is
+    // read only after the query reports success.
+    let queried = unsafe {
+        QueryInformationJobObject(
+            handle,
+            JobObjectCpuRateControlInformation,
+            (&raw mut information).cast(),
+            length,
+            &raw mut returned,
+        )
+    };
+    // SAFETY: this test owns the query handle and closes it exactly once.
+    let _ = unsafe { CloseHandle(handle) };
+    assert_ne!(queried, 0, "Job {name} refused a CPU rate control query");
+    // SAFETY: `CpuRate` is the union member selected by the ENABLE control flag
+    // this crate installs, the query succeeded, and the value is copied out
+    // before the local structure goes out of scope.
+    unsafe { information.Anonymous.CpuRate }
+}
+
+#[cfg(windows)]
+#[test]
+fn job_cpu_rate_control_percent_is_installed_and_read_back_by_the_kernel() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let identity =
+        JobObjectIdentity::new(format!("Local\\Eliot-P02-rate-control-{}", unique_suffix()))
+            .unwrap_or_else(|error| panic!("Job name rejected: {error}"));
+    let limits = JobObjectLimits::new(None, None, None, Some(50))
+        .unwrap_or_else(|error| panic!("50% CPU rate control rejected: {error}"));
+    assert_eq!(limits.cpu_rate_control_percent(), Some(50));
+    let job = JobObject::new_named_kill_on_close_with_limits(identity.clone(), limits)
+        .unwrap_or_else(|error| panic!("rate-controlled Job creation failed: {error}"));
+    assert_eq!(
+        observed_cpu_rate_control(identity.name()),
+        5_000,
+        "a requested 50% cap must reach the Job as 5,000 cycles per 10,000 cycles"
+    );
+    drop(job);
+
+    // The unthrottled Job is the contrast that keeps an absent cap from being
+    // read as a 0% cap: the kernel reports zero units, while the coordinate
+    // this crate carried is the absence itself.
+    let unthrottled_identity = JobObjectIdentity::new(format!(
+        "Local\\Eliot-P02-rate-control-absent-{}",
+        unique_suffix()
+    ))
+    .unwrap_or_else(|error| panic!("Job name rejected: {error}"));
+    let unthrottled = JobObjectLimits::new(None, None, None, None)
+        .unwrap_or_else(|error| panic!("unthrottled limits rejected: {error}"));
+    assert_eq!(unthrottled.cpu_rate_control_percent(), None);
+    let unthrottled_job =
+        JobObject::new_named_kill_on_close_with_limits(unthrottled_identity.clone(), unthrottled)
+            .unwrap_or_else(|error| panic!("unthrottled Job creation failed: {error}"));
+    assert_eq!(observed_cpu_rate_control(unthrottled_identity.name()), 0);
+    drop(unthrottled_job);
+}
+
+#[cfg(windows)]
+#[test]
+fn job_cpu_rate_control_percent_outside_one_to_hundred_is_refused() {
+    let zero = JobObjectLimits::new(None, None, None, Some(0));
+    assert_eq!(zero, Err(WindowsAdapterError::InvalidInput));
+    let above_hundred = JobObjectLimits::new(None, None, None, Some(101));
+    assert_eq!(above_hundred, Err(WindowsAdapterError::InvalidInput));
+    assert_eq!(
+        JobObjectLimits::require_memory_ceiling(None, Some(1_048_576), Some(4), Some(101)),
+        Err(WindowsAdapterError::InvalidInput)
+    );
+    let admitted =
+        JobObjectLimits::require_memory_ceiling(None, Some(1_048_576), Some(4), Some(100))
+            .unwrap_or_else(|error| panic!("100% CPU rate control rejected: {error}"));
+    assert_eq!(admitted.cpu_rate_control_percent(), Some(100));
+}
+
 #[cfg(windows)]
 #[test]
 fn dropping_host_owned_running_job_kills_children_and_removes_reopen_path() {

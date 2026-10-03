@@ -4608,6 +4608,51 @@ pub enum OrsError {
     SupervisionLeaseTicketAlreadyCommitted,
     #[error("supervision-lease history limit must be between 1 and {MAX_RECOVERY_PAGE}")]
     InvalidSupervisionLeaseHistoryLimit,
+    /// An effect operation lease was refused for a generation ORS already records
+    /// as degraded or quarantined for a manifest refusal (I1.9).
+    ///
+    /// The refusal is typed rather than a `field` string, and it carries the
+    /// affected module identity, the affected generation identity and the
+    /// recorded disposition name, so a caller can act on the disposition without
+    /// parsing a reason out of an opaque field error.
+    #[error(
+        "effect operation lease refused: generation {generation:?} of module {module_id} is already recorded {disposition} for a manifest refusal"
+    )]
+    EffectOperationLeaseGenerationDegraded {
+        /// Module identity of the affected generation.
+        module_id: String,
+        /// Generation identity of the affected generation.
+        generation: ResourceGeneration,
+        /// Recorded ORS generation disposition name (`Degraded` or
+        /// `Quarantined`).
+        disposition: String,
+    },
+    /// An effect operation lease was refused because no ORS reconciliation
+    /// record could be read back for the affected generation (I1.9).
+    ///
+    /// An unreadable record is absence of evidence, never evidence that the
+    /// generation is undegraded, so issuance fails closed with the affected
+    /// module and generation named rather than with a bare field error.
+    #[error(
+        "effect operation lease refused: no ORS reconciliation record was read back for generation {generation:?} of module {module_id}, and an unreadable record is not evidence that it is undegraded"
+    )]
+    EffectOperationLeaseGenerationUnrecorded {
+        /// Module identity of the affected generation.
+        module_id: String,
+        /// Generation identity of the affected generation.
+        generation: ResourceGeneration,
+    },
+    /// An effect operation lease's binding to its recorded execution manifest
+    /// disagreed (I1.9).
+    ///
+    /// The refusal is typed rather than a `field` string and names the recorded
+    /// binding that disagreed, so a manifest binding mismatch is distinguishable
+    /// from every other lease refusal.
+    #[error("effect operation lease manifest binding mismatch: {field}")]
+    EffectOperationLeaseManifestBindingMismatch {
+        /// Recorded manifest binding that disagreed.
+        field: &'static str,
+    },
     #[error("durable ORS schema migration required: {reason}")]
     MigrationRequired { reason: String },
     #[error("durable ORS integrity problem in {record_type}: {reason}")]

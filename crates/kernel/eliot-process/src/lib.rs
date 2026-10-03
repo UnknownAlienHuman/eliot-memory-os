@@ -346,6 +346,14 @@ pub struct ResourceLimits {
     stdout_bytes: u64,
     stderr_bytes: u64,
     max_descendants: u32,
+    /// Share-of-a-CPU hard cap in whole percent, applied by the physical
+    /// implementation as the Job Object's CPU rate control.
+    ///
+    /// `None` is an explicitly unthrottled Job, not a 0% cap. The field is
+    /// `#[serde(default)]` so a launch material written before this coordinate
+    /// existed decodes as the absent cap it actually was instead of failing.
+    #[serde(default)]
+    cpu_rate_control_percent: Option<u16>,
 }
 
 impl ResourceLimits {
@@ -383,7 +391,34 @@ impl ResourceLimits {
             stdout_bytes,
             stderr_bytes,
             max_descendants,
+            cpu_rate_control_percent: None,
         })
+    }
+
+    /// Attaches the Job Object's CPU rate-control cap to these limits.
+    ///
+    /// This is a separate coordinate from `cpu_time_ms`: that one is a total
+    /// CPU-time ceiling, this one is a share of a CPU, and only this one is the
+    /// `JOB_OBJECT_CPU_RATE_CONTROL` mechanism. `None` keeps an explicitly
+    /// unthrottled Job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError::InvalidValue`] for a zero percentage or one
+    /// above 100, so a stated cap is always one the platform can install
+    /// verbatim rather than clamped to something the caller did not ask for.
+    pub fn with_cpu_rate_control_percent(
+        mut self,
+        cpu_rate_control_percent: Option<u16>,
+    ) -> Result<Self, ContractError> {
+        if cpu_rate_control_percent.is_some_and(|percent| !(1..=100).contains(&percent)) {
+            return Err(ContractError::InvalidValue {
+                field: "cpu_rate_control_percent",
+                reason: "must be between 1 and 100 when present",
+            });
+        }
+        self.cpu_rate_control_percent = cpu_rate_control_percent;
+        Ok(self)
     }
 
     /// Returns the wall-clock ceiling.
@@ -414,6 +449,14 @@ impl ResourceLimits {
     /// Returns the descendant ceiling.
     pub const fn max_descendants(&self) -> u32 {
         self.max_descendants
+    }
+
+    /// Returns the CPU rate-control cap, if one was requested.
+    ///
+    /// `None` is an explicitly unthrottled Job, never a 0% reading.
+    #[must_use]
+    pub const fn cpu_rate_control_percent(&self) -> Option<u16> {
+        self.cpu_rate_control_percent
     }
 }
 
