@@ -1,6 +1,6 @@
 # Shared seams — ownership is not whole-issue dependency
 
-No entry changes product contracts. SOURCE means a bounded source inspection;
+No entry changes product contracts. SOURCE / SOURCE_SUBSET mean bounded source inspection, not full issue acceptance;
 BODY means the current issue partition was read but the full source/thread join is
 not verified. BODY and HISTORICAL findings are not implementation-ready certifications.
 
@@ -32,18 +32,52 @@ not verified. BODY and HISTORICAL findings are not implementation-ready certific
 
 ## Existing PR collisions at dispatch
 
-The continuation read found 26 open PRs, not just #5021; the complete ID/delta audit
-is still incomplete. Checking the six #5021 paths was only a subset check.
-The actual changed-file lists of #3811 (head 0112b59c) and #3812 (head f371ca89)
-include bins/eliot-kernel/src/lib.rs and daemon_request_dispatch.rs, plus the Store
-adapter's apply.rs, apply/atomic_write.rs and apply/read_boundary.rs. They intersect
-both selected Kernel and Store exclusion scopes and each other. Their old bodies or
-conflict flags are not permission to discard the changes or resume another writer.
-Root resolves these concrete overlaps and every other relevant open-PR delta before
-claiming the affected paths; it records adoption, narrower disjoint scope or explicit
-release with unmatched requirements preserved. This is path/integration coordination,
-not an invented architectural dependency or a reason to stop unrelated tools work.
-No current runner liveness or full PR semantic review was established here.
+All 26 initially open PR IDs and their complete changed-file lists were screened:
+17 owner-authored plus 9 Jules PRs. #2707 was then closed without merge because its
+sole script-registration row is already in main; the follow-up query reports 25 open.
+This is complete PR-path coverage for that read, NOT a complete issue/code audit or
+proof of live writers. PLAN.tsv carries the selected scopes' conflicting_prs and
+an explicit dispatch_gate; READY alone never authorizes a claim.
+
+| Retained candidate | Kernel-scope paths | Store-scope paths | Required reconciliation |
+|---|---:|---:|---|
+| #2369 @ f4f65557106d | 18 | 0 | Compare the old 146-file runtime join with current owner deliveries; do not reapply the whole branch. |
+| #3811 @ 0112b59c3b6b | 3 | 4 | Integration-candidate dispatch/catalogue/apply; serialize with #3812. |
+| #3812 @ f371ca8958fa | 3 | 4 | Mailbox dispatch/catalogue/apply; preserve its separate requirements. |
+| #3869 @ bce9207b52a2 | 4 | 5 | Actual diff has 44 files, including Kernel/protocol and S-03 composition/lifetime; title is not scope. |
+| #4490 @ 29d22677f26a | 5 | 0 | Restore transport and Store gateway must share their real integration owner. |
+| #4599 @ 0ea687a3fdf5 | 2 | 0 | Retain diagnostic evidence separately; compare already-delivered shutdown/source repairs. |
+| #4845 @ 8f03723f826d | 3 | 0 | Actual delta is Kernel restore/dispatch, despite its docs/Watchdog description. |
+
+No screened PR touches either selected #2701 script. That removes this PR-path
+obstruction only; actual local claims and required reads still need preflight.
+For Kernel/Store, RECONCILE_PR_SCOPE forbids issuing the current broad claim until
+root records adoption of reviewed residuals, a genuinely disjoint narrowed scope, or
+explicit old-writer release with unmatched work retained. Full historical PR closure
+is not required for disjoint work. A filename intersection is not proof that all
+hunks remain new: compare merge-base, candidate and current main before disposition.
+No author attribution of inherited hunks is inferred from a PR title or file list.
+
+Reconcile current IDs before reusing this screen; obtain actual all-page filenames,
+including old/new names for renames. Refresh a changed head or changed selected scope.
+Store the claimed candidate identity and disposition at the controller, not a count
+alone. Scope must also cover shared contracts/manifests/generated outputs; this
+filename scan is not proof that every semantic integration edge is independent.
+
+## Reviewed integration holds
+
+- #4999 @ d4dfbbe4870a is draft with REQUEST_CHANGES. Its evidence verifier fallback
+  manufactures premutation reading attestation and recognizes fixture prose to retain
+  selected negative results. Do not merge or reuse that fallback; candidate byte
+  recomputation cannot establish who read before editing. Restore uniform absent-block
+  refusal and actual author-produced evidence. Other doc corrections require their
+  own comparison with #5021/#4688, not blanket acceptance or rejection.
+  Evidence: PR #4999 review 5398877744; full gate/CI execution was not performed.
+- #3058 @ f93239dec051 is draft with a source-review hold, not a blocking self-review.
+  Its five-field materializer predates current RecordedRevocation V2. Port unmatched
+  #686 work to real commit-fence/namespace/bounds/coverage/digest producers; preserve
+  #2966 recovery decisions. Do not restore V1 or fill new coordinates with defaults.
+  Evidence: PR #3058 review 5398880483; no Rust compiler run or full #686 audit.
 
 ## Body-verified cycle partitions: exact outputs before closure
 

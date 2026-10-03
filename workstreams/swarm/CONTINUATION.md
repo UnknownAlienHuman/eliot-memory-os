@@ -16,6 +16,12 @@ candidate, bind its head and actual changed paths to a root disposition: integra
 or adopt the reviewed residual, narrow disjoint claims, or explicitly release the
 old writer while retaining unmatched work. Open/draft/conflicted alone proves neither
 an active writer nor safe retirement. See the concrete collisions in STITCH-PLAN.md.
+PLAN.tsv's conflicting_prs is a checked snapshot, not an architectural dependency.
+RECONCILE_PR_SCOPE requires root to resolve the listed overlaps before issuing that
+claim; CLAIM_AFTER_PREFLIGHT still requires current source, reader and local claims.
+Refresh the complete PR-ID set and changed heads/scopes; do not select by author,
+search rank, title, or a truncated first page. An unrelated held PR does not stop
+M-TOOLS. Record one concrete disposition rather than repeating a BLOCKED report.
 
 One manager uses one worktree and a fresh issue branch for each coherent issue
 delivery. Root owns upstream synchronization and main integration. Subagents may
@@ -64,4 +70,7 @@ from every branch. A clean source check does not establish runtime acceptance.
 The local Make-PR2.sh/v2 evidence emission and runner state were not inspected or
 changed here. Validate a real v2 receipt through the existing doc_read_evidence.py
 before declaring delivery checked; do not disable CI or call a skipped compile PASS.
+The rejected #4999 fallback is not an emitter repair: it invents premutation reading
+and special-cases fixture prose. Missing evidence must remain missing for every PR.
+Use genuine reader output and independent oracle review, not a synthesized attestation.
 Do not claim this PR merged or the swarm running until those events actually occur.
