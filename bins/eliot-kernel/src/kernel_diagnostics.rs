@@ -10,13 +10,31 @@
 //!   text); I07.20 agent-facing error contract (typed codes stay with their
 //!   owners); I07.05 named pipes (no transport material in logs).
 //!
-//! This module owns exactly one process-global `tracing` subscriber
-//! installation plus the bounded, nonsecret field helpers used by Kernel
-//! process-entry observations. It owns no lifecycle, admission, transport,
-//! supervision, Store, generation, provider, credential, or repair authority:
-//! a diagnostic record is evidence only and can never reconcile an
-//! observation, authorize an effect, or promote liveness into
-//! readiness/completion.
+//! This module owns the bounded, nonsecret field helpers and the frozen
+//! entrypoint observation vocabulary used by Kernel process entry. It installs
+//! no process-global subscriber of its own: `eliot-observability-runtime` is
+//! the one subscriber owner (issue #895 residual). The facade records the
+//! install outcome that owner reported, and, when no such outcome was
+//! reported, answers that its own stderr sink is unavailable. Whether the
+//! owner's own global layer was accepted, or a foreign subscriber already held
+//! the process, is not observable from this module.
+//!
+//! DELIVERY IS NOT UNIVERSAL, and this module does not pretend otherwise. The
+//! accepted owner can only be installed once the launch funnel has the roots it
+//! needs, so every record emitted BEFORE that point - the launch/config and
+//! Host-binding stages, and any terminal record reached before it - is emitted
+//! with no global subscriber installed and is therefore dropped, because
+//! `tracing` with no dispatcher is a silent no-op. The same is true for the
+//! whole funnel when the owner's install is refused, and on a target that
+//! installs no owner at all. `main.rs` records those windows at its install
+//! site. Closing them would need either an earlier owner install, which cannot
+//! precede the roots it consumes, or a second `try_init` in this module, which
+//! is precisely the two-owner defect this change removes.
+//!
+//! It owns no lifecycle, admission, transport, supervision, Store, generation,
+//! provider, credential, or repair authority: a diagnostic record is evidence
+//! only and can never reconcile an observation, authorize an effect, or
+//! promote liveness into readiness/completion.
 //!
 //! General diagnostic delivery is workspace `tracing`, written to stderr so
 //! protocol stdout framing is never contaminated. The separately admitted
@@ -30,7 +48,9 @@ use std::sync::OnceLock;
 use eliot_observability::field_policy::{
     self, RedactedHandle, TelemetryFieldFamily, requires_evidence_handle, scrub_labels_for_emit,
 };
-use tracing_subscriber::EnvFilter;
+use eliot_observability_runtime::ObservabilityInstallOutcome;
+
+use crate::execution_metrics::KernelObservabilityError;
 
 /// Target for every event emitted by this facade.
 pub const KERNEL_DIAGNOSTICS_TARGET: &str = "eliot_kernel::diagnostics";
@@ -52,8 +72,62 @@ const DETAIL_LABEL_KEY: &str = "detail";
 /// Label key for one bounded short identity/code value on the emission path.
 const FIELD_LABEL_KEY: &str = "code";
 
-/// Process ownership claim for the facade's one global subscriber install.
-static SUBSCRIBER_INSTALLED: OnceLock<()> = OnceLock::new();
+/// Stable owner-issued code for an observability configuration refusal.
+///
+/// A refused metrics/observability install is not a launch failure: startup
+/// continues and only this non-terminal degraded observation is recorded
+/// (issue #895 residual, Blocking defect 4). The code is the fixed
+/// [`KernelObservabilityError::Config`] projection, never the failure's
+/// `Display` prose, so the emitted code stays stable and comparable.
+pub const OBSERVABILITY_INSTALL_CONFIG_REFUSED: &str = "OBSERVABILITY_INSTALL_CONFIG_REFUSED";
+/// Stable owner-issued code for a non-loopback observability endpoint.
+///
+/// The fixed [`KernelObservabilityError::EndpointNotLoopback`] projection, with
+/// the same stability and non-terminal meaning as
+/// [`OBSERVABILITY_INSTALL_CONFIG_REFUSED`]: the admitted metrics surface is a
+/// local surface, and a non-loopback address is refused rather than narrowed.
+pub const OBSERVABILITY_INSTALL_ENDPOINT_NOT_LOOPBACK: &str =
+    "OBSERVABILITY_INSTALL_ENDPOINT_NOT_LOOPBACK";
+
+/// What the accepted observability owner reported for this process-global
+/// subscriber. A projection of the owner's own outcome, not a second owner:
+/// `ObservabilityInstallOutcome` in the observability runtime remains the
+/// single source of truth for what was installed.
+///
+/// The runtime's outcome carries live handles that only its own `install` can
+/// produce, so this copyable projection is what the facade records and
+/// reports. It decides nothing about the install itself: diagnostics never
+/// change Kernel results.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticSubscriberOwner {
+    /// This process's configuration established the sole global subscriber owner.
+    Installed,
+    /// The accepted observability owner already stood; its owner is unchanged.
+    AlreadyInstalled,
+}
+
+impl DiagnosticSubscriberOwner {
+    /// Project the accepted owner's real install outcome.
+    ///
+    /// This is the only place the runtime's outcome type is matched in the
+    /// Kernel facade, so the projection cannot drift into a second reading of
+    /// what the accepted owner installed.
+    #[must_use]
+    pub fn observed(outcome: &ObservabilityInstallOutcome) -> Self {
+        match outcome {
+            ObservabilityInstallOutcome::Installed(_) => Self::Installed,
+            ObservabilityInstallOutcome::AlreadyInstalled(_) => Self::AlreadyInstalled,
+        }
+    }
+}
+
+/// The accepted owner's reported install outcome, recorded once where the
+/// outcome arrives.
+///
+/// Absent before any install, and never a pre-install ownership claim: it
+/// exists so [`sink_status`] can report the outcome it observed rather than
+/// assert a global dispatch nobody established.
+static OBSERVED_SUBSCRIBER_OWNER: OnceLock<DiagnosticSubscriberOwner> = OnceLock::new();
 
 /// Typed facade failures.
 ///
@@ -62,10 +136,23 @@ static SUBSCRIBER_INSTALLED: OnceLock<()> = OnceLock::new();
 /// a fallback effect, or a lifecycle transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelDiagnosticsError {
-    /// The facade already owns the process-global subscriber installation.
-    /// Repeat installation is bounded and non-panicking: the first install
-    /// stands and no second owner is created.
+    /// The accepted observability owner already holds the process-global
+    /// subscriber.
+    ///
+    /// Installation is bounded and non-panicking: the accepted
+    /// `eliot-observability-runtime` owner stands and no second global
+    /// install is attempted, so a repeat call creates no second owner and
+    /// retries nothing. This answer means the accepted OWNER already stood,
+    /// never that a private latch of this facade fired.
     AlreadyOwned,
+    /// No accepted observability owner established this process's global
+    /// subscriber, so the facade cannot prove its records reach any sink.
+    ///
+    /// This is deliberately a different answer from [`Self::AlreadyOwned`]:
+    /// there is no owner at all here, which is the opposite fact, and an
+    /// operator reading the rendered error must not be told a subscriber is
+    /// owned when none is.
+    SubscriberNotEstablished,
     /// The fixed Kernel Event Log queue has not been started or is unavailable.
     EventLogUnavailable,
 }
@@ -74,6 +161,12 @@ impl fmt::Display for KernelDiagnosticsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyOwned => write!(f, "kernel diagnostics subscriber already owned"),
+            Self::SubscriberNotEstablished => {
+                write!(
+                    f,
+                    "no accepted observability owner established the global subscriber"
+                )
+            }
             Self::EventLogUnavailable => {
                 write!(f, "kernel event log queue unavailable")
             }
@@ -86,7 +179,9 @@ impl std::error::Error for KernelDiagnosticsError {}
 /// Diagnostic delivery sinks visible to the Kernel entrypoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticSink {
-    /// Workspace `tracing` subscriber writing to stderr. Available.
+    /// Workspace `tracing` subscriber writing to stderr. Whether the accepted
+    /// observability owner established it is reported by [`sink_status`], never
+    /// assumed by this variant.
     TracingStderr,
     /// The admitted Kernel Event Log queue. This reports queue capability,
     /// never delivery; FFI remains on its single worker thread.
@@ -98,34 +193,83 @@ pub enum DiagnosticSink {
 /// The Event Log arm answers successfully only after the bounded Kernel queue
 /// was initialized. That is not proof that the worker remains live or that
 /// any event was accepted or delivered.
+///
+/// The `tracing` arm answers from the recorded owner outcome
+/// (`OBSERVED_SUBSCRIBER_OWNER`). Either accepted owner answer means the one
+/// process-global subscriber owner stands, whether this process's
+/// configuration established it ([`DiagnosticSubscriberOwner::Installed`]) or
+/// found it already standing ([`DiagnosticSubscriberOwner::AlreadyInstalled`]),
+/// so both report `Ok(())`. With no such record this facade cannot prove its
+/// records reach stderr, so the sink answers
+/// [`KernelDiagnosticsError::SubscriberNotEstablished`] instead of relabelling
+/// an unobserved dispatch as success. Whether a refused or failed install
+/// inside the accepted owner left a foreign subscriber in place is not
+/// distinguishable from this file, and no answer here claims that case is
+/// resolved.
 pub fn sink_status(sink: DiagnosticSink) -> Result<(), KernelDiagnosticsError> {
     match sink {
-        DiagnosticSink::TracingStderr => Ok(()),
+        DiagnosticSink::TracingStderr => {
+            if OBSERVED_SUBSCRIBER_OWNER.get().is_some() {
+                Ok(())
+            } else {
+                Err(KernelDiagnosticsError::SubscriberNotEstablished)
+            }
+        }
         DiagnosticSink::WindowsEventLog if crate::windows_event_log::queue_initialized() => Ok(()),
         DiagnosticSink::WindowsEventLog => Err(KernelDiagnosticsError::EventLogUnavailable),
     }
 }
 
-/// Installs the one process-global Kernel diagnostics subscriber.
+/// Records the accepted owner's real install outcome.
 ///
-/// The subscriber is `tracing_subscriber::fmt` with an `env-filter` default
-/// of `info` and the stderr writer, so protocol stdout framing is preserved.
-/// The first caller becomes the single owner; every later caller receives
-/// [`KernelDiagnosticsError::AlreadyOwned`] without panic, replacement, or
-/// a second global install. Delivery setup is best-effort: a foreign
-/// pre-existing global install (or any init failure) is kept as-is and the
-/// owner claim still stands, because diagnostics must never gate startup,
-/// retry, recurse, or change Kernel results.
-pub fn install_kernel_diagnostics() -> Result<(), KernelDiagnosticsError> {
-    if SUBSCRIBER_INSTALLED.set(()).is_err() {
-        return Err(KernelDiagnosticsError::AlreadyOwned);
+/// The process-global subscriber is installed by
+/// `eliot_observability_runtime::install`, the one subscriber owner; this
+/// facade emits through that owner and performs no global initialization of
+/// its own. The answer therefore mirrors exactly what the accepted owner
+/// reported: [`DiagnosticSubscriberOwner::Installed`] is that owner's own
+/// report that this process's configuration established its subscriber, while
+/// [`DiagnosticSubscriberOwner::AlreadyInstalled`] means the accepted owner
+/// already stood, and this facade answers
+/// [`KernelDiagnosticsError::AlreadyOwned`] instead of claiming it. Whether
+/// the accepted owner's global layer was actually accepted, or a foreign
+/// subscriber was already in place, is not observable from this module; that
+/// residual is recorded as blocked in the issue checklist, not solved here.
+///
+/// Diagnostics never gate startup: the answer is informational for the caller,
+/// never a panic, a retry, a replacement, or a second global install. It
+/// reports the outcome the accepted owner handed over and nothing more; it
+/// makes no claim about a global subscriber the accepted owner itself refused.
+pub fn install_kernel_diagnostics(
+    owner: DiagnosticSubscriberOwner,
+) -> Result<(), KernelDiagnosticsError> {
+    match owner {
+        DiagnosticSubscriberOwner::Installed => {
+            let _ = OBSERVED_SUBSCRIBER_OWNER.set(owner);
+            Ok(())
+        }
+        DiagnosticSubscriberOwner::AlreadyInstalled => {
+            let _ = OBSERVED_SUBSCRIBER_OWNER.set(owner);
+            Err(KernelDiagnosticsError::AlreadyOwned)
+        }
     }
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
-    Ok(())
+}
+
+/// Projects one refused observability install onto its stable owner code.
+///
+/// This is the only mapping from a [`KernelObservabilityError`] to an emitted
+/// code, so the refusal vocabulary stays closed: the two constants above are
+/// the codes, and no `Display` prose or other dynamic value can become one.
+/// A refusal is non-terminal, so the code is emitted by
+/// [`observe_observability_install_refused`] and never by
+/// [`observe_terminal_error`].
+#[must_use]
+pub const fn observability_install_refused_code(error: KernelObservabilityError) -> &'static str {
+    match error {
+        KernelObservabilityError::Config => OBSERVABILITY_INSTALL_CONFIG_REFUSED,
+        KernelObservabilityError::EndpointNotLoopback => {
+            OBSERVABILITY_INSTALL_ENDPOINT_NOT_LOOPBACK
+        }
+    }
 }
 
 /// One truncated string plus its truncation honesty record.
@@ -464,6 +608,32 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
         detail_redaction = bounded.redaction_status().unwrap_or("none"),
         detail_evidence = bounded.evidence_handle().unwrap_or("none"),
         "kernel entrypoint reached stage"
+    );
+}
+
+/// Records that a refused observability/metrics install degrades diagnostics
+/// without ending the launch.
+///
+/// Non-terminal by contract: a metrics install refusal never gates startup
+/// (A13.10), so this observation carries the degraded disposition and no
+/// `kernel.terminal_error`. On this entrypoint funnel `exit_error` is the sole
+/// `kernel.terminal_error` emitter ([`observe_terminal_error`]); the library
+/// modules keep their own per-operation terminal records. The code is a stable
+/// owner-issued value from [`observability_install_refused_code`], screened
+/// against the shared telemetry field policy and bounded like every other
+/// short field here, so a recognised secret would leave the record as an
+/// immutable redacted evidence handle rather than as text.
+pub fn observe_observability_install_refused(code: &'static str) {
+    let bounded = bound_field(code);
+    tracing::warn!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = "kernel.observability_install_refused",
+        code = bounded.text(),
+        code_bytes = bounded.original_bytes(),
+        code_truncated = bounded.truncated(),
+        code_redaction = bounded.redaction_status().unwrap_or("none"),
+        code_evidence = bounded.evidence_handle().unwrap_or("none"),
+        "kernel observability install refused"
     );
 }
 
