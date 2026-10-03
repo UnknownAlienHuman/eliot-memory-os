@@ -11,7 +11,7 @@ Connect real authenticated admission and explicit role transitions, using actual
 WorkScope/delegation policy rather than caller-selected authority. Bind task, route,
 profile, fence, epoch and expiry; revoke the old context and update independence.
 Do not build a second capability engine. Keep both existing acceptance scenarios.
-Issue comment 5963617714 records the source boundary; read the current full thread,
+Issue comment 5963619581 records the source boundary; read the current full thread,
 I7.21 and routed bundle. #1678/#1701 cannot mutate the same Kernel/IPC scope in parallel.
 
 ## M-STORE — #2691
@@ -24,7 +24,7 @@ Preserve #2688/#2689 handle/incarnation, interruption and terminal-receipt seman
 The existing producer is in backup_snapshot.rs; StoreComposition and main.rs own the
 composition and lifetime. Recheck those actual boundaries before editing. Earlier
 cleanup-charge and duplicate-begin defects have already changed; do not replay old
-patches. Read comments 5931062575/5963619581, the full issue and routed bundle.
+patches. Read comments 5931062575/5963617714, the full issue and routed bundle.
 
 ## M-TOOLS — #2701
 
