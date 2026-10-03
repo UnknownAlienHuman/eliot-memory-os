@@ -2,7 +2,7 @@
   "contract": "F-LOG-HOST-3 launch + retained-artifact diagnostics",
   "issue": 978,
   "target": "eliot_host::diagnostics",
-  "note": "Every case in tests/host_launch_diagnostics.rs is an execution of instrumented production code through an existing public seam of the eliot_host library target (HostLaunchOptions::{parse,parse_system_service,validate_service_main_argv}, classify_host_scm_inspection, validate_host_scm_bootstrap driven to its pre-SCM refusal). The facade is never called directly from the test target, so no expected log record is hand-constructed and no case compares the facade to itself. Records are read back out of a scoped tracing subscriber after real production code ran. Boundaries whose owner is a private module behind pub(super) items (host_job_launch, launch_artifact_lease, launch_descriptor_validation, store_kernel_launch_sequence, kernel_activation_driver, kernel_front_door_client) are proven by inline #[cfg(test)] cases in their owning file; the integration case names the owner and asserts the private source binding. Audit 5910159678: the two false readiness phase tokens are retired (see renamed_phase_tokens) and the frozen structured correlation now carries the owner-held identities. Sink outcome never alters result/order/status/cleanup. Package fixtures never claim live launch. Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the seam is typed-Unavailable, never FFI, never faked.",
+  "note": "Every case in tests/host_launch_diagnostics.rs is an execution of instrumented production code through an existing public seam of the eliot_host library target (HostLaunchOptions::{parse,parse_system_service,validate_service_main_argv}, classify_host_scm_inspection, validate_host_scm_bootstrap driven to its pre-SCM refusal). The facade is never called directly from the test target, so no expected log record is hand-constructed and no case compares the facade to itself. Records are read back out of a scoped tracing subscriber after real production code ran. Boundaries whose owner is a private module behind pub(super) items (host_job_launch, launch_artifact_lease, launch_descriptor_validation, store_kernel_launch_sequence, kernel_activation_driver, kernel_front_door_client) are proven by inline #[cfg(test)] cases in their owning file; the integration case names the owner and asserts the private source binding (see inline_case_owners and unreachable_positive_arms). Audit 5910159678: the two false readiness phase tokens are retired (see renamed_phase_tokens) and the frozen structured correlation now carries the owner-held identities. Sink outcome never alters result/order/status/cleanup. Package fixtures never claim live launch. Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the Event Log seam reports the platform's own live answer - available on Windows where #984's safe port is live, typed EventLogUnavailable off Windows - while the facade's own Event Log arm stays typed EventLogUnavailable on every platform because it routes to tracing only. No fixture drives a real OS report, no FFI is acquired in Host, and no delivery is faked either way.",
   "stages": {
     "startup": "startup",
     "launch_config": "launch_config"
@@ -13,13 +13,28 @@
     "host_start_failed": "host-start-failed",
     "scm_bootstrap_unknown": "host-scm-launch-unknown"
   },
+  "key_meanings": {
+    "operation": "operation names one identity in the activation pair: the canonical KernelRecord operation identity, the labelled-UUID handle kernel_activation_driver.rs binds from current.operation.operation_id or permit.operation_id. NOT every transition is rendered: the driver mints six operation ids (kernel-candidate-shadow, kernel-prior-disposition, kernel-nonce-issued, kernel-activating, kernel-active, kernel-activation-failed) but only some reach a record - the fail observed record deliberately renders the PRE-transition id, because the transition it is about has not committed yet. \"Re-minted per transition\" describes the minter (crate-level `operation` fn), not the set of rendered records. Every kernel_front_door_client.rs call site renders operation=missing: no closure that builds one of those correlations holds that identity, so naming it there would mean re-deriving it. Neither the wire message id (activation id plus a sequence suffix) nor the activation id itself may fill the key, and the wire identity is never parsed back into the activation id. RECORDED LOSS: the reconcile family binds no identity at all (its body is NONE plus an optional reason), so those records carry the phase token and the typed reason kind only - the wire message identity they previously named under operation is rendered nowhere, and the frozen eight-key vocabulary has no slot for a per-message wire identity. RECORDED LOSS, ALSO: scm_launch.rs binds no operation identity at all - not one call site in that file passes one - so every record it emits renders operation=missing, exactly like every other site that does not hold that identity. That file always held a real, non-secret, owner-held identity in hand, the Windows SCM service name (ServiceRegistrationRequest::service_name), and it is rendered nowhere under this key: the name survives in typed form only, in HostScmRegistrationCause::Absent and in InstalledCandidateReadback::service_name, both of which are unchanged. This is a loss of rendered detail, not a claim that the name is unavailable, unobservable, or unimportant.",
+    "fence": "fence does NOT mean one identity across the corpus. It means the candidate activation id on all TEN front-door and kernel-activation sites, matching DurableKernelActivationDriver's record_fence(host, activation_id, activation_generation) binding, and it means TWO further identities inside host_job_launch.rs: the StateFence authority-epoch LINEAGE id at that file's bind and launch sites, and the Host installation epoch's LINEAGE id at its resume and start sites. Those are distinct types (StateFence::authority_epoch: EpochId versus HostInstallationEpoch::epoch: EpochTransition), so under I14.20 line 296 they are not interchangeable. This is a REAL RESIDUAL COLLISION, escalated and deliberately not resolved here: unifying them is a cross-file contract change. Binding the Kernel authority epoch lineage/sequence into fence in the two activation files was RETIRED by this delivery, so in those two files the epoch reaches no correlation slot - but host_job_launch.rs still renders a lineage under the same key, and that is the collision, not a settled difference. The epoch stays compared for real on the semantic path wherever it decides an owner proof.",
+    "process_start": "process_start names ONE identity, the Host-observed Kernel Job root process START identity: the Job root pid together with the handle-observed creation time, rendered in the owner's own shape as pid:<root_pid>:start:<root_start_time_100ns>. It is the start pair, never the pid alone, because a pid is reusable and a process-start identity is not: PID alone, file existence, IPC acknowledgement or exit zero is not readiness or ownership, so no call site on any of the eight files may fill this key with a bare reusable pid. In kernel_activation_driver.rs the value is projected from the retained KernelRecord candidate_job_binding alone - read from binding.root_pid and binding.root_start_time_100ns, through the file's own kernel_process_start_identity projection - on EVERY call site whose record retains one: resume requested, bind requested, candidate observed, nonce requested, nonce issued, activating requested, activation observed, readiness observed and fail observed. Nothing is re-derived, re-read, re-verified or probed to obtain it, and it is never taken from a Kernel-authored process handle; where a record retained NO Job binding (the pre-bind shadow record the resume fixture builds) the slot renders the explicit process_start=missing marker instead, and that absence is a fact about the record, not a claim that a resume or any other step never holds the identity. A Kernel process id that arrives as opaque receipt or request text is NOT a process start identity and is not bound into this key. Only THREE of the other seven files own a start-pair projection and bind this key: host_launch_options.rs does not bind process_start at all (its admitted correlation binds only installation, generation and artifact), and neither do launch_artifact_lease.rs, launch_descriptor_validation.rs or store_kernel_launch_sequence.rs - the last of those emits six phase records and binds only `reason`. The three that do project their own owner start pair are host_job_launch.rs::host_launch_process_start_identity, scm_launch.rs::scm_process_start_identity and kernel_front_door_client.rs::front_door_process_start_identity; a call site holding no such pair renders the explicit missing marker. Two spellings exist for the same fact: windows-pid:<pid>:start:<t> in host_launch_options.rs and scm_launch.rs, and pid:<pid>:start:<t> in kernel_activation_driver.rs and kernel_front_door_client.rs. A reader correlating across files must translate, and unifying the spelling is a cross-file change that is escalated, not decided here.",
+    "generation": "generation is NOT one identity across the corpus and this is a REAL RESIDUAL, escalated and not resolved here. Every value is a u64, so nothing at the type boundary separates them, and a reader cannot tell two records apart by eye. It carries FOUR quantities: the immutable transaction-plan generation (host_launch_options.rs, scm_launch.rs); the approved runtime ResourceGeneration (host_job_launch.rs, launch_descriptor_validation.rs, kernel_activation_driver.rs, kernel_front_door_client.rs); the activation-generation EPOCH SEQUENCE (kernel_activation_driver.rs); and the Host epoch SEQUENCE from the supervision record table (scm_launch.rs). The same activation contour renders generation= from a ResourceGeneration on its nonce records and from an epoch sequence on its activating/activation/fail records. Unifying them is a cross-file contract change.",
+    "artifact": "artifact is NOT one identity across the corpus and this is a REAL RESIDUAL, escalated and not resolved here. It carries at least THREE kinds of digest: the approved executable / host artifact hash (host_job_launch.rs, kernel_activation_driver.rs, kernel_front_door_client.rs, launch_descriptor_validation.rs); the approved launch or bootstrap CONFIG-DESCRIPTOR digest (host_launch_options.rs, scm_launch.rs, launch_descriptor_validation.rs); and the SCM REGISTRATION CONFIGURATION digest (scm_launch.rs, hashed over the canonical registration rather than over a descriptor). launch_artifact_lease.rs makes it worse: its site binds a digest whose meaning is decided by the CALLER, and its callers pass image digests, config digests and a descriptor digest through the same key. Unifying them is a cross-file contract change.",
+    "phase": "phase is a frozen per-file literal vocabulary, not an identity: 105 distinct phase tokens across the eight files. Two records sharing a phase token are the same boundary, not the same operation; `operation` and `fence` are what separate concurrent contours.",
+    "reason": "reason is a per-file typed-kind vocabulary, not one corpus identity: three in scm_launch.rs (absent, mismatched, unknown), two in store_kernel_launch_sequence.rs (dead, unknown) and five in kernel_front_door_client.rs (delivered-response-unusable, unknown-binding, before-start-refusal, no-receipt-carried, activation-receipt-carried). A `reason` names only what its own branch established.",
+    "installation": "installation IS one identity across the corpus: the Host installation identity handle, bound from the owner-held installation/epoch/registration handle on every site that holds one. Where no installation identity is in hand the slot renders the explicit missing marker."
+  },
   "single_terminal_ruling": {
     "physical_launch_guard": "phase-only",
-    "host_start_failed": "host-start-failed",
-    "host_start_failed_owner": "lib.rs HostTerminalGuard (BOUNDARY_START_TERMINAL), the single terminal for one failed physical launch",
+    "single_terminal_is_the_outer_contour": "HostLaunchTerminalGuard in host_job_launch.rs emits no host.terminal_error at all, so exactly ONE terminal remains per failed physical launch and it belongs to the OUTER #891 contour that wrapped the call - never to this card.",
+    "production_path_terminal": "host-open-failed",
+    "production_path_owner": "lib.rs HostTerminalGuard armed with BOUNDARY_OPEN_TERMINAL in HostComposition::open_for_profile (lib.rs:7423), which HostComposition::open (lib.rs:7404) only delegates to at lib.rs:7405; that open contour reaches HostJobBranches::start_approved at lib.rs:10436 inside fn start_manifest_contour (lib.rs:10293).",
+    "exported_api_only_terminal": "host-start-failed",
+    "exported_api_only_owner": "lib.rs HostTerminalGuard armed with BOUNDARY_START_TERMINAL in HostComposition::start_approved_contour (lib.rs:9901). start_approved_contour has NO in-repo caller - the boundary table itself records caller 'none (exported API; no in-repo caller)' for the entry name: 'start.terminal' (lib.rs:669) with event: 'host-start-failed' (lib.rs:672) at lib.rs:673, and start_approved_contour( occurs exactly once in lib.rs, at its own declaration - so this code is reachable only through the exported API.",
+    "backup_contour_terminals": "host-backup-cutover-failed (lib.rs:7048, BOUNDARY_BACKUP_CUTOVER_TERMINAL) reaches start_approved transitively - execute_cutover (lib.rs:7102) -> cutover_generation_contour -> cutover_with_rollback -> start_approved - and owns its own single terminal. host-backup-dispatch-failed (lib.rs:6555, BOUNDARY_BACKUP_DISPATCH_TERMINAL) also owns its own single terminal but NEVER reaches start_approved: both of its owner targets inside dispatch_backup_owner_operation are explicit pre-effect refusals (lib.rs:6698 Prepare, lib.rs:6709 Cutover), so it is not on the physical launch path.",
+    "open_naming_question": "Whether the boundary the physical launch actually takes should keep the exported-API code host-start-failed is a lib.rs decision owned by #891; this card declares lib.rs READ ONLY and raised it as a contract challenge rather than renaming another owner's boundary.",
     "scm_bootstrap_unknown": "host-scm-launch-unknown",
-    "scm_bootstrap_unknown_owner": "scm_launch.rs ScmLaunchTerminalGuard, the single terminal for one failed SCM bootstrap validation, a different operation from a physical launch",
-    "note": "The former host-launch-failed code is gone: HostLaunchTerminalGuard in host_job_launch.rs became phase-only so one failed launch emits exactly one host.terminal_error record. Exactly one of the eight instrumented files may still call observe_terminal_error."
+    "scm_bootstrap_unknown_owner": "scm_launch.rs ScmLaunchTerminalGuard, the single terminal for one failed SCM bootstrap validation, a different operation from a physical launch, and the only remaining observe_terminal_error emission site in the eight instrumented files",
+    "note": "The former host-launch-failed code is gone from every code path: HostLaunchTerminalGuard became phase-only, so the duplicate terminal audit defect 2 named is closed. Exactly one of the eight instrumented files may still call observe_terminal_error. What this fixture does NOT claim is that the surviving terminal is host-start-failed - on the production path it is host-open-failed."
   },
   "correlation_keys": [
     "phase",
@@ -134,6 +149,11 @@
     "host.scm-launch request observed",
     "host.scm-launch process observed",
     "host.scm-launch probe requested",
+    "host.scm-launch supervision record publish requested",
+    "host.scm-launch supervision record publication failed",
+    "host.scm-launch supervision record published",
+    "host.scm-launch installed candidate readback requested",
+    "host.scm-launch installed candidate readback observed",
     "host.store-launch requested",
     "host.store-launch store-dead observed",
     "host.store-launch store-unknown observed",
@@ -158,15 +178,25 @@
     "host.kernel-front-door activation observed",
     "host.kernel-front-door reconcile requested",
     "host.kernel-front-door before-start observed",
-    "host.kernel-front-door timeout observed",
-    "host.kernel-front-door disconnect observed",
+    "host.kernel-front-door no-receipt reconcile observed",
+    "host.kernel-front-door unusable-response observed",
     "host.kernel-front-door unknown observed"
   ],
   "retired_phase_tokens": [
     "host.store-launch store-ready observed",
     "host.kernel-launch kernel-ready observed",
-    "host-launch-failed"
+    "host-launch-failed",
+    "host.kernel-front-door timeout observed",
+    "host.kernel-front-door disconnect observed",
+    "reason=transport-lost"
   ],
+  "front_door_corretirement": {
+    "retired_phase": "host.kernel-front-door disconnect observed",
+    "retired_reason": "reason=transport-lost",
+    "honest_phase": "host.kernel-front-door unusable-response observed",
+    "honest_reason": "reason=delivered-response-unusable",
+    "why": "The retired pair claimed a disconnect the arm cannot observe. activation_response_or_reconcile is reached only when the lib.rs caller already got Ok(DeliveryOutcome::Delivered) from send_frame; a genuine disconnect and DeliveryOutcome::UnknownOutcome are both mapped to None by that caller BEFORE the call, so this closure never sees them. What the Err arm really establishes is that a delivered response could not be turned into a typed control response (receive or decode failed), which leaves the reconcile unsettled. The token is retired in the production code and named only in a retirement comment there, so no code emits it, and the integration target's case 978/9 front-door detail pin list now names honest_phase instead, with a separate negative assertion that both retired literals reach no emitted code."
+  },
   "frozen_sibling_boundaries": [
     "fn validate_host_scm_bootstrap",
     "fn classify_host_scm_inspection",
@@ -212,8 +242,51 @@
     "13": "deterministic semantic correlation fields under two identical injected inspection schedules",
     "14": "actual-path and diff guard: no unsafe, no direct logging facade, no second terminal emitter, no readiness outside its owner"
   },
-  "event_log_sink": "unavailable",
+  "reachable_seams": [
+    "HostLaunchOptions::parse",
+    "HostLaunchOptions::parse_system_service",
+    "HostLaunchOptions::validate_service_main_argv",
+    "classify_host_scm_inspection",
+    "validate_host_scm_bootstrap"
+  ],
+  "inline_case_owners": {
+    "2": [
+      "src/launch_descriptor_validation.rs:validate_eliotd_launch_descriptor_bytes"
+    ],
+    "3": [
+      "src/host_job_launch.rs:approved_launch_paths",
+      "src/launch_artifact_lease.rs:approved_locator",
+      "src/launch_artifact_lease.rs:approved_phase_b_destination_locator",
+      "src/launch_descriptor_validation.rs:validate_eliotd_launch_descriptor_bytes"
+    ],
+    "6": [
+      "src/store_kernel_launch_sequence.rs:launch_store_then_kernel"
+    ],
+    "7": [
+      "src/kernel_activation_driver.rs:DurableKernelActivationDriver::issue_nonce",
+      "src/kernel_activation_driver.rs:DurableKernelActivationDriver::activating",
+      "src/kernel_activation_driver.rs:DurableKernelActivationDriver::active",
+      "src/kernel_front_door_client.rs:kernel_control_request",
+      "src/kernel_front_door_client.rs:validate_authenticated_kernel_peer"
+    ],
+    "8": [
+      "src/kernel_activation_driver.rs:DurableKernelActivationDriver::active"
+    ],
+    "9": [
+      "src/kernel_front_door_client.rs:activation_response_or_reconcile"
+    ],
+    "10": [
+      "src/kernel_activation_driver.rs:DurableKernelActivationDriver::fail",
+      "src/store_kernel_launch_sequence.rs:launch_store_then_kernel"
+    ]
+  },
+  "unreachable_positive_arms": [
+    "classify_host_scm_inspection Matching arm: ServiceRegistrationRuntimeInspection::Matching carries a ServiceRuntimeObservation whose fields are pub(super) inside eliot-platform-windows, so no eliot-host seam can construct it; only that crate's own tests and a live SCM readback can observe it",
+    "activation_response_or_reconcile transport-failure kind: no arm of this closure can name a transport failure kind, and none claims one. lib.rs:3411-3423 calls send_frame first and maps Ok(DeliveryOutcome::UnknownOutcome) and any Err(_) to None, so a genuine transport loss never reaches activation_response_or_reconcile at all; and lib.rs:3416 and lib.rs:3419 both collapse the TransportError variant into HostError::RecoveryRequired(error.to_string()), so by the time the Err arm runs only the erased text is left. The closure therefore records reason=delivered-response-unusable - a delivered response that could not become a typed control response - and proves no read timeout, broken pipe, SessionFenced, OversizeFrame, ZeroLengthFrame or UnknownOutcome classification. Separating those kinds needs the caller's error taxonomy or a new seam, both outside this issue. This fixture claims nothing about real Windows pipe, Job or delivery behaviour, which needs the live edge and #984's Event Log seam."
+  ],
+  "event_log_sink": "live-on-windows-typed-unavailable-off-windows",
   "event_log_source": "EliotHost",
+  "facade_event_log_arm": "EventLogUnavailable",
   "max_field_bytes": 256,
   "max_detail_bytes": 1024,
   "stdout_protocol_contamination": false,

@@ -157,25 +157,87 @@ impl<'a> LaunchPhaseCorrelation<'a> {
     /// [`crate::host_diagnostics::bound_field`] bound; an absent slot renders
     /// as the frozen `<slot>=missing` marker rather than an empty string, a
     /// zero or a placeholder, so a reader can never mistake a missing identity
-    /// for an observed one. Total and panic-free, with bounded allocation only.
+    /// for an observed one.
+    ///
+    /// The WHOLE record is bounded here, to the facade's own
+    /// [`crate::host_diagnostics::MAX_DIAGNOSTIC_DETAIL_BYTES`] ceiling, before
+    /// it leaves this function. Composing six independently bounded slots plus
+    /// keys can exceed that ceiling, and a facade that then truncates the
+    /// record cuts the first overflowing value mid-value and can drop the tail
+    /// slots whole without a marker — leaving a reader with a truncated
+    /// identity, no absence marker, and no way to tell a cut value from a real
+    /// one. So a record that does not fit is shortened by shedding WHOLE slots
+    /// from the tail backwards (`reason`, then `fence`, `process_start`,
+    /// `artifact`, `operation`, `generation`, `installation`), and every shed
+    /// slot still renders as the frozen `<slot>=missing` marker. The leading
+    /// phase token is never shed, the frozen key order and vocabulary are
+    /// unchanged, and the owner-operation identity prefix survives the longest.
+    ///
+    /// A shed slot reads exactly like an unproven one: it says only that this
+    /// record carries no value in that slot, never that the value does not
+    /// exist. Shedding is a size decision, not a sensitivity one (I15.4) — no
+    /// slot is inspected, re-derived or probed to decide it. Total and
+    /// panic-free, with bounded allocation only.
     pub(crate) fn render(&self, phase: &str) -> String {
         let generation = self.generation.map(|value| value.to_string());
+        // Frozen key order, one slot per identity this call site already holds.
+        // Slot zero is the phase token that leads the record.
+        let slots: [(&str, Option<&str>); 8] = [
+            ("phase", Some(phase)),
+            ("installation", self.installation),
+            ("generation", generation.as_deref()),
+            ("operation", self.operation),
+            ("artifact", self.artifact),
+            ("process_start", self.process_start),
+            ("fence", self.fence),
+            ("reason", self.reason),
+        ];
         let mut detail = String::with_capacity(RENDERED_PHASE_DETAIL_BYTES);
-        render_phase_slot(&mut detail, "phase", Some(phase));
-        render_phase_slot(&mut detail, "installation", self.installation);
-        render_phase_slot(&mut detail, "generation", generation.as_deref());
-        render_phase_slot(&mut detail, "operation", self.operation);
-        render_phase_slot(&mut detail, "artifact", self.artifact);
-        render_phase_slot(&mut detail, "process_start", self.process_start);
-        render_phase_slot(&mut detail, "fence", self.fence);
-        render_phase_slot(&mut detail, "reason", self.reason);
+        // Shed whole trailing slots until the composed record fits the facade's
+        // own detail ceiling, so the facade receives it verbatim. EVERY slot is
+        // still rendered: a shed slot renders the frozen `<slot>=missing`
+        // marker, never nothing at all, so the emitted vocabulary is always the
+        // eight frozen keys in the frozen order and a reader can tell a shed
+        // slot from a slot this call site could never have held. Dropping the
+        // tail instead would make a real identity indistinguishable from a slot
+        // that was never rendered, which is exactly the missing marker this
+        // record exists to provide.
+        //
+        // `shed + 1 < slots.len()` keeps at least the phase token and bounds the
+        // loop at `shed == 6`, where `retained == 2`: the last state rendered is
+        // the phase token plus `installation` carrying real values and the six
+        // remaining slots spelled `missing`. Worst case there is two bounded
+        // 256-byte values with their keys plus six short markers, 637 bytes
+        // against the 1024-byte ceiling, so a fitting state is always
+        // found, the loop is total, and no iteration can fail. Every one of the
+        // eight keys is still emitted on every pass, so a shed slot is
+        // distinguishable from an absent one by position and by marker alike.
+        let mut shed = 0_usize;
+        while shed.saturating_add(1) < slots.len() {
+            detail.clear();
+            let retained = slots.len() - shed;
+            for (index, (key, value)) in slots.iter().enumerate() {
+                render_phase_slot(
+                    &mut detail,
+                    key,
+                    if index < retained { *value } else { None },
+                );
+            }
+            if detail.len() <= crate::host_diagnostics::MAX_DIAGNOSTIC_DETAIL_BYTES {
+                break;
+            }
+            shed = shed.saturating_add(1);
+        }
         detail
     }
 }
 
 /// Initial capacity for one rendered phase record. Growth beyond it stays
-/// bounded by [`crate::host_diagnostics::bound_field`] per slot; the facade's
-/// own detail bound truncates the record it receives.
+/// bounded by [`crate::host_diagnostics::bound_field`] per slot, and the
+/// composed record stays bounded by
+/// [`crate::host_diagnostics::MAX_DIAGNOSTIC_DETAIL_BYTES`]: `render` sheds
+/// whole slots as explicit `missing` markers rather than letting the facade
+/// truncate a composed record.
 const RENDERED_PHASE_DETAIL_BYTES: usize = 512;
 
 /// Spelling of one absent identity slot: the frozen shared `missing` value the
@@ -220,8 +282,17 @@ fn host_launch_observe(phase: &str, correlation: &LaunchPhaseCorrelation<'_>) {
 /// and two incarnations of one PID stay distinguishable. `image_path` is
 /// deliberately excluded: a path is never a diagnostic identity (I15.4). Pure
 /// projection of fields the caller already holds — no probe, handle open or
-/// second process observation runs here, and the spelling matches the one other
-/// Host contour emits so a reader correlates records across files.
+/// second process observation runs here.
+///
+/// SPELLING, stated because it is NOT corpus-uniform: three other Host contours
+/// render a `process_start` identity. `scm_launch.rs::scm_process_start_identity`
+/// emits this same `windows-pid:{pid}:start:{start}` shape, while
+/// `kernel_activation_driver.rs::kernel_process_start_identity` and
+/// `kernel_front_door_client.rs::front_door_process_start_identity` both emit
+/// `pid:{pid}:start:{start}` for the same fact. So a reader correlates this
+/// contour's records with the SCM contour's directly, and must translate for the
+/// Kernel activation and front-door records. Unifying the spelling is a
+/// cross-file change and is escalated, not done here.
 #[cfg(windows)]
 fn host_launch_process_start_identity(process: &eliot_platform_windows::ProcessIdentity) -> String {
     format!(
@@ -538,6 +609,17 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
     // re-derived, and no owner operation id is in hand in this file either, so
     // that slot stays missing too. The endpoint itself is read from the approved
     // contour and is never recorded.
+    //
+    // RESIDUAL KEY COLLISION, recorded here so a reader of THIS file sees it, not
+    // only a reader of the fixture: the `fence` slot on this record carries the
+    // StateFence's authority-epoch LINEAGE id, while the activation pair
+    // (`kernel_activation_driver.rs`, `kernel_front_door_client.rs`) binds the
+    // activation id under the same key — and two other sites in THIS file bind a
+    // different lineage again, the Host installation epoch's. So `fence` carries
+    // three identities across the instrumented corpus. Those types are distinct
+    // (`StateFence::authority_epoch` vs `HostInstallationEpoch::epoch`), so under
+    // I14.20 line 296 they are not interchangeable. Unifying them is a cross-file
+    // contract change and is escalated, not decided here.
     let correlation = LaunchPhaseCorrelation::NONE
         .with_installation(binding.installation.as_str())
         .with_fence(binding.state_fence.authority_epoch.lineage_id.as_str());
@@ -1937,6 +2019,10 @@ mod approved_path_tests {
         }
     }
 
+    /// A substituted executable locator is refused with the exact typed reason,
+    /// and the approved identity is never replaced by the substitute. This is
+    /// the real production `approved_launch_paths` refusal, executed.
+    // WORK_UNIT_CASE: 978/3
     #[test]
     fn rejects_substituted_executable_locator() {
         let executable = TempFile::create("bind-exe-real");
@@ -1953,6 +2039,10 @@ mod approved_path_tests {
         );
     }
 
+    /// A substituted config locator is refused the same way. The second half of
+    /// case 978/3 in this file: the approved config identity is retained across a
+    /// substitution failure exactly as the executable identity is.
+    // WORK_UNIT_CASE: 978/3
     #[test]
     fn rejects_substituted_config_locator() {
         let executable = TempFile::create("bind-cfg-exe");
@@ -2045,18 +2135,34 @@ mod approved_path_tests {
 /// leaf guard.
 ///
 /// These cases execute the real private seams of this module (the correlation
-/// renderer and the drop of an armed `HostLaunchTerminalGuard`); no visibility is
-/// widened and no production algorithm is restated here. Every value below is a
-/// synthetic test identity, never a real path, credential or error text.
+/// renderer, this file's own observe seam, the production process-start
+/// projection and the drop of an armed `HostLaunchTerminalGuard`); no visibility
+/// is widened and no production algorithm is restated here. Every value below is
+/// a synthetic test identity, never a real path, credential or error text, and
+/// where a case has no unit-reachable producer for a slot it says so in its own
+/// `HONEST SCOPE` note rather than claiming a proof it does not have.
 #[cfg(all(test, windows))]
 mod phase_correlation_tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
-    use super::{HostLaunchTerminalGuard, LaunchPhaseCorrelation};
+    use super::{HostLaunchTerminalGuard, LaunchPhaseCorrelation, MISSING_IDENTITY};
     use crate::host_diagnostics::{
         MAX_DIAGNOSTIC_DETAIL_BYTES, MAX_DIAGNOSTIC_FIELD_BYTES, bound_detail,
     };
+
+    /// The eight frozen correlation keys, in the order `LaunchPhaseCorrelation::render`
+    /// emits them and the fixture's `correlation_keys` declares them.
+    const FROZEN_CORRELATION_KEYS: [&str; 8] = [
+        "phase",
+        "installation",
+        "generation",
+        "operation",
+        "artifact",
+        "process_start",
+        "fence",
+        "reason",
+    ];
 
     /// In-memory sink that captures facade output without contending for the
     /// process-global subscriber.
@@ -2099,67 +2205,206 @@ mod phase_correlation_tests {
         haystack.matches(needle).count()
     }
 
-    // WORK_UNIT_CASE: 978/3
+    /// One already-observed process identity, as a caller that holds one passes
+    /// it. No process is spawned, no handle is opened and no probe runs here;
+    /// the identity is synthetic and its `image_path` is a canary the record
+    /// must never carry.
+    fn observed_process_identity(
+        process_id: u32,
+        start_time_100ns: u64,
+    ) -> eliot_platform_windows::ProcessIdentity {
+        eliot_platform_windows::ProcessIdentity {
+            process_id,
+            start_time_100ns,
+            image_path: String::from(r"C:\canary\kernel-image.exe"),
+        }
+    }
+
+    /// The `detail` field of the facade record a production observe call
+    /// emitted, read back out of the captured subscriber output. Nothing in this
+    /// module composes that text: the bytes are exactly what the real
+    /// `host_launch_observe` handed to the #889 facade.
+    fn captured_detail(captured: &str) -> String {
+        let (_, rest) = captured.split_once("detail=\"").unwrap_or_else(|| {
+            panic!("an executed production record must carry a detail: {captured}")
+        });
+        rest.split_once('"').map_or_else(
+            || panic!("the detail field must be terminated: {captured}"),
+            |(detail, _)| detail.to_owned(),
+        )
+    }
+
+    /// One REAL emission of this file's observe seam, returned as the structured
+    /// detail the #889 facade recorded for it.
+    fn emitted_detail(phase: &str, correlation: &LaunchPhaseCorrelation<'_>) -> String {
+        captured_detail(&capture(|| {
+            super::host_launch_observe(phase, correlation);
+        }))
+    }
+
+    /// A captured detail parsed into its ordered `key=value` slots, so a claim
+    /// about one slot can never be satisfied by a substring somewhere else in the
+    /// record.
+    ///
+    /// Values are NOT whitespace-free: the `phase` value is a multi-word token by
+    /// construction, so the record is never split on spaces. Each value runs from
+    /// its own `<key>=` anchor to the next `<key>=` anchor of the frozen
+    /// vocabulary, which is the only separator the renderer guarantees.
+    fn rendered_slots(detail: &str) -> Vec<(&str, &str)> {
+        FROZEN_CORRELATION_KEYS
+            .iter()
+            .map(|key| {
+                let anchor = format!("{key}=");
+                let start = detail
+                    .find(&anchor)
+                    .unwrap_or_else(|| panic!("a captured detail must carry {key}=: {detail}"))
+                    + anchor.len();
+                let end = FROZEN_CORRELATION_KEYS
+                    .iter()
+                    .filter(|other| *other != key)
+                    .map(|other| format!(" {other}="))
+                    .filter_map(|needle| detail[start..].find(&needle).map(|at| start + at))
+                    .min()
+                    .unwrap_or(detail.len());
+                (*key, &detail[start..end])
+            })
+            .collect()
+    }
+
+    /// Value of one slot of an already-parsed captured detail.
+    fn slot_value<'a>(parsed: &'a [(&'a str, &'a str)], key: &str) -> &'a str {
+        parsed.iter().find(|(name, _)| *name == key).map_or_else(
+            || panic!("the emitted record must carry {key}="),
+            |(_, value)| *value,
+        )
+    }
+
+    /// Exact non-secret identity, frozen order, explicit absence for every slot
+    /// the call site cannot prove.
+    ///
+    /// HONEST SCOPE: this case is deliberately NOT attributed to a case number,
+    /// because it is a RENDERER case and not a production-path case: it builds a
+    /// correlation from its own literals and asserts the rendered string, so it
+    /// carries no production execution and no owner-held identity. It is kept
+    /// because the frozen order and the absent-slot marker are real contracts,
+    /// but attributing it would let a reader conclude that `approved_launch_paths`
+    /// or `start_approved` is pinned by it, which it is not. The case-3
+    /// attribution in this file sits on the two `rejects_substituted_*_locator`
+    /// tests above, which really execute `approved_launch_paths` with a
+    /// substituted handle.
+    ///
+    /// The process-start slot is bound below by the REAL production projection
+    /// `host_launch_process_start_identity`. The remaining slots have no
+    /// unit-reachable producer in this module - their real producers are
+    /// `start_approved`'s already-held `HostInstallationEpoch`, authority
+    /// generation and approved digests, reachable only through a full admitted
+    /// physical launch.
     #[test]
     fn correlation_binds_exact_nonsecret_identity_and_marks_every_unproven_slot() {
+        let process_start =
+            super::host_launch_process_start_identity(&observed_process_identity(4321, 99));
         let bound = LaunchPhaseCorrelation::NONE
             .with_installation("installation-7")
             .with_generation(7)
             .with_operation("kernel")
             .with_artifact("a1")
-            .with_process_start("windows-pid:4321:start:99")
+            .with_process_start(&process_start)
             .with_fence("fence-3")
             .with_reason("store_owner_unreadable");
         assert_eq!(
-            bound.render("host.launch requested"),
+            emitted_detail("host.launch requested", &bound),
             concat!(
                 "phase=host.launch requested installation=installation-7 generation=7 ",
                 "operation=kernel artifact=a1 process_start=windows-pid:4321:start:99 ",
                 "fence=fence-3 reason=store_owner_unreadable",
-            )
+            ),
+            "a real emission must render every bound slot in the frozen order"
         );
         // Every unproven slot renders as explicit absence: never an empty value,
         // a zero or a placeholder that could read like a real identity.
         assert_eq!(
-            LaunchPhaseCorrelation::NONE.render("host.launch requested"),
+            emitted_detail("host.launch requested", &LaunchPhaseCorrelation::NONE),
             concat!(
                 "phase=host.launch requested installation=missing generation=missing ",
                 "operation=missing artifact=missing process_start=missing fence=missing ",
                 "reason=missing",
-            )
+            ),
+            "a real emission must spell every unproven slot as explicit absence"
         );
     }
 
+    /// A bound process-start identity must differ from an unproven slot.
+    ///
+    /// HONEST SCOPE: both values are produced by the REAL production projection
+    /// `host_launch_process_start_identity`, exactly as the four production call
+    /// sites in this file use it, and both records are real emissions. Observing
+    /// a `ProcessIdentity` itself needs a suspended launch and a validated child
+    /// handle, so this case proves the production projection plus the renderer
+    /// and does not claim a live process observation.
     // WORK_UNIT_CASE: 978/4
     #[test]
     fn a_bound_process_identity_is_not_its_own_absence() {
         let phase = "host.launch image identity preserved";
-        let observed = LaunchPhaseCorrelation::NONE.with_process_start("windows-pid:4321:start:99");
-        let absent = LaunchPhaseCorrelation::NONE;
-        let observed_render = observed.render(phase);
-        let absent_render = absent.render(phase);
+        let first = super::host_launch_process_start_identity(&observed_process_identity(4321, 99));
+        let second =
+            super::host_launch_process_start_identity(&observed_process_identity(4321, 100));
+        assert_eq!(
+            first, "windows-pid:4321:start:99",
+            "the production projection owns this shared spelling"
+        );
         assert_ne!(
-            observed_render, absent_render,
+            first, second,
+            "one reused PID must never yield one process-start identity"
+        );
+        let bound = LaunchPhaseCorrelation::NONE.with_process_start(&first);
+        let unproven = LaunchPhaseCorrelation::NONE;
+        let bound_record = emitted_detail(phase, &bound);
+        let unproven_record = emitted_detail(phase, &unproven);
+        let bound_slots = rendered_slots(&bound_record);
+        let unproven_slots = rendered_slots(&unproven_record);
+        assert_ne!(
+            bound_record, unproven_record,
             "an observed process identity must differ from an unproven slot"
         );
-        assert!(observed_render.contains("process_start=windows-pid:4321:start:99"));
-        assert!(absent_render.contains("process_start=missing"));
+        assert_eq!(
+            slot_value(&bound_slots, "process_start"),
+            first,
+            "the production projection's own value must reach the emitted record: {bound_record}"
+        );
+        assert_eq!(
+            slot_value(&unproven_slots, "process_start"),
+            MISSING_IDENTITY,
+            "an unproven process slot must read as explicit absence: {unproven_record}"
+        );
+        assert!(
+            !bound_record.contains("canary"),
+            "an image path is never a diagnostic identity: {bound_record}"
+        );
         // The phase token itself is preserved verbatim, leads the line, and stays
         // distinct from the request and admitted phases of this contour.
-        for render in [&observed_render, &absent_render] {
-            assert!(render.starts_with(&format!("phase={phase} ")));
+        for record in [&bound_record, &unproven_record] {
+            assert!(record.starts_with(&format!("phase={phase} ")));
         }
         assert_ne!(phase, "host.launch requested");
         assert_ne!(phase, "host.launch admitted");
     }
 
+    /// Every rendered identity stays inside the field bound, the whole record
+    /// stays inside the facade's detail bound, and no value is cut mid-value.
+    ///
+    /// HONEST SCOPE: the oversized input here is a SYNTHETIC stress value. No
+    /// owner holds a 1 KiB identity, and none could be built here without a real
+    /// launch, so this case proves the BOUND production `render` and the #889
+    /// facade apply, read back out of a real emission. It deliberately claims no
+    /// producer for a value no owner holds.
     // WORK_UNIT_CASE: 978/12
     #[test]
     fn every_rendered_identity_stays_bounded_and_path_free() {
         let oversized = "z".repeat(MAX_DIAGNOSTIC_FIELD_BYTES * 4);
-        let rendered = LaunchPhaseCorrelation::NONE
-            .with_artifact(&oversized)
-            .render("host.launch admitted");
+        let rendered = emitted_detail(
+            "host.launch admitted",
+            &LaunchPhaseCorrelation::NONE.with_artifact(&oversized),
+        );
         assert!(rendered.contains(&"z".repeat(MAX_DIAGNOSTIC_FIELD_BYTES)));
         assert!(!rendered.contains(&"z".repeat(MAX_DIAGNOSTIC_FIELD_BYTES + 1)));
         // The facade's own detail ceiling still bounds the whole record.
@@ -2176,12 +2421,24 @@ mod phase_correlation_tests {
         assert!(!rendered.contains(".."));
     }
 
+    /// The armed leaf guard emits exactly one correlated subordinate phase
+    /// record and no terminal.
+    ///
+    /// HONEST SCOPE: the guard, its drop, the renderer and the facade are all
+    /// production code executed here. The correlation is the owner's SLOT
+    /// SELECTION `start_approved` binds - installation, generation and the epoch
+    /// lineage fence - with synthetic values, because `start_approved` needs a
+    /// full admitted physical launch (approved digests, leases and a validated
+    /// descriptor) and cannot be reached from here. So this case proves the
+    /// emission count, the correlation SHAPE and the terminal freedom of the real
+    /// guard; it does not claim that any owner holds these exact identities.
     // WORK_UNIT_CASE: 978/10
     #[test]
     fn the_armed_leaf_guard_emits_one_phase_record_and_no_terminal() {
         let correlation = LaunchPhaseCorrelation::NONE
             .with_installation("installation-7")
-            .with_generation(7);
+            .with_generation(7)
+            .with_fence("fence-3");
         let failed = capture(|| {
             drop(HostLaunchTerminalGuard::armed(
                 "host.launch start failed observed",
@@ -2198,9 +2455,32 @@ mod phase_correlation_tests {
             0,
             "the leaf guard must emit no terminal; lib.rs owns the one terminal: {failed}"
         );
-        assert!(failed.contains("phase=host.launch start failed observed"));
-        assert!(failed.contains("installation=installation-7"));
-        assert!(failed.contains("generation=7"));
+        let failed_record = captured_detail(&failed);
+        assert!(
+            failed_record.starts_with("phase=host.launch start failed observed "),
+            "the guard's own phase token must lead the record: {failed_record}"
+        );
+        let parsed = rendered_slots(&failed_record);
+        for (key, value) in [
+            ("installation", "installation-7"),
+            ("generation", "7"),
+            ("fence", "fence-3"),
+        ] {
+            assert_eq!(
+                slot_value(&parsed, key),
+                value,
+                "the owner's bound slot {key} must reach the emitted record: {failed_record}"
+            );
+        }
+        // Every slot this contour does not bind stays explicitly absent rather
+        // than being filled with an invented identity.
+        for key in ["operation", "artifact", "process_start", "reason"] {
+            assert_eq!(
+                slot_value(&parsed, key),
+                MISSING_IDENTITY,
+                "an unbound slot must read as explicit absence: {failed_record}"
+            );
+        }
         let admitted = capture(|| {
             let mut guard =
                 HostLaunchTerminalGuard::armed("host.launch start failed observed", correlation);
@@ -2210,6 +2490,92 @@ mod phase_correlation_tests {
             count(&admitted, "host.entrypoint_stage"),
             0,
             "an admitted launch emits no failure record: {admitted}"
+        );
+    }
+
+    /// A record composed from several maximal identities must stay inside the
+    /// facade's own detail ceiling, and every slot must read as EITHER a complete
+    /// bounded value OR the explicit absent marker - never a value cut in half,
+    /// and never a key that vanished because it was shed.
+    ///
+    /// Marker-free: this is a property of `render` itself, already covered by the
+    /// case 978/12 vocabulary; it adds no new case denominator.
+    #[test]
+    fn an_oversized_record_sheds_whole_slots_and_never_truncates_one() {
+        // Each identity at the `bound_field` ceiling, so the full record is far
+        // past `MAX_DIAGNOSTIC_DETAIL_BYTES` and shedding is actually reached.
+        let maximal = "x".repeat(MAX_DIAGNOSTIC_FIELD_BYTES);
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(&maximal)
+            .with_operation(&maximal)
+            .with_artifact(&maximal)
+            .with_process_start(&maximal)
+            .with_fence(&maximal)
+            .with_reason(&maximal);
+        let rendered = correlation.render("host.launch oversized probe");
+
+        assert!(
+            rendered.len() <= MAX_DIAGNOSTIC_DETAIL_BYTES,
+            "the composed record must fit the facade ceiling untruncated: {} bytes",
+            rendered.len()
+        );
+        // The facade must never see a truncated record, so its own honesty
+        // fields stay false - this is the observable consequence of shedding.
+        let bounded = bound_detail(&rendered);
+        assert!(
+            !bounded.truncated(),
+            "the facade truncated what render emitted"
+        );
+        assert_eq!(bounded.original_bytes(), rendered.len());
+
+        // The phase token always leads and is never shed.
+        assert!(
+            rendered.starts_with("phase=host.launch oversized probe"),
+            "the phase token leads the record: {rendered}"
+        );
+
+        // Every slot reads either as a complete value or as the absent marker; a
+        // value cut mid-token would leave a fragment with no `=` and no marker.
+        //
+        // Parsed slot sequence, never byte offsets: shedding must never remove a
+        // key, so the record still carries exactly the eight frozen keys in the
+        // frozen order, and every value is either the absent marker or a whole
+        // bounded value.
+        let parsed = rendered_slots(&rendered);
+        assert_eq!(
+            parsed.len(),
+            FROZEN_CORRELATION_KEYS.len(),
+            "shedding must render every frozen slot, never drop one: {rendered}"
+        );
+        for (index, key) in FROZEN_CORRELATION_KEYS.iter().enumerate() {
+            let value = parsed[index].1;
+            assert_eq!(parsed[index].0, *key, "frozen slot order: {rendered}");
+            if index == 0 {
+                assert_eq!(
+                    value, "host.launch oversized probe",
+                    "the phase token is never shed: {rendered}"
+                );
+                continue;
+            }
+            assert!(
+                value == MISSING_IDENTITY || value == maximal,
+                "{key} must be a whole bounded value or the frozen absent marker, got {value:?}"
+            );
+        }
+        // Trailing slots are shed first, so the load-bearing prefix survives and
+        // the least load-bearing slot is the one that gives way - as an explicit
+        // marker, never as a silently missing key.
+        assert!(
+            rendered.contains("installation="),
+            "the installation identity is load-bearing and must survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("reason=x"),
+            "the reason slot is shed first and must not appear as a cut value: {rendered}"
+        );
+        assert!(
+            rendered.contains("reason=missing"),
+            "the shed reason slot must still be present as the frozen marker: {rendered}"
         );
     }
 }
