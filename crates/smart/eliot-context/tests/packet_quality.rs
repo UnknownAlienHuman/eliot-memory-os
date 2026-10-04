@@ -1701,7 +1701,10 @@ fn candidate_admitted_rendered_membership_and_measurement_unchanged() -> TestRes
     );
     assert_eq!(
         bounded.quality,
-        legacy_with([true, false, true, true, true, false, false, true]),
+        // `goal_coverage` is false here because the frozen producer computes it
+        // from the emitted `units`, and a zero budget emits none. The atom
+        // survives as a handle, not as a whole unit, so no role is covered.
+        legacy_with([false, false, true, true, true, false, false, true]),
         "the omission producer keeps its exact original computation"
     );
     assert!(
