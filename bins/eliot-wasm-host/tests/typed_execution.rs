@@ -20,11 +20,12 @@
 //!   `ModuleTestCapsule` run for real; those guarantees are defined to deny
 //!   BEFORE any engine, filesystem or provider work, so proving them needs no
 //!   engine.
-//! - **source guard**: only where the guarantee is a property of the
-//!   read-only owner files that no public API can observe. Case 26 is the
-//!   declared source-guard case; the two smaller guards (the typed leaf
-//!   walkers and the "no synchronous compile-cancellation claim") are marked
-//!   inline at their use site.
+//! - **source guard**: only where the guarantee is a property of an owner
+//!   file's text that no public API can observe. Case 26 is the declared
+//!   whole-file source-guard case; every other case that needs one marks its
+//!   own narrower guard inline at its use site (the typed leaf walkers in
+//!   case 9, the "no synchronous compile-cancellation claim" in case 14, the
+//!   cache-identity composition in case 22, and the rest).
 //!
 //! INTEGRATION-TEST BOUNDARY: the capsule-domain entry
 //! `execute_capsule_domain_experimental` takes a `&TypedDomainRequest`, whose
@@ -33,9 +34,9 @@
 //! `src/lib.rs`), so this external test cannot construct that request. The
 //! in-crate `six_world_capsule_drive::every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
 //! test constructs the requests and drives both domain entries for all six
-//! worlds through the real engine. Case 3 below separately binds each
-//! checked-in fixture to its neutral kit/capsule and executes its real
-//! `describe` export in this integration-test binary.
+//! worlds through the real engine. Case 3 below separately binds each frozen
+//! world's checked-in fixture to its neutral kit/capsule and executes that
+//! fixture's real `describe` export in this integration-test binary.
 
 use std::path::Path;
 
@@ -55,9 +56,12 @@ use eliot_wasm_runtime::{
     CancellationPolicy, CapabilityId, InvocationLimits, ProofStage, Sha256Digest,
 };
 
-// Read-only owner files inspected by the declared source-guard case 26 and by
-// the two inline source guards. `include_str!` reads them at build time; none
-// of them is mutated by this lane.
+// Owner files this file's source guards inspect. `include_str!` reads them at
+// build time, and each guard pins an exact source string, so a guard moves when
+// its owner file moves. `typed_execution.rs` and `receipt_bridge.rs` are this
+// lane's own #758 edit targets; `wasmtime_provider.rs`,
+// `artifact_preflight.rs`, `typed_bindings.rs`, both manifests and
+// `capsule.rs` are read only here.
 const TYPED_EXECUTION_SOURCE: &str = include_str!("../src/typed_execution.rs");
 const TYPED_BINDINGS_SOURCE: &str = include_str!("../src/typed_bindings.rs");
 const ARTIFACT_PREFLIGHT_SOURCE: &str = include_str!("../src/artifact_preflight.rs");
@@ -115,8 +119,9 @@ fn parse_component(text: &str) -> Vec<u8> {
     }
 }
 
-/// Checked-in fixture path. One file per `TypedWorld`, plus the checked-in
-/// NEGATIVE fixtures the same directory carries.
+/// Checked-in fixture path. One file per `TypedWorld`, plus the other
+/// checked-in fixtures the same directory carries (the hostile and
+/// over-reporting ones).
 fn fixture_file(name: &str) -> String {
     format!("tests/data/typed-components/{name}.wat")
 }
@@ -233,6 +238,7 @@ struct CueOptions {
     kind: DescribeKind,
     include_domain_export: bool,
     extra_core_module: bool,
+    extra_core_memory: bool,
     world_len_override: Option<u32>,
     describe_decl: Option<&'static str>,
     domain_decl: Option<&'static str>,
@@ -250,6 +256,7 @@ impl Default for CueOptions {
             // preflight and the denial under test is reached afterwards.
             include_domain_export: true,
             extra_core_module: false,
+            extra_core_memory: false,
             world_len_override: None,
             describe_decl: None,
             domain_decl: None,
@@ -264,8 +271,8 @@ fn cooperative_cue_artifact() -> Vec<u8> {
     cue_activation_artifact(&cooperative_guest(), &CueOptions::default())
 }
 
-/// The real checked-in `dreamer-cycle` fixture: the honest world component the
-/// negative fixtures in the same directory are derived from.
+/// The real checked-in `dreamer-cycle` fixture: the honest world component most
+/// of the negative fixtures in the same directory are derived from.
 fn real_cycle_fixture() -> Vec<u8> {
     load_fixture(TypedWorld::DreamerCycle)
 }
@@ -277,12 +284,61 @@ const DEFAULT_DESCRIBE_DECL: &str = "(func $describe (type $ca-describe)\n    \
 
 /// Default declared domain function. Its body is never reached by the denial
 /// cases: it only has to carry the exact WIT signature.
-const DEFAULT_DOMAIN_DECL: &str = "(func $activate (type $ca-activate)\n    (unreachable))";
+///
+/// A component-level `func` definition has no free body in the text format: the
+/// pinned parser accepts only an import, an alias, or a `canon lift`
+/// (`FuncKind::parse`, wast-256.0.0/src/component/func.rs:294-313, which after
+/// the type use requires `parser.parens(|p| { p.parse::<kw::canon>()?; ... })`).
+/// The trapping body therefore lives in the core function this export lifts,
+/// and stays exactly `(unreachable)`.
+const DEFAULT_DOMAIN_DECL: &str = "(func $activate (type $ca-activate)\n    \
+    (canon lift (core func $core-activate) (memory $memory) (realloc $realloc)))";
+
+/// Fixed base address, in the core module's exported linear memory, of the
+/// lowered `describe` return block.
+///
+/// `describe` returns one `abi-descriptor` record, and a result that does not
+/// fit the flat-result limit lowers to ONE indirect pointer: the pinned
+/// validator sets `MAX_FLAT_FUNC_RESULTS: usize = 1`
+/// (wasmparser-0.256.0 `src/validator/component_types.rs:35`, applied at `:129`
+/// and at `:1276-1296`, where an overflowing result list is cleared and exactly
+/// one pointer is pushed for `Abi::Lift` at `:1290-1292`), and
+/// `src/validator/component.rs:1343` computes that lowered signature while
+/// `:1365` refuses a lifted core signature that differs from it. Eleven flat
+/// `i32` results are therefore refused there, so the core `describe` returns
+/// the address of this block instead of leaving the values on the stack.
+///
+/// The block is eleven 4-byte slots holding exactly the eleven values that
+/// record flattens to, in the field order the WIT record declares
+/// (`wit/typed/descriptor.wit:28-35`): the five reported strings as
+/// `(pointer, length)` pairs, plus `abi-revision`.
+///
+/// Occupancy of the emitted core module, and why this base is free:
+/// - `[0, 16)` is reserved and never written by anything the template emits;
+/// - the five `(data ...)` segments occupy `[16, realloc_offset)`, where
+///   `realloc_offset` is the end of the last segment and is exactly the single
+///   pointer `$realloc` hands out, so nothing is ever allocated above it;
+/// - measured over every descriptor this file builds, `realloc_offset` is at
+///   most 190 bytes (the longest field set is case 24's planted secret: 16
+///   + 14 + 19 + 54 + 23 + 64), so a
+///   block at `[1024, 1068)` clears the data segments by 834 bytes and stays
+///   inside the single declared page (65536 bytes).
+///
+/// `cue_activation_artifact` asserts that measured invariant, so a future
+/// longer descriptor fails loudly at build time instead of silently aliasing
+/// the block.
+const DESCRIBE_RETURN_BASE: u32 = 1024;
+
+/// The `i32` slots of the lowered `describe` return block: the five reported
+/// strings as `(pointer, length)` pairs, plus `abi-revision`.
+const DESCRIBE_RETURN_SLOTS: usize = 11;
 
 /// The flat core `describe` body: an optional prologue that trips a resource
-/// ceiling, then the descriptor's eleven canonical-ABI return values in WIT
-/// field order. `spans` carries the `(pointer, length)` pair of each reported
-/// string, already laid out in the core module's linear memory.
+/// ceiling, then a store of each of the descriptor's eleven canonical-ABI
+/// return values into the block at [`DESCRIBE_RETURN_BASE`], and that block's
+/// address as the single result. `spans` carries the `(pointer, length)` pair
+/// of each reported string, already laid out in the core module's linear
+/// memory.
 fn describe_body(fields: &TypedDescriptor, spans: &[(u32, u32)], options: &CueOptions) -> String {
     let prologue = match options.kind {
         DescribeKind::GrowOnePage => "(drop (memory.grow (i32.const 1)))\n",
@@ -294,23 +350,52 @@ fn describe_body(fields: &TypedDescriptor, spans: &[(u32, u32)], options: &CueOp
     let (revision_ptr, revision_len) = spans[3];
     let (digest_ptr, digest_len) = spans[4];
     let world_len = options.world_len_override.unwrap_or(world_len);
-    match options.kind {
-        DescribeKind::Trap => "(unreachable)".to_owned(),
-        _ => format!(
-            "{prologue}\
-             (i32.const {world_ptr}) (i32.const {world_len})\n\
-             (i32.const {package_ptr}) (i32.const {package_len})\n\
-             (i32.const {})\n\
-             (i32.const {contract_ptr}) (i32.const {contract_len})\n\
-             (i32.const {revision_ptr}) (i32.const {revision_len})\n\
-             (i32.const {digest_ptr}) (i32.const {digest_len})",
-            fields.abi_revision
-        ),
+    if let DescribeKind::Trap = options.kind {
+        return "(unreachable)".to_owned();
     }
+    // The same eleven values, in the same order, that the stack form pushed:
+    // each reported string as `(pointer, length)` in WIT field order, with
+    // `abi-revision` third.
+    let values = [
+        world_ptr,
+        world_len,
+        package_ptr,
+        package_len,
+        fields.abi_revision,
+        contract_ptr,
+        contract_len,
+        revision_ptr,
+        revision_len,
+        digest_ptr,
+        digest_len,
+    ];
+    let mut body = String::new();
+    for (slot, value) in values.iter().enumerate() {
+        let address = DESCRIBE_RETURN_BASE + narrow_u32(slot * 4);
+        body.push_str("(i32.store (i32.const ");
+        body.push_str(&address.to_string());
+        body.push_str(") (i32.const ");
+        body.push_str(&value.to_string());
+        body.push_str("))\n");
+    }
+    body.push_str("(i32.const ");
+    body.push_str(&DESCRIBE_RETURN_BASE.to_string());
+    body.push(')');
+    format!("{prologue}{body}")
 }
 /// Builds a real component-model `cue-activation` component whose exported
 /// signature is the exact frozen WIT signature of both interface functions,
 /// with a parameterisable `describe` body.
+///
+/// The core module carries two extra core functions beside `describe`:
+/// `$activate-core`, whose body is the `(unreachable)` the domain export lifts,
+/// and `$partial-core`, the discriminator body the wrongly-typed `describe`
+/// export of case 7 lifts. Both are lifted, so both core signatures are exactly
+/// the canonical-ABI lowering of the component type they are lifted at:
+/// `$ca-activate` lowers to one indirect `i32` parameter and one indirect `i32`
+/// result (its request record exceeds `MAX_FLAT_FUNC_PARAMS` and its
+/// `result<outcome, error>` payload does not fit one flat value), and
+/// `$ca-describe-partial` lowers to one indirect `i32` result.
 fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Vec<u8> {
     let values = [
         fields.world_name.as_str(),
@@ -334,6 +419,14 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
     let data = segments.concat();
     let results = describe_body(fields, &spans, options);
     let realloc_offset = offset;
+    // The data segments and the `$realloc` pointer must both stay below the
+    // fixed lowered-return block, or the descriptor bytes the lifted return
+    // block points at would be overwritten. See `DESCRIBE_RETURN_BASE`.
+    assert!(
+        realloc_offset + narrow_u32(DESCRIBE_RETURN_SLOTS * 4) <= DESCRIBE_RETURN_BASE,
+        "#758 typed fixture descriptor data would overlap the describe return block: \
+         realloc_offset {realloc_offset} + {DESCRIBE_RETURN_SLOTS} slots"
+    );
     let describe_decl = options
         .describe_decl
         .map_or_else(|| DEFAULT_DESCRIBE_DECL.to_owned(), str::to_owned);
@@ -344,11 +437,30 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
         .ambient_import
         .as_deref()
         .map_or_else(String::new, |name| {
-            format!("(import \"{name}\" (func $ambient (param i32)))\n")
+            // A component `func` param carries its name as a string literal
+            // (`ComponentFunctionParam::parse`, wast-256.0.0/src/component/
+            // types.rs:785-793, parses `name: &'a str` first); a bare
+            // `(param i32)` is rejected there. The imported name and the single
+            // `i32` parameter type are unchanged.
+            format!("(import \"{name}\" (func $ambient (param \"value\" i32)))\n")
         });
     let extra_module = if options.extra_core_module {
         "  (core module $extra (func (export \"unused\")))\n  \
          (core instance $extra (instantiate $extra))\n"
+    } else {
+        ""
+    };
+    // A SECOND defined memory in the SAME core module. Multi-memory is
+    // compiled on by default in the pinned engine (`Config::wasm_multi_memory`
+    // is documented `true` by default at wasmtime-47.0.4 `src/config.rs:1186`
+    // and `configured_engine` at `src/wasmtime_provider.rs:792-806` never
+    // disables it), so this component is VALID and reaches instantiation; only the
+    // Store's memory COUNT can refuse it. The extra memory is unreferenced and
+    // unexported, so every alias, export and body in the template is unchanged:
+    // the one difference between this fixture and the cooperative one is the
+    // count the engine is asked to honour.
+    let extra_memory = if options.extra_core_memory {
+        "    (memory $extra-memory 1)\n"
     } else {
         ""
     };
@@ -373,16 +485,24 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
         r#"(component
 {CUE_TYPES}{ambient_import}  (core module $guest
     (memory (export "memory") 1)
-    {data}    (func $realloc (param i32 i32 i32 i32) (result i32)
+{extra_memory}    {data}    (func $realloc (param i32 i32 i32 i32) (result i32)
       (i32.const {realloc_offset}))
-    (func $describe (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
+    (func $activate-core (param i32) (result i32)
+      (unreachable))
+    (func $partial-core (result i32)
+      (i32.const 0))
+    (func $describe (result i32)
       {results})
+    (export "activate" (func $activate-core))
+    (export "partial" (func $partial-core))
     (export "describe" (func $describe))
     (export "realloc" (func $realloc)))
   (core instance $guest (instantiate $guest))
 {extra_module}  (alias core export $guest "describe" (core func $core-describe))
   (alias core export $guest "memory" (core memory $memory))
   (alias core export $guest "realloc" (core func $realloc))
+  (alias core export $guest "activate" (core func $core-activate))
+  (alias core export $guest "partial" (core func $core-partial))
   {describe_decl}
   {domain_decl}
   (instance $iface
@@ -491,7 +611,7 @@ const CUE_TYPES: &str = r#"
 (type $ca-schema (record (field "want-revision" u32) (field "got-revision" u32) (field "human-detail" string)))
 (type $ca-internal (record (field "human-detail" string)))
 (type $ca-error (variant (case "malformed" $ca-malformed) (case "bound-exceeded" $ca-bound) (case "stale-snapshot" $ca-stale) (case "unsupported-schema" $ca-schema) (case "internal" $ca-internal)))
-(type $ca-activate (func (param "request" $ca-request) (result (result $ca-outcome $ca-error))))
+(type $ca-activate (func (param "request" $ca-request) (result (result $ca-outcome (error $ca-error)))))
 "#;
 
 fn require_governed(result: Result<(), TypedExecutionError>, expected: &TypedExecutionError) {
@@ -978,12 +1098,17 @@ fn missing_or_wrong_descriptor_and_domain_exports_are_denied_before_instantiatio
         &TypedExecutionError::MissingExport("activate".to_owned()),
     );
 
-    // Wrongly typed domain export.
+    // Wrongly typed domain export: a scalar domain type at the exact core
+    // signature the domain core function already has, so the component itself
+    // stays valid and only the exported domain type is wrong.
     let wrong_domain = cue_activation_artifact(
         &cooperative_guest(),
         &CueOptions {
             include_domain_export: true,
-            domain_decl: Some("(func $activate (result u32)\n    (i32.const 0))"),
+            domain_decl: Some(
+                "(func $activate (param u32) (result u32)\n    \
+                 (canon lift (core func $core-activate) (memory $memory) (realloc $realloc)))",
+            ),
             ..CueOptions::default()
         },
     );
@@ -994,12 +1119,16 @@ fn missing_or_wrong_descriptor_and_domain_exports_are_denied_before_instantiatio
         &TypedExecutionError::ExportTypeMismatch("activate".to_owned()),
     );
 
-    // Wrongly typed descriptor export.
+    // Wrongly typed descriptor export: the partial descriptor type at the exact
+    // core signature its discriminator core function has.
     let wrong_descriptor = cue_activation_artifact(
         &cooperative_guest(),
         &CueOptions {
             include_domain_export: true,
-            describe_decl: Some("(func $describe (type $ca-describe-partial)\n    (unreachable))"),
+            describe_decl: Some(
+                "(func $describe (type $ca-describe-partial)\n    \
+                 (canon lift (core func $core-partial) (memory $memory) (realloc $realloc)))",
+            ),
             ..CueOptions::default()
         },
     );
@@ -1501,6 +1630,61 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
         &staged(TypedStage::Cleanup, engine("MemoryLimit")),
     );
 
+    // THE MEMORY-COUNT HALF, EXECUTED. `MAX_TYPED_MEMORIES = 1` reaches the
+    // engine as the Store's memory count (`Store::limiter` snapshots
+    // `ResourceLimiter::memories` as `StoreOpaque::memory_limit`,
+    // wasmtime-47.0.4 `src/runtime/store.rs:936-943`), and the count is checked
+    // by `StoreOpaque::bump_resource_counts`
+    // (`src/runtime/store.rs:1519-1543`, bail at `:1523`, reached from
+    // `Instance::new_raw` at `src/runtime/instance.rs:309` via the component's
+    // own core-module instantiation at
+    // `src/runtime/component/instance.rs:838-841`) BEFORE any memory is
+    // allocated and therefore before `memory_growing` can ever run. Two
+    // consequences this leg pins down, both read off the executed value:
+    // `limit_hit` stays `None`, so the count refusal is NOT typed as a memory
+    // ceiling by this Host; and `map_instantiate_error`
+    // (`src/typed_execution.rs:1305-1338`, `fn map_instantiate_error`) cannot
+    // classify it either --
+    // `is_instance_limit_error` requires "instance" in the message
+    // (`src/wasmtime_provider.rs:767-770`) and the memory-count bail spells
+    // "memory count too high", so the check misses; a `bail!` message is not a
+    // `wasmtime::Trap`, so `trap_termination` returns `None`; and the message
+    // matches none of "import"/"export"/"missing"/"type".
+    //
+    // So the real, observable denial is the staged GENERIC component-error
+    // instantiation denial, and that is what is asserted. The ceiling is
+    // enforced by the Store limiter, not TYPED as a memory ceiling by the
+    // host: `MAX_TYPED_MEMORIES` bounds the count and the excess component is
+    // refused, but the refusal carries no memory-count code of its own. The
+    // discriminator is the identical `GrowOnePage` component above, built by
+    // the same generator one memory shorter, which completes under the same
+    // envelope -- so the second declared memory is what causes this denial.
+    let two_memories = cue_activation_artifact(
+        &cooperative_guest(),
+        &CueOptions {
+            extra_core_memory: true,
+            ..CueOptions::default()
+        },
+    );
+    let count_limits = default_experimental_limits(Sha256Digest::of_bytes(&two_memories));
+    let Err(observed_count_refusal) =
+        run_describe(TypedWorld::CueActivation, &two_memories, &count_limits)
+    else {
+        panic!("a component declaring more memories than the configured maximum must be refused");
+    };
+    assert_eq!(
+        observed_count_refusal,
+        staged(
+            TypedStage::Instantiate,
+            engine("instantiate:component-error")
+        ),
+        "the memory-count ceiling is refused, not typed as a memory ceiling"
+    );
+    assert_eq!(
+        denial_of(&observed_count_refusal),
+        "STAGE:instantiate:ENGINE:instantiate:component-error"
+    );
+
     // Declared source guard for the memory-COUNT ceiling: `InvocationLimits`
     // carries no memory count, so the Host fixes it and forwards it to the
     // engine's `StoreLimits` (a refused growth sets the recorded limit hit).
@@ -1577,8 +1761,44 @@ fn table_instance_and_resource_bounds_are_enforced() {
 // WORK_UNIT_CASE: 758/17
 #[test]
 fn a_guest_typed_error_is_distinct_from_a_trap() {
-    // Real engine: a guest trap arrives as a typed ENGINE denial at the stage
-    // reached, never as a completed receipt.
+    // The name covers both halves of one distinction; they live in two places,
+    // and this comment says which is which, because the halves are not reachable
+    // from the same place.
+    //
+    // THE TYPED-ERR HALF IS PROVEN IN-CRATE, NOT HERE. It is proven in
+    // `src/typed_execution.rs` by the named helper
+    // `six_world_capsule_drive::assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap`,
+    // called from
+    // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
+    // (`src/typed_execution.rs:5656-5657` declares the test, `:5676` is the
+    // call: `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
+    // -> `assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap`).
+    // It cannot live in any `tests/` target,
+    // and that is a reachability fact rather than a preference: the domain
+    // entries take a `&TypedDomainRequest` whose variant payloads are
+    // crate-private generated bindgen types, and `mod typed_bindings;` is
+    // private in `src/lib.rs`, so an external test cannot construct the request
+    // and cannot reach either domain entry at all (the crate states this in the
+    // comment above
+    // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`,
+    // `src/typed_execution.rs:5649-5655`, line 5652: "`mod typed_bindings`
+    // is private in `src/lib.rs`"). That helper decides the typed-`Err`
+    // branch from executed values only — the retained terminal result and the
+    // terminal a terminated guest never produces. None of that is restated or
+    // re-derived here, and this file previously stood in for it with
+    // `TYPED_EXECUTION_SOURCE.contains(...)` checks: a search of the
+    // production file's own text is not an execution, and those checks stayed
+    // green even if the engine-to-`GuestError` mapping were deleted, so they
+    // proved nothing and are gone.
+    //
+    // WHAT THIS TEST PROVES ON ITS OWN IS THE EXECUTED TRAP HALF: real
+    // component bytes, the real Wasmtime engine, a real `(unreachable)` in the
+    // guest's `describe`, and the typed denial the engine actually reports. This
+    // overlaps case 18
+    // (`the_unreachable_guest_path_is_a_trap_not_a_guest_error`), which asserts
+    // the same executed denial and adds a positive control and the
+    // not-rewritten-as-anything-else checks. The overlap is deliberate: the trap
+    // obligation is real, and neither test substitutes for the other.
     let trapper = cue_activation_artifact(
         &cooperative_guest(),
         &CueOptions {
@@ -1595,20 +1815,6 @@ fn a_guest_typed_error_is_distinct_from_a_trap() {
         observed_trap,
         staged(TypedStage::Descriptor, engine("Trap(GuestTrap)"))
     );
-
-    // Declared source guard for the domain leg (which needs a typed request the
-    // integration test cannot construct): a guest's own `Err` becomes
-    // `TypedDomainResult::GuestError`, whose terminal is `GuestError`, and a
-    // trap/fuel/epoch/stack/resource fault becomes `TypedExecutionError`.
-    assert!(TYPED_EXECUTION_SOURCE.contains("TypedDomainResult::GuestError(Box::new("));
-    assert!(TYPED_EXECUTION_SOURCE.contains("Self::Outcome(_) => \"Completed\","));
-    assert!(TYPED_EXECUTION_SOURCE.contains("Self::GuestError(_) => \"GuestError\","));
-    assert!(
-        TYPED_EXECUTION_SOURCE
-            .contains("wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,")
-    );
-    assert!(TYPED_EXECUTION_SOURCE.contains("EngineTermination::Trap(TrapClass::GuestTrap),"));
-    assert!(TYPED_EXECUTION_SOURCE.contains("own typed error is NOT reported here"));
 }
 
 // WORK_UNIT_CASE: 758/18

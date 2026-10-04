@@ -1,0 +1,24 @@
+{
+  "candidate_id": "candidate-1",
+  "mechanism": "the grant is fenced by the epoch",
+  "intervention": "hold the epoch and re-run",
+  "predicted_observable": "the fence rejects the stale write",
+  "counterfactual": "without the epoch the write lands",
+  "possible_confounders": [
+    "clock skew"
+  ],
+  "interacting_causes": [
+    "lease expiry"
+  ],
+  "temporal_lag": "one lease period",
+  "abstraction_level": "component",
+  "rival_explanations": [
+    "clock skew alone"
+  ],
+  "no_plausible_rival_rationale": null,
+  "transfer_boundary": "same epoch discipline only",
+  "edge_status": "supported",
+  "calibration": "medium",
+  "assigned_check": null,
+  "intervention_outcomes": []
+}

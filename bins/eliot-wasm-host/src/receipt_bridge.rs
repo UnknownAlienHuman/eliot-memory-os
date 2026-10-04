@@ -7,14 +7,19 @@
 //! `actual_exports`, `input_bytes`, `fuel_consumed`, `peak_memory_bytes`,
 //! `table_elements`, `instances`, the admitted `operation_id`/`task_id`/
 //! `fence_epoch`/`policy_id` echo, `artifact_bytes`, and the observation-only
-//! `elapsed_ms`. None of those fields is repaired into a neutral shape here;
-//! they stay host-owned and are dropped by the projection, never faked.
+//! `elapsed_ms`. The execution-mode `proof` string is dropped the same way:
+//! the shared contract has no mode field, so `NON_GOVERNED_EXPERIMENTAL` and
+//! a governed proof never travel outward here. None of those fields is
+//! repaired into a neutral shape here; they stay host-owned and are dropped
+//! by the projection, never faked.
 //!
 //! The two shared fields no host receipt carries must arrive from the caller
 //! with their source named at the call site, never invented here:
 //! `kit_digest` is the digest of the governing [`ModuleContractKit`] (its
-//! `digest`, which binds package/world/ABI/artifact/interface/declared
-//! imports/exports/state contract/ceiling), and `proof_ceiling` is the
+//! `digest`, a canonical digest over every kit field — package, world, ABI,
+//! artifact digest AND length, interface digest, declared imports/exports,
+//! state contract digest, proof ceiling and the `governed` flag,
+//! `capsule.rs:49-63` and `:99-101`), and `proof_ceiling` is the
 //! admitted ceiling — on the kit lane `ModuleContractKit::proof_ceiling`, which
 //! the call site admits only after proving it equal to the
 //! `TypedDomainAdmission::proof_ceiling` that call actually enforces (a kit
@@ -26,24 +31,29 @@
 //! the shared receipt instead of synthesizing either value.
 //!
 //! The projected receipt is validated by the shared `validate` before it is
-//! returned: exact package identity, bounded terminal, and the output
-//! invariant (output bytes exist exactly when an output digest exists). The
-//! shared `semantic_digest` is recomputed over the shared fields only, so
+//! returned (`crates/modules/eliot-wasm-runtime/src/types.rs:922-937`): exact
+//! package identity, bounded terminal, and the output invariant (output bytes
+//! exist exactly when an output digest exists). The shared `semantic_digest`
+//! is recomputed over the shared fields only, so
 //! observation timing stays separate from deterministic semantic identity.
 //! Projection success still means one bounded typed call, never candidate
 //! application, use, or task completion.
 //!
 //! The projection is carried outward only from the kit-owned capsule entry
 //! ([`execute_capsule_domain_experimental`]), which returns it as the `Some`
-//! third element beside the host receipt it was computed from. That host
-//! receipt stays the source of truth: the projection is additive fail-closed
-//! evidence, never a replacement, and a projection denial fails the call
+//! third element beside the host receipt it was computed from; the public
+//! kit-taking entry [`execute_domain_experimental`] only forwards that same
+//! element when it is given a kit and capsule, and reports `None` on its
+//! kit-less lane. That host receipt stays the source of truth: the projection
+//! is additive fail-closed evidence, never a replacement, and a projection
+//! denial fails the call
 //! instead of returning a receipt the shared contract rejects. The projection
 //! is computed per call from the receipt of that call alone and nothing is
 //! cached across calls, so one failed invocation cannot poison an independent
 //! later invocation.
 //!
 //! [`execute_capsule_domain_experimental`]: crate::typed_execution::execute_capsule_domain_experimental
+//! [`execute_domain_experimental`]: crate::typed_execution::execute_domain_experimental
 //!
 //! [`ModuleContractKit`]: eliot_wasm_runtime::capsule::ModuleContractKit
 //! [`TypedReceipt`]: crate::typed_execution::TypedReceipt
@@ -60,8 +70,11 @@ use crate::typed_execution::{TypedExecutionError, TypedReceipt, TypedStage};
 /// `proof_ceiling` is the caller-supplied admitted ceiling; both sources are
 /// named at the call site. Every failure is a typed
 /// [`TypedExecutionError`]: an unparsable world is `WorldUnknown`, a legacy
-/// world is `LegacyMismatch`, an unknown host stage code or a shared
-/// validation denial is the owned typed denial with the same fail-closed
+/// world is `LegacyMismatch`, an unknown host stage code is
+/// `OutputViolation("stage")`, and a shared validation denial is the
+/// `AdmissionMismatch` variant [`map_shared_validation`] selects — `package`,
+/// the offending descriptor field, `shared-report`, or `shared-receipt` for a
+/// cause with no more specific arm. All of them keep the same fail-closed
 /// meaning. There is no stringly catch-all and no `Value`/string repair.
 ///
 /// # Errors
@@ -127,7 +140,13 @@ pub fn project_shared_receipt(
 
 /// Maps one host pipeline stage code to the separated shared proof stage.
 /// Each host stage names the proof its completion would support; parity has
-/// no host counterpart and is never produced here.
+/// no host counterpart and is never produced here. A host receipt exists only
+/// on success and both typed lanes stamp it `TypedStage::Cleanup`
+/// (`typed_execution.rs:1049`, `:2150`), so a projection built from a
+/// production receipt always carries `ProofStage::Receipt`. The other five
+/// arms keep the closed host vocabulary mapped rather than silently
+/// collapsed, and an unrecognized code is denied by the `else` arm instead of
+/// being mapped to a neighbouring proof.
 fn project_stage(stage: &str) -> Result<ProofStage, TypedExecutionError> {
     if stage == TypedStage::Compile.as_str() {
         Ok(ProofStage::Build)
@@ -220,7 +239,9 @@ const fn proof_ceiling_code(ceiling: ProofCeiling) -> &'static str {
 }
 
 /// Bounds an unparsable host world for a typed denial: identity only, never
-/// payload, path, or secret.
+/// payload, path, or secret. 96 characters, matching the host's own
+/// bounded-identity bound on the typed path
+/// (`typed_execution.rs:1078`), and tighter than the shared contract's 128.
 fn bounded_identity(value: &str) -> String {
     value.chars().take(96).collect()
 }

@@ -1,0 +1,41 @@
+{
+  "schema_version": "eliot.operator-snapshot-v1",
+  "protocol_version": "eliot.operator-ipc-v1",
+  "protocol_hash": "protocol-sha",
+  "runtime_id": "runtime-1",
+  "auth_generation": "generation-1",
+  "health_refs": [],
+  "task_cognition": [],
+  "memory_inspector": null,
+  "routing": {
+    "host_session_refs": [],
+    "task_role_lease_refs": [],
+    "work_or_action_lease_refs": [],
+    "route_policies": [],
+    "route_decisions": [],
+    "host_sessions": [],
+    "task_role_leases": [],
+    "controller_leases": [],
+    "operation_jobs": [],
+    "agent_results": [],
+    "agent_result_dispositions": [],
+    "work_items": [],
+    "work_leases": [],
+    "worktree_leases": [],
+    "work_conflicts": []
+  },
+  "runs": [],
+  "approvals": [],
+  "timeline": {
+    "cursor": null,
+    "next_cursor": null,
+    "event_refs": [],
+    "incident_refs": []
+  },
+  "project_refs": [
+    "00000000-0000-7000-8000-000000000001"
+  ],
+  "backup_inventory": [],
+  "log_handles": [],
+  "generated_at": "2026-09-07T12:00:00Z"
+}

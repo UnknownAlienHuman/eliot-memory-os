@@ -8,11 +8,11 @@
 ;; limits, not only the later domain call").
 ;;
 ;; The core module declares a `(start ...)` function whose loop has no exit.
-;; `describe_dreamer_cycle` (typed_execution.rs:1787-1820) runs
+;; `describe_dreamer_cycle` (typed_execution.rs:1792-1825) runs
 ;; `DreamerCycle::instantiate` inside `run_guarded`, so the admitted fuel
-;; budget (`typed_fuel_budget`, :1385-1390), the store resource ceilings
-;; (`new_store`, :1392-1421) and the epoch deadline (`EpochDriver::spawn`,
-;; :1503-1534) all apply to it exactly as they apply to the later `describe`
+;; budget (`typed_fuel_budget`, :1390-1395), the store resource ceilings
+;; (`new_store`, :1397-1426) and the epoch deadline (`EpochDriver::spawn`,
+;; :1508-1539) all apply to it exactly as they apply to the later `describe`
 ;; call. The engine therefore genuinely terminates this instantiation: with
 ;; `EpochAndFuel` it is `wasmtime::Trap::OutOfFuel`
 ;; (wasmtime-environ-47.0.4 `trap_encoding.rs`:145, "all fuel consumed by
@@ -21,31 +21,33 @@
 ;;
 ;; WHAT THE HOST REPORTS: the typed fuel/epoch cause this case requires.
 ;; `describe_dreamer_cycle` routes the instantiate failure through
-;; `map_instantiate_error` (:1799), which classifies in this order:
-;; `store.data().limit_hit` first (:1304-1306), then
-;; `is_instance_limit_error` (:1310-1312, which needs "instance" plus
-;; "limit"/"maximum"), then the shared `trap_termination` classifier
-;; (:1321-1323), and only then the substring fallbacks for "import"
-;; (:1325), "export"/"missing"/"type" (:1327). Component initialization is
+;; `map_instantiate_error` (:1305-1338, applied at :1801-1806), which
+;; classifies in this order:
+;; `store.data().limit_hit` first (:1309-1311), then
+;; `is_instance_limit_error` (:1315-1317, which needs "instance" plus
+;; "limit"/"maximum" -- wasmtime_provider.rs:767-770), then the shared
+;; `trap_termination` classifier
+;; (:1326-1328), and only then the substring fallbacks for "import"
+;; (:1330-1331), "export"/"missing"/"type" (:1332-1335). Component initialization is
 ;; untrusted execution too and runs inside the same guarded envelope as the
 ;; descriptor call, so an instantiation the engine terminates with a real trap
 ;; carries the owner-typed cause read from the real engine trap code, never
-;; from message text: `trap_termination` (:1271-1280) maps
-;; `Trap::OutOfFuel` to `EngineTermination::FuelExhausted` (:1274) and
-;; `Trap::Interrupt` to `EngineTermination::EpochDeadline` (:1275).
+;; from message text: `trap_termination` (:1276-1285) maps
+;; `Trap::OutOfFuel` to `EngineTermination::FuelExhausted` (:1279) and
+;; `Trap::Interrupt` to `EngineTermination::EpochDeadline` (:1280).
 ;;
 ;; So this fixture denies with `Engine("FuelExhausted")` under the default
 ;; `EpochAndFuel` policy and `Engine("EpochDeadline")` under
 ;; `CancellationPolicy::EpochInterruption`, both staged `TypedStage::Instantiate`
-;; by the `staged` wrapper at :1797-1800. The untyped
-;; `Engine("instantiate:component-error")` (:1331) is now only the fallback
+;; by the `staged` wrapper at :1800-1806. The untyped
+;; `Engine("instantiate:component-error")` (:1336) is now only the fallback
 ;; for an engine error that is not a trap at all. This is the same classifier
-;; `map_call_error` (:1282-1298) applies to the later `describe`/domain leg, so
+;; `map_call_error` (:1287-1303) applies to the later `describe`/domain leg, so
 ;; both untrusted-execution legs carry the same typed cause.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `step` result tuple, 0x1000 echo scratch, 0x1400 the bump
-;; region the host `realloc` hands out while lowering the request.
+;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo scratch
+;; blocks, 0x1400 the bump region the host `realloc` hands out while lowering the request.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -148,15 +150,16 @@
     (case "internal" $cycle_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome $cycle_error))))
+  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     ;; Component initialization that never returns. A core-module start function
     ;; is ordinary untrusted guest execution that runs inside
     ;; `DreamerCycle::instantiate`, i.e. inside the one guarded envelope of
-    ;; `run_guarded` (typed_execution.rs:1528-1560) and therefore under the same
+    ;; `run_guarded` (typed_execution.rs:1561-1593) and therefore under the same
     ;; fuel budget, store resource ceilings and epoch deadline as `describe`
-    ;; (:1364-1393, :1474-1506). It touches no memory and calls nothing, so only
+    ;; (`typed_fuel_budget`, :1390-1395; `new_store`, :1397-1426;
+    ;; `EpochDriver::spawn`, :1508-1539). It touches no memory and calls nothing, so only
     ;; fuel exhaustion or the epoch deadline can stop it. `describe` and `step`
     ;; below are the untouched honest `dreamer-cycle` bodies: they are never
     ;; reached, which is the point.
@@ -182,19 +185,41 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, flattened in WIT field order.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 13)
-      (i32.const 1037)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1056)
-      (i32.const 19)
-      (i32.const 1075)
-      (i32.const 5)
-      (i32.const 1080)
-      (i32.const 64)
+    ;; the frozen ABI revision, lowered in WIT field order into guest memory.
+    ;;
+    ;; This body is the honest `dreamer-cycle` one and is dead code: `(start
+    ;; $init)` above never returns, so instantiation never completes and this
+    ;; export is never called. The store and the single returned pointer are
+    ;; still written here, because the obligation this file proves is that
+    ;; component INITIALIZATION is terminated by the fuel/epoch policy, and
+    ;; `$init` -- not this body -- is what runs. Nothing below weakens or
+    ;; shortens the start loop.
+    ;;
+    ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
+    ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
+    ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
+    ;; pointer to guest-owned memory: wasmparser-0.256.0
+    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; and push exactly one pointer for `Abi::Lift`, and
+    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
+    ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
+    ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
+    ;; `realloc` bump region. `$init` writes nothing at all, so it collides
+    ;; with nothing. 0x0c00 is clear of all of the above.
+    (func (export "describe") (result i32)
+      (i32.store (i32.const 3072) (i32.const 1024))
+      (i32.store (i32.const 3076) (i32.const 13))
+      (i32.store (i32.const 3080) (i32.const 1037))
+      (i32.store (i32.const 3084) (i32.const 19))
+      (i32.store (i32.const 3088) (i32.const 1))
+      (i32.store (i32.const 3092) (i32.const 1056))
+      (i32.store (i32.const 3096) (i32.const 19))
+      (i32.store (i32.const 3100) (i32.const 1075))
+      (i32.store (i32.const 3104) (i32.const 5))
+      (i32.store (i32.const 3108) (i32.const 1080))
+      (i32.store (i32.const 3112) (i32.const 64))
+      (i32.const 3072)
     )
     ;; `step`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
@@ -213,11 +238,14 @@
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
       ;; echo "state.fence-epoch" back out of the lowered request
+      ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2124) (i32.const 4608))
-      (i32.store (i32.const 2128) (local.get $n))
+      (i32.store (i32.const 2116) (i32.const 4608))
+      (i32.store (i32.const 2120) (local.get $n))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")

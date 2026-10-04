@@ -139,7 +139,7 @@ pub static FRESH_STORE_LAUNCH_ROW: OperationOwnerRecord = OperationOwnerRecord {
     physical_observation: "bins/eliot-host/src/host_job_launch.rs::store_endpoint_foreign_occupant (read-only Occupied/Absent/Unreadable loopback-listener observation) via ::ensure_store_endpoint_available (FreshDependencyStart posture); listener PID is observation only",
     proof: "admitted suspended-launch proof: bins/eliot-host/src/host_job_launch.rs::HostJobBranches::launch (SuspendedJobChild spawn plus validate plus resume) over the approved executable, digest, lease, and config bindings checked by ::HostJobBranches::start_approved",
     authority_check: "start_approved contour gates (already-running refusal, phase-B live, approved locator plus digest verification) and post-launch Job-membership plus observe() liveness closure",
-    effect_primitive: "bins/eliot-host/src/store_kernel_launch_sequence.rs::launch_store_then_kernel (Store first, then Kernel readiness)",
+    effect_primitive: "bins/eliot-host/src/store_kernel_launch_sequence.rs::launch_store_then_kernel_with_correlation (Store first, then Kernel launch; the identity-free launch_store_then_kernel wrapper is #[cfg(all(test, windows))] and is not the production primitive)",
     reconciliation_receipt: "retained Host-owned Job branch (RunningJobChild::evidence) plus bins/eliot-host/src/store_kernel_launch_sequence.rs::StoreLivenessEvidence plus host.launch lifecycle observations",
     production_caller: "bins/eliot-host/src/lib.rs::cutover_with_rollback; bins/eliot-host/src/lib.rs::start_manifest_contour; bins/eliot-host/src/lib.rs::cutover_generation_contour",
     admission: OwnerAdmission::BootstrappedLaunch,

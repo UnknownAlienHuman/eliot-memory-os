@@ -1,0 +1,46 @@
+{
+  "execution_id": "meta-policy-promotion:c1db2a32957d533bd247b9dd6f39cfa8ba223bc1bce31e295251f397026d3d5b",
+  "candidate_id": "experimental-policy:3434e0559c7613a51d83895a99e03ec39d2d249fea6c4f0f8b919d6e4e8c4d9b",
+  "action": "promote",
+  "before_hash": "bf56c5de9f68ba0c1b39b8b6c1e616da4479b0b9f28064c822dcecfeab38788f",
+  "after_hash": "cd1fa3a3c3ddadf1970f9f864e4fa01fa0e8d633e213cbf7a796dbf10e637199",
+  "rollback_target_hash": "bf56c5de9f68ba0c1b39b8b6c1e616da4479b0b9f28064c822dcecfeab38788f",
+  "exact_action_hash": "c1db2a32957d533bd247b9dd6f39cfa8ba223bc1bce31e295251f397026d3d5b",
+  "active_policy": {
+    "policy_kind": "replay_threshold_v1",
+    "policy": {
+      "schema_version": "1",
+      "evaluator_version": "v1",
+      "minimum_pass_basis_points": 10000,
+      "maximum_counter_regressions": 0
+    }
+  },
+  "resulting_candidate": {
+    "candidate_id": "experimental-policy:3434e0559c7613a51d83895a99e03ec39d2d249fea6c4f0f8b919d6e4e8c4d9b",
+    "project_id": "00000000-0000-7000-8000-000000000001",
+    "baseline": {
+      "policy_kind": "replay_threshold_v1",
+      "policy": {
+        "schema_version": "1",
+        "evaluator_version": "v1",
+        "minimum_pass_basis_points": 9000,
+        "maximum_counter_regressions": 0
+      }
+    },
+    "candidate": {
+      "policy_kind": "replay_threshold_v1",
+      "policy": {
+        "schema_version": "1",
+        "evaluator_version": "v1",
+        "minimum_pass_basis_points": 10000,
+        "maximum_counter_regressions": 0
+      }
+    },
+    "baseline_hash": "bf56c5de9f68ba0c1b39b8b6c1e616da4479b0b9f28064c822dcecfeab38788f",
+    "candidate_hash": "cd1fa3a3c3ddadf1970f9f864e4fa01fa0e8d633e213cbf7a796dbf10e637199",
+    "state": "promoted",
+    "source_experiment_ref": "0192f1c2-3d4e-5a5b-8c9d-0e1f2a3b4c61",
+    "created_at": "2025-05-23T18:07:52Z"
+  },
+  "executed_at": "2025-02-08T06:09:30Z"
+}

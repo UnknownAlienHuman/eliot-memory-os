@@ -48,11 +48,19 @@ use super::super::host_job_launch::LaunchPhaseCorrelation;
 // `LaunchPhaseCorrelation` built only from an identity handle the owner already
 // holds and rendered through `crate::host_diagnostics::bound_field`, so a static
 // label classifies the phase while the bounded identity names the artifact it
-// concerned. The artifact identity bound here is only the owner-supplied
-// expected digest handle already in hand at a `verify_launch_digest` outcome —
-// never a recomputed, re-verified or re-read digest, never artifact bytes
-// (`read_bounded`), and never arbitrary error `Debug`/`Display` text, so
-// bounding limits size, not sensitivity (I15.4).
+// concerned. This cell binds no identity of its own beyond one: the only slot
+// any seam fills from its own arguments is the owner-supplied expected digest
+// handle already in hand at a `verify_launch_digest` outcome, and every other
+// identity slot of every record is exactly what the caller's forwarded
+// correlation already held - so a locator or lease record can carry an
+// `artifact` value this cell never supplied. This cell never re-derives any part
+// of that correlation: it forwards it unchanged, and the single slot it sets
+// itself is the digest handle chained onto it at a verification outcome, which
+// OVERWRITES whatever `artifact` the caller had forwarded rather than merging
+// with it. Never bound from anywhere: a
+// recomputed, re-verified or re-read digest, artifact bytes (`read_bounded`), or
+// arbitrary error `Debug`/`Display` text, so bounding limits size, not
+// sensitivity (I15.4).
 //
 // A retained-artifact lease, locator or approved-path handle is a path, and a
 // path is not an identity: `supplied`, the `approved` locator handle and
@@ -62,19 +70,44 @@ use super::super::host_job_launch::LaunchPhaseCorrelation;
 // case 978/12's real `approved_locator` execution, `LaunchLease::path` on case
 // 978/13's real `open_launch_lease` execution, which on this Windows-only cell
 // is the only place that half of the claim is proven. This cell holds no
-// `HostLaunchOptions`, so installation and generation are never available
-// here, and it owns no operation id, process-start identity, fence or typed
-// reason; it also observes no process and no readiness. Missing evidence stays
-// explicitly `missing` rather than invented, which is why every locator and
-// lease call site — including the "digest requested" record, which precedes
-// any verification outcome — binds nothing (cases 978/1, 978/4).
+// `HostLaunchOptions`, owns no operation id, process-start identity, fence or
+// typed reason and observes no process and no readiness, so it binds none of
+// those identities itself; missing evidence stays explicitly `missing` rather
+// than invented (cases 978/1, 978/4).
+//
+// The caller that already holds those identities forwards them instead of
+// having them re-derived here: the locator, lease and digest seams below each
+// have a `_with_correlation` twin that renders the caller's own
+// `LaunchPhaseCorrelation` into every record the seam emits, so a locator or
+// lease phase record names the installation, generation, operation, artifact,
+// process-start, fence and reason the caller already held. A DIGEST record is the
+// one exception this cell makes: at a verification outcome it chains the
+// owner-supplied digest handle onto the forwarded correlation, and because
+// `with_*` overwrites a slot rather than merging, that record's `artifact` names
+// the digest under validation instead of whatever the caller had forwarded -
+// stated here rather than left to be inferred from the builder. The Phase-B
+// destination seam deliberately has no twin: its only
+// production callers are `host_composition_phase_b.rs`, outside this lane's
+// write scope, and it holds no correlation of its own to forward, so every
+// record it emits stays uncorrelated and keeps each identity slot explicitly
+// missing rather than borrowing an identity it was never given. Forwarding is
+// pure — no twin derives, re-computes, re-reads or probes an identity, and the
+// only slot any twin fills from its own arguments is the owner-supplied digest
+// handle `verify_launch_digest` was already given. The identity-free seams stay
+// the honest default: a call site that holds no correlation keeps them through
+// the wrappers below, which forward `LaunchPhaseCorrelation::NONE` unchanged.
+// Through a twin the "digest requested" record carries the identities the
+// caller already held and adds no `artifact` of its own — the owner-supplied
+// digest handle is chained on only after that record — so `artifact` is bound
+// here exactly at the verification outcome.
 //
 // Sink outcome never alters result/order/count/handle/cleanup/timeout. There is
 // no mutable global dedup cache and no terminal emission here: the designated
 // terminal for one failed launch is `lib.rs`'s
-// `HostTerminalGuard(BOUNDARY_START_TERMINAL)` ("host-start-failed"), and the
-// `HostJobBranches::start_approved` leaf guard is phase-only (issue #978 audit
-// defect 2), so this cell can never emit a second terminal. Retained identity on
+// `HostTerminalGuard` on the OUTER contour (`BOUNDARY_OPEN_TERMINAL` on the STARTUP
+// path; a cutover-path launch is owned by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`), and
+// the `start_approved` leaf guard is phase-only (#978 audit defect 2), so this cell
+// cannot emit a second terminal. Retained identity on
 // substitution failure is preserved (case 978/3); digest/descriptor rejections
 // stay typed (case 978/2).
 fn launch_artifact_note_event_log_unavailable() {
@@ -131,62 +164,60 @@ pub(crate) fn approved_locator(
     profile: InstallationProfile,
 ) -> Result<PathBuf, HostError> {
     // WORK_UNIT_CASE: 978/1 — locator requested; no admitted identity is in hand.
-    launch_artifact_observe(
-        "host.launch-artifact locator requested",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    approved_locator_with_correlation(&LaunchPhaseCorrelation::NONE, supplied, approved, profile)
+}
+
+/// [`approved_locator`] with the caller's already-held launch correlation
+/// forwarded to every record this seam emits.
+///
+/// Identical body, phase literals, order, returns and error mapping; the only
+/// difference is the correlation each observation receives. The forwarded slots
+/// are rendered through `crate::host_diagnostics::bound_field` by
+/// `LaunchPhaseCorrelation::render`, so this twin re-derives nothing and binds
+/// no locator, approved handle or canonical path of its own (I15.4).
+pub(crate) fn approved_locator_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    supplied: &Path,
+    approved: &PlatformHandle,
+    profile: InstallationProfile,
+) -> Result<PathBuf, HostError> {
+    // WORK_UNIT_CASE: 978/1 — locator requested; the caller's already-held
+    // identities are forwarded and nothing is derived here.
+    launch_artifact_observe("host.launch-artifact locator requested", correlation);
     if profile != InstallationProfile::PortableDev {
         let result =
             verify_approved_path(supplied, approved, "runtime.approved_locator").map_err(|error| {
                 // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-                launch_artifact_observe(
-                    "host.launch-artifact substitution preserved",
-                    &LaunchPhaseCorrelation::NONE,
-                );
+                launch_artifact_observe("host.launch-artifact substitution preserved", correlation);
                 HostError::ProcessContour(error.to_string())
             });
         if result.is_ok() {
             // WORK_UNIT_CASE: 978/1 — locator admitted.
-            launch_artifact_observe(
-                "host.launch-artifact locator admitted",
-                &LaunchPhaseCorrelation::NONE,
-            );
+            launch_artifact_observe("host.launch-artifact locator admitted", correlation);
         }
         return result;
     }
     if !supplied.is_absolute() {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        launch_artifact_observe(
-            "host.launch-artifact locator typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        launch_artifact_observe("host.launch-artifact locator typed rejection", correlation);
         return Err(HostError::ProcessContour(
             "portable locator must be absolute".to_owned(),
         ));
     }
     let canonical_supplied = std::fs::canonicalize(supplied).map_err(|error| {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        launch_artifact_observe(
-            "host.launch-artifact locator typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        launch_artifact_observe("host.launch-artifact locator typed rejection", correlation);
         HostError::ProcessContour(error.to_string())
     })?;
     let canonical_approved =
         std::fs::canonicalize(Path::new(approved.as_str())).map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            launch_artifact_observe(
-                "host.launch-artifact locator typed rejection",
-                &LaunchPhaseCorrelation::NONE,
-            );
+            launch_artifact_observe("host.launch-artifact locator typed rejection", correlation);
             HostError::ProcessContour(error.to_string())
         })?;
     if canonical_supplied != canonical_approved {
         // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-        launch_artifact_observe(
-            "host.launch-artifact substitution preserved",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        launch_artifact_observe("host.launch-artifact substitution preserved", correlation);
         return Err(HostError::ProcessContour(
             "portable locator is not the approved canonical path".to_owned(),
         ));
@@ -196,10 +227,7 @@ pub(crate) fn approved_locator(
     // verbatim prefix on Windows, which would make the exact root-containment
     // proof reject an otherwise identical approved child.
     // WORK_UNIT_CASE: 978/1 — locator admitted.
-    launch_artifact_observe(
-        "host.launch-artifact locator admitted",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    launch_artifact_observe("host.launch-artifact locator admitted", correlation);
     Ok(supplied.to_path_buf())
 }
 
@@ -310,10 +338,25 @@ pub(crate) fn open_launch_lease(
 ) -> Result<LaunchLease, HostError> {
     // WORK_UNIT_CASE: 978/1 — lease requested; a lease handle is a path, so no
     // identity is in hand.
-    launch_artifact_observe(
-        "host.launch-artifact lease requested",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    open_launch_lease_with_correlation(&LaunchPhaseCorrelation::NONE, profile, root, path)
+}
+
+/// [`open_launch_lease`] with the caller's already-held launch correlation
+/// forwarded to every record this seam emits.
+///
+/// Identical body, phase literals, order, retained handle, returns and error
+/// mapping; the only difference is the correlation each observation receives. A
+/// retained lease is a path, so this twin binds no lease path, root or handle —
+/// only the forwarded, already-held identities (I15.4).
+pub(crate) fn open_launch_lease_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    profile: InstallationProfile,
+    root: Option<&UserOwnedRootLease>,
+    path: &Path,
+) -> Result<LaunchLease, HostError> {
+    // WORK_UNIT_CASE: 978/1 — lease requested; a lease handle is a path, so this
+    // seam binds none itself and forwards only what the caller already held.
+    launch_artifact_observe("host.launch-artifact lease requested", correlation);
     let result = match profile {
         InstallationProfile::PortableDev => {
             let root = root.ok_or_else(|| {
@@ -334,17 +377,11 @@ pub(crate) fn open_launch_lease(
     match &result {
         Ok(_) => {
             // WORK_UNIT_CASE: 978/1 — lease admitted, exact handle preserved.
-            launch_artifact_observe(
-                "host.launch-artifact lease admitted",
-                &LaunchPhaseCorrelation::NONE,
-            );
+            launch_artifact_observe("host.launch-artifact lease admitted", correlation);
         }
         Err(_) => {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            launch_artifact_observe(
-                "host.launch-artifact lease typed rejection",
-                &LaunchPhaseCorrelation::NONE,
-            );
+            launch_artifact_observe("host.launch-artifact lease typed rejection", correlation);
         }
     }
     result
@@ -357,18 +394,37 @@ pub(crate) fn verify_launch_digest(
 ) -> Result<(), HostError> {
     // WORK_UNIT_CASE: 978/1 — digest requested; no verification outcome exists
     // yet, so no artifact identity is bound.
-    launch_artifact_observe(
-        "host.launch-artifact digest requested",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    verify_launch_digest_with_correlation(&LaunchPhaseCorrelation::NONE, lease, digest, field)
+}
+
+/// [`verify_launch_digest`] with the caller's already-held launch correlation
+/// forwarded to every record this seam emits, including the outcome records'
+/// artifact slot.
+///
+/// Identical body, phase literals, order, returns and error mapping. The
+/// outcome correlation chains the owner's already-held `digest` handle onto the
+/// forwarded one exactly as before, so the record names the identity the owner
+/// supplied; nothing is recomputed, re-verified or re-read from the artifact
+/// (I15.4).
+pub(crate) fn verify_launch_digest_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    lease: &LaunchLease,
+    digest: &PlatformHandle,
+    field: &str,
+) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 978/1 — digest requested; no verification outcome exists
+    // yet, so this record adds no artifact identity of its own and forwards only
+    // what the caller already held.
+    launch_artifact_observe("host.launch-artifact digest requested", correlation);
     let result = match lease {
         LaunchLease::Protected(lease) => verify_file_digest_with_lease(lease, digest, field),
         LaunchLease::Portable(lease) => verify_file_digest_with_user_lease(lease, digest, field),
     };
     let result = result.map_err(|error| HostError::ProcessContour(error.to_string()));
     // The owner-supplied expected digest handle is already in hand here and is
-    // bound verbatim; it is not recomputed, re-verified or re-read.
-    let correlation = LaunchPhaseCorrelation::NONE.with_artifact(digest.as_str());
+    // bound verbatim onto the forwarded correlation; it is not recomputed,
+    // re-verified or re-read.
+    let correlation = correlation.with_artifact(digest.as_str());
     match &result {
         Ok(()) => {
             // WORK_UNIT_CASE: 978/1 — digest admitted.
@@ -384,9 +440,10 @@ pub(crate) fn verify_launch_digest(
 
 // F-LOG-HOST-3 (#978) inline proof for this cell's private observation
 // contract. Every case below executes the real instrumented functions through
-// their existing seams - `approved_locator`,
-// `approved_phase_b_destination_locator`, `open_launch_lease` and
-// `verify_launch_digest` - and none of them returns early: an unwritable
+// their existing seams - `approved_locator`, `approved_phase_b_destination_locator`,
+// `open_launch_lease` and `verify_launch_digest`, and the three
+// `_with_correlation` twins added for the first, third and fourth of those -
+// and none of them returns early: an unwritable
 // fixture or an unusable handle panics instead of skipping, so a case cannot
 // pass without having driven its seam. The cases that assert on emitted
 // records read them back out of a scoped `tracing` subscriber over the real
@@ -400,8 +457,10 @@ pub(crate) fn verify_launch_digest(
 #[cfg(test)]
 mod tests {
     use super::{
-        HostError, approved_locator, approved_phase_b_destination_locator, open_launch_lease,
-        verify_launch_digest,
+        HostError, LaunchPhaseCorrelation, approved_locator, approved_locator_with_correlation,
+        approved_phase_b_destination_locator, open_launch_lease,
+        open_launch_lease_with_correlation, verify_launch_digest,
+        verify_launch_digest_with_correlation,
     };
     use eliot_installation::InstallationProfile;
     use eliot_platform::PlatformHandle;
@@ -1028,6 +1087,170 @@ mod tests {
             approved_digest.as_str(),
             &path_canaries(&artifact),
             &recomputed,
+        );
+    }
+
+    /// The three `_with_correlation` twins render the caller's own
+    /// `LaunchPhaseCorrelation` into every record they emit: the installation,
+    /// generation and fence that correlation already held reach each record as
+    /// real values, the slots this cell owns no source for stay explicitly
+    /// missing, and this cell binds no `artifact` before the verification
+    /// outcome, where it chains on the owner-supplied digest handle.
+    ///
+    /// HONEST SCOPE: the three forwarded identities below are this case's own
+    /// synthetic, non-secret literals in this module's existing `978-canary`
+    /// style — no path, argv, environment value, credential or nonce — so this
+    /// case proves the forwarding path and the rendered slots, not any owner's
+    /// real installation, generation or fence. All three twins really execute
+    /// against the real portable fixture here, and every record is read back out
+    /// of a scoped subscriber, so no assertion can pass on a string this case
+    /// composed itself.
+    #[cfg(windows)]
+    #[test]
+    fn forwarded_correlations_name_the_callers_own_identities() {
+        use eliot_platform_windows::{UserOwnedRootLease, sha256_hex};
+
+        const DIGEST_FIELD: &str = "runtime.kernel_artifact";
+        const INSTALLATION: &str = "978-canary-installation";
+        const GENERATION: u64 = 978;
+        const FENCE: &str = "978-canary-fence";
+
+        let Some(artifact) = ApprovedArtifact::create("forwarded") else {
+            panic!("the approved artifact fixture must be writable in this environment");
+        };
+        let Some(approved) = artifact.approved_handle() else {
+            panic!("the approved artifact path must be a valid platform handle");
+        };
+        let Ok(approved_digest) = PlatformHandle::new(sha256_hex(ARTIFACT_BYTES)) else {
+            panic!("the approved artifact digest must be a valid platform handle");
+        };
+        // The existing owner seam: the same portable root lease the launch
+        // contour retains, so the lease and digest below run through the real
+        // Windows mechanics rather than through anything this case restates.
+        let Ok(portable_root) = UserOwnedRootLease::open_existing(&artifact.root) else {
+            panic!("the approved temporary root must open as a portable root lease");
+        };
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(INSTALLATION)
+            .with_generation(GENERATION)
+            .with_fence(FENCE);
+        // All three twins really execute against that one correlation inside a
+        // single scoped subscriber, so every record asserted on below is one
+        // these real executions emitted.
+        let (admitted, records) = recorded(|| {
+            let Ok(admitted) =
+                approved_locator_with_correlation(&correlation, &artifact.file, &approved, PROFILE)
+            else {
+                panic!("the approved locator must stay admitted");
+            };
+            let Ok(lease) = open_launch_lease_with_correlation(
+                &correlation,
+                PROFILE,
+                Some(&portable_root),
+                &artifact.file,
+            ) else {
+                panic!("the approved artifact must retain a launch lease");
+            };
+            let Ok(()) = verify_launch_digest_with_correlation(
+                &correlation,
+                &lease,
+                &approved_digest,
+                DIGEST_FIELD,
+            ) else {
+                panic!("the owner-supplied approved digest must be admitted");
+            };
+            admitted
+        });
+        assert_eq!(
+            admitted, artifact.file,
+            "admission returns the retained locator"
+        );
+        // Each twin's own request record plus its admitted records: forwarding
+        // changes no phase, order or outcome, so every one of these phases is
+        // still published exactly once by the seam it names — and the total
+        // record count is pinned below, so a twin that emitted an EXTRA record
+        // (an admission and a refusal from one call, say) fails here instead of
+        // passing unnoticed.
+        let generation = GENERATION.to_string();
+        let forwarded = [
+            (
+                one_phase_record(&records, LOCATOR_REQUESTED_PHASE),
+                Some("missing"),
+            ),
+            (
+                one_phase_record(&records, LEASE_REQUESTED_PHASE),
+                Some("missing"),
+            ),
+            (
+                one_phase_record(&records, DIGEST_REQUESTED_PHASE),
+                Some("missing"),
+            ),
+            (
+                one_phase_record(&records, LOCATOR_ADMITTED_PHASE),
+                Some("missing"),
+            ),
+            (
+                one_phase_record(&records, LEASE_ADMITTED_PHASE),
+                Some("missing"),
+            ),
+            (
+                one_phase_record(&records, DIGEST_ADMITTED_PHASE),
+                Some(approved_digest.as_str()),
+            ),
+        ];
+        assert_eq!(
+            records.len(),
+            forwarded.len(),
+            "forwarding must add, drop and duplicate no record: these three admitted calls emit exactly their own request and admitted phases, and the fixture's refusal phases belong to the refused calls this case does not make: {records:?}"
+        );
+        for (record, artifact_slot) in forwarded {
+            assert_forwarded_record_slots(
+                record,
+                INSTALLATION,
+                generation.as_str(),
+                FENCE,
+                artifact_slot,
+            );
+        }
+    }
+
+    /// Every slot a forwarded twin record must carry: the three identities the
+    /// caller held, the slots this cell owns no source for, and the artifact slot
+    /// exactly as the caller of that phase left it.
+    fn assert_forwarded_record_slots(
+        record: &EmittedRecord,
+        installation: &str,
+        generation: &str,
+        fence: &str,
+        artifact_slot: Option<&str>,
+    ) {
+        let detail = record.detail();
+        assert_eq!(
+            slot(detail, "installation"),
+            Some(installation),
+            "a forwarded record names the installation the caller already held: {detail}"
+        );
+        assert_eq!(
+            slot(detail, "generation"),
+            Some(generation),
+            "a forwarded record names the generation the caller already held: {detail}"
+        );
+        assert_eq!(
+            slot(detail, "fence"),
+            Some(fence),
+            "a forwarded record names the fence the caller already held: {detail}"
+        );
+        for unproven in ["operation", "process_start", "reason"] {
+            assert_eq!(
+                slot(detail, unproven),
+                Some("missing"),
+                "this cell owns no {unproven} source, so the forwarded binding must leave that slot at the explicit absent marker rather than invent one: {detail}"
+            );
+        }
+        assert_eq!(
+            slot(detail, "artifact"),
+            artifact_slot,
+            "the artifact slot is whatever this cell really holds at this tuple: the absent marker before the digest outcome, and the owner-held approved digest once it has one: {detail}"
         );
     }
 }

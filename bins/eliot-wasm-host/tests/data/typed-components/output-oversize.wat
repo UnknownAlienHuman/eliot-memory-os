@@ -10,15 +10,15 @@
 ;; package-id and abi-revision first, then `bounded_descriptor_string`
 ;; (:517-524) with `MAX_DESCRIPTOR_STRING_BYTES` (512) at :549, which returns
 ;; `TypedExecutionError::OutputViolation("native-contract")`. The describe lane
-;; stages it at `TypedStage::Output` (:1012-1014) and the domain lane at
-;; `TypedStage::Descriptor` (:2073-2075). The aggregate check at :552-563 is
+;; stages it at `TypedStage::Output` (:1017-1019) and the domain lane at
+;; `TypedStage::Descriptor` (:2106-2108). The aggregate check at :552-563 is
 ;; NOT what fires here, because the per-field ceiling is enforced first; the
 ;; aggregate is a second, independent ceiling.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `step` result tuple, 0x1000 echo scratch,
-;; 0x2000 the 1024-byte oversized `native-contract` string, 0x3000 the bump
-;; region the host `realloc` hands out while lowering the request.
+;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo
+;; scratch blocks, 0x2000 the 1024-byte oversized `native-contract` string,
+;; 0x3000 the bump region the host `realloc` hands out while lowering the request.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -121,7 +121,7 @@
     (case "internal" $cycle_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome $cycle_error))))
+  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 12288))
@@ -141,21 +141,39 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor and frozen ABI revision,
-    ;; flattened in WIT field order -- except `native-contract`, which reports
-    ;; 1024 bytes of filler instead of the frozen 19. Every other identity field
-    ;; is true, so the descriptor string ceiling is provably the denial.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 13)
-      (i32.const 1037)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 8192)
-      (i32.const 1024)
-      (i32.const 1075)
-      (i32.const 5)
-      (i32.const 1080)
-      (i32.const 64)
+    ;; lowered in WIT field order into guest memory -- except
+    ;; `native-contract`, which reports 1024 bytes of filler instead of the
+    ;; frozen 19. Every other identity field is true, so the descriptor string
+    ;; ceiling is provably the denial.
+    ;;
+    ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
+    ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
+    ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
+    ;; pointer to guest-owned memory: wasmparser-0.256.0
+    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; and push exactly one pointer for `Abi::Lift`, and
+    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
+    ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
+    ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x2000..0x2400
+    ;; the four 256-byte filler segments `native-contract` claims (8192..9216),
+    ;; 0x3000 the `realloc` bump region. 0x0c00 is clear of all five and inside
+    ;; the single exported page, and it is far below the filler it must not
+    ;; touch.
+    (func (export "describe") (result i32)
+      (i32.store (i32.const 3072) (i32.const 1024))
+      (i32.store (i32.const 3076) (i32.const 13))
+      (i32.store (i32.const 3080) (i32.const 1037))
+      (i32.store (i32.const 3084) (i32.const 19))
+      (i32.store (i32.const 3088) (i32.const 1))
+      ;; the deliberate lie: `native-contract` points at 1024 filler bytes
+      (i32.store (i32.const 3092) (i32.const 8192))
+      (i32.store (i32.const 3096) (i32.const 1024))
+      (i32.store (i32.const 3100) (i32.const 1075))
+      (i32.store (i32.const 3104) (i32.const 5))
+      (i32.store (i32.const 3108) (i32.const 1080))
+      (i32.store (i32.const 3112) (i32.const 64))
+      (i32.const 3072)
     )
     ;; `step`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
@@ -174,11 +192,14 @@
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
       ;; echo "state.fence-epoch" back out of the lowered request
+      ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2124) (i32.const 4608))
-      (i32.store (i32.const 2128) (local.get $n))
+      (i32.store (i32.const 2116) (i32.const 4608))
+      (i32.store (i32.const 2120) (local.get $n))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")

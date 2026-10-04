@@ -9,7 +9,7 @@
 ;;
 ;; Every earlier validation passes on purpose, so the denial under test is
 ;; reachable and is the lying-descriptor denial itself:
-;;   * `preflight_component_type` (typed_execution.rs:1060-1127) sees zero
+;;   * `preflight_component_type` (typed_execution.rs:1065-1132) sees zero
 ;;     imports and exactly one interface export with exactly `describe` and
 ;;     `step`;
 ;;   * `validate_descriptor` (typed_execution.rs:527-579) passes world-name,
@@ -26,8 +26,8 @@
 ;; #758 P5.5).
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `step` result tuple, 0x1000 echo scratch, 0x1400 the bump
-;; region the host `realloc` hands out while lowering the request.
+;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo scratch
+;; blocks, 0x1400 the bump region the host `realloc` hands out while lowering the request.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -130,7 +130,7 @@
     (case "internal" $cycle_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome $cycle_error))))
+  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 5120))
@@ -150,21 +150,36 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and the
-    ;; frozen ABI revision, flattened in WIT field order -- EXCEPT the reported
-    ;; `abi-digest`, which is a well formed 64 hex character value that is not
-    ;; the digest of the frozen WIT this Host generated its bindings from.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 13)
-      (i32.const 1037)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1056)
-      (i32.const 19)
-      (i32.const 1075)
-      (i32.const 5)
-      (i32.const 1080)
-      (i32.const 64)
+    ;; frozen ABI revision, lowered in WIT field order into guest memory --
+    ;; EXCEPT the reported `abi-digest`, which is a well formed 64 hex
+    ;; character value that is not the digest of the frozen WIT this Host
+    ;; generated its bindings from.
+    ;;
+    ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
+    ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
+    ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
+    ;; pointer to guest-owned memory: wasmparser-0.256.0
+    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; and push exactly one pointer for `Abi::Lift`, and
+    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
+    ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
+    ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
+    ;; `realloc` bump region. 0x0c00 is clear of all four.
+    (func (export "describe") (result i32)
+      (i32.store (i32.const 3072) (i32.const 1024))
+      (i32.store (i32.const 3076) (i32.const 13))
+      (i32.store (i32.const 3080) (i32.const 1037))
+      (i32.store (i32.const 3084) (i32.const 19))
+      (i32.store (i32.const 3088) (i32.const 1))
+      (i32.store (i32.const 3092) (i32.const 1056))
+      (i32.store (i32.const 3096) (i32.const 19))
+      (i32.store (i32.const 3100) (i32.const 1075))
+      (i32.store (i32.const 3104) (i32.const 5))
+      ;; the deliberate lie: 0x0438 holds 64 well formed hex zeros
+      (i32.store (i32.const 3108) (i32.const 1080))
+      (i32.store (i32.const 3112) (i32.const 64))
+      (i32.const 3072)
     )
     ;; `step`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
@@ -183,11 +198,14 @@
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
       ;; echo "state.fence-epoch" back out of the lowered request
+      ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2124) (i32.const 4608))
-      (i32.store (i32.const 2128) (local.get $n))
+      (i32.store (i32.const 2116) (i32.const 4608))
+      (i32.store (i32.const 2120) (local.get $n))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")
@@ -210,3 +228,11 @@
     (export "step" (func $domain)))
   (export "eliot:current/cycle@0.1.0" (instance $iface))
 )
+;; Offset note: the memory map above was corrected to the canonical-ABI
+;; derivation, not chosen by hand. `canon lift` of a result that does not fit
+;; MAX_FLAT_FUNC_RESULTS (1) requires the single-pointer signature enforced at
+;; wasmparser-0.256.0/src/validator/component.rs:1343 and :1365, and every
+;; record field offset above is derived with
+;; wasmtime-environ-47.0.4/src/component/types.rs:756-759. The planted
+;; `abi-digest` string is the last (data (i32.const 1080) ...) segment, so its
+;; 64 bytes occupy 0x0438..0x0477 (1080..1144).

@@ -1,0 +1,16 @@
+{
+  "operation_id": "operation-1",
+  "expected_revision": 7,
+  "command_id": "command-1",
+  "accepted": true,
+  "executed": false,
+  "outcome": "queued",
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "action": "suppress",
+  "revision": null,
+  "reasons": [
+    "explicit operator request"
+  ],
+  "canonical_receipt": null,
+  "generated_at": "2026-09-07T12:00:00Z"
+}

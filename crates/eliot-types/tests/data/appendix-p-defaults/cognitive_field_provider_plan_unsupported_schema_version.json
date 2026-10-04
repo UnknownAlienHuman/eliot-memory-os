@@ -1,0 +1,17 @@
+{
+  "schema_version": "eliot-cognitive-field-plan-v1",
+  "run_id": "run-1",
+  "contract_hash": "contract-sha",
+  "calls": [],
+  "planned_provider_calls": 1,
+  "planned_smoke_calls": 1,
+  "planned_reused_roles": 0,
+  "role_evidence_plan_hash": null,
+  "seal_attempt_id": null,
+  "seal_generation": 0,
+  "authority_activation_ref": null,
+  "runtime_manifest_sha256": null,
+  "artifact_manifest_sha256": null,
+  "plan_hash": "blake3:e8ba9a89bf2fbb1ad3cc3cff37263f4d6a9495ff8923cdd2088b8ee3ba333c46",
+  "sealed_at": "2026-09-07T12:00:00Z"
+}

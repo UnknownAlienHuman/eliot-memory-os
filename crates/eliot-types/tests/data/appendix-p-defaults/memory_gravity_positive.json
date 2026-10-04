@@ -1,0 +1,10 @@
+{
+  "memory_ref": "memory-1",
+  "decision": "KEEP_HOT",
+  "activation_pressure": 0.5,
+  "why_it_keeps_appearing": [],
+  "harm_or_utility": "utility",
+  "suppression_needed": false,
+  "evidence_refs": [],
+  "computed_at": "2026-09-07T12:00:00Z"
+}

@@ -5,8 +5,10 @@
 ;; domain function `screen`.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `screen` result tuple, 0x1000 echo scratch, 0x1400 the bump
-;; region the host `realloc` hands out while lowering the request.
+;; 0x0800 the lowered `screen` result tuple, 0x1000, 0x1200, 0x1400 and 0x1600
+;; the four echo scratch blocks (each copy is capped at 512 bytes, so they span
+;; 0x1000..0x17ff), and 0x1400 the bump region the host `realloc` hands out
+;; while lowering the request -- the same 0x1400 as the third scratch block.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -109,7 +111,7 @@
     (case "internal" $screen_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "request" $screen_request) (result (result $screen_outcome $screen_error))))
+  (type $f-domain (func (param "request" $screen_request) (result (result $screen_outcome (error $screen_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 5120))
@@ -129,20 +131,32 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, flattened in WIT field order.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 22)
-      (i32.const 1046)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1065)
-      (i32.const 28)
-      (i32.const 1093)
-      (i32.const 5)
-      (i32.const 1098)
-      (i32.const 64)
-    )
+    ;; the frozen ABI revision, in WIT field order. A lifted export flattens
+    ;; its result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the
+    ;; core function returns ONE pointer into exported linear memory
+    ;; (wasmparser-0.256.0 src/validator/component_types.rs:35, :129 and
+    ;; :1279-1292, enforced at src/validator/component.rs:1343 and :1365).
+    ;; Retptr base 0x600: past the last descriptor byte at 0x48a and below
+    ;; the 0x800 result tuple, so it collides with nothing in this memory.
+    (func (export "describe") (result i32)
+      ;; world-name
+      (i32.store (i32.const 1536) (i32.const 1024))
+      (i32.store (i32.const 1540) (i32.const 22))
+      ;; package-id
+      (i32.store (i32.const 1544) (i32.const 1046))
+      (i32.store (i32.const 1548) (i32.const 19))
+      ;; abi-revision
+      (i32.store (i32.const 1552) (i32.const 1))
+      ;; native-contract
+      (i32.store (i32.const 1556) (i32.const 1065))
+      (i32.store (i32.const 1560) (i32.const 28))
+      ;; native-revision
+      (i32.store (i32.const 1564) (i32.const 1093))
+      (i32.store (i32.const 1568) (i32.const 5))
+      ;; abi-digest
+      (i32.store (i32.const 1572) (i32.const 1098))
+      (i32.store (i32.const 1576) (i32.const 64))
+      (i32.const 1536))
     ;; `screen`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
     ;; identity field is copied back out of the request, so the host echo
