@@ -23,9 +23,11 @@
 //! [`verify_ordering_scope_binding`] on legs carrying an ordering contract;
 //! a content commitment and a CAS expectation are different obligations.
 //!
-//! The input [`CanonicalRequestView`] is the full envelope-equivalent shape:
-//! Governor builds it from [`crate`] admission values, while Kernel/store
-//! build the identical view from their transported
+//! The input [`CanonicalRequestView`] is the complete hashed input: the
+//! admitted envelope's fields plus the two canonical derived fields
+//! (`semantic_source_revisions` and `ordering_scopes`). Governor builds it
+//! from [`crate`] admission values, while Kernel/store build the same view
+//! from their transported
 //! [`crate::StoreRequest::Apply`] values (`context` + `transition` +
 //! expected heads) via [`CanonicalRequestView::from_apply`]. The transition's
 //! own `identity.canonical_request_hash` is the digest output and is never
@@ -110,11 +112,13 @@ use crate::{
 /// malformed claimant so the error itself stays bounded.
 pub const MAX_DIGEST_DETAIL_CHARS: usize = 64;
 
-/// Full envelope-equivalent canonical hash input for issue #63.
-///
-/// The serde shape is intentionally field-identical to the Governor
-/// `CanonicalWriteEnvelope` (same names, same shared types), so hashing this
-/// view yields byte-identical bytes to hashing the admitted envelope.
+/// Complete canonical hash input for issue #63: the admitted envelope's
+/// fields (same names, same shared types) plus the two canonical derived
+/// fields [`CanonicalRequestView::semantic_source_revisions`] and
+/// [`CanonicalRequestView::ordering_scopes`]. Both are canonical renderings
+/// of envelope data the envelope already carries, so nothing is added to
+/// the published wire struct; Governor and Kernel/store therefore hash the
+/// same complete input.
 /// Kernel/store construct the same view from their transported apply values;
 /// no wire change is required because `StoreRequest::Apply` already carries
 /// every field (context, transition, expected revision heads, expected
