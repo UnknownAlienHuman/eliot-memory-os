@@ -31,8 +31,8 @@ use eliot_backup::{
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
     CaptureBudgets, CaptureCallerAuth, CaptureEvidenceLevel, CaptureRequest, CaptureState,
-    FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
-    PublicationReceipt, SnapshotRelation, require_capture_admitted,
+    CapturePorts, FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
+    PublicationReceipt, SnapshotRelation, request_from_ports, require_capture_admitted,
 };
 use eliot_ors::RedbRecoveryStore;
 use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
@@ -850,6 +850,68 @@ fn unadmitted_caller_and_bad_scope_refuse_before_publication() {
         KernelCaptureError::NotAdmitted
     );
     assert!(require_capture_admitted(&admitted_caller()).is_ok());
+
+    // The borrowed adapter must admit the operation before it reads or clones
+    // protected owner evidence. This artifact's bytes no longer match its
+    // retained digest, so shape validation would refuse it if it ran first.
+    let mut malformed_evidence = valid_full_input();
+    let valid_plan = to_request(&malformed_evidence, 1).plan;
+    malformed_evidence.artifacts[0].bytes.push(0);
+    let denied_caller = CaptureCallerAuth {
+        admitted: false,
+        ..admitted_caller()
+    };
+    let denied_ports = CapturePorts {
+        caller: &denied_caller,
+        kernel_fence: &malformed_evidence.export_fence.state_fence,
+        export_fence: &malformed_evidence.export_fence,
+        canonical_events: &malformed_evidence.canonical_events,
+        projections: &malformed_evidence.projections,
+        receipts: &malformed_evidence.receipts,
+        blobs: &malformed_evidence.blobs,
+        purge_ledger: &malformed_evidence.purge_ledger,
+        artifacts: &malformed_evidence.artifacts,
+        ors_snapshot: malformed_evidence.ors_snapshot.as_ref(),
+        suspended_count: 1,
+        watchdog_spool: malformed_evidence.watchdog_spool.as_ref(),
+        host_audit: malformed_evidence.host_audit.as_ref(),
+    };
+    assert_eq!(
+        request_from_ports(&denied_ports, valid_plan.clone()).unwrap_err(),
+        KernelCaptureError::NotAdmitted,
+        "caller admission precedes malformed owner evidence"
+    );
+
+    // The plan is frozen and validated at the same adapter boundary. A valid
+    // caller with an invalid budget must be refused before the malformed
+    // artifact can be inspected.
+    let admitted = admitted_caller();
+    let invalid_plan_ports = CapturePorts {
+        caller: &admitted,
+        kernel_fence: &malformed_evidence.export_fence.state_fence,
+        export_fence: &malformed_evidence.export_fence,
+        canonical_events: &malformed_evidence.canonical_events,
+        projections: &malformed_evidence.projections,
+        receipts: &malformed_evidence.receipts,
+        blobs: &malformed_evidence.blobs,
+        purge_ledger: &malformed_evidence.purge_ledger,
+        artifacts: &malformed_evidence.artifacts,
+        ors_snapshot: malformed_evidence.ors_snapshot.as_ref(),
+        suspended_count: 1,
+        watchdog_spool: malformed_evidence.watchdog_spool.as_ref(),
+        host_audit: malformed_evidence.host_audit.as_ref(),
+    };
+    let mut invalid_plan = valid_plan;
+    invalid_plan.budgets.max_work_items = 0;
+    assert_eq!(
+        request_from_ports(&invalid_plan_ports, invalid_plan).unwrap_err(),
+        KernelCaptureError::InvalidInput {
+            field: "capture.max_work_items",
+            reason: "budget must be nonzero",
+        },
+        "frozen plan validation precedes malformed owner evidence"
+    );
+
     // Bad scope: a ScopeExport plan without a declared scope is invalid input.
     let mut scoped = to_request(&scope_input(), 0);
     scoped.plan.scope_id = None;
