@@ -2833,7 +2833,7 @@ impl DaemonComposition {
     /// entry stale stays with the install, reconcile, and display paths.
     #[allow(clippy::result_large_err)]
     pub fn skill_admit_material_attempt(
-        &self,
+        &mut self,
         receipt: &eliot_skill::SkillHarnessActivationReceipt,
     ) -> Result<eliot_skill::AttemptLifecycleSummary, eliot_skill::SkillError> {
         receipt.validate()?;
@@ -2870,7 +2870,18 @@ impl DaemonComposition {
                 reason: "declared host/tool/contract dependencies changed after the lifecycle view was derived; the Skill is blocked from Material use until revalidated",
             });
         }
-        self.governor.owners().skill.admit_material_attempt(receipt)
+        let summary = self.governor.owners().skill.admit_material_attempt(receipt)?;
+        // #2663 C5 (audit 5856960648): admission RETAINS. This is deliberately
+        // not a separate optional step a caller may skip: while nothing wrote
+        // the receipt, every stored view carried an empty `attempt_receipts`,
+        // so the daemon's "a retained row under this receipt or attempt
+        // identity must agree byte-for-byte" guard had nothing to iterate and
+        // changed material under one receipt identity could never conflict.
+        // Retention is therefore inseparable from admission here, and the
+        // receipt is still just evidence that the attempt happened — usefulness
+        // is never established by retaining it.
+        self.governor.record_skill_activation_attempt(receipt)?;
+        Ok(summary)
     }
 
     /// Publishes one window of execution evidence through the existing
