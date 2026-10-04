@@ -121,15 +121,11 @@ fn the_one_facade_install_this_process_drives() -> Result<(), HostDiagnosticsErr
 }
 
 // WORK_UNIT_CASE: 889/3
-// WORK_UNIT_CASE: 889/4
 #[test]
-fn host_diagnostics_install_is_singly_owned() {
-    // First installation claims process ownership; a repeat install is
-    // bounded AlreadyOwned, never a panic, a replacement, or a second owner.
-    // (Cases 889/3 first install, 889/4 duplicate init.) This is the only
-    // test that touches the process-global install, and it drives the one
-    // attempt exactly once for the process, so parallel tests can neither
-    // race it into a second attempt nor depend on winning the global slot.
+fn host_diagnostics_first_process_install_retains_truthful_result() {
+    // The OnceLock retains the actual first process-wide initialization result.
+    // It is the only first-install attempt in this test process; scoped
+    // subscribers in the other cases never replace or race this global owner.
     let first = the_one_facade_install_this_process_drives();
     assert!(
         matches!(
@@ -142,9 +138,24 @@ fn host_diagnostics_install_is_singly_owned() {
          this process owned the global slot (Ok), or the slot was already held / an attempt is \
          in flight (SetupUnavailable / SetupInProgress), got {first:?}"
     );
-    // The repeat refusal, decided the way the facade decides it and read back
-    // through the call itself rather than through the value held above.
-    let repeat = install_host_diagnostics();
+    // Stderr certification must reflect the observed initial result. The
+    // facade's Windows Event Log diagnostic sink remains its typed unavailable
+    // status; the lower OS port's attemptability is a separate TEST-PHASE fact.
+    assert_eq!(sink_status(DiagnosticSink::TracingStderr), first);
+    assert_eq!(
+        sink_status(DiagnosticSink::WindowsEventLog),
+        Err(HostDiagnosticsError::EventLogUnavailable)
+    );
+}
+
+// WORK_UNIT_CASE: 889/4
+#[test]
+fn host_diagnostics_duplicate_init_is_bounded_and_nonpanicking() {
+    // Ensure this case cannot become the first attempt when scheduled before
+    // case 3: both cases read the same OnceLock-cached real process result.
+    let first = the_one_facade_install_this_process_drives();
+    let repeat = std::panic::catch_unwind(std::panic::AssertUnwindSafe(install_host_diagnostics));
+    let repeat = repeat.expect("a duplicate installation must return a typed result, not panic");
     match first {
         Ok(()) => assert_eq!(
             repeat,
@@ -160,81 +171,6 @@ fn host_diagnostics_install_is_singly_owned() {
         ),
     }
 
-    // Tracing-stderr delivery is available exactly when this process's own
-    // install really took the global slot. The facade answers this arm from
-    // its OBSERVED install state and maps only `Installed` to `Ok` (src/
-    // host_diagnostics.rs:246-251), so this is a real equality against the
-    // product's own state rather than an assumption about this platform: if
-    // the one attempt above won the slot, the stderr sink is certified, and
-    // if it found the slot already held, the facade must never certify it.
-    // #984 landed, so the wrapper seam below attempts real delivery through
-    // the safe port on Windows and stays typed-Unavailable off Windows: never
-    // silent delivery elsewhere and never FFI. (Supports 889/15-18.)
-    assert_eq!(sink_status(DiagnosticSink::TracingStderr), first);
-    assert_eq!(
-        sink_status(DiagnosticSink::WindowsEventLog),
-        Err(HostDiagnosticsError::EventLogUnavailable)
-    );
-    if cfg!(windows) {
-        assert_eq!(
-            event_log_sink_status(),
-            Ok(()),
-            "wired wrapper must report the sink attemptable on Windows"
-        );
-    } else {
-        assert_eq!(
-            event_log_sink_status(),
-            Err(WindowsEventLogError::EventLogUnavailable),
-            "off Windows the port stays typed-Unavailable"
-        );
-    }
-
-    // Truncation honesty: oversized inputs keep a bounded prefix and record
-    // the original length. (Supports 889/10 sizing.)
-    let oversized = "x".repeat(8 * MAX_DIAGNOSTIC_DETAIL_BYTES);
-    let bounded = bound_detail(&oversized);
-    assert_eq!(bounded.original_bytes(), oversized.len());
-    assert!(
-        bounded.truncated(),
-        "oversized input must report truncation"
-    );
-    assert!(
-        bounded.text().len() <= MAX_DIAGNOSTIC_DETAIL_BYTES,
-        "retained prefix must stay bounded, got {} bytes",
-        bounded.text().len()
-    );
-    let exact = "y".repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
-    let kept = bound_detail(&exact);
-    assert!(
-        !kept.truncated(),
-        "in-bound input must not report truncation"
-    );
-    assert_eq!(kept.text(), exact);
-
-    let long_code = "c".repeat(8 * MAX_DIAGNOSTIC_FIELD_BYTES);
-    let bounded_code = bound_field(&long_code);
-    assert!(bounded_code.truncated());
-    assert!(bounded_code.text().len() <= MAX_DIAGNOSTIC_FIELD_BYTES);
-
-    // Terminal vocabulary projects the frozen Host stop codes without a
-    // second lifecycle owner; the two funnel codes stay distinct.
-    assert_ne!(
-        HOST_TERMINAL_CODE_CONSOLE_FAILED,
-        HOST_TERMINAL_CODE_DISPATCHER_FAILED
-    );
-    let fixture = contract_fixture();
-    assert_eq!(
-        HOST_TERMINAL_CODE_CONSOLE_FAILED,
-        fixture["terminal_codes"]["console_failed"]
-            .as_str()
-            .expect("fixture must pin the console_failed code")
-    );
-    assert_eq!(
-        HOST_TERMINAL_CODE_DISPATCHER_FAILED,
-        fixture["terminal_codes"]["dispatcher_failed"]
-            .as_str()
-            .expect("fixture must pin the dispatcher_failed code")
-    );
 }
 
 // WORK_UNIT_CASE: 889/2
@@ -857,14 +793,9 @@ fn host_request_projection_carries_the_exact_typed_identities() {
     let text = assert_the_stop_and_sighting_stay_two_scoped_host_request_records(&options);
 
     // The exact identities the stop projection was handed.
-    let stop_line = text
-        .lines()
-        .find(|line| line.contains("evidence=\"durable_committed\""))
-        .expect("the committed stop must emit its own durable_committed record");
-    let sighting_line = text
-        .lines()
-        .find(|line| line.contains("evidence=\"observed\""))
-        .expect("the sighting must emit its own observed record");
+    let stop_line =
+        request_record_carrying(&text, HostRequestEvidence::DurableCommitted.as_str());
+    let sighting_line = request_record_carrying(&text, HostRequestEvidence::Observed.as_str());
     for (key, expected) in [
         ("request", HostConsoleRequest::Stop.as_str()),
         ("operation", AdmittedEvent::ServiceStop.as_str()),
@@ -1024,138 +955,108 @@ fn assert_each_sighting_classifies_under_the_frozen_evidence_vocabulary(sighting
 }
 
 // WORK_UNIT_CASE: 889/5
-// WORK_UNIT_CASE: 889/13
 #[test]
-fn host_diagnostics_entrypoint_observation_matches_contract_fixture() {
-    // The facade is compiled once in the host library and observed here;
-    // the binary's use is compile-gated in `src/main.rs` (same crate path,
-    // no second `mod`/copy). Scoped capture shadows any global install, so
-    // this test stays isolated and parallel-safe. (Cases 889/5 stable
-    // mapping without a second lifecycle, 889/13 deterministic capture.)
-    let fixture = contract_fixture();
-    let text = capture_the_entrypoint_stage_observation();
-    let captured_len = captured_byte_count(&text);
-
-    let expected_stage = fixture["stages"]["console_loop"]
-        .as_str()
-        .expect("fixture must pin the console_loop stage name");
+fn host_request_event_reason_phase_are_stable_without_second_lifecycle_owner() {
+    let error = HostError::Stopped;
+    let projection = HostRequestProjection::failed(EntrypointStage::ShutdownDrain, &error)
+        .with_request(HostConsoleRequest::Stop)
+        .with_operation(AdmittedEvent::ServiceFailure)
+        .with_terminal_exit(HOST_TERMINAL_EXIT);
+    let records = capture_emitted_records(|| observe_host_request(&projection));
+    let event_names: Vec<&str> = records.iter().map(|record| record.event.as_str()).collect();
     assert_eq!(
-        EntrypointStage::ConsoleLoop.as_str(),
-        expected_stage,
-        "facade stage name must match the contract fixture"
+        event_names,
+        ["host.event_log_admission", "host.request"],
+        "the admitted failure is observed in stable admission-then-request order"
     );
-    assert_eq!(
-        EntrypointStage::Startup.as_str(),
-        fixture["stages"]["startup"]
-            .as_str()
-            .expect("fixture must pin the startup stage name")
-    );
-    assert_eq!(
-        EntrypointStage::ScmDispatch.as_str(),
-        fixture["stages"]["scm_dispatch"]
-            .as_str()
-            .expect("fixture must pin the scm_dispatch stage name")
-    );
-    assert!(
-        text.contains(HOST_DIAGNOSTICS_TARGET),
-        "scoped capture must contain the facade target, got: {text}"
-    );
-    assert!(
-        text.contains(
-            fixture["entrypoint_event"]
-                .as_str()
-                .expect("fixture must pin the entrypoint event name")
-        ),
-        "scoped capture must contain the entrypoint event, got: {text}"
-    );
-    assert!(
-        text.contains(expected_stage),
-        "scoped capture must contain the observed stage, got: {text}"
-    );
+    assert!(records
+        .iter()
+        .all(|record| record.target == HOST_DIAGNOSTICS_TARGET));
 
-    // Bounds and the absent Event Log seam stay pinned by the same fixture.
-    assert_the_facade_bounds_match_the_contract_fixture(&fixture, captured_len);
-
-    // No secret or payload canary may appear in a plain stage observation.
-    assert_no_payload_canary_reaches_a_stage_observation(&text);
-}
-
-/// Runs one real `observe_entrypoint` stage observation through the facade under
-/// a scoped `tracing` subscriber and returns the captured window.
-///
-/// Scoped capture shadows any global install rather than replacing it, so this
-/// stays isolated and parallel-safe.
-fn capture_the_entrypoint_stage_observation() -> String {
-    let sink = CaptureSink::default();
-    let writer_sink = sink.clone();
-    let captured = {
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer_sink.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            observe_entrypoint(EntrypointStage::ConsoleLoop);
-        });
-        sink.bytes.lock().unwrap().clone()
-    };
-    String::from_utf8_lossy(&captured).into_owned()
-}
-
-/// The capture window's own size, so the caller can compare it against the
-/// product's byte bound instead of against a constant it invented.
-fn captured_byte_count(text: &str) -> usize {
-    text.len()
-}
-
-/// Proves the two bounds this case publishes really are the facade's own, and
-/// that the absent Event Log seam is still the one the fixture declares.
-fn assert_the_facade_bounds_match_the_contract_fixture(fixture: &Value, captured_len: usize) {
-    assert_eq!(
-        MAX_DIAGNOSTIC_FIELD_BYTES,
-        usize::try_from(
-            fixture["max_field_bytes"]
-                .as_u64()
-                .expect("fixture must pin max_field_bytes")
-        )
-        .expect("fixture bound must fit usize")
-    );
-    assert_eq!(
-        MAX_DIAGNOSTIC_DETAIL_BYTES,
-        usize::try_from(
-            fixture["max_detail_bytes"]
-                .as_u64()
-                .expect("fixture must pin max_detail_bytes")
-        )
-        .expect("fixture bound must fit usize")
-    );
-    assert_eq!(
-        fixture["event_log_sink"]
-            .as_str()
-            .expect("fixture must pin the event log seam"),
-        "unavailable"
-    );
-    assert!(
-        captured_len < 8 * 1024,
-        "diagnostic capture must stay bounded, got {captured_len} bytes"
-    );
-}
-
-/// Sweeps the credential and payload canaries that must never reach a plain
-/// stage observation. Nothing is fabricated: each canary is checked against the
-/// bytes the facade actually rendered.
-fn assert_no_payload_canary_reaches_a_stage_observation(text: &str) {
-    for canary in [
-        "AKIA",
-        "password",
-        "token=",
-        "connection_string",
-        "BEGIN PRIVATE",
+    let request = records
+        .iter()
+        .find(|record| record.event == "host.request")
+        .expect("the scoped capture must contain the projected request");
+    let receipt_exit = HOST_TERMINAL_EXIT.to_string();
+    for (field, expected) in [
+        ("phase", EntrypointStage::ShutdownDrain.as_str()),
+        ("evidence", HostRequestEvidence::Failed.as_str()),
+        ("request", HostConsoleRequest::Stop.as_str()),
+        ("operation", AdmittedEvent::ServiceFailure.as_str()),
+        ("reason", "stopped"),
+        ("receipt_exit", receipt_exit.as_str()),
     ] {
-        assert!(
-            !text.contains(canary),
-            "stage observation must not contain canary {canary:?}, got: {text}"
+        assert_eq!(
+            request.field(field),
+            Some(expected),
+            "the host.request record must preserve {field} from its typed projection"
         );
     }
+    assert_eq!(request.field("reason_missing"), Some("false"));
+    assert_eq!(request.field("receipt_exit_missing"), Some("false"));
+
+    // The public projection path observes already-owned state. It may publish
+    // diagnostics and request admission only; it has no lifecycle transition
+    // or Host operation that could become a second authority.
+    let facade = manifest_source("src/host_diagnostics.rs");
+    let body = fn_body_without_whitespace(&facade, "pub fn observe_host_request")
+        .expect("the facade must keep one observable request function");
+    assert!(body.starts_with("publish_projected_event_log_record(projection);"));
+    for authority_call in [
+        "host.start(",
+        "host.stop(",
+        "transition_activation(",
+        "HostComposition::open(",
+    ] {
+        assert!(
+            !body.contains(authority_call),
+            "observation must not acquire lifecycle authority through {authority_call:?}"
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 889/13
+#[test]
+fn scoped_diagnostic_records_are_deterministic_in_semantics_and_order() {
+    let emit = || {
+        observe_entrypoint(EntrypointStage::ConsoleLoop);
+        observe_terminal_error(HOST_TERMINAL_CODE_CONSOLE_FAILED);
+    };
+    let first = capture_emitted_records(emit);
+    let second = capture_emitted_records(emit);
+    let semantic_shape = |records: &[CapturedRecord]| {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.target.clone(),
+                    record.event.clone(),
+                    record.fields.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        semantic_shape(&first),
+        semantic_shape(&second),
+        "separate scoped subscribers must capture identical semantic fields in emission order"
+    );
+    assert_eq!(
+        first.iter().map(|record| record.event.as_str()).collect::<Vec<_>>(),
+        ["host.entrypoint_stage", "host.terminal_error"],
+        "the capture must be nonempty and keep its two event names in submitted order"
+    );
+    assert!(first
+        .iter()
+        .all(|record| record.target == HOST_DIAGNOSTICS_TARGET));
+    assert_eq!(first[0].field("stage"), Some("console_loop"));
+    assert_eq!(
+        first[1].field("code"),
+        Some(HOST_TERMINAL_CODE_CONSOLE_FAILED)
+    );
+    assert_eq!(first[1].field("code_truncated"), Some("false"));
+    assert!(!first[0].field_names().contains("timestamp"));
+    assert!(!first[1].field_names().contains("timestamp"));
 }
 
 /// The canonical five-pair Host launch argv this test target admits, so the
@@ -1781,8 +1682,9 @@ fn event_log_success_is_never_reported_above_registration_unknown() {
     // successful handle acquisition with installed message resources." This is
     // exactly the conflation comment `5934100576` refuted a prior delivery for.
     //
-    // Proof is read-only source plus type shape plus the real seam. No wrapper
-    // source is edited and no delivery outcome is invented.
+    // Proof is read-only receipt and wrapper source plus typed vocabulary.
+    // Normal unit tests do not call the synchronous OS port; supported-Windows
+    // delivery remains separate TEST-PHASE evidence.
     //
     // The receipt admits exactly one source-availability state and it is the
     // unknown one, so no receipt on any host can prove the registered-source
@@ -1802,11 +1704,6 @@ fn event_log_success_is_never_reported_above_registration_unknown() {
     // registration unknown.
     assert_the_reachable_delivery_arm_is_named_registration_unknown(&readback);
 
-    // Runtime proof on the seam this target can really drive: the real
-    // `report_event` outcome, checked against the product's own typed seam
-    // status so each arm is compared to the port state that produced it rather
-    // than to a `cfg!` constant.
-    assert_the_real_event_log_outcome_matches_the_seam_status();
 }
 
 /// Proves the wrapper's success mapping is exhaustive over the one receipt
@@ -1887,67 +1784,6 @@ fn assert_the_reachable_delivery_arm_is_named_registration_unknown(readback: &st
     );
 }
 
-/// Drives one real `report_event` call and checks the outcome against the
-/// product's OWN live seam status rather than against a compile-time constant.
-///
-/// `event_log_sink_status()` is the same live probe the facade's
-/// `note_event_log_sink_status` consumes, so it is the real platform predicate
-/// "this build has a live Event Log port", not an assertion about the target.
-/// The two clauses this replaces each fell out of `report_event` alone:
-///
-/// * an accepted delivery could only be reported where the port is live, so
-///   `EventLogUnavailable` answers are the port-dead branch and must carry no
-///   success claim, and any success must be the weak registration-unknown arm;
-/// * a refusal (`SourceUnavailable`/`ReportRefused`) means the OS port WAS
-///   reached and the OS itself refused, which off Windows is unreachable
-///   because no call is ever made there -- so `EventLogUnavailable` off Windows
-///   remains the one honest answer, proven by the seam status being
-///   `EventLogUnavailable` exactly when this build is off Windows.
-fn assert_the_real_event_log_outcome_matches_the_seam_status() {
-    let seam_attemptable = event_log_sink_status() == Ok(());
-    let record = EventLogRecord::new(
-        AdmittedEvent::ServiceStart,
-        "service=EliotHost phase=startup evidence=process_started",
-    );
-    match report_event(&record) {
-        Ok(delivery) => {
-            assert!(
-                seam_attemptable,
-                "a success outcome exists only where the live Event Log seam is attemptable, \
-                 which is the port being answered at all"
-            );
-            assert!(
-                matches!(
-                    delivery,
-                    EventLogDelivery::OsAcceptedRegistrationUnknown {
-                        event: AdmittedEvent::ServiceStart
-                    }
-                ),
-                "an accepted delivery must be reported registration-unknown, never as the \
-                 registered-source profile, got: {delivery:?}"
-            );
-        }
-        Err(WindowsEventLogError::EventLogUnavailable) => {
-            assert!(
-                !seam_attemptable,
-                "an unavailable answer exists only where the live Event Log seam reports \
-                 unavailable: on Windows the port must be attempted, not answered unavailable"
-            );
-        }
-        Err(
-            error @ (WindowsEventLogError::SourceUnavailable { .. }
-            | WindowsEventLogError::ReportRefused { .. }),
-        ) => {
-            assert!(
-                seam_attemptable,
-                "a refusal outcome exists only where the live Event Log seam is attemptable, \
-                 got: {error:?}"
-            );
-        }
-        Err(error) => panic!("the bounded redacted record must validate, got: {error:?}"),
-    }
-}
-
 /// The platform Event Log receipt admits exactly one source-availability state
 /// and it is the unknown one, so no receipt on any host can prove the
 /// registered-source profile and the wrapper's registered-source arm has no
@@ -2000,109 +1836,167 @@ fn prove_the_receipt_admits_only_unknown_availability() -> String {
 }
 
 // WORK_UNIT_CASE: 889/15
+#[test]
+fn event_log_start_mapping_is_exact() {
+    let fixture = contract_fixture();
+    let correlation = format!(
+        "service={} phase={} evidence={} operation={}",
+        eliot_host::SERVICE_NAME,
+        EntrypointStage::Startup.as_str(),
+        HostRequestEvidence::ProcessStarted.as_str(),
+        AdmittedEvent::ServiceStart.as_str()
+    );
+    let record = EventLogRecord::new(AdmittedEvent::ServiceStart, &correlation);
+    assert_event_mapping_matches_fixture(&record, &fixture, "service_start");
+    assert_eq!(record.insertion(), correlation);
+    assert_eq!(record.original_bytes(), correlation.len());
+    assert!(!record.truncated());
+    assert!(record.insertion().contains("operation=service_start"));
+}
+
 // WORK_UNIT_CASE: 889/16
+#[test]
+fn event_log_stop_mapping_is_exact() {
+    let fixture = contract_fixture();
+    let correlation = format!(
+        "service={} phase={} evidence={} operation={} exit={}",
+        eliot_host::SERVICE_NAME,
+        EntrypointStage::ShutdownDrain.as_str(),
+        HostRequestEvidence::DurableCommitted.as_str(),
+        AdmittedEvent::ServiceStop.as_str(),
+        HOST_TERMINAL_EXIT
+    );
+    let record = EventLogRecord::new(AdmittedEvent::ServiceStop, &correlation);
+    assert_event_mapping_matches_fixture(&record, &fixture, "service_stop");
+    assert_eq!(record.insertion(), correlation);
+    assert_eq!(record.original_bytes(), correlation.len());
+    assert!(!record.truncated());
+    assert!(record.insertion().contains("evidence=durable_committed"));
+    assert!(record.insertion().contains("operation=service_stop"));
+}
+
 // WORK_UNIT_CASE: 889/17
+#[test]
+fn event_log_failure_mapping_preserves_redacted_correlation() {
+    let fixture = contract_fixture();
+    let correlation = format!(
+        "service={} phase={} evidence={} operation={} exit={}",
+        eliot_host::SERVICE_NAME,
+        EntrypointStage::ConsoleLoop.as_str(),
+        HostRequestEvidence::Failed.as_str(),
+        AdmittedEvent::ServiceFailure.as_str(),
+        HOST_TERMINAL_EXIT
+    );
+    let record = EventLogRecord::new(AdmittedEvent::ServiceFailure, &correlation);
+    assert_event_mapping_matches_fixture(&record, &fixture, "service_failure");
+    assert_eq!(record.insertion(), correlation);
+    assert_eq!(record.original_bytes(), correlation.len());
+    assert!(!record.truncated());
+    assert!(record.insertion().contains("operation=service_failure"));
+    assert!(!record.insertion().contains("HostError"));
+    assert!(!record.insertion().contains("password"));
+
+    let oversized = "d".repeat(8 * EVENT_LOG_MAX_INSERTION_BYTES);
+    let truncated = EventLogRecord::new(AdmittedEvent::ServiceFailure, &oversized);
+    assert!(truncated.truncated());
+    assert_eq!(truncated.original_bytes(), oversized.len());
+    assert!(truncated.insertion().len() <= EVENT_LOG_MAX_INSERTION_BYTES);
+    assert!(oversized.starts_with(truncated.insertion()));
+}
+
 // WORK_UNIT_CASE: 889/18
 #[test]
-fn windows_event_log_wrapper_reports_through_the_safe_port() {
-    // The wrapper maps #984's consumer contract (fixed source, event ids,
-    // severity, redacted insertions; admitted start/stop/failure only)
-    // through the safe port: typed accepted/refused/unavailable outcomes,
-    // never FFI and never a silent fallback. (Cases 889/15 start, 889/16
-    // stop, 889/17 failure mapping and correlation, 889/18 missing/denied
-    // stays distinct and leaves the Host result unchanged.)
+fn unknown_source_refusal_and_delivery_profiles_stay_distinct() {
     let fixture = contract_fixture();
+    assert_eq!(
+        fixture["event_log_source_availability"].as_str(),
+        Some("unknown"),
+        "the fixture must record the actual receipt availability"
+    );
+    assert_eq!(
+        fixture["event_log_os_delivery_evidence"].as_str(),
+        Some("TEST-PHASE_NOT_EXECUTED"),
+        "the fixture must keep actual OS delivery outside ordinary unit evidence"
+    );
+    let readback = prove_the_receipt_admits_only_unknown_availability();
+    assert!(
+        readback.ends_with(" -> EventLogSourceAvailability {"),
+        "the wrapper classification must use the receipt's availability accessor"
+    );
+
+    let wrapper = manifest_source("src/windows_event_log.rs");
+    assert_no_wrapper_path_inflates_an_acceptance_receipt(&wrapper);
+    let report = fn_body_without_whitespace(&wrapper, "pub fn report_event")
+        .expect("the wrapper must keep one synchronous report boundary");
+    assert!(report.contains(
+        "EventLogSourceAvailability::Unknown=>Ok(EventLogDelivery::OsAcceptedRegistrationUnknown{event})"
+    ));
+    assert!(report.contains("Err(error)=>Err(map_event_log_error(error))"));
+    assert!(!report.contains("RegisteredSourceAccepted"));
+    assert!(!report.contains("DegradedApplicationAccepted"));
+
+    let error_mapping = fn_body_without_whitespace(&wrapper, "fn map_event_log_error")
+        .expect("the wrapper must map the typed platform errors");
+    assert!(error_mapping.contains(
+        "EventLogError::RegistrationFailed{code}=>WindowsEventLogError::SourceUnavailable{code}"
+    ));
+    assert!(error_mapping.contains(
+        "EventLogError::ReportFailed{code}=>WindowsEventLogError::ReportRefused{code}"
+    ));
+
+    let accepted = EventLogDelivery::OsAcceptedRegistrationUnknown {
+        event: AdmittedEvent::ServiceStart,
+    };
+    let source_denied = WindowsEventLogError::SourceUnavailable { code: 5 };
+    let report_denied = WindowsEventLogError::ReportRefused { code: 6 };
+    let unavailable = WindowsEventLogError::EventLogUnavailable;
+    let error_names = [
+        source_denied.as_str(),
+        report_denied.as_str(),
+        unavailable.as_str(),
+    ];
+    assert_eq!(
+        error_names.iter().copied().collect::<std::collections::HashSet<_>>().len(),
+        error_names.len(),
+        "source refusal, report refusal and unavailable status must keep distinct typed names"
+    );
+    assert!(error_names.iter().all(|name| *name != accepted.as_str()));
+    assert_eq!(accepted.event(), AdmittedEvent::ServiceStart);
+    assert_eq!(
+        accepted.as_str(),
+        "os_accepted_registration_unknown",
+        "the accepted current profile stays explicitly registration-unknown"
+    );
+}
+
+/// Checks the fixed source, event id, and severity against the independent
+/// fixture for one locally constructed mapping. This helper never calls the OS.
+fn assert_event_mapping_matches_fixture(record: &EventLogRecord, fixture: &Value, key: &str) {
     assert_eq!(
         EVENT_LOG_SOURCE,
         fixture["event_log_source"]
             .as_str()
-            .expect("fixture must pin the event log source")
+            .expect("fixture must pin the fixed Event Log source")
     );
-    for (event, key) in [
-        (AdmittedEvent::ServiceStart, "service_start"),
-        (AdmittedEvent::ServiceStop, "service_stop"),
-        (AdmittedEvent::ServiceFailure, "service_failure"),
-    ] {
-        let record = EventLogRecord::new(event, "host funnel reached boundary");
-        let (source, event_id, severity) = record.mapping();
-        assert_eq!(source, EVENT_LOG_SOURCE);
-        assert_eq!(
-            event_id,
-            u32::try_from(
-                fixture["event_mappings"][key]["event_id"]
-                    .as_u64()
-                    .expect("fixture must pin the event id")
-            )
-            .expect("event id must fit u32")
-        );
-        assert_eq!(
-            severity.as_str(),
-            fixture["event_mappings"][key]["severity"]
-                .as_str()
-                .expect("fixture must pin the severity")
-        );
-        // Delivery proof through #984's safe port: on Windows the OS call is
-        // attempted and every outcome stays typed; off Windows the port is
-        // honestly unavailable. The caller's Host result is untouched either
-        // way (Ok stays Ok around the call).
-        let host_result: Result<(), &'static str> = Ok(());
-        assert_safe_port_outcome_is_typed(&record, event, host_result);
-    }
-
-    // Failure correlation uses the frozen terminal code as the redacted
-    // insertion; the record keeps truncation honesty.
-    let failure = EventLogRecord::new(
-        AdmittedEvent::ServiceFailure,
-        HOST_TERMINAL_CODE_CONSOLE_FAILED,
-    );
-    assert!(failure.insertion().contains("console_failed"));
-    assert!(!failure.truncated());
-    let long_insertion = "d".repeat(8 * MAX_DIAGNOSTIC_DETAIL_BYTES);
-    let truncated = EventLogRecord::new(AdmittedEvent::ServiceFailure, &long_insertion);
-    assert!(truncated.truncated());
-    assert!(truncated.insertion().len() <= MAX_DIAGNOSTIC_DETAIL_BYTES);
-
-    // Finite nonblocking admission: capacity is honored, overflow drops with
-    // an exact count, shutdown parks the remainder as Unknown without
-    // claiming a drain or abort that did not complete. (Supports 889/10 and
-    // 889/14 queue/drop/shutdown honesty.)
+    let (source, event_id, severity) = record.mapping();
+    assert_eq!(source, EVENT_LOG_SOURCE);
     assert_eq!(
-        usize::try_from(
-            fixture["queue_capacity"]
+        event_id,
+        u32::try_from(
+            fixture["event_mappings"][key]["event_id"]
                 .as_u64()
-                .expect("fixture must pin the queue capacity")
+                .expect("fixture must pin the event id")
         )
-        .expect("queue capacity must fit usize"),
-        EVENT_LOG_QUEUE_CAPACITY
+        .expect("event id must fit u32")
     );
-    let mut queue = WindowsEventLogQueue::new(2);
-    assert!(queue.is_empty());
-    queue
-        .try_admit(EventLogRecord::new(AdmittedEvent::ServiceStart, "start"))
-        .expect("admission within capacity must succeed");
-    queue
-        .try_admit(EventLogRecord::new(AdmittedEvent::ServiceStop, "stop"))
-        .expect("admission within capacity must succeed");
-    assert_eq!(queue.len(), 2);
     assert_eq!(
-        queue.try_admit(EventLogRecord::new(AdmittedEvent::ServiceFailure, "full")),
-        Err(WindowsEventLogError::QueueFull)
+        severity.as_str(),
+        fixture["event_mappings"][key]["severity"]
+            .as_str()
+            .expect("fixture must pin the severity")
     );
-    assert_eq!(queue.dropped_total(), 1);
-    let shutdown = queue.shutdown();
-    assert!(queue.is_closed());
-    assert_eq!(
-        shutdown.unsent(),
-        2,
-        "shutdown must park held records as unsent"
-    );
-    assert_eq!(shutdown.dropped_total(), 1);
-    assert_eq!(
-        queue.try_admit(EventLogRecord::new(AdmittedEvent::ServiceStart, "late")),
-        Err(WindowsEventLogError::Closed)
-    );
+    assert!(record.insertion().len() <= EVENT_LOG_MAX_INSERTION_BYTES);
 }
-
 // WORK_UNIT_CASE: 889/22
 #[test]
 fn tracing_never_corrupts_console_stdout_framing() {
@@ -3240,12 +3134,11 @@ fn diagnostic_bounds_and_queue_admission_are_honest_about_truncation_and_drops()
     // prefixes must stay inside the two declared caps.
     for (retained, cap, label) in [
         (&retained_field, field_cap, "field"),
-        (&retained_marked_field, field_cap, "field"),
         (&retained_detail, detail_cap, "detail"),
     ] {
         assert!(
             !retained.contains(tail),
-            "a retained {label} prefix must never carry the removed tail: {retained}"
+            "a truncated {label} prefix must not carry the removed tail: {retained}"
         );
         assert!(
             retained.len() <= cap,
@@ -3253,6 +3146,15 @@ fn diagnostic_bounds_and_queue_admission_are_honest_about_truncation_and_drops()
             retained.len()
         );
     }
+    assert_eq!(
+        retained_marked_field, fixtures.marked_at_cap,
+        "the at-cap marked field is intentionally retained verbatim"
+    );
+    assert!(
+        retained_marked_field.ends_with(tail),
+        "the exact-cap marker fixture keeps its tail because it was not truncated"
+    );
+    assert_eq!(retained_marked_field.len(), field_cap);
     assert!(
         retained_head_at_cap.ends_with(&head),
         "the input of exactly the detail cap must keep its whole tail: {retained_head_at_cap}"
@@ -6983,13 +6885,11 @@ fn assert_the_start_record_reports_what_the_producer_published(
 }
 
 // WORK_UNIT_CASE: 889/1
-// WORK_UNIT_CASE: 889/19
 #[test]
-fn host_reference_failure_and_registration_are_singular() {
-    // Exactly one current `main.rs` reference failure uses the facade, and
-    // the library registration is exactly the two new modules: no lifecycle
-    // instrumentation here (that is #891's), no FFI in Host. (Cases 889/1
-    // inventory, 889/19 single reference failure.)
+fn host_diagnostics_subscriber_sink_and_reference_inventory_is_actual() {
+    // Inventory the actual library-owned facade, producer cell and typed
+    // unavailable Host diagnostic sink. The lower OS port is separately
+    // attemptable on supported Windows and is not inferred from this status.
     let lib = manifest_source("src/lib.rs");
     assert_eq!(
         lib.matches("pub mod host_diagnostics;").count(),
@@ -7002,6 +6902,47 @@ fn host_reference_failure_and_registration_are_singular() {
         "lib must register the sink seam exactly once"
     );
 
+    let main = manifest_source("src/main.rs");
+    let facade = manifest_source("src/host_diagnostics.rs");
+    let wrapper = manifest_source("src/windows_event_log.rs");
+    assert_eq!(facade.matches("static SUBSCRIBER_SETUP").count(), 1);
+    assert_eq!(wrapper.matches("static EVENT_LOG_PRODUCER").count(), 1);
+    assert_eq!(sink_status(DiagnosticSink::WindowsEventLog), Err(HostDiagnosticsError::EventLogUnavailable));
+    assert_eq!(
+        contract_fixture()["host_facade_event_log_sink"].as_str(),
+        Some("unavailable"),
+        "fixture names the Host facade sink status, not lower OS-port attemptability"
+    );
+
+    // Host owns the typed seam; the implementation never acquires Event Log
+    // FFI directly. Delivery smoke remains separate TEST-PHASE evidence.
+    for (name, contents) in [
+        ("host_diagnostics.rs", facade),
+        ("windows_event_log.rs", wrapper.clone()),
+        ("main.rs", main.clone()),
+    ] {
+        for forbidden in [
+            "RegisterEventSource",
+            "ReportEventW",
+            "DeregisterEventSource",
+        ] {
+            assert!(
+                !contents.contains(forbidden),
+                "{name} must not acquire Event Log FFI ({forbidden})"
+            );
+        }
+    }
+    assert!(
+        wrapper.contains("EventLogUnavailable"),
+        "the wrapper keeps a typed unavailable outcome"
+    );
+}
+
+// WORK_UNIT_CASE: 889/19
+#[test]
+fn main_has_exactly_one_actual_reference_failure() {
+    // One real Host reference failure site uses the frozen code. This is a
+    // source census of main's actual call, not a generated or test-only path.
     let main = manifest_source("src/main.rs");
     assert_eq!(
         main.matches("install_host_diagnostics").count(),
@@ -7016,36 +6957,6 @@ fn host_reference_failure_and_registration_are_singular() {
     assert!(
         main.contains("HOST_TERMINAL_CODE_CONSOLE_FAILED"),
         "the single reference failure must use the frozen console code"
-    );
-
-    // No Event Log FFI is acquired inside Host; the seam stays typed and
-    // absent until #984 lands.
-    for (name, contents) in [
-        (
-            "host_diagnostics.rs",
-            manifest_source("src/host_diagnostics.rs"),
-        ),
-        (
-            "windows_event_log.rs",
-            manifest_source("src/windows_event_log.rs"),
-        ),
-        ("main.rs", main),
-    ] {
-        for forbidden in [
-            "RegisterEventSource",
-            "ReportEventW",
-            "DeregisterEventSource",
-        ] {
-            assert!(
-                !contents.contains(forbidden),
-                "{name} must not acquire Event Log FFI ({forbidden})"
-            );
-        }
-    }
-    let wrapper = manifest_source("src/windows_event_log.rs");
-    assert!(
-        wrapper.contains("EventLogUnavailable"),
-        "wrapper must keep the typed unavailable seam"
     );
 }
 

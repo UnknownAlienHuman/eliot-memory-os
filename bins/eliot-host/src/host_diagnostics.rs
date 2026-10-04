@@ -54,6 +54,15 @@ pub const HOST_TERMINAL_CODE_DISPATCHER_FAILED: &str = "dispatcher_failed";
 /// failure; later leaves (#891) own the remaining sites.
 pub const HOST_TERMINAL_CODE_CONSOLE_FAILED: &str = "console_failed";
 
+/// Runs one synchronous tracing emission as best-effort diagnostics.
+///
+/// A subscriber is foreign code and may unwind while formatting or writing an
+/// event. Contain only that callback unwind: do not retry, report recursively,
+/// or change the owner operation that produced the observation.
+fn emit_best_effort(emit: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(emit));
+}
+
 /// Observed state of the facade's one process-global subscriber install.
 ///
 /// A claim, a running attempt, a successful Host-owned install, and a failed or
@@ -394,18 +403,20 @@ pub fn start_event_log_reporting() {
     let status = crate::windows_event_log::start_event_log_producer();
     let queued = status.queued().known();
     let in_flight = status.in_flight().known();
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.event_log_producer_start",
-        worker_started = status.worker_started(),
-        shutdown = status.is_shutdown(),
-        queued = queued.unwrap_or(0),
-        queued_unknown = queued.is_none(),
-        in_flight = in_flight.unwrap_or(0),
-        in_flight_unknown = in_flight.is_none(),
-        dropped_total = status.dropped_total(),
-        "host event log producer start disposition"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.event_log_producer_start",
+            worker_started = status.worker_started(),
+            shutdown = status.is_shutdown(),
+            queued = queued.unwrap_or(0),
+            queued_unknown = queued.is_none(),
+            in_flight = in_flight.unwrap_or(0),
+            in_flight_unknown = in_flight.is_none(),
+            dropped_total = status.dropped_total(),
+            "host event log producer start disposition"
+        );
+    });
 }
 
 /// Closes Event Log admission without waiting for the OS worker. Queued or
@@ -415,17 +426,19 @@ pub fn shutdown_event_log_reporting() {
     let status = crate::windows_event_log::shutdown_event_log_producer();
     let queued = status.queued().known();
     let in_flight = status.in_flight().known();
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.event_log_producer_shutdown",
-        queued = queued.unwrap_or(0),
-        queued_unknown = queued.is_none(),
-        in_flight = in_flight.unwrap_or(0),
-        in_flight_unknown = in_flight.is_none(),
-        outstanding_delivery = status.delivery_disposition().as_str(),
-        dropped_total = status.dropped_total(),
-        "host event log producer shutdown disposition"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.event_log_producer_shutdown",
+            queued = queued.unwrap_or(0),
+            queued_unknown = queued.is_none(),
+            in_flight = in_flight.unwrap_or(0),
+            in_flight_unknown = in_flight.is_none(),
+            outstanding_delivery = status.delivery_disposition().as_str(),
+            dropped_total = status.dropped_total(),
+            "host event log producer shutdown disposition"
+        );
+    });
 }
 
 /// One truncated string plus its truncation honesty record.
@@ -572,12 +585,14 @@ impl EntrypointStage {
 /// call. All macro arguments are precomputed pure values, so a disabled
 /// event evaluates no extra effectful operation.
 pub fn observe_entrypoint(stage: EntrypointStage) {
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.entrypoint_stage",
-        stage = stage.as_str(),
-        "host entrypoint reached stage"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.entrypoint_stage",
+            stage = stage.as_str(),
+            "host entrypoint reached stage"
+        );
+    });
 }
 
 /// Records that the entrypoint reached one frozen boundary stage with a
@@ -587,15 +602,17 @@ pub fn observe_entrypoint(stage: EntrypointStage) {
 /// attached; see [`bound_detail`] for the nonsecret caller contract.
 pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     let bounded = bound_detail(detail);
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.entrypoint_stage",
-        stage = stage.as_str(),
-        detail = bounded.text(),
-        detail_bytes = bounded.original_bytes(),
-        detail_truncated = bounded.truncated(),
-        "host entrypoint reached stage"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.entrypoint_stage",
+            stage = stage.as_str(),
+            detail = bounded.text(),
+            detail_bytes = bounded.original_bytes(),
+            detail_truncated = bounded.truncated(),
+            "host entrypoint reached stage"
+        );
+    });
 }
 
 /// Records the single terminal error boundary with its exact typed code.
@@ -609,14 +626,16 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
 /// exit code) is untouched and still owns the process exit.
 pub fn observe_terminal_error(code: &str) {
     let bounded = bound_field(code);
-    tracing::error!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.terminal_error",
-        code = bounded.text(),
-        code_bytes = bounded.original_bytes(),
-        code_truncated = bounded.truncated(),
-        "host terminal error"
-    );
+    emit_best_effort(|| {
+        tracing::error!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.terminal_error",
+            code = bounded.text(),
+            code_bytes = bounded.original_bytes(),
+            code_truncated = bounded.truncated(),
+            "host terminal error"
+        );
+    });
 }
 
 /// Notes Event Log sink unavailability where the sink cannot carry a record.
@@ -632,11 +651,13 @@ pub fn note_event_log_sink_status() {
     if crate::windows_event_log::event_log_sink_status().is_ok() {
         return;
     }
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.event_log_sink_unavailable",
-        "event log sink unavailable; record stays on tracing"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.event_log_sink_unavailable",
+            "event log sink unavailable; record stays on tracing"
+        );
+    });
 }
 
 /// Typed evidence basis for one projected Host request record.
@@ -954,34 +975,36 @@ impl HostRequestProjection {
 pub fn observe_host_request(projection: &HostRequestProjection) {
     publish_projected_event_log_record(projection);
     let installation = projection.installation.as_ref();
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.request",
-        service = crate::SERVICE_NAME,
-        phase = projection.phase.as_str(),
-        evidence = projection.evidence.as_str(),
-        request = projection.request.map_or("", HostConsoleRequest::as_str),
-        request_missing = projection.request.is_none(),
-        operation = projection.operation.map_or("", AdmittedEvent::as_str),
-        operation_missing = projection.operation.is_none(),
-        installation = installation.map_or("", BoundedField::text),
-        installation_bytes = installation.map_or(0, BoundedField::original_bytes),
-        installation_truncated = installation.is_some_and(BoundedField::truncated),
-        installation_missing = installation.is_none(),
-        generation = projection.generation.unwrap_or(0),
-        generation_missing = projection.generation.is_none(),
-        process = projection.process.unwrap_or(0),
-        process_missing = projection.process.is_none(),
-        running = projection.running.unwrap_or(false),
-        running_missing = projection.running.is_none(),
-        reason = projection.reason.unwrap_or(""),
-        reason_missing = projection.reason.is_none(),
-        receipt_sequence = projection.receipt_sequence.unwrap_or(0),
-        receipt_sequence_missing = projection.receipt_sequence.is_none(),
-        receipt_exit = projection.receipt_exit.unwrap_or(0),
-        receipt_exit_missing = projection.receipt_exit.is_none(),
-        "host request projection"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.request",
+            service = crate::SERVICE_NAME,
+            phase = projection.phase.as_str(),
+            evidence = projection.evidence.as_str(),
+            request = projection.request.map_or("", HostConsoleRequest::as_str),
+            request_missing = projection.request.is_none(),
+            operation = projection.operation.map_or("", AdmittedEvent::as_str),
+            operation_missing = projection.operation.is_none(),
+            installation = installation.map_or("", BoundedField::text),
+            installation_bytes = installation.map_or(0, BoundedField::original_bytes),
+            installation_truncated = installation.is_some_and(BoundedField::truncated),
+            installation_missing = installation.is_none(),
+            generation = projection.generation.unwrap_or(0),
+            generation_missing = projection.generation.is_none(),
+            process = projection.process.unwrap_or(0),
+            process_missing = projection.process.is_none(),
+            running = projection.running.unwrap_or(false),
+            running_missing = projection.running.is_none(),
+            reason = projection.reason.unwrap_or(""),
+            reason_missing = projection.reason.is_none(),
+            receipt_sequence = projection.receipt_sequence.unwrap_or(0),
+            receipt_sequence_missing = projection.receipt_sequence.is_none(),
+            receipt_exit = projection.receipt_exit.unwrap_or(0),
+            receipt_exit_missing = projection.receipt_exit.is_none(),
+            "host request projection"
+        );
+    });
 }
 
 /// Reports the Event Log record a projected Host request carries, if any.
@@ -1027,17 +1050,19 @@ fn publish_projected_event_log_record(projection: &HostRequestProjection) {
         operation.as_str(),
     );
     let admission = crate::windows_event_log::try_admit_admitted_event(operation, &correlation);
-    tracing::info!(
-        target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.event_log_admission",
-        service = crate::SERVICE_NAME,
-        phase = projection.phase.as_str(),
-        evidence = projection.evidence.as_str(),
-        operation = operation.as_str(),
-        outcome = admission.as_str(),
-        dropped_total = admission.dropped_total(),
-        "host event log admission outcome"
-    );
+    emit_best_effort(|| {
+        tracing::info!(
+            target: HOST_DIAGNOSTICS_TARGET,
+            event = "host.event_log_admission",
+            service = crate::SERVICE_NAME,
+            phase = projection.phase.as_str(),
+            evidence = projection.evidence.as_str(),
+            operation = operation.as_str(),
+            outcome = admission.as_str(),
+            dropped_total = admission.dropped_total(),
+            "host event log admission outcome"
+        );
+    });
 }
 
 /// The single `tracing` emission surface for the whole Host binary.

@@ -2,10 +2,16 @@
   "contract": "F-LOG-HOST-0 host structured diagnostics facade",
   "issue": 889,
   "target": "eliot_host::diagnostics",
-  "note": "Pins the facade-init, absent Event Log seam, bounded queue/drop, and stdout-ownership proofs exercised by the focused contract tests, and enumerates every case of the 22-case matrix below so none stays deferred. Real Host-wrapper Event Log delivery smoke on isolated Windows needs #984 and stays an honest residual. Every label below is a short restatement of its issue's verbatim case text; where a test cannot reach the whole case, the label names only the part it proves.",
+  "note": "Declares the 22 exact issue cases and their intended Rust function names. Current `binding` values are planned names; they are not source-verified until the writer finishes the distinct marker/function split. Every execution_status is NOT_EXECUTED until the exact integration target is run; labels describe intended deterministic/source evidence and do not claim a pass. Ordinary tests do not perform native Event Log reporting or a blocked synchronous OS call. Real Host-wrapper delivery and stalled-port/cleanup proof on isolated supported Windows remain TEST-PHASE. allowed_diff is the declared eight-path scope, including the permitted work-unit removal; it is not an observed repository diff.",
   "allowed_diff": [
-    "bins/eliot-host/tests/host_diagnostics_contract.rs",
-    "bins/eliot-host/tests/data/host_diagnostics_cases.json"
+    ".github/temporary/work-unit-889.md",
+    "bins/eliot-host/Cargo.toml",
+    "bins/eliot-host/src/host_diagnostics.rs",
+    "bins/eliot-host/src/lib.rs",
+    "bins/eliot-host/src/main.rs",
+    "bins/eliot-host/src/windows_event_log.rs",
+    "bins/eliot-host/tests/data/host_diagnostics_cases.json",
+    "bins/eliot-host/tests/host_diagnostics_contract.rs"
   ],
   "stages": {
     "startup": "startup",
@@ -23,37 +29,183 @@
   "reference_failure": "console_failed",
   "max_field_bytes": 256,
   "max_detail_bytes": 1024,
-  "event_log_sink": "unavailable",
   "event_log_source": "EliotHost",
   "event_mappings": {
-    "service_start": { "event_id": 100, "severity": "information" },
-    "service_stop": { "event_id": 101, "severity": "information" },
-    "service_failure": { "event_id": 102, "severity": "error" }
+    "service_start": {
+      "event_id": 100,
+      "severity": "information"
+    },
+    "service_stop": {
+      "event_id": 101,
+      "severity": "information"
+    },
+    "service_failure": {
+      "event_id": 102,
+      "severity": "error"
+    }
   },
   "queue_capacity": 64,
   "stdout_protocol_contamination": false,
   "cases": [
-    { "id": 1, "marker": "889/1", "label": "exact current subscriber/sink/reference-callsite inventory" },
-    { "id": 2, "marker": "889/2", "label": "only workspace tracing facade" },
-    { "id": 3, "marker": "889/3", "label": "first process subscriber initialization" },
-    { "id": 4, "marker": "889/4", "label": "duplicate setup bounded and nonpanicking" },
-    { "id": 5, "marker": "889/5", "label": "stable event/reason/phase mapping; the test proves the event and phase names, not that no second lifecycle owner exists" },
-    { "id": 6, "marker": "889/6", "label": "exact request/operation/component identities" },
-    { "id": 7, "marker": "889/7", "label": "four runtime evidence classes emit distinct records; semantically_ready has a distinct name and running-state source proof and differs from all four, without a fabricated Host" },
-    { "id": 8, "marker": "889/8", "label": "failed/cancelled/unknown distinct" },
-    { "id": 9, "marker": "889/9", "label": "unsupported success assertion rejected or downgraded, not invented" },
-    { "id": 10, "marker": "889/10", "label": "field/text/record/queue bounds and honest truncation/drop; the test proves the fixture's declared queue capacity against the product's own EVENT_LOG_QUEUE_CAPACITY and the honest drop counts, and does NOT prove an in-flight bound -- case 889/14 reads the live producer snapshot" },
-    { "id": 11, "marker": "889/11", "label": "no credential/token/environment/connection field slot in any captured record; raw DUMMY! fixtures test size bounds only and retain in-bound text; typed Platform failure projects one nonmissing platform reason with all four category canaries absent from every record; no raw free-text auto-redaction claim" },
-    { "id": 12, "marker": "889/12", "label": "no source/user/model field slot in facade records; raw DUMMY! fixtures test size bounds and removed tails only; typed Platform failure projects one nonmissing platform reason with all three category canaries absent from every record; no raw free-text auto-redaction claim" },
-    { "id": 13, "marker": "889/13", "label": "scoped capture has deterministic semantic fields/order" },
-    { "id": 14, "marker": "889/14", "label": "sink degradation/blocked OS call cannot recurse, spawn unbounded workers or change operation result; timeout cannot falsely certify abort/drain" },
-    { "id": 15, "marker": "889/15", "label": "Event Log start source/event/severity mapping" },
-    { "id": 16, "marker": "889/16", "label": "Event Log stop mapping" },
-    { "id": 17, "marker": "889/17", "label": "Event Log failure mapping and correlation" },
-    { "id": 18, "marker": "889/18", "label": "missing/denied source and explicitly admitted degraded profile remain distinct and leave original Host result unchanged" },
-    { "id": 19, "marker": "889/19", "label": "exactly one current main.rs reference failure uses the facade" },
-    { "id": 20, "marker": "889/20", "label": "allowed-diff and no-lifecycle/unsafe/authority mutation guard" },
-    { "id": 21, "marker": "889/21", "label": "binary, library consumer and integration test compile against the same exported facade without duplicated module/subscriber state" },
-    { "id": 22, "marker": "889/22", "label": "tracing never corrupts console stdout framing and parallel scoped capture cannot replace a global subscriber" }
-  ]
+    {
+      "id": 1,
+      "marker": "889/1",
+      "label": "exact current subscriber/sink/reference-callsite inventory",
+      "binding": "host_diagnostics_subscriber_sink_and_reference_inventory_is_actual",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 2,
+      "marker": "889/2",
+      "label": "only the workspace tracing facade emits Host diagnostics",
+      "binding": "host_diagnostics_emission_surface_is_only_the_workspace_tracing_facade",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 3,
+      "marker": "889/3",
+      "label": "first process subscriber install retains the truthful observed result",
+      "binding": "host_diagnostics_first_process_install_retains_truthful_result",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 4,
+      "marker": "889/4",
+      "label": "duplicate setup is bounded and nonpanicking",
+      "binding": "host_diagnostics_duplicate_init_is_bounded_and_nonpanicking",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 5,
+      "marker": "889/5",
+      "label": "stable event/reason/phase projection without a second lifecycle owner",
+      "binding": "host_request_event_reason_phase_are_stable_without_second_lifecycle_owner",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 6,
+      "marker": "889/6",
+      "label": "exact request/operation/component identities",
+      "binding": "host_request_projection_carries_the_exact_typed_identities",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 7,
+      "marker": "889/7",
+      "label": "observed/requested/started/ready/durable evidence remains distinct",
+      "binding": "host_request_evidence_progress_slots_stay_distinct",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 8,
+      "marker": "889/8",
+      "label": "failed/cancelled/unknown terminal evidence remains distinct",
+      "binding": "host_request_terminal_evidence_slots_stay_three_distinct_records",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 9,
+      "marker": "889/9",
+      "label": "port success is never reported above source-registration Unknown",
+      "binding": "event_log_success_is_never_reported_above_registration_unknown",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 10,
+      "marker": "889/10",
+      "label": "field/text/record/queue bounds and honest truncation/drop; source proves the 0/1 in-flight bound without a global worker snapshot; blocked-call runtime remains TEST-PHASE",
+      "binding": "diagnostic_bounds_and_queue_admission_are_honest_about_truncation_and_drops",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 11,
+      "marker": "889/11",
+      "label": "credential/token/environment/connection canaries are absent from dedicated fields; raw DUMMY fixtures prove size bounds only, not automatic redaction",
+      "binding": "credential_token_environment_and_connection_canaries_are_bounded_and_carry_no_dedicated_channel",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 12,
+      "marker": "889/12",
+      "label": "source/user/model payloads have no dedicated field; raw DUMMY fixtures prove bounds/removal of over-cap tails only, not automatic redaction",
+      "binding": "source_user_and_model_payloads_have_no_dedicated_field_and_lose_only_over_cap_material",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 13,
+      "marker": "889/13",
+      "label": "scoped records have deterministic semantic fields and order",
+      "binding": "scoped_diagnostic_records_are_deterministic_in_semantics_and_order",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 14,
+      "marker": "889/14",
+      "label": "local sink-degradation/panic containment and admission leave Host result unchanged; source shows finite worker and truthful shutdown; blocked OS timeout/drain runtime remains TEST-PHASE",
+      "binding": "sink_degradation_and_timeout_never_change_the_host_result_or_claim_a_drain",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 15,
+      "marker": "889/15",
+      "label": "pure local start source/event/severity mapping; no report_event call",
+      "binding": "event_log_start_mapping_is_exact",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 16,
+      "marker": "889/16",
+      "label": "pure local stop source/event/severity mapping; no report_event call",
+      "binding": "event_log_stop_mapping_is_exact",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 17,
+      "marker": "889/17",
+      "label": "pure local failure mapping and bounded correlation from nonsecret typed values; no report_event call or claim that main emits ServiceFailure",
+      "binding": "event_log_failure_mapping_preserves_redacted_correlation",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 18,
+      "marker": "889/18",
+      "label": "receipt Unknown and typed source/report refusal errors stay distinct; no Registered/degraded profile is fabricated; native Windows OS delivery is TEST-PHASE",
+      "binding": "unknown_source_refusal_and_delivery_profiles_stay_distinct",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 19,
+      "marker": "889/19",
+      "label": "exactly one current main.rs reference failure uses the facade",
+      "binding": "main_has_exactly_one_actual_reference_failure",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 20,
+      "marker": "889/20",
+      "label": "exact eight-path allowed-diff declaration; guard is a declaration, not observed diff",
+      "binding": "host_diagnostics_allowed_diff_has_no_lifecycle_unsafe_or_authority_mutation",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 21,
+      "marker": "889/21",
+      "label": "binary/library/integration test share one exported facade owner",
+      "binding": "host_facade_is_compiled_once_and_reached_through_one_exported_owner",
+      "execution_status": "NOT_EXECUTED"
+    },
+    {
+      "id": 22,
+      "marker": "889/22",
+      "label": "tracing preserves stdout framing and scoped capture does not replace a global subscriber",
+      "binding": "tracing_never_corrupts_console_stdout_framing",
+      "execution_status": "NOT_EXECUTED"
+    }
+  ],
+  "host_facade_event_log_sink": "unavailable",
+  "event_log_source_availability": "unknown",
+  "event_log_port_attemptability": "platform_dependent",
+  "event_log_os_delivery_evidence": "TEST-PHASE_NOT_EXECUTED",
+  "blocked_os_call_evidence": "TEST-PHASE_NOT_EXECUTED",
+  "test_binding_status": "PLANNED_NOT_SOURCE_VERIFIED"
 }
