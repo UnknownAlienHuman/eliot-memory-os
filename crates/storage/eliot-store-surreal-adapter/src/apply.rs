@@ -463,7 +463,36 @@ pub(crate) async fn probe_generation(
         Map::new(),
     )
     .await?;
-    let record = take_schema_meta(&mut response, 0)?;
+    observed_schema_generation(&mut response)
+}
+
+/// The same schema-generation observation issued on the isolated
+/// health/admin lane (issue #1933, blocking defect 2).
+///
+/// Readiness and health must not queue behind — or consume a slot in — the
+/// canonical read/write sets, so these two probes enter
+/// [`client::RpcTransport::query_admin`] instead of the generic dispatch. The
+/// decode is shared with [`probe_generation`] so the two lanes cannot drift in
+/// how they classify an observed generation.
+pub(crate) async fn probe_generation_admin(
+    db: &client::RpcTransport,
+) -> Result<Option<String>, AdapterError> {
+    let mut response = db
+        .query_admin(
+            "read.schema_generation",
+            schema::READ_SCHEMA_META,
+            Map::new(),
+        )
+        .await?;
+    observed_schema_generation(&mut response)
+}
+
+/// Decodes one schema-generation observation, shared by the pooled-read and
+/// the isolated health/admin lanes.
+fn observed_schema_generation(
+    response: &mut client::RpcResults,
+) -> Result<Option<String>, AdapterError> {
+    let record = take_schema_meta(response, 0)?;
     if let Some(record) = &record {
         if record.migration_state == schema::MIGRATION_STATE_APPLYING {
             // A committed intent is not a generation. Readiness stays
@@ -523,7 +552,26 @@ pub(crate) async fn probe_readiness(
     adapter: &SurrealStoreAdapter,
 ) -> Result<SemanticReadiness, AdapterError> {
     let db = client(adapter).await?;
-    observe_readiness(db, &adapter.config).await
+    // Health/readiness is the isolated health/admin observation (issue #1933,
+    // blocking defect 2): both probes below ride `SessionRole::HealthAdmin`
+    // rather than the pooled read lane or the facade socket, so a saturated
+    // canonical write set cannot starve readiness and readiness never consumes
+    // a write slot.
+    observe_readiness_admin(db, &adapter.config).await
+}
+
+/// The readiness observation on the isolated health/admin lane.
+async fn observe_readiness_admin(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<SemanticReadiness, AdapterError> {
+    let observed = probe_generation_admin(db).await?;
+    let readiness = readiness_from_observation(observed, &config.expected_schema_generation);
+    if matches!(readiness, SemanticReadiness::Ready { .. }) {
+        let fence = receipt_reconciliation::read_fence_admin(db).await?;
+        return readiness_with_fence(readiness, fence, &config.expected_schema_generation);
+    }
+    Ok(readiness)
 }
 
 async fn observe_readiness(
@@ -863,6 +911,31 @@ pub(crate) async fn apply_prepared_with_authority(
     // this is not a new full-duration application-global gate.
     let _admission = adapter.exclusive_admission.ordinary_write().await;
 
+    // I5.9 / issue #1933 (blocking defect 1): the canonical transaction rides
+    // the bounded pooled normal-write lane, not the single facade socket.
+    //
+    // The bridge's `ClientClass::Write` lease bound and this pool's
+    // `SessionRole::NormalWrite` slot count are the same configured value —
+    // `ClientSetLimits::write_sessions` is built from the Kernel's
+    // `store_transaction_limit` and `bounded_client_set_limits` refuses any
+    // value outside the closed 1..=8 profile — so N concurrent outer write
+    // leases now mean N distinct class-specific write clients instead of N
+    // logical leases converging on one facade session.
+    //
+    // Both lanes send the identical parameterized `query` RPC with the same
+    // binding codec (`atomic_write::send_transaction`); only the session
+    // differs, so transaction semantics are unchanged. Correctness under
+    // concurrency never rested on the facade socket: the fence CAS and the
+    // `RevisionHead`/`OrderingHead` predicates inside the transaction are the
+    // authority, and they run identically on this lane.
+    //
+    // This deliberately does NOT install a concurrent execution generation:
+    // `install_concurrent_execution` refuses the unreserved lane
+    // (`unreserved_apply_admission`), so installing it here would reject every
+    // ordinary production canonical write. Routing the ordinary write onto the
+    // bounded pool is what closes the outer/physical capacity mismatch without
+    // changing which writes are admitted.
+    //
     // Boxed: the retry future holds the multi-kilobyte canonical
     // `PreparedTransition` across provider awaits, exceeding the default
     // future-size lint.
@@ -874,7 +947,7 @@ pub(crate) async fn apply_prepared_with_authority(
         expected_revision_heads,
         expected_ordering_heads,
         authorities,
-        TxLane::Facade,
+        TxLane::PooledWrite,
     ))
     .await
 }
@@ -884,11 +957,11 @@ pub(crate) async fn apply_prepared_with_authority(
 /// Runs the exact production attempt loop over the admitted #987 pooled
 /// read lane for pre-transaction reads and the pooled normal-write lane
 /// for the canonical transaction (one checked-out session per concurrent
-/// task). Since the rework, the production entry above is equally
-/// unguarded and arbitrates through the same fence CAS and head
-/// predicates; this seam never disables safety globally, never compiles
-/// outside `#[cfg(test)]`, and remains as additional pooled-lane
-/// coverage — never as the only concurrent path.
+/// task). Since issue #1933 the production entry above runs on the same
+/// pooled normal-write lane, so this seam is no longer the only overlapping
+/// path; it remains as additional pooled-lane coverage, never as a private
+/// alternate write path. It never disables safety globally and never
+/// compiles outside `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) async fn apply_prepared_without_write_guard(
     adapter: &SurrealStoreAdapter,
@@ -906,7 +979,10 @@ pub(crate) async fn apply_prepared_without_write_guard(
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
 
-    apply_with_retry(
+    // Boxed for the same reason as the production entry above: the attempt
+    // loop future exceeds the default future-size lint, and this seam runs the
+    // identical loop.
+    Box::pin(apply_with_retry(
         adapter,
         db,
         ctx,
@@ -915,7 +991,7 @@ pub(crate) async fn apply_prepared_without_write_guard(
         expected_ordering_heads,
         authorities,
         TxLane::PooledWrite,
-    )
+    ))
     .await
 }
 

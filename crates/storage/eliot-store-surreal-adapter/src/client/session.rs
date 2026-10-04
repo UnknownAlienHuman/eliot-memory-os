@@ -6,7 +6,7 @@ use super::rpc_parse::{
     ResponseCeiling, parse_response, parse_response_bounded, provider_version_from_rpc,
     response_ceiling_refusal, rpc_result,
 };
-use super::{RPC_PROTOCOL_VERSION, RpcRequest, RpcSocket, millis};
+use super::{RPC_PROTOCOL_VERSION, RpcRequest, RpcSocket};
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use eliot_platform_windows::{
@@ -49,9 +49,19 @@ impl fmt::Debug for RpcSession {
     }
 }
 impl RpcSession {
+    /// Connects one authenticated session.
+    ///
+    /// `request_timeout` is the admitted per-class deadline for the lane this
+    /// session will serve (issue #1933): read and normal-write sessions carry
+    /// the configured query timeout, the isolated health/admin session the
+    /// configured connect timeout, and the facade session the query timeout.
+    /// Before this parameter existed every session of every role applied the
+    /// single generic query timeout, so the three admitted class deadlines
+    /// controlled no physical request.
     pub(super) async fn connect(
         owner: &Arc<ProviderOwner>,
         deadline: Instant,
+        request_timeout: Duration,
     ) -> Result<Self, AdapterError> {
         let mut child = owner.provider_child.lock().await;
         let before = validate_child_process(
@@ -78,7 +88,7 @@ impl RpcSession {
         drop(child);
         let session = Self {
             socket: Mutex::new(socket),
-            request_timeout: millis(owner.config.query_timeout_ms),
+            request_timeout,
             owner: Arc::downgrade(owner),
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -792,6 +802,7 @@ mod ownership_tests {
             RpcSession::connect(
                 &self.transport().provider,
                 Instant::now() + Duration::from_secs(30),
+                Duration::from_secs(1),
             )
             .await
             .expect("second session")
@@ -865,9 +876,12 @@ mod ownership_tests {
         let h = Harness::start().await;
         let before = h.observed_identity();
         let second = h.second().await;
-        assert!(Weak::ptr_eq(&h.transport().session.owner, &second.owner));
+        assert!(Weak::ptr_eq(
+            &h.transport().incarnation().session.owner,
+            &second.owner
+        ));
         assert_eq!(before, h.observed_identity());
-        assert_selected(&selected(&h.transport().session).await);
+        assert_selected(&selected(&h.transport().incarnation().session).await);
         assert_selected(&selected(&second).await);
         drop(second);
         h.cleanup().await;
@@ -886,7 +900,7 @@ mod ownership_tests {
             .await
             .expect("owner remains live");
         assert_eq!(before, h.observed_identity());
-        assert_selected(&selected(&h.transport().session).await);
+        assert_selected(&selected(&h.transport().incarnation().session).await);
         h.cleanup().await;
     }
 
@@ -895,7 +909,12 @@ mod ownership_tests {
     async fn failed_partial_session_does_not_stop_the_owned_provider() {
         let h = Harness::start().await;
         let before = h.observed_identity();
-        let result = RpcSession::connect(&h.transport().provider, Instant::now()).await;
+        let result = RpcSession::connect(
+            &h.transport().provider,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(result.is_err(), "expired connection cannot become ready");
         // Authentication failure on a separate real socket cannot alter the first session.
         let partial = h.second().await;
@@ -903,7 +922,7 @@ mod ownership_tests {
         assert!(partial.signin(&h.config.username, &bad).await.is_err());
         drop(partial);
         assert_eq!(before, h.observed_identity());
-        assert_selected(&selected(&h.transport().session).await);
+        assert_selected(&selected(&h.transport().incarnation().session).await);
         h.cleanup().await;
     }
 
@@ -972,6 +991,7 @@ mod ownership_tests {
         assert!(h.transport().provider.validate_owned().await.is_err());
         assert!(
             h.transport()
+                .incarnation()
                 .session
                 .request("proof.986.dead", "version", json!([]))
                 .await
@@ -988,6 +1008,7 @@ mod ownership_tests {
         let result = RpcSession::connect(
             &h.transport().provider,
             Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
         )
         .await;
         assert!(result.is_err());
@@ -1110,7 +1131,7 @@ mod ownership_tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         // An uncertain session is discarded, never reconnected or replayed here.
         drop(bounded);
-        assert_selected(&selected(&h.transport().session).await);
+        assert_selected(&selected(&h.transport().incarnation().session).await);
         h.cleanup().await;
     }
 
@@ -1122,7 +1143,7 @@ mod ownership_tests {
             "{:?} {:?} {:?}",
             h.adapter(),
             h.transport().provider,
-            h.transport().session
+            h.transport().incarnation().session
         );
         for canary in [
             &h.config.username,
@@ -1151,7 +1172,7 @@ mod ownership_tests {
         .expect("listener");
         assert_eq!(listener.process_id(), identity.process_id);
         assert_eq!(identity, h.transport().provider.provider_process_identity);
-        assert_selected(&selected(&h.transport().session).await);
+        assert_selected(&selected(&h.transport().incarnation().session).await);
         assert_selected(&selected(&second).await);
         println!(
             "986/15 provider_sha256={} process_id={} start={} root={} session_sockets=2 version={}",
@@ -1159,7 +1180,12 @@ mod ownership_tests {
             identity.process_id,
             identity.start_time_100ns,
             h.root.display(),
-            h.transport().session.version().await.expect("version")
+            h.transport()
+                .incarnation()
+                .session
+                .version()
+                .await
+                .expect("version")
         );
         drop(second);
         assert_eq!(identity, h.observed_identity());

@@ -1417,9 +1417,36 @@ fn source_api_diff_guard_excludes_out_of_scope_changes() {
         apply.contains("TxLane::PooledWrite"),
         "seam uses the admitted pooled write lane"
     );
+    // Issue #1933 (blocking defect 1) reversed this guard's premise. The
+    // bridge's write-client set IS the pool's `SessionRole::NormalWrite`
+    // slots, so ordinary production canonical writes must ride that lane:
+    // keeping them on the single facade socket made N outer write leases
+    // converge on one physical session while the real bounded write pool
+    // sat unused. The invariant worth keeping is therefore stronger than the
+    // old negative one: a canonical transaction has exactly ONE lane, and the
+    // facade variant no longer exists to select.
+    let production_entry = "pub(crate) async fn apply_prepared_with_authority";
+    let production_at = apply.find(production_entry).expect("production entry");
+    let production_end = apply[production_at..]
+        .find("\npub(crate) async fn apply_prepared_without_write_guard")
+        .map_or(apply.len(), |offset| production_at + offset);
+    let production_body = &apply[production_at..production_end];
     assert!(
-        apply.contains("TxLane::Facade"),
-        "production keeps the facade lane"
+        production_body.contains("TxLane::PooledWrite"),
+        "production canonical writes use the admitted pooled normal-write lane"
+    );
+    assert!(
+        !production_body.contains("TxLane::Facade"),
+        "production canonical writes never fall back to the facade socket"
+    );
+    let writer = source("src/apply/atomic_write.rs");
+    assert!(
+        !writer.contains("TxLane::Facade"),
+        "the facade lane is no longer selectable for a canonical transaction"
+    );
+    assert!(
+        writer.contains("TxLane::PooledWrite => db.query_write"),
+        "the single admitted lane sends on the pooled normal-write session"
     );
     // No process-local sequence authority, no hidden reinterpretation, no
     // blind retry: retries re-enter only on classified contention.
