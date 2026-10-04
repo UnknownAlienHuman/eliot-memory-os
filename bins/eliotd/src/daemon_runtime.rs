@@ -1093,8 +1093,8 @@ fn bind_declared_startup_capabilities(
             let retained = RetainedStartupBinding::OwnerSession {
                 session_binding: facts.session_binding().to_owned(),
                 connection_id: facts.connection_id().to_owned(),
-                generation: owner_state.generation,
-                authority_epoch: owner_state.authority_epoch,
+                generation: owner_state.generation(),
+                authority_epoch: owner_state.authority_epoch(),
             };
             composition.note_owner_session_binding(facts);
             Ok(retained)
@@ -1719,9 +1719,12 @@ async fn run_loop(
     // record is the one observed here through the same accessor. A withheld
     // pre-loop verdict published neither exchange nor producer, so it seeds no
     // key and the first admissible pass still runs the one exchange.
-    let supervision_exchange_owner = supervision_progress
-        .as_ref()
-        .map(|_| (observed_owner.generation, observed_owner.authority_epoch));
+    let supervision_exchange_owner = supervision_progress.as_ref().map(|_| {
+        (
+            observed_owner.generation(),
+            observed_owner.authority_epoch(),
+        )
+    });
     let readiness_record = Rc::new(RefCell::new(LoopReadinessRecord {
         observed_owner: Some(observed_owner),
         published_report: startup_readiness.borrow().report(),
@@ -3415,7 +3418,7 @@ fn observe_readiness_transition(
     //    copied out and the new one written back without ever holding two borrows.
     let core_before = projection.core_readiness_prerequisites_satisfied();
     let observed = eliotd::startup_readiness::observe_core_owner_state(composition);
-    let previous = record.borrow().observed_owner;
+    let previous = record.borrow().observed_owner.clone();
     projection
         .observe_owner(composition)
         .map_err(|error| format!("startup readiness owner observation: {error}"))?;
@@ -3432,30 +3435,44 @@ fn observe_readiness_transition(
         }
         _ => ReadinessTransition::Unchanged,
     };
-    // 2. identity, not health: only a generation or authority-epoch advance
+    // 2. identity, not health: only an admitted owner-context change
     //    revokes a generation-scoped proof. The observed identity is recorded for
     //    the next pass before this returns, so the comparison is always against
     //    the previous pass's own observation.
-    record.borrow_mut().observed_owner = Some(observed);
+    record.borrow_mut().observed_owner = Some(observed.clone());
     // This loop pre-fills its record with a real observation and every pass
     // restores one, so a previous identity is always present. Without one there
     // is no prior identity to have moved, so this pass reports only its verdict.
     let Some(prior) = previous else {
         return Ok(verdict);
     };
-    let identity_moved = prior.generation != observed.generation
-        || prior.authority_epoch != observed.authority_epoch;
+    // #2647: the comparison is the whole admitted owner context, not the two
+    // scalars it used to be. A rebind from `(lineage-A, sequence 1)` to
+    // `(lineage-B, sequence 1)` at the same resource generation, or a change of
+    // artifact, protected-snapshot or principal digest, is a different admitted
+    // owner context that leaves the previous pass's generation-scoped proofs
+    // describing a context that no longer exists. Comparing scalars reported
+    // those passes as unchanged and kept every retained proof readable across
+    // the replacement; I14.14 is explicit that after a cutover an old request is
+    // rejected as stale, and the same is true of a proof retained under the old
+    // epoch's lineage.
+    let identity_moved = prior.identity != observed.identity;
     if !identity_moved {
         return Ok(verdict);
     }
-    // The resource generation or authority epoch advanced. Every
+    // The admitted owner context was replaced or rebound. Every
     // generation-scoped proof (both Dreamer route contexts and the agent-fabric
     // descriptor) carries owner generation identity, so that event revokes all
     // of them at once. The reason names the identity the loop observed before
     // and the one it observes now, which is exactly what this comparison read.
     let reason = format!(
-        "owner generation/epoch advanced: generation {} -> {} authority_epoch {} -> {}",
-        prior.generation, observed.generation, prior.authority_epoch, observed.authority_epoch
+        "owner generation/epoch advanced: generation {} -> {} authority_epoch {} -> {} owner_context {} -> {}",
+        prior.generation(),
+        observed.generation(),
+        prior.authority_epoch(),
+        observed.authority_epoch(),
+        prior.identity,
+        observed.identity
     );
     let retired = projection
         .retire_generation_scoped_bindings(&reason)
@@ -3468,8 +3485,8 @@ fn observe_readiness_transition(
             Ok(RetainedStartupBinding::OwnerSession {
                 session_binding: facts.session_binding().to_owned(),
                 connection_id: facts.connection_id().to_owned(),
-                generation: observed.generation,
-                authority_epoch: observed.authority_epoch,
+                generation: observed.generation(),
+                authority_epoch: observed.authority_epoch(),
             }),
             StartupRefreshReason::OwnerRevisionAdvanced,
         ),
@@ -3494,7 +3511,7 @@ fn observe_readiness_transition(
         retired_generation_scoped = retired,
         refresh_reason = startup_refresh_reason_name(refresh_reason),
         reason = %reason,
-        "a real generation or authority-epoch advance revoked every generation-scoped proof and re-proved the mandatory owner session from the live authenticated owner"
+        "a real admitted owner-context replacement or rebind revoked every generation-scoped proof and re-proved the mandatory owner session from the live authenticated owner"
     );
     Ok(ReadinessTransition::OwnerReplaced { reason })
 }
@@ -3962,10 +3979,10 @@ async fn run_health_heartbeat_tick(
     // MOVED identity (or a refused exchange, which writes nothing) opens it. A
     // withheld generation never reaches here at all, because the condition
     // requires a SATISFIED verdict.
-    let observed_owner = readiness_record.borrow().observed_owner;
-    let exchange_already_ran = observed_owner.is_some_and(|observed| {
+    let observed_owner = readiness_record.borrow().observed_owner.clone();
+    let exchange_already_ran = observed_owner.as_ref().is_some_and(|observed| {
         readiness_record.borrow().supervision_exchange_owner
-            == Some((observed.generation, observed.authority_epoch))
+            == Some((observed.generation(), observed.authority_epoch()))
     });
     let recovery_reachable = supervision_progress.is_none()
         && readiness_verdict.core_satisfied()
@@ -3982,7 +3999,7 @@ async fn run_health_heartbeat_tick(
                 // that same identity does not re-issue; a moved identity does.
                 if let Some(observed) = observed_owner {
                     readiness_record.borrow_mut().supervision_exchange_owner =
-                        Some((observed.generation, observed.authority_epoch));
+                        Some((observed.generation(), observed.authority_epoch()));
                 }
                 tracing::info!(
                     target: "eliotd::diagnostics",
@@ -5292,14 +5309,28 @@ fn settle_local_read_completion_updating_readiness(
     let LocalReadCompletion::Settled(Ok(step)) = &completion else {
         return settle_local_read_completion(completion, flight);
     };
-    // Adopt the flight's own observations, if it made any, before the outcome
-    // settles. Adoption is synchronous and touches only the slots this demand
-    // actually reevaluated.
-    if !step.deltas.is_empty() {
-        let settled = startup_readiness
+    // Adopt the flight's own observations, if it made any. Adoption is
+    // synchronous and touches only the slots this demand actually reevaluated.
+    //
+    // #2647: the adoption result is HELD, not propagated with `?`. The previous
+    // shape returned the token-exhaustion error straight out of this function,
+    // which meant the completed read/submit outcome below was never settled, the
+    // flight was never returned to `Idle`, the `eliotd.local_read_settled` record
+    // was never emitted, and the `?` at the loop's call site failed the whole
+    // daemon closed. A readiness-control failure is a control-plane refusal: the
+    // operation that already completed must still settle exactly once and must
+    // not be repeated or left installed. Both errors are therefore reported, and
+    // settlement is attempted first so a failing outcome is never masked by a
+    // readiness refusal.
+    let adoption = if step.deltas.is_empty() {
+        Ok(Vec::new())
+    } else {
+        startup_readiness
             .adopt_local_deltas(&step.deltas)
-            .map_err(|error| format!("daemon local-read delta adoption: {error}"))?;
-        for (capability, adoption) in &settled {
+            .map_err(|error| format!("daemon local-read delta adoption: {error}"))
+    };
+    if let Ok(settled) = &adoption {
+        for (capability, adoption) in settled {
             tracing::info!(
                 target: "eliotd::diagnostics",
                 event = "eliotd.local_read_delta_adoption",
@@ -5310,7 +5341,15 @@ fn settle_local_read_completion_updating_readiness(
             );
         }
     }
-    settle_local_read_completion(completion, flight)
+    // The borrow of `completion` ends here; the outcome settles exactly once
+    // whatever the adoption verdict was.
+    let settlement = settle_local_read_completion(completion, flight);
+    match (settlement, adoption) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(adoption_error)) => Err(format!("{error}; {adoption_error}")),
+    }
 }
 
 /// Names one settled local-read poll outcome for the loop's own record.

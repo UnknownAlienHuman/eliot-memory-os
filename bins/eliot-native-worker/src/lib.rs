@@ -633,8 +633,12 @@ where
 /// invoking the drive closure. An admitted envelope flows through as the
 /// validated action the drive binds, and the drive receipt propagates
 /// unchanged. Production supplies the [`drive_admitted_claimed`] sequence as
-/// the drive closure; the contour owner adopts this entry at the binary
-/// call site once the envelope source is plumbed (no wire source exists yet).
+/// the drive closure. The wire source already exists: the Kernel mints one
+/// envelope per driven operation in `dispatch_launch.rs` and copies the
+/// admitted claim's `work_scope_id` into `scope_ref`. The contour owner's
+/// binary call site is [`drive_governed_material`], which admits those carried
+/// envelopes through [`admit_product_envelopes`] before the drive runs; this
+/// entry is the single-operation form of that same gate.
 // The typed refusal travels by value so the repair shape stays readable.
 #[allow(
     clippy::result_large_err,
@@ -2741,7 +2745,7 @@ mod tests {
         let envelope = serde_json::json!({
             "operation": envelope_op,
             "intent": format!("execute governed {envelope_op}"),
-            "scope_ref": "scope-1911",
+            "scope_ref": "scope-1",
             "preconditions": "claim admitted; fence live",
             "expected_effect": format!("bounded {envelope_op} effect"),
             "invariants": "no ambient effects",

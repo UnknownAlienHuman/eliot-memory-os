@@ -671,7 +671,12 @@ impl ImprovementProposal {
         text(&self.target_capability, "target_capability")?;
         text(&self.target_generation, "target_generation")?;
         text(&self.expected_delta, "expected_delta")?;
-        text(&self.risk_ceiling, "risk_ceiling")?;
+        // A blank risk qualifier is UNSUPPORTED, not absent. `risk_ceiling` names a
+        // closed typed policy value with exactly one admitted member, so a value
+        // that carries no qualifier at all is the same closed-set violation as
+        // `unbounded` and must not be reported as a missing field. Checked here,
+        // before the input profile, so no later field check can relabel it.
+        check_risk_ceiling_present(&self.risk_ceiling)?;
         text(&self.effect_ceiling, "effect_ceiling")?;
         text(&self.budget_ref, "budget_ref")?;
         text(&self.deadline_ref, "deadline_ref")?;
@@ -4327,9 +4332,39 @@ fn commitment_of(normalized: &ImprovementProposal) -> Result<ProposalCommitment,
     })
 }
 
+/// Refuses a `risk_ceiling` that carries no qualifier at all.
+///
+/// `risk_ceiling` is a closed typed policy value, not free text, and its only
+/// member is [`IMPROVEMENT_RISK_CEILING_BOUNDED`]. A blank or whitespace-only
+/// value is therefore the same closed-set violation as `unbounded` and refuses
+/// with the same typed failure; reporting it as a missing field would claim the
+/// field is absent from the record when the record carries the field and its
+/// value is simply not a member of the closed set.
+///
+/// This is the single statement of that rule, called both from
+/// [`ImprovementProposal::validate`] and from the commitment profile, so every
+/// path that reads or canonicalizes a proposal refuses a blank risk ceiling the
+/// same way instead of only the admission path doing so.
+fn check_risk_ceiling_present(value: &str) -> Result<(), PipelineError> {
+    if value.trim().is_empty() {
+        return Err(PipelineError::UnsupportedRiskCeiling {
+            encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// Validates the admitted input, count, string, and total-size profile before
 /// any clone, sort, or serialization happens.
 fn check_commitment_profile(proposal: &ImprovementProposal) -> Result<(), PipelineError> {
+    // Checked ahead of the generic string profile below, which reports a blank
+    // value of this field as `MissingField`. A caller that canonicalizes a
+    // proposal WITHOUT running `ImprovementProposal::validate` — the gate in
+    // `admit_improvement_candidate_without_execution_evidence`, and therefore the
+    // daemon route's re-profile of a proposal the admitting path already refused
+    // — reaches the closed-set failure here instead of a missing-field error that
+    // contradicts what the admitting path reported for the same bytes.
+    check_risk_ceiling_present(&proposal.risk_ceiling)?;
     for (field, value) in [
         ("proposal_id", proposal.proposal_id.as_str()),
         ("candidate_id", proposal.candidate_id.as_str()),
@@ -4509,14 +4544,12 @@ fn bounded_text(value: &str, field: &'static str, limit: usize) -> Result<(), Pi
 ///    unrelated run references. Asserting a refusal here would assert a check
 ///    that does not exist, so the case below states the presence and the ceiling
 ///    the code really enforces and nothing more.
-/// 2. A BLANK `risk_ceiling` refused with `PipelineError::UnsupportedRiskCeiling`.
-///    `ImprovementProposal::validate` runs the required-field check
-///    (`text(&self.risk_ceiling, "risk_ceiling")`, line 674) BEFORE the
-///    exact-equality check (`self.risk_ceiling != IMPROVEMENT_RISK_CEILING_BOUNDED`,
-///    line 713), so a blank or whitespace-only qualifier is absent rather than
-///    unsupported and refuses with `PipelineError::MissingField("risk_ceiling")`.
-///    Only `unbounded` and other NONBLANK wrong values reach
-///    `UnsupportedRiskCeiling`, and only those are asserted as that error.
+///
+/// A BLANK `risk_ceiling` is no longer such a case: `risk_ceiling` is a closed
+/// typed policy value whose only member is `IMPROVEMENT_RISK_CEILING_BOUNDED`,
+/// so a blank or whitespace-only qualifier is unsupported rather than absent and
+/// refuses with `PipelineError::UnsupportedRiskCeiling`, the same typed failure
+/// `unbounded` and every other nonblank wrong value produce.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4586,6 +4619,26 @@ mod tests {
                 Ok(ImprovementTerminalDisposition::CanaryAdmitted { handoff }) => *handoff,
                 Ok(other) => panic!("joined input must admit for one canary, got {other:?}"),
                 Err(error) => panic!("joined input must admit for one canary, got {error:?}"),
+            }
+        }
+
+        /// Runs the gate-only entry point and returns its typed refusal.
+        ///
+        /// This is the second public entry point, and it deliberately does NOT
+        /// run `ImprovementProposal::validate`; it canonicalizes the proposal
+        /// instead. The daemon route calls it with the same proposal bytes the
+        /// admitting path already refused, so the two entries must name the same
+        /// violation for the same record.
+        fn gate_refusal(&self) -> PipelineError {
+            match admit_improvement_candidate_without_execution_evidence(
+                &self.proposal,
+                &self.experiment,
+                &self.candidate,
+                &self.admission_evidence,
+                &self.policy,
+            ) {
+                Err(error) => error,
+                Ok(disposition) => panic!("gate must refuse, got {disposition:?}"),
             }
         }
     }
@@ -5671,13 +5724,87 @@ mod tests {
             }
         );
 
-        // The blank qualifier is NOT one of the cases above: `validate` runs the
-        // required-field check before the exact-equality check, so it is absent
-        // rather than unsupported and never yields
-        // `UnsupportedRiskCeiling`. Stated here so the gap is on the record.
+        // The blank qualifier refuses with the SAME typed failure as `unbounded`:
+        // `risk_ceiling` is a closed typed policy value with one admitted member,
+        // so a value carrying no qualifier at all is unsupported, not absent, and
+        // is never reported as a missing field.
         let mut group = fixture("a");
         group.proposal.risk_ceiling = "   ".to_string();
-        assert_eq!(group.refusal(), PipelineError::MissingField("risk_ceiling"));
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = String::new();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        // A tab/CR/LF-only qualifier is the same blank case, refused the same way.
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "\t\r\n".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn both_public_entry_points_refuse_a_blank_risk_ceiling_identically() {
+        // The admitting path and the gate are two public entry points over the
+        // same seven records, and the daemon route re-proposes the identical
+        // bytes through the gate after the admitting path refuses — the gate's
+        // own typed error is the one a caller then receives. If the two named
+        // different violations for one record, the route would report a missing
+        // field for a field that is present, contradicting what the admitting
+        // path said about the very same bytes.
+        for blank in ["", "   ", "\t\r\n"] {
+            let mut group = fixture("a");
+            group.proposal.risk_ceiling = blank.to_string();
+            let expected = PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            };
+            assert_eq!(
+                group.refusal(),
+                expected,
+                "admitting path must refuse a blank risk ceiling as unsupported, blank={blank:?}"
+            );
+            assert_eq!(
+                group.gate_refusal(),
+                expected,
+                "gate must refuse a blank risk ceiling as unsupported, blank={blank:?}"
+            );
+        }
+
+        // DELIBERATE BOUNDARY, not an oversight: this entry point does not enforce the
+        // full closed risk set, because its own contract says it applies the
+        // gate's rules and not the admission preconditions. What it does not do
+        // is misreport a field that IS present as absent — and that is the whole
+        // of what this change alters. A nonblank wrong qualifier reaches the
+        // admitting path first on the real route, which refuses it as
+        // unsupported before the gate is ever called, so widening the gate here
+        // would be a second set of admission rules in a function that documents
+        // it has none.
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "unbounded".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+        assert!(!matches!(
+            group.gate_refusal(),
+            PipelineError::UnsupportedRiskCeiling { .. }
+        ));
     }
 
     #[test]

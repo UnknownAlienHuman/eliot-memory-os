@@ -4,9 +4,11 @@
 //! operation exposed by this binary (`register`, `claim`, `reconcile`,
 //! `start_claimed`, `serve_stdio`) runs through a Harness action contract
 //! before any adapter is invoked. The Governor derives impact from the
-//! registered tool/effect profile plus affected resources; Material and
-//! Critical effects require the A10.3 action-model fields; the returned
-//! observation binds the State Fence and verifier; finish uses the honest
+//! registered tool/effect profile plus affected resources, floored by the
+//! declared operation (every declared external-adapter operation is at least
+//! Material); Material and Critical effects require the A10.3 action-model
+//! fields; the returned observation binds the State Fence and verifier; finish
+//! uses the honest
 //! A10.8 vocabulary and never labels work complete without admissible proof.
 //!
 //! This module mints no authority and starts nothing: it validates the
@@ -258,10 +260,14 @@ pub fn is_external_adapter_op(operation: &str) -> bool {
 /// Derives impact from the registered tool/effect profile plus affected
 /// resources (A10.2, ARCH-ACT-01: effect defines impact, not intent).
 ///
-/// Deterministic projection: `forbidden` markers dominate, then critical
-/// markers, then any external-adapter profile or non-empty affected set
-/// classifies Material, then `reversible`, else Observe. Uncertainty resolves
-/// upward to Material, never silently downward.
+/// Deterministic string-marker projection over presenter free text:
+/// `forbidden` markers dominate, then critical markers, then any
+/// external-adapter profile or non-empty affected set classifies Material,
+/// then `reversible`, else Observe. It reads only what the presenter declared
+/// and cannot see the operation being invoked, so it is a lower bound, not the
+/// admitted class: a declared operation that is an external state change is
+/// floored to Material by [`effective_impact`], which every admission path
+/// must apply.
 #[must_use]
 pub fn derive_impact(tool_profile: &str, affected_resources: &[String]) -> ImpactClass {
     let profile = tool_profile.trim().to_lowercase();
@@ -296,6 +302,38 @@ pub fn derive_impact(tool_profile: &str, affected_resources: &[String]) -> Impac
         return ImpactClass::Reversible;
     }
     ImpactClass::Observe
+}
+
+/// Returns the impact floor implied by the declared operation itself.
+///
+/// Every member of [`EXTERNAL_ADAPTER_OPS`] is an external state change, so
+/// the declared operation floors its envelope at `Material`. The floor is a
+/// property of the operation, not of presenter free text: an envelope cannot
+/// lower its own impact by declaring a low-impact `tool_profile`.
+#[must_use]
+pub fn operation_impact_floor(operation: &str) -> ImpactClass {
+    if is_external_adapter_op(operation) {
+        ImpactClass::Material
+    } else {
+        ImpactClass::Observe
+    }
+}
+
+/// Returns the greater of the derived impact and the declared-operation floor.
+///
+/// `Forbidden` and marker-derived `Critical` stay dominant so
+/// [`derive_impact`] can still raise above the floor; the floor only prevents
+/// a declared external-adapter operation from being downgraded below Material.
+#[must_use]
+pub fn effective_impact(derived: ImpactClass, operation: &str) -> ImpactClass {
+    let floor = operation_impact_floor(operation);
+    if derived == ImpactClass::Forbidden || derived.requires_action_model() {
+        derived
+    } else if floor.requires_action_model() {
+        floor
+    } else {
+        derived
+    }
 }
 
 fn generic_rejection(operation: &str, reason: &str) -> ActionRejection {
@@ -500,7 +538,10 @@ fn check_resources_and_impact(
             ));
         }
     }
-    let impact = derive_impact(envelope.tool_profile.as_str(), &envelope.affected_resources);
+    let impact = effective_impact(
+        derive_impact(envelope.tool_profile.as_str(), &envelope.affected_resources),
+        operation,
+    );
     if impact == ImpactClass::Forbidden {
         return Err(ActionRejection {
             operation: operation.to_owned(),
@@ -670,5 +711,62 @@ pub fn run_governed_external_op<T>(
 impl From<ActionRejection> for crate::NativeWorkerError {
     fn from(rejection: ActionRejection) -> Self {
         Self::KernelAdmissionRequired(rejection.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActionEnvelope, ImpactClass, require_governed_op};
+
+    fn field(present: bool) -> String {
+        if present {
+            "declared".to_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    fn bound_envelope(action_model: bool) -> ActionEnvelope {
+        ActionEnvelope {
+            operation: "register".to_owned(),
+            intent: "register one governed generation".to_owned(),
+            scope_ref: "scope-1911".to_owned(),
+            preconditions: field(action_model),
+            expected_effect: field(action_model),
+            invariants: field(action_model),
+            known_failures: field(action_model),
+            rollback_or_compensation: field(action_model),
+            verifier: "verifier-1911".to_owned(),
+            stop_condition: "stop on fence mismatch".to_owned(),
+            state_fence: serde_json::json!({"generation": 1}),
+            authority_epoch: serde_json::json!({"sequence": 1}),
+            // Presenter-declared profile far below the declared operation.
+            tool_profile: "probe".to_owned(),
+            affected_resources: Vec::new(),
+            applicable_authority: "kernel-authority-for-register".to_owned(),
+        }
+    }
+
+    /// A declared external-adapter operation is an external state change, so a
+    /// low presenter `tool_profile` cannot downgrade it below Material and
+    /// skip the A10.3 action model (issue #1911).
+    #[test]
+    fn declared_operation_floors_downgraded_tool_profile_to_material() {
+        let downgraded = bound_envelope(false);
+        let Err(rejection) = require_governed_op(Some(&downgraded), "register") else {
+            panic!("a downgraded tool_profile must not skip the A10.3 action model");
+        };
+        assert!(
+            rejection
+                .reason
+                .contains("material action-model field 'preconditions' is missing (A10.3)"),
+            "unexpected rejection reason: {}",
+            rejection.reason
+        );
+
+        let bound = bound_envelope(true);
+        let validated = require_governed_op(Some(&bound), "register")
+            .unwrap_or_else(|rejection| panic!("bound envelope must be admitted: {rejection}"));
+        assert_eq!(validated.impact, ImpactClass::Material);
     }
 }

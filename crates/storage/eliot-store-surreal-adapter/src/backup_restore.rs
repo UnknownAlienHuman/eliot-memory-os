@@ -1745,12 +1745,34 @@ fn cached_receipt(operation: &OperationIdentity) -> Option<RestoreValidationRece
         .and_then(|ledger| ledger.readback(operation))
 }
 
-/// Maps projection-lock poisoning to the typed unknown outcome.
+/// Answers with the typed unknown outcome over THIS admitted operation identity.
+///
+/// The restore path knows the identity it is refusing for, so it answers
+/// [`StoreError::UnknownOutcome`], whose whole contract is "reconcile only this
+/// admitted operation identity before any further mutation". It deliberately does
+/// NOT answer [`StoreError::MissingReceiptEnvelope`], which is the value the
+/// adapter error model's own boundary mapping produces
+/// ([`AdapterError::into_store_error`]): that variant names a missing envelope
+/// and carries no identity, so a caller holding it cannot reconcile by identity
+/// and is invited into an unqualified retry. The mapping is left unchanged for
+/// every other caller, because which identity a foreign call site may answer for
+/// is not this function's to decide.
+///
+/// Identity text that is not a valid contract identity is refused to the
+/// envelope variant rather than manufactured: an unknown outcome must never
+/// carry an invented operation. On this path the text is always
+/// `OperationIdentity::operation_id`, which is already a validated
+/// [`OperationId`], so the fallback is unreachable for admitted work.
 fn unknown_outcome(operation_id: &str) -> StoreError {
-    AdapterError::UnknownOutcome {
-        operation_id: operation_id.to_owned(),
+    match OperationId::new(operation_id) {
+        Ok(identity) => StoreError::UnknownOutcome {
+            operation_id: identity,
+        },
+        Err(_) => AdapterError::UnknownOutcome {
+            operation_id: operation_id.to_owned(),
+        }
+        .into_store_error(),
     }
-    .into_store_error()
 }
 
 /// Redacts a store error so no record, query or credential prose crosses.
@@ -7124,10 +7146,22 @@ mod tests {
             RestoreEffectState::NoWriteSubmitted,
             "the apply stage's uncertainty says nothing about the carrier stage"
         );
-        assert_eq!(
+        assert!(
+            matches!(
+                &unknown_outcome(operation_id),
+                StoreError::UnknownOutcome { operation_id: reported }
+                    if reported.as_str() == operation_id
+            ),
+            "the answer at that gate is the typed unknown outcome over THIS operation \
+             identity, never a receipt"
+        );
+        assert_ne!(
             unknown_outcome(operation_id),
             StoreError::MissingReceiptEnvelope,
-            "the answer at that gate is the typed unknown outcome, never a receipt"
+            "the two are distinct answers, exactly as this file's carrier refusal arm \
+             documents: the typed unknown names the identity to reconcile, while \
+             MissingReceiptEnvelope names a missing envelope and carries no identity, so \
+             it cannot answer 'reconcile only this admitted operation identity'"
         );
         assert!(
             cached_receipt(&batch.operation).is_none(),

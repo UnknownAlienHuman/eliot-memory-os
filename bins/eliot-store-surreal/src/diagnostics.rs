@@ -1586,3 +1586,868 @@ mod snapshot_budget_tests {
         assert!(!rendered.contains("remaining=0"));
     }
 }
+
+#[cfg(test)]
+// Inline private-path proofs for issue #742. They stay inside this module
+// because the closed boundary ledger, the emitters, and the frozen outcome
+// vocabulary are not exported for testing, and no runtime flag may reach them.
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+mod bridge_boundary_partition_tests {
+    use std::collections::BTreeMap;
+
+    use eliot_contracts::{
+        ArtifactId, ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId,
+        ResourceGeneration, SourceId, StateFence, TaskId,
+    };
+    use eliot_protocol::dreamer_job::{
+        DurableJobRequest, DurableRequestIdentity, JobOperation, JobRole,
+    };
+    use eliot_store_api::{
+        CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+        NamedMutationRequest, NamedReadOperation, NamedReadRequest, OperationIdentity,
+        OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
+        PolicyConfigSchemaVersions, PreparedTransition, ReadConsistency, RequestMeta,
+        ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation,
+        RevisionKey, STORE_FAILURE_CONTRACT_REVISION, ScopeId, SecurityContext,
+        StoreBackupOperation, StoreBackupRequest, StoreBackupResponse, StoreBackupStatus,
+        StoreBackupStatusOutcome, StoreEvidenceHandles, StoreFailure, StoreFailureDisposition,
+        StoreGenesisRequest, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+        StoreRecoveryRequest, StoreRetryDirective, TransitionClass, WriteAdmissionParams,
+        WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
+        bind_issue18_digests, generated_operation_manifests, operation_manifest_set_digest,
+    };
+
+    use crate::{Request, Response};
+
+    use super::{
+        ADMITTED_OPERATIONS, BoundedEventLog, BridgeBoundary, BridgeDiagnosticEvent,
+        BridgeIdentity, MAX_DIAGNOSTIC_EVENTS, RequestOutcome, classify_response,
+        dispatch_boundary, emit_attempted, emit_dispatch_outcome, emit_lifecycle, emit_received,
+        emit_reconciled, emit_validation_rejected, is_admitted_operation, operation_name,
+    };
+
+    fn fence() -> StateFence {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440742").expect("lineage");
+        let sequence = std::num::NonZeroU64::new(7).expect("epoch sequence");
+        StateFence::new(
+            EpochId::new(lineage, sequence).expect("authority epoch"),
+            ResourceGeneration::genesis(),
+        )
+    }
+
+    fn request_meta() -> RequestMeta {
+        RequestMeta {
+            request_id: RequestId::new("request-742-partition").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-742-partition").expect("product id"),
+            source_id: SourceId::new("source-742-partition").expect("source id"),
+            state_fence: fence(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn operation_identity() -> OperationIdentity {
+        OperationIdentity {
+            operation_id: OperationId::new("operation-742-partition").expect("operation id"),
+            idempotency_key: "idempotency-742-partition".to_owned(),
+            canonical_request_hash: "a".repeat(64),
+        }
+    }
+
+    fn prepared_transition() -> PreparedTransition {
+        let entries = generated_operation_manifests().expect("generated operation manifests");
+        let operation_manifest_digest =
+            operation_manifest_set_digest(&entries).expect("operation manifest set digest");
+        let mut transition = PreparedTransition {
+            contract_version: CONTRACT_VERSION,
+            identity: operation_identity(),
+            state_fence: fence(),
+            scope_id: ScopeId::new("scope-742-partition").expect("scope id"),
+            task_id: None,
+            ordering_scopes: vec![
+                OrderingScopeId::new("scope-742-partition").expect("ordering scope"),
+            ],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest,
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-742-partition"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
+    }
+
+    fn reserved_write_request() -> ReservedWriteRequest {
+        let transition = prepared_transition();
+        let params = WriteAdmissionParams {
+            reservation_id: "reservation-742-partition".to_owned(),
+            reservation_order: 742,
+            operation_id: transition.identity.operation_id.clone(),
+            idempotency_key: transition.identity.idempotency_key.clone(),
+            canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+            scopes: vec![ReservedScopeBinding {
+                scope: OrderingScopeId::new("scope-742-partition").expect("ordering scope"),
+                reserved_sequence: 7,
+                expected_sequence: 6,
+                expected_head_digest: "c".repeat(64),
+            }],
+            writer_epoch: WriterEpochBinding {
+                lineage_id: "epoch-lineage-742-partition".to_owned(),
+                epoch: 7,
+                predecessor_lineage_id: None,
+                predecessor_epoch: None,
+            },
+            state_fence: fence(),
+            source_id: "source-742-partition".to_owned(),
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_700_000_060_000,
+            recovery_owner: "recovery-owner-742-partition".to_owned(),
+        };
+        let admission = WriteAdmissionProjection::bind(&transition, params)
+            .expect("reservation admission binds");
+        ReservedWriteRequest {
+            context: request_meta(),
+            transition,
+            admission,
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("revision-742-partition").expect("revision key"),
+                expected_revision: 3,
+                state_fence: fence(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-742-partition").expect("ordering scope"),
+                expected_sequence: 6,
+                state_fence: fence(),
+            }],
+        }
+    }
+
+    fn backup_request() -> StoreBackupRequest {
+        StoreBackupRequest {
+            context: request_meta(),
+            identity: operation_identity(),
+            operation: StoreBackupOperation::Status {
+                operation_id: OperationId::new("operation-742-backup").expect("operation id"),
+            },
+        }
+    }
+
+    fn durable_job_request() -> DurableJobRequest {
+        let state_fence = fence();
+        let context = request_meta();
+        let operation = JobOperation::Status {
+            job_id: TaskId::new("job-742-partition").expect("task id"),
+            attempt_id: ArtifactId::new("attempt-742-partition").expect("artifact id"),
+            expected_revision: 1,
+            expected_fence: state_fence.clone(),
+        };
+        let operation_kind = operation.kind().as_str().to_owned();
+        let fence_json = serde_json::to_value(&state_fence).expect("state fence json");
+        let context_json = serde_json::to_value(&context).expect("request context json");
+        let request_identity: DurableRequestIdentity = serde_json::from_value(serde_json::json!({
+            "request": {
+                "request": {
+                    "metadata": context_json,
+                    "state_fence": fence_json.clone(),
+                },
+                "idempotency_key": "transport-742-partition",
+                "deadline_unix_ms": 600_000,
+                "cancellation_id": "cancel-742-partition",
+            },
+            "operation": {
+                "operation_id": "operation-742-dreamer",
+                "request_id": "originating-742-partition",
+                "idempotency_key": "idempotency-742-dreamer",
+                "operation_kind": operation_kind,
+                "effect": "CANDIDATE",
+                "state_fence": fence_json,
+            },
+            "canonical_request_hash": "0".repeat(64),
+        }))
+        .expect("durable request identity decodes");
+        DurableJobRequest {
+            request_identity,
+            role: JobRole::Requester,
+            operation,
+        }
+    }
+
+    /// One instance of every arm of the closed 13-arm dispatch catalogue, each
+    /// paired with the operation name that arm must project to.
+    fn catalogue_requests() -> Vec<(&'static str, Request)> {
+        vec![
+            ("health", Request::Health),
+            ("readiness", Request::Readiness),
+            (
+                "named",
+                Request::Named {
+                    request: NamedReadRequest {
+                        operation: NamedReadOperation::GetRevisionHeads,
+                        scope_id: None,
+                        consistency: ReadConsistency::ExactFence,
+                        state_fence: fence(),
+                        parameters: BTreeMap::new(),
+                    },
+                },
+            ),
+            (
+                "apply",
+                Request::Apply {
+                    context: request_meta(),
+                    transition: prepared_transition(),
+                    expected_revision_heads: Vec::new(),
+                    expected_ordering_heads: Vec::new(),
+                },
+            ),
+            (
+                "receipt",
+                Request::Receipt {
+                    operation_id: operation_identity().operation_id,
+                },
+            ),
+            (
+                "reserved_write",
+                Request::ReservedWrite {
+                    request: reserved_write_request(),
+                },
+            ),
+            (
+                "backup",
+                Request::Backup {
+                    request: backup_request(),
+                },
+            ),
+            (
+                "revision_heads",
+                Request::RevisionHeads { keys: Vec::new() },
+            ),
+            (
+                "ordering_heads",
+                Request::OrderingHeads { scopes: Vec::new() },
+            ),
+            ("validation_snapshot", Request::ValidationSnapshot),
+            (
+                "recovery",
+                Request::Recovery {
+                    request: StoreRecoveryRequest {
+                        contract_version: CONTRACT_VERSION,
+                        state_fence: fence(),
+                        records: Vec::new(),
+                        include_receipts: false,
+                        include_jobs: false,
+                    },
+                },
+            ),
+            (
+                "initialize_genesis",
+                Request::InitializeGenesis {
+                    context: request_meta(),
+                    request: StoreGenesisRequest {
+                        contract_version: CONTRACT_VERSION,
+                        operation_id: OperationId::new("operation-742-genesis")
+                            .expect("operation id"),
+                        idempotency_key: "idempotency-742-genesis".to_owned(),
+                        canonical_request_hash: "d".repeat(64),
+                        state_fence: fence(),
+                        owner_records: Vec::new(),
+                    },
+                },
+            ),
+            (
+                "dreamer_job",
+                Request::DreamerJob {
+                    context: request_meta(),
+                    request: durable_job_request(),
+                },
+            ),
+        ]
+    }
+
+    fn write_receipt(status: WriteReceiptStatus) -> WriteReceipt {
+        WriteReceipt {
+            operation_id: OperationId::new("operation-742-receipt").expect("operation id"),
+            idempotency_key: "idempotency-742-receipt".to_owned(),
+            canonical_request_hash: "e".repeat(64),
+            transition_class: TransitionClass::CaptureCandidate,
+            status,
+            commit_id: None,
+            state_fence: fence(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: Vec::new(),
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new("f".repeat(64))
+                .expect("operation manifest digest shape"),
+            admission_digest: "1".repeat(64),
+            mutation_plan_digest: "2".repeat(64),
+            semantic_source_revisions: Vec::new(),
+            policy_config_schema_versions: PolicyConfigSchemaVersions {
+                policy_revision: None,
+                config_profile: "operation-catalogue-profile-fixture".to_owned(),
+                schema_revision: CONTRACT_VERSION,
+            },
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: None,
+            envelope: None,
+        }
+    }
+
+    fn typed_failure(
+        disposition: StoreFailureDisposition,
+        mutation_disposition: StoreMutationDisposition,
+    ) -> StoreFailure {
+        StoreFailure {
+            contract_revision: STORE_FAILURE_CONTRACT_REVISION.to_owned(),
+            disposition,
+            reason_code: StoreReasonCode::new("bridge.failure.observed").expect("reason code"),
+            request_id: Some(RequestId::new("request-742-failure").expect("request id")),
+            operation_id: Some(OperationId::new("operation-742-failure").expect("operation id")),
+            idempotency_key_ref_or_digest: Some("idempotency-742-failure".to_owned()),
+            state_fence_ref_or_exact_safe_projection: None,
+            mutation_disposition,
+            retry_directive: StoreRetryDirective::DoNotRetry,
+            recovery_action: StoreRecoveryAction::EscalateInternalDefect,
+            conflict: None,
+            retry_after_ms: None,
+            retry_after_dependency_revision: None,
+            evidence_ref: None,
+            evidence_handles: StoreEvidenceHandles::default(),
+            human_detail: Some("bounded bridge failure detail".to_owned()),
+        }
+    }
+
+    /// One response per outcome the typed response projection can reach: every
+    /// terminal receipt status, the empty and present receipt lookup, both
+    /// legacy variants, all ten typed failure dispositions, the unknown
+    /// mutation disposition override, and all five backup status outcomes.
+    fn classified_responses() -> Vec<Response> {
+        let mut responses = vec![
+            Response::Transaction {
+                receipt: write_receipt(WriteReceiptStatus::Committed),
+            },
+            Response::Transaction {
+                receipt: write_receipt(WriteReceiptStatus::Rejected),
+            },
+            Response::Transaction {
+                receipt: write_receipt(WriteReceiptStatus::DeadLetter),
+            },
+            Response::Transaction {
+                receipt: write_receipt(WriteReceiptStatus::Cancelled),
+            },
+            Response::Genesis {
+                receipt: write_receipt(WriteReceiptStatus::Committed),
+            },
+            Response::Receipt { receipt: None },
+            Response::Receipt {
+                receipt: Some(write_receipt(WriteReceiptStatus::Committed)),
+            },
+            Response::RevisionHeads { heads: Vec::new() },
+            Response::OrderingHeads { heads: Vec::new() },
+            Response::Unknown {
+                operation_id: OperationId::new("operation-742-unknown").expect("operation id"),
+                reason: "provider outcome unknown".to_owned(),
+            },
+            Response::Error {
+                error: "legacy string failure".to_owned(),
+            },
+        ];
+        for disposition in [
+            StoreFailureDisposition::DeterministicRejection,
+            StoreFailureDisposition::Denied,
+            StoreFailureDisposition::Unsupported,
+            StoreFailureDisposition::Unavailable,
+            StoreFailureDisposition::Backpressured,
+            StoreFailureDisposition::DeadlineExceeded,
+            StoreFailureDisposition::MigrationRequired,
+            StoreFailureDisposition::UnknownOutcome,
+            StoreFailureDisposition::Conflict,
+            StoreFailureDisposition::InternalDefect,
+        ] {
+            responses.push(Response::Failure {
+                failure: typed_failure(disposition, StoreMutationDisposition::NotAttempted),
+            });
+        }
+        responses.push(Response::Failure {
+            failure: typed_failure(
+                StoreFailureDisposition::DeterministicRejection,
+                StoreMutationDisposition::Unknown,
+            ),
+        });
+        for outcome in [
+            StoreBackupStatusOutcome::Complete,
+            StoreBackupStatusOutcome::Reconciled,
+            StoreBackupStatusOutcome::Unknown,
+            StoreBackupStatusOutcome::InProgress,
+            StoreBackupStatusOutcome::Expired,
+        ] {
+            responses.push(Response::Backup {
+                response: StoreBackupResponse::Status {
+                    report: StoreBackupStatus {
+                        operation_id: OperationId::new("operation-742-backup-status")
+                            .expect("operation id"),
+                        state_fence: fence(),
+                        outcome,
+                    },
+                },
+            });
+        }
+        responses
+    }
+
+    fn filler_identity(index: usize) -> BridgeIdentity {
+        BridgeIdentity::new().with_generation(&format!("fill-{index}"))
+    }
+
+    // WORK_UNIT_CASE: 742/17
+    #[test]
+    fn every_inventoried_boundary_emits_one_owning_event_and_the_log_stays_bounded() {
+        let identity = BridgeIdentity::new()
+            .with_request(&RequestId::new("request-742-17").expect("request id"))
+            .with_operation(&OperationId::new("operation-742-17").expect("operation id"))
+            .with_idempotency_ref("idempotency-742-17")
+            .with_generation("generation-742-17");
+        let reason = StoreReasonCode::new("bridge.boundary.observed").expect("reason code");
+
+        let mut log = BoundedEventLog::new();
+        assert!(log.is_empty(), "a fresh bounded log retains nothing");
+
+        // One request-receipt event per inventoried boundary: every boundary
+        // in the closed ledger owns exactly one recorded event, and no
+        // boundary is inflated into a second event by the same call.
+        assert_eq!(
+            BridgeBoundary::ALL.len(),
+            28,
+            "the closed bridge-boundary ledger has twenty-eight entries"
+        );
+        for &boundary in BridgeBoundary::ALL {
+            emit_received(&mut log, boundary, boundary.as_str(), &identity);
+        }
+        assert_eq!(
+            log.len(),
+            BridgeBoundary::ALL.len(),
+            "each emitting call records exactly one event"
+        );
+        assert_eq!(log.dropped(), 0, "no event is dropped below the bound");
+
+        let mut counts: Vec<(&str, usize)> = BridgeBoundary::ALL
+            .iter()
+            .copied()
+            .map(|boundary| (boundary.as_str(), 0))
+            .collect();
+        for event in &log {
+            let code = event.boundary().as_str();
+            let entry = counts
+                .iter_mut()
+                .find(|entry| entry.0 == code)
+                .expect("a recorded boundary belongs to the closed ledger");
+            entry.1 += 1;
+            assert_eq!(
+                event.operation(),
+                code,
+                "a boundary event records the stable machine code it observed"
+            );
+            assert_eq!(
+                event.outcome(),
+                RequestOutcome::Received,
+                "a request-receipt event is recorded as received, never as an attempt"
+            );
+        }
+        assert!(
+            counts.iter().all(|(_, count)| *count == 1),
+            "no owning boundary carries a duplicate inflated event"
+        );
+
+        // Every remaining public emitting entry adds exactly one event on the
+        // boundary it owns, and names an admitted operation.
+        let baseline = log.len();
+        let mut expected = baseline;
+        emit_attempted(&mut log, "apply", &identity);
+        expected += 1;
+        assert_eq!(log.len(), expected, "the handoff entry records one event");
+        emit_validation_rejected(
+            &mut log,
+            BridgeBoundary::SessionValidation,
+            "apply",
+            &identity,
+            Some(&reason),
+        );
+        expected += 1;
+        assert_eq!(
+            log.len(),
+            expected,
+            "the validation-rejection entry records one event"
+        );
+        emit_reconciled(&mut log, "reconciliation", &identity);
+        expected += 1;
+        assert_eq!(
+            log.len(),
+            expected,
+            "the reconciliation entry records one event"
+        );
+        emit_lifecycle(
+            &mut log,
+            BridgeBoundary::Shutdown,
+            "shutdown",
+            &identity,
+            Some(&reason),
+        );
+        expected += 1;
+        assert_eq!(log.len(), expected, "the lifecycle entry records one event");
+        let legacy_failure = Response::Error {
+            error: "legacy string failure".to_owned(),
+        };
+        emit_dispatch_outcome(
+            &mut log,
+            BridgeBoundary::FrameRejection,
+            "frame",
+            &identity,
+            &legacy_failure,
+        );
+        expected += 1;
+        assert_eq!(
+            log.len(),
+            expected,
+            "the classified-outcome entry records one event"
+        );
+
+        let owners: Vec<(BridgeBoundary, RequestOutcome)> = log
+            .iter()
+            .skip(baseline)
+            .map(|event| (event.boundary(), event.outcome()))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                (BridgeBoundary::Dispatch, RequestOutcome::Attempted),
+                (
+                    BridgeBoundary::SessionValidation,
+                    RequestOutcome::ValidationRejected
+                ),
+                (
+                    BridgeBoundary::ReceiptReconciliation,
+                    RequestOutcome::Reconciled
+                ),
+                (BridgeBoundary::Shutdown, RequestOutcome::LifecycleObserved),
+                (BridgeBoundary::FrameRejection, RequestOutcome::Defect),
+            ],
+            "each emitting entry records the boundary it owns and its own outcome"
+        );
+        assert!(
+            log.iter()
+                .skip(baseline)
+                .all(|event| ADMITTED_OPERATIONS.contains(&event.operation())),
+            "every call-site event names an admitted operation"
+        );
+
+        // Repeated output is bounded: the buffer never grows past
+        // MAX_DIAGNOSTIC_EVENTS, every drop past the bound is counted once,
+        // and the oldest events are the ones discarded.
+        let filler_count = MAX_DIAGNOSTIC_EVENTS;
+        for index in 0..filler_count {
+            emit_lifecycle(
+                &mut log,
+                BridgeBoundary::Dispatch,
+                "apply",
+                &filler_identity(index),
+                Some(&reason),
+            );
+        }
+        assert_eq!(
+            log.len(),
+            MAX_DIAGNOSTIC_EVENTS,
+            "the bounded log never grows past its capture capacity"
+        );
+        assert_eq!(
+            log.dropped(),
+            u64::try_from(baseline).expect("baseline event count fits in u64"),
+            "every event pushed past the bound is counted as dropped exactly once"
+        );
+        let retained: Vec<usize> = log
+            .iter()
+            .filter_map(|event| event.identity().generation())
+            .filter_map(|generation| {
+                generation
+                    .strip_prefix("fill-")
+                    .and_then(|index| index.parse::<usize>().ok())
+            })
+            .collect();
+        assert_eq!(
+            retained.len(),
+            MAX_DIAGNOSTIC_EVENTS,
+            "every retained event is one of the bounded filler events"
+        );
+        assert_eq!(
+            retained.first(),
+            Some(&0),
+            "the bound evicted exactly the oldest events: the first filler survives"
+        );
+        assert_eq!(
+            retained.last(),
+            Some(&(filler_count - 1)),
+            "the newest emitted event is always retained"
+        );
+        assert!(
+            retained.windows(2).all(|pair| pair[0] < pair[1]),
+            "the bounded log preserves emission order and drops oldest-first"
+        );
+    }
+
+    // WORK_UNIT_CASE: 742/23
+    #[test]
+    fn boundary_operation_and_outcome_partitions_stay_closed_and_rollback_stays_unobservable() {
+        // The closed boundary ledger is a partition: one distinct, non-prose
+        // machine code per entry.
+        let codes: Vec<&'static str> = BridgeBoundary::ALL
+            .iter()
+            .copied()
+            .map(BridgeBoundary::as_str)
+            .collect();
+        let mut distinct_codes = codes.clone();
+        distinct_codes.sort_unstable();
+        distinct_codes.dedup();
+        assert_eq!(
+            distinct_codes.len(),
+            BridgeBoundary::ALL.len(),
+            "every bridge boundary owns one distinct machine code"
+        );
+        assert!(
+            codes
+                .iter()
+                .all(|code| !code.is_empty() && !code.contains(' ')),
+            "a boundary machine code is never blank or prose"
+        );
+
+        // The admitted operation vocabulary is closed and duplicate-free, and
+        // it admits no caller prose.
+        let mut distinct_admitted = ADMITTED_OPERATIONS.to_vec();
+        distinct_admitted.sort_unstable();
+        let admitted_total = distinct_admitted.len();
+        distinct_admitted.dedup();
+        assert_eq!(
+            distinct_admitted.len(),
+            admitted_total,
+            "the admitted operation vocabulary has no duplicate entry"
+        );
+        assert!(
+            !is_admitted_operation("apply per caller prose"),
+            "caller prose is never admitted as an operation name"
+        );
+
+        // The closed dispatch catalogue projects onto admitted operations and
+        // onto the owning result boundaries, with no arm collapsed and no
+        // boundary invented outside the ledger.
+        let arms = catalogue_requests();
+        assert_eq!(
+            arms.len(),
+            13,
+            "the closed dispatch catalogue has thirteen arms"
+        );
+        let mut projected_operations: Vec<&'static str> = Vec::with_capacity(arms.len());
+        let mut result_boundaries: Vec<BridgeBoundary> = Vec::with_capacity(arms.len());
+        for (expected_operation, request) in &arms {
+            let operation = operation_name(request);
+            let boundary = dispatch_boundary(request);
+            let boundary_code = boundary.as_str();
+            assert_eq!(
+                operation, *expected_operation,
+                "an arm projects exactly its own admitted operation name"
+            );
+            assert!(
+                ADMITTED_OPERATIONS.contains(&operation),
+                "every projected operation name is admitted: {operation}"
+            );
+            assert!(
+                BridgeBoundary::ALL.contains(&boundary),
+                "every owning result boundary is in the closed ledger: {boundary_code}"
+            );
+            projected_operations.push(operation);
+            result_boundaries.push(boundary);
+        }
+        let mut distinct_operations = projected_operations.clone();
+        distinct_operations.sort_unstable();
+        distinct_operations.dedup();
+        assert_eq!(
+            distinct_operations.len(),
+            arms.len(),
+            "no two dispatch arms collapse onto one operation name"
+        );
+        let mut ordered_boundaries: Vec<(&'static str, BridgeBoundary)> = result_boundaries
+            .iter()
+            .copied()
+            .map(|boundary| (boundary.as_str(), boundary))
+            .collect();
+        ordered_boundaries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        ordered_boundaries.dedup_by(|left, right| left.0 == right.0);
+        let boundary_partition: Vec<BridgeBoundary> = ordered_boundaries
+            .into_iter()
+            .map(|entry| entry.1)
+            .collect();
+        assert_eq!(
+            boundary_partition,
+            vec![
+                BridgeBoundary::BackupBoundary,
+                BridgeBoundary::Dispatch,
+                BridgeBoundary::DreamerLedger,
+                BridgeBoundary::GenesisBoundary,
+                BridgeBoundary::MutationResult,
+                BridgeBoundary::ReceiptLookup,
+                BridgeBoundary::RecoveryBoundary,
+            ],
+            "the catalogue arms partition onto exactly the owning result boundaries"
+        );
+
+        // Frozen identity distinction: read-path, head, snapshot, and recovery
+        // arms project the empty identity; identity-bearing arms keep one.
+        let identity_arms: Vec<bool> = arms
+            .iter()
+            .map(|(_, request)| {
+                let projected = BridgeIdentity::from_request(request);
+                projected.operation_id().is_some()
+            })
+            .collect();
+        assert_eq!(
+            identity_arms,
+            vec![
+                false, false, false, true, true, true, true, false, false, false, false, true,
+                true,
+            ],
+            "only identity-bearing arms project an operation identity"
+        );
+
+        // The typed response projection reaches exactly the observable
+        // outcomes; the reserved rollback outcome is unreachable.
+        let responses = classified_responses();
+        let classified: Vec<RequestOutcome> = responses.iter().map(classify_response).collect();
+        assert!(
+            !classified.contains(&RequestOutcome::RolledBack),
+            "the response projection never produces the reserved rollback outcome"
+        );
+        let mut classified_pairs: Vec<(&'static str, RequestOutcome)> = classified
+            .iter()
+            .copied()
+            .map(|outcome| (outcome.as_str(), outcome))
+            .collect();
+        classified_pairs.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        classified_pairs.dedup_by(|left, right| left.0 == right.0);
+        let outcome_partition: Vec<RequestOutcome> =
+            classified_pairs.into_iter().map(|entry| entry.1).collect();
+        assert_eq!(
+            outcome_partition,
+            vec![
+                RequestOutcome::Attempted,
+                RequestOutcome::Committed,
+                RequestOutcome::Conflict,
+                RequestOutcome::Defect,
+                RequestOutcome::NotAttempted,
+                RequestOutcome::ReadCompleted,
+                RequestOutcome::Reconciled,
+                RequestOutcome::TerminalNonCommit,
+                RequestOutcome::Unknown,
+                RequestOutcome::ValidationRejected,
+            ],
+            "the response projection reaches exactly the ten observable outcomes and never rollback"
+        );
+        assert_eq!(
+            classify_response(&Response::Error {
+                error: "legacy string failure".to_owned(),
+            }),
+            RequestOutcome::Defect,
+            "the legacy string failure stays a typed defect, never a commit"
+        );
+        assert_eq!(
+            classify_response(&Response::Receipt { receipt: None }),
+            RequestOutcome::ReadCompleted,
+            "a receipt lookup with no receipt is a completed read, never a commit claim"
+        );
+
+        // No public emitting entry can record the reserved rollback outcome.
+        let identity = BridgeIdentity::new()
+            .with_operation(&OperationId::new("operation-742-23").expect("operation id"))
+            .with_idempotency_ref("idempotency-742-23");
+        let reason = StoreReasonCode::new("bridge.partition.observed").expect("reason code");
+        let mut log = BoundedEventLog::new();
+        emit_received(
+            &mut log,
+            BridgeBoundary::SessionValidation,
+            "apply",
+            &identity,
+        );
+        emit_attempted(&mut log, "apply", &identity);
+        emit_validation_rejected(
+            &mut log,
+            BridgeBoundary::SessionValidation,
+            "apply",
+            &identity,
+            Some(&reason),
+        );
+        emit_dispatch_outcome(
+            &mut log,
+            BridgeBoundary::MutationResult,
+            "apply",
+            &identity,
+            &responses[0],
+        );
+        emit_reconciled(&mut log, "reconciliation", &identity);
+        emit_lifecycle(
+            &mut log,
+            BridgeBoundary::SchemaMigration,
+            "schema_migration",
+            &identity,
+            Some(&reason),
+        );
+        assert_eq!(
+            log.len(),
+            6,
+            "each public emitting entry records exactly one event"
+        );
+        let emitted: Vec<RequestOutcome> = log.iter().map(BridgeDiagnosticEvent::outcome).collect();
+        assert_eq!(
+            emitted,
+            vec![
+                RequestOutcome::Received,
+                RequestOutcome::Attempted,
+                RequestOutcome::ValidationRejected,
+                RequestOutcome::Committed,
+                RequestOutcome::Reconciled,
+                RequestOutcome::LifecycleObserved,
+            ],
+            "each emitting entry records its own call-site outcome"
+        );
+        assert!(
+            emitted
+                .iter()
+                .all(|outcome| *outcome != RequestOutcome::RolledBack),
+            "no emitting entry can record the reserved rollback outcome"
+        );
+        assert_eq!(
+            RequestOutcome::RolledBack.as_str(),
+            "rolled_back",
+            "the reserved rollback vocabulary entry keeps its stable machine code"
+        );
+        assert!(
+            log.iter()
+                .all(|event| ADMITTED_OPERATIONS.contains(&event.operation())),
+            "every recorded event names an admitted operation"
+        );
+    }
+}
