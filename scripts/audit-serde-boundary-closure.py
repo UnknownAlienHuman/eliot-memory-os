@@ -438,7 +438,10 @@ def load_inventory_module(root: Path) -> Any:
         )
     module = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)
+        exec(
+            compile(script.read_bytes(), str(script), "exec", dont_inherit=True),
+            module.__dict__,
+        )
     except Exception as error:
         raise InventoryUnavailable(
             f"inventory module failure: {INVENTORY_SCRIPT_REL}:1 "
