@@ -1,15 +1,17 @@
 use eliot_engine::{
     Adapter, AdapterExecutionContext, AdapterMemoryWriter, AdapterObservationBridge,
-    AdapterRegistry, AdapterSupervisor, BoxAdapterFuture, EngineError, HealthAdapter,
+    AdapterRegistry, AdapterSupervisor, BoxAdapterFuture, BoxProcessDispatchFuture, EngineError,
+    HealthAdapter, PROCESS_ADAPTER_ID, ProcessAdapterConfig, ProcessDispatchError,
+    ProcessDispatchOutcome, ProcessDispatchPort, ProcessDispatchRequest, ProcessExecutionReceipt,
     TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter, WorkState,
     WriteAdmissionService, WriterActor, WriterConfig, normalize_result_to_observation,
     test_request,
 };
 use eliot_store::{BlobStore, CanonicalStore, ControlWal};
 use eliot_types::{
-    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterError, AdapterResult,
-    AdapterResultStatus, AdapterState, AgentHostId, BlackboardItemKind, BlobStoreConfig,
-    CapabilityManifest, ControlWalConfig, GovernorConfig, MailboxMessageKind,
+    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterError, AdapterRequest,
+    AdapterResult, AdapterResultStatus, AdapterState, AgentHostId, BlackboardItemKind,
+    BlobStoreConfig, CapabilityManifest, ControlWalConfig, GovernorConfig, MailboxMessageKind,
     ModuleAuthorityProfile, ModuleCapability, OperationPhase, OperationReconciliationState,
     ProviderDeclaredBudget, ProviderDispatchState, ProviderRoutePolicy, TaintClass,
 };
@@ -983,4 +985,533 @@ fn repo_root() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+// ===========================================================================
+// Issue #1819 - deterministic process adapter (I10.17, acceptance A1)
+// ===========================================================================
+
+/// Path fragment carrying characters a shell would treat as syntax.
+///
+/// `;`, `&`, `$`, `(`, `)` and `'` are all legal path-component characters, so a
+/// path containing them is data that any correct implementation must pass through
+/// verbatim. `|`, `<`, `>`, `:`, `*`, `?` and `"` are excluded because they cannot
+/// appear in a path at all.
+const SHELL_METACHARACTER_PATH: &str = "probe dir & calc $(whoami); rm -rf 'x'";
+
+/// Real-child dispatch port: the physical half of the process adapter seam.
+///
+/// This is the TEST owner of the sole-`ProcessExecutor` launch rule (`clippy.toml`
+/// / `I10.8.2`). It exists so acceptance A1 can run a REAL OS process and observe a
+/// real exit code: a mock could not prove that a metacharacter path reaches the
+/// child unexpanded. Production binds `ProcessDispatchPort` to the Kernel-owned
+/// `WindowsProcessExecutor`. Removal condition: deleted with the A1 acceptance
+/// proof, never promoted to a product route.
+struct RealChildDispatch {
+    launches: AtomicU32,
+}
+
+impl RealChildDispatch {
+    fn new() -> Self {
+        Self {
+            launches: AtomicU32::new(0),
+        }
+    }
+}
+
+impl ProcessDispatchPort for RealChildDispatch {
+    fn dispatch(&self, request: ProcessDispatchRequest) -> BoxProcessDispatchFuture<'_> {
+        Box::pin(async move {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            let intent = &request.intent;
+            // Executable and argv come from separate intent members and are never
+            // joined: this is the physical proof that nothing downstream can
+            // re-split them back into a command line.
+            // Disallowed-methods escape hatch (clippy.toml I10.8.2). Owner: the
+            // issue #1819 A1 acceptance fixture in this crate's test surface.
+            // Operation: this TEST-ONLY port launches the in-crate
+            // `eliot_adapter_process_probe` child to observe a real exit code and
+            // real captured output. Removal condition: deleted with the A1
+            // acceptance proof, or as soon as the adapter binds the Kernel
+            // `ProcessExecutor`, at which point this launch goes through that
+            // owner instead of a raw spawn.
+            #[allow(clippy::disallowed_methods)]
+            let output = {
+                let mut command = std::process::Command::new(intent.executable());
+                command.args(intent.argv());
+                command.current_dir(intent.working_directory());
+                command.env_clear();
+                for (name, value) in intent.environment().non_secret() {
+                    command.env(name, value);
+                }
+                command.output().map_err(|error| {
+                    ProcessDispatchError::Launch(format!("child launch failed: {error}"))
+                })?
+            };
+            Ok(ProcessDispatchOutcome {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                exit_code: output.status.code(),
+                killed: false,
+            })
+        })
+    }
+}
+
+/// Never-launches port: proves refusal happens at admission, before any process.
+struct NoLaunchDispatch {
+    launches: AtomicU32,
+}
+
+impl NoLaunchDispatch {
+    fn new() -> Self {
+        Self {
+            launches: AtomicU32::new(0),
+        }
+    }
+}
+
+impl ProcessDispatchPort for NoLaunchDispatch {
+    fn dispatch(&self, _request: ProcessDispatchRequest) -> BoxProcessDispatchFuture<'_> {
+        Box::pin(async move {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            Err(ProcessDispatchError::Launch(
+                "no-launch port must never be reached".to_owned(),
+            ))
+        })
+    }
+}
+
+fn probe_executable() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_eliot_adapter_process_probe"))
+}
+
+/// A working directory whose own path contains shell metacharacters.
+fn metacharacter_root(root: &Path) -> TestResult<PathBuf> {
+    let path = root.join(SHELL_METACHARACTER_PATH);
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn probe_resource_limits() -> eliot_process::ResourceLimits {
+    eliot_process::ResourceLimits::new(30_000, None, None, 65_536, 65_536, 8)
+        .expect("bounded probe resource profile")
+}
+
+fn probe_environment() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([("ELIOT_ADAPTER_PROBE".to_owned(), "allowlisted".to_owned())])
+}
+
+fn process_adapter_config(
+    root: &Path,
+    executable: Option<String>,
+) -> TestResult<ProcessAdapterConfig> {
+    ProcessAdapterConfig::new(
+        PROCESS_ADAPTER_ID,
+        "Deterministic Process Adapter",
+        "1.0.0",
+        executable,
+        vec![root.display().to_string()],
+        root.display().to_string(),
+        probe_environment(),
+        probe_resource_limits(),
+    )
+    .map_err(Into::into)
+}
+
+fn process_request(input: serde_json::Value) -> AdapterRequest {
+    AdapterRequest {
+        request_id: format!("proc-{}", eliot_types::OperationId::new_v7()),
+        adapter_id: PROCESS_ADAPTER_ID.to_owned(),
+        requested_capability: AdapterCapability::ExecuteTest,
+        context: eliot_types::AdapterContext {
+            project_id: eliot_types::ProjectId::new_v7(),
+            task_id: eliot_types::TaskId::new_v7(),
+            session_id: None,
+            trace_id: format!("trace-{}", eliot_types::OperationId::new_v7()),
+            created_at: OffsetDateTime::now_utc(),
+            role_lease_id: None,
+            role_lease_epoch: None,
+            operation_generation: None,
+            runtime_contract_sha256: None,
+        },
+        input,
+    }
+}
+
+fn receipt_of(result: &AdapterResult) -> TestResult<ProcessExecutionReceipt> {
+    Ok(serde_json::from_value(
+        result
+            .output
+            .get("process")
+            .cloned()
+            .ok_or("adapter result carries no process receipt")?,
+    )?)
+}
+
+// WORK_UNIT_CASE: 1819/A1
+#[tokio::test]
+async fn adapter_deterministic_process_records_separate_executable_argv_and_receipt() -> TestResult
+{
+    let root = test_root("process-a1")?;
+    let working_directory = metacharacter_root(&root)?;
+    let executable = probe_executable();
+    let executable_text = executable.display().to_string();
+    let probe_arg = working_directory
+        .join("child input & echo pwned.txt")
+        .display()
+        .to_string();
+    let argv = vec![
+        "--echo-arg".to_owned(),
+        probe_arg.clone(),
+        "--echo-env".to_owned(),
+        "ELIOT_ADAPTER_PROBE".to_owned(),
+    ];
+    let config = process_adapter_config(&root, Some(executable_text.clone()))?;
+    let dispatch = Arc::new(RealChildDispatch::new());
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::clone(&dispatch) as Arc<dyn ProcessDispatchPort>,
+        Arc::clone(&blob_store),
+    )?);
+
+    let health = supervisor.health_probe(PROCESS_ADAPTER_ID).await;
+    assert!(health.healthy, "process adapter must be ready: {health:?}");
+    assert_eq!(health.state, AdapterState::Healthy);
+
+    let result = supervisor
+        .execute(
+            PROCESS_ADAPTER_ID,
+            process_request(json!({
+                "executable": executable_text,
+                "argv": argv,
+                "working_directory": working_directory.display().to_string(),
+            })),
+            Some(&blob_store),
+        )
+        .await?;
+    assert_eq!(
+        result.status,
+        AdapterResultStatus::Succeeded,
+        "a real child must succeed: {result:?}"
+    );
+    let receipt = receipt_of(&result)?;
+
+    // Separate executable/argv: neither is a substring of the other, and the child
+    // echoed the metacharacter argument back byte-for-byte, which only happens when
+    // no shell interpreted it.
+    assert_eq!(receipt.executable, executable_text);
+    assert_eq!(receipt.argv, argv);
+    assert!(
+        !receipt.executable.contains("cmd.exe") && !receipt.executable.contains("sh"),
+        "the recorded executable must be the child itself, not a shell"
+    );
+    assert!(
+        receipt.stdout.contains(&format!("ARG[0]={probe_arg}")),
+        "metacharacter argument must reach the child verbatim: {:?}",
+        receipt.stdout
+    );
+    assert!(
+        receipt
+            .stdout
+            .contains("ENV:ELIOT_ADAPTER_PROBE=allowlisted"),
+        "the child must observe exactly the allowlisted environment: {:?}",
+        receipt.stdout
+    );
+
+    // Explicit cwd, itself a path containing metacharacters, and it was honoured.
+    assert_eq!(
+        receipt.working_directory,
+        working_directory.display().to_string()
+    );
+    assert!(
+        receipt
+            .stdout
+            .contains(&format!("CWD={}", working_directory.display())),
+        "the child must run in the admitted cwd: {:?}",
+        receipt.stdout
+    );
+
+    // Environment allowlist is recorded by NAME only; values are never published.
+    assert_eq!(receipt.environment, vec!["ELIOT_ADAPTER_PROBE".to_owned()]);
+
+    // Version + input hash.
+    assert_eq!(receipt.adapter_version, "1.0.0");
+    assert_eq!(
+        receipt.executable_sha256.len(),
+        64,
+        "the executable content digest is the exact process version: {:?}",
+        receipt.executable_sha256
+    );
+    assert_eq!(
+        receipt.input_hash.len(),
+        64,
+        "the sealed effect digest is the exact input hash: {:?}",
+        receipt.input_hash
+    );
+    assert_ne!(
+        receipt.input_hash, receipt.executable_sha256,
+        "input hash and executable identity are different facts"
+    );
+
+    // Exit / protocol receipt.
+    assert_eq!(receipt.exit_code, Some(0));
+    assert_eq!(receipt.protocol_status, "ok");
+    assert!(!receipt.killed);
+    assert_eq!(receipt.generation, 1);
+
+    // No canonical state write.
+    assert!(!receipt.wrote_canonical_state);
+    for observation in &result.observations {
+        assert!(
+            observation.write_receipt.is_none(),
+            "a deterministic process adapter must never take a canonical write receipt"
+        );
+    }
+    assert_eq!(dispatch.launches.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1819/A1-output-bound
+#[tokio::test]
+async fn adapter_deterministic_process_spills_bounded_output_to_blob_store() -> TestResult {
+    let root = test_root("process-blob")?;
+    let executable_text = probe_executable().display().to_string();
+    let argv = vec![
+        "--raw-bytes".to_owned(),
+        "9000".to_owned(),
+        "--stderr-bytes".to_owned(),
+        "16".to_owned(),
+    ];
+    let config = process_adapter_config(&root, Some(executable_text.clone()))?;
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::new(RealChildDispatch::new()),
+        Arc::clone(&blob_store),
+    )?);
+    let result = supervisor
+        .execute(
+            PROCESS_ADAPTER_ID,
+            process_request(json!({ "executable": executable_text, "argv": argv })),
+            Some(&blob_store),
+        )
+        .await?;
+    assert_eq!(result.status, AdapterResultStatus::Succeeded);
+    let receipt = receipt_of(&result)?;
+
+    // The receipt stays bounded while the raw bytes are still addressable.
+    assert!(
+        receipt.truncated,
+        "9 KiB of stdout must overflow the inline bound"
+    );
+    assert!(receipt.stdout.len() <= 4_096);
+    assert!(receipt.stdout_bytes > 9_000);
+    let blob = receipt
+        .raw_output_blob
+        .as_ref()
+        .ok_or("overflowing output must produce a Blob Store handle")?;
+    assert!(blob_store.blob_path(blob).exists());
+    let spilled = blob_store.read_verified(blob)?;
+    assert_eq!(spilled.len(), receipt.stdout_bytes - receipt.stdout.len());
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1819/A1-admission
+#[tokio::test]
+async fn adapter_deterministic_process_refuses_unlisted_executable_before_launch() -> TestResult {
+    let root = test_root("process-admission")?;
+    let executable_text = probe_executable().display().to_string();
+    let config = process_adapter_config(&root, Some(executable_text))?;
+    let dispatch = Arc::new(NoLaunchDispatch::new());
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::clone(&dispatch) as Arc<dyn ProcessDispatchPort>,
+        Arc::clone(&blob_store),
+    )?);
+    let result = supervisor
+        .execute(
+            PROCESS_ADAPTER_ID,
+            process_request(json!({
+                "executable": "cmd.exe",
+                "argv": ["/C", "echo", "hi"],
+            })),
+            Some(&blob_store),
+        )
+        .await?;
+    // An unlisted executable is an unsupported capability, not a transport failure,
+    // and it must never reach the launcher.
+    assert_eq!(result.status, AdapterResultStatus::UnsupportedCapability);
+    assert_eq!(
+        dispatch.launches.load(Ordering::SeqCst),
+        0,
+        "admission must refuse before any process exists"
+    );
+    let health = supervisor.health_probe(PROCESS_ADAPTER_ID).await;
+    assert!(
+        !health.circuit_open,
+        "an unsupported capability must not open the circuit"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1819/A1-cwd-admission
+#[tokio::test]
+async fn adapter_deterministic_process_refuses_working_directory_outside_admitted_roots()
+-> TestResult {
+    let root = test_root("process-cwd")?;
+    let executable_text = probe_executable().display().to_string();
+    let config = process_adapter_config(&root, Some(executable_text))?;
+    let dispatch = Arc::new(NoLaunchDispatch::new());
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::clone(&dispatch) as Arc<dyn ProcessDispatchPort>,
+        Arc::clone(&blob_store),
+    )?);
+    let outside = repo_root().join("target");
+    let result = supervisor
+        .execute(
+            PROCESS_ADAPTER_ID,
+            process_request(json!({
+                "argv": [],
+                "working_directory": outside.display().to_string(),
+            })),
+            Some(&blob_store),
+        )
+        .await?;
+    assert_eq!(result.status, AdapterResultStatus::Rejected);
+    assert_eq!(dispatch.launches.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1819/A1-circuit
+#[tokio::test]
+async fn adapter_deterministic_process_counts_only_launch_failure_in_circuit() -> TestResult {
+    let root = test_root("process-circuit")?;
+    let executable_text = probe_executable().display().to_string();
+    let config = process_adapter_config(&root, Some(executable_text.clone()))?;
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::new(RealChildDispatch::new()),
+        Arc::clone(&blob_store),
+    )?);
+    // Non-zero exit: a completed exchange that failed.
+    for _ in 0..4 {
+        let result = supervisor
+            .execute(
+                PROCESS_ADAPTER_ID,
+                process_request(json!({
+                    "executable": executable_text,
+                    "argv": ["--exit", "3"],
+                })),
+                Some(&blob_store),
+            )
+            .await?;
+        assert_eq!(result.status, AdapterResultStatus::Failed);
+        let receipt = receipt_of(&result)?;
+        assert_eq!(receipt.exit_code, Some(3));
+        assert_eq!(receipt.protocol_status, "non_zero_exit");
+    }
+    let health = supervisor.health_probe(PROCESS_ADAPTER_ID).await;
+    assert!(
+        !health.circuit_open && health.healthy,
+        "a child that ran and exited non-zero is not a transport failure: {health:?}"
+    );
+
+    // Now a genuine launch failure: the executor cannot start the sealed intent.
+    let missing = root.join("absent-probe.exe").display().to_string();
+    let config = process_adapter_config(&root, Some(missing))?;
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::new(NoLaunchDispatch::new()),
+        Arc::clone(&blob_store),
+    )?);
+    let result = supervisor
+        .execute(
+            PROCESS_ADAPTER_ID,
+            process_request(json!({ "argv": [] })),
+            Some(&blob_store),
+        )
+        .await?;
+    assert_eq!(result.status, AdapterResultStatus::TransportFailure);
+    let health = supervisor.health_probe(PROCESS_ADAPTER_ID).await;
+    assert!(
+        health.consecutive_failures > 0 || health.circuit_open,
+        "a launch failure is recorded in circuit accounting: {health:?}"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1819/A1-manifest
+#[tokio::test]
+async fn adapter_deterministic_process_manifest_declares_no_shell_and_no_authority() -> TestResult {
+    let root = test_root("process-manifest")?;
+    let executable_text = probe_executable().display().to_string();
+    let config = process_adapter_config(&root, Some(executable_text))?;
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::new(NoLaunchDispatch::new()),
+        Arc::clone(&blob_store),
+    )?);
+    let manifest = supervisor.registry().inspect(PROCESS_ADAPTER_ID)?;
+
+    assert_eq!(manifest.adapter_class, AdapterClass::LocalService);
+    assert!(manifest.process_policy.process_spawn_allowed);
+    assert_eq!(manifest.process_policy.allowed_executables.len(), 1);
+    assert!(!manifest.process_policy.inherit_environment);
+    assert!(!manifest.process_policy.network_allowed);
+    assert!(!manifest.authority_profile.can_write_truth);
+    assert!(!manifest.authority_profile.can_request_patch);
+    assert!(!manifest.authority_profile.can_finish_task);
+    assert!(
+        manifest
+            .capabilities
+            .iter()
+            .all(|capability| !capability.is_forbidden_authority()),
+        "a deterministic process adapter may not hold truth/patch/finish authority"
+    );
+    // The registry admits no `raw_shell`-shaped capability name.
+    assert!(
+        AdapterRegistry::validate_capability_names(&["raw_shell".to_owned()]).is_err(),
+        "a shell capability name must stay unadmittable"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1819/A1-unarmed
+#[tokio::test]
+async fn adapter_deterministic_process_without_executable_is_unavailable_not_ready() -> TestResult {
+    let root = test_root("process-unarmed")?;
+    let config = process_adapter_config(&root, None)?;
+    let blob_store = Arc::new(BlobStore::open(&BlobStoreConfig {
+        root: root.join("blobs").display().to_string(),
+    })?);
+    let supervisor = AdapterSupervisor::new(AdapterRegistry::builtin_with_process(
+        config,
+        Arc::new(NoLaunchDispatch::new()),
+        Arc::clone(&blob_store),
+    )?);
+    let health = supervisor.health_probe(PROCESS_ADAPTER_ID).await;
+    assert_eq!(health.state, AdapterState::Unavailable);
+    assert!(!health.healthy);
+    let manifest = supervisor.registry().inspect(PROCESS_ADAPTER_ID)?;
+    assert!(!manifest.process_policy.process_spawn_allowed);
+    Ok(())
 }
