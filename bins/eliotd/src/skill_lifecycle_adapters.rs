@@ -924,6 +924,7 @@ impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {
         evidence_refs: Vec<String>,
         dependencies: Vec<eliot_skill::DependencyVersion>,
         scope: eliot_skill::SkillScope,
+        policy_revision: String,
     ) -> Result<SkillCandidate, SkillError> {
         self.inner
             .propose(
@@ -934,6 +935,7 @@ impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {
                 evidence_refs,
                 dependencies,
                 scope,
+                policy_revision,
             )
             .await
     }
@@ -1135,6 +1137,7 @@ mod tests {
             _evidence_refs: Vec<String>,
             _dependencies: Vec<DependencyVersion>,
             _scope: SkillScope,
+            _policy_revision: String,
         ) -> Result<SkillCandidate, SkillError> {
             *self.calls.lock().expect("calls") += 1;
             Err(SkillError::NotFound)
@@ -3147,6 +3150,8 @@ mod tests {
                 route: "route-1".to_owned(),
                 governance_scope: "gov-1".to_owned(),
             },
+            "policy-rev-1".to_owned(),
+            "proposal-operation-1".to_owned(),
             fence.clone(),
         )
         .expect("candidate")

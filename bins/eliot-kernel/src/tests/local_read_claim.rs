@@ -94,16 +94,38 @@ fn query_envelope(
     request_id: &str,
     tool_digest: &str,
 ) -> HostRequestEnvelope {
+    // An Invocation envelope must carry a RESOLVED correlation projection.
+    // `stage_host_request` refuses an Invocation or Cancellation whose
+    // `correlation_projection` is `None` with
+    // `HostRequestLegacyCorrelationUnresolved`, so a fixture that omitted it
+    // could never stage, claim, submit or seal anything.
+    //
+    // `McpJsonRpc` is the shape the real producer uses — the agent bridge
+    // carries the MCP adapter's typed JSON-RPC id — and the envelope's
+    // `request_id` is DERIVED from it, exactly as production does:
+    // `HostRequestRecord::validate_correlation_projection` requires
+    // `projection.occurrence_text() == request_id`, and the admitted read leg
+    // builds `HostCorrelationId::new(projection.occurrence_text())`. An
+    // `Opaque` occurrence would sidestep that derivation, and
+    // `KernelOperational` is not usable on a host request envelope at all —
+    // the bridge explicitly rejects that profile here, so choosing it would
+    // make this fixture pass a gate no production envelope passes.
+    let correlation_projection = eliot_contracts::HostCorrelationProjection::McpJsonRpc {
+        domain: eliot_contracts::HostCorrelationDomain::Request,
+        id: eliot_contracts::HostJsonRpcCorrelationId::String(request_id.to_owned()),
+    };
+    let request_id_text = correlation_projection.occurrence_text();
     HostRequestEnvelope {
         wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
         wire_version: HostRequestEnvelope::CONTRACT_VERSION,
         kind: HostRequestKind::Invocation,
         connection_id: "conn-test-1".to_owned(),
         identity: HostRequestIdentity {
-            request_id: eliot_contracts::RequestId::new(request_id).expect("valid request id"),
-            correlation_projection: None,
-            idempotency_key: format!("{request_id}:invoke"),
-            cancellation_id: format!("{request_id}:invoke:cancel"),
+            request_id: eliot_contracts::RequestId::new(&request_id_text)
+                .expect("valid request id"),
+            correlation_projection: Some(correlation_projection),
+            idempotency_key: format!("{request_id_text}:invoke"),
+            cancellation_id: format!("{request_id_text}:invoke:cancel"),
             parent_operation_id: None,
             deadline_unix_ms,
             capability: "eliot.query".to_owned(),
