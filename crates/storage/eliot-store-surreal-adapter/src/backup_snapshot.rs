@@ -6236,22 +6236,40 @@ mod snapshot_capture_contention_tests {
         let _serial = registry_serial();
         let fixture =
             CaptureFixture::install(1, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
-        let mut claim = fixture.claim_page();
-        let (before, held) = {
+        let before = {
             let states = lock_registry().expect("registry lock is free");
             let state = states.get(fixture.digest()).expect("installed");
             assert!(
                 !capture_is_retired(state, fixture.opened_at_ms()),
                 "the live fixture window must still be servable"
             );
+            evidence(&states, fixture.digest())
+        };
+        assert_eq!(
+            before.claim, None,
+            "no call owns this capture before its first page call"
+        );
+        let mut claim = fixture.claim_page();
+        let (in_flight, held) = {
+            let states = lock_registry().expect("registry lock is free");
+            let slot = states
+                .get(fixture.digest())
+                .expect("installed")
+                .claim
+                .as_ref()
+                .expect("the page call owns the slot");
             (
-                evidence(&states, fixture.digest()),
+                (
+                    slot.claim_id,
+                    call_kind_label(slot.kind),
+                    slot.expected_revision,
+                ),
                 charged(&states, BudgetDimension::ActivePageCalls),
             )
         };
         assert_eq!(
-            before.claim,
-            Some((claim.claim_id, "Page", before.progress_revision)),
+            in_flight,
+            (claim.claim_id, "Page", before.progress_revision),
             "the claim is bound to the progress revision it was validated against"
         );
 
@@ -6679,7 +6697,12 @@ mod snapshot_capture_contention_tests {
 
         // Dropping the superseded claim releases nothing: the units its slot no
         // longer describes were already returned by the release that replaced it.
+        // The registry lock is released first: the claim's destructor takes it, so
+        // holding it here would be a self-deadlock rather than a proof.
+        drop(states);
         drop(first);
+
+        let states = lock_registry().expect("registry lock is free");
         assert!(
             states
                 .get(fixture.digest())
