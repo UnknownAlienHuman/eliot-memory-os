@@ -745,7 +745,10 @@ fn test_gated_lines(source: &str) -> Vec<bool> {
         // item's entire body as PRODUCTION code, which is the one thing this reader
         // exists to prevent. The block is therefore located by walking forward to the
         // first line whose net balance opens one; a single-line item (a `use`, a
-        // `const`, a one-line `fn`) is closed by its `;` and owns no block at all.
+        // `const`) is closed by its `;` and owns no block at all. A ONE-LINE `fn` IS NOT
+        // HANDLED and would be walked past, because it has net balance zero and no
+        // trailing `;`; rustfmt forbids that shape and no gated item in the eight
+        // delivered files is one, so this is recorded rather than papered over.
         let mut probe = index + 1;
         let mut depth = 0_i64;
         let mut opens = false;
@@ -2831,7 +2834,7 @@ fn launch_06_store_before_kernel() {
     // original from its own replacement. The original's declaration is located by
     // its EXACT name - the only place it can be seen - and it is a `#[cfg(all(test,
     // windows))]` item by design, which is why the assertions further down require it
-    // to be ABSENT from production code (`store_kernel_launch_sequence.rs:187`).
+    // to be ABSENT from production code (`store_kernel_launch_sequence.rs:188`).
     //
     // (b) both live literals occur THREE times in that file - once in the
     // sequence and twice in its own `#[cfg(all(test, windows))] mod tests` - so a

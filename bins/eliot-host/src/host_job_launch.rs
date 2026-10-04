@@ -77,11 +77,11 @@ use crate::store_kernel_launch_sequence::{
 // record and no terminal at all. The designated terminal for one failed launch
 // is `lib.rs`'s `HostTerminalGuard` on the OUTER contour that wrapped the call - the
 // STARTUP path arms `BOUNDARY_OPEN_TERMINAL` ("host-open-failed"); a cutover-path
-// launch is owned by `BOUNDARY_BACKUP_CUTOVER_TERMINAL` instead - while
+// launch by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`, and a phase-B resume is owned by `BOUNDARY_RESUME_PENDING_TERMINAL` instead - while
 // `BOUNDARY_START_TERMINAL` ("host-start-failed") is armed only inside the uncalled
 // exported `start_approved_contour`. The leaf terminal code retired here appears
-// nowhere in this file, so one failed launch cannot produce two terminal records.
-// stay `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2, 978/3); admitted
+// nowhere in this file, so one failed launch cannot produce two terminal
+// records. Typed rejections stay `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2, 978/3); admitted
 // launches are distinct from readiness (case 978/4 — never readiness here).
 
 /// Bounded, secret-free correlation identities for one launch phase record.

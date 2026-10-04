@@ -57,7 +57,7 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // one failed launch is `lib.rs`'s `HostTerminalGuard` on the OUTER contour - the
 // STARTUP path arms `BOUNDARY_OPEN_TERMINAL` there, a cutover-path launch by
 // `BOUNDARY_BACKUP_CUTOVER_TERMINAL` instead - and the `start_approved` leaf
-// guard is phase-only (#978 audit defect 2), so this cell cannot emit a second terminal.
+// guard is phase-only (#978 audit defect 2), so this cell cannot emit a second
 // terminal. Typed rejections stay `HostError::Platform` (case 978/2); admitted
 // launches are distinct positive observations carrying the exact admitted
 // identities (cases 978/1, 978/12).

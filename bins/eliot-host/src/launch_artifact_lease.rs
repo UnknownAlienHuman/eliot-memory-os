@@ -105,7 +105,7 @@ use super::super::host_job_launch::LaunchPhaseCorrelation;
 // no mutable global dedup cache and no terminal emission here: the designated
 // terminal for one failed launch is `lib.rs`'s
 // `HostTerminalGuard` on the OUTER contour (`BOUNDARY_OPEN_TERMINAL` on the STARTUP
-// path; a cutover-path launch is owned by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`), and
+// path; a cutover-path launch by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`, a phase-B resume by `BOUNDARY_RESUME_PENDING_TERMINAL` instead), and
 // the `start_approved` leaf guard is phase-only (#978 audit defect 2), so this cell
 // cannot emit a second terminal. Retained identity on
 // substitution failure is preserved (case 978/3); digest/descriptor rejections
