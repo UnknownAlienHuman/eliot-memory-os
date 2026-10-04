@@ -1,0 +1,8 @@
+{
+  "path": "C:\\synthetic-fixture\\not-a-real-directory\\archive.json",
+  "endpoint": "http://backup-fixture.invalid:8080/synthetic-endpoint",
+  "sql": "SELECT * FROM synthetic_fixture_table WHERE synthetic_fixture_column = 'synthetic-fixture-value'",
+  "command": "powershell -NoProfile -Command Remove-Item -LiteralPath C:\\synthetic-fixture\\not-a-real-file.txt -Force",
+  "key": "-----BEGIN PRIVATE KEY-----\nSYNTHETICFAKEKEYMATERIAL0000000000000000000000\n-----END PRIVATE KEY-----",
+  "credential": "password=synthetic-not-a-real-secret"
+}
