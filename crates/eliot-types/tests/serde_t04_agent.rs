@@ -991,9 +991,13 @@ fn assert_case_binding(case: &str, touched: &[&str]) {
             "case {case} names {name}, which the frozen allocation does not bind to it; bound there: {bound:?}"
         );
     }
+    // `bound` is a `Vec<String>` and `touched` is a `&[&str]`, so `name` here is a
+    // `&String` while `touched.contains(..)` is `[&str]::contains` and wants a
+    // `&&str`. The `.as_str()` in the argument is what reconciles the two: passing
+    // `name` directly is a type error, not a missing comparison.
     for name in &bound {
         assert!(
-            touched.contains(name),
+            touched.contains(&name.as_str()),
             "the frozen allocation binds {name} to {case}, so that case must name it as one of \
              the types it owns; it names {touched:?}"
         );
@@ -1030,10 +1034,10 @@ where
     let owner = TYPE_HOME_CASE
         .iter()
         .find(|(name, _)| *name == type_name)
-        .map(|(_, case)| *case)
-        .unwrap_or_else(|| {
-            panic!("{type_name} is decoded here, so it must appear in the frozen allocation")
-        });
+        .map_or_else(
+            || panic!("{type_name} is decoded here, so it must appear in the frozen allocation"),
+            |(_, case)| *case,
+        );
     assert_eq!(
         owner, owner_case,
         "{type_name} is decoded by this case, but the frozen allocation gives it the home \
