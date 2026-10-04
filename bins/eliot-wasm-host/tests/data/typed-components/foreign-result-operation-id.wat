@@ -11,11 +11,12 @@
 ;; bins/eliot-wasm-host/wit/typed/dreamer-cycle.wit surface, field for field and
 ;; in WIT order. A record field the WIT does not declare is a different
 ;; interface, not a variation of this one, and
-;; `execute_domain_lane` proves that difference is fatal rather than cosmetic:
-;; see the `:2102` bullet in (c). An earlier revision of this file declared a
+;; `fn execute_domain_lane` proves that difference is fatal rather than
+;; cosmetic: see the `preflight_component_type` -> `typecheck_world_signatures`
+;; bullet in (c). An earlier revision of this file declared a
 ;; second, WIT-absent field `"bound"` on `$cycle_bound`; it has been removed, and
 ;; WIT dreamer-cycle.wit:168 (`record cycle-bound { human-detail: string }`) and
-;; sibling dreamer-cycle.wat:93-95 (the same single field) are what this file now
+;; sibling dreamer-cycle.wat:95-97 (the same single field) are what this file now
 ;; declares. No other type declaration here ever departed from the frozen WIT.
 ;; Structurally copied from
 ;; bins/eliot-wasm-host/tests/data/typed-components/dreamer-cycle.wat (which is
@@ -25,8 +26,9 @@
 ;;   1. this header block replaces the copied fixture's header block;
 ;;   2. the two in-body comment blocks that have to describe this fixture's
 ;;      forgery are replaced by this fixture's own: the trailing comment of
-;;      `describe` (sibling dreamer-cycle.wat:137-138) and the comment above
-;;      `step` (sibling :158-161). Both replacements are comments only; no
+;;      `describe` (sibling dreamer-cycle.wat:133-140 -- the WHOLE trailing
+;;      comment block, whose `describe` opens at sibling :141) and the comment
+;;      above `step` (sibling :160-163). Both replacements are comments only; no
 ;;      instruction, address, data segment, export, import, helper or memory
 ;;      declaration is touched by either, and `describe`'s body below them is
 ;;      byte for byte the sibling's;
@@ -50,10 +52,10 @@
 ;;
 ;; (b) DERIVED ADDRESS ARITHMETIC for the forged store.
 ;; `step` returns ONE core value: a lifted result that does not fit
-;; MAX_FLAT_FUNC_RESULTS = 1 (wasmparser-0.256.0
-;; src/validator/component_types.rs:35) clears the flat results and pushes
-;; exactly one pointer for `Abi::Lift` (same file :1290-1292), a signature the
-;; export check enforces at src/validator/component.rs:1343 and :1365.
+;; MAX_FLAT_FUNC_RESULTS = 1 (wasmparser-0.252.0
+;; src/validator/component_types.rs:36) clears the flat results and pushes
+;; exactly one pointer for `Abi::Lift` (same file :1272-1274), a signature the
+;; export check enforces at src/validator/component.rs:1328 and :1350.
 ;; With that one pointer = 2048 (0x800):
 ;;   2048        `result<cycle-outcome, cycle-error>` discriminant, one byte
 ;;               (variant_static, wasmtime-environ-47.0.4/src/component/types.rs:841);
@@ -73,99 +75,154 @@
 ;;   (i32.store (i32.const 2064) (i32.const 2304))   ;; ptr  = 0x900, the forged literal
 ;;   (i32.store (i32.const 2068) (i32.const 36))     ;; len  = 36 bytes, the literal's real length
 ;; CROSS-CHECK against the two checked-in siblings that store the SAME record,
-;; `cycle-step-result`, at the SAME base: dreamer-cycle.wat:172-173
-;; (2064 = 4096 scratch, 2068 = $n) and raised-proof-ceiling.wat:196-197
+;; `cycle-step-result`, at the SAME base: dreamer-cycle.wat:174-175
+;; (2064 = 4096 scratch, 2068 = $n) and raised-proof-ceiling.wat:209-210
 ;; (2064 = 4096 scratch, 2068 = $n). Neither address was chosen by hand here.
 ;; The forged literal lives at 0x900 (2304), which is inside the same single
-;; page, above the last result-tuple store at 2128 (0x850) and below the
-;; `describe` retptr block at 0x600 and the 0x1000/0x1200 scratch blocks, so it
-;; collides with nothing: 0x900..0x923 is written by this file's own data
-;; segment and by nothing else.
+;; page, above the last result-tuple store and below the 0x1000/0x1200 scratch
+;; blocks, so it collides with nothing: 0x900..0x923 is written by this file's
+;; own data segment and by nothing else. The last result-tuple store this file
+;; performs is the `state.fence-epoch` length at 2120, i.e. the
+;; `(i32.store (i32.const 2120) (local.get $n))` inside `step` below, covering
+;; 2120..2124 = 0x848..0x84c; 2128 is `state.fence-generation`, which this
+;; fixture never writes. The `describe` retptr block is at 0x600 (1536), i.e.
+;; every `(i32.store (i32.const 1536) ...)` / `(i32.store (i32.const 1540)
+;; ...)` pair of the exported `describe` below, so 0x900 sits ABOVE it, not
+;; below it.
 ;;
 ;; WHY THE FORGED LITERAL CANNOT EQUAL THE ADMITTED VALUE. It is a fixed
 ;; 36-byte constant, "forged-operation-id-758-not-admitted", planted by a data
 ;; segment; the guest never reads the request for it, so no admitted value can
 ;; make it match. Every admitted operation-id checked in this repository is a
-;; short token: "op" (src/typed_execution.rs:4088) or "operation-758"
-;; (tests/typed_execution.rs:627). 36 printable bytes that begin with "forged"
+;; short token: "op" (the test-module constant `const OPERATION_ID: &str = "op"`
+;; in src/typed_execution.rs -- cited by symbol and quoted source text, not by
+;; line, because that file is edited underneath this comment) or "operation-758"
+;; (the `operation-758` literal in the `governed_admission` fixture in
+;; tests/typed_execution.rs - cited by name, not by line, because that file is
+;; being edited underneath this comment). 36 printable bytes that begin with "forged"
 ;; cannot equal a 2-byte or a 12-byte token.
 ;;
-;; (c) THE FORGED FIELD IS THE FIRST CHECK THAT CAN FAIL. In call order through
-;; `execute_domain_lane` (src/typed_execution.rs:2068-2165), every check that
-;; runs before the forged comparison still passes:
-;;   :2076 admitted.validate()                  -- the test's own admitted record;
-;;                                                 not guest-supplied.
-;;   :2081 request.world() != world             -- the caller passes this world's
+;; (c) THE FORGED FIELD IS THE FIRST CHECK THAT CAN FAIL. This block cites by
+;; SYMBOL, not by line: every `fn` named below lives in src/typed_execution.rs
+;; and every backquoted string is verbatim source text, so the block survives
+;; edits made above the cited statements. In call order through `fn
+;; execute_domain_lane` -- the interior lane whose body ends
+;; `Ok((receipt, result))` -- every check that runs before the forged
+;; comparison still passes:
+;;   `admitted.validate()?;`                     -- the test's own admitted
+;;                                                 record; not guest-supplied.
+;;   `if request.world() != world {`            -- the caller passes this world's
 ;;                                                 own generated request.
-;;   :2090 bound_request / :2091 input_bound.finish
+;;   `bound_request(world, request, admitted, &mut input_bound)?;` /
+;;   `input_bound.finish(limits.max_input_bytes)?;`
 ;;                                               -- request-side only; the forged
 ;;                                                 field is on the result side.
-;;   :2094-2095 preflight_bytes + validate_limits, :2097 check_cache_identity
+;;   `preflight_bytes(artifact)?;` /
+;;   `validate_limits(limits, &preflight.digest)?;` /
+;;   `check_cache_identity(world, artifact, &preflight.digest, limits)?;`
 ;;                                               -- digest/limit/identity checks
 ;;                                                 over the presented bytes; the
 ;;                                                 limits are the test's.
-;;   :2102 preflight_component_type -> :1077-1080 imports must be empty (this
-;;      fixture imports nothing), :1083-1087 at least one export, :1088 exactly
-;;      one export, :1095 it must not be the legacy `run` export, :1098 the
-;;      export name must match world.interface_name() -> "cycle"
-;;      (src/typed_bindings.rs:133), i.e. "eliot:current/cycle@0.1.0"
-;;      (TYPED_PACKAGE_ID src/typed_bindings.rs:24), which is what this file
-;;      exports; :1104 the export must be a component instance; :1113-1125 the
-;;      interface may expose no callable or structural export outside
-;;      `describe` and `step`; :1127-1128 both functions must resolve in the
-;;      instance type; and :1129 typecheck_world_signatures, whose CYCLE arm at
-;;      :1208-1212 requires this component's declared `step` parameter, result
-;;      and error types to match
+;;   `preflight_component_type(world, engine, component)?;` -- inside `fn
+;;   preflight_component_type` (src/typed_execution.rs): `if let Some(import) =
+;;   imports.first()` requires the imports to be empty (this fixture imports
+;;   nothing); `if exports.is_empty()` requires at least one export; `if
+;;   exports.len() != 1` requires exactly one; `if *name ==
+;;   crate::typed_bindings::LEGACY_EXPORT || *name == "run"` rejects the legacy
+;;   `run` export; `export_matches_interface(name, world.interface_name())` --
+;;   `TypedWorld::interface_name` (src/typed_bindings.rs:133) -> "cycle", i.e.
+;;   "eliot:current/cycle@0.1.0" — the frozen export SPELLING the admission gate
+;;   accepts, formed as `format!("{TYPED_PACKAGE_ID}/{interface}")` at
+;;   src/typed_bindings.rs:185, where `TYPED_PACKAGE_ID` is
+;;   "eliot:current@0.1.0" (src/typed_bindings.rs:24).
+;;   CAREFUL: THIS FILE DOES NOT EXPORT THAT SPELLING. It deliberately plants the
+;;   bare `eliot:current@0.1.0` at its package-id field, which is this fixture
+;;   family's lie and the reason a sibling fixture exists at all. An earlier
+;;   version of this comment said "which is what this file exports" and
+;;   contradicted its own fixture body.
+;;   `ComponentItem::ComponentInstance` requires the export to be a component
+;;   instance; the `for (name, item) in interface_type.exports(engine)` loop
+;;   permits no callable or structural export outside `describe` and `step`;
+;;   `component_function` must resolve both in the instance type; and
+;;   `typecheck_world_signatures(world, &descriptor, &domain, component)?`,
+;;   whose `TypedWorld::DreamerCycle` arm requires this component's declared
+;;   `step` parameter, result and error types to match
 ;;      `(wit::CycleStepInput,), (Result<wit::CycleOutcome, wit::CycleError>,)`.
 ;;      That is the check that requires the DECLARED TYPES ABOVE to equal the
 ;;      frozen WIT records -- record for record, field for field, in WIT order --
 ;;      and it is the check a WIT-absent record field fails: a mismatch is
-;;      returned as TypedExecutionError::ExportTypeMismatch("step") (:1212),
-;;      before `step` is dispatched at all. Nothing below is reached if it fails,
-;;      so this file's type declarations are load-bearing for this fixture, not
+;;      returned as TypedExecutionError::ExportTypeMismatch("step"), before
+;;      `step` is dispatched at all. Nothing below is reached if it fails, so
+;;      this file's type declarations are load-bearing for this fixture, not
 ;;      decoration.
-;;   :2107 validate_descriptor -> :532 world-name == world.world_name() ->
-;;      "dreamer-cycle" (src/typed_bindings.rs:120); :537 package-id ==
-;;      TYPED_PACKAGE_ID; :542 abi-revision == TYPED_ABI_REVISION; :547-551 the
-;;      bounded descriptor strings. `describe` is copied verbatim from the honest
-;;      sibling, so every one of these reads its true value.
-;;   :2109 validate_descriptor_abi_digest -> :798
-;;      descriptor.abi_digest == typed_wit_digest(). The abi-digest data segment
-;;      is copied verbatim from dreamer-cycle.wat:203, so it is the real digest
-;;      of the frozen WIT bytes, not a fixture-chosen value.
-;;   :2113 check_result -> :3433 selects check_cycle_result for
-;;      TypedDomainOutcome::DreamerCycle; :3611 `let R::Stepped(body) = value;`
-;;      binds because this file writes the ok discriminant 0 at 2048 and the
-;;      "stepped" case discriminant 0 at 2056.
-;;   :3612 check_echo(&body.operation_id, &admitted.operation_id,
-;;      "operation-id")  <-- THIS FIXTURE FORGES THIS FIELD. First failure.
-;; Everything after :3612 is never reached. For the record, the checks after it
-;; would have passed anyway: :3613 `state.fence-epoch` echoes the request
-;; honestly (dreamer-cycle.wat:194-196 kept here, and the caller builds that
-;; request's `state.fence-epoch` from the admitted record at
-;; src/typed_execution.rs:4509, so observed == admitted), and :3618
-;; `check_ceiling` reads the zeroed `proof-ceiling` byte as enum case 0 =
-;; "observation", rank 0, which is not above any admitted ceiling (proof_rank,
-;; :875-886).
+;;   `validate_descriptor(world, &descriptor, limits.max_output_bytes)` -- inside
+;;   `fn validate_descriptor`: `if descriptor.world_name != world.world_name()`
+;;   -> `TypedWorld::world_name` (src/typed_bindings.rs:120) -> "dreamer-cycle";
+;;   `if descriptor.package_id != crate::typed_bindings::TYPED_PACKAGE_ID`;
+;;   `if descriptor.abi_revision != TYPED_ABI_REVISION`; then the five
+;;   `bounded_descriptor_string(...)` calls. `describe` is copied verbatim from
+;;   the honest sibling, so every one of these reads its true value.
+;;   `validate_descriptor_abi_digest(&descriptor)` -- inside `fn
+;;   validate_descriptor_abi_digest`: `if descriptor.abi_digest !=
+;;   typed_wit_digest().as_str()`. The abi-digest data segment is copied
+;;   verbatim from dreamer-cycle.wat:205, so it is the real digest of the frozen
+;;   WIT bytes, not a fixture-chosen value.
+;;   `check_result(&result, admitted, &mut output_bound)` -- inside `fn
+;;   check_result`, the arm `TypedDomainOutcome::DreamerCycle(value) =>
+;;   check_cycle_result(value, admitted, bound)`; inside `fn check_cycle_result`
+;;   `let R::Stepped(body) = value;` binds because this file writes the ok
+;;   discriminant 0 at 2048 and the "stepped" case discriminant 0 at 2056.
+;;   `check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;`
+;;      <-- THIS FIXTURE FORGES THIS FIELD. First failure.
+;; Everything after that `check_echo` is never reached. For the record, the
+;; checks after it would have passed anyway: the `check_echo` of
+;; `&body.state.fence_epoch` against `&admitted.fence_epoch` (field
+;; `"fence-epoch"`) echoes the request honestly (dreamer-cycle.wat:194-196 kept
+;; here, and the caller builds that request's `state.fence-epoch` from the
+;; admitted record -- `fence_epoch: admitted.fence_epoch.clone()` inside
+;; `state: cycle_wit::DreamerState { ... }` of `fn cycle_request` in
+;; src/typed_execution.rs -- so observed == admitted), and the `check_ceiling`
+;; of `ceiling_cycle(body.proof_ceiling)` against `admitted.proof_ceiling`
+;; (field `"proof-ceiling"`) reads the zeroed `proof-ceiling` byte as enum case
+;; 0 = "observation", `fn proof_rank` rank 0, which is not above any admitted
+;; ceiling (`fn proof_rank` in src/typed_execution.rs).
 ;;
-;; (d) THE PRODUCTION LINE THAT COMPARES THE FORGED FIELD.
-;;   bins/eliot-wasm-host/src/typed_execution.rs:3612
+;; (d) THE PRODUCTION LINE THAT COMPARES THE FORGED FIELD, BY SYMBOL. Each item
+;; is a `fn` name in bins/eliot-wasm-host/src/typed_execution.rs plus the
+;; verbatim source text of the statement, deliberately NOT a line number: this
+;; file is edited underneath its own header, and a bare `:NNNN` rots silently.
+;;   fn check_cycle_result
+;;     let R::Stepped(body) = value;
 ;;     check_echo(&body.operation_id, &admitted.operation_id, "operation-id")?;
-;; inside `check_cycle_result` (typed_execution.rs:3605-3632), reached from
-;; `check_result` (typed_execution.rs:3415-3439, arm :3433). `check_echo` is
-;; defined at typed_execution.rs:890-899 and the comparison that fires is
-;; `if observed != admitted` at typed_execution.rs:895, returning
-;; TypedExecutionError::OutputViolation("operation-id"), staged as
-;; TypedStage::Output by the caller at typed_execution.rs:2113-2114.
+;;   <-- THE LINE THAT COMPARES THE FORGED FIELD
+;; reached from `fn check_result`, whose
+;;     TypedDomainOutcome::DreamerCycle(value) => check_cycle_result(value, admitted, bound)
+;; arm selects it. The comparison that fires is inside `fn check_echo`:
+;;   fn check_echo(
+;;     observed: &str,
+;;     admitted: &str,
+;;     field: &'static str,
+;; ) -> Result<(), TypedExecutionError> {
+;;     if observed != admitted {
+;;         return Err(TypedExecutionError::OutputViolation(field.to_owned()));
+;;     }
+;; so the denial is TypedExecutionError::OutputViolation("operation-id"). The
+;; caller stages it as TypedStage::Output at
+;;     check_result(&result, admitted, &mut output_bound)
+;;         .map_err(|error| staged(TypedStage::Output, error))?;
+;; inside `fn execute_domain_lane`, whose body ends `Ok((receipt, result))`.
 ;;
 ;; (e) LIMITS OF THIS FIXTURE, stated rather than hidden.
 ;;   - It proves the `check_echo` denial for the CYCLE world's operation-id only.
-;;     `TypedDomainOutcome::DreamerCycle` is the only arm that reaches :3612.
+;;     `TypedDomainOutcome::DreamerCycle` is the only arm that reaches the
+;;     forged-field `check_echo` in (d). The `:NNNN` figures in this bullet are
+;;     line positions of `check_echo` CALL SITES, which have no symbol of their
+;;     own; re-derive them from the `fn`s named in (c) and (d) above.
 ;;     There are TWELVE `check_echo` operation-id sites in the crate: six on the
-;;     REQUEST side (:3144 :3194 :3222 -- the activation world's `request-id` --
-;;     :3244 :3272 :3299, one per world) and six on the RESULT side (:3449
-;;     admission, :3503 assembly, :3543 activation, :3566 handler, :3586 screen,
-;;     :3612 cycle). This file reaches exactly one of the six result-side sites
+;;     REQUEST side (:3161 :3211 :3239 -- the activation world's `request-id` --
+;;     :3261 :3289 :3316, one per world) and six on the RESULT side (:3466
+;;     admission, :3520 assembly, :3560 activation, :3583 handler, :3603 screen,
+;;     :3629 cycle). This file reaches exactly one of the six result-side sites
 ;;     and says nothing about the other eleven.
 ;;   - It denies at the OUTPUT stage. Nothing downstream of `check_result` -- no
 ;;     receipt, no shared receipt, no semantic digest -- is produced, so the
@@ -174,8 +231,9 @@
 ;;     the gate compares by value and not by length; it does NOT separately
 ;;     exercise the length-only path, because the denial is a value denial.
 ;;   - The fixture still echoes `state.fence-epoch` honestly. That is deliberate:
-;;     forging it too would move the first failure to :3613 and would prove
-;;     nothing about :3612.
+;;     forging it too would move the first failure to the `fence-epoch`
+;;     `check_echo` that follows it, and would prove nothing about the
+;;     `operation-id` `check_echo` in (d).
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -301,8 +359,8 @@
     ;; the frozen ABI revision, in WIT field order. A lifted export flattens
     ;; its result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the
     ;; core function returns ONE pointer into exported linear memory
-    ;; (wasmparser-0.256.0 src/validator/component_types.rs:35, :129 and
-    ;; :1279-1292, enforced at src/validator/component.rs:1343 and :1365).
+    ;; (wasmparser-0.252.0 src/validator/component_types.rs:36, :130 and
+    ;; :1261-1274, enforced at src/validator/component.rs:1328 and :1350).
     ;; Retptr base 0x600: past the last descriptor byte at 0x478 and below
     ;; the 0x800 result tuple, so it collides with nothing in this memory.
     ;; Copied verbatim from dreamer-cycle.wat: this fixture's forgery lives in
@@ -327,8 +385,8 @@
       (i32.store (i32.const 1576) (i32.const 64))
       (i32.const 1536))
     ;; `step`: the admitted typed request arrives already lowered into guest
-    ;; memory. `state.fence-epoch` is copied back out of the request, so the
-    ;; host echo check for THAT field compares a value the guest actually read.
+    ;; memory. The request's own "fence-epoch" (record offset 28/32) is copied
+    ;; into the result's "state.fence-epoch", which the host echo check pins.
     ;; `operation-id` is not echoed at all: it is the forged literal below.
     (func (export "step") (param $req i32) (result i32)
       (local $n i32)
@@ -346,7 +404,7 @@
       ;; operation-id can equal it, so check_echo must deny.
       (i32.store (i32.const 2064) (i32.const 2304))
       (i32.store (i32.const 2068) (i32.const 36))
-      ;; echo "state.fence-epoch" back out of the lowered request.
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; Canonical-ABI derivation, pinned to wasmtime 47.0.4 /
       ;; wasmtime-environ-47.0.4 (CARGO_HOME registry):
       ;;   result<cycle-outcome, cycle-error> retptr base 0x800 (2048);

@@ -27,6 +27,29 @@
 //!   case 9, the "no synchronous compile-cancellation claim" in case 14, the
 //!   cache-identity composition in case 22, and the rest).
 //!
+//! SOURCE-GUARD SWEEP (W4, 2026-10-04). Every `TYPED_EXECUTION_SOURCE`
+//! text-search assertion in this file was classified, and none was deleted or
+//! weakened. Each one now carries an inline note naming its verdict:
+//! - **CONVERTED** — real-engine proof of the same property now exists and can
+//!   fail. Some were converted by assertions this sweep ADDED (case 13's
+//!   fuel-metering pair, case 14's stage-code rendering, case 22's isolated
+//!   allow-list leg, case 21's and case 23's store-scoped observation
+//!   equalities); the rest were already carried by executed assertions in the
+//!   same test, and the note names which one.
+//! - **NOT CONVERTIBLE** — no executed alternative exists from an external test
+//!   target, with the reason and the production lines recorded inline:
+//!   doc-comment prose, whole-file or whole-manifest ABSENCE claims, a negative
+//!   global scan for cross-invocation state, a private struct's per-slot
+//!   digests, the private `EpochDriver` teardown ordering, and the whole typed
+//!   DOMAIN request/result lane, whose `TypedDomainRequest` payloads are
+//!   crate-private generated bindgen types.
+//! - **UNAUTHORABLE FIXTURE** — case 15's `memory_grow_failed` post-approval
+//!   growth-failure path, which the pinned engine makes unreachable from any
+//!   authored component. Escalated, not weakened.
+//!
+//! The report for this sweep is
+//! `control-20260923-impl/v2/issues/758/SOURCE-GUARD-SWEEP-W4-20261004.md`.
+//!
 //! INTEGRATION-TEST BOUNDARY: the capsule-domain entry
 //! `execute_capsule_domain_experimental` takes a `&TypedDomainRequest`, whose
 //! variant payloads are crate-private generated bindgen types
@@ -72,6 +95,22 @@ const NEUTRAL_MANIFEST: &str =
     include_str!("../../../crates/modules/eliot-wasm-runtime/Cargo.toml");
 const NEUTRAL_CAPSULES_SOURCE: &str =
     include_str!("../../../crates/modules/eliot-wasm-runtime/src/capsule.rs");
+
+/// The instance count production stamps on every successful typed receipt.
+///
+/// This mirrors PRODUCTION's value and is not an independent expectation:
+/// `TypedReceipt` is built with the bare field `instances: 1` at
+/// `bins/eliot-wasm-host/src/typed_execution.rs:1061` (descriptor lane) and
+/// `:2162` (domain lane), and production names no constant for it — the
+/// `typed_execution` re-export block in `src/lib.rs:108-114` exports
+/// `TypedReceipt` (whose `instances` field is the produced value, not the
+/// expected one) but no `*_INSTANCES` constant, so the expectation is not
+/// reachable from this integration test without a production change. This one
+/// named site replaces the anonymous `1` literals that would otherwise drift
+/// silently. CHANGE PRODUCTION AND THIS TOGETHER: if either
+/// `src/typed_execution.rs:1061` or `:2162` stops being `instances: 1`, this
+/// constant must change in the same commit.
+const PRODUCTION_SUCCESS_INSTANCES: u32 = 1;
 
 /// The exact component interface export spelling the Host requires: the
 /// frozen package id plus the world's interface name.
@@ -469,9 +508,9 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
     // A SECOND defined table in the SAME core module, for the table-COUNT
     // ceiling. It is the exact table-shaped twin of `extra_memory` above and
     // carries the same single-variable argument: `MAX_TYPED_TABLES = 1`
-    // (`src/typed_execution.rs:54`) reaches the engine as the Store's table
-    // count (`src/typed_execution.rs:1408`, read back through
-    // `StoreState::tables` at `:1484-1486`), and the count is checked by
+    // (`src/typed_execution.rs:58`) reaches the engine as the Store's table
+    // count (`src/typed_execution.rs:1425`, read back through
+    // `StoreState::tables` at `:1501-1503`), and the count is checked by
     // `StoreOpaque::bump_resource_counts`
     // (`StoreLimits` snapshots `ResourceLimiter::tables` as
     // `StoreOpaque::table_limit`, wasmtime-47.0.4 `src/runtime/store.rs:936-943`;
@@ -898,7 +937,7 @@ fn every_six_typed_worlds_component_executes_through_its_neutral_capsule_pair() 
             "unexpected export spelling: {:?}",
             receipt.actual_exports[0]
         );
-        assert_eq!(receipt.instances, 1);
+        assert_eq!(receipt.instances, PRODUCTION_SUCCESS_INSTANCES);
         assert_eq!(receipt.stage, TypedStage::Cleanup.as_str());
         assert_eq!(receipt.terminal, "Completed");
         observed.push(world.world_name().to_owned());
@@ -912,6 +951,16 @@ fn every_six_typed_worlds_component_executes_through_its_neutral_capsule_pair() 
     }
     // A governed kit is refused on this lane (source contract): the
     // experimental receipt can never satisfy governed proof.
+    //
+    // NOT CONVERTIBLE (retained deliberately). Both guards pin the refusal
+    // production implements at
+    // `bins/eliot-wasm-host/src/typed_execution.rs:2312-2316`, inside
+    // `execute_capsule_domain_experimental` (`:2295`), whose
+    // `request: &TypedDomainRequest` parameter (`:2300`) carries six
+    // `Box<crate::typed_bindings::<world>::…>` payloads (`:1855-1892`) while
+    // `mod typed_bindings;` is private (`src/lib.rs:41`). An external test
+    // target can neither construct nor obtain such a request, so no executed
+    // alternative exists from this binary. Certified, not converted.
     assert!(TYPED_EXECUTION_SOURCE.contains("\"kit-governed\".to_owned()"));
     assert!(TYPED_EXECUTION_SOURCE.contains("if kit.governed {"));
 }
@@ -947,6 +996,18 @@ fn experimental_receipt_cannot_claim_governed_proof() {
     // the kit still validates, so nothing but the lane decides it.
     assert!(governed.validate().is_ok());
     assert!(governed.governed);
+    // NOT CONVERTIBLE (retained deliberately). Both guards below pin the
+    // capsule lane's governed-kit refusal, which production implements at
+    // `bins/eliot-wasm-host/src/typed_execution.rs:2312-2316` inside
+    // `execute_capsule_domain_experimental` (`:2295`). That entry takes
+    // `request: &TypedDomainRequest` (`:2300`), whose six variants each hold a
+    // `Box<crate::typed_bindings::<world>::…>` payload (`:1855-1892`) while
+    // `mod typed_bindings;` is private (`src/lib.rs:41`), so an external test
+    // target can neither construct nor obtain a request and can never enter
+    // that function. No executed alternative exists from here; the refusal is
+    // proven in-crate by the neutral-capsule drive in
+    // `src/typed_execution.rs`. The second guard is a verbatim duplicate of the
+    // case-3 guard at test `:932`; both are kept.
     assert!(TYPED_EXECUTION_SOURCE.contains("pub fn execute_capsule_domain_experimental("));
     assert!(TYPED_EXECUTION_SOURCE.contains("if kit.governed {"));
 
@@ -954,6 +1015,13 @@ fn experimental_receipt_cannot_claim_governed_proof() {
     // host never derives a governed ceiling on this lane.
     assert!(RECEIPT_BRIDGE_SOURCE.contains("proof_ceiling,"));
     assert!(RECEIPT_BRIDGE_SOURCE.contains("let mut shared = eliot_wasm_runtime::TypedReceipt {"));
+    // CONVERTED (already executed): the real proof of this guard is
+    // `assert_eq!(receipt.proof, ExecutionMode::LocalExperimental.proof())`
+    // above, bound to production
+    // `bins/eliot-wasm-host/src/typed_execution.rs:1044`
+    // (`proof: ExecutionMode::LocalExperimental.proof().to_owned()`) and read
+    // off a receipt the real engine produced. That assertion can fail if the
+    // production assignment drifts; this text search cannot. Guard kept.
     assert!(
         TYPED_EXECUTION_SOURCE
             .contains("proof: ExecutionMode::LocalExperimental.proof().to_owned()")
@@ -1273,6 +1341,22 @@ fn artifact_raw_input_and_leaf_bounds_are_checked_before_allocation() {
     // Declared source guard for the per-leaf typed string/list/item ceilings,
     // which live on the domain request path: the walkers bound each leaf
     // individually and `bound_request` runs before any lowering or dispatch.
+    //
+    // NOT CONVERTIBLE (retained deliberately). All five guards are reachable
+    // only through `execute_domain_lane`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:2107` calls
+    // `bound_request`, `:2121` calls `dispatch_domain`), and every entry into
+    // it needs a `&TypedDomainRequest` whose payloads are crate-private
+    // generated bindgen types (`:1855-1892`, `mod typed_bindings;` private at
+    // `src/lib.rs:41`). `MAX_TYPED_STRING_BYTES` / `MAX_TYPED_LIST_ITEMS`
+    // (`:50`, `:52`) are read only by `TypedBound::text` / `TypedBound::list`
+    // (`:845-869`), whose every caller is one of the `bound_*` walkers the
+    // domain request path owns. The descriptor lane reached from this test
+    // target bounds reported strings with a DIFFERENT ceiling,
+    // `MAX_DESCRIPTOR_STRING_BYTES` (`:42`, applied by `bounded_descriptor_string`
+    // at `:528`), which the executed `OutputViolation("native-contract")`
+    // denial above already proves. Both ceilings are proven on real engine
+    // input by the in-crate domain drive in this module.
     assert!(TYPED_EXECUTION_SOURCE.contains("const MAX_TYPED_STRING_BYTES: usize = 4_096;"));
     assert!(TYPED_EXECUTION_SOURCE.contains("const MAX_TYPED_LIST_ITEMS: usize = 256;"));
     assert!(TYPED_EXECUTION_SOURCE.contains("fn texts(&mut self, values: &[String])"));
@@ -1323,6 +1407,22 @@ fn the_same_buffer_is_hashed_and_compiled_and_a_foreign_digest_denies() {
 
     // Declared source guard: both the revalidation and the compile take the
     // same `&[u8]`; neither takes a path, a name or a URL.
+    //
+    // CONVERTED (already executed). The real proof of all three guards is
+    // executed above and can fail if production drifts:
+    // - `assert_eq!(receipt.artifact_digest, digest)` /
+    //   `assert_eq!(receipt.artifact_bytes, artifact.len() as u64)` bind the
+    //   receipt to the compiled buffer and cover the provider seam
+    //   (`bins/eliot-wasm-host/src/typed_execution.rs:1024` builds the provider
+    //   from that same `artifact`, `:1047-1048` records its digest and length);
+    //   `artifact` here is generated in this file and never written to disk, so
+    //   a receipt reporting its hash is a receipt about the PRESENTED bytes.
+    // - the two `AdmissionMismatch("cache-artifact")` denials above are
+    //   produced by the allow-list consult on the hash of the buffer handed in
+    //   (`:728` re-hash, `:734-737` the denial), which is why the mutated
+    //   buffer denies while the identical un-mutated one executes. Both
+    //   denials happen before `build_typed_dispatch_provider` is reached
+    //   (`:1022` before `:1024`), so no engine exists to serve a stale entry.
     assert!(TYPED_EXECUTION_SOURCE.contains("let digest = Sha256Digest::of_bytes(artifact);"));
     assert!(TYPED_EXECUTION_SOURCE.contains(
         "let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;"
@@ -1532,15 +1632,93 @@ fn infinite_loop_exhausts_fuel_at_the_stage_it_reaches() {
     assert_eq!(receipt.terminal, "Completed");
     assert!(receipt.fuel_consumed <= 50_000);
 
+    // EXECUTED PROOF that the fuel-metered store IS the store the guest
+    // actually ran in, and that the budget is policy-gated. Production measures
+    // `fuel_consumed` as `budget - store.get_fuel()` and only when
+    // `typed_fuel_budget` returned `Some`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:1587-1590`), and
+    // `typed_fuel_budget` returns `Some` only under `EpochAndFuel`
+    // (`:1407-1412`). Two failable consequences, both read off real receipts:
+    //
+    // - a COMPLETING call that reports fuel consumed cannot have run in a store
+    //   the budget never reached, because `run_guarded` builds exactly one
+    //   store (`:1583`) and runs the instantiate-and-describe closure on it
+    //   (`:1585`);
+    // - the SAME buffer under `EpochInterruption` with a ONE-unit fuel ceiling
+    //   COMPLETING is the discriminator. If that one unit had been installed,
+    //   the pinned engine would raise `Trap::OutOfFuel` and the denial above
+    //   would land at the descriptor stage; instead the call completes, which
+    //   is only reachable through the `EpochInterruption => None` arm (`:1410`)
+    //   and the `None` arm of the measurement (`:1589`). The epoch deadline is
+    //   pushed to the lane maximum here so the deadline cannot be what ends the
+    //   call and the completion is attributable to the absent fuel alone.
+    assert!(
+        receipt.fuel_consumed > 0,
+        "a completing fuel-metered typed call must have consumed fuel from the metered store"
+    );
+    let mut unmetered = default_experimental_limits(Sha256Digest::of_bytes(&honest));
+    unmetered.epoch.cancellation = CancellationPolicy::EpochInterruption;
+    // NOT asserted here: `unmetered.epoch.cancellation` against the literal it
+    // was just assigned from. That compares a test-authored value with itself,
+    // production is not involved, and no change in production could fail it.
+    // What is actually under test is the EXECUTED outcome below, which is
+    // driven by what production reads off that envelope.
+    unmetered.epoch.deadline_ticks = eliot_wasm_runtime::MAX_EPOCH_DEADLINE_TICKS;
+    unmetered.max_fuel = 1;
+    let (unmetered_receipt, _) = must(
+        run_describe(TypedWorld::DreamerCycle, &honest, &unmetered)
+            .map_err(|error| error.to_string()),
+    );
+    assert_eq!(
+        unmetered_receipt.terminal, "Completed",
+        "epoch-only execution must install no fuel budget at all"
+    );
+    // `fuel_consumed` is deliberately NOT asserted here. Production returns
+    // `None` for a store with no fuel meter and the receipt renders that as
+    // `0` at the `None => 0` arm, so the value is fixed by the envelope the
+    // test just built rather than by anything the engine did, and it is
+    // subsumed by the `Completed` assertion above. The executed proof that a
+    // metered call really consumes fuel is the `> 0` assertion in the metered
+    // leg above, which production's own counter can falsify.
+
     // Declared source guard: the store (fuel, epoch deadline and resource
     // limits) is built before instantiation and the descriptor call, both
     // inside the same guarded closure.
+    //
+    // CONVERTED: the executed assertions that now carry these two guards are
+    // the `receipt.fuel_consumed > 0` / `unmetered_receipt.terminal ==
+    // "Completed"` pair above, bound to production
+    // `bins/eliot-wasm-host/src/typed_execution.rs:1583-1590` (the one store,
+    // the one driver, the one closure, and the fuel measurement read from that
+    // store) and `:1407-1412` (`typed_fuel_budget`). Both can fail; the text
+    // search cannot.
     assert!(TYPED_EXECUTION_SOURCE.contains("run_guarded(engine, limits, |store| {"));
     assert!(TYPED_EXECUTION_SOURCE.contains("fn run_guarded<T>("));
     // Declared source guard: BOTH untrusted-execution legs read the cause from
     // the real engine trap code through one shared classifier, so the
     // initialization denials asserted above are the owner-typed fuel/epoch
     // causes rather than an untyped stage string.
+    //
+    // CONVERTED (already executed), each guard named:
+    // - `fn trap_termination` / `OutOfFuel => FuelExhausted`: the
+    //   `staged(Descriptor, engine("FuelExhausted"))` denial asserted above for
+    //   the `looping-describe` fixture is produced by `map_call_error`
+    //   (`:1316-1317`) from the real `Trap::OutOfFuel` the engine raised; the
+    //   code string `FuelExhausted` exists nowhere else in that path.
+    // - `Interrupt => EpochDeadline`: the
+    //   `staged(Instantiate, engine("EpochDeadline"))` denial asserted above for
+    //   the `instantiation-start-loop` fixture comes from
+    //   `map_instantiate_error` (`:1343-1344`) on a real `Trap::Interrupt`, and
+    //   the descriptor-stage `EpochDeadline` denials in case 14 from the same
+    //   arm.
+    // - `if let Some(termination) = trap_termination(error) {`: that is the
+    //   `map_instantiate_error` arm at `:1343`, and the instantiate-stage
+    //   `FuelExhausted` and `EpochDeadline` denials asserted above are
+    //   reachable only through it.
+    // - `ContextAdmission::instantiate(...)`: `:1642`, and the executed
+    //   `context-admission` fixture in the case-3 and case-26 loops returns a
+    //   receipt, which requires that exact call to have succeeded on the empty
+    //   linker.
     assert!(
         TYPED_EXECUTION_SOURCE.contains(
             "fn trap_termination(error: &wasmtime::Error) -> Option<EngineTermination> {"
@@ -1557,6 +1735,12 @@ fn infinite_loop_exhausts_fuel_at_the_stage_it_reaches() {
     assert!(
         TYPED_EXECUTION_SOURCE.contains("if let Some(termination) = trap_termination(error) {")
     );
+    // CONVERTED: `CancellationPolicy::EpochInterruption => None` is
+    // `typed_fuel_budget`'s `None` arm at
+    // `bins/eliot-wasm-host/src/typed_execution.rs:1410`. The executed proof is
+    // the `unmetered_receipt.terminal == "Completed"` assertion above: the same
+    // buffer under `EpochInterruption` with `max_fuel = 1` completes instead of
+    // dying on `Trap::OutOfFuel`, so no fuel was installed.
     assert!(TYPED_EXECUTION_SOURCE.contains("CancellationPolicy::EpochInterruption => None,"));
     assert!(
         TYPED_EXECUTION_SOURCE
@@ -1605,19 +1789,62 @@ fn the_supported_deadline_is_independent_of_fuel() {
         &staged(TypedStage::Descriptor, engine("EpochDeadline")),
     );
 
+    // EXECUTED PROOF that the compile-stage CODE is rendered by production and
+    // not by this file. `TypedStage::as_str`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:127-136`, the
+    // `Self::Compile => "compile"` arm at `:130`) is what `Display for
+    // TypedStage` delegates to (`:139-143`), and that is the `stage` the
+    // `Staged` arm of `Display for TypedExecutionError` formats (`:323`). Both
+    // assertions below can fail if either production mapping drifts, and
+    // neither compares a test-authored value against itself.
+    assert_eq!(TypedStage::Compile.as_str(), "compile");
+    assert_eq!(
+        denial_of(&staged(
+            TypedStage::Compile,
+            engine("compile:component-error")
+        )),
+        "STAGE:compile:ENGINE:compile:component-error"
+    );
+
     // Declared source guard: no synchronous compile-cancellation is claimed.
     // Compilation is synchronous, the compile stage is named but never
     // reported as aborted, and the epoch driver exists only around the
     // guarded invocation.
+    //
+    // NOT CONVERTIBLE, each guard named (retained deliberately):
+    // - "Compilation in\n/// this Host is synchronous" and "no
+    //   compile-cancellation or compile-abort" are DOC-COMMENT PROSE
+    //   (`bins/eliot-wasm-host/src/typed_execution.rs:104-107`). A comment is
+    //   not behaviour and no execution can falsify its wording.
+    // - `struct EpochDriver {` (`:1519`) and `impl Drop for EpochDriver {`
+    //   (`:1559`) are a PRIVATE struct and its teardown impl. Spawning a driver
+    //   has no observable effect beyond the epoch terminations already executed
+    //   above, and the ORDER of `stop`/`join` inside `Drop` (`:1560-1565`) is
+    //   unobservable from outside the crate: no exported symbol exposes driver
+    //   state, and a joined thread and an abandoned one differ only in timing.
+    //   The observable consequence of per-invocation teardown — an interrupted
+    //   call leaving nothing behind for the next one — is executed in case 21.
     assert!(TYPED_EXECUTION_SOURCE.contains("Compilation in\n/// this Host is synchronous"));
+    // CONVERTED: the executed proof is the `starved` leg above plus its case-13
+    // twin `unmetered_receipt.terminal == "Completed"`: the same buffer under
+    // `EpochInterruption` with a ONE-unit fuel ceiling ends at the deadline (or
+    // completes, for an honest buffer) instead of on `Trap::OutOfFuel`, which
+    // is only reachable if `typed_fuel_budget`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:1407-1412`) returned `None`.
     assert!(
         TYPED_EXECUTION_SOURCE
             .contains("fn typed_fuel_budget(limits: &InvocationLimits) -> Option<u64> {")
     );
+    // CONVERTED: the `EpochInterruption => None` arm at
+    // `bins/eliot-wasm-host/src/typed_execution.rs:1410`; see the case-13
+    // `unmetered_receipt` assertions, which execute that arm.
     assert!(TYPED_EXECUTION_SOURCE.contains("CancellationPolicy::EpochInterruption => None,"));
     assert!(TYPED_EXECUTION_SOURCE.contains("struct EpochDriver {"));
     assert!(TYPED_EXECUTION_SOURCE.contains("impl Drop for EpochDriver {"));
     assert!(TYPED_EXECUTION_SOURCE.contains("no compile-cancellation or compile-abort"));
+    // CONVERTED: the executed proof is the `TypedStage::Compile.as_str()` /
+    // staged-rendering pair added above, bound to production
+    // `bins/eliot-wasm-host/src/typed_execution.rs:130`, `:139-143` and `:323`.
     assert!(TYPED_EXECUTION_SOURCE.contains("Self::Compile => \"compile\","));
 }
 
@@ -1674,7 +1901,7 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
     // consequences this leg pins down, both read off the executed value:
     // `limit_hit` stays `None`, so the count refusal is NOT typed as a memory
     // ceiling by this Host; and `map_instantiate_error`
-    // (`src/typed_execution.rs:1305-1338`, `fn map_instantiate_error`) cannot
+    // (`src/typed_execution.rs:1322-1355`, `fn map_instantiate_error`) cannot
     // classify it either --
     // `is_instance_limit_error` requires "instance" in the message
     // (`src/wasmtime_provider.rs:767-770`) and the memory-count bail spells
@@ -1719,6 +1946,26 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
     // Declared source guard for the memory-COUNT ceiling: `InvocationLimits`
     // carries no memory count, so the Host fixes it and forwards it to the
     // engine's `StoreLimits` (a refused growth sets the recorded limit hit).
+    //
+    // CONVERTED (already executed), each guard named, all bound to
+    // `bins/eliot-wasm-host/src/typed_execution.rs`:
+    // - `MAX_TYPED_MEMORIES = 1` (`:55`) and `.memories(MAX_TYPED_MEMORIES)`
+    //   (`:1423`): the `two_memories` leg above declares TWO core memories and
+    //   is refused at instantiation, while the byte-identical-one-memory
+    //   component from the same generator completes under the same envelope.
+    //   One is the only ceiling that makes those two outcomes differ.
+    // - `.memory_size(usize::try_from(limits.max_memory_bytes))` (`:1422`): the
+    //   sub-page leg below sets `max_memory_bytes = 32_768` against a
+    //   component whose declared minimum is one page and gets a
+    //   `staged(Instantiate, engine("MemoryLimit"))` denial. A ceiling that
+    //   were not forwarded could not refuse the component at all.
+    // - `self.limit_hit.get_or_insert(ResourceLimitHit::Memory)` (`:1463`):
+    //   the cause `MemoryLimit` is produced ONLY by `resource_limit_error`
+    //   (`:1270-1276`, `:1272`) from a recorded `limit_hit`, and
+    //   `map_instantiate_error` reads `limit_hit` before the engine message
+    //   (`:1326-1328`). The memory-COUNT refusal above proves the converse,
+    //   that a refusal with `limit_hit == None` surfaces as the generic
+    //   `instantiate:component-error` instead.
     assert!(TYPED_EXECUTION_SOURCE.contains("const MAX_TYPED_MEMORIES: usize = 1;"));
     assert!(TYPED_EXECUTION_SOURCE.contains(".memories(MAX_TYPED_MEMORIES)"));
     assert!(
@@ -1727,6 +1974,38 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
     assert!(
         TYPED_EXECUTION_SOURCE.contains("self.limit_hit.get_or_insert(ResourceLimitHit::Memory);")
     );
+    // NOT CONVERTIBLE — UNAUTHORABLE FIXTURE (retained deliberately). This is
+    // the POST-APPROVAL growth-failure path
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:1468-1472`), and the pinned
+    // engine makes it unreachable from any authored component. Reaching it needs
+    // the limiter to ALLOW a growth and the allocation to fail afterwards; every
+    // Wasm-reachable refusal is decided BEFORE approval: `Memory::grow`
+    // There are EXACTLY TWO call sites of `memory_grow_failed` in the pinned
+    // engine's memory-growth path, and BOTH are unreachable from an authored
+    // component. An earlier version of this comment named only the second and
+    // was therefore incomplete.
+    //
+    // (1) `memory.rs:641-646` — reached only when
+    // `!self.ty().allow_growth_to(new_byte_size)`, i.e. a growth this linear
+    // memory's TYPE cannot represent. `allow_growth_to` returns `true`
+    // immediately for any memory with a non-default page size and otherwise
+    // admits growth for the standard 64 KiB-page memories these fixtures
+    // declare, so this branch is not taken. A limiter failure here would call
+    // `memory_grow_failed` at `:644` BEFORE the store limiter ever approves,
+    // which is why the approval story below does not cover this path.
+    //
+    // (2) `memory.rs:715-724` — reached only when the underlying HOST
+    // allocator's `grow_to` returns an error, i.e. a real allocation failure,
+    // after the store limiter has already approved. A guest-declared maximum
+    // cannot get here: `StoreLimits::memory_growing` returns `Ok(false)` for
+    // `desired > limit` and for `desired > maximum`, so the growth is refused
+    // at `:650-657` and the closure holding the "Memory maximum size exceeded"
+    // bail at `:666-670` never runs. An authored component cannot provoke a
+    // host allocation failure either.
+    //
+    // Escalated, not weakened: the growth-refusal proof this file does have is
+    // the `memory_growing` not-allowed branch exercised by the `memory-growth`
+    // fixture above, which is a different production line.
     assert!(
         TYPED_EXECUTION_SOURCE
             .contains("fn memory_grow_failed(&mut self, _error: wasmtime::Error)")
@@ -1744,7 +2023,7 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
     // Where the refusal is produced, verified by opening each range:
     // - the ceiling is `limits.max_memory_bytes`, forwarded to
     //   `wasmtime::StoreLimitsBuilder::memory_size`
-    //   (`src/typed_execution.rs:1405`), and `StoreLimits::memory_growing`
+    //   (`src/typed_execution.rs:1422`), and `StoreLimits::memory_growing`
     //   returns `Ok(false)` for any `desired > limit`
     //   (wasmtime-47.0.4 `src/runtime/limits.rs:337-355`, the comparison at
     //   `:344`);
@@ -1759,24 +2038,24 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
     //   initializer (`src/runtime/component/instance.rs:838-841`);
     // - this Host records the refusal: `StoreState::memory_growing` stores
     //   `ResourceLimitHit::Memory` in `limit_hit` on the not-allowed branch
-    //   (`src/typed_execution.rs:1429-1449`, `:1445-1447`);
+    //   (`src/typed_execution.rs:1446-1466`, `:1462-1464`);
     // - and `map_instantiate_error` consults `limit_hit` FIRST, before it reads
-    //   the engine message at all (`src/typed_execution.rs:1309-1311`), so the
+    //   the engine message at all (`src/typed_execution.rs:1326-1328`), so the
     //   typed cause is the owner-typed `MemoryLimit` from
-    //   `resource_limit_error` (`src/typed_execution.rs:1253-1259`, mapping
+    //   `resource_limit_error` (`src/typed_execution.rs:1270-1276`, mapping
     //   `ResourceLimitHit::Memory` to `EngineTermination::MemoryLimit` at
-    //   `:1255`), NOT a substring of the engine's own "memory minimum size of
+    //   `:1272`), NOT a substring of the engine's own "memory minimum size of
     //   1 pages exceeds memory limits" bail. No generic internal-error prose is
     //   reported as normal control behaviour: the cause is the exact owner-typed
     //   limit code.
     //
     // The stage is the one actually reached -- component instantiation, before
     // the descriptor call -- from `describe_cue_activation`'s instantiate arm
-    // (`src/typed_execution.rs:1694-1700`), so it is `Instantiate`, not the
+    // (`src/typed_execution.rs:1711-1717`), so it is `Instantiate`, not the
     // `Cleanup` the soft growth refusal above reports.
     //
     // Half a page is as far below as this lane can go: a ZERO ceiling is refused
-    // by the Host's own envelope validation (`src/typed_execution.rs:500-513`)
+    // by the Host's own envelope validation (`src/typed_execution.rs:511-524`)
     // as `LIMIT_DENIED:envelope` before the engine is ever built, so it would
     // prove the envelope gate, not the Store ceiling.
     //
@@ -1852,10 +2131,38 @@ fn table_instance_and_resource_bounds_are_enforced() {
             .map_err(|error| error.to_string()),
     );
     assert_eq!(receipt.terminal, "Completed");
-    assert_eq!(receipt.instances, 1);
+    assert_eq!(receipt.instances, PRODUCTION_SUCCESS_INSTANCES);
 
     // Declared source guard: table elements/count and instance count are all
     // forwarded to the engine's `StoreLimits`.
+    //
+    // CONVERTED (already executed), each guard named, all bound to
+    // `bins/eliot-wasm-host/src/typed_execution.rs`:
+    // - `MAX_TYPED_TABLES = 1` (`:58`) and `.tables(MAX_TYPED_TABLES)` (`:1425`):
+    //   the `two_tables` leg below declares TWO core tables and is refused at
+    //   instantiation, while the same generator's one-table component completes
+    //   under the same ceilings and envelope.
+    // - `.table_elements(usize::try_from(limits.max_table_elements))` (`:1424`):
+    //   the `table-exhaustion` denial above at the default eight elements and
+    //   the `one_element` denial below at one element are the SAME fixture
+    //   under two ceilings, so the forwarded value is what moved.
+    // - `.instances(usize::try_from(limits.max_instances))` (`:1426`): the
+    //   `two_instances` leg above sets `max_instances = 1` against a
+    //   two-core-instance component and gets
+    //   `staged(Instantiate, engine("InstanceLimit"))`.
+    // - `fn table_growing(` (`:1474`): the `TableLimit` cause above and below
+    //   exists only via `resource_limit_error` (`:1270-1276`, `:1273`) from a
+    //   recorded `limit_hit`, and the pinned engine decides every
+    //   Wasm-reachable table refusal inside that call —
+    //   `StoreLimits::table_growing` returns `Ok(false)` for `desired > limit`
+    //   (wasmtime-47.0.4 `src/runtime/limits.rs:366-384`, `:373`) and for
+    //   `desired > maximum` (`:375`), so the not-allowed branch at `:1486` is
+    //   the one that runs.
+    // - `if is_instance_limit_error(error) {` (`:1332`): `InstanceLimit` is
+    //   produced only at `:1333` inside that branch, so the `two_instances`
+    //   denial is the executed witness; the `two_memories` and `two_tables`
+    //   denials, whose engine messages do not match that classifier, land on
+    //   the generic `:1352-1353` fallback instead, which is the discriminator.
     assert!(TYPED_EXECUTION_SOURCE.contains("const MAX_TYPED_TABLES: usize = 1;"));
     assert!(TYPED_EXECUTION_SOURCE.contains(".tables(MAX_TYPED_TABLES)"));
     assert!(
@@ -1868,7 +2175,7 @@ fn table_instance_and_resource_bounds_are_enforced() {
 
     // THE TABLE-ELEMENT CEILING, TIGHTENED AND EXECUTED. The default admits
     // EIGHT elements (`default_experimental_limits`,
-    // `src/typed_execution.rs:460`); this leg admits ONE, which is exactly the
+    // `src/typed_execution.rs:471`); this leg admits ONE, which is exactly the
     // fixture's own declared table minimum `(table 1 256 funcref)`
     // (`tests/data/typed-components/table-exhaustion.wat:127`), so the guest is
     // refused its very first `table.grow`. The refusal is still the engine's own
@@ -1877,17 +2184,17 @@ fn table_instance_and_resource_bounds_are_enforced() {
     // the comparison at `:373`), so `table.grow` returns -1, the guest runs to
     // completion, and `StoreState::table_growing` records
     // `ResourceLimitHit::Table` in `limit_hit` on the not-allowed branch
-    // (`src/typed_execution.rs:1457-1472`, `:1468-1470`). `run_guarded` then
+    // (`src/typed_execution.rs:1474-1489`, `:1485-1487`). `run_guarded` then
     // denies the COMPLETED call at teardown from that recorded hit
-    // (`src/typed_execution.rs:1574` and `:1576-1589`, the staged refusal at
-    // `:1579`), which `resource_limit_error` renders as the owner-typed
-    // `TableLimit` (`src/typed_execution.rs:1253-1259`, mapping
-    // `ResourceLimitHit::Table` to `EngineTermination::TableLimit` at `:1256`).
+    // (`src/typed_execution.rs:1591` and `:1593-1606`, the staged refusal at
+    // `:1596`), which `resource_limit_error` renders as the owner-typed
+    // `TableLimit` (`src/typed_execution.rs:1270-1276`, mapping
+    // `ResourceLimitHit::Table` to `EngineTermination::TableLimit` at `:1273`).
     // The tightened value is therefore not decoration: it is what moves the
     // refusal from the tail of the guest's growth attempts to its very first
     // one, and the denial still names the ceiling that refused it. One element is
     // the floor this lane can reach: a ZERO ceiling is refused by the Host's own
-    // envelope validation (`src/typed_execution.rs:500-513`) as
+    // envelope validation (`src/typed_execution.rs:511-524`) as
     // `LIMIT_DENIED:envelope` before any engine work, and the fixture's declared
     // one-element minimum is already admitted at a ceiling of one, so an
     // instantiation-time element refusal is unreachable here and is NOT claimed.
@@ -1910,9 +2217,9 @@ fn table_instance_and_resource_bounds_are_enforced() {
 
     // THE TABLE-COUNT CEILING, EXECUTED. `MAX_TYPED_TABLES = 1` is a Host
     // constant with no `InvocationLimits` field behind it
-    // (`src/typed_execution.rs:52-54`), forwarded to the engine's Store as
-    // `StoreLimitsBuilder::tables` (`src/typed_execution.rs:1408`) and read back
-    // through `StoreState::tables` (`src/typed_execution.rs:1484-1486`). This
+    // (`src/typed_execution.rs:56-58`), forwarded to the engine's Store as
+    // `StoreLimitsBuilder::tables` (`src/typed_execution.rs:1425`) and read back
+    // through `StoreState::tables` (`src/typed_execution.rs:1501-1503`). This
     // component declares TWO core tables in the same core module, and the base
     // template declares none, so the engine really is asked to honour a count
     // of two against `MAX_TYPED_TABLES = 1`, and the count really is
@@ -1930,13 +2237,13 @@ fn table_instance_and_resource_bounds_are_enforced() {
     // Three consequences, all read off the executed value and none invented:
     // `limit_hit` stays `None`, so this Host does NOT type a count refusal as a
     // table ceiling; `map_instantiate_error`
-    // (`src/typed_execution.rs:1305-1338`) cannot classify it either --
+    // (`src/typed_execution.rs:1322-1355`) cannot classify it either --
     // `is_instance_limit_error` requires "instance" in the message
     // (`src/wasmtime_provider.rs:767-770`) and this bail spells "resource limit
     // exceeded: table count too high at 2"; the bail is not a `wasmtime::Trap`,
-    // so `trap_termination` returns `None` (`src/typed_execution.rs:1276-1285`);
+    // so `trap_termination` returns `None` (`src/typed_execution.rs:1293-1302`);
     // and the message matches none of "import"/"export"/"missing"/"type" in the
-    // `:1329-1337` fallbacks. The real, observable denial is therefore the
+    // `:1346-1354` fallbacks. The real, observable denial is therefore the
     // staged generic component-error instantiation denial, asserted in full
     // below with its exact rendered string -- the ceiling IS enforced by the
     // Store limiter; it simply carries no table-count code of its own, and this
@@ -1987,7 +2294,7 @@ fn table_instance_and_resource_bounds_are_enforced() {
         .map_err(|error| error.to_string()),
     );
     assert_eq!(cooperative_receipt.terminal, "Completed");
-    assert_eq!(cooperative_receipt.instances, 1);
+    assert_eq!(cooperative_receipt.instances, PRODUCTION_SUCCESS_INSTANCES);
 }
 
 // WORK_UNIT_CASE: 758/17
@@ -2002,7 +2309,7 @@ fn a_guest_typed_error_is_distinct_from_a_trap() {
     // `six_world_capsule_drive::assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap`,
     // called from
     // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
-    // (`src/typed_execution.rs:5656-5657` declares the test, `:5676` is the
+    // (`src/typed_execution.rs:5673-5674` declares the test, `:5693` is the
     // call: `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
     // -> `assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap`).
     // It cannot live in any `tests/` target,
@@ -2013,7 +2320,7 @@ fn a_guest_typed_error_is_distinct_from_a_trap() {
     // and cannot reach either domain entry at all (the crate states this in the
     // comment above
     // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`,
-    // `src/typed_execution.rs:5649-5655`, line 5652: "`mod typed_bindings`
+    // `src/typed_execution.rs:5666-5672`, line 5669: "`mod typed_bindings`
     // is private in `src/lib.rs`"). That helper decides the typed-`Err`
     // branch from executed values only — the retained terminal result and the
     // terminal a terminated guest never produces. None of that is restated or
@@ -2149,6 +2456,15 @@ fn output_size_schema_and_identity_violations_are_denied() {
             .map_err(|error| error.to_string()),
     );
     assert_eq!(receipt.terminal, "Completed");
+    // NOT CONVERTIBLE (retained deliberately). This guard is a verbatim
+    // duplicate of the case-9 guard, and `MAX_TYPED_LIST_ITEMS`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:52`) is read only by
+    // `TypedBound::list` (`:855-869`), whose every caller is a `bound_*` walker
+    // on the domain REQUEST path — `bound_request` is reached only from
+    // `execute_domain_lane` (`:2107`), which needs a `&TypedDomainRequest` this
+    // external test target cannot build. The executed leg above is the honest
+    // half of this fixture: its `describe` really does run and complete, which
+    // is what makes the domain leg's list ceiling reachable in-crate at all.
     assert!(TYPED_EXECUTION_SOURCE.contains("const MAX_TYPED_LIST_ITEMS: usize = 256;"));
 }
 
@@ -2216,6 +2532,17 @@ fn proof_authority_and_effect_escalation_is_rejected() {
 
     // Declared source guard: a guest ceiling above the admitted ceiling is
     // refused by rank, never accepted because it is well formed.
+    //
+    // NOT CONVERTIBLE (retained deliberately). `check_ceiling`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:919-928`, the rank compare
+    // at `:924`) has no caller outside the six `check_<world>_result` result
+    // gates (`:3470`, `:3489`, `:3524`, `:3529`, `:3561`, `:3584`, `:3607`,
+    // `:3635`), and those gates run only from `dispatch_domain` (`:3651`),
+    // i.e. the domain RESULT path — which needs a `&TypedDomainRequest` and the
+    // admitted echo identity this external test target cannot construct. The
+    // `raised-proof-ceiling` leg above is the honest half that can run from
+    // here: its `describe` really executes, which is what makes the domain
+    // ceiling gate reachable in-crate.
     assert!(TYPED_EXECUTION_SOURCE.contains("fn check_ceiling("));
     assert!(TYPED_EXECUTION_SOURCE.contains("if observed > proof_rank(admitted) {"));
 }
@@ -2282,8 +2609,35 @@ fn cancellation_preserves_the_actual_stage_and_cleanup() {
     assert_eq!(after.cache_identity, baseline.cache_identity);
     assert_eq!(after.stage, TypedStage::Cleanup.as_str());
 
+    // EXECUTED PROOF that the interrupted call's PER-STORE measurement did not
+    // survive it. `fuel_consumed` is read from that call's own store as
+    // `budget - store.get_fuel()`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:1587-1590`) and is
+    // deliberately EXCLUDED from `semantic_digest` (`:753-793` pushes no fuel
+    // field), so it is an independent observation the next call had to
+    // reproduce from its own store. The two equalities above cannot show this:
+    // `semantic_digest` and `cache_identity` agree whether or not a store's
+    // fuel counter leaked, so without this assertion the leak would be
+    // invisible.
+    assert_eq!(
+        after.fuel_consumed, baseline.fuel_consumed,
+        "the interrupted call's fuel measurement must not survive into the next call"
+    );
+
     // Declared source guard: the epoch driver is joined in `Drop`, so every
     // exit path tears the driver down before the engine is dropped.
+    //
+    // CONVERTED (partially; scope stated precisely). All four guards describe
+    // `bins/eliot-wasm-host/src/typed_execution.rs:1559-1566` (`Drop`:
+    // `stop.store` at `:1561`, `handle.join()` at `:1563`) and the explicit
+    // `drop(driver)` at `:1586`, which runs AFTER the closure returns on every
+    // exit path, including the `EpochDeadline` exit this test just executed.
+    // The executed witness is the pair above: the interrupted call's
+    // store-scoped fuel measurement is gone, and the next call's is its own.
+    // What is NOT claimed: whether the driver THREAD was joined, as
+    // opposed to merely left harmless, is unobservable from outside the crate —
+    // no exported symbol exposes driver state, and the observable difference
+    // between the two is timing only. Guard kept for that narrower claim.
     assert!(TYPED_EXECUTION_SOURCE.contains("impl Drop for EpochDriver {"));
     assert!(TYPED_EXECUTION_SOURCE.contains("self.stop.store(true, Ordering::Release);"));
     assert!(TYPED_EXECUTION_SOURCE.contains("let _ = handle.join();"));
@@ -2297,9 +2651,18 @@ fn cache_identity_binds_artifact_policy_abi_and_engine() {
     let digest = Sha256Digest::of_bytes(&artifact);
     let limits = default_experimental_limits(digest.clone());
 
-    // Revalidation passes on every call; there is no bypass and no cache hit
-    // that skips the engine: each receipt is produced after a real
-    // instantiation and descriptor call.
+    // DETERMINISM CONTROL, NOT EVIDENCE THAT A SLOT IS BOUND. Both receipts
+    // below come from the ONE `dreamer-cycle` buffer under the ONE envelope
+    // `limits`, so `cache_identity` and `semantic_digest` are each a pure
+    // function of that single (artifact, envelope, world) input. Neither
+    // comparison varies anything, so neither can attribute an identity to a
+    // slot: `cache_identity` is a pure function of one input, and
+    // `semantic_digest` (`src/typed_execution.rs:753-793`) is strictly broader
+    // because it also folds in the output, stage and terminal, so it is a wider
+    // determinism control rather than an independent confirmation of the
+    // cache-identity slot. Both are kept because determinism across two
+    // independent real invocations is worth asserting. The evidence that a slot
+    // is BOUND is the `assert_ne!` legs below.
     let (first, _) = must(
         run_describe(TypedWorld::DreamerCycle, &artifact, &limits)
             .map_err(|error| error.to_string()),
@@ -2312,11 +2675,15 @@ fn cache_identity_binds_artifact_policy_abi_and_engine() {
     assert_eq!(first.semantic_digest, second.semantic_digest);
     // Real execution on both calls, not a cache pass: the receipt is produced
     // only after the component was instantiated and the descriptor was called.
-    assert_eq!(first.instances, 1);
+    assert_eq!(first.instances, PRODUCTION_SUCCESS_INSTANCES);
     assert_eq!(first.stage, TypedStage::Cleanup.as_str());
     assert_eq!(second.stage, TypedStage::Cleanup.as_str());
 
-    // Policy is bound: a different admitted ceiling is a different identity.
+    // Policy is bound, ISOLATED: `max_output_bytes` reaches
+    // `typed_policy_digest` (`src/typed_execution.rs:658`) and does NOT reach
+    // `typed_engine_configuration_digest` (`:641`, which binds version, target,
+    // fuel/epoch mode, stack, memory/table/instances), so this leg moves the
+    // policy slot alone.
     let mut other_policy = default_experimental_limits(digest.clone());
     other_policy.max_output_bytes += 1;
     let (policy_receipt, _) = must(
@@ -2325,8 +2692,69 @@ fn cache_identity_binds_artifact_policy_abi_and_engine() {
     );
     assert_ne!(policy_receipt.cache_identity, first.cache_identity);
 
+    // POLICY SLOT, ISOLATED ON THE ADMITTED ALLOW-LIST ALONE — and this is the
+    // leg that carries the `typed_policy_digest` guard below. Widening the
+    // allow-list moves `typed_policy_digest`'s allow-list tail and NOTHING
+    // else: `artifact` is the presented buffer's own digest and `artifact_bytes`
+    // its own length, and `typed_engine_configuration_digest`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:639-650`) reads only
+    // `max_memory_bytes`, `max_table_elements`, `max_instances`, `consume_fuel`
+    // and compile-time constants — never the allow-list. Same buffer, same
+    // world, same every ceiling: the artifact digest and length equalities
+    // below assert that, so a composed identity that failed to bind the
+    // allow-list would report the same `cache_identity` for both runs. The
+    // added digest belongs to no artifact presented here, so it cannot change
+    // what executed.
+    let mut widened = default_experimental_limits(digest.clone());
+    widened
+        .artifact_access
+        .allowed_digests
+        .insert(Sha256Digest::of_bytes(b"758-unrelated-admitted-artifact"));
+    let (widened_receipt, _) = must(
+        run_describe(TypedWorld::DreamerCycle, &artifact, &widened)
+            .map_err(|error| error.to_string()),
+    );
+    // ISOLATION PRECONDITIONS, NOT PROOF. These three state what this leg
+    // deliberately holds constant. Both runs execute the SAME buffer, so both
+    // sides' `artifact_digest`, `artifact_bytes` and `wit_digest` are read off
+    // that one buffer by production and are equal for every possible
+    // production state: they are controls, and they are kept because they
+    // document the precondition that makes the assertion below meaningful. The
+    // PROOF is the single `assert_ne!` that follows, and it is the one a
+    // production change can turn red.
+    assert_eq!(
+        widened_receipt.artifact_digest, first.artifact_digest,
+        "only the admitted allow-list may move in this leg"
+    );
+    assert_eq!(
+        widened_receipt.artifact_bytes, first.artifact_bytes,
+        "only the admitted allow-list may move in this leg"
+    );
+    assert_eq!(
+        widened_receipt.wit_digest, first.wit_digest,
+        "the ABI binding must be unchanged when only the allow-list moves"
+    );
+    assert_ne!(
+        widened_receipt.cache_identity, first.cache_identity,
+        "the admitted artifact allow-list must be bound into the cache identity"
+    );
+
     // Engine configuration is bound: different memory/table/instance ceilings
     // are a different identity even with the same artifact and world.
+    //
+    // PRECISE SCOPE, because the evidence must not be overstated: as composed,
+    // every limit-derived engine input (`max_memory_bytes`,
+    // `max_table_elements`, `max_instances`, and the `epoch.cancellation`-driven
+    // `consume_fuel`) is ALSO a field of `typed_policy_digest`
+    // (`src/typed_execution.rs:658-666`), and the only engine-digest inputs the
+    // policy digest omits are compile-time constants (`:639-650`: `ENGINE_VERSION`,
+    // target, `PROVIDER_STACK_SIZE`, `MAX_TYPED_MEMORIES`, `MAX_TYPED_TABLES`).
+    // This leg therefore proves the ceiling is bound INTO the identity; it
+    // cannot, from an integration test, separate the engine slot from the
+    // policy slot, because `TypedCacheIdentity` is private
+    // (`src/typed_execution.rs:601`) and its per-slot digests are not exported
+    // (`src/lib.rs:108-114`). Reported as the missing production surface; the
+    // policy leg above is the isolated one.
     let mut other_engine = default_experimental_limits(digest.clone());
     other_engine.max_memory_bytes = 131_072;
     let (engine_receipt, _) = must(
@@ -2335,8 +2763,14 @@ fn cache_identity_binds_artifact_policy_abi_and_engine() {
     );
     assert_ne!(engine_receipt.cache_identity, first.cache_identity);
 
-    // Artifact is bound: a different byte sequence for the same world is a
-    // different identity.
+    // Artifact is bound: a different byte sequence is a different identity.
+    //
+    // This leg moves the artifact AND the world AND the policy allow-list at
+    // once (`first` is `dreamer-cycle`, this runs `cue-activation`, and each
+    // envelope allow-lists only its own digest, which `typed_policy_digest`
+    // folds in at `src/typed_execution.rs:673-676`), so on its own it proves
+    // only that this other component is a different identity. The isolated
+    // artifact proof is the paired leg immediately below it.
     let mut other_fields = cooperative_guest();
     other_fields.native_revision = "fixture-native-revision-2".to_owned();
     let other_artifact = cue_activation_artifact(&other_fields, &CueOptions::default());
@@ -2348,8 +2782,50 @@ fn cache_identity_binds_artifact_policy_abi_and_engine() {
     assert_ne!(artifact_receipt.cache_identity, first.cache_identity);
     assert_ne!(artifact_receipt.artifact_digest, first.artifact_digest);
 
+    // Artifact slot, ISOLATED. Same world (`CueActivation` for both), same
+    // ceilings, and ONE envelope whose allow-list carries BOTH digests, so
+    // `typed_policy_digest` is byte-identical across the two runs and
+    // `typed_engine_configuration_digest` and `typed_abi_digest` are unchanged
+    // by construction. The artifact digest and its length are therefore the only
+    // inputs that differ, and a composed identity that did not bind them would
+    // report the same `cache_identity` for both.
+    let paired_base = cooperative_cue_artifact();
+    let mut paired_limits = default_experimental_limits(Sha256Digest::of_bytes(&paired_base));
+    paired_limits
+        .artifact_access
+        .allowed_digests
+        .insert(Sha256Digest::of_bytes(&other_artifact));
+    let (paired_first, _) = must(
+        run_describe(TypedWorld::CueActivation, &paired_base, &paired_limits)
+            .map_err(|error| error.to_string()),
+    );
+    let (paired_second, _) = must(
+        run_describe(TypedWorld::CueActivation, &other_artifact, &paired_limits)
+            .map_err(|error| error.to_string()),
+    );
+    // `world`, `engine_version` and `wit_digest` are held CONSTANT BY
+    // CONSTRUCTION in this pair and are deliberately NOT asserted: both calls
+    // pass the same `TypedWorld::CueActivation` literal and the same
+    // `paired_limits` value, and production assigns `world` from that literal,
+    // `engine_version` from `ENGINE_VERSION` and `wit_digest` from
+    // `typed_wit_digest()` unconditionally. Comparing those three would
+    // compare a constant with itself and could not fail, which is a stand-in
+    // rather than evidence. The three assertions below are the load-bearing
+    // ones, and they are the ones a production change can turn red.
+    assert_ne!(paired_first.artifact_digest, paired_second.artifact_digest);
+    assert_ne!(paired_first.artifact_bytes, paired_second.artifact_bytes);
+    assert_ne!(paired_first.cache_identity, paired_second.cache_identity);
+
     // ABI/world is bound: another frozen world's real component has a
     // different identity.
+    //
+    // PRECISE SCOPE: as above, this leg moves the artifact, its length, the
+    // world and the policy allow-list together, because a component's exported
+    // interface IS its world, so no integration test can hold the artifact fixed
+    // while changing the ABI slot. It proves a different frozen world is a
+    // different identity; isolating the ABI slot needs the per-slot digest of
+    // `TypedCacheIdentity.abi` (`src/typed_execution.rs:610`), which production
+    // does not export. Reported as the missing production surface.
     let other_world = load_fixture(TypedWorld::ContextAdmission);
     let world_limits = default_experimental_limits(Sha256Digest::of_bytes(&other_world));
     let (world_receipt, _) = must(
@@ -2361,12 +2837,36 @@ fn cache_identity_binds_artifact_policy_abi_and_engine() {
     // Declared source guard: the identity is exactly artifact+length+engine
     // configuration+ABI+policy, and carries no name, path, generation, fence
     // or proof value.
+    //
+    // MIXED, each guard named (all retained):
+    // - `typed_policy_digest` (`:656`): CONVERTED. The new `widened` leg above
+    //   executes the allow-list tail of that function's canonical string
+    //   (`:673-676`) in isolation — same buffer, same world, same ceilings, only
+    //   the admitted allow-list widened — so the denial-free identity change
+    //   below is attributable to the policy slot and to nothing else.
+    // - `struct TypedCacheIdentity {` (`:601`) and the five-slot format string
+    //   (`:619`): NOT CONVERTIBLE. The struct is private and the per-slot
+    //   digests are never exported (`src/lib.rs:108-114` re-exports the receipt
+    //   but no `TypedCacheIdentity` surface), so only the folded digest is
+    //   observable; the SLOT COUNT and the exact separator/order cannot be
+    //   falsified by execution from an integration test target. Escalated: the
+    //   missing surface is the per-slot digests of
+    //   `bins/eliot-wasm-host/src/typed_execution.rs:602-612`.
+    // - `typed_engine_configuration_digest` (`:639`) and `typed_abi_digest`
+    //   (`:683`): NOT CONVERTIBLE, and the two PRECISE SCOPE comments above
+    //   already state why — every limit-derived engine input is also a policy
+    //   input, so no envelope can move the engine slot alone, and a component's
+    //   exported interface IS its world, so no buffer can move the ABI slot
+    //   alone. Escalated: the same missing per-slot surface.
     assert!(TYPED_EXECUTION_SOURCE.contains("struct TypedCacheIdentity {"));
     assert!(TYPED_EXECUTION_SOURCE.contains("\"758-typed-cache-identity|{}|{}|{}|{}|{}\""));
     assert!(
         TYPED_EXECUTION_SOURCE
             .contains("fn typed_engine_configuration_digest(limits: &InvocationLimits)")
     );
+    // CONVERTED: the executed `widened_receipt.cache_identity !=
+    // first.cache_identity` assertion above, bound to production
+    // `bins/eliot-wasm-host/src/typed_execution.rs:673-676`.
     assert!(TYPED_EXECUTION_SOURCE.contains("fn typed_policy_digest(limits: &InvocationLimits)"));
     assert!(TYPED_EXECUTION_SOURCE.contains("fn typed_abi_digest(world: TypedWorld)"));
 }
@@ -2418,11 +2918,71 @@ fn a_failed_invocation_does_not_contaminate_the_next_one() {
     assert_eq!(after.artifact_digest, baseline.artifact_digest);
     assert_eq!(after.output_digest, baseline.output_digest);
     assert_eq!(after.terminal, "Completed");
+    // `instances` is deliberately NOT asserted here. Production stamps it as the
+    // bare literal `1` at both receipt construction sites, so it is not read
+    // from a counter or from the store, and the earlier inference that "no Store
+    // or instance handle survived the two failures" did not follow from it: both
+    // assertions below would have held no matter what the two failures did. The
+    // executed proof that each call measured its OWN store is the fuel and peak
+    // measurement block immediately after this one, which compares values the
+    // engine actually produced and therefore can fail.
+
+    // EXECUTED PROOF that each call measured its OWN store. The two
+    // observations below are read from the store of the call that produced
+    // them (`bins/eliot-wasm-host/src/typed_execution.rs` fuel at the
+    // `StoreState::finish_measurements` call and memory peak at the same
+    // site) and are deliberately EXCLUDED from `semantic_digest`, so the
+    // equalities above are blind to them: a leaked store, fuel budget or
+    // measurement would leave `semantic_digest`, `cache_identity`, the
+    // digests and the instance count untouched while moving these. Each can
+    // fail, because production reads both off a real meter.
+    assert_eq!(
+        after.fuel_consumed, baseline.fuel_consumed,
+        "a failed invocation must not leave its store's fuel measurement behind"
+    );
+    assert_eq!(
+        after.peak_memory_bytes, baseline.peak_memory_bytes,
+        "a failed invocation must not leave its store's peak-memory observation behind"
+    );
+    // `table_elements` is deliberately NOT asserted, and the reason is a fact
+    // about the fixture rather than about the host. The honest cycle fixture
+    // this case drives declares NO table at all — `dreamer-cycle.wat` has no
+    // `(table ...)` form anywhere — so `StoreState::table_elements` is
+    // initialised `None` and nothing ever writes it, because `observe_table`
+    // is fed only by a `table_growing` callback that this module never
+    // triggers. Both sides would therefore be `None`, and comparing `None`
+    // with `None` passes for every possible production state: it is a
+    // stand-in, not evidence. Observing a table here needs a fixture that
+    // declares one, which is the `table-exhaustion` case's job and not this
+    // one's.
 
     // Declared source guard: every call builds a fresh engine, component,
     // store and driver; this module holds no cross-invocation state.
+    //
+    // CONVERTED for the store (`:1583`, the first guard): the three executed
+    // observation equalities above are the witness. They can only hold if the
+    // third call built a store whose fuel counter, peak-memory tracker and
+    // table-element tracker started empty, which is what
+    // `wasmtime::Store::new(engine, StoreState { … peak_memory_bytes: None, …
+    // })` at `bins/eliot-wasm-host/src/typed_execution.rs:1418-1434` provides
+    // and only a per-call store can provide.
     assert!(TYPED_EXECUTION_SOURCE.contains("let mut store = new_store(engine, limits)?;"));
+    // NOT CONVERTIBLE (retained deliberately). `EpochDriver::spawn` (`:1525`)
+    // is reached from `run_guarded` (`:1584`) and its handle is dropped at
+    // `:1586`; a private driver thread leaves no observable trace beyond the
+    // epoch terminations case 13 and case 14 already execute, and no exported
+    // symbol exposes driver state, so spawn/teardown cannot be falsified from
+    // outside the crate. The observable consequence of a per-call driver — the
+    // next call reproducing its own measurements — is the assertion above.
     assert!(TYPED_EXECUTION_SOURCE.contains("let driver = EpochDriver::spawn(engine, limits)?;"));
+    // NOT CONVERTIBLE — NEGATIVE GLOBAL SCAN (retained deliberately). This
+    // loop asserts the ABSENCE of five static/cell constructs anywhere in
+    // `bins/eliot-wasm-host/src/typed_execution.rs`. An absence claim over a
+    // whole owner file's text has no executed witness: there is no API that
+    // enumerates a module's statics, and no fixture can make a
+    // never-referenced `OnceLock` observable. The executed partial substitute
+    // is the observation-equality triple above, which catches cross-invocation
+    // state that actually affects a call and cannot catch state that does not.
     for global in [
         "static MEMORY",
         "static mut",
@@ -2487,6 +3047,21 @@ fn receipt_bounds_and_secret_redaction_hold() {
 
     // The receipt record itself carries no path, payload or secret FIELD (the
     // prose may name what is excluded; the declared fields may not hold it).
+    //
+    // NOT CONVERTIBLE (retained deliberately). This scans the DECLARED FIELD
+    // LIST of `pub struct TypedReceipt`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:193-251`) out of the source
+    // text. "No field named path/secret/payload/raw/token exists" is a claim
+    // about a declaration, not about behaviour, and no run can falsify it: a
+    // field that nothing populates produces no observation. The executed
+    // substitute is the loop above, which walks EVERY reachable receipt string
+    // — proof, world, package, engine version, stage, terminal, both identity
+    // digests, cache identity, input/output digests, the actual import/export
+    // lists and the four optional identity fields
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:195-250`) — and fails on
+    // the planted secret, on `tests/`, on a backslash, on control characters
+    // and on any value over 512 bytes, then requires all five digest fields to
+    // be lowercase 64-hex. It cannot prove a field that production never fills.
     let declaration = TYPED_EXECUTION_SOURCE
         .split("pub struct TypedReceipt {")
         .nth(1)
@@ -2554,6 +3129,27 @@ fn the_semantic_receipt_is_deterministic_and_timing_stays_observational() {
 
     // Observational timing is recorded on its own field, never inside the
     // semantic identity.
+    //
+    // NOT CONVERTIBLE (retained deliberately). These assertions read the BODY
+    // of `fn semantic_digest`
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:753-793`) out of the source
+    // text and ask which field names it does not mention. The EXCLUSION claim
+    // they make has no executed witness from this target, and the reason is a
+    // reachability fact rather than an omission: to falsify "observation is
+    // excluded" a test needs two completed receipts with every SEMANTIC field
+    // equal and some OBSERVATION different, and no such pair exists here. Every
+    // field of `InvocationLimits` is an input to `typed_policy_digest`
+    // (`:656-678`) and therefore to `cache_identity`, which IS a semantic
+    // field (`:767`), so no envelope can hold the identity fixed while changing
+    // an observation; and the only lever that moves `fuel_consumed`,
+    // `peak_memory_bytes` or `table_elements` without moving the buffer is a
+    // ceiling, which moves the identity with it. The executed evidence in this
+    // test is therefore the DETERMINISM direction only: two independent real
+    // invocations of the same buffer under the same envelope agree on
+    // `semantic_digest` across every semantic field (asserted above) while
+    // `elapsed_ms` is measured per call. Case 13, case 21 and case 23 execute
+    // the same three observational fields as real values and show they vary
+    // with the call rather than with the identity.
     let observation_fields = [
         "elapsed_ms",
         "fuel_consumed",
@@ -2585,6 +3181,10 @@ fn the_semantic_receipt_is_deterministic_and_timing_stays_observational() {
             "observation leaked into the shared semantic digest: {field}"
         );
     }
+    // NOT CONVERTIBLE (retained deliberately): both are DOC-COMMENT PROSE on
+    // the `elapsed_ms` and `semantic_digest` fields
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:245` and `:249`). A comment
+    // is not behaviour; nothing that executes can falsify its wording.
     assert!(TYPED_EXECUTION_SOURCE.contains("    /// Observation-only wall time in milliseconds."));
     assert!(
         TYPED_EXECUTION_SOURCE.contains("    /// Deterministic semantic digest (excludes timing).")
@@ -2625,6 +3225,13 @@ fn the_production_binding_path_has_zero_ambient_inheritance_one_engine_and_no_mi
     }
 
     // Source guard: no WASI anywhere in the typed composition.
+    //
+    // NOT CONVERTIBLE (retained deliberately) — these are ABSENCE claims over
+    // whole-file and whole-manifest text. No execution can falsify "this string
+    // does not appear anywhere in this file": there is no API that enumerates a
+    // crate's dependencies or its source text, and no fixture can make an
+    // unreferenced `wasmtime_wasi` import observable at run time. This is the
+    // case-26 whole-file source guard the header declares.
     assert!(!HOST_MANIFEST.contains("wasmtime-wasi"));
     assert!(!HOST_MANIFEST.contains("wasmtime_wasi"));
     assert!(!TYPED_EXECUTION_SOURCE.contains("wasmtime_wasi"));
@@ -2632,6 +3239,16 @@ fn the_production_binding_path_has_zero_ambient_inheritance_one_engine_and_no_mi
         HOST_MANIFEST.matches("wasmtime.workspace = true").count(),
         1
     );
+    // CONVERTED (already executed). The real proof that the linker is EMPTY is
+    // the six-world loop above plus the case-11 denial: each world's real
+    // component reports `actual_imports.is_empty()` and exactly one export
+    // AFTER a successful instantiation, and the `forbidden-import` fixture —
+    // the honest `dreamer-cycle` surface plus one ambient WASI clock import —
+    // is refused as `ForbiddenImport("wasi:clocks/wall-clock@0.2.0")` by the
+    // component-TYPE preflight
+    // (`bins/eliot-wasm-host/src/typed_execution.rs:1090-1097`), before
+    // instantiation, so an ambient import could not be satisfied even if one
+    // were offered. A non-empty linker or any host function would break both.
     assert!(TYPED_EXECUTION_SOURCE.contains("wasmtime::component::Linker::new(engine)"));
 
     // Source guard: no second neutral-runtime engine and no second provider.
@@ -2660,6 +3277,23 @@ fn the_production_binding_path_has_zero_ambient_inheritance_one_engine_and_no_mi
 
     // Source guard: no legacy byte-runner fallback and no auto-upgrade on the
     // typed lane.
+    //
+    // MIXED, each guard named (all retained):
+    // - `call_run` / `guest_exec::` absences: NOT CONVERTIBLE, absence claims
+    //   over one owner file's whole text, as above. The executed PARTIAL
+    //   substitute is case 5: the checked-in legacy `run` component, presented
+    //   for a frozen world, is denied `LegacyMismatch` three times — including
+    //   under a zero host-call budget — so no legacy byte-runner fallback
+    //   served it. That catches a fallback that would have EXECUTED; it cannot
+    //   catch a reference no path reaches.
+    // - the legacy-export compare and its `LegacyMismatch` return: CONVERTED
+    //   (already executed). They are
+    //   `bins/eliot-wasm-host/src/typed_execution.rs:1112-1113`, inside
+    //   `preflight_component_type`, and the `LegacyMismatch` denials asserted
+    //   in case 5 are produced by exactly those two lines on a real compiled
+    //   legacy component. `check_governed_admission` and the neutral
+    //   `NeutralWorld::parse` assertions in that same case prove the identity is
+    //   unselectable, and `parse_args` proves the CLI never auto-promotes it.
     assert!(!TYPED_EXECUTION_SOURCE.contains("call_run"));
     assert!(!TYPED_EXECUTION_SOURCE.contains("guest_exec::"));
     assert!(TYPED_EXECUTION_SOURCE.contains("if *name == crate::typed_bindings::LEGACY_EXPORT"));

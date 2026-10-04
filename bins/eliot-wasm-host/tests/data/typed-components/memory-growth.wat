@@ -1,21 +1,31 @@
 ;; ELIOT typed NEGATIVE fixture for case 15 of #758: "memory growth/count
 ;; bounds".
 ;;
-;; `new_store` (typed_execution.rs:1397-1426) installs a
-;; `wasmtime::StoreLimits` with `memory_size(max_memory_bytes)` (at :1405) and
-;; `memories(MAX_TYPED_MEMORIES)` (at :1406), and `StoreState` (:1353-1360, with
-;; its `ResourceLimiter` impl at :1428-1491) forwards the
+;; `new_store` (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `new_store`,
+;; lines 1414-1443) installs a
+;; `wasmtime::StoreLimits` with `memory_size(max_memory_bytes)` (at same-file
+;; line 1422,
+;; `.memory_size(usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX))`)
+;; and
+;; `memories(MAX_TYPED_MEMORIES)` (at same-file line 1423, `.memories(
+;; MAX_TYPED_MEMORIES)`), and `StoreState` (same file, lines 1370-1377, with
+;; its `ResourceLimiter` impl at same-file lines 1445-1508) forwards the
 ;; count bounds while enforcing the byte bound in `memory_growing`
-;; (:1429-1449) and `memory_grow_failed` (:1451-1455). This component's
+;; (same file, lines 1446-1466) and `memory_grow_failed` (same-file lines
+;; 1468-1472). This component's
 ;; `describe` allocates until a grow is refused, which records
 ;; `StoreState::limit_hit`.
 ;;
 ;; Because the pinned `StoreLimits` denies growth softly
 ;; (`trap_on_grow_failure` is off), `memory.grow` returns -1 and the guest
 ;; runs to completion -- so the denial cannot be mistaken for a guest trap.
-;; `run_guarded` (:1561-1593) sees `Ok` with `limit_hit = Some(Memory)`
+;; `run_guarded` (`bins/eliot-wasm-host/src/typed_execution.rs`, fn
+;; `run_guarded`, lines 1578-1610) sees `Ok` with `limit_hit = Some(Memory)`
 ;; and returns `TypedExecutionError::Engine("MemoryLimit")`
-;; (`resource_limit_error`, :1253-1259) staged at `TypedStage::Cleanup` (:1579). A
+;; (`resource_limit_error`, same file, fn `resource_limit_error`, lines
+;; 1270-1276, `ResourceLimitHit::Memory => EngineTermination::MemoryLimit`)
+;; staged at `TypedStage::Cleanup` (same-file line 1596,
+;; `Err(staged(TypedStage::Cleanup, resource_limit_error(hit)))`). A
 ;; resource violation never becomes a successful receipt even though the guest
 ;; handled the failed grow and returned normally.
 ;;
@@ -149,10 +159,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
@@ -204,10 +214,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

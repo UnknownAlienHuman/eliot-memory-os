@@ -8,17 +8,29 @@
 ;; frozen WIT bytes the Host generated its bindings from.
 ;;
 ;; Every earlier validation passes on purpose, so the denial under test is
-;; reachable and is the lying-descriptor denial itself:
-;;   * `preflight_component_type` (typed_execution.rs:1065-1132) sees zero
-;;     imports and exactly one interface export with exactly `describe` and
-;;     `step`;
-;;   * `validate_descriptor` (typed_execution.rs:527-579) passes world-name,
+;; reachable and is the lying-descriptor denial itself. Every citation below
+;; names `bins/eliot-wasm-host/src/typed_execution.rs` -- NOT the same-basename
+;; `bins/eliot-wasm-host/tests/typed_execution.rs`, which is a different, shorter
+;; file:
+;;   * `preflight_component_type` (same file, fn `preflight_component_type`,
+;;     lines 1082-1149) sees zero
+;;     imports -- `if let Some(import) = imports.first() {` at same-file line
+;;     1094 -- and exactly one interface export with exactly `describe` and
+;;     `step` (the `exports.len() != 1` and `export_matches_interface` checks at
+;;     same-file lines 1105-1119);
+;;   * `validate_descriptor` (same file, fn `validate_descriptor`, lines 538-590)
+;;     passes world-name,
 ;;     package-id, abi-revision, every `bounded_descriptor_string` check at
-;;     :517-524 and the `output_bytes <= max_output_bytes` check at :552-563.
+;;     same-file lines 528-535 and the output-byte ceiling, which production
+;;     states as `if output_bytes > max_output_bytes {` at same-file lines
+;;     569-574 — quoted in the guard's own direction, since a lie that is
+;;     merely at the ceiling would be refused for a different reason.
 ;;     The lie is well formed and in bounds, so it is never accepted "because
 ;;     it looks right";
-;;   * `validate_descriptor_abi_digest` (typed_execution.rs:797-804) compares
-;;     the reported digest with `typed_wit_digest()` and returns
+;;   * `validate_descriptor_abi_digest` (same file, fn
+;;     `validate_descriptor_abi_digest`, lines 812-819) compares
+;;     the reported digest with `typed_wit_digest()` -- same-file line 813,
+;;     `if descriptor.abi_digest != typed_wit_digest().as_str() {` -- and returns
 ;;     `TypedExecutionError::OutputViolation("abi-digest")`.
 ;;
 ;; A descriptor is a claim, not a grant: it cannot add an import, select another
@@ -158,10 +170,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
@@ -197,10 +209,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
@@ -231,7 +243,7 @@
 ;; Offset note: the memory map above was corrected to the canonical-ABI
 ;; derivation, not chosen by hand. `canon lift` of a result that does not fit
 ;; MAX_FLAT_FUNC_RESULTS (1) requires the single-pointer signature enforced at
-;; wasmparser-0.256.0/src/validator/component.rs:1343 and :1365, and every
+;; wasmparser-0.252.0/src/validator/component.rs:1328 and :1350, and every
 ;; record field offset above is derived with
 ;; wasmtime-environ-47.0.4/src/component/types.rs:756-759. The planted
 ;; `abi-digest` string is the last (data (i32.const 1080) ...) segment, so its

@@ -2,7 +2,11 @@
   "contract": "F-LOG-HOST-0 host structured diagnostics facade",
   "issue": 889,
   "target": "eliot_host::diagnostics",
-  "note": "Pins the facade-init, absent Event Log seam, bounded queue/drop, and stdout-ownership proofs exercised by the focused contract tests. The full 22-case matrix (complete inventory, per-identity distinctions, canary sweeps, allowed-diff review) is deferred to the owning follow-ups (#891/#893/#985); real Host-wrapper Event Log delivery smoke on isolated Windows needs #984 and stays an honest residual.",
+  "note": "Pins the facade-init, absent Event Log seam, bounded queue/drop, and stdout-ownership proofs exercised by the focused contract tests, and enumerates every case of the 22-case matrix below so none stays deferred. Real Host-wrapper Event Log delivery smoke on isolated Windows needs #984 and stays an honest residual. Every label below is a short restatement of its issue's verbatim case text; where a test cannot reach the whole case, the label names only the part it proves.",
+  "allowed_diff": [
+    "bins/eliot-host/tests/host_diagnostics_contract.rs",
+    "bins/eliot-host/tests/data/host_diagnostics_cases.json"
+  ],
   "stages": {
     "startup": "startup",
     "launch_config": "launch_config",
@@ -27,5 +31,29 @@
     "service_failure": { "event_id": 102, "severity": "error" }
   },
   "queue_capacity": 64,
-  "stdout_protocol_contamination": false
+  "stdout_protocol_contamination": false,
+  "cases": [
+    { "id": 1, "marker": "889/1", "label": "exact current subscriber/sink/reference-callsite inventory" },
+    { "id": 2, "marker": "889/2", "label": "only workspace tracing facade" },
+    { "id": 3, "marker": "889/3", "label": "first process subscriber initialization" },
+    { "id": 4, "marker": "889/4", "label": "duplicate setup bounded and nonpanicking" },
+    { "id": 5, "marker": "889/5", "label": "stable event/reason/phase mapping; the test proves the event and phase names, not that no second lifecycle owner exists" },
+    { "id": 6, "marker": "889/6", "label": "exact request/operation/component identities" },
+    { "id": 7, "marker": "889/7", "label": "observed/requested/started/ready/durable evidence distinct; the test proves observed/admitted/started/durable at runtime and ready at the vocabulary level only" },
+    { "id": 8, "marker": "889/8", "label": "failed/cancelled/unknown distinct" },
+    { "id": 9, "marker": "889/9", "label": "unsupported success assertion rejected or downgraded, not invented" },
+    { "id": 10, "marker": "889/10", "label": "field/text/record/queue bounds and honest truncation/drop; the test proves the fixture's declared queue capacity against the product's own EVENT_LOG_QUEUE_CAPACITY and the honest drop counts, and does NOT prove an in-flight bound -- case 889/14 reads the live producer snapshot" },
+    { "id": 11, "marker": "889/11", "label": "no credential/token/environment/connection field slot in any facade record, and no over-cap secret tail or fragment in any record; the test does NOT prove an in-bound secret is absent, and asserts the opposite -- each in-bound canary is recorded verbatim with detail_truncated=false" },
+    { "id": 12, "marker": "889/12", "label": "no source/user/model field slot in any facade record and no over-cap payload tail or fragment in any record; the test does NOT prove an in-bound payload is absent, and asserts the opposite -- an in-bound payload is recorded verbatim with detail_truncated=false" },
+    { "id": 13, "marker": "889/13", "label": "scoped capture has deterministic semantic fields/order" },
+    { "id": 14, "marker": "889/14", "label": "sink degradation/blocked OS call cannot recurse, spawn unbounded workers or change operation result; timeout cannot falsely certify abort/drain" },
+    { "id": 15, "marker": "889/15", "label": "Event Log start source/event/severity mapping" },
+    { "id": 16, "marker": "889/16", "label": "Event Log stop mapping" },
+    { "id": 17, "marker": "889/17", "label": "Event Log failure mapping and correlation" },
+    { "id": 18, "marker": "889/18", "label": "missing/denied source and explicitly admitted degraded profile remain distinct and leave original Host result unchanged" },
+    { "id": 19, "marker": "889/19", "label": "exactly one current main.rs reference failure uses the facade" },
+    { "id": 20, "marker": "889/20", "label": "allowed-diff and no-lifecycle/unsafe/authority mutation guard" },
+    { "id": 21, "marker": "889/21", "label": "binary, library consumer and integration test compile against the same exported facade without duplicated module/subscriber state" },
+    { "id": 22, "marker": "889/22", "label": "tracing never corrupts console stdout framing and parallel scoped capture cannot replace a global subscriber" }
+  ]
 }

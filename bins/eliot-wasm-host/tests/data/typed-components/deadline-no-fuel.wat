@@ -11,10 +11,15 @@
 ;; `EpochInterruption`.
 ;;
 ;; The result is `wasmtime::Trap::Interrupt`, mapped by `map_call_error`
-;; (typed_execution.rs:1287-1303) to `EngineTermination::EpochDeadline` and
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `map_call_error`, which
+;; returns `TypedExecutionError::Engine(format!("{termination:?}"))` from
+;; `trap_termination`) to `EngineTermination::EpochDeadline` -- the exact arm fn
+;; `trap_termination` reads is
+;; `wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,` -- and is
 ;; reported as `TypedExecutionError::Engine("EpochDeadline")` staged at
 ;; `TypedStage::Descriptor`. The deadline comes from the host-driven epoch pump
-;; (`EpochDriver::spawn`, :1508-1539), which forces the epoch once
+;; (`EpochDriver::spawn`, `bins/eliot-wasm-host/src/typed_execution.rs`,
+;; lines 1525-1556), which forces the epoch once
 ;; `wall_deadline_ms` expires: a real supported interruption, not a dropped
 ;; caller future and not a claimed synchronous compile cancellation.
 ;;
@@ -144,19 +149,22 @@
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor shape. The signature is the
     ;; single `i32` retptr that `canon lift` of a record flattening to more than
-    ;; `MAX_FLAT_FUNC_RESULTS` (1) core values demands: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; `MAX_FLAT_FUNC_RESULTS` (1) core values demands: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;;
     ;; The spin below is the whole obligation of this file: with
     ;; `CancellationPolicy::EpochInterruption` the store carries NO fuel at all
-    ;; (`typed_fuel_budget`, typed_execution.rs:1390-1395 returns None at :1393 and
-    ;; `new_store` at :1397-1426 never calls `set_fuel`, which is only reached at
-    ;; :1419-1422), so the only thing that
+    ;; (`typed_fuel_budget`, `bins/eliot-wasm-host/src/typed_execution.rs`
+    ;; lines 1407-1412, whose `None` arm is
+    ;; `CancellationPolicy::EpochInterruption => None,`; and
+    ;; `new_store`, same file lines 1414-1443, never calls `set_fuel`, which is
+    ;; only reached at same-file lines 1436-1439), so the only thing that
     ;; can end this call is the injected epoch/wall deadline
-    ;; (`EpochDriver::spawn`, :1508-1539; `Trap::Interrupt` maps to
-    ;; `EngineTermination::EpochDeadline` at :1280). No retptr region is written
+    ;; (`EpochDriver::spawn`, same file lines 1525-1556; `Trap::Interrupt` maps to
+    ;; `EngineTermination::EpochDeadline` at same-file line 1297, the arm quoted
+    ;; in the header above). No retptr region is written
     ;; and no descriptor value is produced, because adding a store or a return
     ;; here would destroy exactly the obligation this file exists to prove.
     (func (export "describe") (result i32)
@@ -200,10 +208,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

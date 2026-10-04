@@ -77,9 +77,27 @@ the named owner file and requires the named consumer to still reference both
 the symbol and the crate.
 
 Completeness is measured against the independent expected sets declared in
-this module -- :data:`EXPECTED_AFFECTED_MANIFESTS`, :data:`EXPECTED_FROZEN_EDGES`
-and :data:`EXPECTED_FROZEN_LOCK_EDGES` -- never against a copy of the same
+this module -- :data:`EXPECTED_AFFECTED_MANIFESTS`, :data:`EXPECTED_FROZEN_EDGES`,
+:data:`EXPECTED_FROZEN_LOCK_EDGES` and
+:data:`EXPECTED_KERNEL_DEPENDENCY_KEYS` -- never against a copy of the same
 fixture list.
+
+:data:`EXPECTED_KERNEL_DEPENDENCY_KEYS` is the frozen admission list for the
+whole ``bins/eliot-kernel`` dependency-key surface, covering every table Cargo
+resolves from the manifest -- ``[dependencies]``, ``[dev-dependencies]``,
+``[build-dependencies]`` and all three sub-tables under each ``[target.*]``
+entry -- as one union. It is not :data:`EXPECTED_FROZEN_EDGES`: that constant
+names the four kernel edges this work unit prepares, while the composition root
+legitimately declares its entire runtime and test surface besides them. Case 2
+compares the manifest's real declared key set against the literal and requires
+equality in both directions, so an edge added outside the frozen set -- the
+unconsumed ``eliot-artifact`` edge of #974, in whichever table it is declared --
+is reported rather than riding along unconsumed, and an admitted edge deleted
+from the manifest is reported too. The constant is a hand-written literal, never
+derived from the manifest at run time; deriving it would make the comparison
+circular and permanently green. That is a human-review invariant rather than a
+machine-checked one, and it is called out as such at the predicate below rather
+than claimed as an enforcement this module does not perform.
 """
 
 from __future__ import annotations
@@ -210,6 +228,85 @@ EXPECTED_FROZEN_PACKAGES = (
     "eliot-blob-api",
     "eliot-kernel",
     "eliot-store-api",
+)
+
+# The frozen admitted DEPENDENCY-KEY set for ``bins/eliot-kernel/Cargo.toml``.
+#
+# ``EXPECTED_FROZEN_EDGES`` above names only the four edges THIS work unit is
+# preparing; the kernel composition root legitimately declares many more keys
+# (its whole runtime composition surface). Those two sets are therefore not the
+# same thing and must not be confused: a naive "kernel keys == frozen edges"
+# equality would be false. What this constant is instead is the exact,
+# deliberately-frozen admission list for the kernel manifest -- the key set the
+# manifest declared before issue #974 added its unconsumed ``eliot-artifact``
+# edge, i.e. the measured 31 ``[dependencies]`` keys minus ``eliot-artifact``.
+# Case 2 compares the manifest's real declared key set against this literal.
+#
+# ANTI-VACUITY: this is a hand-written LITERAL, never computed from the live
+# manifest at runtime. That is the whole point: deriving the expected set from
+# the file under test would make the comparison circular and always-green. It
+# must be edited deliberately (and the edit re-justified in review) whenever a
+# kernel dependency is added or removed -- which is exactly what forces the
+# artifact edge to be reported instead of silently riding along. HONEST SCOPE:
+# nothing in this module machine-checks that it is a literal, so this is a
+# human-review invariant; see the docstring of
+# :func:`unadmitted_dependency_keys`, which says so where the comparison
+# happens. The set covers EVERY table Cargo resolves from the kernel manifest
+# as their union -- ``[dependencies]``, ``[dev-dependencies]``,
+# ``[build-dependencies]`` and each ``[target.*]`` sub-table -- because the
+# card's wording is "declares ANY dependency key": a new unconsumed edge
+# smuggled into the dev table, into a build table or into a target-scoped table
+# would otherwise report green. A key declared in more than one table (there are
+# five in both the runtime and the dev table: eliot-installation, eliot-ipc,
+# eliot-kernel-service, eliot-ors, eliot-platform-windows) is one edge, so it is
+# listed once per table and de-duplicates in the comparison. The two marked
+# blocks below are therefore 30 runtime keys and 10 dev keys, 35 distinct keys
+# -- NOT 40. bins/eliot-kernel declares no ``[build-dependencies]`` and no
+# ``[target.*]`` table today, so those tables add no key here. This is the ONLY
+# literal to edit: no second list mirrors it, so there is nothing that can drift.
+EXPECTED_KERNEL_DEPENDENCY_KEYS = (
+    # [dependencies]
+    "blake3",
+    "eliot-authority",
+    "eliot-backup",
+    "eliot-contracts",
+    "eliot-installation",
+    "eliot-kernel-core",
+    "eliot-kernel-service",
+    "eliot-ipc",
+    "eliot-observability",
+    "eliot-observability-runtime",
+    "eliot-ors",
+    "eliot-process-executor",
+    "eliot-protocol",
+    "eliot-platform",
+    "eliot-platform-windows",
+    "eliot-runtime",
+    "eliot-receipts",
+    "eliot-runtime-contracts",
+    "eliot-security-contracts",
+    "eliot-store-api",
+    "eliot-testd-core",
+    "eliot-user-broker-core",
+    "eliot-workscope",
+    "eliot-process",
+    "serde_json",
+    "serde",
+    "sha2",
+    "tokio",
+    "tracing",
+    "tracing-subscriber",
+    # [dev-dependencies]
+    "eliot-ipc",
+    "eliot-kernel-service",
+    "eliot-ors",
+    "eliot-platform-windows",
+    "eliot-runtime-status",
+    "eliot-installation",
+    "redb",
+    "eliot-store-memory",
+    "eliot-store-surreal-adapter",
+    "secrecy",
 )
 
 # Change kinds the frozen lock delta declares out of bounds. Each is checked
@@ -584,6 +681,152 @@ def manifest_dependencies(manifest_path: Path) -> dict:
     dependencies = manifest.get("dependencies", {})
     assert isinstance(dependencies, dict), f"bad [dependencies] in {manifest_path}"
     return dependencies
+
+
+def manifest_dev_dependencies(manifest_path: Path) -> dict:
+    """Return the [dev-dependencies] table of a Cargo manifest.
+
+    Both this and :func:`manifest_dependencies` read the real parsed manifest
+    and assert the table's shape, so neither can degrade into an empty key set
+    for a manifest whose table is malformed. They do not stop it the same way,
+    and the assertion is not the first thing to fire: on the file path a
+    malformed table is usually a malformed DOCUMENT, so ``[dependencies] = 1``,
+    ``["k"] = 1``, a ``[target]`` table followed by ``cfg(windows) = 1``, and a
+    ``[target.cfg(windows)]`` table whose ``dependencies`` is a scalar each
+    raise ``tomllib.TOMLDecodeError`` inside :func:`load_toml` before a line of
+    this function has run. That input still fails loudly and non-silently, just
+    as a TOML parse error rather than as the named assertion. The assertion is
+    defence in depth: it is what catches a mapping that was never parsed from
+    such a file -- the hand-built dicts the negative probes hand to the sibling
+    :func:`manifest_dependency_tables`, and the rare top-level bare
+    ``dependencies = 1``, which does parse and reaches the check -- so that is
+    where the message naming the table is what a reader actually sees.
+    """
+    manifest = load_toml(manifest_path)
+    dependencies = manifest.get("dev-dependencies", {})
+    assert isinstance(dependencies, dict), f"bad [dev-dependencies] in {manifest_path}"
+    return dependencies
+
+
+def manifest_dependency_tables(manifest: dict) -> dict[str, dict]:
+    """Return every dependency table Cargo resolves from a parsed manifest.
+
+    Cargo resolves four kinds of declaration and a completeness check that
+    reads only two of them is blind to the other two: ``[dependencies]``,
+    ``[dev-dependencies]`` and ``[build-dependencies]``, plus the same three
+    sub-tables under every ``[target.'cfg(...)']`` entry. An edge smuggled into
+    ``[build-dependencies]`` or into a target-scoped table declares the key just
+    as really as one in ``[dependencies]``, so leaving either out is the same
+    hole the artifact edge exploited. ``[target.*]`` is an established pattern
+    in this workspace -- ``crates/kernel/eliot-ipc/Cargo.toml`` and
+    ``crates/kernel/eliot-platform-windows/Cargo.toml`` both use it -- so this
+    mirrors what ``scripts/audit-architecture-boundaries.py`` already walks in
+    ``_manifest_dependencies``: this gate must not be weaker than the sibling
+    auditor already in the repository.
+
+    The result maps the labels ``(scope, table)`` -- ``"manifest:
+    dependencies"``, ``"target:'cfg(windows)':dev-dependencies"``, and so on --
+    to the table itself. A key is one edge wherever it is declared, so only the
+    KEY sets are compared downstream: :func:`declared_dependency_keys` unions
+    ``values()`` and no caller reads a ``target:``-labelled key back out, so the
+    labels buy no reachability they do not already have. What they do buy is
+    two properties a bare union does not have -- distinct tables cannot
+    collide in one mapping, and a failure MESSAGE can name which table was
+    wrong, which a set of keys cannot. A table that is ABSENT is skipped
+    silently, because a manifest legitimately declares no ``[build-
+    dependencies]`` and no ``[target.*]`` at all; a table that is PRESENT but
+    is not a dict is rejected by an assertion naming the table, exactly as the
+    outer ``[target]`` table already is, so a malformed table cannot be
+    silently skipped and leave a hole where a smuggled edge would have been
+    read. WHICH failure that is depends on where the mapping came from. This
+    function takes an already-parsed dict, so on the file path a table this
+    malformed never arrives: a scalar or string where a table header belongs
+    (``[dependencies] = 1``, ``["k"] = 1``, a ``[target]`` table followed by
+    ``cfg(windows) = 1``, a ``[target.cfg(windows)]`` table whose
+    ``dependencies`` is a scalar) raises ``tomllib.TOMLDecodeError`` inside
+    :func:`load_toml` first, one layer up. The assertions are genuine
+    defence in depth for a HAND-BUILT mapping -- which is exactly how the
+    negative probes in case 2 call this -- where they are also the only
+    mechanism: a bare top-level ``dependencies = 1``, ``target = 1`` or
+    ``'cfg(windows)' = 1`` under ``[target]`` is valid TOML that parses into a
+    non-dict value and reaches these checks, so nothing is skipped and nothing
+    degrades to an empty key set either way. ``bins/eliot-kernel/Cargo.toml``
+    declares no ``[build-dependencies]`` and no ``[target.*]`` table today, so
+    the delivered verdict is unchanged by covering them.
+    """
+    labels = ("dependencies", "dev-dependencies", "build-dependencies")
+    tables: dict[str, dict] = {}
+    for label in labels:
+        table = manifest.get(label)
+        if table is None:
+            # Absent table, not a malformed one: nothing is declared there.
+            continue
+        assert isinstance(
+            table, dict,
+        ), f"bad [{label}] table: not a table of dependency declarations"
+        tables[f"manifest:{label}"] = table
+    target = manifest.get("target")
+    if target is not None:
+        assert isinstance(
+            target, dict,
+        ), "bad [target] table: not a table of target tables"
+        for selector, target_table in target.items():
+            assert isinstance(
+                target_table, dict,
+            ), f"bad [target.'{selector}'] table: not a table of dependency tables"
+            for label in labels:
+                sub_table = target_table.get(label)
+                if sub_table is None:
+                    # The target-scoped table is simply not declared here.
+                    continue
+                assert isinstance(
+                    sub_table, dict,
+                ), (
+                    f"bad [target.'{selector}'.{label}] table: not a table of "
+                    "dependency declarations"
+                )
+                tables[f"target:'{selector}':{label}"] = sub_table
+    return tables
+
+
+def declared_dependency_keys(manifest: dict) -> set[str]:
+    """Return every dependency key Cargo resolves from a parsed manifest.
+
+    The union across :func:`manifest_dependency_tables`, so a key declared in
+    several tables -- ``eliot-ipc`` and friends are declared in both the runtime
+    and the dev table of the kernel manifest -- is one edge rather than two.
+    """
+    keys: set[str] = set()
+    for table in manifest_dependency_tables(manifest).values():
+        keys.update(table)
+    return keys
+
+
+def unadmitted_dependency_keys(
+    declared: set[str],
+    expected: tuple[str, ...],
+) -> list[str]:
+    """Return the declared dependency keys outside the frozen admitted set.
+
+    ``declared`` is the union over EVERY table Cargo resolves -- see
+    :func:`manifest_dependency_tables` -- and it is compared against
+    ``expected`` as SETS, so both directions are reported by one predicate: a
+    key declared outside the frozen set is admitted nowhere, and a key expected
+    but absent is declared nowhere. Keys in several tables are one edge, not
+    several, which is why the union is taken before the comparison.
+
+    ``expected`` is a hand-written literal constant -- here
+    :data:`EXPECTED_KERNEL_DEPENDENCY_KEYS` -- and must never be a projection
+    of the manifest under test. HONEST SCOPE OF THIS INVARIANT: it is a
+    human-review invariant, NOT machine-checked. No assertion in this module can
+    tell a literal from a manifest-derived tuple, and the negative probes
+    tamper the declared side only, so a circular ``expected`` computed from the
+    manifest would pass every case here including the probes. The invariant is
+    therefore stated, re-justified and honoured by hand on every deliberate
+    edit, not enforced by a runtime guard.
+    """
+    admitted = set(expected)
+    return sorted(set(declared) - admitted) + sorted(admitted - set(declared))
 
 
 def unidentified_manifests(affected: object, identities: object) -> list[str]:
@@ -967,6 +1210,41 @@ class BackupDependencyLinkTests(unittest.TestCase):
         """Declared dependency edges exist in manifests and Rust sources."""
         kernel_deps = manifest_dependencies(KERNEL_MANIFEST)
         self.assertIn("eliot-backup", kernel_deps)
+        kernel_dev_deps = manifest_dev_dependencies(KERNEL_MANIFEST)
+        # One parse of the real manifest is the source for the verdict and for
+        # every probe below, so a probe can never judge a different document
+        # than the one the verdict judged.
+        kernel_manifest = load_toml(KERNEL_MANIFEST)
+        kernel_tables = manifest_dependency_tables(kernel_manifest)
+        # COMPLETENESS over the whole kernel manifest: the declared dependency
+        # key set must equal the frozen admitted literal exactly. This is the
+        # check that closes the false green -- two individual membership
+        # assertions say nothing about an eleventh key nobody enumerated, so an
+        # unconsumed edge like `eliot-artifact` could be added to this
+        # composition root, stay absent from every frozen list and fixture, and
+        # still report the denominator exact in cases 1/2/9. Set equality
+        # against a literal is the only shape that catches both directions: a
+        # key outside the frozen set (the defect) and a key expected but no
+        # longer declared (a silent removal of an admitted edge). It is
+        # deliberately NOT compared against EXPECTED_FROZEN_EDGES: those four
+        # kernel edges are the subset this work unit prepares, not the
+        # manifest's full composition surface. The declared side is the union
+        # over ALL FOUR kinds of table Cargo resolves, so an edge smuggled into
+        # `[build-dependencies]` or into a `[target.'cfg(...)']` sub-table is
+        # reported here too instead of reaching around the check.
+        self.assertEqual(
+            unadmitted_dependency_keys(
+                declared_dependency_keys(kernel_manifest),
+                EXPECTED_KERNEL_DEPENDENCY_KEYS,
+            ),
+            [],
+            "bins/eliot-kernel declares a dependency key outside the frozen "
+            "admitted set, or is missing one of them -- in [dependencies], "
+            "[dev-dependencies], [build-dependencies] or any [target.*] "
+            "sub-table; every kernel edge needs an actual accepted interface "
+            "use and must appear in the frozen admission list, so add it here "
+            "deliberately rather than let it report green unconsumed",
+        )
         kernel_text = read_text(KERNEL_BACKUP_RS) + read_text(KERNEL_PORTS_RS)
         self.assertTrue(uses_crate(kernel_text, "eliot_backup"))
         self.assertIn("BackupBlob", kernel_text)
@@ -992,6 +1270,99 @@ class BackupDependencyLinkTests(unittest.TestCase):
         # Negative: kernel must not claim a direct blob-api edge.
         self.assertNotIn("eliot-blob-api", kernel_deps)
         self.assertNotIn("eliot_blob_api", read_text(KERNEL_BACKUP_RS))
+        # Negative: the completeness predicate above is shown to be able to
+        # fail, using the very tables it just judged. An extra key (the exact
+        # SHAPE of the #974 defect: one new unadmitted edge smuggled in beside
+        # the admitted ones -- `eliot-artifact` itself is NOT declared in the
+        # kernel manifest today, and the verdict above is [] precisely because
+        # that edge is gone) and a removed key (an admitted edge silently
+        # dropped) must each be reported. If these ever return [] the verdict
+        # above is vacuous.
+        extra_runtime = copy.deepcopy(kernel_manifest)
+        extra_runtime["dependencies"]["eliot-artifact"] = {"workspace": True}
+        self.assertEqual(
+            unadmitted_dependency_keys(
+                declared_dependency_keys(extra_runtime),
+                EXPECTED_KERNEL_DEPENDENCY_KEYS,
+            ),
+            ["eliot-artifact"],
+            "the completeness predicate does not report an EXTRA declared key",
+        )
+        missing_runtime = copy.deepcopy(kernel_manifest)
+        del missing_runtime["dependencies"]["eliot-backup"]
+        self.assertEqual(
+            unadmitted_dependency_keys(
+                declared_dependency_keys(missing_runtime),
+                EXPECTED_KERNEL_DEPENDENCY_KEYS,
+            ),
+            ["eliot-backup"],
+            "the completeness predicate does not report a MISSING declared key",
+        )
+        # Negative for the COVERAGE this predicate claims. An edge that appears
+        # ONLY in a target-scoped table must be reported: that is the exact
+        # counterexample the two-table version of this check missed, where that
+        # declaration reported GREEN with the artifact edge present. The probe
+        # is built from the real manifest's own parsed structure -- a deep copy
+        # of the real parse with one table attached -- and the declaration uses
+        # the shape the pattern really has in this workspace, the bare
+        # `[target.'cfg(windows)'.dependencies]` table that
+        # crates/kernel/eliot-ipc/Cargo.toml and
+        # crates/kernel/eliot-platform-windows/Cargo.toml carry and that
+        # scripts/audit-architecture-boundaries.py already walks. Every kind is
+        # probed, because `[build-dependencies]` and the target-scoped dev table
+        # were the other two blind spots.
+        #
+        # Two anchors keep this a proof rather than a tautology. Both are read
+        # from the real parse and both can fail: the kernel manifest must carry
+        # no `[target.*]` table, so the probe demonstrates reachability of a
+        # table the manifest does not have; and the probe's declared key set must
+        # differ from the real one by exactly the one unadmitted key, so the
+        # verdict below is reporting the smuggled edge and nothing else.
+        self.assertNotIn(
+            "target", kernel_manifest,
+            "bins/eliot-kernel grew a [target.*] table, so the target-scoped "
+            "negative probe below no longer proves reachability of a table this "
+            "manifest does not declare",
+        )
+        self.assertEqual(
+            sorted(kernel_tables["manifest:dependencies"]),
+            sorted(kernel_deps),
+            "the dependency-table collector does not read the kernel "
+            "[dependencies] table the completeness verdict judged",
+        )
+        self.assertEqual(
+            sorted(kernel_tables["manifest:dev-dependencies"]),
+            sorted(kernel_dev_deps),
+            "the dependency-table collector does not read the kernel "
+            "[dev-dependencies] table the completeness verdict judged",
+        )
+        real_keys = declared_dependency_keys(kernel_manifest)
+        for label in ("dependencies", "dev-dependencies", "build-dependencies"):
+            with self.subTest(target_table=label):
+                smuggled = copy.deepcopy(kernel_manifest)
+                smuggled["target"] = {
+                    "cfg(windows)": {label: {"eliot-artifact": {"workspace": True}}},
+                }
+                probe_keys = declared_dependency_keys(smuggled)
+                self.assertEqual(
+                    probe_keys - real_keys, {"eliot-artifact"},
+                    f"the target-scoped probe for {label} did not add exactly the "
+                    "one unadmitted key to the real manifest's declarations",
+                )
+                self.assertEqual(
+                    real_keys - probe_keys, set(),
+                    f"the target-scoped probe for {label} dropped a real "
+                    "declaration, so it proves nothing about the added edge",
+                )
+                self.assertEqual(
+                    unadmitted_dependency_keys(
+                        probe_keys, EXPECTED_KERNEL_DEPENDENCY_KEYS,
+                    ),
+                    ["eliot-artifact"],
+                    f"a key declared ONLY in [target.'cfg(windows)'.{label}] is "
+                    "not reported, so the completeness check is blind to "
+                    "target-scoped edges and lets the #974 defect report green",
+                )
 
         _raw, fixture = require_fixture_json(2, "edge-symbols.json")
         self.assertTrue(self.fixtures_available)
