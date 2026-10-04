@@ -3425,7 +3425,9 @@ mod tests {
                 status: SourceStatus::Admitted,
                 domains: Vec::new(),
                 digest: "a".repeat(64),
-                authority_basis: None,
+                authority_basis: Some(AuthorityBasis::HumanOwner {
+                    owner_ref: "owner:test".into(),
+                }),
             }],
             Vec::new(),
         ) {
