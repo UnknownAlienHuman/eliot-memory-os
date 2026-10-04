@@ -2505,12 +2505,21 @@ mod control_plane_diagnostics_tests {
             // "AUTHORED" is the operative word, and the emitted set is one key
             // LARGER than the authored one: both producers pass a format string
             // to `tracing::info!`, and the macro turns it into a field named
-            // `message` before the authored fields
-            // (tracing-0.1.44 `src/macros.rs:660`:
-            // `{ message = format_args!($($arg)+), $($fields)* }`, documented as
-            // the implicit `message` field at `src/lib.rs:414`). `Event::record`
-            // visits every field including that one, so a capacity record's key
-            // set is `capacity`, `event`, `message`. An expectation written from
+            // `message`. `Event::record` visits every field including that one,
+            // so a capacity record's key set is `capacity`, `event`, `message`.
+            //
+            // WHICH MACRO ARM, so the next reader follows the one this call
+            // actually takes. `info!(target: T, event = .., capacity = .., "s")`
+            // has no braces and no `name:`/`parent:`, so it matches the
+            // `target:` arm at `src/macros.rs:1986` and then the field-list arm at
+            // `:671` - NOT the `event!(.., {..}, $args)` arm at `:660`, which is
+            // the equivalent statement for the BRACE form and is easy to cite by
+            // mistake. The field named `message` is synthesised by the
+            // `fieldset!` fallback at `:3218-3221` and its value by the
+            // `valueset_all!` fallback at `:2965-2968`; both prepend it in the
+            // same position. `target:` is METADATA, not a field, which is why
+            // there is no fourth key. Pinned by Cargo.lock to tracing 0.1.44.
+            // An expectation written from
             // the source call alone omits `message` and is therefore false on
             // every run - which is what the first version of this assertion did.
             let field = |name: &str| visitor.fields.get(name).cloned().unwrap_or_default();
