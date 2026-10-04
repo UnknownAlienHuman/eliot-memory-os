@@ -367,6 +367,66 @@ source = "scripts/verify-legacy-config-retirement.py"
 path = "docs/notes.md"
 reason = "The self-test fixture uses docs/notes.md as a temporary test path."
 
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "Bounded candidate discovery path table."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/A.md"
+reason = "Self-test fixture path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_wasm_component_lane.py"
+path = "docs/unrelated.md"
+reason = "Self-test fixture path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/verify-github-workflows.py"
+path = "docs/note.md"
+reason = "Self-test fixture path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/work_unit_gate/fixtures/pr_prose_override.md"
+path = "docs/architecture/ARCHITECTURE_CONTRACT.md"
+reason = "Work unit gate fixture path."
+
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"
 router_front_door = "scripts/docs_router.py"
