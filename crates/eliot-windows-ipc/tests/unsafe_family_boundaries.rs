@@ -557,10 +557,7 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
             let named_body = w1b_test_body(&suite_code_lines, &suite_lines, declaration_index + 1);
             if let Some((problem, why)) = w1b_adequacy_floor(&named_body) {
                 panic!(
-                    "CASE IDENTITY (source_test is adequate): case {id} names source_test `{name}`, \
-                     whose body fails the shared anti-placeholder adequacy floor `{problem}`: {why}. \
-                     A `#[test]` attribute proves the function is discovered, not that it proves its \
-                     title, so an empty or placeholder body certifies nothing"
+                    "CASE IDENTITY (source_test is adequate): case {id} names source_test `{name}`, whose body fails the shared anti-placeholder adequacy floor `{problem}`: {why}. A `#[test]` attribute proves the function is discovered, not that it proves its title, so an empty or placeholder body certifies nothing"
                 );
             }
             // Fact 2: the flag is an honest verdict about the binding.
@@ -713,13 +710,7 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                 let claims_bound_marker = claimed_marker == bound_marker;
                 assert!(
                     claims_own_marker || (claims_bound_marker && recorded_repoint),
-                    "CASE IDENTITY (registry marker agreement): case {id} claims registry_marker \
-                     `{claimed_marker}` over source_test `{name}`, but the anchored marker actually \
-                     bound to that test in unsafe_family_boundaries.rs is `{bound_marker}`, not its \
-                     own case marker `{own_marker}`; a re-pointed row must record WHY in \
-                     `binding_note`, `title_mismatch_reason` or `full_match_justification` AND that \
-                     note must name source_test `{name}`, otherwise the row is not internally \
-                     consistent about which case its test proves"
+                    "CASE IDENTITY (registry marker agreement): case {id} claims registry_marker `{claimed_marker}` over source_test `{name}`, but the anchored marker actually bound to that test in unsafe_family_boundaries.rs is `{bound_marker}`, not its own case marker `{own_marker}`; a re-pointed row must record WHY in `binding_note`, `title_mismatch_reason` or `full_match_justification` AND that note must name source_test `{name}`, otherwise the row is not internally consistent about which case its test proves"
                 );
             }
         } else {
@@ -2327,8 +2318,7 @@ fn w1b_test_body(code_lines: &[&str], source_lines: &[&str], declaration_line: u
     }
     assert!(
         inside_body,
-        "w1b_test_body found no body for the fn declared on line {declaration_line}, \
-         which must name a `fn <name>(` line that opens a brace"
+        "w1b_test_body found no body for the fn declared on line {declaration_line}, which must name a `fn <name>(` line that opens a brace"
     );
     body.join("\n")
 }
@@ -2421,8 +2411,7 @@ fn w1b_adequacy_floor(body: &str) -> Option<(&'static str, String)> {
                 return Some((
                     "TRIVIAL_SELF_EQUALITY",
                     format!(
-                        "whole body is `{inner}`, the gate's trivial self-equality over the \
-                         identifier `{first}`"
+                        "whole body is `{inner}`, the gate's trivial self-equality over the identifier `{first}`"
                     ),
                 ));
             }
@@ -2468,8 +2457,7 @@ fn w1b_adequacy_floor(body: &str) -> Option<(&'static str, String)> {
     }
     Some((
         "NO_CHECK_CONSTANT",
-        "body holds none of `assert`, `panic`, `check`, `verify` or `should_panic` as a real call, \
-         macro or trait path, so the gate reads it as constant construction with no checked result"
+        "body holds none of `assert`, `panic`, `check`, `verify` or `should_panic` as a real call, macro or trait path, so the gate reads it as constant construction with no checked result"
             .to_owned(),
     ))
 }
@@ -3920,17 +3908,14 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
         let marker_line = offset + 1;
         let Some(marker_id) = marker_id else {
             suite_marker_defects.push(format!(
-                "line {marker_line}: `{}` is not an anchored `// WORK_UNIT_CASE: 789/<n>` marker of \
-                 this work unit (the gate requires exactly `{marker_prefix} <digits>/<digits>` to the \
-                 end of the line), so its case id cannot be bound to a test",
+                "line {marker_line}: `{}` is not an anchored `// WORK_UNIT_CASE: 789/<n>` marker of this work unit (the gate requires exactly `{marker_prefix} <digits>/<digits>` to the end of the line), so its case id cannot be bound to a test",
                 suite_lines[offset].trim()
             ));
             continue;
         };
         if !(1..=42).contains(&marker_id) {
             suite_marker_defects.push(format!(
-                "line {marker_line}: `// WORK_UNIT_CASE: 789/{marker_id}` is OUT OF RANGE, every case \
-                 id must be in 1..=42"
+                "line {marker_line}: `// WORK_UNIT_CASE: 789/{marker_id}` is OUT OF RANGE, every case id must be in 1..=42"
             ));
             continue;
         }
@@ -3943,23 +3928,20 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             let next_line = walk + 1;
             if stripped.is_empty() {
                 reason = Some(format!(
-                    "line {marker_line}: DETACHED BY A BLANK LINE (line {next_line}), \
-                     the gate stops at a blank line before it reaches a function"
+                    "line {marker_line}: DETACHED BY A BLANK LINE (line {next_line}), the gate stops at a blank line before it reaches a function"
                 ));
                 break;
             }
             if stripped.starts_with("//") || stripped.starts_with("/*") {
                 reason = Some(format!(
-                    "line {marker_line}: DETACHED BY AN INTERVENING COMMENT (line {next_line}: \
-                     `{stripped}`), the gate stops at a comment before it reaches a function"
+                    "line {marker_line}: DETACHED BY AN INTERVENING COMMENT (line {next_line}: `{stripped}`), the gate stops at a comment before it reaches a function"
                 ));
                 break;
             }
             if stripped.starts_with("#[") {
                 if stripped.contains("ignore") {
                     reason = Some(format!(
-                        "line {marker_line}: NOT ATTACHED TO AN EXECUTED `#[test]` FN, the marker \
-                         reaches an `#[ignore]` attribute on line {next_line} before the function"
+                        "line {marker_line}: NOT ATTACHED TO AN EXECUTED `#[test]` FN, the marker reaches an `#[ignore]` attribute on line {next_line} before the function"
                     ));
                     break;
                 }
@@ -3984,8 +3966,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
                 break;
             }
             reason = Some(format!(
-                "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, line {next_line} is neither an \
-                 attribute nor a function declaration (`{stripped}`)"
+                "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, line {next_line} is neither an attribute nor a function declaration (`{stripped}`)"
             ));
             break;
         }
@@ -4000,12 +3981,10 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
         if !has_test_attr {
             match fn_name {
                 Some(name) => suite_marker_defects.push(format!(
-                    "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, the function `{name}` it \
-                     binds carries no test attribute"
+                    "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, the function `{name}` it binds carries no test attribute"
                 )),
                 None => suite_marker_defects.push(format!(
-                    "line {marker_line}: DETACHED, no attribute or function declaration follows it \
-                     before the end of the file"
+                    "line {marker_line}: DETACHED, no attribute or function declaration follows it before the end of the file"
                 )),
             }
             continue;
@@ -4013,8 +3992,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
         let Some(bound_name) = fn_name else {
             suite_marker_defects.push(reason.unwrap_or_else(|| {
                 format!(
-                    "line {marker_line}: DETACHED, no attribute or function declaration follows it \
-                     before the end of the file"
+                    "line {marker_line}: DETACHED, no attribute or function declaration follows it before the end of the file"
                 )
             }));
             continue;
@@ -4025,8 +4003,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             .find(|(name, _)| *name == bound_name)
         {
             suite_marker_defects.push(format!(
-                "line {marker_line}: DUPLICATE TEST IDENTITY `{bound_name}`, marker on line \
-                 {first_line} already binds that same function"
+                "line {marker_line}: DUPLICATE TEST IDENTITY `{bound_name}`, marker on line {first_line} already binds that same function"
             ));
             continue;
         }
@@ -4063,8 +4040,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
         let body_text = w1b_test_body(&suite_code_lines, &suite_lines, walk + 1);
         if let Some((problem, why)) = w1b_adequacy_floor(&body_text) {
             suite_marker_defects.push(format!(
-                "line {marker_line}: ADEQUACY FLOOR FAILS `{problem}`, case {marker_id} binds \
-                 `{bound_name}` whose {why}"
+                "line {marker_line}: ADEQUACY FLOOR FAILS `{problem}`, case {marker_id} binds `{bound_name}` whose {why}"
             ));
             continue;
         }
@@ -4073,11 +4049,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     }
     assert!(
         suite_marker_defects.is_empty(),
-        "W7 DENOMINATOR (source marker binding): every anchored `// WORK_UNIT_CASE: 789/<n>` marker in \
-         this source must be bound to its own `#[test]` fn, clear `scripts/work_unit_gate/case_binding.py` \
-         `:377-384` (`IGNORED_TEST`, `DUPLICATE_TEST_IDENTITY`) and the anti-placeholder adequacy floor \
-         `:386-424` (`EMPTY_TEST_BODY`, `UNCONDITIONAL_TRUE`, `TRIVIAL_SELF_EQUALITY`, `NO_CHECK_CONSTANT`), \
-         and carry a case id in 1..=42; {} marker(s) are not bound: {}",
+        "W7 DENOMINATOR (source marker binding): every anchored `// WORK_UNIT_CASE: 789/<n>` marker in this source must be bound to its own `#[test]` fn, clear `scripts/work_unit_gate/case_binding.py` `:377-384` (`IGNORED_TEST`, `DUPLICATE_TEST_IDENTITY`) and the anti-placeholder adequacy floor `:386-424` (`EMPTY_TEST_BODY`, `UNCONDITIONAL_TRUE`, `TRIVIAL_SELF_EQUALITY`, `NO_CHECK_CONSTANT`), and carry a case id in 1..=42; {} marker(s) are not bound: {}",
         suite_marker_defects.len(),
         suite_marker_defects.join(" | ")
     );
