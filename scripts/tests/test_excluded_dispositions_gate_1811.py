@@ -76,6 +76,17 @@ class TestExcludedDispositionsGate1811(unittest.TestCase):
                 'disposition = "REWORK"\nowner = "fixture-owner"\n',
                 encoding="utf-8",
             )
+            # The gate derives its denominator from the accepted Cargo/package
+            # discovery owner and refuses when that owner is absent, because an
+            # empty denominator reads as "there are no standalone packages",
+            # which is a false proof rather than a measurement. The fixture root
+            # must therefore carry that owner, or this case would assert the
+            # consumer refusal while actually only asserting the missing-owner
+            # refusal -- a different message on a different code path.
+            (tmp_root / "scripts").mkdir(parents=True, exist_ok=True)
+            (tmp_root / "scripts/verify-standalone-crates.py").write_bytes(
+                (ROOT / "scripts/verify-standalone-crates.py").read_bytes()
+            )
             completed = run_gate(tmp_root)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("without", completed.stdout)
