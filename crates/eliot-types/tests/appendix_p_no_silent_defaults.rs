@@ -2598,7 +2598,7 @@ fn case_08_versions_and_control_vocabulary_outside_the_frozen_set_fail() {
     );
     assert_refusal_names::<ProviderInvocationAttempt>(
         &corpus("provider_invocation_attempt_unsupported_state.json"),
-        "UNKNOWN_OUTCOME_V2",
+        "PROCESS_TERMINAL_V2",
         "a control variant outside the frozen set",
     );
     assert_refusal_names::<MemoryStateTransition>(

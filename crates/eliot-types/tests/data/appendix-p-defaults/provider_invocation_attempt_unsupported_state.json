@@ -19,7 +19,7 @@
     {
       "transition_id": "transition-1",
       "from": null,
-      "to": "UNKNOWN_OUTCOME_V2",
+      "to": "PROCESS_TERMINAL_V2",
       "recorded_at": "2026-09-07T12:00:00Z",
       "evidence_refs": []
     }
