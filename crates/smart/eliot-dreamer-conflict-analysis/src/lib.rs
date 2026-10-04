@@ -277,6 +277,14 @@
 //! closed, 673/56 exact pre-handler receipt plus seven preservation dimensions,
 //! 673/57 failed and unknown dimensions stay independent without borrowing,
 //! 673/58 complete analysis unresolved without external receipt,
+//! its complete outcome carries no hub rejection hint, and the exact
+//! `AuthorityCeiling` note literal is retained with every preservation
+//! dimension passing unaveraged, both reopen conditions stay named with the
+//! live hit rate under load gap among them, both rival positions keep
+//! their own source handles, unknowns and assumptions stay verbatim, the
+//! fixed candidate-only proof note is unchanged, and the recommended
+//! `DecisionOwnerKind::Multiple` owner, still owed owner-scoped evidence,
+//! names the boundary that must decide later,
 //! 673/60 irrelevant order preserves digest, 673/61 exact and one-over
 //! limits fail closed, 673/62 cancellation and deadline emit blocked/stale,
 //! 673/64 every expected position and objection stays visible,
