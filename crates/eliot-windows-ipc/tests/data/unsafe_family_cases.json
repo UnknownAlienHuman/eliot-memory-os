@@ -5,22 +5,70 @@
   "test_file": "crates/eliot-windows-ipc/tests/unsafe_family_boundaries.rs",
   "source_identity": {
     "freeze_base": "3c6305dcc6b771798afa1294ceec7618737461bd",
-    "freeze_base_line_count_lib": 5578,
-    "main_head_at_delivery": "3c6305dcc6b771798afa1294ceec7618737461bd",
+    "freeze_base_line_count_lib": 5066,
+    "freeze_base_line_count_lib_history": {
+      "superseded_value": 5578,
+      "status": "HISTORICAL - WRONG. Retained so the corrected value is not mistaken for an arbitrary edit; the superseded number is not a claim about crates/eliot-windows-ipc/src/lib.rs at any ref named in this block.",
+      "evidence": "measured with `git show 3c6305dcc6b771798afa1294ceec7618737461bd:crates/eliot-windows-ipc/src/lib.rs`: sha256:1b9aaf951101ccf2b0803bc8e997e34bbf5ceb5c158a17dfc6ca21e48b513a51, 207861 bytes, 5066 lines. 5578 is the line count of this file at 73b3be03a, not at freeze_base, so pairing 5578 with freeze_base was self-contradictory.",
+      "correction_measurement": "offline, at this repair, with git plumbing only (`git show`, `git rev-parse`, `git rev-list`, `git cat-file`); no build, test or cargo command was run"
+    },
+    "main_head_at_delivery": "64cd8f41b130c158415399e24881350fcfcc50ca",
+    "main_head_at_delivery_history": {
+      "superseded_value": "3c6305dcc6b771798afa1294ceec7618737461bd",
+      "status": "HISTORICAL - FALSE. Retained as the record of what the previous writer asserted, not as a current identity.",
+      "evidence": "measured: `git rev-parse lane/CB2` = 64cd8f41b130c158415399e24881350fcfcc50ca, the #789-lane main head named for this repair, and its lib.rs blob is 83b9ffca129578cadb2ea415b735af9a5c393470 - the same blob as origin/main and as the checked-out HEAD (4eb04f08fc8b232b2263b7bd1a4f90a312d05c87). At 3c6305dcc6b7 this file is 5066 lines, 207861 bytes; at 64cd8f41b it is 5601 lines, 233572 bytes. The superseded value therefore named as main's head a commit whose lib.rs is 535 lines shorter than main's lib.rs.",
+      "qualified_caveat": "64cd8f41b is NOT an ancestor of the checked-out HEAD: `git merge-base 3c6305dcc6b7 64cd8f41b` = 6a2e810458, and `git rev-list --count 3c6305dcc6b7..64cd8f41b` = 27 while `64cd8f41b..3c6305dcc6b7` = 3. The superseded value IS an ancestor of the checked-out HEAD, 34 commits back (`git rev-list --count 3c6305dcc6b7..HEAD` = 34). 'Behind main' is therefore stated as a measured divergence, not as a linear ancestor claim against 64cd8f41b."
+    },
     "crate_tree_at_freeze_base": "3c6305dcc6b771798afa1294ceec7618737461bd",
-    "crate_tree_at_main_head": "3c6305dcc6b771798afa1294ceec7618737461bd",
-    "freeze_is_current": true,
-    "staleness_note": "every inventory span, digest, safety_line and safety_distance in this file was re-derived from the worktree bytes of crates/eliot-windows-ipc/src/lib.rs at HEAD 3c6305dcc6b771798afa1294ceec7618737461bd (5535 lines, sha256 sha256:7b7171822cf1df44dc00dee134adb85dd075e3a30c7cb109d65ebce2fd572869). The previously recorded coordinates described an earlier revision of that file and were stale: 93 of 107 spans no longer contained the token `unsafe`, and 107 of 107 digests no longer equalled the sha256 of the bytes at their own stated span. No stale span was deleted or reworded to force a digest match; every row now points at a real site measured on the current bytes.",
+    "crate_tree_at_main_head": "64cd8f41b130c158415399e24881350fcfcc50ca",
+    "crate_tree_at_main_head_history": {
+      "superseded_value": "3c6305dcc6b771798afa1294ceec7618737461bd",
+      "status": "HISTORICAL - FALSE. Same defect as main_head_at_delivery_history; retained as the record of what the previous writer asserted.",
+      "evidence": "measured: `git rev-parse lane/CB2` = 64cd8f41b130c158415399e24881350fcfcc50ca, lib.rs blob 83b9ffca129578cadb2ea415b735af9a5c393470, byte-identical to origin/main and to the checked-out HEAD. The superseded value names a commit whose lib.rs is 5066 lines, 207861 bytes, sha256:1b9aaf951101ccf2b0803bc8e997e34bbf5ceb5c158a17dfc6ca21e48b513a51."
+    },
+    "freeze_is_current": false,
+    "freeze_is_current_enforcement": {
+      "enforced_in_tree": false,
+      "reader_search": "searched crates/eliot-windows-ipc/tests for the strings source_identity, freeze_is_current, freeze_base, re_derived, staleness_note and main_head_at_delivery. The only file that contains any of them is this fixture itself, so nothing in this crate reads this block.",
+      "consequence": "this field, and the false value now recorded beside it, is a statement, not a check. No test in the repository can observe this field being true, and no later drift of lib.rs will be caught by any assertion here."
+    },
+    "current_lib_identity_at_repair": {
+      "measured_at": "main head lane/CB2 = 64cd8f41b130c158415399e24881350fcfcc50ca, whose lib.rs blob 83b9ffca129578cadb2ea415b735af9a5c393470 is byte-identical to origin/main and to the checked-out HEAD (4eb04f08fc8b232b2263b7bd1a4f90a312d05c87). The worktree bytes of crates/eliot-windows-ipc/src/lib.rs hash to the same sha256, so the present tree is clean for this path.",
+      "sha256": "sha256:8220cd5ea8fc028867916b39fa03fbd03eba1382d8b9735c711dbe48afe3f8ce",
+      "bytes": 233572,
+      "line_count": 5601,
+      "git_blob": "83b9ffca129578cadb2ea415b735af9a5c393470",
+      "line_count_history": {
+        "at_freeze_base_3c6305dcc6b7": 5066,
+        "at_delivery_73b3be03a": 5578,
+        "at_current_main_head": 5601,
+        "unattributable_draft_value": 5535,
+        "note": "recorded so the 5535 draft line count cannot be mistaken for a revision of this file; the evidence that it matches no revision in the 45-commit history of this path is in re_derived.re_derived_against_lib_line_count_status"
+      }
+    },
+    "staleness_note": "WHAT THIS BLOCK'S COORDINATES ACTUALLY DESCRIBE. Every inventory span, digest, safety_line and safety_distance in this file describes crates/eliot-windows-ipc/src/lib.rs AS OF 73b3be03a1b70e98e0624c98e7087e5609dfae44, the #789 delivery commit: sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f, 231978 bytes, 5578 lines. The coordinates are PINNED TO THAT REF, as files[0] records, and they are not a claim about the bytes present in the tree now. THE 5535 PAIR IS UNATTRIBUTABLE. The pair (5535 lines, sha256 sha256:7b7171822cf1df44dc00dee134adb85dd075e3a30c7cb109d65ebce2fd572869) is retained below as the historical record of what a previous writer claimed for the ref 3c6305dcc6b7, and it describes no bytes that exist in this repository: that digest matches zero of the repository's git objects, and 5535 is the line count of no revision of this path in its 45-commit history. It is not the operative measurement of this block and must not be read as one. It previously appeared here as the operative statement ('re-derived from the worktree bytes ... at HEAD 3c6305dcc6b7 (5535 lines, sha256 sha256:7b717182...)'), which made a staleness acknowledgement double as the carrier of two values that cannot be attributed to any ref. WHAT THE STALENESS CORRECTION ACTUALLY ESTABLISHED. The previously recorded coordinates described an earlier revision and were genuinely stale: 93 of 107 spans no longer contained the token `unsafe` and 107 of 107 digests no longer equalled the sha256 of the bytes at their own stated span, and no stale span was deleted or reworded to force a digest match. That correction is retained. It was not, however, performed against the bytes of 3c6305dcc6b7: at that ref the file is 5066 lines, so 5578-line-file coordinates cannot describe a 5066-line file. MEASUREMENT AGAINST THE PRESENT TREE, performed at this repair. The present file is sha256:8220cd5ea8fc028867916b39fa03fbd03eba1382d8b9735c711dbe48afe3f8ce, 233572 bytes, 5601 lines. Against those bytes the recorded coordinates still resolve: 107 of 107 recorded spans contain the token `unsafe` and 107 of 107 recorded digests recompute exactly, because every recorded span ends at or before line 4211 while the 73b3be03a-to-present diff for this path begins at line 5013. So files[0] is not current, and the inventory array is nevertheless not wholesale stale against the present tree. WHAT IS STILL STALE. files[0] itself is the delivery commit and not the present file: the present tree is +1594 bytes and +23 lines on files[0]. The 107 inventory spans were NOT re-derived against the present tree, and nothing in this file may be read as saying they were. They were also not re-derived at this repair: re-deriving them is a separate job, and inventing coordinates is forbidden. NO RE-DERIVATION WAS PERFORMED BY THIS REPAIR. Every value labelled CURRENT or UNATTRIBUTABLE in this block was measured at this repair with git plumbing only (`git show`, `git rev-parse`, `git rev-list`, `git cat-file --batch-all-objects`) plus one read of this fixture; no build, test or cargo command was run. Re-deriving the 107 spans against the present tree remains outstanding.",
     "previous_freeze_commit": "a70fd5a3d6c409c798d5d7d80079b1c742e05d54",
     "previous_freeze_validity": "the wave-2 coordinates resolved 105/105 only at a70fd5a3d6c409c798d5d7d80079b1c742e05d54; the issue's own second and later merges shifted them, so every wave-2 line coordinate is stale on the freeze base and is superseded by this inventory",
     "files": [
       {
         "path": "crates/eliot-windows-ipc/src/lib.rs",
+        "describes_ref": "73b3be03a1b70e98e0624c98e7087e5609dfae44",
+        "describes_ref_meaning": "the #789 DELIVERY COMMIT, NOT the present file. The three coordinates below are the identity of crates/eliot-windows-ipc/src/lib.rs AT 73b3be03a. This row was previously left unlabelled and read as a whole-file identity claim for the current worktree; it is not one, and it is not current.",
+        "is_current": false,
         "sha256": "sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f",
         "bytes": 231978,
         "target": "windows (library, #![cfg(windows)])",
         "feature": "default",
-        "line_count": 5578
+        "line_count": 5578,
+        "measured_at_describes_ref": "measured at this repair with `git show 73b3be03a:crates/eliot-windows-ipc/src/lib.rs`: sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f, 231978 bytes, 5578 lines, git blob c52650cbb0648c40746f386afcfb67bba9257008. All three values reproduce exactly.",
+        "staleness_against_present_tree": {
+          "present_sha256": "sha256:8220cd5ea8fc028867916b39fa03fbd03eba1382d8b9735c711dbe48afe3f8ce",
+          "present_bytes": 233572,
+          "present_line_count": 5601,
+          "measured_delta": "+1594 bytes, +23 lines on this row (233572-231978, 5601-5578)",
+          "coordinates_pinned_to_named_ref": "the 107 inventory span/digest coordinates elsewhere in this file are pinned to this row's describes_ref, 73b3be03a, and were NOT re-derived against the present tree. They were not re-derived at this repair either: re-derivation is a separate job and inventing coordinates is forbidden. Every recorded span ends at or before line 4211 and the 73b3be03a-to-present diff for this path begins at line 5013, so the 107 spans and digests do still resolve on the present bytes, but that is a measured coincidence of where the file grew, not a re-derivation and not a currency claim.",
+          "outstanding_work": "re-deriving the 107 spans against the present tree is outstanding and is deliberately not attempted here"
+        }
       },
       {
         "path": "crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs",
@@ -66,10 +114,24 @@
       }
     },
     "re_derived": {
-      "reason": "every previously recorded span and digest was measured against the freeze base, and the delivered worktree bytes of crates/eliot-windows-ipc/src/lib.rs have since advanced; all 107 inventory spans and all 107 digests were therefore re-derived from scratch against the CURRENT bytes at the HEAD recorded above.",
+      "reason": "every previously recorded span and digest was measured against the freeze base, and the delivered worktree bytes of crates/eliot-windows-ipc/src/lib.rs have since advanced; all 107 inventory spans and all 107 digests were therefore re-derived from scratch. The original sentence ended 'against the CURRENT bytes at the HEAD recorded above', which asserted a currency that is false and is not restated here: re_derived_against_head names 3c6305dcc6b7, whose lib.rs is 5066 lines, while the recorded coordinates are 5578-line-file coordinates pinned to 73b3be03a. See the two _status fields below for the provenance of the draft the rows were sliced from, and files[0].describes_ref for the ref the coordinates actually correspond to.",
       "re_derived_against_head": "3c6305dcc6b771798afa1294ceec7618737461bd",
+      "re_derived_against_head_status": "HISTORICAL - the ref a previous writer NAMED for the re-derivation. Retained verbatim. It is not a verified input: see the two _status fields below. The file at this ref is 5066 lines, so the 5578-line-file coordinates recorded in files[0] and the 5535 draft line count recorded below cannot both describe it.",
       "re_derived_against_lib_sha256": "sha256:7b7171822cf1df44dc00dee134adb85dd075e3a30c7cb109d65ebce2fd572869",
+      "re_derived_against_lib_sha256_status": {
+        "status": "UNATTRIBUTABLE - NOT DELETED, RELABELLED. The value is retained verbatim as the historical record of what a previous writer claimed this file's whole-file digest to be. It is NOT a digest of any bytes that exist in this repository and must not be read as a measurement.",
+        "evidence_no_matching_blob": "measured at this repair with `git cat-file --batch-all-objects --batch-check` over every object in the repository: the hex 7b7171822cf1df44dc00dee134adb85dd075e3a30c7cb109d65ebce2fd572869 matches zero objects, of 324621 objects total and 78178 of type blob. A git blob id for lib.rs at a ref was also checked directly for the three refs named in this block (83b9ffca..., c52650cb..., 6ec26fdf...) and none is this value.",
+        "evidence_no_matching_revision": "it is not the digest of crates/eliot-windows-ipc/src/lib.rs at any ref. Measured identities for this path: present/main head 8220cd5e / 233572 / 5601; delivery 73b3be03a b30d6e9e / 231978 / 5578; freeze_base 3c6305dcc6b7 1b9aaf95 / 207861 / 5066.",
+        "evidence_internal_refutation": "the same 5535-line draft this digest was paired with is refuted inside this fixture. Adopting it makes `mod heartbeat_transport_file_tests` span 5460..5535, i.e. end the file. Measured, that module is never the last item of this path at any ref examined: at the present/main head it is declared at line 5527 and the file runs to line 5601; at 73b3be03a it is at 5504 and the file runs to 5578; at 3c6305dcc6b7 it is at 4992 and the file runs to 5066. The file always continues past it to a closing brace. A file that ended inside that module is not a revision of this path.",
+        "what_the_coordinates_do_correspond_to": "the inventory span/digest coordinates recorded in this file correspond to 73b3be03a1b70e98e0624c98e7087e5609dfae44, the #789 delivery commit: sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f, 231978 bytes, 5578 lines, git blob c52650cbb0648c40746f386afcfb67bba9257008. Measured at this repair: 107 of 107 recorded spans recompute their recorded digest exactly at 73b3be03a. They are pinned to that ref (see files[0].describes_ref) and are not a claim about the present tree."
+      },
       "re_derived_against_lib_line_count": 5535,
+      "re_derived_against_lib_line_count_status": {
+        "status": "UNATTRIBUTABLE - NOT DELETED, RELABELLED. The value is retained verbatim as the historical record of what a previous writer claimed. It is NOT the line count of any revision of this path.",
+        "evidence_no_revision_has_that_line_count": "measured at this repair by enumerating `git log --all --format=%H -- crates/eliot-windows-ipc/src/lib.rs` (45 commits) and counting the lines of the file at each distinct blob: 30 distinct states, line counts 2013, 2018, 2102, 2441, 3021, 3063, 3148, 3160, 3187, 3201, 3231, 3376, 3515, 3633, 4011, 4065, 4069, 4094, 4615, 4646, 4693, 4753, 4827, 4958, 5066, 5329, 5578, 5601 - and no 5535. Zero commits produce 5535 lines.",
+        "evidence_internal_refutation": "as above, this value makes `mod heartbeat_transport_file_tests` span 5460..5535 and end the file, which no revision of this path does.",
+        "relationship_to_line_count_delta": "the sibling line_count_delta of 708 is computed from the 5535 draft, i.e. 5535 - 4827. It is therefore an arithmetic statement about the draft pair, not a measured drift between two revisions of this file, and it is retained on that basis."
+      },
       "prior_line_count_claim": 4827,
       "line_count_delta": 708,
       "prior_stale_row_counts": {
@@ -78,7 +140,7 @@
         "rows_whose_prior_digest_no_longer_matched_the_bytes_at_their_own_span": 107,
         "rows_whose_prior_safety_line_had_drifted": 107
       },
-      "content_unchanged_in_worktree_semantics": "the field is now TRUE for all 107 rows by construction rather than by assertion: every row's span and digest were sliced from the CURRENT worktree bytes of crates/eliot-windows-ipc/src/lib.rs and are re-verified by recomputing sha256 over the exact span text including its trailing newline. It previously claimed true for 107 rows while 107 of those rows did not match the delivered bytes."
+      "content_unchanged_in_worktree_semantics": "CORRECTED - the previous wording ('the field is now TRUE for all 107 rows by construction') claimed a construction that did not happen, and is not what is established. What is actually established: the 107 inventory rows were sliced from the 5535-line DRAFT that the previous writer recorded, not from the revision files[0] describes (73b3be03a) and not from the present tree. The 'by construction' wording is retained in this sentence only as the superseded claim being corrected. The draft itself is unattributable - no object in this repository hashes to re_derived_against_lib_sha256 and no revision of crates/eliot-windows-ipc/src/lib.rs has 5535 lines - so the rows cannot be verified against the bytes they were actually sliced from. The rows DO verify against 73b3be03a: measured at this repair, all 107 recorded spans recompute their recorded digest exactly at that ref. They also happen to verify against the present bytes, 107 of 107, because every recorded span ends at or before line 4211 while the 73b3be03a-to-present diff for this path begins at line 5013. So the honest statement is: the rows resolve against 73b3be03a and against the present tree by measurement, they were not derived from either of those, and their stated provenance is the unattributable draft. It previously claimed true for 107 rows while 107 of those rows did not match the delivered bytes."
     }
   },
   "assignment": {

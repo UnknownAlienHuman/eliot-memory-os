@@ -3403,6 +3403,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
         suite_marker_defects.len(),
         suite_marker_defects.join(" | ")
     );
+
     let suite_marker_count = suite_marker_ids.len();
     assert_eq!(
         suite_marker_count, 42,
