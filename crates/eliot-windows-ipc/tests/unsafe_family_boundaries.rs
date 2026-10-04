@@ -3934,26 +3934,20 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             let next_line = walk + 1;
             if stripped.is_empty() {
                 reason = Some(format!(
-
                     "line {marker_line}: DETACHED BY A BLANK LINE (line {next_line}), the gate stops at a blank line before it reaches a function"
-
                 ));
                 break;
             }
             if stripped.starts_with("//") || stripped.starts_with("/*") {
                 reason = Some(format!(
-
                     "line {marker_line}: DETACHED BY AN INTERVENING COMMENT (line {next_line}: `{stripped}`), the gate stops at a comment before it reaches a function"
-
                 ));
                 break;
             }
             if stripped.starts_with("#[") {
                 if stripped.contains("ignore") {
                     reason = Some(format!(
-
                         "line {marker_line}: NOT ATTACHED TO AN EXECUTED `#[test]` FN, the marker reaches an `#[ignore]` attribute on line {next_line} before the function"
-
                     ));
                     break;
                 }
@@ -3978,7 +3972,6 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
                 break;
             }
             reason = Some(format!(
-
                 "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, line {next_line} is neither an attribute nor a function declaration (`{stripped}`)"
             ));
             break;
@@ -4063,7 +4056,6 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     assert!(
         suite_marker_defects.is_empty(),
         "W7 DENOMINATOR (source marker binding): every anchored `// WORK_UNIT_CASE: 789/<n>` marker in this source must be bound to its own `#[test]` fn, clear `scripts/work_unit_gate/case_binding.py` `:377-384` (`IGNORED_TEST`, `DUPLICATE_TEST_IDENTITY`) and the anti-placeholder adequacy floor `:386-424` (`EMPTY_TEST_BODY`, `UNCONDITIONAL_TRUE`, `TRIVIAL_SELF_EQUALITY`, `NO_CHECK_CONSTANT`), and carry a case id in 1..=42; {} marker(s) are not bound: {}",
-
         suite_marker_defects.len(),
         suite_marker_defects.join(" | ")
     );
