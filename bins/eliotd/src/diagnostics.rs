@@ -1369,6 +1369,11 @@ pub enum DrainOutcome {
     /// In-flight activation drained with unknown retention; original
     /// identity preserved verbatim.
     ActivationUnknown,
+    /// #2559 D1: a Kernel-claimed ticket was still awaiting resolution when
+    /// the drain budget expired. It carries a ticket identity but NO result
+    /// digest, so `emit_drain` is called with an empty result and the
+    /// disposition code carries the distinction on its own.
+    ActivationClaimedUnknown,
 }
 
 impl DrainOutcome {
@@ -1378,6 +1383,7 @@ impl DrainOutcome {
         match self {
             Self::Idle => "drain-idle",
             Self::ActivationUnknown => "drain-activation-unknown",
+            Self::ActivationClaimedUnknown => "drain-activation-claimed-unknown",
         }
     }
 }

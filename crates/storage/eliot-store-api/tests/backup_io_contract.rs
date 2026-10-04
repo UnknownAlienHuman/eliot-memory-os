@@ -235,6 +235,29 @@ fn page_for(begin: &SnapshotBeginRequest) -> SnapshotPage {
     }
 }
 
+fn continuation_page_for(begin: &SnapshotBeginRequest, previous: &SnapshotPage) -> SnapshotPage {
+    let frontier = previous
+        .next_cursor
+        .clone()
+        .expect("the previous page published a continuation");
+    let last = reference_member();
+    SnapshotPage {
+        members: vec![last.clone()],
+        coverage: SnapshotPageCoverage {
+            state: SnapshotPageState::Complete,
+            cumulative_members: frontier.cumulative_members + 1,
+            denominator_members: begin.denominator.member_count(),
+        },
+        cumulative_bytes: frontier.cumulative_bytes + last.residency.byte_count,
+        cumulative_work: 60,
+        is_last: true,
+        predecessor_digest: hex('5'),
+        next_cursor: None,
+        cursor: frontier,
+        handle: handle_for(begin),
+    }
+}
+
 fn end_receipt(completeness: SnapshotCompleteness) -> SnapshotEndReceipt {
     SnapshotEndReceipt {
         handle: handle_for(&begin_request()),
@@ -633,6 +656,39 @@ fn snapshot_pages_and_cursors_cannot_cross_snapshot_or_reset_bounds() {
     let mut skipped = page.clone();
     skipped.cursor.page_index = 5;
     assert!(skipped.validate_continuation(&page).is_err());
+    // An exact continuation of the previous page is accepted. It is built
+    // from the previous page's own published frontier, so it is a real
+    // continuation and not merely a second self-consistent page.
+    let second = continuation_page_for(&begin, &page);
+    assert!(second.validate().is_ok());
+    assert!(second.validate_for_begin(&begin).is_ok());
+    assert!(second.validate_continuation(&page).is_ok());
+    // A continuation whose own cursor is foreign to its own handle is
+    // refused. Every field the continuation comparison reaches matches, so
+    // this can only be caught by validating the page itself first.
+    let mut foreign_cursor = second.clone();
+    foreign_cursor.cursor.handle_digest = hex('9');
+    assert!(foreign_cursor.validate().is_err());
+    assert!(foreign_cursor.validate_continuation(&page).is_err());
+    // A previous page whose published frontier was rewritten is refused
+    // rather than treated as the page this continuation actually came from.
+    let mut rewritten_frontier = page.clone();
+    rewritten_frontier
+        .next_cursor
+        .as_mut()
+        .expect("page has a continuation")
+        .cumulative_bytes += 1;
+    assert!(rewritten_frontier.validate().is_err());
+    assert!(second.validate_continuation(&rewritten_frontier).is_err());
+    // A continuation whose own cumulative bytes do not add up to its own
+    // cursor plus its own members is refused for the same reason.
+    let mut unbalanced = second.clone();
+    unbalanced.cumulative_bytes -= 1;
+    assert!(unbalanced.validate().is_err());
+    assert!(unbalanced.validate_continuation(&page).is_err());
+    // A continuation is still refused when it reaches the end of the
+    // denominator twice: a terminal page has no successor.
+    assert!(second.validate_continuation(&second).is_err());
     // A page handle that does not match the begin-request digest is refused.
     assert!(crossed.validate_for_begin(&begin).is_err());
     // Cumulative work past the declared bounds is refused as too large.
@@ -1225,11 +1281,13 @@ fn no_archive_format_sql_credential_wire_or_runtime_surface() {
             "backup-I/O surface must not grow an unowned surface: {forbidden}"
         );
     }
-    // `credential` occurs exactly once, in the module denial prose ("no
-    // database, filesystem, credential, backup-library ..."); no credential
-    // field, parameter, or surface exists.
-    assert_eq!(SOURCE.matches("credential").count(), 1);
+    // `credential` occurs exactly twice, and both occurrences are denial
+    // prose: the module denial ("no database, filesystem, credential,
+    // backup-library ...") and the retained-member doc comment that states it
+    // names no credential. No credential field, parameter, or surface exists.
+    assert_eq!(SOURCE.matches("credential").count(), 2);
     assert!(SOURCE.contains("credential, backup-library"));
+    assert!(SOURCE.contains("endpoint or credential"));
     // `CAPABILITIES` occurs exactly twice: the closed vocabulary declaration
     // and its membership check. No Store wire catalogue is referenced.
     assert_eq!(SOURCE.matches("CAPABILITIES").count(), 2);
