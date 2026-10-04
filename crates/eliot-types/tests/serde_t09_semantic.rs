@@ -482,8 +482,8 @@ fn fixture_key_tokens_in_source() -> Vec<String> {
         // digits at all and must not be read as a key-shaped name.
         let is_key_shape =
             digits > 0 && tail.starts_with('_') && tail.len() > 1 && shape.len() == literal.len();
-        if is_key_shape && !tokens.contains(&shape.to_owned()) {
-            tokens.push(shape.to_owned());
+        if is_key_shape && !tokens.contains(&shape.clone()) {
+            tokens.push(shape.clone());
         }
         cursor = end + 1;
     }
@@ -648,9 +648,10 @@ fn top_level_member_span(document: &str, member: &str) -> RawMemberSpan {
         {
             cursor += 1;
         }
-        if cursor >= bytes.len() || bytes[cursor] == b'}' {
-            panic!("the stored document must carry a top-level member `{member}`");
-        }
+        assert!(
+            cursor < bytes.len() && bytes[cursor] != b'}',
+            "the stored document must carry a top-level member `{member}`"
+        );
         let key_start = cursor;
         let key_end = scan_json_string(bytes, cursor)
             .unwrap_or_else(|| panic!("the stored document must be well-formed JSON"));
@@ -659,9 +660,11 @@ fn top_level_member_span(document: &str, member: &str) -> RawMemberSpan {
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
-        if bytes.get(cursor) != Some(&b':') {
-            panic!("a top-level member must be followed by `:`");
-        }
+        assert_eq!(
+            bytes.get(cursor),
+            Some(&b':'),
+            "a top-level member must be followed by `:`"
+        );
         cursor += 1;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
@@ -1062,7 +1065,7 @@ fn inventory_allocated_types() -> Vec<String> {
 /// type named `ProviderInvocationAttempt`.
 fn normalize_type_name(name: &str) -> String {
     name.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .map(|character| character.to_ascii_lowercase())
         .collect()
 }
@@ -1283,10 +1286,11 @@ where
 
 /// The decoded value carries EXACTLY the document's own members:
 /// `serde_json::to_value` of the decoded value equals a witness parse of the
-/// stored text. This is the "the decode erased nothing and invented nothing" check
-/// - the executable form of "this document changed no status, created no receipt,
-/// no authority and no effect" - and it is member-order-insensitive, which is
-/// what makes it usable for a document holding a `serde_json::Value` member.
+/// stored text. This is the "the decode erased nothing and invented nothing"
+/// check, the executable form of "this document changed no status, created no
+/// receipt, no authority and no effect", and it is member-order-insensitive,
+/// which is what makes it usable for a document holding a `serde_json::Value`
+/// member.
 fn assert_round_trip_identical<T>(document: &str, label: &str)
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
@@ -1325,7 +1329,12 @@ where
 /// be `None`, and a value must decode to that value: that is what keeps "explicitly
 /// `None`" and "silently omitted" different facts
 /// (`docs/architecture/I05-16-common-durable-fields.md:46`).
-fn assert_nullable_member_agrees<T>(decoded: &Option<T>, member: &str, document: &str)
+///
+/// The parameter is `Option<&T>`, not `&Option<T>`: this helper OWNS its signature
+/// (it is private to this file and every call site is below), and a borrow of an
+/// `Option` is the shape clippy rejects because it cannot be `None`-checked without
+/// a deref. Callers pass `field.as_ref()`, which borrows exactly the same member.
+fn assert_nullable_member_agrees<T>(decoded: Option<&T>, member: &str, document: &str)
 where
     T: serde::Serialize,
 {
@@ -1415,12 +1424,28 @@ fn attribute_is_closed(block: &str) -> bool {
 /// read as an attribute, and a `serde(default)` mentioned inside prose cannot be
 /// mistaken for one. That distinction is what makes the `sd8` and case-10
 /// assertions about members with long disposition comments exact.
+///
+/// `declaration` MAY SIT IN THE MIDDLE OF A LINE - a struct FIELD is indented, so the
+/// text before it ends with that field's own indentation rather than with a newline.
+/// `str::lines()` yields that trailing fragment as a final element, so walking
+/// `lines().rev()` from it sees an item that is not a line at all, decides it is not an
+/// attribute and stops - collecting nothing. An earlier version had exactly that bug:
+/// it worked for every TOP-LEVEL `pub struct`/`pub enum` (whose declaration starts at
+/// column 0, where there is no fragment) and silently returned an empty string for every
+/// FIELD. That made a positive field assertion fail and a negated one pass for the wrong
+/// reason. The partial line is therefore dropped before the walk upwards.
 fn attributes_above(source: &str, declaration: &str) -> String {
     let at = source
         .find(declaration)
         .unwrap_or_else(|| panic!("the production file must declare `{declaration}`"));
+    let mut head = &source[..at];
+    if !head.is_empty() && !head.ends_with('\n') {
+        // Drop the remainder of the line the declaration sits on, keeping the newline
+        // that ends the line before it.
+        head = &head[..head.rfind('\n').unwrap_or(0)];
+    }
     let mut collected: Vec<&str> = Vec::new();
-    for line in source[..at].lines().rev() {
+    for line in head.lines().rev() {
         if line.trim_start().starts_with("#[") {
             collected.push(line.trim());
             continue;
@@ -2289,29 +2314,99 @@ fn c6_wrong_or_unknown_tags_refused() {
         "the corrected status `{corrected_token}` must be one of the spellings this file derived \
          from the source ({legal:?}), or the control proves nothing"
     );
+    // COMPARED AS VALUES, NOT AS TEXT. `to_string` of a unit enum variant yields the
+    // QUOTED wire form (`"completed"`), while `member_text` yields the document's own
+    // unquoted token (`completed`), so comparing the two as strings could never hold and
+    // the control was failing on quotation marks rather than on the claim. Both sides
+    // are compared as `serde_json::Value`, which is the same comparison without the
+    // encoding difference.
     assert_eq!(
-        serde_json::to_string(&accepted.status).expect("a status must re-encode"),
-        corrected_token,
-        "the CONTROL: the corrected run decodes and carries the legal spelling"
+        serde_json::to_value(&accepted.status).expect("a status must re-encode"),
+        member_value(&accepted_document, REPLAY_STATUS),
+        "the CONTROL: the corrected run decodes and carries the legal spelling, as a VALUE and \
+         not as quoted text"
     );
 
-    // (b) An internally tagged result enum whose tag and payload disagree refuses:
+    // (b) An internally tagged result enum whose tag and payload disagree refuses.
     // `ExperienceFormationResult`
-    // (`crates/eliot-types/src/semantic_memory.rs:238`) is tagged on `outcome`
-    // with `deny_unknown_fields` (`:237`), so a payload that does not match the
-    // tag is a `missing field` refusal naming the absent member.
+    // (`crates/eliot-types/src/semantic_memory.rs:237-248`) is
+    // `#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]` with
+    // the single variant field `experience_case: Box<ExperienceCase>` (`:241-243`).
+    //
+    // THE INJECTED DEFECT HERE IS THE UNKNOWN KEY, NOT THE OMISSION. The stored
+    // document is exactly `{"outcome":"formed","reason":"c6 tag and payload disagree"}`,
+    // which carries TWO independent defects at once: `experience_case` is omitted AND
+    // `reason` is a member of the OTHER variant. The refusal is `unknown field
+    // \`reason\`, expected \`experience_case\`` because serde raises the two in a FIXED
+    // ORDER, and the order is what decides which one is reported:
+    //
+    // - `deny_unknown_fields` is an IN-LOOP check: it fires the moment an unrecognised
+    //   key is VISITED, while the derived `visit_map` is still walking the map.
+    // - `missing field` is a POST-LOOP check: the derived code first consumes the whole
+    //   map, collecting each declared field into an `Option`, and only afterwards asks
+    //   whether any of them is still `None`.
+    //
+    // So a document that both omits a required member and carries an unknown member
+    // ALWAYS refuses as `unknown field` first, and the omission can never be the
+    // reported cause. Internally tagged enums sharpen this rather than soften it: the
+    // tag and the remaining content are buffered and re-deserialized as a unit before
+    // the variant is chosen, so the variant's own field set is what the `expected`
+    // list names - which is why the message here names `experience_case` and not the
+    // whole enum.
+    //
+    // `unknown field` is therefore the CORRECT refusal and the sharpest available one:
+    // it names the offending key AND the exact field set the chosen variant accepts.
+    // `assert_omitted_member_refused` is deliberately NOT used on this document: that
+    // helper's precondition is that the ABSENCE is the injected defect, and here it is
+    // not, so using it would demand a `missing field` refusal this decoder cannot
+    // produce. The helper keeps its own semantics for the `c7` omission rows, where the
+    // documents carry nothing unknown and nothing is preempted.
     let wrong_payload = raw("c6_semantic_memory_wrong_outcome_payload_refuse");
-    assert_omitted_member_refused::<ExperienceFormationResult>(
-        &wrong_payload,
-        "c6_semantic_memory_wrong_outcome_payload_refuse",
-        FORMATION_CASE_MEMBER,
+    assert!(
+        !wrong_payload.contains(&format!("\"{FORMATION_CASE_MEMBER}\"")),
+        "the wrong-payload document must really OMIT `{FORMATION_CASE_MEMBER}`, so that the \
+         case exercises the disagreement between the tag and the payload it carries \
+         instead of a document that is merely incomplete"
     );
-    let refused_tag = member_text(&wrong_payload, OUTCOME_TAG);
     assert!(
         wrong_payload.contains(&format!("\"{OUTCOME_REASON_MEMBER}\"")),
         "the wrong-payload document must carry the payload member of the OTHER variant \
          (`{OUTCOME_REASON_MEMBER}`), or this is not a tag/payload disagreement"
     );
+    let Err(unknown_payload) = decode::<ExperienceFormationResult>(&wrong_payload) else {
+        panic!(
+            "c6_semantic_memory_wrong_outcome_payload_refuse must be refused: its `outcome` tag \
+             selects a variant whose payload does not declare the member the document carries"
+        )
+    };
+    let unknown_payload_message = unknown_payload.to_string();
+    assert!(
+        unknown_payload_message.contains("unknown field"),
+        "the refusal must be `unknown field`, which is the IN-LOOP `deny_unknown_fields` check \
+         pre-empting the post-loop `missing field` check, got: {unknown_payload_message}"
+    );
+    assert!(
+        unknown_payload_message.contains(OUTCOME_REASON_MEMBER),
+        "the refusal must name the offending key `{OUTCOME_REASON_MEMBER}`, got: \
+         {unknown_payload_message}"
+    );
+    assert!(
+        unknown_payload_message.contains(FORMATION_CASE_MEMBER),
+        "the refusal's `expected` list is the CHOSEN VARIANT's field set, so it must name \
+         `{FORMATION_CASE_MEMBER}`: that is what makes this the sharpest available refusal, \
+         because it states both the offending key and what the variant does accept, got: \
+         {unknown_payload_message}"
+    );
+    assert!(
+        !unknown_payload_message.contains("missing field"),
+        "the omission of `{FORMATION_CASE_MEMBER}` must NOT be the reported cause here: \
+         `deny_unknown_fields` fires in-loop and pre-empts the post-loop `missing field` \
+         check, so a `missing field` message would mean a different mechanism ran. Got: \
+         {unknown_payload_message}"
+    );
+    // The tag the refusal was about, read out of the document itself, so the CONTROL
+    // below can show that the two tags really differ.
+    let refused_tag = member_text(&wrong_payload, OUTCOME_TAG);
     // The CONTROL, built from raw text: the SAME bytes with the tag that matches
     // the payload decode, which is the whole content of the case.
     let corrected = accepted_formation_result_document();
@@ -2409,34 +2504,42 @@ fn c7_missing_or_empty_required_ids_refused() {
     let manifest: BackupManifest =
         decode(&canonical_manifest).expect("the canonical manifest must decode");
     assert_nullable_member_agrees(
-        &manifest.surreal_source_endpoint,
+        manifest.surreal_source_endpoint.as_ref(),
         SURREAL_SOURCE_ENDPOINT,
         &canonical_manifest,
     );
     assert_nullable_member_agrees(
-        &manifest.surreal_source_storage_ref,
+        manifest.surreal_source_storage_ref.as_ref(),
         SURREAL_SOURCE_STORAGE_REF,
         &canonical_manifest,
     );
     assert_nullable_member_agrees(
-        &manifest.blob_payload_root,
+        manifest.blob_payload_root.as_ref(),
         BLOB_PAYLOAD_ROOT,
         &canonical_manifest,
     );
     let plan: RestorePlan =
         decode(&canonical_plan).expect("the canonical restore plan must decode");
-    assert_nullable_member_agrees(&plan.target_endpoint, TARGET_ENDPOINT, &canonical_plan);
     assert_nullable_member_agrees(
-        &plan.target_storage_ref,
+        plan.target_endpoint.as_ref(),
+        TARGET_ENDPOINT,
+        &canonical_plan,
+    );
+    assert_nullable_member_agrees(
+        plan.target_storage_ref.as_ref(),
         TARGET_STORAGE_REF,
         &canonical_plan,
     );
-    assert_nullable_member_agrees(&plan.exact_action_hash, EXACT_ACTION_HASH, &canonical_plan);
+    assert_nullable_member_agrees(
+        plan.exact_action_hash.as_ref(),
+        EXACT_ACTION_HASH,
+        &canonical_plan,
+    );
     let canonical_receipt = raw("c2_RestoreReceipt_canonical");
     let receipt: RestoreReceipt =
         decode(&canonical_receipt).expect("the canonical restore receipt must decode");
     assert_nullable_member_agrees(
-        &receipt.exact_action_hash,
+        receipt.exact_action_hash.as_ref(),
         EXACT_ACTION_HASH,
         &canonical_receipt,
     );
@@ -2889,7 +2992,11 @@ fn c10_unsafe_absent_identity_or_lineage_refuses() {
         "the canonical plan must carry `{EXACT_ACTION_HASH}` explicitly"
     );
     let plan: RestorePlan = decode(&canonical_plan).expect("the canonical plan must decode");
-    assert_nullable_member_agrees(&plan.exact_action_hash, EXACT_ACTION_HASH, &canonical_plan);
+    assert_nullable_member_agrees(
+        plan.exact_action_hash.as_ref(),
+        EXACT_ACTION_HASH,
+        &canonical_plan,
+    );
 
     // (b) The one `TaskMeaningFrame` document the corpus stores is the case-5
     // duplicate; dropping its FIRST `task_id` pair as raw text leaves a
@@ -3065,15 +3172,17 @@ fn c11_opaque_data_cannot_smuggle_control_meaning() {
     let collapse_row = known_non_clean_rows()
         .into_iter()
         .find(|row| {
-            let text = format!(
-                "{}{}",
-                row.get("property")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-                row.get("observed")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-            );
+            let property = row
+                .get("property")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let observed = row
+                .get("observed")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let text = format!("{property}{observed}");
             text.contains("payload") && text.to_lowercase().contains("collaps")
         })
         .expect("the corpus must record the `payload: Value` collapse exception as a row");
@@ -3196,27 +3305,30 @@ fn c12_proposed_or_verified_is_not_applied() {
         .iter()
         .map(|variant| camel_to_snake(variant))
         .collect();
+    let verified_only = legal_status
+        .iter()
+        .find(|spelling| *spelling == "verified_only")
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
         serde_json::to_string(&RestoreStatus::VerifiedOnly).expect("a status must re-encode"),
-        format!(
-            "\"{}\"",
-            legal_status
-                .iter()
-                .find(|spelling| *spelling == "verified_only")
-                .cloned()
-                .unwrap_or_default()
-        ),
+        format!("\"{verified_only}\""),
         "`RestoreStatus::VerifiedOnly` must re-encode to the spelling this file derived from the \
          enum's own declared variants ({legal_status:?})"
     );
     let canonical_receipt = raw("c2_RestoreReceipt_canonical");
     let receipt: RestoreReceipt =
         decode(&canonical_receipt).expect("the canonical restore receipt must decode");
+    // COMPARED AS VALUES, NOT AS TEXT. `to_string` of a unit enum variant yields the
+    // QUOTED wire form (`"verified_only"`), while `member_text` yields the document's own
+    // unquoted token (`verified_only`); the comparison above was failing on quotation
+    // marks, not on the claim. Note the sibling assertion just above is correct AS
+    // WRITTEN because both of ITS sides are quoted text.
     assert_eq!(
-        serde_json::to_string(&receipt.status).expect("a status must re-encode"),
-        member_text(&canonical_receipt, RESTORE_STATUS),
-        "the decoded restore receipt must re-encode its own status spelling, whichever status \
-         the container's canonical document states"
+        serde_json::to_value(receipt.status).expect("a status must re-encode"),
+        member_value(&canonical_receipt, RESTORE_STATUS),
+        "the decoded restore receipt must carry the status the container's canonical document \
+         states, compared as a VALUE and not as quoted text"
     );
     assert_round_trip_identical::<RestoreReceipt>(
         &canonical_receipt,
@@ -3438,8 +3550,7 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
         explicit_unknown_keys[0].contains(CAMPAIGN_INTEGRITY)
             && explicit_unknown_keys[0].ends_with("_absent_explicit_unknown"),
         "the non-refusing `c7` document must be the `campaign_integrity` one and must be named \
-         for the disposition it really has: {:?}",
-        explicit_unknown_keys
+         for the disposition it really has: {explicit_unknown_keys:?}"
     );
 
     // (e) `rp1..rp4` against the REAL source: the set of `#[serde(default`-carrying
@@ -3554,7 +3665,8 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
         "exactly ONE row may state the file-wide count of replay.rs wire defaults, and it must \
          cite every measured line. Measured: {counting:?}"
     );
-    let counting_text = row_text(counting[0]);
+    let counting_id = counting[0];
+    let counting_text = row_text(counting_id);
     let counting_lower = counting_text.to_lowercase();
     // The COUNT is derived from the source, not typed: `measured_lines.len()` defaults are
     // counted here, and the row must state that same count. Case-insensitively, because
@@ -3570,10 +3682,9 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
     };
     assert!(
         counting_lower.contains(count_word),
-        "the row that states the file-wide count (`{}`) must state the count this file MEASURED - \
-         {count_word} - because that many `#[serde(default` declarations exist in replay.rs at \
-         {measured_lines:?}. It says: {counting_text}",
-        counting[0]
+        "the row that states the file-wide count (`{counting_id}`) must state the count this file \
+         MEASURED - {count_word} - because that many `#[serde(default` declarations exist in \
+         replay.rs at {measured_lines:?}. It says: {counting_text}"
     );
     assert!(
         counting_lower.contains("not two"),
@@ -3834,20 +3945,23 @@ fn c15_decoder_refuses_before_trusted_output() {
         // that lossy parse, and it is deliberately the ONLY route here that is
         // allowed to lose the repeat.
         let collapsed = witness(&document);
+        // WHERE the repeated member really sits, computed ONCE and named, so both
+        // failure messages below quote the same path instead of one of them
+        // interpolating the raw `Vec` and the other a joined string.
+        let repeated_at = path.join(".");
         let mut cursor = &collapsed;
         for step in &path {
-            cursor = cursor.get(step).unwrap_or_else(|| {
+            cursor = cursor.get(*step).unwrap_or_else(|| {
                 panic!(
                     "{fixture}: the lossy route must still reach `{step}` on the way to `{member}`, \
-                     because the erasure is observable at {path:?} and nowhere shallower",
-                    path = path.join(".")
+                     because the erasure is observable at {repeated_at} and nowhere shallower"
                 )
             });
         }
         let retained = cursor.as_str().unwrap_or_else(|| {
             panic!(
-                "{fixture}: the repeated member at {} must be a string in the lossy projection",
-                path.join(".")
+                "{fixture}: the repeated member at {repeated_at} must be a string in the lossy \
+                 projection"
             )
         });
         assert_eq!(
@@ -3880,19 +3994,49 @@ fn c15_decoder_refuses_before_trusted_output() {
             );
         };
         let inner_message = inner_error.to_string();
-        let needle = if member == DUPLICATE_ENTITY_ROLE_KEY {
-            "duplicate map key"
-        } else {
+        // TWO MEMBERS, TWO MECHANISMS, TWO NEEDLES - never one needle for both.
+        //
+        // `task_id` is a plain derived `String`, so its repeat is refused by the
+        // DERIVE's own per-field check, which interpolates the field's wire name:
+        // `serde_derive-1.0.229/src/de/struct_.rs:266-273` emits
+        // `Error::duplicate_field(#deser_name)` when the field is already `Some`, before
+        // the repeated value is visited. That is why the message may be required to NAME
+        // `task_id`.
+        //
+        // `subject` is not a field at all: it is a KEY of the `entity_roles` MAP, which
+        // carries `#[serde(deserialize_with = "deserialize_strict_btree_map")]`
+        // (`crates/eliot-types/src/semantic_memory.rs:264-265`, visitor defined at `:16`
+        // and erroring at `:41-43`). That visitor raises a BARE
+        // `Error::custom("duplicate map key")` and deliberately does not echo the key -
+        // the shared lexical decoder's `DuplicateKey` does not echo it either
+        // (`crates/eliot-types/src/strict_json.rs:39`, redacted by design at `:64-66`).
+        // So requiring this message to contain `subject` would demand a disclosure the
+        // decoder deliberately does not make, and I will not weaken the map assertion to
+        // "the decode fails" either: it asserts the refusal CLASS.
+        let derived_member = member == DUPLICATE_TASK_ID;
+        let needle = if derived_member {
             "duplicate field"
+        } else {
+            "duplicate map key"
         };
         assert!(
             inner_message.contains(needle),
             "{fixture}: the inner frame's refusal must be `{needle}`, got: {inner_message}"
         );
-        assert!(
-            inner_message.contains(member),
-            "{fixture}: the inner frame's refusal must name `{member}`, got: {inner_message}"
-        );
+        if derived_member {
+            assert!(
+                inner_message.contains(member),
+                "{fixture}: the DERIVE's `duplicate field` refusal interpolates the field's wire \
+                 name, so it must name `{member}`, got: {inner_message}"
+            );
+        } else {
+            assert!(
+                !inner_message.contains(&format!("`{member}`")),
+                "{fixture}: the map visitor's refusal must NOT echo the repeated key - it is a \
+                 bare `duplicate map key` by design, so a message naming `{member}` would mean a \
+                 different mechanism had fired. Got: {inner_message}"
+            );
+        }
     }
 
     // (d) THE ROLLBACK CONSUMER, quoted from the container's own row and checked
@@ -4101,7 +4245,7 @@ fn c16_scope_schema_routing_dependencies_visibility_unchanged() {
             )
         });
         assert!(
-            !types.iter().any(|allocated| *allocated == claimed_type),
+            !types.contains(&claimed_type),
             "{label}: `{claimed_type}` is named by the probe as being outside this slice's \
              allocation, so it must not be one of the 160 names `meta.types` records"
         );
@@ -4113,12 +4257,12 @@ fn c16_scope_schema_routing_dependencies_visibility_unchanged() {
              makes the probe's member name a REAL type name rather than an invented one"
         );
     }
+    let probe_total = probes.len();
     assert!(
         probes_naming_another_family > 0,
         "at least one probe must carry a member that is the name of a real type the frozen \
          inventory allocates to ANOTHER family, or the group does not show that an out-of-slice \
-         type name is not accepted as one. Measured: {probes_naming_another_family} of {}",
-        probes.len()
+         type name is not accepted as one. Measured: {probes_naming_another_family} of {probe_total}"
     );
 
     // (e) The visibility fact a test CAN read: every type this file names is
