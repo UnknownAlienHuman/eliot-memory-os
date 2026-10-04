@@ -5010,6 +5010,14 @@ mod tests {
     /// separate sink rather than extra `use` lines at the top of this module,
     /// because those imports are part of the harness contract and must not be
     /// disturbed.
+    // Disallowed-methods escape hatch (clippy.toml I10.8.2). Owner: the
+    // issue #789 harness in this crate's test surface. Operation: this
+    // TEST-ONLY fixture spawns `cmd /D /C ping -n 30 127.0.0.1 >NUL` to own
+    // a real, long-lived child process handle, which is the only way the
+    // unarmed-drop case can prove a real `OwnedHandle::close`. Removal
+    // condition: deleted with the #789 harness, never promoted to production.
+    #[allow(clippy::disallowed_methods)]
+    #[allow(clippy::expect_used)]
     fn owned_handle_sink() -> std::process::Child {
         std::process::Command::new("cmd")
             .args(["/D", "/C", "ping", "-n", "30", "127.0.0.1", ">NUL"])
@@ -5031,9 +5039,9 @@ mod tests {
         finished: std::sync::atomic::AtomicUsize,
         entered: std::sync::atomic::AtomicUsize,
         publish: std::sync::mpsc::Sender<()>,
-        observe: std::sync::mpsc::Receiver<()>,
+        observe: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         reached_loop: std::sync::mpsc::Sender<()>,
-        loop_observed: std::sync::mpsc::Receiver<()>,
+        loop_observed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     impl ShutdownRendezvous {
@@ -5045,13 +5053,14 @@ mod tests {
                 finished: std::sync::atomic::AtomicUsize::new(0),
                 entered: std::sync::atomic::AtomicUsize::new(0),
                 publish,
-                observe,
+                observe: std::sync::Mutex::new(observe),
                 reached_loop,
-                loop_observed,
+                loop_observed: std::sync::Mutex::new(loop_observed),
             }
         }
 
         /// The observer publishes this once it is parked in its polling loop.
+        #[allow(clippy::expect_used)]
         fn publish_entered(&self) {
             self.entered.store(1, Ordering::Release);
             self.reached_loop
@@ -5063,8 +5072,11 @@ mod tests {
         /// This is a CHANNEL rendezvous, not a timer: it returns as soon as the
         /// observer publishes the fact, so no assertion downstream depends on a
         /// chosen duration.
+        #[allow(clippy::expect_used)]
         fn await_entered(&self) {
             self.loop_observed
+                .lock()
+                .expect("the loop rendezvous mutex must not be poisoned")
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the observer must reach its parked loop");
             assert!(
@@ -5074,6 +5086,7 @@ mod tests {
         }
 
         /// Releases every waiter and takes the single release token back.
+        #[allow(clippy::expect_used)]
         fn shut(&self) {
             self.released.fetch_add(1, Ordering::AcqRel);
             self.publish
@@ -5082,8 +5095,11 @@ mod tests {
         }
 
         /// Blocks until the release token is published.
+        #[allow(clippy::expect_used)]
         fn wait(&self) {
             self.observe
+                .lock()
+                .expect("the shutdown rendezvous mutex must not be poisoned")
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown must release the observer exactly once");
         }
@@ -5102,9 +5118,12 @@ mod tests {
     /// the release flag and the observer publishes its finish flag before
     /// consuming the token, so observing one implies the other was already
     /// visible.
+    #[allow(clippy::expect_used)]
     fn take_shutdown_token(rendezvous: &ShutdownRendezvous) {
         rendezvous
             .observe
+            .lock()
+            .expect("the shutdown rendezvous mutex must not be poisoned")
             .recv_timeout(Duration::from_secs(5))
             .expect("the observer must consume the shutdown token");
     }
@@ -5169,10 +5188,7 @@ mod tests {
         let sink = owned_handle_sink();
         let mut observed = Vec::new();
         let unresolved_before = unresolved_handle_cleanup_count();
-        let guard = match DirectoryOplockGuard::acquire(directory) {
-            Ok(guard) => Some(guard),
-            Err(_) => None,
-        };
+        let guard = DirectoryOplockGuard::acquire(directory).ok();
         {
             // The returned guard restores the previous armed set on drop, so
             // no injected fault can outlive the step that armed it.
@@ -5212,9 +5228,10 @@ mod tests {
     /// Requirement 1: the observer's shutdown ordering is observed
     /// deterministically, with no elapsed-time assumption.
     #[test]
+    #[allow(clippy::expect_used)]
     fn observer_shutdown_ordering_is_observed_through_a_rendezvous_not_a_timer() {
-        let rendezvous = Arc::new(ShutdownRendezvous::open());
-        let thread_rendezvous = Arc::clone(&rendezvous);
+        let rendezvous = std::sync::Arc::new(ShutdownRendezvous::open());
+        let thread_rendezvous = std::sync::Arc::clone(&rendezvous);
         let observer = std::thread::spawn(move || {
             // The observer polls its shutdown flag before each dequeue, which
             // is what `job_process_observer_loop` does around its bounded
@@ -5269,9 +5286,15 @@ mod tests {
     /// armable denominator, asserting a real invariant per boundary.
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::expect_used)]
     fn fixed_seed_model_sequence_keeps_every_boundary_inside_its_failing_closed_ramp() {
         let all = FaultBoundary::ALL;
         assert_eq!(all.len(), 7, "the boundary vocabulary is closed");
+        // Every PRNG draw is reduced against this `u64` span, which equals the
+        // `all.len()` asserted above, and is converted to an index only after
+        // the reduction. The value handed to `usize` is therefore already
+        // below `all.len()`, so the conversion is total and cannot truncate.
+        let span = u64::try_from(all.len()).unwrap_or_default();
         let directory = HarnessDirectory::new("eliot-model-sequence-walk")
             .expect("harness directory must be created");
         let mut seed = MODEL_SEED;
@@ -5281,8 +5304,8 @@ mod tests {
                 // The armed set is FIXED for every round. What the fixed seed
                 // decides is the order the boundaries are walked in, and that
                 // order is asserted rather than merely reproduced.
-                let mut candidate =
-                    all[(advance_model_seed(&mut seed) as usize + index) % all.len()];
+                let offset = (advance_model_seed(&mut seed) % span + index as u64) % span;
+                let mut candidate = all[usize::try_from(offset).unwrap_or_default()];
                 if observed.iter().any(|(name, _)| *name == candidate.name()) {
                     // Never re-visit a boundary within a round: a duplicated
                     // visit must not be mistaken for coverage.
@@ -5305,8 +5328,7 @@ mod tests {
                 let reported = facts
                     .iter()
                     .find(|(name, _)| *name == boundary.name())
-                    .map(|(_, value)| value.as_str())
-                    .unwrap_or("");
+                    .map_or("", |(_, value)| value.as_str());
                 match boundary {
                     // The Cleanup arm must count exactly one unresolved owned
                     // handle: a silent close or a double count both fail here.
@@ -5390,14 +5412,14 @@ mod tests {
         let mut replay = MODEL_SEED;
         let mut first = Vec::new();
         for _ in 0..all.len() {
-            let draw = advance_model_seed(&mut replay);
-            first.push(all[draw as usize % all.len()].name());
+            let draw = advance_model_seed(&mut replay) % span;
+            first.push(all[usize::try_from(draw).unwrap_or_default()].name());
         }
         let mut replay = MODEL_SEED;
         let mut second = Vec::new();
         for _ in 0..all.len() {
-            let draw = advance_model_seed(&mut replay);
-            second.push(all[draw as usize % all.len()].name());
+            let draw = advance_model_seed(&mut replay) % span;
+            second.push(all[usize::try_from(draw).unwrap_or_default()].name());
         }
         assert_eq!(
             first, second,
@@ -5419,11 +5441,12 @@ mod tests {
     /// crash-containment family is carried outside this crate's test surface.
     /// No assertion below stands in for it.
     #[test]
+    #[allow(clippy::expect_used)]
     fn armed_cleanup_boundary_counts_every_owned_handle_drop_it_defers() {
         // Unarmed: the same sink closes for real and nothing is counted. This
         // is also the positive control for the counter, so an assertion that
         // the armed path counts can only fail because that path changed.
-        let mut sink = owned_handle_sink();
+        let sink = owned_handle_sink();
         let before_unarmed = unresolved_handle_cleanup_count();
         drop(sink);
         assert_eq!(
@@ -5481,7 +5504,7 @@ mod tests {
         // unarmed drop must close silently again. The comparison is against
         // the armed total, which can only have moved by zero from here.
         let restored = unresolved_handle_cleanup_count();
-        let mut sink = owned_handle_sink();
+        let sink = owned_handle_sink();
         drop(sink);
         assert_eq!(
             unresolved_handle_cleanup_count(),
