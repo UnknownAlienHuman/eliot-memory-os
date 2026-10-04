@@ -1324,6 +1324,7 @@ fn commit_canonical_store_cutover_ownership_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::KernelConfig;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -1417,6 +1418,17 @@ mod tests {
         assert_eq!(
             generation_cutover_terminal_code(&KernelServiceError::ReadinessNotProven),
             "CUTOVER_READINESS_NOT_PROVEN"
+        );
+        // The variant the cutover path actually refuses with
+        // (`KernelServiceError::HandshakeMismatch`, generation_control.rs:883),
+        // pinned by literal here so the mapper's own arm is anchored rather
+        // than only ever compared against its own output. Only the variant is
+        // mapped; the `field` payload is never rendered.
+        assert_eq!(
+            generation_cutover_terminal_code(&KernelServiceError::HandshakeMismatch {
+                field: "generation_cutover.live_state"
+            }),
+            "CUTOVER_HANDSHAKE_MISMATCH"
         );
         assert_eq!(
             generation_cutover_terminal_code(&KernelServiceError::Platform(
@@ -1597,5 +1609,592 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // F-LOG-KERNEL-4 (#903 T8 / T27): the generation gateway's own cutover
+    // receipt comparison, the route snapshot the gateway publishes, and the
+    // one terminal each generation operation owns.
+    //
+    // Governing handles, read from the routed bundle
+    // `.eliot/docs-read-bundle.md` (read receipt
+    // sha256:f7f6664699fb6c81022a58d4c1a5f1619409893fba520754d92eae7094fd9f48; a copy
+    // sits beside this delivery as v2/issues/903/docs-read-bundle-run8.md, because
+    // `.eliot/` is gitignored and no reader or CI job can resolve a path in it):
+    //
+    // I1.8 (exact ownership and call paths) - "Kernel verifies identity,
+    // authority, State Fence, idempotency, ordering and runtime generation"
+    // and "No component alone can invent semantics, authorize them and commit
+    // them. This is a two-check implementation of one authority, not two
+    // writers or two policy owners."
+    //
+    // I14.20 (canonical runtime lifecycle vocabulary) - "COMMITTED is the ORS
+    // linearization point" and "Rollback is never a backward state transition.
+    // It is a new cutover with a newer Authority Epoch."
+    //
+    // I14.14 (module hot replacement, in the bundle) - "commit one ORS cutover
+    // transition: active route for new admissions = candidate; new Authority
+    // Epoch = issued; old general generation authority = fenced", "atomically
+    // swap the in-memory route snapshot from that committed record", and
+    // "Exactly one generation owns new effect admission for a
+    // CapabilityRouteScope."
+    //
+    // I14.21 (unknown commit recovery) - "if unknown -> pause Ordering Scope,
+    // preserve operation and open Problem State; no blind duplicate effect."
+    //
+    // I14.24 (local failure containment matrix) - "config candidate invalid |
+    // retain old snapshot | continues | fix candidate": a refused switch
+    // retains the current active state instead of publishing a best-effort
+    // route.
+    //
+    // I13.11 (diagnostic brief) - "timeline and correlation" plus "exact
+    // evidence/log handles"; the brief is a correlated problem model, so one
+    // failed operation carries one terminal record under its own identity.
+    //
+    // I14.03 (control reserve, governing handle) - "Each disposition names
+    // the exhausted resource and the work shed, deferred or quarantined": a
+    // terminal code names its own owner and never a second owner's.
+    //
+    // I16.17 (instrument plane observability) - "Operational logs never
+    // become verifier evidence by themselves": the assertions below read the
+    // rendered records, and no record is treated as a state change.
+    // ---------------------------------------------------------------------
+
+    /// Gives one test its own composition work root, so parallel tests never
+    /// share one ORS or one route table.
+    fn probe_work_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "eliot-kernel-generation-control-{label}-{}-{}",
+            std::process::id(),
+            crate::unix_ms()
+        ))
+    }
+
+    /// Mints one decision through the production constructor, so the epoch
+    /// lineage, the one-step advance and the distinct-generation rule are the
+    /// owner's own validation and not a hand-built struct.
+    fn probe_decision(
+        cutover_id: &str,
+        scope: &str,
+        old_generation: u64,
+        new_generation: u64,
+        old_epoch: u64,
+        new_epoch: u64,
+    ) -> CutoverDecision {
+        CutoverDecision::new(
+            cutover_id.to_owned(),
+            probe_scope(scope),
+            Some(ResourceGeneration::new(old_generation).unwrap_or_else(|_| unreachable!())),
+            ResourceGeneration::new(new_generation).unwrap_or_else(|_| unreachable!()),
+            test_epoch(old_epoch),
+            test_epoch(new_epoch),
+            GenerationCutoverState::Committed,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn probe_scope(value: &str) -> RouteScope {
+        RouteScope::new(value.to_owned()).unwrap_or_else(|_| unreachable!())
+    }
+
+    /// Builds the route table the durable owner would have published: one
+    /// scope bound to one generation at one exact epoch.
+    fn probe_router(epoch_sequence: u64, scope: &str, generation: u64) -> GenerationRouter {
+        let epoch = test_epoch(epoch_sequence);
+        let mut router = GenerationRouter::at_epoch(epoch.clone());
+        router
+            .register(
+                GenerationRoute::new(
+                    probe_scope(scope),
+                    ResourceGeneration::new(generation).unwrap_or_else(|_| unreachable!()),
+                    epoch,
+                )
+                .unwrap_or_else(|_| unreachable!()),
+            )
+            .unwrap_or_else(|_| unreachable!());
+        router
+    }
+
+    /// Builds the live Kernel owner and places it at one exact lineage-aware
+    /// epoch through its own durable epoch bridge.
+    fn probe_service(epoch_sequence: u64) -> eliot_kernel_service::KernelService {
+        let mut service = eliot_kernel_service::KernelService::new([53; 32], 2, 4)
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .synchronize_authority_epoch(test_epoch(epoch_sequence))
+            .unwrap_or_else(|_| unreachable!());
+        service
+    }
+
+    /// Counts rendered records across the WHOLE captured surface, never a
+    /// hand-listed subset of it.
+    fn count_records(surface: &str, marker: &str) -> usize {
+        surface.matches(marker).count()
+    }
+
+    /// Reads one field back off the rendered record itself, so an assertion
+    /// compares the owner-published identity rather than a local variable.
+    fn rendered_field<'a>(record: &'a str, key: &str) -> &'a str {
+        let marker = format!("{key}=");
+        let Some((_, rest)) = record.split_once(marker.as_str()) else {
+            return "";
+        };
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        rest.split(['"', ' ']).next().unwrap_or("")
+    }
+
+    #[test]
+    fn cutover_live_endpoint_requires_the_exact_current_owner_receipt() {
+        // I1.8: "Kernel verifies identity, authority, State Fence, idempotency,
+        // ordering and runtime generation"; I14.20: "COMMITTED is the ORS
+        // linearization point".
+        //
+        // Every premise is a production value read through the production
+        // comparator `classify_generation_cutover_live_endpoint`
+        // (generation_control.rs:582): a `CutoverDecision` minted by
+        // `CutoverDecision::new` (eliot-kernel-core/src/module/
+        // generation_routing.rs:120), a `GenerationRouter` published through
+        // `GenerationRouter::register` (same file :249), and a `KernelService`
+        // placed at an exact epoch through
+        // `KernelService::synchronize_authority_epoch` (lifecycle.rs:1272).
+        //
+        // Term-by-term account of that comparator, because no leg below claims
+        // coverage the legs do not deliver. ISOLATED marks a term some leg
+        // moves alone: exactly one operand differs from that leg's reference
+        // premise, so deleting the term by itself flips that leg's answer.
+        // UNISOLATABLE marks a term no premise this test can mint can decide.
+        //
+        //   ISOLATED, one operand each:
+        //     :598  route.active_generation() == generation
+        //     :604  service_epoch.is_same_authority(decision.new_epoch())
+        //     :597  route.is_some_and(..)      (the exact route scope)
+        //     :613  service_epoch.is_same_authority(decision.old_epoch())
+        //   UNISOLATABLE, with the reason:
+        //     :587  decision.state() != Committed   guard, not covered:
+        //           `probe_decision` pins `GenerationCutoverState::Committed`.
+        //     :590  decision.old_generation() None  guard, not covered: the
+        //           same helper pins `Some(old_generation)`.
+        //     :603  router.epoch() .. new_epoch()   implied by :605.
+        //           `register` refuses any route epoch that is not the
+        //           router's own active tuple (generation_routing.rs:249, whose
+        //           guard is `authorize_presented_epoch` at :267), so a route
+        //           carrying the new epoch forces the router epoch to be the
+        //           new epoch; :603 can never be the deciding term.
+        //     :599  route.authority_epoch() .. epoch  implied by that same
+        //           guard: the route epoch IS the router epoch, and :603 or
+        //           :612 already pinned that router epoch to this very epoch.
+        //     :612  router.epoch() .. old_epoch()   implied by :614 through
+        //           the same guard, so it can never be the deciding term
+        //           either.
+        //     :606  new_epoch.is_direct_child_of(old_epoch)  unreachable by
+        //           construction: `CutoverDecision::new` refuses any pair that
+        //           is not the exact one-step child
+        //           (generation_routing.rs:143), so no decision this test can
+        //           mint ever reaches it. A defensive re-assertion of the
+        //           owner's own constructor validation, not a covered term.
+        //
+        // The `probe_router(3, ..)` leg below is deliberately NOT a single-term
+        // move: it lowers the router epoch and its route's epoch together, and
+        // `probe_service(3)` lowers the live owner epoch too, so that one leg
+        // falsifies :603, :604, :605, :612 and :613 at once. It proves only
+        // that a stale live state classifies as Mismatch, never which term
+        // decided it.
+        let decision = probe_decision("cutover-classify-903", "daemon", 7, 8, 4, 5);
+
+        // Exact committed destination: route table, live owner epoch and the
+        // route itself all name the decision's new tuple. Readback, never a
+        // second apply.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(5, "daemon", 8),
+                &probe_service(5),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Readback
+        );
+
+        // Exact source: the published route is still the decision's old tuple,
+        // so the switch has to be applied rather than read back.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(4, "daemon", 7),
+                &probe_service(4),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Apply
+        );
+
+        // One generation off: the committed route serves a generation the
+        // decision never names. Dropping :598 answers Readback here.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(5, "daemon", 9),
+                &probe_service(5),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Mismatch
+        );
+
+        // One fence off: the route table already holds the committed
+        // destination while the live Kernel authority epoch is still the old
+        // one. Dropping :604 answers Readback here.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(5, "daemon", 8),
+                &probe_service(4),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Mismatch
+        );
+
+        // Receipt for another route scope: the published route table carries
+        // no such route. Dropping :597's presence test answers Readback here.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(5, "store_bridge", 8),
+                &probe_service(5),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Mismatch
+        );
+
+        // Not a single-term move, and the header says so: `probe_router` and
+        // `probe_service` are independent, so this leg lowers the router epoch,
+        // its route's epoch and the live owner epoch together. It proves only
+        // that a stale live state is a Mismatch.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(3, "daemon", 7),
+                &probe_service(3),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Mismatch
+        );
+
+        // The live owner epoch alone, one term off the Apply premise
+        // (`probe_router(4, "daemon", 7)` with `probe_service(4)`): the route
+        // table still holds the decision's old tuple at the old epoch, so :603
+        // cannot reach Readback whatever :613 says, and the Apply branch is
+        // decided by :613 alone. Dropping :613 answers Apply here.
+        //
+        // `probe_service(6)` is an ordinary premise: `KernelService::new` starts
+        // at `genesis_epoch()` (lifecycle.rs:45, sequence 1, the same lineage
+        // `test_epoch` mints), and `synchronize_authority_epoch` refuses only a
+        // regression, a foreign lineage or a gap above `MAX_EPOCH_SYNC_GAP`
+        // (lifecycle.rs:1290 and :1302), so sequence 6 is a plain forward sync.
+        assert_eq!(
+            classify_generation_cutover_live_endpoint(
+                &probe_router(4, "daemon", 7),
+                &probe_service(6),
+                &decision,
+            ),
+            GenerationCutoverLiveEndpoint::Mismatch
+        );
+    }
+
+    #[test]
+    fn refused_cutover_stays_typed_and_publishes_no_route_change() {
+        // I14.24: "config candidate invalid | retain old snapshot | continues |
+        // fix candidate"; I1.8: "No component alone can invent semantics,
+        // authorize them and commit them."
+        //
+        // The refused comparison is production's own
+        // `KernelComposition::apply_generation_cutover` (generation_control.rs
+        // :813) reaching `classify_generation_cutover_live_endpoint` (:876)
+        // through `apply_generation_cutover_inner`. The route snapshot is read
+        // back through the owner's `generation_route_snapshot` (:764).
+        let root = probe_work_root("cutover-refusal");
+        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        let kernel =
+            KernelComposition::new(KernelConfig::new(&root)).unwrap_or_else(|_| unreachable!());
+        let scope = probe_scope("daemon");
+        let before = kernel
+            .generation_route_snapshot()
+            .unwrap_or_else(|_| unreachable!());
+        let before_route = before
+            .route(&scope)
+            .unwrap_or_else(|_| unreachable!())
+            .clone();
+
+        // A receipt naming a route scope the committed route table does not
+        // carry: one term of the production comparison is wrong.
+        let refused = probe_decision("cutover-refusal-903", "absent_scope", 1, 2, 1, 2);
+        let mut observed = None;
+        let text = capture(|| {
+            observed = Some(kernel.apply_generation_cutover(&refused));
+        });
+        let Some(Err(error)) = observed else {
+            unreachable!("a receipt for an absent route scope must stay a typed refusal");
+        };
+
+        // Typed refusal, not a best-effort cutover (:882-:886).
+        assert!(matches!(
+            &error,
+            KernelServiceError::HandshakeMismatch {
+                field: "generation_cutover.live_state"
+            }
+        ));
+        // I13.11: the terminal is bound to the operation its own records name.
+        assert_eq!(count_records(&text, "kernel.terminal_error"), 1);
+        assert_eq!(
+            count_records(&text, "kernel.generation.cutover_requested"),
+            1
+        );
+        assert_eq!(count_records(&text, "kernel.generation.cutover_failed"), 1);
+        let failed = text
+            .lines()
+            .find(|line| line.contains("kernel.generation.cutover_failed"))
+            .unwrap_or("");
+        assert_eq!(rendered_field(failed, "cutover_id"), refused.cutover_id());
+        let terminal = text
+            .lines()
+            .find(|line| line.contains("kernel.terminal_error"))
+            .unwrap_or("");
+        // The literal, not a second application of the mapper: the record's
+        // `code` was itself produced by `generation_cutover_terminal_code`
+        // (generation_control.rs:841, whose `HandshakeMismatch` arm is :485), so
+        // comparing it against that same mapper on the same error would move
+        // both sides together and distinguish nothing. That arm is pinned by
+        // literal in the mapper-table test at generation_control.rs:1392.
+        assert_eq!(
+            rendered_field(terminal, "code"),
+            "CUTOVER_HANDSHAKE_MISMATCH"
+        );
+        // Whole-surface absence: the read path's terminal vocabulary belongs to
+        // :461 and must never appear on the cutover path's own records.
+        assert_eq!(count_records(&text, "SNAPSHOT_"), 0);
+
+        // The refusal published nothing and fenced nothing: the durable owner's
+        // route snapshot and live fence are byte-identical to before.
+        let after = kernel
+            .generation_route_snapshot()
+            .unwrap_or_else(|_| unreachable!());
+        let after_route = after.route(&scope).unwrap_or_else(|_| unreachable!());
+        assert_eq!(after_route, &before_route);
+        assert_eq!(after.epoch(), before.epoch());
+        assert!(
+            kernel
+                .generation_poison
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a typed cutover refusal must not fence the generation gateway"
+        );
+        assert!(
+            !kernel
+                .service
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .generation_fenced(),
+            "a typed cutover refusal must not fence the Kernel service"
+        );
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_cutover_publishes_candidate_and_retires_old_generation() {
+        // I14.14 step 8/9: "active route for new admissions = candidate; new
+        // Authority Epoch = issued; old general generation authority = fenced"
+        // then "atomically swap the in-memory route snapshot from that
+        // committed record"; I14.20: "Rollback is never a backward state
+        // transition. It is a new cutover with a newer Authority Epoch."
+        //
+        // Every value compared here is read back from the snapshot the gateway
+        // itself published (`generation_route_snapshot`, :764) and from the
+        // Kernel's own live projection (`active_generation_registry_projection`,
+        // :701) - never from a local variable the test also built.
+        let root = probe_work_root("cutover-commit");
+        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        let kernel =
+            KernelComposition::new(KernelConfig::new(&root)).unwrap_or_else(|_| unreachable!());
+        let scope = probe_scope("daemon");
+        let before = kernel
+            .generation_route_snapshot()
+            .unwrap_or_else(|_| unreachable!());
+        let before_route = before
+            .route(&scope)
+            .unwrap_or_else(|_| unreachable!())
+            .clone();
+        let old_epoch = before.epoch().clone();
+        let new_epoch = test_epoch(old_epoch.sequence.get() + 1);
+        let decision = probe_decision(
+            "cutover-commit-903",
+            "daemon",
+            before_route.active_generation().value(),
+            before_route.active_generation().value() + 1,
+            old_epoch.sequence.get(),
+            new_epoch.sequence.get(),
+        );
+
+        let text = capture(|| {
+            assert!(kernel.apply_generation_cutover(&decision).is_ok());
+        });
+        // Requested and committed stay distinct answers on one call.
+        assert_eq!(
+            count_records(&text, "kernel.generation.cutover_requested"),
+            1
+        );
+        assert_eq!(
+            count_records(&text, "kernel.generation.cutover_committed"),
+            1
+        );
+        // Whole-surface absence: `cutover_failed` is emitted only by the Err
+        // arm at generation_control.rs:836; a mutation that also emitted it on
+        // the committed leg would add this record here.
+        assert_eq!(count_records(&text, "kernel.generation.cutover_failed"), 0);
+
+        // The published snapshot, not a local variable.
+        let after = kernel
+            .generation_route_snapshot()
+            .unwrap_or_else(|_| unreachable!());
+        let after_route = after.route(&scope).unwrap_or_else(|_| unreachable!());
+        let other_scope = probe_scope("store_bridge");
+        let other_route = after
+            .route(&other_scope)
+            .unwrap_or_else(|_| unreachable!())
+            .clone();
+        assert_ne!(
+            before_route.active_generation(),
+            after_route.active_generation()
+        );
+        assert_eq!(after_route.active_generation(), decision.new_generation());
+        // The superseded epoch is nowhere current in the published snapshot.
+        assert_eq!(after.epoch(), &new_epoch);
+        // Both registered scopes are re-fenced at the issued epoch, and BOTH
+        // positives come before the absences that scan them, on their own
+        // bindings: `other_route` is proven non-empty by its own re-fence
+        // assertion, never by `after_route`'s.
+        assert!(after_route.authority_epoch().is_same_authority(&new_epoch));
+        assert!(other_route.authority_epoch().is_same_authority(&new_epoch));
+        assert!(!after_route.authority_epoch().is_same_authority(&old_epoch));
+        assert!(!other_route.authority_epoch().is_same_authority(&old_epoch));
+
+        // The Kernel's own projection reads the same candidate and the same
+        // issued epoch off the committed route and the live service epoch.
+        let projection = kernel
+            .active_generation_registry_projection("daemon")
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(projection.active_generation(), decision.new_generation());
+        assert!(projection.authority_epoch().is_same_authority(&new_epoch));
+        assert_eq!(
+            projection.state_fence(),
+            &StateFence::new(new_epoch, decision.new_generation())
+        );
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_route_read_emits_one_snapshot_terminal() {
+        // I13.11: the brief is a correlated problem model, so one failed read
+        // carries one terminal under its own read vocabulary; I14.21: "no blind
+        // duplicate effect".
+        //
+        // The terminal is the owner's own: `generation_route_snapshot` (:764)
+        // hands `generation_snapshot_terminal_code(&error)` (:461) to the
+        // facade, and the expected code below is that same mapper applied to
+        // the error this very call returned.
+        let root = probe_work_root("snapshot-terminal");
+        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        let kernel =
+            KernelComposition::new(KernelConfig::new(&root)).unwrap_or_else(|_| unreachable!());
+        kernel.poison_generation_for_test();
+
+        let mut expected = None;
+        let text = capture(|| {
+            let Err(error) = kernel.generation_route_snapshot() else {
+                unreachable!("a fenced generation gateway must refuse the route read");
+            };
+            expected = Some(generation_snapshot_terminal_code(&error));
+        });
+        let code = expected.unwrap_or("unavailable");
+
+        assert_eq!(code, "SNAPSHOT_PLATFORM");
+        assert_eq!(count_records(&text, "kernel.terminal_error"), 1);
+        assert_eq!(
+            count_records(&text, "kernel.generation.snapshot_requested"),
+            1
+        );
+        assert_eq!(count_records(&text, "kernel.generation.snapshot_failed"), 1);
+        let terminal = text
+            .lines()
+            .find(|line| line.contains("kernel.terminal_error"))
+            .unwrap_or("");
+        // Anchored to the literal, not to `code`: `code` IS
+        // `generation_snapshot_terminal_code` applied to the very error this call
+        // returned, so comparing the rendered field against it would stay green if
+        // the mapper changed. :2115 above is what ties the mapper to the literal.
+        assert_eq!(rendered_field(terminal, "code"), "SNAPSHOT_PLATFORM");
+        // Whole-surface absence, not a hand-listed string set: the cutover
+        // vocabulary belongs to :481 and a read terminal reusing it would put
+        // one of these on the surface.
+        assert_eq!(count_records(&text, "CUTOVER_"), 0);
+        // Whole-surface absence of the owner's own error body: :774 passes only
+        // the mapped code, so the poison reason this call returned cannot be
+        // rendered.
+        assert_eq!(count_records(&text, "test publication failure"), 0);
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refused_cutover_frame_emits_one_cutover_terminal() {
+        // I14.21: "if unknown -> pause Ordering Scope, preserve operation and
+        // open Problem State; no blind duplicate effect"; I14.03: "Each
+        // disposition names the exhausted resource and the work shed, deferred
+        // or quarantined" - the terminal names this operation's own owner.
+        //
+        // This is the frame the production ingress refuses BEFORE the gateway
+        // (`rollback_refusal_outcome`, generation_control.rs:535, reached from
+        // :1051 and :1086). Exactly one terminal exists for it, and the reply
+        // echoes that same code instead of making a second failure claim.
+        let fence = StateFence::new(
+            test_epoch(4),
+            ResourceGeneration::new(7).unwrap_or_else(|_| unreachable!()),
+        );
+        let request = GenerationCutoverRequest {
+            version: 1,
+            cutover_id: "cutover-rollback-refusal-903".to_owned(),
+            state_fence: fence.clone(),
+            replacement: None,
+        };
+        let mut reply = None;
+        let text = capture(|| {
+            reply = Some(
+                rollback_refusal_outcome(&request, KernelServiceError::GenerationFenced)
+                    .unwrap_or_else(|_| unreachable!()),
+            );
+        });
+        let Some(outcome) = reply else {
+            unreachable!("a forward-repair refusal is projected onto the reply");
+        };
+
+        assert_eq!(count_records(&text, "kernel.terminal_error"), 1);
+        let terminal = text
+            .lines()
+            .find(|line| line.contains("kernel.terminal_error"))
+            .unwrap_or("");
+        assert_eq!(
+            rendered_field(terminal, "code"),
+            generation_cutover_terminal_code(&KernelServiceError::GenerationFenced)
+        );
+        // Bound to the operation its own records name.
+        assert_eq!(outcome.terminal_code, Some("CUTOVER_GENERATION_FENCED"));
+        assert_eq!(outcome.cutover_id, request.cutover_id);
+        assert_eq!(outcome.state_fence, fence);
+        let failed = text
+            .lines()
+            .find(|line| line.contains("kernel.generation.cutover_failed"))
+            .unwrap_or("");
+        assert_eq!(rendered_field(failed, "cutover_id"), request.cutover_id);
+        // No fabricated cutover evidence rides on a refusal that never reached
+        // the ORS linearization point.
+        assert!(outcome.cutover_receipt.is_none());
+        // Whole-surface absence: the read vocabulary belongs to :461.
+        assert_eq!(count_records(&text, "SNAPSHOT_"), 0);
     }
 }
