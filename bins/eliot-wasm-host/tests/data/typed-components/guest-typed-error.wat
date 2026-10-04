@@ -1,14 +1,47 @@
-;; ELIOT typed fixture component for the frozen `memory-curation-screen` world.
-;; Derived from bins/eliot-wasm-host/wit/typed/memory-curation-screen.wit: every type, field,
-;; case and function below is that world's own WIT surface. Zero imports, exactly
-;; one exported interface `eliot:current/screen@0.1.0` exposing `describe` and the world
-;; domain function `screen`.
+;; ELIOT typed fixture component that returns its OWN typed WIT error for the
+;; frozen `memory-curation-screen` world (#758 marker 17: typed guest error
+;; versus trap). Copied from the world's success fixture
+;; `memory-curation-screen.wat` -- same type surface, same `describe`, same
+;; `realloc` -- with three differences: that fixture's `$copy` echo helper and
+;; its four echo copies are dropped, one data segment carries the error
+;; detail, and `screen` differs in one way: it returns the `err` arm of the
+;; same WIT signature `result<screen-outcome, screen-error>` with a REAL,
+;; guest-produced `screen-error` value. It is NOT a trap: no `unreachable`, no
+;; `memory.grow` fault, no fuel or epoch exhaustion. `unreachable` is
+;; `TypedExecutionError` at stage `invoke`; this is
+;; `TypedDomainResult::GuestError` with `ScreenError::CancelledScreen`
+;; retained verbatim.
 ;;
-;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `screen` result tuple, 0x1000, 0x1200, 0x1400 and 0x1600
-;; the four echo scratch blocks (each copy is capped at 512 bytes, so they span
-;; 0x1000..0x17ff), and 0x1400 the bump region the host `realloc` hands out
-;; while lowering the request -- the same 0x1400 as the third scratch block.
+;; World wiring (must match the host kit/capsule that drives this fixture):
+;; - WIT source: bins/eliot-wasm-host/wit/typed/memory-curation-screen.wit
+;; - export name: eliot:current/screen@0.1.0 (package id `eliot:current@0.1.0`)
+;; - domain func: `screen`; descriptor probe: `describe`
+;; - interface digest for the kit: sha256 of that one .wit file's bytes
+;; - abi-digest the guest `describe` must report: the frozen `typed_wit_digest()`
+;;   over all seven wit/typed files, i.e. the same value every per-world fixture
+;;   reports.
+;;
+;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings, 0x0600 the
+;; `describe` retarea, 0x0800 the lowered `screen` result tuple, 0x0900 the one
+;; error-detail byte the guest writes, 0x1400 the bump region the host
+;; `realloc` hands out while lowering the request.
+;;
+;; Canonical-ABI layout of the returned retarea (base = the pointer this core
+;; function returns, 0x800; the host requires `base % align32 == 0`, 0x800 is
+;; 8-aligned). Sizes/offsets follow wasmtime 47's store layout: `u64` is
+;; (size 8, align 8), `bool`/enum are (1, 1), string/list are (8, 4), and every
+;; record is stored INLINE (only strings and lists are pointer pairs). A
+;; variant is a join: its 1-byte discriminant sits at the start and EVERY case
+;; payload starts at the same offset, so on the err arm the byte at 0x008 is
+;; `screen-error`'s own discriminant:
+;;   0x000 result discriminant            1 = err          <- the typed-Err arm
+;;   0x008 screen-error discriminant      1 = "cancelled-screen"
+;;   0x00c screen-cancelled.human-detail  (ptr, len) -> 0x900, 1
+;; The ok arm's `screen-outcome` discriminant occupies the same byte 0x008 and is
+;; selected only when the result discriminant at 0x000 is 0. The err payload
+;; starts at result payload_offset32 = align_to(1, align 8) = 8; screen-error's
+;; payload starts 4 bytes past its discriminant because its widest case
+;; (`screen-malformed`, two strings) aligns to 4.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -115,14 +148,6 @@
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 5120))
-    (func $copy (param $dst i32) (param $src i32) (param $len i32)
-      (local $i i32)
-      (block $done
-        (loop $next
-          (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
-          (i32.store8 (i32.add (local.get $dst) (local.get $i)) (i32.load8_u (i32.add (local.get $src) (local.get $i))))
-          (local.set $i (i32.add (local.get $i) (i32.const 1)))
-          (br $next))))
     (func $realloc (param $old i32) (param $old_size i32) (param $align i32) (param $new_size i32) (result i32)
       (local $ptr i32)
       (local.set $ptr (global.get $bump))
@@ -130,14 +155,12 @@
                  (i32.xor (local.get $align) (i32.const -1))))
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
-    ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, in WIT field order. A lifted export flattens
-    ;; its result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the
-    ;; core function returns ONE pointer into exported linear memory
-    ;; (wasmparser-0.256.0 src/validator/component_types.rs:35, :129 and
-    ;; :1279-1292, enforced at src/validator/component.rs:1343 and :1365).
-    ;; Retptr base 0x600: past the last descriptor byte at 0x48a and below
-    ;; the 0x800 result tuple, so it collides with nothing in this memory.
+    ;; `describe`: the frozen WIT abi-descriptor, five static strings and the
+    ;; frozen ABI revision, in WIT field order. A lifted export flattens its
+    ;; result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the core
+    ;; function returns ONE pointer into exported linear memory.
+    ;; Retptr base 0x600: past the last descriptor byte at 0x48a and below the
+    ;; 0x800 result tuple, so it collides with nothing in this memory.
     (func (export "describe") (result i32)
       ;; world-name
       (i32.store (i32.const 1536) (i32.const 1024))
@@ -158,39 +181,18 @@
       (i32.store (i32.const 1576) (i32.const 64))
       (i32.const 1536))
     ;; `screen`: the admitted typed request arrives already lowered into guest
-    ;; memory. The closed WIT result tuple is written in full and every
-    ;; identity field is copied back out of the request, so the host echo
-    ;; check compares values the guest actually read.
+    ;; memory and is not needed here; this export returns the `err` arm of the
+    ;; world's own `result<screen-outcome, screen-error>` with a real
+    ;; `screen-error` value the guest itself writes.
     (func (export "screen") (param $req i32) (result i32)
-      (local $n i32)
-      ;; result ok case: the WIT success variant
-      (i32.store (i32.const 2048) (i32.const 0))
-      ;; variant "screen-outcome" selects WIT case "screened"
-      (i32.store (i32.const 2056) (i32.const 0))
-      ;; echo "operation-id" back out of the lowered request
-      (local.set $n (i32.load (i32.add (local.get $req) (i32.const 8))))
-      (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
-      (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
-      (i32.store (i32.const 2064) (i32.const 4096))
-      (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "task-id" back out of the lowered request
-      (local.set $n (i32.load (i32.add (local.get $req) (i32.const 16))))
-      (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
-      (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 12))) (local.get $n))
-      (i32.store (i32.const 2072) (i32.const 4608))
-      (i32.store (i32.const 2076) (local.get $n))
-      ;; echo "scope-id" back out of the lowered request
-      (local.set $n (i32.load (i32.add (local.get $req) (i32.const 24))))
-      (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
-      (call $copy (i32.const 5120) (i32.load (i32.add (local.get $req) (i32.const 20))) (local.get $n))
-      (i32.store (i32.const 2080) (i32.const 5120))
-      (i32.store (i32.const 2084) (local.get $n))
-      ;; echo "fence-epoch" back out of the lowered request
-      (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
-      (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
-      (call $copy (i32.const 5632) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2088) (i32.const 5632))
-      (i32.store (i32.const 2092) (local.get $n))
+      ;; result err arm: result discriminant 1, distinct from the ok arm
+      (i32.store8 (i32.const 2048) (i32.const 1))
+      ;; variant "screen-error" selects WIT case "cancelled-screen" (disc 1);
+      ;; this is the same byte the ok arm uses for the "screened" discriminant
+      (i32.store8 (i32.const 2056) (i32.const 1))
+      ;; screen-cancelled.human-detail: the real detail byte at 0x900
+      (i32.store (i32.const 2060) (i32.const 2304))
+      (i32.store (i32.const 2064) (i32.const 1))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "memory-curation-screen")
@@ -198,6 +200,7 @@
     (data (i32.const 1065) "eliot-memory-curation-screen")
     (data (i32.const 1093) "0.1.0")
     (data (i32.const 1098) "6e878cbb40e2060fd2d570345a1b0105920a0398b3c70e2c4e1f9b7eb291a0e6")
+    (data (i32.const 2304) "x")
   )
   (core instance $guest (instantiate $guest))
   (alias core export $guest "memory" (core memory $memory))
