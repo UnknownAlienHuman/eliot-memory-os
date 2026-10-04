@@ -95,7 +95,76 @@ The conformance policy introduced by issue #291 lives at
 - `DCC-010` — Markdown scan omits required generated/local exclusions;
 - `DCC-011` — changed-path routing loses deletions;
 - `DCC-012` — Markdown paths are not checked for exact case cross-platform;
-- `DCC-013` — drive-qualified paths are accepted as repository-relative.
+- `DCC-013` — drive-qualified paths are accepted as repository-relative;
+- `DCC-014` — bounded per-surface stale traceability markers in
+  `config/doc-traceability-retirement.toml` (required replacement tokens only);
+- `DCC-015` — unknown numeric `A*`/`I*` handle or handle range in a code span or
+  path-qualified reference;
+- `DCC-016` — unknown `ARCH-*` Decision Anchor;
+- `DCC-017` — generated normative/Decision-Anchor index missing, symlinked, or
+  drifted from its canonical projection;
+- `DCC-018` — stale documentation provenance or authority prose anywhere under the
+  declared production/current-documentation roots. See the section below.
+
+### DCC-018 — stale documentation provenance (issue #1147)
+
+`DCC-018` is enforced by `scripts/doc_code_conformance_lib/stale_provenance.py`
+and configured by the `[stale_provenance]` section of
+`config/doc-code-conformance.toml`. Its enforcement boundary is
+`retired_references.scan_roots` — the repository's own notion of a production
+surface — so a **new production file is covered automatically with no ledger
+edit**. `DCC-014` and `config/doc-traceability-retirement.toml` remain, but they
+now only declare *required replacement tokens* for the ~50 surfaces they already
+name; they no longer define the denominator. `docs` is deliberately outside the
+roots because the documentation books record predecessor identities
+intentionally.
+
+Each family is a closed, versioned regex pair — a **context** pattern (the
+provenance narrative) plus a **substrate** pattern (the legacy spelling the
+narrative depends on). `policy_version` is bumped whenever a family or its
+classification rules change, and a mismatch fails closed with exit code 2.
+
+| Family | Forbidden narrative | Substrate it must be attached to |
+|---|---|---|
+| `legacy-index-attestation` | a verification/attestation verb followed by a preposition | a legacy codebase-memory index spelled as prose |
+| `snapshot-document-id` | `source of truth`, `authority`, or a verification verb + preposition | a frozen `eliot-*-docs-<id>` / `eliot-memory-os-*-live` identity |
+| `historical-authority-pin` | `source of truth`, `canonical base/parent`, `pinned at`, `line spans refer to` | a `branch@sha` coordinate |
+| `dotted-legacy-handle` | the dotted form itself | — (`ELIOT_ARCHITECTURE.md` is exempt; `DCC-003` owns it) |
+
+**The prohibition is stale provenance and authority prose, not the existence of a
+legacy integration name.** A global ban on `codebase[_-]?memory` would break live
+product surface — `codebase_memory_mcp` is a real integration id,
+`CodeEvidenceSource::CodebaseMemory` is a serde enum variant (a serialization
+contract), and `.codebase-memory` is a real skip-directory name. Those all
+survive, and the detector proves it in its self-test with a positive case.
+
+Classification rests on two orthogonal tests rather than on a file list:
+
+1. **Lexical context.** No family matches a bare token; each requires a
+   narrative context (`verified via`, `source of truth`, …). A product
+   identifier sitting in a tuple or an enum body has no such context.
+2. **Evidence substrate.** The attestation phrase families additionally require a
+   legacy substrate in the same sentence. This matters because
+   `verified against` / `source of truth` are ordinary product prose here — 268
+   in-scope occurrences, all legitimate (e.g. "the host receipt stays the source
+   of truth", "the recorded digest is verified against the live root"). Banning
+   the phrases would break live code; requiring the substrate does not.
+
+For the codebase-memory family the substrate test is the crisp discriminator:
+the **hyphenated** `codebase-memory` is the real on-disk directory and the
+**underscored** `codebase_memory` / PascalCase `CodebaseMemory` are real
+identifiers, so neither is ever evidence by itself — only the **spaced** prose
+spelling `codebase memory` is. A bare `CodebaseMemory,` therefore survives,
+while the same substring placed after an attestation verb is rejected. Likewise
+a retired snapshot id is spared on its own and rejected only once a line frames
+it as the authority — and that framing is what the second family detects.
+
+Each finding reports the exact repository path, line, matched text, family id,
+matched substrate, and the canonical replacement handle/path to use instead.
+Exceptions are exact by `path` + regex `pattern` + `reason` (a regex, not a
+literal, because these are families — a literal would silence one frozen
+instance and leave the family open); unknown keys are rejected so an exception
+cannot be silently widened. No production path currently carries an exception.
 
 The conformance self-test and repository audit run from `just quick` and
 `scripts/verify.ps1`; `scripts/verify.sh` delegates to the same PowerShell-owned

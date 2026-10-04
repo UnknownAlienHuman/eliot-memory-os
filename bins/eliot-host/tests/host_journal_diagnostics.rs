@@ -295,11 +295,11 @@ fn receipt(mutation: &str, request_digest: &str) -> HostKernelRestartReceipt {
     let mut value = HostKernelRestartReceipt {
         mutation_digest: handle(mutation),
         request_digest: handle(request_digest),
-        old_kernel_generation: handle(&"c".repeat(32)),
-        new_kernel_generation: handle(&"d".repeat(32)),
-        store_fence: handle(&"e".repeat(32)),
-        activation_receipt_digest: handle(&"f".repeat(32)),
-        ready_receipt_digest: handle(&"a".repeat(32)),
+        old_kernel_generation: handle(&"c".repeat(64)),
+        new_kernel_generation: handle(&"d".repeat(64)),
+        store_fence: handle(&"e".repeat(64)),
+        activation_receipt_digest: handle(&"f".repeat(64)),
+        ready_receipt_digest: handle(&"a".repeat(64)),
         receipt_digest: handle(&"0".repeat(64)),
     };
     value.receipt_digest = value.computed_digest().expect("owner receipt digest");

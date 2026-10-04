@@ -118,6 +118,11 @@ ignore_globs = [
   "scripts/docs_shards_core.py",
   # The closure audit defines the same retired-token list it scans for.
   "scripts/docs_closure_audit.py",
+  # The DCC-018 detector owns the provenance families it scans for and must be
+  # able to spell out each negative narrative in its own self-test fixtures.
+  # This is the same exemption DCC-003 applies to doc_code_conformance_core.py
+  # above; it exempts exactly one file and never widens the denominator.
+  "scripts/doc_code_conformance_lib/stale_provenance.py",
 ]
 unstable_line_reference_regex = '(?<![A-Za-z0-9_./-])(?:docs/(?:normative|architecture)/)?ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+(?:-(?:[A-Za-z0-9_]+)?)?'
 
@@ -377,3 +382,51 @@ required_link_skip_parts = [
 ]
 exact_case_marker = "DOC_LINK_EXACT_CASE_V1"
 drive_path_rejection_marker = "DRIVE_QUALIFIED_PATH_REJECTED"
+
+# DCC-018 (issue #1147). Repository-wide stale-documentation-provenance scan.
+#
+# The denominator is the `retired_references.scan_roots` array above; this
+# section deliberately does not restate it and `docs` is deliberately still
+# excluded, because the documentation books record predecessor identities
+# intentionally. Adding a new production file is therefore covered
+# automatically, with no ledger edit. `config/doc-traceability-retirement.toml`
+# keeps declaring required replacement tokens for the surfaces it already names;
+# it no longer defines what is inspected.
+#
+# `policy_version` is bumped whenever a family or its classification rules
+# change; a mismatched value fails closed with exit code 2 rather than
+# silently scanning with a different policy.
+[stale_provenance]
+policy_version = "eliot-stale-provenance-v1"
+
+# Every enabled family is defined in scripts/doc_code_conformance_lib/stale_provenance.py.
+# Naming a family that does not exist is a configuration error.
+families = [
+  # Legacy codebase-memory index cited as the attestation substrate.
+  "legacy-index-attestation",
+  # Frozen snapshot identity presented as document authority.
+  "snapshot-document-id",
+  # Historical commit/branch coordinate presented as current authority.
+  "historical-authority-pin",
+  # Unresolved dotted ELIOT_* compatibility handle.
+  "dotted-legacy-handle",
+]
+
+# Exceptions are exact by path + regex pattern + reason, and are restricted to
+# detector fixtures and explicitly non-authoritative historical fixtures. An
+# exception never widens the scan denominator: a NEW production file is always
+# covered. A regex pattern is used rather than a literal token because the stale
+# patterns are families (arbitrary snapshot ids, arbitrary SHAs, arbitrary
+# substrate spellings); a literal would only silence one frozen instance and
+# leave the family open. Unknown keys are rejected so an exception cannot be
+# widened by adding a field this detector does not honour.
+#
+# There are currently NO production exceptions. Two categories are handled
+# without any exception entry at all:
+#   * A product identifier such as the `codebase_memory_mcp` integration id, the
+#     `CodeEvidenceSource::CodebaseMemory` serde variant, or the hyphenated
+#     `.codebase-memory` skip-directory is classified as a legitimate identifier
+#     by the context rules and never becomes a finding.
+#   * The detector's own source is exempted via `retired_references.ignore_globs`
+#     above, the same way DCC-003 exempts doc_code_conformance_core.py, so a rule
+#     can always name the narrative it forbids.

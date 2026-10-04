@@ -166,6 +166,38 @@ impl<'a> PhaseBObservation<'a> {
         observation
     }
 
+    /// Binds the result of one completed Phase-B rollback.
+    ///
+    /// `for_pending_prepared` describes the rollback *as staged*: the pending
+    /// disposition, and a `prepared_digest` for a record the rollback is about to
+    /// retire. Using it after the clears reported a prepared record and a pending
+    /// disposition for a rollback that had already restored the destinations and
+    /// dropped both durable records — the "restored" label was backed by the
+    /// pre-rollback state rather than by the readback that proved it.
+    ///
+    /// Here the staged identities stay, because they are the operation that
+    /// ran, but `state` reports the durable readback's own view: the prepared and
+    /// intent records are gone, which is the evidence the rollback completed. A
+    /// record that still carried a prepared digest here would be asserting that
+    /// the materialization it just rolled back is still staged.
+    fn for_rollback_restored(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        prepared: &'a HostPhaseBPreparedMaterialization,
+        cleared: bool,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.effect = Some(prepared.effect_id.as_str());
+        observation.request = Some(prepared.request_digest.as_str());
+        observation.receipt = None;
+        observation.state = Some(if cleared {
+            "restored-staged-records-cleared"
+        } else {
+            "restored-staged-records-retained"
+        });
+        observation
+    }
+
     /// Binds the manifest plus the installer approval identities carried by
     /// an active-generation rebind request.
     fn for_approval(
@@ -1895,10 +1927,24 @@ impl HostComposition {
         // WORK_UNIT_CASE: 893/9 — uncommitted destinations restored and the
         // prepared/intent records cleared. A failed rollback emits no restored
         // record here (case 10); the outer contour owns the single terminal.
-        phase_b_observe_bound(&PhaseBObservation::for_pending_prepared(
+        //
+        // The record is built from the post-clear readback, not from the
+        // `prepared` value the clears retired 40 lines above. `for_pending_prepared`
+        // named that prepared digest and the pending disposition, so a
+        // "restored" record asserted a staged materialization the registry had
+        // already dropped. The readback decides `cleared`: if either record is
+        // still present, this is reported as an unproven restoration rather than
+        // claimed as a completed one.
+        let cleared = self.registry.pending_activation().is_some_and(|current| {
+            current.phase_b_intent.is_none()
+                && current.phase_b_prepared.is_none()
+                && current.phase_b_prepared_receipt.is_none()
+        });
+        phase_b_observe_bound(&PhaseBObservation::for_rollback_restored(
             "host.phase-b-rollback restored",
             pending,
             prepared,
+            cleared,
         ));
         Ok(())
     }
