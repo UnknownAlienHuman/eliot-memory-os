@@ -4887,12 +4887,30 @@ impl ClaimModality {
     }
 }
 
+/// The number of axes a [`ClaimConditions`] set compares.
+///
+/// The axes are counted rather than spelled as a literal in
+/// [`ClaimOppositionRelation::condition_compatibility`] so that adding an axis
+/// cannot silently leave the "no axis matched" threshold behind: a partial overlap
+/// that happened to mismatch every axis but one would otherwise be reported as
+/// full incompatibility.
+pub const CLAIM_CONDITION_AXES: usize = 5;
+
 /// The scope under which one claim or one counterevidence relation is asserted.
 ///
 /// I21.8 requires a claim to be judged under the population, time, definition and
 /// denominator it was actually made under. A source about another population is
 /// not a weaker contradiction of a claim about this one; it is a statement about
 /// something else, and this record is what keeps the two apart.
+///
+/// The **intervention** axis is part of that set. A relation that attributes an
+/// outcome to an intervention ("deploying X changes Y") and a claim that asserts
+/// the same outcome under the same population, time, definition and modality are
+/// still statements about different things: one is a causal attribution, the other
+/// a description. Without this axis the comparison silently treated an
+/// interventional source as a description of the same population and could admit
+/// it as a contradiction, which is precisely the broad-domain test
+/// [`ClaimOppositionRelation::condition_compatibility`] exists to replace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClaimConditions {
     /// Population or scope the statement is about.
@@ -4903,17 +4921,31 @@ pub struct ClaimConditions {
     pub definition_unit_denominator: String,
     /// Modality the statement asserts in.
     pub modality: ClaimModality,
+    /// The intervention the statement attributes its outcome to, or the empty
+    /// string for a purely descriptive statement that attributes nothing.
+    ///
+    /// Empty is a real, comparable value rather than an absent one: a descriptive
+    /// claim and an interventional source about that same description disagree
+    /// about the intervention axis exactly as they would about any other axis.
+    pub intervention: String,
 }
 
 impl ClaimConditions {
     /// Stable wire spelling of this condition set.
+    ///
+    /// Every axis appears, in declaration order, so two condition sets that differ
+    /// on any single axis have different wire spellings. Adding the intervention
+    /// axis changed this spelling; that is intended, because the spelling is the
+    /// identity of the condition set and a set that omitted an axis was not the
+    /// same set.
     pub fn wire_name(&self) -> String {
         format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             self.population_scope,
             self.time_version,
             self.definition_unit_denominator,
-            self.modality.wire_name()
+            self.modality.wire_name(),
+            self.intervention
         )
     }
 }
@@ -5143,6 +5175,11 @@ impl AuditedClaim {
                     sources.account,
                 ),
                 modality: ClaimModality::Descriptive,
+                // The audited claim text itself attributes its outcome to no
+                // intervention: it is a description, so the axis carries the
+                // explicit empty value rather than borrowing an interventional
+                // spelling from anywhere.
+                intervention: String::new(),
             },
             artifact_digest: self.statement_artifact_digest(),
             claim_revision: 1,
@@ -5635,9 +5672,17 @@ impl ClaimOppositionRelation {
         if self.compatible_conditions.modality != claim_conditions.modality {
             mismatched.push(OppositionDimension::Proposition);
         }
+        // The intervention axis. An interventional source is compared against an
+        // interventional claim here, never against a descriptive one: the two are
+        // statements about different things even when population, time,
+        // definition and modality all agree, and that agreement is what used to
+        // let a causal attribution read as a description-level contradiction.
+        if self.compatible_conditions.intervention != claim_conditions.intervention {
+            mismatched.push(OppositionDimension::Intervention);
+        }
         if mismatched.is_empty() {
             ConditionCompatibility::Compatible
-        } else if mismatched.len() == 4 {
+        } else if mismatched.len() == CLAIM_CONDITION_AXES {
             ConditionCompatibility::Incompatible(mismatched)
         } else {
             ConditionCompatibility::PartiallyOverlapping(mismatched)
@@ -5667,6 +5712,26 @@ pub enum ClaimOutcome {
     Unsupported,
     /// Preserved counterevidence contests the claim.
     Contradicted,
+    /// A verified contradiction EXISTS, and is preserved, but is not yet promoted
+    /// to [`Self::Contradicted`].
+    ///
+    /// Distinct from [`Self::NotVerifiableInScope`] on purpose. That outcome means
+    /// no contradiction could be established; this one means one WAS established
+    /// by an owner-issued opposition relation and is being withheld from the
+    /// public class on purpose. Collapsing the two would make a verified
+    /// contradiction indistinguishable from an unverified allegation, which is the
+    /// conflation this issue exists to remove.
+    ///
+    /// The hold is deliberate and owned, not a missing feature. Promoting a
+    /// verified contradiction to the public `CONTRADICTED` class requires an
+    /// excerpt-evaluation route - proof that the quoted span actually supports the
+    /// opposing statement rather than merely being an admitted span - and no owner
+    /// is named for route `eliot.research.claim-excerpt-evaluation`. Until that
+    /// route has an owner, the contradiction is preserved here with its own
+    /// residue and projected as not verifiable, which is fail-closed: a release
+    /// consumer cannot read `CONTRADICTED` off a claim whose excerpt support was
+    /// never proved.
+    ContradictionHeld,
     /// An attached counterclaim identity is preserved but cannot be verified as
     /// relevant to this claim's domain under the frozen manifest, so it neither
     /// contradicts nor supports.
@@ -5892,6 +5957,11 @@ impl ClaimOutcome {
             Self::PartiallySupported => "PARTIALLY_SUPPORTED",
             Self::Unsupported => "UNSUPPORTED",
             Self::Contradicted => "CONTRADICTED",
+            // Deliberately NOT spelled `CONTRADICTED`. The wire name is what a
+            // consumer reads, and the whole point of the hold is that this verdict
+            // must not be readable as a contradiction finding. The `HELD_` prefix
+            // keeps it visibly distinct from the promoted spelling above.
+            Self::ContradictionHeld => "HELD_VERIFIED_CONTRADICTION",
             Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
             Self::OutsideManifest => "OUTSIDE_MANIFEST",
             Self::RevokedEvidence => "REVOKED_EVIDENCE",
@@ -6196,7 +6266,8 @@ impl ClaimVerdict {
             ClaimOutcome::Supported => PublicAuditClass::Supported,
             ClaimOutcome::PartiallySupported => PublicAuditClass::PartiallySupported,
             ClaimOutcome::Unsupported | ClaimOutcome::StaleLimited => PublicAuditClass::Unsupported,
-            ClaimOutcome::OutsideManifest
+            ClaimOutcome::ContradictionHeld
+            | ClaimOutcome::OutsideManifest
             | ClaimOutcome::RevokedEvidence
             | ClaimOutcome::NotVerifiableInScope
             | ClaimOutcome::IncompleteAccounting => PublicAuditClass::NotVerifiableInScope,
@@ -7688,6 +7759,27 @@ fn audit_claim_with_retained(
         // identity is not a verdict about this claim at all. Checked before the
         // citation partition for that reason.
         ClaimOutcome::NotVerifiableInScope
+    } else if !contradicting.is_empty() {
+        // A VERIFIED contradiction is decided before the withdrawn-evidence arms,
+        // so it can no longer be discarded by them. It used to sit BELOW
+        // `revoked_citation` and `outside_citation`, which meant a claim carrying
+        // both a revoked citation and an owner-issued verified opposition reported
+        // only the revoked citation: the contradiction was computed, partitioned
+        // and then thrown away by check order. Two true facts were reduced to one
+        // and the surviving one was the less informative.
+        //
+        // The contradiction is still not promoted to `Contradicted`: it is HELD,
+        // because the excerpt-evaluation route that would prove the quoted span
+        // supports the opposing statement has no named owner. Holding it keeps the
+        // fact observable and stops it from becoming a public verdict, and it is a
+        // different outcome from `NotVerifiableInScope`, which means no
+        // contradiction was established at all.
+        residue.push(
+            "claim: a verified contradiction is preserved but not promoted: no owner is named \
+             for route eliot.research.claim-excerpt-evaluation"
+                .to_owned(),
+        );
+        ClaimOutcome::ContradictionHeld
     } else if revoked_citation {
         // Withdrawn evidence. A handle the manifest revoked is not "outside" it —
         // it was inside and then removed — and the residue above names the
@@ -7695,8 +7787,6 @@ fn audit_claim_with_retained(
         ClaimOutcome::RevokedEvidence
     } else if outside_citation {
         ClaimOutcome::OutsideManifest
-    } else if !contradicting.is_empty() {
-        ClaimOutcome::Contradicted
     } else if !unverifiable.is_empty() {
         ClaimOutcome::NotVerifiableInScope
     } else if lineage_gap || precision_gap || support_gap {

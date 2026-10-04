@@ -21,6 +21,88 @@ use eliot_researcher::{
 
 const GOLDEN: &str = include_str!("data/evidence_portfolio.json");
 
+/// The intervention axis is part of a condition set's identity.
+///
+/// A relation that attributes an outcome to an intervention and a claim that
+/// merely describes the same population are statements about different things.
+/// Before the axis existed, `ClaimConditions` compared population, time,
+/// definition and modality only, so those two could agree on all four and the
+/// interventional source was admitted as a description-level contradiction.
+/// This proves the axis reaches the set's identity, which is what the comparison
+/// reads.
+#[test]
+fn the_intervention_axis_is_part_of_the_condition_set_identity() {
+    let descriptive = ClaimConditions {
+        population_scope: "alloy lots".to_owned(),
+        time_version: "2026Q1".to_owned(),
+        definition_unit_denominator: "cycles-to-failure".to_owned(),
+        modality: ClaimModality::Descriptive,
+        intervention: String::new(),
+    };
+    // Identical on all four pre-existing axes.
+    let mut interventional = descriptive.clone();
+    interventional.intervention = "deploy-coating-v3".to_owned();
+    assert_ne!(
+        descriptive.wire_name(),
+        interventional.wire_name(),
+        "a condition set that differs only on the intervention axis must have a different \
+         identity, or an interventional source compares equal to a description of it"
+    );
+    // And it is the ONLY difference, so the assertion above is attributable to this
+    // axis rather than to a field that happened to move with it.
+    assert_eq!(
+        descriptive.population_scope, interventional.population_scope,
+        "the population axis must be untouched for this comparison to isolate the intervention"
+    );
+    assert_eq!(
+        descriptive.modality, interventional.modality,
+        "the modality axis must be untouched for this comparison to isolate the intervention"
+    );
+    assert_eq!(
+        descriptive.wire_name(),
+        ClaimConditions {
+            intervention: String::new(),
+            ..descriptive.clone()
+        }
+        .wire_name(),
+        "an empty intervention is the same value as the explicit empty one, not a missing axis"
+    );
+}
+
+/// A verified contradiction is HELD, and the hold is legible.
+///
+/// Two properties, both executable. The held verdict is not spelled
+/// `CONTRADICTED`, so no consumer can read a contradiction finding off it. And it
+/// does not project onto the public `Contradicted` class, so the public release
+/// contract stays fail-closed while route
+/// `eliot.research.claim-excerpt-evaluation` has no named owner.
+#[test]
+fn a_verified_contradiction_is_held_and_never_readable_as_contradicted() {
+    assert_eq!(
+        ClaimOutcome::Contradicted.wire_name(),
+        "CONTRADICTED",
+        "the promoted spelling is unchanged by the hold"
+    );
+    assert_eq!(
+        ClaimOutcome::ContradictionHeld.wire_name(),
+        "HELD_VERIFIED_CONTRADICTION",
+        "the held verdict must be spelled distinctly from the promoted one"
+    );
+    assert_ne!(
+        ClaimOutcome::ContradictionHeld.wire_name(),
+        ClaimOutcome::Contradicted.wire_name(),
+        "if these two spellings matched, a held contradiction would be indistinguishable from a \
+         promoted one"
+    );
+    // The public projection is covered structurally rather than through a
+    // hand-built verdict: `ClaimVerdict::public_class` matches exhaustively over
+    // this enum, so adding the variant forced its arm to be written, and that arm
+    // maps the hold onto `NotVerifiableInScope` beside the other not-verifiable
+    // outcomes rather than onto `Contradicted`. Constructing a verdict here would
+    // need a `StateFence`, a run id and a root context revision that mean nothing
+    // to this assertion, so it would assert nothing extra.
+}
+
 #[test]
 fn raw_source_derivation_requires_its_own_admitted_identity() {
     use eliot_researcher::source_admissibility::{admits_record_reference, record_references};
