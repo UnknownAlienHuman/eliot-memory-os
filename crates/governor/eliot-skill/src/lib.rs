@@ -1145,6 +1145,68 @@ impl SkillRegistry {
         Ok(derive_attempt_summary(receipt))
     }
 
+    /// Retains one admitted activation receipt in the stored view and returns
+    /// the owner's resulting position (issue #2663, audit 5856960648 item C5).
+    ///
+    /// This is the ACTIVATION counterpart of
+    /// [`Self::record_execution_evidence`], and it exists because nothing
+    /// retained an activation receipt. Every construction of the stored view's
+    /// `attempt_receipts` passed `Vec::new()` except
+    /// [`derive_lifecycle_view`](activation::derive_lifecycle_view), which is
+    /// fed the previous view's own set — so the field was self-perpetuating
+    /// empty, the daemon's retained-receipt conflict loop had nothing to
+    /// iterate, and the guard "changed material under one receipt identity
+    /// conflicts" was statically unreachable.
+    ///
+    /// The identity binding is exactly the one
+    /// [`Self::admit_material_attempt`] applies, so a receipt cannot be filed
+    /// under a Skill revision or package digest the stored view does not name.
+    ///
+    /// Conflict and idempotence are decided on the RECEIPT IDENTITY, not on
+    /// arrival: a retained row under the same `receipt_id` or `attempt_ref`
+    /// whose content differs is [`SkillError::RevisionConflict`] — a changed
+    /// record under a retained identity is a conflict, never a rewrite — while
+    /// a byte-identical replay returns the stored view unchanged, so exact
+    /// replay does not inflate `lifecycle_revision`. Only genuinely new
+    /// material advances the revision and re-records through
+    /// [`Self::record_view`], which keeps the same fence and
+    /// monotonically-advancing-revision rules every other owner write obeys.
+    ///
+    /// Usefulness is never established here, exactly as in
+    /// [`Self::admit_material_attempt`]: retaining the receipt records that the
+    /// attempt happened, not that it helped.
+    pub fn record_activation_attempt(
+        &mut self,
+        receipt: &SkillHarnessActivationReceipt,
+    ) -> Result<SkillLifecycleView, SkillError> {
+        receipt.validate()?;
+        let key = receipt.skill_id.as_str();
+        let previous = self.views.get(key).ok_or(SkillError::NotFound)?.clone();
+        if receipt.skill_revision != previous.skill_ref.registration.revision
+            || receipt.package_digest != previous.skill_ref.package_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let retained_index = previous.attempt_receipts.iter().position(|held| {
+            held.receipt_id == receipt.receipt_id || held.attempt_ref == receipt.attempt_ref
+        });
+        if let Some(index) = retained_index {
+            if previous.attempt_receipts[index] != *receipt {
+                return Err(SkillError::RevisionConflict);
+            }
+            return Ok(previous);
+        }
+        let mut view = previous;
+        view.attempt_receipts.push(receipt.clone());
+        view.lifecycle_revision = view
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or(SkillError::RevisionConflict)?;
+        view.validate()?;
+        self.record_view(view.clone())?;
+        Ok(view)
+    }
+
     /// Records one window of execution evidence through this lifecycle owner
     /// and returns only after the owner accepted it (issue #2663, I7.25).
     ///

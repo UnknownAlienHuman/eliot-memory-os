@@ -5497,6 +5497,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Retains one admitted activation receipt in the existing Skill lifecycle
+    /// owner and returns its resulting position.
+    ///
+    /// The activation counterpart of [`Self::record_skill_execution_evidence`],
+    /// and a narrow write seam for the same reason: no unrestricted
+    /// `owners_mut` exists, so admitting a Skill activation without retaining
+    /// its receipt would have to go through this one method too. Without it the
+    /// stored view's `attempt_receipts` was always empty (issue #2663,
+    /// audit 5856960648 item C5).
+    ///
+    /// This is an in-process owner write. It does not imply durable
+    /// persistence or restart recovery for the observation, exactly as for the
+    /// execution-evidence seam above.
+    #[allow(clippy::result_large_err)]
+    pub fn record_skill_activation_attempt(
+        &mut self,
+        receipt: &eliot_skill::SkillHarnessActivationReceipt,
+    ) -> Result<SkillLifecycleView, eliot_skill::SkillError> {
+        self.owners.skill.record_activation_attempt(receipt)
+    }
+
     /// Prepares this composition's existing maintenance admission under its
     /// current state and fence (issue #1693).
     ///
