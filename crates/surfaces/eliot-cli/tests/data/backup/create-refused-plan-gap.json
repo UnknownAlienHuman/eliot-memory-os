@@ -1,0 +1,8 @@
+{
+  "command": "backup.create",
+  "status": "refused",
+  "idempotency_key": "synthetic-idempotency-key-create-0001",
+  "code": "plan_gap",
+  "missing_owner": "backup-capture-owner (#959)",
+  "reason": "capture owner entry KernelBackupCapture::capture is unreachable: #959's BlobArchivePublicationOwner cannot be bound because no production BlobStoreService exists, and no producer supplies the accepted CaptureRequest evidence"
+}

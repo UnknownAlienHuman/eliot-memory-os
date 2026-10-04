@@ -1,0 +1,22 @@
+{
+  "command": "backup.restore-test",
+  "status": "refused",
+  "idempotency_key": "synthetic-idempotency-key-restore-test-0003",
+  "code": "restore-destination-not-admitted",
+  "reason": "recovery import target is not an owner-admitted isolated destination of this operation",
+  "gates_passed": [
+    "decode",
+    "validate",
+    "shape",
+    "authorization-shape",
+    "provisioning",
+    "isolation",
+    "archive-decode",
+    "plan-compile",
+    "journal-admission"
+  ],
+  "gates_not_admitted": [
+    "destination-manifest-admission",
+    "cutover-qualification"
+  ]
+}
