@@ -63,13 +63,13 @@ Accepted-owner reuse (no second general source parser or runner):
     fixed package suite and Clippy once, and retains the validated results; no
     historical passed-JSON or marker-only evidence.
 
-Scope note for case 26/27: this worktree also carries other lanes' work, so the
-forbidden-family observation is scoped to the paths this issue owns and the
-families its card forbids (Cargo.toml, Cargo.lock, .github/**, docs/**,
-scripts/**, and the two crates' sources) rather than to the whole tree. Every
-forbidden observation must be EMPTY; every owned observation must be a subset of
-the closed two-path set and must actually show the owned test module as changed,
-so neither can pass by construction.
+The owned status and candidate-range observations are acquired unscoped so
+out-of-scope changes cannot be hidden by a Git pathspec; the separate
+forbidden-family observations are limited to the listed families and exclude
+the two owned files. The candidate range is origin/main...HEAD, so this check
+must run before merge; after merge it is empty and fails closed. The combined
+owned observation must equal the two EDIT paths, and both forbidden
+observations must be empty.
 """
 from __future__ import annotations
 
