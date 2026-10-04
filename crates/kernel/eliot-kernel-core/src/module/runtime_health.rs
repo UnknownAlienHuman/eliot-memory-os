@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::compatibility_handshake::{
-    expected_seal_tag, AcceptedCompatibilityEvidence, HANDSHAKE_ENVELOPE_VERSION,
+    AcceptedCompatibilityEvidence, HANDSHAKE_ENVELOPE_VERSION, expected_seal_tag,
 };
 use super::process_health::{CapabilityHealth, CapabilityReadiness, ProcessHealthStatus};
 use crate::error::{KernelError, KernelResult};
