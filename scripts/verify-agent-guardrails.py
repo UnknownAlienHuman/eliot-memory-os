@@ -63,9 +63,6 @@ FORBIDDEN_OVERCLAIMS = (
 
 ONBOARDING_START = "START.md"
 ONBOARDING_README = "README.md"
-# README lines 27-31 hold the out-of-scope fetch/prune block per issue #1231.
-# The writer must not touch that block, so onboarding sync checks skip it.
-README_OUT_OF_SCOPE_LINES = frozenset({27, 28, 29, 30, 31})
 
 ONBOARDING_PROHIBITION_HINTS = (
     "never",
@@ -106,6 +103,13 @@ ONBOARDING_CARGO_EVIDENCE = (
     "cargo check",
     "cargo test",
     "cargo build",
+)
+
+# Issue #1231: catch the root README's imperative sync shorthand even when it
+# omits shell command names such as `git fetch` and `git pull`.
+ONBOARDING_PROSE_WORKER_SYNC = re.compile(
+    r"\bfetch\s*/\s*prune\b[^.\n]{0,80}"
+    r"\bfast-forward\b[^.\n]{0,40}\bmain\b"
 )
 
 # Issue #1231. Two onboarding regressions were prose-only and therefore
@@ -241,8 +245,6 @@ def _onboarding_lines(root: Path, rel: str) -> tuple[list[tuple[int, str]] | Non
         return None, str(error)
     lines: list[tuple[int, str]] = []
     for lineno, raw in enumerate(text.splitlines(), start=1):
-        if rel == ONBOARDING_README and lineno in README_OUT_OF_SCOPE_LINES:
-            continue
         lines.append((lineno, raw))
     return lines, None
 
@@ -266,11 +268,18 @@ def verify_onboarding(root: Path) -> list[Finding]:
                     continue
                 if "git fetch" in low or "git pull" in low or "fetch origin --prune" in low:
                     continue
+                if ONBOARDING_PROSE_WORKER_SYNC.search(low):
+                    continue
                 if ("rev-list" in low or "ls-tree" in low or "switch --detach" in low) and "origin/main" in low:
                     continue
                 if "git reset" in low:
                     continue
-            if "git fetch" in low or "git pull" in low or "fetch origin --prune" in low:
+            if (
+                "git fetch" in low
+                or "git pull" in low
+                or "fetch origin --prune" in low
+                or ONBOARDING_PROSE_WORKER_SYNC.search(low)
+            ):
                 findings.append(
                     Finding("onboarding_worker_sync", f"{rel}:{lineno}", f"worker sync instruction is forbidden: {raw.strip()[:120]}")
                 )
@@ -541,6 +550,38 @@ def self_test() -> None:
             raise AssertionError("prohibition-worded fetch line must not fail")
         start_path.write_text(good_start, encoding="utf-8")
 
+        sync_instruction = "Fetch/prune, fast-forward `main` from the worker branch."
+        for expected_line in (27, 32):
+            readme_lines = [
+                "# Fixture README",
+                *("" for _ in range(expected_line - 2)),
+                sync_instruction,
+                "",
+                "```powershell",
+                "cargo metadata --locked --no-deps",
+                "just quick",
+                "```",
+            ]
+            readme_path.write_text("\n".join(readme_lines) + "\n", encoding="utf-8")
+            sync_findings = [
+                item
+                for item in verify_onboarding(root)
+                if item.code == "onboarding_worker_sync"
+            ]
+            if len(sync_findings) != 1 or sync_findings[0].path != f"README.md:{expected_line}":
+                raise AssertionError(
+                    f"README worker-sync prose at line {expected_line} did not fail exactly: {sync_findings}"
+                )
+        readme_path.write_text(good_readme, encoding="utf-8")
+
+        readme_prohibition = good_readme + (
+            "\nWorkers must never fetch/prune or fast-forward `main`.\n"
+        )
+        readme_path.write_text(readme_prohibition, encoding="utf-8")
+        if [item for item in verify_onboarding(root) if item.code == "onboarding_worker_sync"]:
+            raise AssertionError("prohibition-worded README sync line must not fail")
+        readme_path.write_text(good_readme, encoding="utf-8")
+
         start_path.write_text(good_start + "\ngit fetch origin --prune\n", encoding="utf-8")
         if not any(item.code == "onboarding_worker_sync" for item in verify_onboarding(root)):
             raise AssertionError("worker-fetch fixture did not fail")
@@ -682,7 +723,7 @@ def self_test() -> None:
         if final:
             raise AssertionError(f"restored onboarding fixture failed: {final}")
 
-    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=24")
+    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=27")
 
 
 def parse_args() -> argparse.Namespace:
