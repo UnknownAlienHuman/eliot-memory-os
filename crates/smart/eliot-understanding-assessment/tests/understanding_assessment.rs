@@ -517,8 +517,12 @@ fn scoped_candidate_refuses_tampering_and_version_drift() {
     candidate.validate().expect("optional slots stay optional");
 }
 
-/// Text identity fields are bounded and non-blank: a blank or control-bearing
-/// field is refused rather than carried into a candidate.
+/// Text identity fields are bounded and non-blank: a blank, control-bearing or
+/// overlong field is refused by name rather than carried into a candidate.
+///
+/// `validate()` checks these texts before it recomputes the digest, so each case
+/// below fails on its own field rather than on `assessment.digest` even though
+/// the mutation also invalidated the carried digest.
 #[test]
 fn scoped_candidate_refuses_blank_and_control_bearing_text() {
     let mut blank = scoped_candidate();
