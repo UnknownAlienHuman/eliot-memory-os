@@ -6,12 +6,18 @@
 ;; this `describe` is the exact frozen identity of the `dreamer-cycle` world
 ;; except `native-contract`, which reports 1024 bytes of filler.
 ;;
-;; `validate_descriptor` (typed_execution.rs:527-579) checks world-name,
+;; `validate_descriptor` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `validate_descriptor`, lines 538-590) checks world-name,
 ;; package-id and abi-revision first, then `bounded_descriptor_string`
-;; (:517-524) with `MAX_DESCRIPTOR_STRING_BYTES` (512) at :549, which returns
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn
+;; `bounded_descriptor_string`, lines 528-535) with `MAX_DESCRIPTOR_STRING_BYTES`
+;; (512, same-file line 42) at same-file line 560, which returns
 ;; `TypedExecutionError::OutputViolation("native-contract")`. The describe lane
-;; stages it at `TypedStage::Output` (:1017-1019) and the domain lane at
-;; `TypedStage::Descriptor` (:2106-2108). The aggregate check at :552-563 is
+;; stages it at `TypedStage::Output` (same file, fn
+;; `execute_describe_experimental`, lines 1034-1036)
+;; and the domain lane at
+;; `TypedStage::Descriptor` (same file, fn `execute_domain_lane`, lines
+;; 2123-2125). The aggregate check at same-file lines 563-574 is
 ;; NOT what fires here, because the per-field ceiling is enforced first; the
 ;; aggregate is a second, independent ceiling.
 ;;
@@ -149,10 +155,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x2000..0x2400
@@ -191,10 +197,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

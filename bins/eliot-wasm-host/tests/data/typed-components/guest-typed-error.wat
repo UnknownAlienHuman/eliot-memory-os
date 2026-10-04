@@ -26,7 +26,7 @@
 ;; error-detail byte -- carried by this file's extra
 ;; `(data (i32.const 2304) "x")` segment, not stored by any instruction; the
 ;; `screen` body writes that byte's pointer/length pair into the retarea (along
-;; with the two variant discriminants at 0x800 and 0x858, both documented below) --
+;; with the two variant discriminants at 0x800 and 0x808, both documented below) --
 ;; and 0x1400 the bump region the host `realloc` hands out while lowering the
 ;; request.
 ;;

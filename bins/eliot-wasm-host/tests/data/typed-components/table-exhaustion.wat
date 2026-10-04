@@ -1,16 +1,26 @@
 ;; ELIOT typed NEGATIVE fixture for case 16 of #758: "table/instance/resource/
 ;; host-lifting exhaustion" -- the table half.
 ;;
-;; `new_store` (typed_execution.rs:1397-1426) builds `StoreLimits` with
-;; `table_elements(max_table_elements)` (at :1407) and `tables(MAX_TYPED_TABLES)`
-;; (at :1408), and `StoreState::table_growing` (:1457-1472) and `table_grow_failed`
-;; (:1474-1478) record `limit_hit = Table` when a grow is refused. This
+;; `new_store` (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `new_store`,
+;; lines 1414-1443) builds `StoreLimits` with
+;; `table_elements(max_table_elements)` (at same-file line 1424,
+;; `.table_elements(usize::try_from(limits.max_table_elements).unwrap_or(
+;; usize::MAX))`) and `tables(MAX_TYPED_TABLES)`
+;; (at same-file line 1425, `.tables(MAX_TYPED_TABLES)`), and
+;; `StoreState::table_growing` (same file, lines 1474-1489) and
+;; `table_grow_failed`
+;; (same-file lines 1491-1495) record `limit_hit = Table` when a grow is
+;; refused. This
 ;; component's `describe` allocates table elements until a grow is refused.
 ;;
 ;; As with memory, the pinned `StoreLimits` denies growth softly, so
 ;; `table.grow` returns -1 and the guest runs to completion; `run_guarded`
-;; (:1561-1593) then returns `TypedExecutionError::Engine("TableLimit")`
-;; (`resource_limit_error`, :1253-1259) staged at `TypedStage::Cleanup` (:1579). The
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `run_guarded`,
+;; lines 1578-1610) then returns `TypedExecutionError::Engine("TableLimit")`
+;; (`resource_limit_error`, same file, fn `resource_limit_error`, lines
+;; 1270-1276, `ResourceLimitHit::Table => EngineTermination::TableLimit`)
+;; staged at `TypedStage::Cleanup` (same-file line 1596,
+;; `Err(staged(TypedStage::Cleanup, resource_limit_error(hit)))`). The
 ;; measured `table_elements` peak is still recorded, and the violation never
 ;; becomes a successful receipt.
 ;;
@@ -147,10 +157,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
@@ -200,10 +210,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

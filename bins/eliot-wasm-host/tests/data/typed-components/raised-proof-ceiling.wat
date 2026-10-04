@@ -1,13 +1,17 @@
 ;; ELIOT typed NEGATIVE fixture for case 20 of #758: "proof/authority/effect
 ;; escalation rejected".
 ;;
-;; `check_cycle_result` (typed_execution.rs:3605-3632, `check_ceiling` called at
-;; :3618-3622) compares the guest's
+;; `check_cycle_result` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `check_cycle_result`, lines 3622-3649, `check_ceiling` called at
+;; same-file lines 3635-3639) compares the guest's
 ;; reported `proof-ceiling` with the admitted one through `check_ceiling`
-;; (:902-911), which refuses any rank above `proof_rank(admitted)`
-;; (:875-886, compared at :907) with
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `check_ceiling`,
+;; lines 919-928), which refuses any rank above `proof_rank(admitted)`
+;; (same file, `const fn proof_rank`, lines 892-903, compared at same-file
+;; line 924, `if observed > proof_rank(admitted) {`) with
 ;; `TypedExecutionError::OutputViolation("proof-ceiling")`,
-;; staged at `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
+;; staged at `TypedStage::Output` by `execute_domain_lane` (same file, fn
+;; `execute_domain_lane`, lines 2130-2131).
 ;;
 ;; This component is otherwise an honest `dreamer-cycle` fixture: `describe`
 ;; reports the true frozen descriptor and `step` echoes the admitted
@@ -153,10 +157,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple (including its claimed proof ceiling at 0x0868),
@@ -188,11 +192,14 @@
       (i32.store (i32.const 2056) (i32.const 0))
       ;; Proof/authority escalation: the result claims `handler`, the highest
       ;; rank of the closed `proof-ceiling` enum (`proof_rank`,
-      ;; typed_execution.rs:875-886), whatever the admitted ceiling is. Every
+      ;; `bins/eliot-wasm-host/src/typed_execution.rs`, `const fn proof_rank`,
+      ;; lines 892-903, whose top arm is
+      ;; `ProofCeiling::Handler => 7,`), whatever the admitted ceiling is. Every
       ;; other identity field still echoes the admitted request, so the ceiling
       ;; comparison is provably the denial and nothing is hidden behind it.
       ;; canonical-ABI: `proof-ceiling` is cycle-step-result record offset 88
-      ;; (next_field32, types.rs:756) as a one-byte enum (enum_, types.rs:882)
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; one-byte enum (enum_, wasmtime-environ-47.0.4/src/component/types.rs:882)
       ;; -> 2064 + 88 = 2152. The claimed rank 7 stays the escalation marker.
       (i32.store (i32.const 2152) (i32.const 7))
       ;; echo "operation-id" back out of the lowered request
@@ -201,10 +208,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
@@ -235,7 +242,7 @@
 ;; Offset note: the memory map above was corrected to the canonical-ABI
 ;; derivation, not chosen by hand. `canon lift` of a result that does not fit
 ;; MAX_FLAT_FUNC_RESULTS (1) requires the single-pointer signature enforced at
-;; wasmparser-0.256.0/src/validator/component.rs:1343 and :1365, and every
+;; wasmparser-0.252.0/src/validator/component.rs:1328 and :1350, and every
 ;; record field offset above is derived with
 ;; wasmtime-environ-47.0.4/src/component/types.rs:756-759. The claimed
 ;; `proof-ceiling` byte is cycle-step-result record offset 88 at

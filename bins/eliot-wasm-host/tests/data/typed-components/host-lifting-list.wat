@@ -3,11 +3,14 @@
 ;;
 ;; A guest that can make the HOST allocate and measure is a host-lifting
 ;; exhaustion risk, so every list leaf is bounded before it is folded into the
-;; call's output budget. `check_cycle_result` (typed_execution.rs:3605-3632)
-;; measures `state.pending` with `TypedBound::list` (:838-848), which refuses
+;; call's output budget. `check_cycle_result`
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `check_cycle_result`,
+;; lines 3622-3649)
+;; measures `state.pending` with `TypedBound::list` (same file, lines 855-865,
+;; whose guard is `if count > MAX_TYPED_LIST_ITEMS {`), which refuses
 ;; more than `MAX_TYPED_LIST_ITEMS` (256) items with
 ;; `TypedExecutionError::LimitDenied("typed-list")`, staged at
-;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
+;; `TypedStage::Output` by `execute_domain_lane` (same file, lines 2130-2131).
 ;;
 ;; This component is an honest `dreamer-cycle` fixture except for THREE things.
 ;; The hostile lifted length: `describe` reports the true frozen descriptor, the
@@ -22,8 +25,14 @@
 ;; region note below), so a reader must not assume this fixture's allocator
 ;; behaves as its sibling's. The type surface, the `$copy` helper, `realloc`'s
 ;; body, the echo copies and all five `(data ...)` segments are otherwise
-;; identical to that sibling. Every earlier check therefore passes and the list
-;; item ceiling is provably the denial.
+;; identical to that sibling. That list deliberately OMITS the bump start, and
+;; the omission is not a house convention to be reversed by a later reader:
+;; sibling `raised-proof-ceiling.wat` writes the same class of `identical` list
+;; and likewise omits the bump start, but there the omission is correct, because
+;; its own `$bump` really is `dreamer-cycle.wat`'s 5120
+;; (`raised-proof-ceiling.wat:136`), so nothing in that file licenses restoring
+;; this entry here. Every earlier check therefore passes and the list item
+;; ceiling is provably the denial.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
 ;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo
@@ -160,10 +169,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x8000..0xa0d0
@@ -202,7 +211,7 @@
       ;; engine -- is what refuses it.
       ;; canonical-ABI: `state.pending` is dreamer-state record offset 20
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 20 = 2100 (ptr) and 2104 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 20 = 2100 (ptr) and 2104 (len).
       (i32.store (i32.const 2100) (i32.const 32768))
       (i32.store (i32.const 2104) (i32.const 300))
       ;; echo "operation-id" back out of the lowered request
@@ -211,10 +220,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

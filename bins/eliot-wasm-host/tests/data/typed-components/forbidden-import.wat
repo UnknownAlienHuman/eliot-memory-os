@@ -2,9 +2,9 @@
 ;; rejected".
 ;;
 ;; Why this file exists: `preflight_component_type`
-;; (bins/eliot-wasm-host/src/typed_execution.rs:1065-1132) collects the REAL
-;; observed component import set at :1073-1076 and refuses the first entry with
-;; `TypedExecutionError::ForbiddenImport` at :1077-1080, before any instance is
+;; (bins/eliot-wasm-host/src/typed_execution.rs:1082-1149) collects the REAL
+;; observed component import set at :1090-1093 and refuses the first entry with
+;; `TypedExecutionError::ForbiddenImport` at :1094-1097, before any instance is
 ;; created and before any descriptor or domain function is invoked. Only real
 ;; engine input whose actual import surface is non-empty can reach that denial;
 ;; a zero-import fixture can never produce it.
@@ -176,10 +176,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, from 0x0800 the `step`
     ;; result tuple, 0x1000..0x13ff the two echo scratch blocks (0x1000 and 0x1200,
@@ -215,7 +215,7 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
       ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
