@@ -635,7 +635,9 @@ fn remove_receipt_confirmed_runtime_restart_pending(
     // confirm its directory entry is durable with the existing checked sync
     // before touching pending evidence, then remove only this operation's
     // pending record and commit the cleanup. NotFound is idempotent cleanup;
-    // any other removal or directory-commit failure stays an explicit error.
+    // any other removal or directory-commit failure stays an explicit error,
+    // and both are observed as cleanup that did not complete against an already
+    // committed receipt.
     // The receipt itself is never rewritten and unrelated files are never
     // touched; conflicting pending evidence is left in place and fails
     // closed.
@@ -677,7 +679,21 @@ fn remove_receipt_confirmed_runtime_restart_pending(
     }
     #[cfg(all(test, windows))]
     ordering::record("pending_remove_done");
-    sync_runtime_restart_store_dir(dir)?;
+    // The receipt is already committed and this pending entry is already
+    // unlinked, so a directory commit that does not succeed is a cleanup step
+    // that did not complete and never a publication failure. It carries the
+    // same verdict the unlink failure above carries, and the sync error itself
+    // still propagates unchanged.
+    if let Err(cleanup_commit) = sync_runtime_restart_store_dir(dir) {
+        host_restart_observe(
+            &HostJournalObservation::new(
+                "host.restart pending removal failed observed",
+                HostJournalDisposition::CleanupIncomplete,
+            )
+            .with_mutation(receipt.mutation_digest.as_str()),
+        );
+        return Err(cleanup_commit);
+    }
     #[cfg(all(test, windows))]
     ordering::record("pending_remove_dir_sync_success");
     Ok(())
@@ -998,32 +1014,37 @@ pub(super) fn persist_runtime_restart_receipt(
     // publication result is propagated before `cleanup` is consulted, exactly
     // as the previous early return did.
     let publication_value = publication?;
-    let publication_disposition = match cleanup {
-        Ok(()) => publication_value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => publication_value,
-        Err(error) => {
-            // The receipt is already durable here: the only step that did
-            // not complete is its temporary-file cleanup.
-            host_restart_observe(
-                &HostJournalObservation::new(
-                    "host.restart receipt cleanup failed observed",
-                    HostJournalDisposition::CleanupIncomplete,
-                )
-                .with_mutation(receipt.mutation_digest.as_str()),
-            );
-            return Err(HostError::RecoveryRequired(format!(
-                "runtime restart receipt temporary cleanup failed: {error}"
-            )));
-        }
-    };
-    sync_after_cleanup?;
+    // The receipt is already durable at this point: its hard link and that
+    // link's directory sync both succeeded above. A cleanup step that does not
+    // complete therefore keeps exactly that meaning: its verdict is observed
+    // before the durable record below and its error is carried past that
+    // record, so a committed receipt never reads as uncommitted publication
+    // failure and its record is never withdrawn by residue.
+    let mut cleanup_error = Ok(());
+    if let Err(error) = &cleanup
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        host_restart_observe(
+            &HostJournalObservation::new(
+                "host.restart receipt cleanup failed observed",
+                HostJournalDisposition::CleanupIncomplete,
+            )
+            .with_mutation(receipt.mutation_digest.as_str()),
+        );
+        cleanup_error = Err(HostError::RecoveryRequired(format!(
+            "runtime restart receipt temporary cleanup failed: {error}"
+        )));
+    }
     #[cfg(all(test, windows))]
     ordering::record("receipt_durable_before_pending_remove");
-    // Receipt is durable before pending removal. The one publication record is
-    // typed on the owner's own `Created | Replay` disposition: each arm pairs
-    // its own boundary with its own single typed disposition, so the durable
-    // record never names a disposition its own call did not reach.
-    let durable_record = match publication_disposition {
+    // Receipt is durable before pending removal. Durability is the receipt's own
+    // link and that link's directory sync, both already committed above; the
+    // temp-file cleanup verdicts below neither gate nor withdraw this record.
+    // The one publication record is typed on the owner's own `Created | Replay`
+    // disposition: each arm pairs its own boundary with its own single typed
+    // disposition, so the durable record never names a disposition its own call
+    // did not reach.
+    let durable_record = match publication_value {
         RuntimeRestartReceiptPublication::Created => HostJournalObservation::new(
             "host.restart receipt durable observed",
             HostJournalDisposition::PublicationCreated,
@@ -1038,6 +1059,21 @@ pub(super) fn persist_runtime_restart_receipt(
             .with_mutation(receipt.mutation_digest.as_str())
             .with_request_digest(receipt.request_digest.as_str()),
     );
+    cleanup_error?;
+    // Both cleanup syncs already ran above; only this verdict is carried past
+    // the durable record. The receipt's own directory entry is durable, so an
+    // unconfirmed commit of its temporary-file removal is cleanup residue, and
+    // the sync error itself still propagates unchanged.
+    if let Err(cleanup_commit) = sync_after_cleanup {
+        host_restart_observe(
+            &HostJournalObservation::new(
+                "host.restart receipt cleanup failed observed",
+                HostJournalDisposition::CleanupIncomplete,
+            )
+            .with_mutation(receipt.mutation_digest.as_str()),
+        );
+        return Err(cleanup_commit);
+    }
     remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, receipt)?;
     Ok(())
 }

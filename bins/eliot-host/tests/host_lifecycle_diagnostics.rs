@@ -2288,6 +2288,19 @@ fn lifecycle_stop_request_pending_stopped_distinct() {
     // progress record is bound to the request's generation, progress never
     // regresses to a request, and a repeat observation is readback.
     let (journal, host, generation) = case6_journal();
+    // `HostStateJournal` admits a drain record only under an activation fence it
+    // already holds, so the durable owner is seeded with that one real
+    // activation first. The seed is a committed record of the same owner, not a
+    // bypass: without it every drain append below is refused as a stale fence
+    // before the drain reducer is ever reached.
+    journal
+        .append(case6_activation_record(
+            &host,
+            &generation,
+            "host-drain-seed-activation",
+            eliot_host_state::ActivationState::Starting,
+        ))
+        .expect("the activation the drain fence names must commit");
     let commit = journal
         .append(case6_drain_record(
             &host,
@@ -2850,6 +2863,19 @@ fn lifecycle_drain_request_progress_completion_distinct() {
     // are three distinct states, progress is bound to the request generation, a
     // duplicate request is refused, and a repeat observation is readback.
     let (journal, host, generation) = case6_journal();
+    // `HostStateJournal` admits a drain record only under an activation fence it
+    // already holds, so the durable owner is seeded with that one real
+    // activation first. The seed is a committed record of the same owner, not a
+    // bypass: without it every drain append below is refused as a stale fence
+    // before the drain reducer is ever reached.
+    journal
+        .append(case6_activation_record(
+            &host,
+            &generation,
+            "host-drain-progress-seed-activation",
+            eliot_host_state::ActivationState::Starting,
+        ))
+        .expect("the activation the drain fence names must commit");
     let request = journal
         .append(case6_drain_record(
             &host,
@@ -7133,7 +7159,7 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
             else {
                 assert!(
                     case22_facade_callee(statement.as_str()).is_none(),
-                    "no_unowned_edit: a statement that calls the #889 facade directly must reach the observation path only through one of the already-allowed shapes (the frozen `host_lifecycle_observe_*` seam, the frozen `host_lifecycle_frozen_event`/`host_lifecycle_boundary` projection, the one already-pinned `pub use` seam re-export, or the identity seam's own projection), never through a free event string or a `format!` it built itself: {statement}"
+                    "no_unowned_edit: a statement that calls the #889 facade directly must reach the observation path only through one of the already-allowed shapes (the frozen `host_lifecycle_observe_*` seam, the frozen `host_lifecycle_frozen_event`/`host_lifecycle_boundary` projection, or the identity seam's own projection), never through a free event string or a `format!` it built itself: {statement}"
                 );
                 continue;
             };
@@ -7590,6 +7616,15 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         std::mem::discriminant(&owner_unobserved_error),
         "no_lifecycle_delta: the second observed owner operation must return the same failure variant as the unobserved one"
     );
+    // Every needle below is taken from the parsed table by its row NAME, never
+    // from the literal it is then counted against, so what the owner emitted is
+    // bound to `HOST_LIFECYCLE_BOUNDARY_TABLE` rather than to a spelling this
+    // test made up itself. The terminal record's own `event` attribute is the
+    // facade's fixed terminal spelling and is not a row field, so that one is
+    // left as it is.
+    let open_requested_detail = case22_event(&rows, "open.requested");
+    let open_terminal_code = case22_event(&rows, "open.terminal");
+    let open_admitted_detail = case22_event(&rows, "open.admitted");
     for (owner_label, owner) in [
         ("owner_first", &owner_first),
         ("owner_second", &owner_second),
@@ -7605,17 +7640,17 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         );
         for &record in &terminal_records {
             assert!(
-                record.contains("code=\"host-open-failed\""),
+                record.contains(&format!("code=\"{open_terminal_code}\"")),
                 "single_terminal_per_failed_op: every terminal record of one failed operation must carry that operation's own terminal code ({owner_label}): {record}"
             );
         }
         assert_eq!(
-            count_occurrences(owner, "code=\"host-open-failed\""),
+            count_occurrences(owner, &format!("code=\"{open_terminal_code}\"")),
             1,
             "single_terminal_per_failed_op: one designated terminal per failed owner operation, never two ({owner_label}): {owner}"
         );
         assert_eq!(
-            count_occurrences(owner, "detail=\"host.open admitted\""),
+            count_occurrences(owner, &format!("detail=\"{open_admitted_detail}\"")),
             0,
             "the admitted row was never reached, because this failing open stops at its first fallible step; the lifecycle-delta proof is the unchanged typed result above plus the observation-surface text proof, not this row count ({owner_label}): {owner}"
         );
@@ -7638,12 +7673,15 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         "the second owner capture must carry the same bounded record set as the first, so no emission is added or lost on a repeat: {owner_second}"
     );
     assert_eq!(
-        count_occurrences(&owner_first, "detail=\"host.open requested\""),
+        count_occurrences(&owner_first, &format!("detail=\"{open_requested_detail}\"")),
         1,
         "no_duplicate_evaluation: re-running the owner yields one record per call, not an accumulation: {owner_first}"
     );
     assert_eq!(
-        count_occurrences(&owner_second, "detail=\"host.open requested\""),
+        count_occurrences(
+            &owner_second,
+            &format!("detail=\"{open_requested_detail}\"")
+        ),
         1,
         "no_duplicate_evaluation: re-running the owner yields one record per call, not an accumulation: {owner_second}"
     );
@@ -8091,9 +8129,13 @@ fn case22_facade_callee(line: &str) -> Option<&'static str> {
 ///
 /// The allowed set is named exactly, because the file's own seam bodies are the
 /// allowed shapes and a rule that rejected them would prove nothing: a direct
-/// facade call must be the frozen seam family, the frozen projection itself, the
-/// one already-published seam re-export, or the identity seam's own
-/// `HostRequestProjection` argument.
+/// facade call must be the frozen seam family, the frozen projection itself, or
+/// the identity seam's own `HostRequestProjection` argument.
+///
+/// The published `pub use host_diagnostics::note_event_log_sink_status;`
+/// re-export is deliberately not one of these shapes: it carries no facade call,
+/// so no collected statement can ever be it, and the case pins that re-export as
+/// the single published observation-surface item by exact set comparison instead.
 fn case22_allowed_facade_shape(statement: &str, identity_seam: &str) -> Option<&'static str> {
     let callee = case22_facade_callee(statement)?;
     if statement.contains("host_lifecycle_observe_") {
@@ -8103,9 +8145,6 @@ fn case22_allowed_facade_shape(statement: &str, identity_seam: &str) -> Option<&
         || statement.contains("host_lifecycle_boundary(")
     {
         return Some("frozen-projection-detail");
-    }
-    if statement.trim() == "pub use host_diagnostics::note_event_log_sink_status;" {
-        return Some("published-seam-re-export");
     }
     if callee == "observe_host_request(" && identity_seam.contains(statement.trim()) {
         return Some("frozen-identity-seam");

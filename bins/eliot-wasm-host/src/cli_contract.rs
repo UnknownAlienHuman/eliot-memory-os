@@ -567,13 +567,21 @@ mod tests {
 
     #[test]
     fn guest_exec_args_fail_closed() {
-        // Missing artifact piece.
+        // Missing artifact piece. Draining the flag and its value leaves every
+        // remaining token pairing cleanly as flag/value, so the parse loop
+        // cannot refuse on its own: the only reachable refusal is the assembled
+        // `--guest-exec` missing-artifact requirement. The exact detail is
+        // pinned, for the same reason as the ceiling case below — a refusal
+        // raised anywhere else fails here instead of being satisfied by any
+        // `MalformedArgument`.
         let mut argv = guest_argv();
         argv.drain(3..5);
-        assert!(matches!(
+        assert_eq!(
             parse_args(argv),
-            Err(CliError::MalformedArgument(_))
-        ));
+            Err(CliError::MalformedArgument(
+                "--guest-exec requires --guest-exec-artifact".to_owned()
+            ))
+        );
         // Non-numeric ceiling VALUE: `argv[14]` is the `--guest-exec-max-memory`
         // value, so this reaches `parse_guest_limit`'s `u64` parse rather than
         // the unknown-argument arm. The expected detail is bound from the flag
@@ -585,12 +593,17 @@ mod tests {
         let mut argv = guest_argv();
         argv[14] = "lots".to_owned();
         assert_eq!(parse_args(argv), Err(CliError::MalformedArgument(expected)));
-        // Stray guest piece without the mode flag.
+        // Stray guest piece without the mode flag. Removing `--guest-exec`
+        // leaves a complete, individually well-formed guest argument set, so
+        // the loop accepts every token and the refusal must come from the
+        // assembled guest mode, for the reason the parse names.
         let mut argv = guest_argv();
         argv.remove(2);
-        assert!(matches!(
+        assert_eq!(
             parse_args(argv),
-            Err(CliError::MalformedArgument(_))
-        ));
+            Err(CliError::MalformedArgument(
+                "guest execution arguments require --guest-exec".to_owned()
+            ))
+        );
     }
 }

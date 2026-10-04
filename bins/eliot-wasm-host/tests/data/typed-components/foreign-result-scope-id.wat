@@ -118,8 +118,12 @@
 ;; (c) THE FORGED FIELD IS THE FIRST CHECK THAT CAN FAIL. This block cites by
 ;; SYMBOL, not by line: every `fn` named below lives in src/typed_execution.rs
 ;; and every backquoted string is verbatim source text, so the block survives
-;; edits made above the cited statements. In call order through `fn
-;; execute_domain_lane` -- the interior lane whose body ends
+;; edits made above the cited statements. A quote too long for one comment line
+;; is WRAPPED across consecutive `;;` lines, with nothing elided inside the
+;; quoted span: rejoin those lines before comparing. Where a statement's
+;; leading `let <binding> =` is not quoted, the quoted text is the call
+;; expression exactly as it appears on its own source line. In call order
+;; through `fn execute_domain_lane` -- the interior lane whose body ends
 ;; `Ok((receipt, result))` -- every check that runs before the forged
 ;; comparison still passes:
 ;;   `admitted.validate()?;`                     -- the test's own admitted
@@ -153,14 +157,20 @@
 ;;   `typecheck_world_signatures(world, &descriptor, &domain, component)?`,
 ;;   whose `TypedWorld::MemoryCurationScreen` arm requires this component's
 ;;   declared `screen` parameter, result and error types to match
-;;      `(wit::ScreenRequest,), (Result<wit::ScreenOutcome, wit::ScreenError>,)`.
+;;      `(wit::ScreenRequest,),` and `(Result<wit::ScreenOutcome,
+;;      wit::ScreenError>,)`, the two argument lines of the `typecheck::<..>`
+;;      generic as they stand on their own source lines.
 ;;      That is the check that requires the DECLARED TYPES ABOVE to equal the
 ;;      frozen WIT records -- record for record, field for field, in WIT order --
-;;      and it is the check a WIT-absent record field fails: a mismatch is
-;;      returned as TypedExecutionError::ExportTypeMismatch("screen"), before
-;;      `screen` is dispatched at all. Nothing below is reached if it fails, so
-;;      this file's type declarations are load-bearing for this fixture, not
-;;      decoration.
+;;      and it is the check a WIT-absent record field fails. The mismatch is
+;;      returned by the `TypedWorld::MemoryCurationScreen` arm of
+;;      `fn typecheck_world_signatures` as the statement below, quoted
+;;      VERBATIM: only its 12-space leading indentation is trimmed, nothing
+;;      else is changed, the `map_err` wrapper and the `.to_owned()` included.
+;; .map_err(|_| TypedExecutionError::ExportTypeMismatch("screen".to_owned()))?;
+;;      It is returned before `screen` is dispatched at all. Nothing below is
+;;      reached if it fails, so this file's type declarations are load-bearing
+;;      for this fixture, not decoration.
 ;;   `validate_descriptor(world, &descriptor, limits.max_output_bytes)` -- inside
 ;;   `fn validate_descriptor`: `if descriptor.world_name != world.world_name()`
 ;;   -> `TypedWorld::world_name` (src/typed_bindings.rs:119) ->
@@ -175,8 +185,9 @@
 ;;   verbatim from memory-curation-screen.wat:200, so it is the real digest of
 ;;   the frozen WIT bytes, not a fixture-chosen value.
 ;;   `check_result(&result, admitted, &mut output_bound)` -- inside `fn
-;;   check_result`, the arm `TypedDomainOutcome::MemoryCurationScreen(value) =>
-;;   check_screen_result(value, admitted, bound)`; inside `fn
+;;   check_result`, the arm `TypedDomainOutcome::MemoryCurationScreen(value)`
+;;   is the BRACED BLOCK quoted verbatim in (d), NOT the collapsed arrow
+;;   expression a one-line paraphrase would suggest; inside `fn
 ;;   check_screen_result` `let R::Screened(body) = value;` binds because this
 ;;   file writes the ok discriminant 0 at 2048 and the "screened" case
 ;;   discriminant 0 at 2056.
@@ -199,8 +210,8 @@
 ;; `fence_epoch: admitted.fence_epoch.clone()` in `fn screen_request`), and the
 ;; `check_ceiling` of `ceiling_screen(body.proof_ceiling)` against
 ;; `admitted.proof_ceiling` (field `"proof-ceiling"`) reads the zeroed
-;; `proof-ceiling` byte as enum case 0 = "observation", `fn proof_rank` rank 0,
-;; which is not above any admitted ceiling (`fn proof_rank` in
+;; `proof-ceiling` byte as enum case 0 = "observation", `const fn proof_rank`
+;; rank 0, which is not above any admitted ceiling (`const fn proof_rank` in
 ;; src/typed_execution.rs).
 ;;
 ;; (d) THE PRODUCTION LINE THAT COMPARES THE FORGED FIELD, BY SYMBOL. Each item
@@ -227,7 +238,11 @@
 ;;     if observed != admitted {
 ;;         return Err(TypedExecutionError::OutputViolation(field.to_owned()));
 ;;     }
-;; so the denial is TypedExecutionError::OutputViolation("scope-id"). The caller
+;;     Ok(())
+;; }
+;; so the denial is `TypedExecutionError::OutputViolation("scope-id")` -- the
+;; resulting VALUE, with `field` = "scope-id"; the source expression is the
+;; `field.to_owned()` quoted above, not a literal. The caller
 ;; stages it as TypedStage::Output at
 ;;     check_result(&result, admitted, &mut output_bound)
 ;;         .map_err(|error| staged(TypedStage::Output, error))?;
