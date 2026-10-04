@@ -74,11 +74,11 @@ FROZEN_CASES = (
     ("885/8", "immutable DTO yields zero candidates"),
     ("885/9", "mutex-guarded long-lived growth is an unbounded candidate"),
     ("885/10", "static global growth is an unbounded candidate"),
-    ("885/11", "literal capacity plus removal is hard-bounded"),
-    ("885/12", "policy-owned growth is versioned-policy-bounded"),
-    ("885/13", "same-slice removal without hard bound is lifecycle-removal"),
-    ("885/14", "ttl signal with scheduled cleanup is TTL/lease bounded"),
-    ("885/15", "cross-file removal is external compaction"),
+    ("885/11", "literal capacity plus removal stays unresolved, preallocation retained"),
+    ("885/12", "policy-like name without enforced limit stays unresolved, name retained"),
+    ("885/13", "bare clear() presence stays unresolved, removal callsite retained"),
+    ("885/14", "ttl signal with scheduled per-entry retention is TTL/lease bounded"),
+    ("885/15", "cross-file per-entry compaction is external compaction"),
     ("885/16", "append signal with retention is append-only segmented retention"),
     ("885/17", "cfg(test) region row is test-only"),
     ("885/18", "growth-free fields stay ownership/lifetime unknown"),
@@ -135,7 +135,8 @@ class TestLongLivedCollectionInventory(unittest.TestCase):
         """885/2: header carries closed versioned identity."""
         header = _fixture_inventory()["header"]
         self.assertEqual(header["schema"], "eliot.long-lived-collection-inventory.v1")
-        self.assertEqual(header["rule_revision"], "885.1")
+        self.assertEqual(header["rule_revision"], "885.2")
+        self.assertEqual(header["rule_revision"], oracle.RULE_REVISION)
         self.assertEqual(header["tool_version"], "0.1.0")
         self.assertEqual(header["scan_roots"], ["scripts/testdata/long-lived-collections"])
         self.assertEqual(len(header["classifications"]), 12)
@@ -163,7 +164,13 @@ class TestLongLivedCollectionInventory(unittest.TestCase):
             int(header["unresolved_count"]),
             sum(1 for row in inventory["rows"] if row["classification"] in UNRESOLVED),
         )
-        self.assertEqual(int(header["unresolved_count"]), 5)
+        # Under RULE_REVISION 885.2 the three previously-refuted bounded claims
+        # (preallocation, policy-like name, bare removal presence) plus the
+        # long-lived no-evidence rows are all explicitly unresolved; only the
+        # five evidenced classifications (request-local, test-only,
+        # append-only retention, TTL/lease, external compaction) are resolved.
+        self.assertEqual(int(header["unresolved_count"]), 8)
+        self.assertEqual(int(header["classified_count"]) - int(header["unresolved_count"]), 5)
 
     def test_885_05_coverage_complete_safety_blocking(self) -> None:
         """885/5: coverage COMPLETE coexists with FINDINGS_REMAIN_BLOCKING safety."""
@@ -226,58 +233,151 @@ class TestLongLivedCollectionInventory(unittest.TestCase):
         self.assertTrue(row["growth_callsites"])
         self.assertEqual(row["repair_issue"], "UNRESOLVED")
 
-    def test_885_11_hard_bounded(self) -> None:
-        """885/11: literal capacity plus removal is hard-bounded."""
+    def test_885_11_preallocation_is_not_a_hard_bound(self) -> None:
+        """885/11: preallocation plus removal stays unresolved; evidence retained.
+
+        Issue #885's source audit refuted this case: `Vec::with_capacity(n)`
+        PREALLOCATES and is not a maximum length, so a literal capacity plus an
+        unscheduled `retain` cannot yield `long-lived hard-bounded`. Audit
+        clause: "preallocation+optional cleanup (not proved bounded)" is
+        discovery evidence only, "must never by themselves yield a hard/configured
+        bound or `none-required`", and ambiguous evidence "stays explicitly
+        unresolved while RETAINING the observed details".
+        """
         (row,) = _rows_by_path(_fixture_inventory())[
             "scripts/testdata/long-lived-collections/hard_bounded.rs"
         ]
-        self.assertEqual(row["classification"], "long-lived hard-bounded")
-        self.assertEqual(row["bound"], "with_capacity(64)")
-        self.assertEqual(row["bound_status"], "hard")
+        # The refuted classification is refused.
+        self.assertEqual(row["classification"], "unbounded long-lived candidate")
+        self.assertNotEqual(row["classification"], "long-lived hard-bounded")
+        # No bound is claimed: with_capacity(64) is initialization, not a limit.
+        self.assertEqual(row["bound"], "none-observed")
+        self.assertEqual(row["bound_status"], "none")
+        self.assertNotEqual(row["bound_status"], "hard")
+        # The observed details survive in the row rather than being discarded.
         self.assertTrue(row["growth_callsites"])
         self.assertTrue(row["removal_callsites"])
-        self.assertEqual(row["repair_issue"], "none-required")
+        self.assertTrue(any(":retain" in call for call in row["removal_callsites"]))
+        self.assertIn("with_capacity(64)", row["evidence"])
+        self.assertIn("discovery evidence only", row["evidence"])
+        self.assertIn("not a maximum length", row["evidence"])
+        # Uncertain evidence stays unresolved and hands off through UNRESOLVED.
+        self.assertEqual(row["repair_owner"], "UNRESOLVED")
+        self.assertEqual(row["repair_issue"], "UNRESOLVED")
+        self.assertNotEqual(row["repair_issue"], "none-required")
 
-    def test_885_12_versioned_policy_bounded(self) -> None:
-        """885/12: policy-owned growth is versioned-policy-bounded."""
+    def test_885_12_policy_name_without_limit_is_unresolved(self) -> None:
+        """885/12: a policy-like name without an enforced limit stays unresolved.
+
+        Issue #885's source audit refuted this case: a policy-LIKE NAME with no
+        enforced limit is not a bound. Audit clause: "a policy-like field name
+        without an enforced limit (unresolved)" is discovery evidence only, and
+        such evidence "must never by themselves yield a hard/configured bound or
+        `none-required`".
+        """
         (row,) = _rows_by_path(_fixture_inventory())[
             "scripts/testdata/long-lived-collections/versioned_policy_bounded.rs"
         ]
-        self.assertEqual(row["classification"], "versioned-policy-bounded")
-        self.assertEqual(row["bound_status"], "configured")
+        # The refuted classification is refused.
+        self.assertEqual(row["classification"], "unbounded long-lived candidate")
+        self.assertNotEqual(row["classification"], "versioned-policy-bounded")
+        # The policy-like name buys no configured bound.
+        self.assertEqual(row["bound"], "none-observed")
+        self.assertEqual(row["bound_status"], "none")
+        self.assertNotEqual(row["bound_status"], "configured")
+        # The observed growth and the policy-like-name signal stay visible.
         self.assertTrue(row["growth_callsites"])
-        self.assertEqual(row["repair_issue"], "none-required")
+        self.assertEqual(row["field_name"], "policies")
+        self.assertIn("policy-like name signal without an enforced limit", row["evidence"])
+        self.assertIn("discovery evidence only", row["evidence"])
+        self.assertIn("not a configured bound", row["evidence"])
+        # Ambiguous evidence stays explicitly unresolved.
+        self.assertEqual(row["repair_owner"], "UNRESOLVED")
+        self.assertEqual(row["repair_issue"], "UNRESOLVED")
+        self.assertNotEqual(row["repair_issue"], "none-required")
 
-    def test_885_13_lifecycle_removal(self) -> None:
-        """885/13: same-slice removal without hard bound is lifecycle-removal."""
+    def test_885_13_bare_removal_presence_is_not_lifecycle_removal(self) -> None:
+        """885/13: mere `.clear()` presence stays unresolved; callsite retained.
+
+        Issue #885's source audit refuted this case: bare removal-method presence
+        proves no bound, and a cleanup that only clears a collection "proves no
+        scheduling and no cardinality limit". Audit clause: removal-method
+        presence is "DISCOVERY EVIDENCE ONLY and must never by itself yield a
+        hard/configured bound or `none-required`", and the row "stays explicitly
+        unresolved while RETAINING the observed details".
+        """
         (row,) = _rows_by_path(_fixture_inventory())[
             "scripts/testdata/long-lived-collections/lifecycle_removal.rs"
         ]
-        self.assertEqual(row["classification"], "lifecycle-removal")
+        # The refuted classification is refused.
+        self.assertEqual(row["classification"], "unbounded long-lived candidate")
+        self.assertNotEqual(row["classification"], "lifecycle-removal")
+        # A whole-collection clear() is not a bound and not per-entry retention.
+        self.assertEqual(row["bound"], "none-observed")
+        self.assertEqual(row["bound_status"], "none")
+        self.assertNotEqual(row["bound_status"], "hard")
+        # The observed growth and the clear() callsite survive in the row.
         self.assertTrue(row["growth_callsites"])
         self.assertTrue(any(call.endswith(":clear") for call in row["removal_callsites"]))
-        self.assertEqual(row["repair_issue"], "none-required")
+        self.assertIn(":clear", row["evidence"])
+        self.assertIn("establishes no guard/eviction/cleanup obligation", row["evidence"])
+        self.assertIn("discovery evidence only", row["evidence"])
+        # Uncertain evidence stays explicitly unresolved.
+        self.assertEqual(row["repair_owner"], "UNRESOLVED")
+        self.assertEqual(row["repair_issue"], "UNRESOLVED")
+        self.assertNotEqual(row["repair_issue"], "none-required")
 
     def test_885_14_ttl_lease_bounded(self) -> None:
-        """885/14: ttl signal with scheduled cleanup is TTL/lease bounded."""
+        """885/14: ttl signal with scheduled per-entry retention is TTL/lease bounded.
+
+        This classification was KEPT by issue #885's source audit but TIGHTENED:
+        it now requires genuinely scheduled, receiver-attributed, per-entry
+        retention (audit case 16, "TTL/lease needs scheduled bounded cleanup
+        owner") rather than any production removal. The fixture supplies exactly
+        that: an expiry/ttl signal on the field and a `retain` per-entry call
+        carrying a scheduling marker on the same line, with `self.ttl` as the
+        exact receiver. A whole-collection `clear()` would NOT qualify.
+        """
         (row,) = _rows_by_path(_fixture_inventory())[
             "scripts/testdata/long-lived-collections/ttl_lease.rs"
         ]
         self.assertEqual(row["classification"], "TTL/lease with scheduled bounded cleanup")
         self.assertEqual(row["bound_status"], "configured")
-        self.assertTrue(str(row["bound"]).startswith("scheduled cleanup:"))
+        # The tightened evidence is named in the bound: a scheduled, per-entry
+        # (retain) retention owner, not a whole-collection clear/drain.
+        self.assertTrue(str(row["bound"]).startswith("scheduled retention:"))
+        self.assertIn("(retain)", str(row["bound"]))
+        self.assertNotIn("clear", str(row["bound"]))
+        # Receiver-attributed per-entry retention callsite is retained.
+        self.assertTrue(any(call.endswith(":retain") for call in row["removal_callsites"]))
+        self.assertIn("receiver-attributed scheduled retention owner", row["evidence"])
+        self.assertIn("whole-collection clear/drain is not retention", row["evidence"])
         self.assertEqual(row["cardinality_key"], "String")
         self.assertEqual(row["repair_issue"], "none-required")
 
     def test_885_15_external_compaction(self) -> None:
-        """885/15: cross-file removal is external compaction."""
+        """885/15: a genuine cross-file per-entry compaction call is external compaction.
+
+        This classification was KEPT by issue #885's source audit but TIGHTENED to
+        require receiver-exact per-entry compaction owned outside the declaring
+        file (audit case 17, "external compaction owner bound exactly"), not any
+        cross-file removal. The fixture now destructures the exact
+        CompactStore.records field in store_compactor.rs and calls `retain`
+        (per-entry) on that receiver, so the owner is bound exactly and the
+        classification is demonstrable.
+        """
         by_path = _rows_by_path(_fixture_inventory())
         (row,) = by_path["scripts/testdata/long-lived-collections/compacted_store.rs"]
         self.assertEqual(row["classification"], "external compaction")
         self.assertEqual(row["bound_status"], "configured")
+        # The single cross-file callsite is a receiver-exact per-entry retain.
         cross = [call for call in row["removal_callsites"] if "(cross-file)" in call]
         self.assertEqual(len(cross), 1)
         self.assertIn("store_compactor.rs", cross[0])
+        self.assertIn(":retain", cross[0])
+        self.assertNotIn(":clear", cross[0])
+        self.assertIn("outside the declaring file", row["evidence"])
+        # The compactor's own marker buffer stays a separate unresolved row.
         (compactor,) = by_path["scripts/testdata/long-lived-collections/store_compactor.rs"]
         self.assertEqual(compactor["classification"], "unbounded long-lived candidate")
         self.assertEqual(compactor["field_name"], "swept")
@@ -370,24 +470,39 @@ class TestLongLivedCollectionInventory(unittest.TestCase):
         """885/21: unresolved rows carry UNRESOLVED repair plus bounded successor scope."""
         inventory = _fixture_inventory()
         unresolved = [row for row in inventory["rows"] if row["classification"] in UNRESOLVED]
-        self.assertEqual(len(unresolved), 5)
+        # 885.2 moved the three refuted bounded claims into this blocking set.
+        self.assertEqual(len(unresolved), 8)
+        self.assertEqual(len(unresolved), int(inventory["header"]["unresolved_count"]))
+        # Every uncertain row keeps the blocking handoff AND retains its details.
         for row in unresolved:
             self.assertEqual(row["repair_owner"], "UNRESOLVED", row["id"])
             self.assertEqual(row["repair_issue"], "UNRESOLVED", row["id"])
+            self.assertNotEqual(row["repair_issue"], "none-required", row["id"])
             scope = str(row["successor_scope"])
             self.assertTrue(scope.startswith("bounded successor scope:"), row["id"])
             owner = row["struct_name"] or row["owner"]
             self.assertIn(f"{owner}.{row['field_name']}", scope, row["id"])
+        # Uncertain rows keep FINDINGS_REMAIN_BLOCKING while coverage stays
+        # COMPLETE: scan coverage is independent of findings.
+        self.assertEqual(inventory["header"]["coverage_disposition"], "COMPLETE")
+        self.assertEqual(inventory["header"]["safety_disposition"], "FINDINGS_REMAIN_BLOCKING")
 
     def test_885_22_resolved_rows_owned(self) -> None:
         """885/22: resolved rows carry owned repair and none-required successor."""
         inventory = _fixture_inventory()
         resolved = [row for row in inventory["rows"] if row["classification"] not in UNRESOLVED]
-        self.assertEqual(len(resolved), 8)
+        # Only the five classifications with real evidenced proof remain resolved;
+        # 885.2 removed hard-bounded, versioned-policy-bounded and
+        # lifecycle-removal from what the fixtures can prove.
+        self.assertEqual(len(resolved), 5)
         for row in resolved:
             self.assertEqual(row["repair_issue"], "none-required", row["id"])
             self.assertIn(row["repair_owner"], ("none-required", row["package"]), row["id"])
             self.assertEqual(row["successor_scope"], "none-required", row["id"])
+        # The three refuted classifications no longer appear as resolved rows.
+        resolved_classes = {row["classification"] for row in resolved}
+        for refuted in ("long-lived hard-bounded", "versioned-policy-bounded", "lifecycle-removal"):
+            self.assertNotIn(refuted, resolved_classes)
 
     def test_885_23_sync_byte_identical_check_passes(self) -> None:
         """885/23: sync is byte-identical and check passes."""
