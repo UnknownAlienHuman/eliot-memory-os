@@ -49,6 +49,7 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eliot_contracts::{ResourceGeneration, StateFence};
@@ -82,24 +83,48 @@ impl Write for CaptureSink {
 
 /// A sink that refuses every write, used by case 29 to prove a failing sink
 /// changes no production call or result.
-struct FailingWriter;
+///
+/// The counter is what makes that arm's premise OBSERVABLE rather than
+/// inferred from the healthy arm. `tracing-subscriber-0.3.23`'s
+/// `src/fmt/fmt_layer.rs:1050` calls `io::Write::write_all` and only reports the
+/// `Err` at `:1051-1055` when `log_internal_errors` is set, which
+/// `Layer::default()` leaves `false` (`:752`) and nothing in this file sets;
+/// there is no error channel above the layer either
+/// (`tracing-core-0.1.36/src/subscriber.rs:346` `fn event` returns `()`, as
+/// does `src/dispatcher.rs:607-612`). A silent `Err` therefore leaves NO other
+/// trace, and without this counter the arm would assert nothing at all - it
+/// would pass identically if `write` returned `Ok(buf.len())`. The return
+/// values below are exactly the ones the arm already had; only the observation
+/// is new.
+struct FailingWriter {
+    write_attempts: Arc<AtomicUsize>,
+}
 
 impl Write for FailingWriter {
     fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        self.write_attempts.fetch_add(1, Ordering::Relaxed);
         Err(std::io::Error::other("sink failed"))
     }
 
+    /// Counted as an attempt too: this writer refuses `flush` exactly as it
+    /// refuses `write`, and both refusals are silent for the reasons above.
     fn flush(&mut self) -> std::io::Result<()> {
+        self.write_attempts.fetch_add(1, Ordering::Relaxed);
         Err(std::io::Error::other("sink failed"))
     }
 }
 
-/// A sink that accepts and discards every record, used by case 29 to prove a
-/// dropped sink changes no production call or result.
-struct DiscardWriter;
+/// A sink that ACCEPTS every byte and discards the content, used by case 29 to
+/// prove a discarding sink changes no production call or result. It is not a
+/// dropping sink and no byte is ever refused - that is the difference from
+/// `FailingWriter` - so its counter measures write ATTEMPTS that all succeeded.
+struct DiscardWriter {
+    write_attempts: Arc<AtomicUsize>,
+}
 
 impl Write for DiscardWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_attempts.fetch_add(1, Ordering::Relaxed);
         Ok(buf.len())
     }
 
@@ -125,37 +150,82 @@ where
     (String::from_utf8_lossy(&bytes).into_owned(), result)
 }
 
-/// Case 29: delivery through a writer that fails every write.
-fn capture_with_failing_sink<F, R>(f: F) -> R
+/// Case 29: delivery through a writer that fails every write. Returns the
+/// shared attempt counter alongside the driven result (the shape used by
+/// `capture_with_discarding_sink` too), so the caller can assert that
+/// production really reached the refusing writer.
+fn capture_with_failing_sink<F, R>(f: F) -> (Arc<AtomicUsize>, R)
 where
     F: FnOnce() -> R,
 {
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(|| FailingWriter)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f)
+    let write_attempts = Arc::new(AtomicUsize::new(0));
+    let for_sink = Arc::clone(&write_attempts);
+    let result = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || FailingWriter {
+                write_attempts: Arc::clone(&for_sink),
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, f)
+    };
+    (write_attempts, result)
 }
 
-/// Case 29: delivery through a writer that accepts and discards every record.
-fn capture_with_discarding_sink<F, R>(f: F) -> R
+/// Case 29: delivery through a writer that accepts every byte and discards the
+/// content. Returns the shared attempt counter alongside the driven result, so
+/// the caller can assert that production really reached this writer and that it
+/// accepted those bytes.
+fn capture_with_discarding_sink<F, R>(f: F) -> (Arc<AtomicUsize>, R)
 where
     F: FnOnce() -> R,
 {
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(|| DiscardWriter)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f)
+    let write_attempts = Arc::new(AtomicUsize::new(0));
+    let for_sink = Arc::clone(&write_attempts);
+    let result = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || DiscardWriter {
+                write_attempts: Arc::clone(&for_sink),
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, f)
+    };
+    (write_attempts, result)
 }
 
 /// Case 29: delivery with no subscriber at all, so every record is dropped at
 /// the dispatcher exactly as it would be before the observability owner exists.
-fn capture_with_disabled_sink<F, R>(f: F) -> R
+///
+/// `NoSubscriber::register_callsite` returns `Interest::never()`
+/// (`tracing-core-0.1.36/src/subscriber.rs:676-678`, with `enabled` returning
+/// `false` at `:691-693`), so NO event is ever dispatched and no writer is ever
+/// asked. This arm's honest observable is therefore the OPPOSITE polarity from
+/// the other two: a ZERO attempt count, not a non-zero one, and there is no
+/// disabled WRITER here at all - the subscriber is absent.
+/// `MakeWriter::make_writer` (`writer.rs:118`) returns a `Writer` and not a
+/// `Result`, so producing one cannot fail either; only `write`/`flush` can, and
+/// nothing calls them.
+///
+/// The middle value is the dispatcher's own answer, measured inside this exact
+/// scope with the same enablement question production's `tracing::info!`
+/// (`generation_control.rs:428-429`) asks: it mirrors a real `kernel.*`
+/// emission's target and level rather than asserting a hard-coded zero, so the
+/// zero-count assertion above it has an observed cause.
+fn capture_with_disabled_sink<F, R>(f: F) -> (Arc<AtomicUsize>, u32, R)
 where
     F: FnOnce() -> R,
 {
-    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), f)
+    let write_attempts = Arc::new(AtomicUsize::new(0));
+    let (dispatchable, result) =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            let dispatchable = u32::from(tracing::enabled!(
+                target: KERNEL_DIAGNOSTICS_TARGET,
+                tracing::Level::INFO
+            ));
+            (dispatchable, f())
+        });
+    (write_attempts, dispatchable, result)
 }
 
 // -------------------- fixture --------------------
@@ -2962,13 +3032,21 @@ fn environment_config_path_and_payload_canaries_are_absent() {
 // return `ACCEPTED_PENDING`"; and issue #903's own noninterference requirement,
 // quoted from the card rather than from a document: "sink failure/drop/disabled
 // noninterference" (`ROOT-continuation/workstreams/swarm/cards/903.md`:24).
-// Pins that the four delivery conditions — a healthy sink, a failing sink, a
-// discarding sink and no subscriber at all — return byte-identical generation,
-// reserve and health results, and that the healthy capture keeps the causal
-// phase order.
+// Pins that the four delivery conditions — a healthy sink, a sink that refuses
+// every write, a sink that accepts every byte and discards the content, and no
+// subscriber at all — return the identical `ProbeResults`, every field of which
+// is a production read taken by `probe` (`:920-936`) from four independent
+// compositions, and that the healthy capture keeps the causal phase order.
+//
+// It does NOT byte-compare a rendered surface across the four arms: three of
+// them capture no text at all, and the healthy arm's `healthy_text` is compared
+// only against itself, by the causal-order and absence assertions below. The
+// four-arm equality is a determinism fact about production across four fresh
+// compositions, not a fact about any sink; the per-arm sink premises are
+// measured separately, by each arm's own write-attempt counter.
 #[allow(
     clippy::too_many_lines,
-    reason = "four sink delivery conditions compared byte for byte are one noninterference claim"
+    reason = "four sink delivery conditions plus their per-arm premise observations are one noninterference claim"
 )]
 #[test]
 fn sink_failure_drop_and_disable_preserve_calls_and_results() {
@@ -2980,26 +3058,32 @@ fn sink_failure_drop_and_disable_preserve_calls_and_results() {
     });
 
     let (failing_kernel, _failing_guard) = test_kernel();
-    let failing = capture_with_failing_sink(|| {
+    let (failing_attempts, failing) = capture_with_failing_sink(|| {
         drive(&failing_kernel);
         probe(&failing_kernel)
     });
 
     let (discarding_kernel, _discarding_guard) = test_kernel();
-    let discarding = capture_with_discarding_sink(|| {
+    let (discarding_attempts, discarding) = capture_with_discarding_sink(|| {
         drive(&discarding_kernel);
         probe(&discarding_kernel)
     });
 
     let (disabled_kernel, _disabled_guard) = test_kernel();
-    let disabled = capture_with_disabled_sink(|| {
+    let (disabled_attempts, disabled_dispatchable, disabled) = capture_with_disabled_sink(|| {
         drive(&disabled_kernel);
         probe(&disabled_kernel)
     });
 
     assert_eq!(healthy, failing, "a failing sink must change no result");
-    assert_eq!(healthy, discarding, "a dropping sink must change no result");
-    assert_eq!(healthy, disabled, "a disabled sink must change no result");
+    assert_eq!(
+        healthy, discarding,
+        "a sink that accepts every byte and discards the content must change no result"
+    );
+    assert_eq!(
+        healthy, disabled,
+        "no subscriber at all (an absent subscriber, not a disabled writer) must change no result"
+    );
     // The compared results are the owner's own answers, read field by field so
     // the equality above is a byte-identity claim about production output and not
     // about a diagnostic rendering.
@@ -3037,6 +3121,42 @@ fn sink_failure_drop_and_disable_preserve_calls_and_results() {
     assert!(
         healthy_text.contains(capacity_event),
         "the healthy capture must carry the records"
+    );
+    // PER-ARM SINK PREMISES, MEASURED (the healthy arm's positive above is the
+    // idiom). Without these two, the failing and discarding arms would assert
+    // nothing about their sinks: swapping either helper for `capture_with`
+    // would leave every other assertion in this case untouched, so the
+    // equality above would be a determinism fact about production and not a
+    // fact about a sink that was actually asked. A non-zero attempt count is
+    // what makes those two arms' premises observed rather than inherited from
+    // the healthy arm.
+    assert!(
+        failing_attempts.load(Ordering::Relaxed) > 0,
+        "the failing sink must have been asked to write, and that failure is otherwise unobservable, got {attempts}",
+        attempts = failing_attempts.load(Ordering::Relaxed)
+    );
+    assert!(
+        discarding_attempts.load(Ordering::Relaxed) > 0,
+        "the discarding sink must have been asked to write and have accepted those bytes, got {attempts}",
+        attempts = discarding_attempts.load(Ordering::Relaxed)
+    );
+    // REFUSAL CASE, and the opposite polarity on purpose: `NoSubscriber` makes
+    // `register_callsite` return `Interest::never()`
+    // (`tracing-core-0.1.36/src/subscriber.rs:676-678`), so no event is ever
+    // dispatched and no writer is ever asked. ZERO is therefore the honest
+    // claim for this arm - the writer is not disabled, the subscriber is absent
+    // - and it is the polarity that catches a regression in which a
+    // no-subscriber path starts writing. The second assertion measures why:
+    // the dispatcher itself answers `never` for a real `kernel.*` target.
+    assert_eq!(
+        disabled_attempts.load(Ordering::Relaxed),
+        0,
+        "with no subscriber no writer may be asked at all, got {attempts}",
+        attempts = disabled_attempts.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        disabled_dispatchable, 0,
+        "the `NoSubscriber` dispatcher must report nothing dispatchable for a `kernel.*` target"
     );
     assert_causal_order(
         &healthy_text,
