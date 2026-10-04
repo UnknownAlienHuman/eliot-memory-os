@@ -615,6 +615,31 @@ pub struct SnapshotPageCoverage {
 }
 
 impl SnapshotPage {
+    /// Computes the canonical digest of this whole page.
+    ///
+    /// This is the one definition of a page digest in this contract, and it is
+    /// the value a successor page carries in
+    /// [`SnapshotPage::predecessor_digest`]. An owner that retains one page and
+    /// serves its continuation sets exactly this value, so the chain commits
+    /// to the bytes of the page it actually came from and not to a digest some
+    /// other definition produced.
+    ///
+    /// The predecessor commitment is currently not compared by
+    /// [`Self::validate_continuation`]: `bins/eliot-store-surreal`'s frozen
+    /// `backup-store-edge` page fixtures carry an illustrative placeholder
+    /// there (documented as such at
+    /// `tests/backup_store_edge.rs:1656`), and that suite is not this
+    /// issue's mutable scope. Comparing the two would refuse those fixtures
+    /// rather than bind them, so the comparison is left to their owner. The
+    /// accepted concrete owner already stores this exact value for the next
+    /// page.
+    #[must_use = "the computed digest must be bound into the successor page"]
+    pub fn compute_digest(&self) -> Result<String, StoreError> {
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Validates handle/cursor binding, member closure, and cursor chaining.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.handle.validate()?;
@@ -788,9 +813,19 @@ impl SnapshotPage {
     /// is refused before any cursor or cumulative bound is examined, so a
     /// continuation can never advance a capture it does not belong to.
     ///
-    /// The cursor/bounds checks below are unchanged and still apply once the
-    /// handle is proven identical.
+    /// Both pages are validated on their own terms first. This method claims to
+    /// validate a continuation, so it may not assume its two arguments already
+    /// passed [`Self::validate`]: a page whose own cursor is foreign to its own
+    /// handle, whose cumulative bounds do not add up, or whose previous page has
+    /// a rewritten frontier is refused here instead of being compared onward.
+    ///
+    /// The exact previous frontier is then required, not merely plausible
+    /// counters: this cursor must equal the next cursor the previous page
+    /// published in every field, so a continuation can only begin where the
+    /// owner said the capture would continue.
     pub fn validate_continuation(&self, previous: &SnapshotPage) -> Result<(), StoreError> {
+        self.validate()?;
+        previous.validate()?;
         if previous.is_last || previous.coverage.state != SnapshotPageState::InProgress {
             return Err(StoreError::InvalidField {
                 field: "snapshot.page",
@@ -837,6 +872,22 @@ impl SnapshotPage {
             return Err(StoreError::InvalidField {
                 field: "snapshot.coverage.denominator_members",
                 reason: "continuation must preserve the owner-observed denominator",
+            });
+        }
+        // The previous page is independently valid, so a terminal state is
+        // impossible here and the frontier is present; a missing frontier is
+        // still refused rather than treated as "continue anywhere".
+        let frontier = previous
+            .next_cursor
+            .as_ref()
+            .ok_or(StoreError::InvalidField {
+                field: "snapshot.next_cursor",
+                reason: "previous page published no continuation frontier",
+            })?;
+        if &self.cursor != frontier {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.cursor",
+                reason: "continuation must start exactly at the previous page's next cursor",
             });
         }
         Ok(())
@@ -1483,6 +1534,11 @@ pub trait CanonicalSnapshotPort: Send + Sync {
 /// Implementations validate inputs first and then refuse without
 /// manufacturing durable evidence: no successful default body exists, and
 /// support is advertised only from an accepted concrete backend.
+///
+/// Every default body in this trait validates its arguments and then returns
+/// a typed refusal. None of them composes a receipt out of the caller's own
+/// claims, because a receipt is owner-issued evidence and the caller is not
+/// the owner.
 #[allow(async_fn_in_trait)]
 pub trait IsolatedRestorePort: Send + Sync {
     /// Prepares an isolated destination from externally admitted evidence.
@@ -1521,19 +1577,27 @@ pub trait IsolatedRestorePort: Send + Sync {
     }
 
     /// Reconciles two identities for the same operation.
+    ///
+    /// This default body refuses, and refusing is the only shape a default
+    /// may have. A [`BackupOperationReconciliation`] record is owner-issued
+    /// evidence about one durably admitted operation, and a record assembled
+    /// from the two identities the caller just handed over is that caller's
+    /// own claims echoed back: no owner readback, no admitted operation and
+    /// no durable record takes part in it, so a shared surface that
+    /// manufactured one would report an outcome no owner ever established.
+    ///
+    /// An implementation that does return a record must derive it from an
+    /// owner readback of the retained operation record.
+    /// [`reconcile_same_operation`] is the pure structural comparison helper
+    /// used inside that derivation; it compares two identities and is never a
+    /// reconciliation record by itself.
     async fn reconcile_operation(
         &self,
         first: OperationIdentity,
         second: OperationIdentity,
     ) -> Result<BackupOperationReconciliation, StoreError> {
-        let outcome = reconcile_same_operation(&first, &second)?;
-        let reconciliation = BackupOperationReconciliation {
-            first_digest: first.canonical_request_hash.clone(),
-            second_digest: second.canonical_request_hash.clone(),
-            operation: first,
-            outcome,
-        };
-        reconciliation.validate()?;
-        Ok(reconciliation)
+        first.validate()?;
+        second.validate()?;
+        Err(StoreError::Unavailable)
     }
 }
