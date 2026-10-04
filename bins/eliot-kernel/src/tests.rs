@@ -6106,6 +6106,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             last_request_id: None,
             last_observation_sha256: None,
             last_successor_revision: None,
+            last_renewal_predecessor_revision: None,
+            last_renewal_predecessor_receipt_sha256: None,
             reconciliation_pending: false,
         }
     }
@@ -6123,6 +6125,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             last_request_id: None,
             last_observation_sha256: None,
             last_successor_revision: None,
+            last_renewal_predecessor_revision: None,
+            last_renewal_predecessor_receipt_sha256: None,
             missed_renewals: 0,
             last_eligible_observation_ms: None,
             reconciliation_pending: false,
@@ -6202,6 +6206,13 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
     replayed.last_request_id = progress.last_request_id.clone();
     replayed.last_observation_sha256 = progress.last_observation_sha256.clone();
     replayed.last_successor_revision = progress.last_successor_revision;
+    // Issue #88 A2: the replay must echo the transition that was actually
+    // recorded, so the retained original predecessor identity travels with the
+    // idempotency triple. Without it the join honestly reports
+    // ReconciliationRequired instead of a fabricated ExactReplay.
+    replayed.last_renewal_predecessor_revision = progress.last_renewal_predecessor_revision;
+    replayed.last_renewal_predecessor_receipt_sha256 =
+        progress.last_renewal_predecessor_receipt_sha256.clone();
     let mut replay_progress = progress.clone();
     let replay = KernelComposition::decide_daemon_supervision_progress_renewal(
         &test_request("obs-88-w2-1"),

@@ -1782,7 +1782,8 @@ impl DaemonSupervisionRenewalRequest {
 /// Every field is current authority selected by the Kernel owner: the exact
 /// durable ORS predecessor, lineage identities, boot/session binding, lease
 /// window, per-channel accepted cursors, admitted idle contract, last
-/// monotonic evidence, idempotency record, and reconciliation flag.
+/// monotonic evidence, idempotency record with the retained original renewal
+/// transition identity, and reconciliation flag.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonSupervisionCurrentState {
@@ -1820,6 +1821,22 @@ pub struct DaemonSupervisionCurrentState {
     pub last_observation_sha256: Option<String>,
     /// Successor revision created by the last recorded renewal, if any.
     pub last_successor_revision: Option<u64>,
+    /// Predecessor revision the LAST RECORDED renewal superseded, recovered
+    /// from that transition's recorded submission/receipt state.
+    ///
+    /// It is the original transition identity of the recorded renewal and is
+    /// never derived from the current head: after a committed renewal the head
+    /// already is the recorded successor, so an exact replay must echo the
+    /// predecessor that was actually superseded instead of one reconstructed
+    /// from the head. Absent until a caller records it from its own committed
+    /// transition; absence is reported honestly, never filled in.
+    #[serde(default)]
+    pub last_renewal_predecessor_revision: Option<u64>,
+    /// Predecessor receipt digest the LAST RECORDED renewal superseded, from
+    /// the same recorded transition and under the same never-derived-from-the-
+    /// current-head rule as `last_renewal_predecessor_revision`.
+    #[serde(default)]
+    pub last_renewal_predecessor_receipt_sha256: Option<String>,
     /// True while an unknown ORS/live-receipt publication outcome is still
     /// unreconciled; blocks every new successor until exact reconciliation.
     pub reconciliation_pending: bool,
@@ -1912,6 +1929,48 @@ impl DaemonSupervisionCurrentState {
                 "current: recorded successor requires a recorded request identity",
             ));
         }
+        self.validate_retained_renewal_predecessor()?;
+        Ok(())
+    }
+
+    /// Validates the retained original transition identity of the last recorded
+    /// renewal, kept separate so the head/identity rules stay readable.
+    ///
+    /// The pair is absent until a caller records it. Once present it is strict:
+    /// revision and digest are paired, the revision is non-zero, the digest is
+    /// well formed, and a recorded successor stays exactly one past the RETAINED
+    /// predecessor — never one past the current head, which after a committed
+    /// renewal already is that successor.
+    fn validate_retained_renewal_predecessor(&self) -> Result<(), DaemonSupervisionHeartbeatError> {
+        match (
+            self.last_renewal_predecessor_revision,
+            self.last_renewal_predecessor_receipt_sha256.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(revision), Some(digest)) => {
+                if revision == 0 {
+                    return Err(heartbeat_shape(
+                        "current.last_renewal_predecessor_revision: must be greater than zero",
+                    ));
+                }
+                heartbeat_digest(digest, "current.last_renewal_predecessor_receipt_sha256")?;
+                if let Some(successor) = self.last_successor_revision {
+                    let expected = revision.checked_add(1).ok_or_else(|| {
+                        heartbeat_shape("current.last_renewal_predecessor_revision: overflows")
+                    })?;
+                    if successor != expected {
+                        return Err(heartbeat_shape(
+                            "current: successor must be one past the retained predecessor",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(heartbeat_shape(
+                    "current: retained predecessor revision and digest must be paired",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1985,7 +2044,8 @@ impl DaemonSupervisionRenewalPolicy {
 pub enum DaemonSupervisionRenewalOutcome {
     /// Exactly one successor revision is admitted.
     Renewed,
-    /// Exact replay of a recorded request; no new transition.
+    /// Exact replay of a recorded request; no new transition. Echoes the
+    /// retained original predecessor identity of the last recorded renewal.
     ExactReplay,
     /// Genuine observation before the renewal deadline; no transition.
     NotDue,
@@ -2271,6 +2331,29 @@ fn renewal_decision(
     }
 }
 
+/// Builds the exact-replay decision from the retained ORIGINAL predecessor
+/// identity of the last recorded renewal.
+///
+/// A committed renewal leaves the current head at the recorded successor, so a
+/// decision built from that head reports the successor as its own predecessor.
+/// A replay must instead echo the transition that was actually recorded; the
+/// caller supplies that retained identity and this join never reconstructs it.
+fn exact_replay_decision(
+    request: &DaemonSupervisionRenewalRequest,
+    predecessor_revision: u64,
+    predecessor_receipt_sha256: &str,
+    successor_revision: Option<u64>,
+) -> DaemonSupervisionRenewalDecision {
+    DaemonSupervisionRenewalDecision {
+        request_id: request.request_id.clone(),
+        lease_id: request.observation.lease_id.clone(),
+        outcome: DaemonSupervisionRenewalOutcome::ExactReplay,
+        predecessor_revision,
+        successor_revision,
+        predecessor_receipt_sha256: predecessor_receipt_sha256.to_owned(),
+    }
+}
+
 /// Pure renewal join: decides one heartbeat request against exact current state.
 ///
 /// `now_ms` is the injected Kernel clock (milliseconds); this function
@@ -2287,6 +2370,15 @@ fn renewal_decision(
 /// `NO_PROGRESS` disposition with no cursor evidence) is refused with
 /// [`DaemonSupervisionHeartbeatError::ProgressEvidenceInsufficient`]: Store
 /// health polling can never silently renew supervision authority.
+///
+/// An exact replay is answered from the retained original predecessor identity
+/// of the last recorded renewal, because a committed renewal leaves the
+/// current head at the recorded successor. When that retained identity is
+/// absent, the join reports [`DaemonSupervisionRenewalOutcome::ReconciliationRequired`]
+/// so the caller completes that same publication from recorded
+/// submission/receipt state; it never reconstructs a predecessor from the
+/// current head and never relabels a recorded request as
+/// [`DaemonSupervisionRenewalOutcome::NotDue`].
 #[allow(
     clippy::too_many_lines,
     reason = "renewal join must evaluate the full ordered refusal taxonomy in one pure function"
@@ -2308,10 +2400,21 @@ pub fn evaluate_daemon_supervision_renewal(
 
     if current.last_request_id.as_deref() == Some(request.request_id.as_str()) {
         if current.last_observation_sha256.as_deref() == Some(observation_sha256.as_str()) {
-            return Ok(renewal_decision(
+            let (Some(predecessor_revision), Some(predecessor_receipt_sha256)) = (
+                current.last_renewal_predecessor_revision,
+                current.last_renewal_predecessor_receipt_sha256.as_deref(),
+            ) else {
+                return Ok(renewal_decision(
+                    request,
+                    current,
+                    DaemonSupervisionRenewalOutcome::ReconciliationRequired,
+                    None,
+                ));
+            };
+            return Ok(exact_replay_decision(
                 request,
-                current,
-                DaemonSupervisionRenewalOutcome::ExactReplay,
+                predecessor_revision,
+                predecessor_receipt_sha256,
                 current.last_successor_revision,
             ));
         }
@@ -2587,6 +2690,8 @@ mod daemon_heartbeat_tests {
             last_request_id: None,
             last_observation_sha256: None,
             last_successor_revision: None,
+            last_renewal_predecessor_revision: None,
+            last_renewal_predecessor_receipt_sha256: None,
             reconciliation_pending: false,
         }
     }
@@ -2653,19 +2758,93 @@ mod daemon_heartbeat_tests {
         );
     }
 
+    /// Returns the current state after a committed `7 -> 8` renewal: the head
+    /// already is the recorded successor, and the original predecessor identity
+    /// of that transition is retained separately from the head.
+    fn committed_after_renewal() -> DaemonSupervisionCurrentState {
+        let observation_sha256 = observation().digest().expect("observation digest");
+        let mut committed = current();
+        committed.predecessor.lease_revision = 8;
+        committed.predecessor.receipt_sha256 = digest('8');
+        committed.last_request_id = Some("obs-1".to_owned());
+        committed.last_observation_sha256 = Some(observation_sha256);
+        committed.last_successor_revision = Some(8);
+        committed.last_renewal_predecessor_revision = Some(7);
+        committed.last_renewal_predecessor_receipt_sha256 = Some(digest('d'));
+        committed
+    }
+
     #[test]
     fn exact_replay_echoes_the_recorded_successor() {
-        let observation_sha256 = observation().digest().expect("observation digest");
-        let mut current = current();
-        current.last_request_id = Some("obs-1".to_owned());
-        current.last_observation_sha256 = Some(observation_sha256);
-        current.last_successor_revision = Some(8);
-        let decision = decide(&request(), &current, &policy(), DUE_NOW_MS).expect("exact replay");
+        // Issue #88 A2: after a committed `7 -> 8` the head is 8, so a replay
+        // built from the head would report predecessor = successor = 8 and fail
+        // its own validator. The join must echo the retained original
+        // predecessor, and `decide` proves the result still validates.
+        let committed = committed_after_renewal();
+        let decision = decide(&request(), &committed, &policy(), DUE_NOW_MS).expect("exact replay");
         assert_eq!(
             decision.outcome,
             DaemonSupervisionRenewalOutcome::ExactReplay
         );
+        assert_eq!(decision.predecessor_revision, 7);
         assert_eq!(decision.successor_revision, Some(8));
+        assert_eq!(decision.predecessor_receipt_sha256, digest('d'));
+    }
+
+    #[test]
+    fn replay_without_the_retained_predecessor_reconciles_and_never_fabricates() {
+        // The head cannot prove the original predecessor: decrementing it would
+        // recreate the transition semantically. The replay stays a decision the
+        // caller can publish, reporting the typed reconciliation outcome with no
+        // successor rather than a fabricated predecessor or a `NOT_DUE` relabel.
+        let mut committed = committed_after_renewal();
+        committed.last_renewal_predecessor_revision = None;
+        committed.last_renewal_predecessor_receipt_sha256 = None;
+        let decision =
+            decide(&request(), &committed, &policy(), DUE_NOW_MS).expect("reconcile the replay");
+        assert_eq!(
+            decision.outcome,
+            DaemonSupervisionRenewalOutcome::ReconciliationRequired
+        );
+        assert_eq!(decision.successor_revision, None);
+        assert_eq!(decision.predecessor_revision, 8);
+    }
+
+    #[test]
+    fn retained_renewal_predecessor_is_strict_and_backward_compatible() {
+        committed_after_renewal()
+            .validate()
+            .expect("retained predecessor pair is coherent");
+
+        let mut unpaired = committed_after_renewal();
+        unpaired.last_renewal_predecessor_receipt_sha256 = None;
+        assert!(unpaired.validate().is_err());
+
+        let mut zero = committed_after_renewal();
+        zero.last_renewal_predecessor_revision = Some(0);
+        assert!(zero.validate().is_err());
+
+        let mut malformed = committed_after_renewal();
+        malformed.last_renewal_predecessor_receipt_sha256 = Some("not-a-digest".to_owned());
+        assert!(malformed.validate().is_err());
+
+        // A recorded successor stays exactly one past the retained predecessor;
+        // the advanced head is never accepted in its place.
+        let mut head_substituted = committed_after_renewal();
+        head_substituted.last_renewal_predecessor_revision = Some(6);
+        assert!(head_substituted.validate().is_err());
+
+        // Recorded state written before this retained identity existed still
+        // decodes; the absent pair stays honest absence.
+        let mut value =
+            serde_json::to_value(committed_after_renewal()).expect("current state value");
+        let object = value.as_object_mut().expect("current state object");
+        object.remove("last_renewal_predecessor_revision");
+        object.remove("last_renewal_predecessor_receipt_sha256");
+        let decoded: DaemonSupervisionCurrentState =
+            serde_json::from_value(value).expect("state without the retained pair decodes");
+        assert_eq!(decoded.last_renewal_predecessor_revision, None);
+        assert_eq!(decoded.last_renewal_predecessor_receipt_sha256, None);
     }
 
     #[test]

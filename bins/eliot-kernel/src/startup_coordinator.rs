@@ -1088,9 +1088,19 @@ impl StartupCoordinator {
     /// observation that produced it is retained as history rather than dropped.
     /// The progress frontier is deliberately not reset: it counts independent
     /// physical observations accepted by this Kernel, not observations of one
-    /// contour. Callers use this at the one owner-correct moment a new
-    /// candidate contour is admitted (I1.5), because the previous observation
-    /// belonged to the previous activation.
+    /// contour. There are two owner-correct moments for this, and only two.
+    ///
+    /// First, when a new candidate contour is admitted (I1.5), because the
+    /// previous observation belonged to the previous activation.
+    ///
+    /// Second, when the supervision lease reaches its expiry without a proved
+    /// renewal (I1.5: "If renewal cannot be proved, coverage ends at expiry and
+    /// is reported honestly"). Independent coverage ended there, so continuing
+    /// to publish a Profile that claims it would report dishonestly; the
+    /// Governance Profile's Supervision axis must fall back to what the
+    /// remaining evidence actually supports (A7.7: a claim is no stronger than
+    /// its weakest relevant axis). Only a new Host-observed Watchdog branch can
+    /// re-establish it.
     pub fn revoke_supervision_evidence(&mut self) {
         self.supervision_evidence_complete = false;
         if let Some(previous) = self.current_supervision_observation.take() {

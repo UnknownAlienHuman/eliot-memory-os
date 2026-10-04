@@ -165,7 +165,10 @@ registry checksum where applicable. A missing lock does not trigger lock
 generation or metadata resolution. Missing tools, metadata errors, malformed
 or ambiguous joins, and identity mismatches remain
 `source_only_incomplete`; missing or malformed identity records are counted as
-incomplete as well. The current ten non-member manifests each declare an
+incomplete as well. The current non-member production manifests are discovered
+by `scripts/verify-standalone-crates.py` and recorded in
+`workstreams/security/standalone-crate-dispositions.toml`; testdata and fixture
+workspaces are outside that denominator. These manifests each declare an
 independent `[workspace]` and have no adjacent checked-in `Cargo.lock`, so they
 remain incomplete and the Rust denominator remains `incomplete`. Only a
 successful declaration-to-resolver-to-lock join clears an individual edge's
