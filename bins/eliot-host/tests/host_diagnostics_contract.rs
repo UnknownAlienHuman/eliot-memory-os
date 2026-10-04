@@ -102,13 +102,12 @@ fn write_protocol_frame(buffer: &mut Vec<u8>, value: &Value) -> bool {
 /// (src/host_diagnostics.rs:349-355), which fails whenever ANY global subscriber
 /// already holds the slot -- including one that a `with_default` scope installed,
 /// because `set_default` publishes a THREAD-LOCAL default (the repo documents
-/// this at crates/kernel/eliot-kernel/src/tests/process_supervision_identity.rs
-/// :113). So whether the single attempt can win that slot is a fact about what
-/// else was already running, not about the facade. The honest reachable set is
-/// therefore read out of the facade's own typed answers below rather than
-/// demanded: a facade that claimed the install must have taken the slot
-/// (`Ok`), and one that found it already taken must report the typed degraded
-/// answer, never `Ok`.
+/// this at bins/eliot-kernel/src/tests/process_supervision_identity.rs:113). So
+/// whether the single attempt can win that slot is a fact about what else was
+/// already running, not about the facade. The honest reachable set is therefore
+/// read out of the facade's own typed answers below rather than demanded: a
+/// facade that claimed the install must have taken the slot (`Ok`), and one that
+/// found it already taken must report the typed degraded answer, never `Ok`.
 ///
 /// The repeat refusal is decided from that first observed outcome, exactly as
 /// `install_host_diagnostics` itself decides it (`SubscriberSetup::
@@ -6211,18 +6210,18 @@ fn assert_the_concurrent_sweep_is_accounted_exactly() -> (u64, u64) {
 /// the emissions it is bounding.
 const SWEEP_RECORDS_PER_ITERATION: usize = 4;
 
-/// The fifth record of the sweep: `note_event_log_sink_status` publishes it
-/// only where the Event Log sink cannot carry a record, so the sweep's byte
-/// budget admits it only where `event_log_sink_status` agrees that the sink is
-/// unavailable. Read through the product's own answer rather than through this
-/// platform's name, so the budget tracks the emissions the sweep really makes.
-fn the_sweep_sink_unavailable_record_name() -> &'static str {
-    if event_log_sink_status().is_ok() {
-        "no record: the sink carries what this sweep submits"
-    } else {
-        "host.event_log_sink_unavailable"
-    }
-}
+/// The PRODUCT'S OWN sink-unavailability record name, as the `fmt` layer
+/// writes it: a dotted identifier carries no quoting trigger, and this file's
+/// established idiom for counting a product record by name is the quoted
+/// `event="..."` field form used for `host.request` (line 957) and
+/// `host.event_log_admission` (lines 980, 987). Matching the FIELD, not a bare
+/// substring, means the needle cannot be satisfied by the same text appearing
+/// in an unrelated free-text payload value. This string is emitted by the
+/// product at src/host_diagnostics.rs:637 (`event = "host.event_log_sink_
+/// unavailable"` inside `note_event_log_sink_status`), so a product that grew
+/// or removed that record changes the count below and turns the live-port arm
+/// red.
+const SWEEP_SINK_UNAVAILABLE_EVENT_FIELD: &str = "event=\"host.event_log_sink_unavailable\"";
 
 /// Every sweep iteration produced exactly one stage record and one terminal
 /// record, and the whole formatted output stayed within the product's own
@@ -6254,22 +6253,32 @@ fn assert_the_sweep_emitted_exactly_one_record_per_iteration(
     // own sink answer says this platform really publishes it: a sweep that grew
     // a sink-status record per iteration where the sink is live would fail here
     // rather than quietly growing inside the byte budget.
-    let sink_unavailable_name = the_sweep_sink_unavailable_record_name();
+    //
+    // BOTH branches now name the SAME PRODUCT RECORD -- matched as its
+    // `event="..."` field -- and differ only in the count the product's own
+    // answer requires. The branch decision comes from `event_log_sink_status()`
+    // directly rather than being smuggled inside a helper's return string, so
+    // the live-port arm can now FAIL: a product that started emitting (or
+    // stopped suppressing) `host.event_log_sink_unavailable` where the port is
+    // live turns this count red, which the old self-invented prose needle could
+    // never do.
     let mut records_per_iteration = SWEEP_RECORDS_PER_ITERATION;
-    if sink_unavailable_name == "host.event_log_sink_unavailable" {
+    if event_log_sink_status().is_err() {
         assert_eq!(
-            rendered.matches(sink_unavailable_name).count(),
+            rendered.matches(SWEEP_SINK_UNAVAILABLE_EVENT_FIELD).count(),
             expected_records,
-            "with no live Event Log port every sweep iteration must have emitted exactly one sink \
-             status record"
+            "with no live Event Log port every sweep iteration must have emitted exactly one \
+             {} record",
+            SWEEP_SINK_UNAVAILABLE_EVENT_FIELD
         );
         records_per_iteration = records_per_iteration.saturating_add(1);
     } else {
         assert_eq!(
-            rendered.matches(sink_unavailable_name).count(),
+            rendered.matches(SWEEP_SINK_UNAVAILABLE_EVENT_FIELD).count(),
             0,
-            "a live Event Log port publishes nothing to note, so the sweep must have emitted no \
-             sink status record at all"
+            "a live Event Log port publishes nothing to note, so the sweep must have emitted no {} \
+             record at all",
+            SWEEP_SINK_UNAVAILABLE_EVENT_FIELD
         );
     }
     let budget = expected_records
@@ -6319,12 +6328,27 @@ fn assert_the_sweep_reached_the_event_log_seam_exactly_once_per_iteration(
 /// then shuts it down (through `shutdown_event_log_producer`) before the sweep
 /// runs, so every swept admission is a refusal; but WHICH refusal depends on what
 /// the single product worker was doing when each sweep thread submitted, and that
-/// is a fact about the worker, not about this sweep. The worker has not been
-/// started yet by any other case at that point, so an `Admitted` outcome is not
-/// reachable here -- and the first arm below proves it is not, rather than
-/// assuming it. The `Admitted` arm of the accounting is nonetheless counted as a
-/// first-class outcome, so the sweep is accounted for by EXACTLY ONE typed
-/// outcome per submission however the product really answered.
+/// is a fact about the worker, not about this sweep.
+///
+/// WHY `Admitted` IS UNREACHABLE HERE -- the real reason, so a future reader
+/// cannot be misled into thinking the shutdown call is optional. It is NOT
+/// "the worker was never started": the worker HAS been started, by this very case
+/// through `capture_the_producer_start_record` before the shutdown. The reason is
+/// the WRITE-ONCE shutdown state. `shutdown_event_log_producer` stores `true`
+/// into `EVENT_LOG_SHUTDOWN_REQUESTED` (src/windows_event_log.rs:955) and into
+/// `state.shutdown` (src/windows_event_log.rs:964), and NEITHER is ever cleared
+/// anywhere in the product; `EVENT_LOG_PRODUCER` is a `OnceLock` that is set once
+/// and never reset. `try_admit_admitted_event` checks those flags at its FIRST
+/// test (src/windows_event_log.rs:873) and returns `RejectedShutdown` before it
+/// can ever reach the queue. Because the flags are permanently closed once this
+/// case calls shutdown, an `Admitted` outcome is not reachable here -- and the
+/// first arm below proves it is not, rather than assuming it. Deleting the
+/// shutdown call would reopen the queue and make that arm reachable, so the
+/// shutdown call is load-bearing for `assert_eq!(admitted, 0)` below.
+///
+/// The `Admitted` arm of the accounting is nonetheless counted as a first-class
+/// outcome, so the sweep is accounted for by EXACTLY ONE typed outcome per
+/// submission however the product really answered.
 ///
 /// Returns the HIGHEST drop total any swept admission published, which the
 /// caller compares its post-shutdown counter against.
@@ -6407,15 +6431,21 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
         "every sweep submission must be accounted for by exactly one typed outcome: admitted into \
          the queue, refused as worker-unavailable, or refused as shut down"
     );
-    // The `Admitted` arm is counted honestly above, and on THIS platform it must
-    // be unreachable rather than merely tolerated: no test has started the single
-    // product worker before this sweep, and the producer is closed before it
-    // runs, so a swept admission that reached the queue would mean a worker this
-    // suite never started -- a product that spawned one on demand.
+    // The `Admitted` arm is counted honestly above, and it must be unreachable
+    // here rather than merely tolerated -- because the WRITE-ONCE shutdown state
+    // makes it so, NOT because no worker was ever started (this very case
+    // started one, through `capture_the_producer_start_record`). The producer is
+    // CLOSED before this sweep runs, and its two shutdown flags are never
+    // cleared afterwards, so `try_admit_admitted_event` refuses at its first
+    // check (src/windows_event_log.rs:873) and no swept admission can reach the
+    // queue. This assertion is what would catch a product that reopened the
+    // queue, so deleting the shutdown call above would make it fail -- that call
+    // is load-bearing here, not incidental.
     assert_eq!(
         admitted, 0,
-        "no producer worker exists when this sweep runs, so every swept admission must be a typed \
-         refusal: an admitted record means a worker was started that this suite never started"
+        "the producer's shutdown flags are write-once and already set before this sweep, so \
+         every swept admission must be a typed refusal: an admitted record means the product \
+         reopened a queue this suite had already closed"
     );
     assert!(
         worker_refusals + shutdown_refusals == submissions,
@@ -6449,14 +6479,23 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
     highest_drops
 }
 
-/// THE SINGLE WORKER, observed rather than asserted. While the producer runs,
-/// its delivery records reach the diagnostic stream on the thread that delivers
-/// them, so the distinct thread ids in that stream ARE the threads the product
-/// created while delivering this sweep's records.
+/// THE SINGLE WORKER, observed rather than asserted -- and, where the port is
+/// live, observed only as far as this thread-local scope can actually see.
+///
+/// This sweep installs its layers with `tracing::subscriber::with_default`,
+/// which publishes a THREAD-LOCAL default that does not reach the product's
+/// Event Log worker thread. The product's delivery record is emitted FROM that
+/// worker, so it never appears in this capture; the arms below therefore
+/// assert what IS observable here -- that the caller-side capture carries no
+/// delivery-named record, and that the two delivery-named observers over this
+/// same scope agree -- and the single-worker BOUND itself is asserted
+/// unconditionally from the product's own spawn sites by
+/// [`assert_the_wrapper_spawns_exactly_one_named_worker`]. See the live-port
+/// arm below for why the delivery record cannot be observed from here.
 ///
 /// `captured` is the sweep's own record set and `observing_ids` the ids the
-/// sweep's observing layer collected, so the two sides are INDEPENDENTLY
-/// observed and their equality is a real one.
+/// sweep's observing layer collected, so the two sides are filled
+/// independently and their equality is a real one.
 fn assert_delivery_reached_one_product_thread(
     captured: &[CapturedRecord],
     observing_threads: &Arc<Mutex<Vec<std::thread::ThreadId>>>,
@@ -6477,36 +6516,58 @@ fn assert_delivery_reached_one_product_thread(
     let observing_ids: std::collections::HashSet<std::thread::ThreadId> =
         observing_threads.lock().unwrap().iter().copied().collect();
     if event_log_sink_status().is_ok() {
+        // WHY THE DELIVERY RECORD IS NOT OBSERVABLE FROM HERE, so this arm
+        // asserts what CAN be seen instead of a record it can never see. The
+        // product emits its `host.event_log_delivery` record from the Event Log
+        // WORKER thread (src/windows_event_log.rs:1064-1072). `captured` is the
+        // sweep's THREAD-LOCAL `RecordingLayer`, installed by
+        // `tracing::subscriber::with_default`; that publishes a thread-local
+        // default only and does NOT propagate it to threads spawned inside the
+        // block -- the vendored tracing-core `dispatcher.rs` states verbatim:
+        // "with_default will not propagate the current thread's default
+        // subscriber to any threads spawned within the with_default block". A
+        // worker thread with no local default falls back to `get_global()`,
+        // which this sweep never set, so the delivery record physically CANNOT
+        // reach `delivery_records` from the worker. A non-empty requirement here
+        // would therefore be deterministically RED on precisely the platform
+        // whose delivery this arm is about. Nothing can observe that record from
+        // this thread-local scope, so the requirement is dropped rather than
+        // faked.
+        //
+        // WHAT IS OBSERVABLE AND NON-VACUOUS remains: (a) the caller-side
+        // capture must contain NO delivery-named record, because a delivery
+        // record visible HERE would mean the product emitted it on a thread that
+        // DID inherit the capture -- claiming a delivery without dispatching it
+        // through its own worker; and (b) the single-worker bound itself is
+        // asserted unconditionally elsewhere in this case by
+        // `assert_the_wrapper_spawns_exactly_one_named_worker`, which reads the
+        // product's spawn sites directly. Together those still fail a product
+        // that grew a second worker or that claimed delivery off its worker.
         assert!(
-            !delivery_records.is_empty(),
-            "a live Event Log port means every admitted record was delivered, so the sweep must \
-             have observed the product's own delivery records"
-        );
-        assert_eq!(
-            distinct_threads.len(),
-            1,
-            "delivery must happen on ONE product thread however many records the sweep admitted; \
-             observed {distinct_threads:?}"
+            delivery_records.is_empty(),
+            "the delivery record is emitted on the product's own worker thread, which cannot see \
+             this thread-local capture, so a delivery-named record must never appear among the \
+             sweep's caller-side records -- got {:?}. A record here means the product claimed a \
+             delivery WITHOUT dispatching it through its own worker",
+            delivery_records
+                .iter()
+                .map(|record| record.event.as_str())
+                .collect::<Vec<_>>()
         );
         // `HashSet` implements `Index` never -- only `HashMap` does -- so the
-        // single member is taken by iteration. The `len() == 1` assertion above
-        // has already proved there is exactly one, so this cannot miss.
-        let delivering_thread = distinct_threads
-            .iter()
-            .next()
-            .expect("the len() == 1 assertion above already proved the set has a member");
-        assert_ne!(
-            *delivering_thread,
-            std::thread::current().id(),
-            "the delivering thread must be the product's own worker, never the caller's thread"
-        );
+        // sets are compared directly rather than sorted. Both sides are captured
+        // from the SAME thread-local scope over the SAME delivery-named events,
+        // so they must observe the same emitting threads: a disagreement means
+        // one side saw a delivery-named event the other did not, which is
+        // exactly the "claimed a delivery without its own worker" case caught
+        // above, restated as an equality over two independently filled sets.
         assert_eq!(
             observing_ids, distinct_threads,
-            "the threads that emitted the product's delivery records are the same threads this \
-             layer observed, never a second set: a per-record worker would show up here. The \
-             comparison is over the two INDEPENDENTLY observed sets, so it is a real equality; \
-             re-collecting `observing_ids` into a `HashSet` of its own would only have compared \
-             a value with itself, and is deliberately absent"
+            "both sides are captured from the same thread-local scope and watch the same \
+             delivery-named events, so they must observe the same emitting threads; a difference \
+             means one side saw a delivery-named event the other did not. Re-collecting \
+             `observing_ids` into a `HashSet` of its own would only have compared a value with \
+             itself, and is deliberately absent"
         );
     } else {
         assert!(
