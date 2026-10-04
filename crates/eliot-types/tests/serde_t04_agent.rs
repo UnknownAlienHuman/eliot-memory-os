@@ -3964,6 +3964,15 @@ fn c12_observe_alias_and_helper_default_are_recorded_non_clean_not_passes() {
     // for exactly that reason - zero lines above any declaration move - so these
     // three coordinates are unchanged from `main` and the recorded-versus-measured
     // delta is zero, not three and two.)
+    //
+    // AND THE RE-MEASUREMENT IS NOW RE-MEASURED, because the first delivery of that
+    // sentence was itself wrong in the very next line: it replaced the helper's true
+    // coordinates `:476-478` with `:506-508`, and `mcp_contract.rs:506-508` is
+    // `ToolInputErrorData`'s `code`/`missing` fields, not the helper. A coordinate
+    // correction that is not itself checked against the file is not a correction, and
+    // the general rule this file already states elsewhere applies here as well: print
+    // the bytes rather than reasoning about where a line ought to be. `274`, `418` and
+    // `465` were verified again in this pass and are correct; the helper is at `:476`.
 
     // ============================== WORDS FIRST =============================
     // The THREE paths exercised below are KNOWN NON-CLEAN. They are recorded here as
@@ -3991,7 +4000,7 @@ fn c12_observe_alias_and_helper_default_are_recorded_non_clean_not_passes() {
     //    `owner = "#692"`, `repair_child = "#933"`) with `eliot-app` coordinating.
     // 2. `ObserveInput.schema_version` carries the helper default
     //    `default = "default_observe_schema_version"` (`mcp_contract.rs:472-473`,
-    //    helper at `:506-508`),
+    //    helper at `:476-478`),
     //    so an OMITTED key is silently promoted to the current version. The version
     //    IS enforced later by `dispatch_observe`, outside this crate's file scope;
     //    making the key required would move the published `eliot.observe`
