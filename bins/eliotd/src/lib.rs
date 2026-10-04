@@ -4461,7 +4461,14 @@ impl DaemonComposition {
     /// The daemon never infers a workspace from cwd, proximity, or recency, and
     /// never mints a receipt of its own: `ScopeAttachIngress` is the only
     /// accepted input and its `receipt_ref` is a reference the Governor binds,
-    /// not an authority the daemon asserts.
+    /// not an authority the daemon asserts. The governing sources that
+    /// authenticate the observed instance are admitted here through
+    /// [`eliot_governor::GovernorComposition::admit_governing_sources_for_scope`]
+    /// from the ingress's exact `SourceAdmissionRequest`: only the admitted set
+    /// it returns reaches the rebind, an admission made at another Kernel fence
+    /// or carrying an unresolved conflict fails the attach closed with the owner
+    /// who must resolve it, and the ingress no longer carries a source set at
+    /// all.
     ///
     /// # Not yet reached (issue #1929)
     ///
@@ -4472,8 +4479,8 @@ impl DaemonComposition {
     /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
     ///   fails closed unless a `WorkScope` owner is already retained, and this
     ///   method is the only daemon path that installs one;
-    /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
-    ///   no authenticated authorization reference, so three of the nine
+    /// - the daemon holds no `WorkScopeDescriptor`, no governing-source
+    ///   admission, and no authenticated authorization reference, so those
     ///   `ScopeAttachIngress` fields would have to be fabricated;
     /// - the daemon knows only its own config and state directories, which are
     ///   not a user `WorkScope`. Attaching one of them as a scope would create
@@ -4503,6 +4510,37 @@ impl DaemonComposition {
             ingress.explicit_root.as_path(),
             &fence,
         )?;
+        // The governing sources that authenticate the observed instance are
+        // admitted here, not taken from the ingress: the Governor entry runs the
+        // admission (candidates from authenticated roots or a valid discovery
+        // lease, applicable authority claims, declared precedences, proven
+        // bindings/contracts) and enforces its fence, expiry and admitted
+        // authority before anything binds. An admission that does not hold at
+        // the live fence, or that names an unresolved conflict, fails the
+        // attach closed with the owner who must resolve it — no caller-supplied
+        // source set can reach a `WorkScope` binding.
+        let admission =
+            GovernorComposition::<dyn KernelGenerationPort>::admit_governing_sources_for_scope(
+                ingress.source_admission.clone(),
+                unix_ms(),
+            )?;
+        if admission.state_fence != fence {
+            return Err(DaemonError::TaskBinding(
+                task_binding_admission::TaskBindingError::scope_incompatible(
+                    "governing-source admission was admitted at another Kernel fence",
+                ),
+            ));
+        }
+        if let Some(conflict) = &admission.conflict {
+            return Err(DaemonError::TaskBinding(
+                task_binding_admission::TaskBindingError::selection_required(format!(
+                    "governing sources are conflicted for scope {} and await owner {}: {}",
+                    conflict.scope_ref,
+                    conflict.required_owner_ref,
+                    conflict.conflicting_refs.join(", ")
+                )),
+            ));
+        }
         let (receipt, owner) = self.governor.admit_observed_scope_attach(
             ingress.receipt_ref.as_str(),
             &observed,
@@ -4510,7 +4548,7 @@ impl DaemonComposition {
             ingress.authorizing_ref.as_str(),
             ingress.privacy_class,
             ingress.governing_source_generation,
-            &ingress.sources,
+            &admission.admitted,
             &ingress.privacy,
             ingress.owner_revision,
         )?;
@@ -4519,6 +4557,62 @@ impl DaemonComposition {
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
         Ok((receipt, snapshot))
+    }
+
+    /// Promotes one task-intake candidate through its owner or proven
+    /// delegation (issue #1791, intake-promotion production caller).
+    ///
+    /// The daemon owns exactly one step: it reads the scope's retained terminal
+    /// readiness receipt through the Governor owner
+    /// ([`eliot_governor::GovernorComposition::current_task_selection_for_claim`],
+    /// which validates the full claim, the durable terminal and the live fence)
+    /// and hands that owner-proven `task_binding` to
+    /// [`eliot_governor::GovernorComposition::promote_task_intake`] together with
+    /// the authenticated owner reference and any delegating binding the
+    /// transport presented. The daemon never edits the candidate, never reads a
+    /// task identity from it, and never derives the delegating task from a
+    /// caller field: the delegation is proven against the retained current
+    /// binding or refused.
+    ///
+    /// The returned [`eliot_workscope::TaskBindingInput`] carries the admitting
+    /// decision owner (or delegating binding) as `selection_source_ref` and the
+    /// exact intake as `evidence_ref`, so the bind path compares owner evidence
+    /// instead of request-supplied structure. A refused promotion is a typed
+    /// `TASK_SELECTION_REQUIRED`: host-visible prompt text, imported text and
+    /// agent proposals never become a current task through this path.
+    ///
+    /// # Live status
+    ///
+    /// `caller: STITCH` — the explicit task-intake transport (UI/bridge
+    /// first-open or intake request) that would supply the authenticated owner
+    /// reference and the full readiness claim is still to be built. The
+    /// admission, provenance and delegation legs themselves run here.
+    pub fn admit_task_intake(
+        &self,
+        ingress: &task_binding_admission::TaskIntakeIngress,
+    ) -> Result<eliot_workscope::TaskBindingInput, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        ingress.validate()?;
+        let (_activation, receipt) = self
+            .governor
+            .current_task_selection_for_claim(unix_ms(), &ingress.readiness_claim)?;
+        let parent = receipt.task_binding.clone();
+        let basis = ingress.authority_basis(&parent)?;
+        GovernorComposition::<dyn KernelGenerationPort>::promote_task_intake(
+            &ingress.candidate,
+            &basis,
+            &parent,
+            ingress.task_revision,
+        )
+        .map_err(|error| {
+            DaemonError::TaskBinding(
+                task_binding_admission::TaskBindingError::selection_required(format!(
+                    "task intake promotion withheld: {error}"
+                )),
+            )
+        })
     }
 
     /// Resolves the current, applicable task selection for admission from the
