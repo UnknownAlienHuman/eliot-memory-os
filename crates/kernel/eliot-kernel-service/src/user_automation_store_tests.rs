@@ -960,3 +960,180 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
         "status on unknown automation must fail"
     );
 }
+
+/// End-to-end owner proof for the real production normalization route.
+///
+/// Drives `normalize_user_automation_operation` with a `NormalizeSchedule`
+/// draft whose requested wall clock (`2026-03-08T02:30:00` in
+/// `America/New_York`) does not exist: it falls in the one-hour DST gap. The
+/// owner, not this test, resolves it through the pinned zone table, so the
+/// returned revision must carry the exact ten-field V4 occurrence record with
+/// the gap disposition and the exact one-hour shift, plus a normalization
+/// receipt that is no longer the unissued draft projection.
+#[test]
+fn normalize_schedule_returns_owner_issued_gap_shift_revision() {
+    use eliot_kernel_core::user_automation::{
+        DstFoldPolicy, DstGapPolicy, PINNED_ZONE_DATABASE_REVISION, ScheduleNormalizationReceipt,
+    };
+
+    // A pending Edit-style revision: a new immutable revision id that
+    // supersedes the previous one. Its schedule carries the owner-output slots
+    // empty and unissued, exactly as the accepted compiler requires, and its
+    // WorkScope names the same product as the authenticated request metadata
+    // because the owner binds both into one receipt core.
+    let mut draft = valid_revision(
+        "auto-normalize-gap",
+        "r-2",
+        UserAutomationConfigurationState::Active,
+    );
+    draft.supersedes = Some("r-1".to_owned());
+    draft.work_scope.product_id = "product-automation".to_owned();
+    draft.schedule = NormalizedSchedule {
+        kind: ScheduleKind::OneShot,
+        expression: "local:2026-03-08T02:30:00".to_owned(),
+        calendar: "gregorian-local".to_owned(),
+        timezone: "America/New_York".to_owned(),
+        dst_fold: DstFoldPolicy::First,
+        dst_gap: DstGapPolicy::ShiftForward,
+        start_at: "2026-03-08T00:00:00Z".to_owned(),
+        end_at: None,
+        next_occurrences: Vec::new(),
+        normalization_receipt: Box::new(ScheduleNormalizationReceipt::default()),
+    };
+
+    // The normalization operation is read-only and cannot derive a canonical
+    // request hash, so the retry identity carries an empty hash. This fixture
+    // also drops the task binding: the pinned State Fence of `fence()` carries
+    // no task revision, and the owner refuses to bind a task without one rather
+    // than dropping the binding (the same established fixture shape as
+    // `unbound_normalization_receipt_envelope`).
+    let mut request_context = context();
+    request_context.task_id = None;
+    let request = crate::user_automation::UserAutomationServiceRequest {
+        context: request_context,
+        authenticated_principal: "human-1".to_owned(),
+        identity: OperationIdentity {
+            operation_id: OperationId::new("op-normalize-gap").expect("operation"),
+            idempotency_key: "idem-normalize-gap".to_owned(),
+            canonical_request_hash: String::new(),
+        },
+        intent: intent(UserAutomationOperation::NormalizeSchedule {
+            revision: Box::new(draft.clone()),
+            occurrence_count: 1,
+        }),
+    };
+
+    let (normalized, _envelope) =
+        super::user_automation_store::normalize_user_automation_operation(&request)
+            .expect("owner normalizes the DST-gap draft");
+
+    // The requested wall clock is an owner-output slot: a draft that supplies
+    // one is refused, so the empty draft above really did have the owner
+    // compile it.
+    let mut precompiled = draft.clone();
+    precompiled.schedule.next_occurrences = vec![
+        "ELIOT/I11.12/OCCURRENCE/V4|America/New_York|2026c|2026-03-08T02:30:00|2026-03-08T02:30:00|-05:00|2026-03-08T07:30:00Z|-|-|UNIQUE|forged"
+            .to_owned(),
+    ];
+    let forged_context = context();
+    let forged = crate::user_automation::UserAutomationServiceRequest {
+        context: forged_context,
+        authenticated_principal: "human-1".to_owned(),
+        identity: OperationIdentity {
+            operation_id: OperationId::new("op-normalize-gap-forged").expect("operation"),
+            idempotency_key: "idem-normalize-gap-forged".to_owned(),
+            canonical_request_hash: String::new(),
+        },
+        intent: intent(UserAutomationOperation::NormalizeSchedule {
+            revision: Box::new(precompiled),
+            occurrence_count: 1,
+        }),
+    };
+    assert!(
+        super::user_automation_store::normalize_user_automation_operation(&forged).is_err(),
+        "a draft supplying its own owner output must be refused"
+    );
+
+    // The source digest and the pinned release are read back from the owner
+    // result, never hardcoded here.
+    let source_digest = normalized
+        .schedule
+        .source_digest()
+        .expect("normalized schedule source digest");
+    assert_eq!(
+        source_digest,
+        draft.schedule.source_digest().expect("draft digest"),
+        "normalization does not change the versioned trigger contract"
+    );
+
+    assert_eq!(
+        normalized.schedule.next_occurrences.len(),
+        1,
+        "one-shot normalization compiles exactly one occurrence"
+    );
+    let occurrence = &normalized.schedule.next_occurrences[0];
+    let fields: Vec<&str> = occurrence.split('|').collect();
+    assert_eq!(fields.len(), 10, "V4 occurrence record has ten fields");
+    assert_eq!(
+        fields,
+        vec![
+            "ELIOT/I11.12/OCCURRENCE/V4",
+            "America/New_York",
+            PINNED_ZONE_DATABASE_REVISION,
+            "2026-03-08T02:30:00",
+            "2026-03-08T02:30:00",
+            "-04:00",
+            "2026-03-08T07:30:00Z",
+            "-05:00~-04:00",
+            "GAP_SHIFT_FORWARD",
+            source_digest.as_str(),
+        ],
+        "the nonexistent requested wall clock is carried verbatim beside its resolution"
+    );
+    assert_eq!(
+        occurrence,
+        &format!(
+            "ELIOT/I11.12/OCCURRENCE/V4|America/New_York|{PINNED_ZONE_DATABASE_REVISION}|2026-03-08T02:30:00|2026-03-08T03:30:00|-04:00|2026-03-08T07:30:00Z|-05:00~-04:00|GAP_SHIFT_FORWARD|{source_digest}"
+        ),
+        "owner shifts the nonexistent wall clock forward by exactly one hour"
+    );
+
+    // The returned receipt is owner-issued and bound to this occurrence set,
+    // not the empty draft projection the request carried.
+    let receipt = normalized.schedule.normalization_receipt.as_ref();
+    assert!(!receipt.receipt_id.is_empty(), "owner issues a receipt id");
+    assert!(
+        !receipt.normalizer_authority.is_empty(),
+        "owner names its normalization authority"
+    );
+    assert_eq!(
+        receipt.occurrences_digest,
+        normalized
+            .schedule
+            .compiled_occurrences_digest()
+            .expect("compiled occurrences digest"),
+        "receipt binds the exact compiled occurrence set"
+    );
+    assert_eq!(receipt.source_digest, source_digest);
+    assert_eq!(
+        receipt.zone_database_revision, PINNED_ZONE_DATABASE_REVISION,
+        "receipt pins the same zone release as the occurrence"
+    );
+
+    // The result is the new immutable revision, not an in-place rewrite of the
+    // draft: it keeps the submitted revision identity and its supersession
+    // relation while every non-schedule field is carried through unchanged.
+    assert_eq!(normalized.automation_id, draft.automation_id);
+    assert_eq!(normalized.revision, "r-2");
+    assert_eq!(normalized.supersedes.as_deref(), Some("r-1"));
+    assert_eq!(
+        normalized.owner_principal, draft.owner_principal,
+        "owner attribution is carried unchanged"
+    );
+    assert_eq!(normalized.schedule.expression, draft.schedule.expression);
+    assert_eq!(
+        draft.schedule.next_occurrences.len(),
+        0,
+        "the submitted draft is never mutated in place"
+    );
+}
