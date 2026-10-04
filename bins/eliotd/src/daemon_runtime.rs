@@ -1968,15 +1968,17 @@ async fn run_loop(
                     &mut solo_poll_last_refusal,
                     &mut fair_pull_recovery_flight,
                     &mut fair_pull_recovery_last_refusal,
+                    // #2559 D3: the campaign-packet flight keeps its own queue,
+                    // claim, compile and result legs, the Task Controller
+                    // flight keeps its own queue and attempt type, and Finish
+                    // keeps its own submit leg. All three now drain inside the
+                    // shared bounded budget instead of behind three further
+                    // fresh ones, so `exit` already accounts for all of them.
+                    &mut campaign_packet_flight,
+                    &mut task_controller_flight,
+                    &mut finish_flight,
                 )
                 .await?;
-                // #1862: the campaign-packet flight keeps its own queue, claim,
-                // compile and result legs, and the Task Controller flight keeps
-                // its own queue and attempt type. Both drain on their own
-                // bounded budgets after the shared flights settle.
-                drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
-                drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
-                drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -4486,6 +4488,9 @@ async fn drain_flights_on_shutdown(
     solo_poll_last_refusal: &mut Option<String>,
     fair_pull_recovery_flight: &mut FairPullRecoveryFlight,
     fair_pull_recovery_last_refusal: &mut Option<String>,
+    campaign_packet_flight: &mut CampaignPacketFlight,
+    task_controller_flight: &mut TaskControllerFlight,
+    finish_flight: &mut FinishFlight,
 ) -> Result<RunLoopExit, RunLoopFailure> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -4515,6 +4520,13 @@ async fn drain_flights_on_shutdown(
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
             && matches!(fair_pull_recovery_flight, FairPullRecoveryFlight::Idle)
+            // #2559 D3: these three were previously drained AFTER this
+            // function returned, each under its own fresh
+            // `SHUTDOWN_ACTIVATION_DRAIN`. They are part of the same drain now,
+            // so an all-idle drain means all of them are idle.
+            && matches!(campaign_packet_flight, CampaignPacketFlight::Idle)
+            && matches!(task_controller_flight, TaskControllerFlight::Idle)
+            && matches!(finish_flight, FinishFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -4592,6 +4604,30 @@ async fn drain_flights_on_shutdown(
             }
             testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
+            }
+            // #2559 D3: these three settle inside the shared drain, so a
+            // campaign packet, a Task Controller attempt and a Finish submit
+            // are polled concurrently with every other flight under the ONE
+            // absolute deadline. Previously they were polled only after this
+            // loop returned, which let a dependency one of them needed make no
+            // progress while it waited, and which spent up to three further
+            // two-second budgets in sequence.
+            campaign_packet_completion =
+                next_campaign_packet_completion(campaign_packet_flight) => {
+                    settle_campaign_packet_completion(
+                        campaign_packet_completion,
+                        campaign_packet_flight,
+                    )?;
+                }
+            task_controller_completion =
+                next_task_controller_completion(task_controller_flight) => {
+                    settle_task_controller_completion(
+                        task_controller_completion,
+                        task_controller_flight,
+                    )?;
+                }
+            finish_completion = next_finish_completion(finish_flight) => {
+                settle_finish_completion(finish_completion, finish_flight)?;
             }
             watchdog_export_drain_completion =
                 next_watchdog_export_drain_completion(watchdog_export_drain_flight) => {
@@ -4693,6 +4729,20 @@ async fn drain_flights_on_shutdown(
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
                 *fair_pull_recovery_flight = FairPullRecoveryFlight::Idle;
+                // #2559 D3: the campaign-packet, Task Controller and Finish
+                // flights are dropped here, on the SAME single absolute
+                // deadline as every other flight, instead of behind three
+                // further `timeout(SHUTDOWN_ACTIVATION_DRAIN, ...)` calls that
+                // each granted a fresh budget after this loop had stopped
+                // polling them. The honest classification of a dropped
+                // campaign/Task-Controller/Finish step - claimed vs submitted vs
+                // committed-but-unacknowledged - is NOT invented here; these
+                // flight states still carry no retained operation identity, and
+                // that absence is defect 2 and defect 4 of this issue, not
+                // something this budget fix may paper over.
+                *campaign_packet_flight = CampaignPacketFlight::Idle;
+                *task_controller_flight = TaskControllerFlight::Idle;
+                *finish_flight = FinishFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
                 return Ok(exit);
@@ -6552,19 +6602,6 @@ async fn submit_campaign_packet_result_idempotent(
     }
 }
 
-async fn drain_campaign_packet_on_shutdown(
-    flight: &mut CampaignPacketFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, CampaignPacketFlight::Idle);
-    let CampaignPacketFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(CampaignPacketCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
 /// Outcome of one production Task Controller poll step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskControllerPollOutcome {
@@ -7013,17 +7050,6 @@ async fn run_finish_poll(
     }
 }
 
-async fn drain_finish_on_shutdown(flight: &mut FinishFlight) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, FinishFlight::Idle);
-    let FinishFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(FinishCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
 async fn run_task_controller_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -7087,19 +7113,6 @@ async fn run_task_controller_poll(
                 "Kernel Task Controller result submit: {first_error}; retry: {second_error}"
             )),
         },
-    }
-}
-
-async fn drain_task_controller_on_shutdown(
-    flight: &mut TaskControllerFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, TaskControllerFlight::Idle);
-    let TaskControllerFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(TaskControllerCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 

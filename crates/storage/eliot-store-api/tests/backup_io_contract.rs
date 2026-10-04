@@ -29,7 +29,10 @@
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::items_after_statements)]
 
+use std::future::Future;
 use std::num::NonZeroU64;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 
 use eliot_contracts::{
     ClockReading, ContractVersion, EpochId, EpochLineageId, OperationId, ProductId, RequestId,
@@ -258,6 +261,49 @@ fn continuation_page_for(begin: &SnapshotBeginRequest, previous: &SnapshotPage) 
     }
 }
 
+/// Pins what a continuation's predecessor commitment must equal.
+///
+/// The value is one exact digest of the whole previous page, so it is stable
+/// across repeated computation and changes when any single field of the
+/// predecessor changes. A continuation that commits to its real predecessor's
+/// digest and one that commits to a foreign digest are both structurally
+/// accepted, because `validate_continuation` does not compare the field yet;
+/// both cases are pinned here so the comparison its owner still owes has a
+/// proven positive and a proven negative to apply to.
+fn assert_predecessor_commitment_is_the_canonical_digest(
+    previous: &SnapshotPage,
+    continuation: &SnapshotPage,
+) {
+    let page_digest = previous.compute_digest().unwrap();
+    assert_eq!(page_digest, previous.compute_digest().unwrap());
+    assert_eq!(page_digest.len(), 64);
+    let mut member_changed = previous.clone();
+    member_changed.members[0].content_digest = hex('a');
+    assert_ne!(member_changed.compute_digest().unwrap(), page_digest);
+    let mut cursor_changed = previous.clone();
+    cursor_changed
+        .next_cursor
+        .as_mut()
+        .expect("the previous page published a continuation")
+        .page_index += 1;
+    assert_ne!(cursor_changed.compute_digest().unwrap(), page_digest);
+    // A foreign commitment is not the same chain and does not compare
+    // equal to the digest of the page actually served before it.
+    let mut foreign = continuation.clone();
+    foreign.predecessor_digest = hex('5');
+    assert!(foreign.validate().is_ok());
+    assert_ne!(foreign.predecessor_digest, page_digest);
+    // The commitment is not self-referential: a page cannot name its own
+    // digest as its predecessor.
+    assert_ne!(previous.predecessor_digest, page_digest);
+    // The accepted owner serves a continuation that commits to its real
+    // predecessor's digest, which is moved in last.
+    let mut bound = continuation.clone();
+    bound.predecessor_digest = page_digest;
+    assert!(bound.validate().is_ok());
+    assert!(bound.validate_continuation(previous).is_ok());
+}
+
 fn end_receipt(completeness: SnapshotCompleteness) -> SnapshotEndReceipt {
     SnapshotEndReceipt {
         handle: handle_for(&begin_request()),
@@ -432,24 +478,100 @@ fn consume_client_defaults<C: CanonicalStoreClient>() {
     let _ = C::dreamer_job;
 }
 
+/// Drives one inherited default body to completion without a runtime.
+///
+/// The port bodies contain no suspension points, so one poll with a no-op
+/// waker is a complete drive. No dev-dependency runtime is added for it and
+/// no backend I/O happens. A body that suspended would report [`Poll::Pending`]
+/// and fail here: that is exactly the gap this helper closes, because an
+/// unpolled future proves only that a signature compiles and cannot tell a
+/// refusing default from a success-shaped one.
+fn drive_default<F: Future>(future: F) -> F::Output {
+    let mut future: Pin<Box<F>> = Box::pin(future);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("an inherited default body must refuse, not suspend"),
+    }
+}
+
 /// Restore-port stub with zero fields and no overrides: every method keeps
 /// its fail-closed default body.
 struct StubRestorePort;
 
 impl IsolatedRestorePort for StubRestorePort {}
 
-fn consume_restore_defaults(
+/// Proves every inherited restore-port default refuses, driven to completion.
+///
+/// The stub has zero fields and overrides nothing, so each body exercised here
+/// is the shared default. The exact typed refusal is asserted for each one,
+/// because a bare `is_err()` cannot distinguish an unknown operation from
+/// unavailability from a success.
+fn assert_restore_defaults_refuse(
     port: &impl IsolatedRestorePort,
     ctx: &RequestMeta,
-    batch: CanonicalRestoreBatch,
-    dest: IsolatedDestination,
-    first: OperationIdentity,
-    second: OperationIdentity,
+    batch: &CanonicalRestoreBatch,
+    dest: &IsolatedDestination,
+    first: &OperationIdentity,
+    second: &OperationIdentity,
 ) {
-    std::mem::drop(port.prepare_isolated_destination(ctx, dest, begin_request().operation));
-    std::mem::drop(port.restore_canonical_batch(ctx, batch.clone()));
-    std::mem::drop(port.validate_restore(ctx, batch));
-    std::mem::drop(port.reconcile_operation(first, second));
+    assert_eq!(
+        drive_default(port.prepare_isolated_destination(ctx, dest.clone(), first.clone())),
+        Err(StoreError::UnknownOperation)
+    );
+    assert_eq!(
+        drive_default(port.restore_canonical_batch(ctx, batch.clone())),
+        Err(StoreError::UnknownOperation)
+    );
+    assert_eq!(
+        drive_default(port.validate_restore(ctx, batch.clone())),
+        Err(StoreError::Unavailable)
+    );
+    assert_eq!(
+        drive_default(port.reconcile_operation(first.clone(), second.clone())),
+        Err(StoreError::Unavailable)
+    );
+}
+
+/// The pure structural comparison helper is separate from the port and stays
+/// usable without an owner: equal digests replay, a changed digest conflicts,
+/// and a different operation id is refused outright.
+///
+/// It returns an outcome, never a record. A reconciliation record is
+/// owner-issued evidence and cannot be obtained from two caller claims, so the
+/// record built here is validated as a shape, never as a verdict.
+fn assert_pure_reconcile_helper_never_returns_a_record(
+    first: &OperationIdentity,
+    second: &OperationIdentity,
+) {
+    assert_eq!(
+        reconcile_same_operation(first, first),
+        Ok(ReconciliationOutcome::ReplayIdentity)
+    );
+    let changed = OperationIdentity {
+        canonical_request_hash: hex('c'),
+        ..second.clone()
+    };
+    if first.canonical_request_hash != changed.canonical_request_hash {
+        assert_eq!(
+            reconcile_same_operation(first, &changed),
+            Ok(ReconciliationOutcome::IdentityConflict)
+        );
+    }
+    let other = operation("op-950-9", "idem-950-9", &hex('a'));
+    assert!(reconcile_same_operation(first, &other).is_err());
+    let record = BackupOperationReconciliation {
+        first_digest: first.canonical_request_hash.clone(),
+        second_digest: changed.canonical_request_hash.clone(),
+        operation: first.clone(),
+        outcome: if first.canonical_request_hash == changed.canonical_request_hash {
+            ReconciliationOutcome::ReplayIdentity
+        } else {
+            ReconciliationOutcome::IdentityConflict
+        },
+    };
+    assert_eq!(record.validate(), Ok(()));
 }
 
 /// Capture/restore consumer with zero fields and no backend: proves one
@@ -689,6 +811,9 @@ fn snapshot_pages_and_cursors_cannot_cross_snapshot_or_reset_bounds() {
     // A continuation is still refused when it reaches the end of the
     // denominator twice: a terminal page has no successor.
     assert!(second.validate_continuation(&second).is_err());
+    // The predecessor commitment is one exact value: the canonical digest of
+    // the page that was actually served before.
+    assert_predecessor_commitment_is_the_canonical_digest(&page, &second);
     // A page handle that does not match the begin-request digest is refused.
     assert!(crossed.validate_for_begin(&begin).is_err());
     // Cumulative work past the declared bounds is refused as too large.
@@ -947,19 +1072,36 @@ fn purge_and_reference_closure_with_fail_closed_restore_defaults() {
     let mut open = denominator();
     open.members[2].reference_digest = None;
     assert!(open.validate().is_err());
-    // The default port bodies exist and are invocable without a backend.
-    // Futures are constructed but never polled: no async runtime is needed
-    // (this crate has no dev-dependency runtime) and no backend I/O happens.
-    // `provider_unknown_outcome.rs` likewise covers sync refusal contours
-    // only; execution refusal lives with the accepted concrete backend.
-    consume_restore_defaults(
+    // The default port bodies are invocable without a backend and are driven
+    // to completion, so each one is proved to refuse rather than merely
+    // constructed: an unpolled future cannot tell a refusing default from a
+    // success-shaped one. No dev-dependency runtime is added and no backend
+    // I/O happens; `provider_unknown_outcome.rs` likewise covers sync refusal
+    // contours only, and execution refusal lives with the accepted concrete
+    // backend.
+    let replay = operation("op-950-1", "idem-950-1", &hex('a'));
+    let changed = operation("op-950-1", "idem-950-1", &hex('c'));
+    assert_restore_defaults_refuse(
         &StubRestorePort,
         &context(),
-        batch(),
-        destination(),
-        operation("op-950-1", "idem-950-1", &hex('a')),
-        operation("op-950-1", "idem-950-1", &hex('a')),
+        &batch(),
+        &destination(),
+        &replay,
+        &changed,
     );
+    // The same two claims are refused identically when they are equal and
+    // when they differ, so no input pair reaches a verdict through a default.
+    assert_restore_defaults_refuse(
+        &StubRestorePort,
+        &context(),
+        &batch(),
+        &destination(),
+        &replay,
+        &replay,
+    );
+    // The pure helper is a separate surface and is not part of the port's
+    // refusal: it is what an owner implementation derives its verdict from.
+    assert_pure_reconcile_helper_never_returns_a_record(&replay, &changed);
 }
 
 // WORK_UNIT_CASE: 950/11
