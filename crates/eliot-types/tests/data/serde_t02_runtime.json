@@ -171,16 +171,5 @@
       "why": "this row is for the optional `role_lease_id` identifier on `RuntimeOperationDetail`: it is present as the empty string, which is an absent identifier rather than a weaker one.",
       "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"phase\":\"running\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"root_pid\":10,\"active_process_count\":1,\"stdin_state\":\"open\",\"stdout_state\":\"open\",\"stderr_state\":\"open\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"role_lease_id\":\"\",\"role_lease_epoch\":3}"
     }
-  },
-  "known_weaknesses": {
-    "id": "repeated_object_member_collapses_to_last_wins",
-    "where": "crates/eliot-types/src/runtime_supervision.rs::DescendantsAtRootExitCaptured, and through it the closed DescendantsAtRootExit enum and therefore ProcessReapReceipt",
-    "property": "A member that appears twice in the JSON text is assigned twice by serde_json's derived struct visitor and the LAST occurrence is the value the validator sees; #[serde(deny_unknown_fields)] rejects unknown member NAMES and is silent about a repeated known member, so no bound in validate_descendants_captured can observe that a repeat occurred.",
-    "why_it_is_recorded_and_not_fixed": "It is outside cards/931.md: that card's DEFER covers the sixteen WORK_UNIT_CASE acceptance cases, and issue #931 acceptance case 5 is this property; the card's DONE-FOR-INTEGRATION 'duplicate/unsorted descendant PID' clause instead means duplicate ENTRIES in the descendants ARRAY, which refuse_duplicate_descendant_pid already covers. Issue #931 Work item 5 does ask for it ('In manual map visitors, reject repeated keys before insertion'), but that item is not this card's. The owner that already rejects duplicate members in this crate is eliot_types::strict_json::strict_json_value (crates/eliot-types/src/strict_json.rs:96), a different file and outside this card's EDIT list, and the card's DO NOT leaves strict_json.rs unedited per leaf.",
-    "wire_shape_that_exposes_it": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":0,\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}",
-    "expectation_if_it_were_a_case": {
-      "expect": "refuse",
-      "note": "The current decoder would ACCEPT this document, because the second occurrence overwrites the first and the collapsed value passes every bound; this has NOT been observed by running anything - it is read off the derived-decoder mechanism, not measured."
-    }
   }
 }
