@@ -2870,7 +2870,11 @@ impl DaemonComposition {
                 reason: "declared host/tool/contract dependencies changed after the lifecycle view was derived; the Skill is blocked from Material use until revalidated",
             });
         }
-        let summary = self.governor.owners().skill.admit_material_attempt(receipt)?;
+        let summary = self
+            .governor
+            .owners()
+            .skill
+            .admit_material_attempt(receipt)?;
         // #2663 C5 (audit 5856960648): admission RETAINS. This is deliberately
         // not a separate optional step a caller may skip: while nothing wrote
         // the receipt, every stored view carried an empty `attempt_receipts`,
