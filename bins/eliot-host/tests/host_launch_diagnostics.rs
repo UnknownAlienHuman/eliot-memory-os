@@ -706,12 +706,22 @@ fn test_gated_lines(source: &str) -> Vec<bool> {
     let mut gated = vec![false; lines.len()];
     let mut remaining = 0_i64;
     let mut inside = false;
+    // Whether the gated item's block has actually opened yet. A multi-line
+    // signature sits between the attribute and its `{` on lines whose net balance is
+    // ZERO, so without this flag the close test below would fire on the first
+    // parameter line and the rest of the item would read as production code.
+    let mut opened = false;
     for index in 0..lines.len() {
         if inside {
             gated[index] = true;
-            remaining += brace_balance(lines[index]);
-            if remaining <= 0 {
+            let balance = brace_balance(lines[index]);
+            if balance > 0 {
+                opened = true;
+            }
+            remaining += balance;
+            if opened && remaining <= 0 {
                 inside = false;
+                opened = false;
             }
             continue;
         }
@@ -720,15 +730,39 @@ fn test_gated_lines(source: &str) -> Vec<bool> {
         }
         gated[index] = true;
         let own_balance = brace_balance(lines[index]);
-        // A gate attribute carries no brace, so the gated item's own block opens
-        // on the line after it; a gate in front of a single-line item owns that
-        // line alone.
-        let opens_block = lines
-            .get(index + 1)
-            .is_some_and(|next| brace_balance(next) > 0);
-        if own_balance > 0 || opens_block {
+        if own_balance > 0 {
             inside = true;
+            opened = true;
             remaining = own_balance;
+            continue;
+        }
+        // The gate attribute itself carries no brace, so the gated item's own block
+        // opens LATER - and for a multi-line signature it opens several lines later,
+        // not on the next one: `#[cfg(all(test, windows))]` in front of
+        // `pub(super) fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(` leaves the
+        // whole parameter list, the `where` clause and the bounds between the
+        // attribute and the `{`. Reading only the next line therefore classified that
+        // item's entire body as PRODUCTION code, which is the one thing this reader
+        // exists to prevent. The block is therefore located by walking forward to the
+        // first line whose net balance opens one; a single-line item (a `use`, a
+        // `const`, a one-line `fn`) is closed by its `;` and owns no block at all.
+        let mut probe = index + 1;
+        let mut depth = 0_i64;
+        let mut opens = false;
+        while probe < lines.len() {
+            depth += brace_balance(lines[probe]);
+            if depth > 0 {
+                opens = true;
+                break;
+            }
+            if lines[probe].trim_end().ends_with(';') {
+                break;
+            }
+            probe += 1;
+        }
+        if opens {
+            inside = true;
+            remaining = 0;
         }
     }
     gated
@@ -1818,12 +1852,23 @@ fn launch_02_options_descriptor_typed_rejection() {
             "transaction plan generation must be non-zero",
         ),
     ];
+    // `execute_launch_parse` renders the typed error through `HostError::to_string()`
+    // and `HostError::Platform` is declared `#[error("host platform: {0}")]` in
+    // `lib.rs`, so the observable refusal carries that prefix in front of its own
+    // reason. Asserted here ONCE against the real type and then spelled out in full at
+    // every site, so a change to the prefix cannot move the expectation together with
+    // the production text it is supposed to pin.
+    assert_eq!(
+        HostError::Platform("invalid Host launch argv: probe".to_owned()).to_string(),
+        "host platform: invalid Host launch argv: probe",
+        "every pinned argv refusal below is HostError::Platform's Display over the argv reason"
+    );
     for (label, args, reason) in &cases {
         let (parsed, records) = execute_launch_parse(args);
         assert_eq!(
             parsed,
-            Err(format!("invalid Host launch argv: {reason}")),
-            "{label} must keep its exact typed reason"
+            Err(format!("host platform: invalid Host launch argv: {reason}")),
+            "{label} must keep its exact typed reason, host platform: prefix included"
         );
         assert_eq!(
             phase_tokens(&detail_records(&records), &tokens),
@@ -1915,9 +1960,10 @@ fn launch_03_retained_identity_on_substitution() {
     assert_eq!(
         relocated,
         Err(
-            "invalid Host launch argv: config descriptor path must be absolute and valid"
+            "host platform: invalid Host launch argv: config descriptor path must be absolute and valid"
                 .to_owned()
-        )
+        ),
+        "a relocated descriptor locator must keep its exact typed reason, host platform: prefix included"
     );
     assert_eq!(
         phase_tokens(&detail_records(&relocated_records), &tokens),
@@ -1930,7 +1976,11 @@ fn launch_03_retained_identity_on_substitution() {
     let (substituted_digest, substituted_records) = execute_launch_parse(&substituted);
     assert_eq!(
         substituted_digest,
-        Err("invalid Host launch argv: config descriptor digest is not valid text".to_owned())
+        Err(
+            "host platform: invalid Host launch argv: config descriptor digest is not valid text"
+                .to_owned()
+        ),
+        "a substituted digest must keep its exact typed reason, host platform: prefix included"
     );
     assert_eq!(
         phase_tokens(&detail_records(&substituted_records), &tokens),
@@ -2182,11 +2232,51 @@ fn launch_03_retained_identity_on_substitution() {
         "every correlated entry point must be named as a forwarded caller, in the same order"
     );
 
+    // The twin SET itself is derived from SOURCE here, not trusted from the fixture:
+    // every `fn <name>_with_correlation` declaration the eight delivered files really
+    // carry must be pinned by one of the two maps, and neither map may name a twin the
+    // source does not declare. Without this, a ninth forwarding entry point added
+    // later and listed in neither map would be reachable from no assertion at all -
+    // the exact failure mode the two descriptor validators had. Comments are stripped
+    // first, because a doc line naming a twin in prose is a mention, not a
+    // declaration.
+    let mut source_twins: Vec<String> = Vec::new();
+    for (path, _) in OBSERVER_HELPERS {
+        for line in manifest_source(path).lines() {
+            let Some((_, after_fn)) = code_of(line).split_once("fn ") else {
+                continue;
+            };
+            let name = after_fn.split(['(', '<']).next().unwrap_or_default().trim();
+            if name.ends_with("_with_correlation") {
+                source_twins.push(format!("{path}:fn {name}"));
+            }
+        }
+    }
+    source_twins.sort();
+    let mut declared_twins = entries.clone();
+    declared_twins.extend(
+        fixture["correlated_entry_points_excluded"]
+            .as_array()
+            .expect("the fixture must declare every correlated entry point it excludes")
+            .iter()
+            .map(|excluded| {
+                excluded["twin"]
+                    .as_str()
+                    .expect("an excluded twin must be spelled path:fn symbol")
+                    .to_owned()
+            }),
+    );
+    declared_twins.sort();
+    assert_eq!(
+        declared_twins, source_twins,
+        "the two fixture maps must pin exactly the forwarding entry points the source declares"
+    );
+
     // FIX 1: the list above is the SUBJECT SET of the all-sites call-site scan
     // below, so a twin that is missing from it is a twin whose every call site is
     // read by no assertion - and that is exactly how the two approved-descriptor
     // validators were unpinned: `start_approved` calls both with `&correlation`
-    // (host_job_launch.rs:1669 and host_job_launch.rs:1713), both are declared in
+    // (host_job_launch.rs:1666 and host_job_launch.rs:1710), both are declared in
     // `inline_case_owners` and `inline_case_owner_cases`, and before this
     // correction neither appeared here, so reverting either one to a fresh
     // `LaunchPhaseCorrelation::NONE` failed nothing in this suite.
@@ -2355,7 +2445,7 @@ fn launch_03_retained_identity_on_substitution() {
     let start_call_body = fn_declared_call_body(&launch_source, &caller_leaf);
     assert!(
         start_call_body.len() <= start_body.len(),
-        "the approved-start contour's own body cannot be wider than the span that ends at the next declaration"
+        "the approved-start contour's brace-bounded read must terminate INSIDE the span that ends at the next declaration: an equal or shorter read is what proves the brace scan found this function's own closing brace rather than running to end of file"
     );
     for slot in object_list(contour, "bound_slots") {
         assert!(
@@ -2406,7 +2496,7 @@ fn launch_03_retained_identity_on_substitution() {
     // calls `approved_launch_paths_with_correlation`. But `launch` is a second
     // real forwarding caller: it builds its OWN correlation from the identities it
     // already holds and forwards that binding into that twin at
-    // host_job_launch.rs:1020. With no assertion on this edge, reverting it to a
+    // host_job_launch.rs:1016. With no assertion on this edge, reverting it to a
     // fresh `LaunchPhaseCorrelation::NONE` failed nothing anywhere in this suite.
     //
     // Read with the SAME per-occurrence all-sites reader the approved-start check
@@ -2748,9 +2838,20 @@ fn launch_06_store_before_kernel() {
             "the sequence must still emit {live:?} from production code exactly once: its own test module re-declares the same literal, so a whole-file match would pass after the production emission is deleted"
         );
     }
+    // The identity-free ORIGINAL is `#[cfg(all(test, windows))]` on purpose - the
+    // production contour calls the twin, and the gate is what keeps a non-test build
+    // free of a dead-code finding without an `allow`. So a CORRECT production-code
+    // read must contain the twin and must NOT contain the original. Asserting the
+    // original's presence in production code instead would pin the reader's own blind
+    // spot: the original's block opens ten lines after its attribute, so a reader that
+    // looked only at the next line classified that test-only body as production.
     assert!(
-        production_sequence.contains("fn launch_store_then_kernel<"),
-        "the sequence must still declare the ORIGINAL fn launch_store_then_kernel<...>(, whose generic parameter list the twin's own _with_correlation declaration cannot spell: {production_sequence}"
+        production_sequence.contains("fn launch_store_then_kernel_with_correlation<"),
+        "the production contour's entry point must be the correlated twin: {production_sequence}"
+    );
+    assert!(
+        !production_sequence.contains("fn launch_store_then_kernel<"),
+        "the identity-free original is test-gated, so production code must not contain it: {production_sequence}"
     );
     assert!(
         !production_sequence
@@ -3117,7 +3218,7 @@ fn launch_06_store_before_kernel() {
         let call_body = fn_declared_call_body(&source, symbol);
         assert!(
             call_body.len() <= body.len(),
-            "{path}: {symbol}'s own body cannot be wider than the span that ends at the next declaration"
+            "{path}: {symbol}'s brace-bounded read must terminate INSIDE the span that ends at the next declaration: an equal or shorter read is what proves the brace scan found this function's own closing brace rather than running to end of file"
         );
         assert!(
             !body.contains("LaunchPhaseCorrelation::NONE"),
@@ -3286,7 +3387,7 @@ fn launch_06_store_before_kernel() {
     assert_eq!(
         refusal_arms.len(),
         7,
-        "all SEVEN delivered twins that emit a refusal phase must be listed: {refusal_arms:?}"
+        "all SEVEN twins that start_approved calls with its correlation and that emit a refusal phase must be listed here: {refusal_arms:?}. The eighth delivered twin, approved_launch_paths_with_correlation, is deliberately absent because start_approved never calls it; its refusal arms are executed by its own inline owner case and its one call site is scanned on the branch contour"
     );
     let sequence_entries = entries
         .iter()
@@ -3376,6 +3477,14 @@ fn launch_07_nonce_handshake_auth_activation_distinct() {
     // private modules, so their distinctness is the inline owner case there.
     let frontdoor = manifest_source("src/kernel_front_door_client.rs");
     let driver = manifest_source("src/kernel_activation_driver.rs");
+    // Read as PRODUCTION code, never as raw text: `host.kernel-front-door handshake
+    // requested` occurs three times in that file - once in a `//` comment, once at the
+    // real emission, and once inside a `#[cfg(test)]` string - so a raw `contains`
+    // stays green after the production emission is deleted, which is the whole defect
+    // this case exists to catch. Both owners are read through the same reader the
+    // retired-label guards use.
+    let frontdoor_production = production_code(&frontdoor);
+    let driver_production = production_code(&driver);
     for detail in [
         "host.kernel-front-door handshake requested",
         "host.kernel-front-door handshake observed",
@@ -3384,8 +3493,8 @@ fn launch_07_nonce_handshake_auth_activation_distinct() {
         "host.kernel-front-door control requested",
     ] {
         assert!(
-            frontdoor.contains(detail),
-            "front-door owner must pin {detail:?}"
+            frontdoor_production.contains(detail),
+            "front-door owner must emit {detail:?} from production code, not name it in a comment or a test string"
         );
     }
     for detail in [
@@ -3396,8 +3505,8 @@ fn launch_07_nonce_handshake_auth_activation_distinct() {
         "host.kernel-activation activation observed",
     ] {
         assert!(
-            driver.contains(detail),
-            "activation owner must pin {detail:?}"
+            driver_production.contains(detail),
+            "activation owner must emit {detail:?} from production code, not name it in a comment or a test string"
         );
     }
 }
@@ -3730,10 +3839,15 @@ fn launch_11_sink_failure_leaves_operation_identical() {
     assert!(baseline.absent_cause.is_some());
     assert!(baseline.mismatched_cause.is_some());
     assert!(baseline.unknown_cause.is_some());
+    // `tracked_parse` wraps a value in `DropTracked` only on its `Ok` arm, so the
+    // REJECTED parse can never appear here - and that absence is the proof, not a gap:
+    // `HostLaunchOptions::parse` returned `Err` before it ever owned a launch value, so
+    // there is nothing of the caller's to release. Exactly the two admitted values are
+    // released, each exactly once, and no third release exists.
     assert_eq!(
         baseline.drop_order,
-        vec!["parse", "parse-rejected", "system-service"],
-        "every owner-held launch value is released exactly once"
+        vec!["parse", "system-service"],
+        "every owner-held launch value is released exactly once, and the rejected parse owned none"
     );
 
     // The Event Log seam keeps the platform's own live answer. #984's safe port is

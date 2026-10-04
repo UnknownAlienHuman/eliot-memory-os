@@ -75,14 +75,14 @@ use crate::store_kernel_launch_sequence::{
 // One designated terminal per underlying operation: the leaf guard below is
 // PHASE-ONLY. `HostLaunchTerminalGuard` emits one correlated subordinate phase
 // record and no terminal at all. The designated terminal for one failed launch
-// is `lib.rs`'s `HostTerminalGuard(BOUNDARY_START_TERMINAL)`, whose frozen
-// code is "host-start-failed"; the leaf terminal code this file used to emit is
-// retired and appears nowhere here, so one failed launch can no longer produce
+// is `lib.rs`'s `HostTerminalGuard` on the OUTER contour that wrapped the call:
+// the production path arms `BOUNDARY_OPEN_TERMINAL` ("host-open-failed"), while
+// `BOUNDARY_START_TERMINAL` ("host-start-failed") is armed only inside
+// `start_approved_contour`, which has no in-repo caller. The leaf terminal code
+// retired here appears nowhere in this file, so one failed launch cannot produce
 // two terminal records. Typed rejections stay
-// `HostError::ProcessContour`/`RecoveryRequired`
-// (cases 978/2, 978/3); admitted launches are distinct from readiness (case
-// 978/4 — admitted here is never readiness, which stays with the readiness
-// contour).
+// `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2, 978/3); admitted
+// launches are distinct from readiness (case 978/4 — never readiness here).
 
 /// Bounded, secret-free correlation identities for one launch phase record.
 ///
@@ -311,10 +311,10 @@ fn host_launch_process_start_identity(process: &eliot_platform_windows::ProcessI
 /// `Err` return (explicit or via `?`) drops armed and emits exactly one
 /// subordinate phase record, correlated with the identities this contour
 /// already holds. It emits NO terminal: the designated terminal for one failed
-/// launch is `lib.rs`'s `HostTerminalGuard(BOUNDARY_START_TERMINAL)`
-/// ("host-start-failed"), which this leaf must not duplicate (issue #978 audit
-/// defect 2). Emitting here never changes the `Result`: the guard only observes
-/// the already-produced outcome. No dedup cache, no lock, no second evaluation.
+/// launch is `lib.rs`'s `HostTerminalGuard` on the outer contour - the production
+/// path arms `BOUNDARY_OPEN_TERMINAL`, while `BOUNDARY_START_TERMINAL` is armed
+/// only in the uncalled exported `start_approved_contour` - which this leaf must
+/// not duplicate (#978 audit 2). It only observes the outcome; no dedup or lock.
 #[cfg(windows)]
 struct HostLaunchTerminalGuard<'a> {
     phase: &'a str,
@@ -2606,7 +2606,19 @@ mod phase_correlation_tests {
         // Every same-operation phase record the forwarded seam emits carries the
         // identities the caller already held, never their absence marker.
         for record in forwarded.split("host.entrypoint_stage").skip(1) {
-            let parsed = rendered_slots(record);
+            // The split yields the RAW captured text between two event markers, so it
+            // still carries the facade's own framing and the subscriber's trailing
+            // metadata. `rendered_slots` needs the extracted `detail`, and the
+            // difference is load-bearing for `reason`: it is the LAST frozen key, so
+            // its span has no following `<key>=` anchor and runs to the end of the
+            // haystack - on a raw chunk that end is the closing quote of the quoted
+            // detail field plus `detail_bytes=…`, which would read as
+            // `missing" detail_bytes=…` instead of the absent marker. Every other
+            // key survived only because a later anchor happened to stop it first. The
+            // extracted text is bound to a name first because `rendered_slots` returns
+            // spans that borrow its argument.
+            let detail = captured_detail(record);
+            let parsed = rendered_slots(&detail);
             for (key, value) in [
                 ("installation", "installation-7"),
                 ("generation", "7"),
