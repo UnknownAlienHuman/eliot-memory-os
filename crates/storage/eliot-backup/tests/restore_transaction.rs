@@ -1409,9 +1409,10 @@ fn malformed_stale_and_out_of_order_resumed_states_are_rejected() {
     let mut target = FakeTarget::new(&bundle, &plan);
     assert_eq!(
         run(&bundle, &plan, &mut target, &mut journal.clone()),
-        Err(BackupError::RestoreJournalMismatch),
+        Err(BackupError::RestoreEvidenceLevelMismatch),
         "Completed with an inflated proof level is refused"
     );
+    assert!(target.calls.is_empty());
 
     let bundle = full_bundle();
     let plan = plan_for(&bundle, &manifest_string(&fixture_manifest(), "target_id"));
