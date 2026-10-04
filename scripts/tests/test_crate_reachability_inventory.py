@@ -727,6 +727,112 @@ class TestCrateReachabilityInventory(unittest.TestCase):
             self.assertEqual(provider["capability_construction"], "NOWHERE")
             self.assertEqual(provider["source_consumers"], [])
 
+    def test_production_construction_requires_call_or_construct_not_a_reference(self) -> None:
+        provider_source = (
+            "pub struct Proof {}\n"
+            "impl Proof { pub fn new() -> Self { Self {} } }\n"
+            "pub fn make_proof() -> Proof { Proof {} }\n"
+        )
+        reference_only_cases = (
+            (
+                "qualified_type_parameter",
+                "fn carry_proof(_proof: eliot_contracts::Proof) {}\n",
+                {"eliot_contracts", "Proof"},
+            ),
+            (
+                "imported_type_alias_parameter",
+                "use eliot_contracts::Proof as ImportedProof;\n"
+                "fn carry_imported_proof(_proof: ImportedProof) {}\n",
+                {"eliot_contracts", "Proof", "ImportedProof"},
+            ),
+            (
+                "uncalled_function_item_reference",
+                "fn retain_factory() {\n"
+                "    let factory = eliot_contracts::make_proof;\n"
+                "    let _ = factory;\n"
+                "}\n",
+                {"eliot_contracts", "make_proof", "factory"},
+            ),
+        )
+        for label, consumer_source, expected_identifiers in reference_only_cases:
+            with self.subTest(reference_only=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runner = _write_inventory_fixture(
+                    root,
+                    consumer_source=consumer_source,
+                    provider_source=provider_source,
+                )
+                inventory = build_inventory(root, runner, as_of=date(2026, 9, 29))
+                provider = next(row for row in inventory["packages"] if row["name"] == "eliot-contracts")
+                consumer = next(row for row in inventory["packages"] if row["name"] == "eliot")
+                source_file = next(
+                    item
+                    for item in inventory["source_files"]
+                    if item["package_key"] == consumer["package_key"]
+                    and item["path"] == "bins/eliot/src/main.rs"
+                )
+                expected_reference = [{"package_key": consumer["package_key"], "scope": "PRODUCTION"}]
+
+                self.assertEqual(provider["capability_construction"], "NOWHERE")
+                self.assertEqual(provider["source_consumers"], [])
+                self.assertEqual(provider["consumer_summary"]["production_source_consumers"], 0)
+                self.assertEqual(provider["production_gap_evidence"]["production_source_consumer_count"], 0)
+                self.assertEqual(provider["source_reference_consumers"], expected_reference)
+                self.assertEqual(provider["consumer_summary"]["production_source_references"], 1)
+                self.assertEqual(source_file["scope"], "PRODUCTION")
+                self.assertEqual(source_file["sha256"], _sha256(consumer_source.encode("utf-8")))
+                self.assertTrue(expected_identifiers.issubset(set(source_file["identifiers"])))
+                self.assertEqual(runner.calls.count(_METADATA_COMMAND), 1)
+                self.assertNotIsInstance(runner, cri.SubprocessRunner)
+
+        construction_cases = (
+            (
+                "qualified_function_call",
+                "fn main() { let _proof = eliot_contracts::make_proof(); }\n",
+                {"eliot_contracts", "make_proof"},
+            ),
+            (
+                "qualified_associated_constructor",
+                "fn main() { let _proof = eliot_contracts::Proof::new(); }\n",
+                {"eliot_contracts", "Proof", "new"},
+            ),
+            (
+                "qualified_struct_literal",
+                "fn main() { let _proof = eliot_contracts::Proof {}; }\n",
+                {"eliot_contracts", "Proof"},
+            ),
+        )
+        for label, consumer_source, expected_identifiers in construction_cases:
+            with self.subTest(production_construction=label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runner = _write_inventory_fixture(
+                    root,
+                    consumer_source=consumer_source,
+                    provider_source=provider_source,
+                )
+                inventory = build_inventory(root, runner, as_of=date(2026, 9, 29))
+                provider = next(row for row in inventory["packages"] if row["name"] == "eliot-contracts")
+                consumer = next(row for row in inventory["packages"] if row["name"] == "eliot")
+                source_file = next(
+                    item
+                    for item in inventory["source_files"]
+                    if item["package_key"] == consumer["package_key"]
+                    and item["path"] == "bins/eliot/src/main.rs"
+                )
+                expected_consumer = [{"package_key": consumer["package_key"], "scope": "PRODUCTION"}]
+
+                self.assertEqual(provider["capability_construction"], "PRODUCTION_CONSTRUCTED")
+                self.assertEqual(provider["source_consumers"], expected_consumer)
+                self.assertEqual(provider["consumer_summary"]["production_source_consumers"], 1)
+                self.assertEqual(provider["production_gap_evidence"]["production_source_consumer_count"], 1)
+                self.assertEqual(provider["source_reference_consumers"], expected_consumer)
+                self.assertEqual(provider["consumer_summary"]["production_source_references"], 1)
+                self.assertEqual(source_file["scope"], "PRODUCTION")
+                self.assertEqual(source_file["sha256"], _sha256(consumer_source.encode("utf-8")))
+                self.assertTrue(expected_identifiers.issubset(set(source_file["identifiers"])))
+                self.assertEqual(runner.calls.count(_METADATA_COMMAND), 1)
+                self.assertNotIsInstance(runner, cri.SubprocessRunner)
+
     def test_dependency_alias_parameter_shadow_and_qualified_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
