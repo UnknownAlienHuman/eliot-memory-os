@@ -21,6 +21,7 @@
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupError, BackupInput,
@@ -474,10 +475,15 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
 /// The full-recovery case carries one purge entry, so its owner must have
 /// applied exactly that entry — otherwise the owner reports 0 and `eliot-backup`
 /// refuses a non-empty ledger bound to a zero revision. The degraded and scope
-/// cases carry no ledger and need a virgin owner, so each case gets its own.
+/// cases carry no ledger and need a virgin owner. Every invocation gets a
+/// process/call-unique namespace so concurrent tests never share a Redb path.
 fn purge_owner(entries: &[PurgeLedgerEntry], label: &str) -> std::sync::Arc<RedbRecoveryStore> {
-    let path = std::env::temp_dir().join(format!("eliot-960-capture-owner-{label}"));
-    let _ = std::fs::remove_dir_all(&path);
+    static NEXT_OWNER_NAMESPACE: AtomicU64 = AtomicU64::new(0);
+    let invocation = NEXT_OWNER_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "eliot-960-capture-owner-{}-{invocation}-{label}",
+        std::process::id()
+    ));
     let owner = std::sync::Arc::new(
         RedbRecoveryStore::open(&path).expect("fixture purge owner opens for the capture"),
     );
@@ -654,7 +660,7 @@ const KERNEL_MANIFEST: &str = include_str!("../Cargo.toml");
 #[test]
 fn admitted_full_recovery_capture_completes_and_binds_archive() {
     let input = valid_full_input();
-    let request = to_request(&input, 0);
+    let request = to_request(&input, 1);
     let mut publisher = MemPublisher::default();
     // This case carries one purge entry, so the bound owner must have applied
     // exactly that entry: the coordinator reads the ledger-wide revision from
@@ -793,7 +799,10 @@ fn bounded_scope_export_distinct_from_installation_backup() {
     // An installation ORS snapshot inside a scope transfer refuses: a scope
     // export is never an installation backup.
     let mut widened = scope_input();
-    widened.ors_snapshot = Some(ors_fence(&base_fence(), Vec::new()));
+    let mut snapshot = ors_fence(&base_fence(), Vec::new());
+    snapshot.last_event_cursor = 1;
+    snapshot.last_receipt_cursor = 0;
+    widened.ors_snapshot = Some(snapshot);
     assert_eq!(
         BackupBundle::build(widened).unwrap_err(),
         BackupError::UnexpectedRecoveryComponent("ors_snapshot")
@@ -933,6 +942,20 @@ fn timestamps_alone_fail_and_no_global_transaction_assumed() {
             assert!(!src.contains(banned), "banned {banned} in capture src");
         }
     }
+
+    // A lawful bounded FullRecovery capture still reports the verified
+    // publication identity separately from the one-entry ORS frontier.
+    let request = to_request(&valid_full_input(), 1);
+    let owner_label = format!("w4-959-6-{}", std::process::id());
+    let owner = purge_owner(&request.purge_ledger, &owner_label);
+    let mut publisher = MemPublisher::default();
+    let report = coordinator(owner)
+        .capture(&request, &mut publisher)
+        .unwrap_or_else(|error| panic!("coherent bounded FullRecovery capture completes: {error}"));
+    assert_eq!(report.class, BackupClass::FullRecovery);
+    assert_eq!(report.state, CaptureState::Complete);
+    assert_eq!(report.receipt_identity, Some(report.operation_id.clone()));
+    assert_eq!(report.suspended_operation_count, 1);
 }
 
 // WORK_UNIT_CASE: 959/7
@@ -943,8 +966,9 @@ fn controlled_concurrent_mutation_excluded_or_represented() {
     let mut clean_input = valid_full_input();
     clean_input.ors_snapshot = Some(ors_fence(&base_fence(), Vec::new()));
     let clean_request = to_request(&clean_input, 0);
+    let clean_owner = purge_owner(&clean_request.purge_ledger, "w4-959-7-clean");
     let mut publisher = MemPublisher::default();
-    let clean = virgin_coordinator("case")
+    let clean = coordinator(clean_owner)
         .capture(&clean_request, &mut publisher)
         .expect("immutable snapshot capture passes");
     assert_eq!(clean.state, CaptureState::Complete);
@@ -964,8 +988,9 @@ fn controlled_concurrent_mutation_excluded_or_represented() {
         vec!["op-pending-959-1".to_owned(), "op-pending-959-2".to_owned()],
     ));
     let frontier_request = to_request(&frontier_input, 2);
+    let frontier_owner = purge_owner(&frontier_request.purge_ledger, "w4-959-7-frontier");
     let mut publisher = MemPublisher::default();
-    let frontier = virgin_coordinator("case")
+    let frontier = coordinator(frontier_owner)
         .capture(&frontier_request, &mut publisher)
         .expect("frontier-recorded capture passes");
     assert_eq!(frontier.state, CaptureState::Complete);
@@ -1007,7 +1032,7 @@ fn generation_schema_continuation_drift_blocks_complete() {
     let mut generation_input = valid_full_input();
     generation_input.export_fence.store_generation = drifted.store_generation.clone();
     generation_input.export_fence.state_fence = advanced.clone();
-    let generation_request = to_request(&generation_input, 0);
+    let generation_request = to_request(&generation_input, 1);
     let mut publisher = MemPublisher::default();
     let generation_blocked = virgin_coordinator("case")
         .capture(&generation_request, &mut publisher)
@@ -1026,7 +1051,7 @@ fn generation_schema_continuation_drift_blocks_complete() {
     // Schema drift similarly: the drifted schema generation rides the same
     // incoherent fence relation and blocks the same way.
     let schema_input = generation_input;
-    let mut schema_request = to_request(&schema_input, 0);
+    let mut schema_request = to_request(&schema_input, 1);
     schema_request.plan.schema_generation = drifted.schema_generation.clone();
     let mut publisher = MemPublisher::default();
     let schema_blocked = virgin_coordinator("case")
@@ -1049,9 +1074,10 @@ fn generation_schema_continuation_drift_blocks_complete() {
 #[test]
 fn every_member_has_one_disposition() {
     let input = valid_full_input();
-    let request = to_request(&input, 0);
+    let request = to_request(&input, 1);
+    let owner = purge_owner(&request.purge_ledger, "w4-959-9-valid");
     let mut publisher = MemPublisher::default();
-    let report = virgin_coordinator("case")
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("capture completes");
     // Bijection: exactly one disposition per expected member, no more.
@@ -1066,7 +1092,7 @@ fn every_member_has_one_disposition() {
         .canonical_events
         .push(canonical_event("event-959-1"));
     duplicated.export_fence.event_range.count = 3;
-    let duplicated_request = to_request(&duplicated, 0);
+    let duplicated_request = to_request(&duplicated, 1);
     let mut publisher = MemPublisher::default();
     let refused = virgin_coordinator("case")
         .capture(&duplicated_request, &mut publisher)
@@ -1087,7 +1113,7 @@ fn incoherent_boundary_and_count_gap_never_capture() {
     // An exporter that did not prove one coherent boundary cannot capture.
     let mut incoherent = valid_full_input();
     incoherent.export_fence.consistent = false;
-    let incoherent_request = to_request(&incoherent, 0);
+    let incoherent_request = to_request(&incoherent, 1);
     let mut publisher = MemPublisher::default();
     assert_eq!(
         virgin_coordinator("case")
@@ -1099,7 +1125,7 @@ fn incoherent_boundary_and_count_gap_never_capture() {
     // An event range claiming more members than carried cannot capture.
     let mut gapped = valid_full_input();
     gapped.export_fence.event_range.count = 5;
-    let gapped_request = to_request(&gapped, 0);
+    let gapped_request = to_request(&gapped, 1);
     let mut publisher = MemPublisher::default();
     let refused = virgin_coordinator("case")
         .capture(&gapped_request, &mut publisher)
@@ -1118,9 +1144,11 @@ fn references_and_residency_closure_preserved() {
     // member fails archive closure.
     let mut dangling = valid_full_input();
     dangling.projections = vec![projection_for("event-missing-959")];
-    let dangling_request = to_request(&dangling, 0);
+    let dangling_request = to_request(&dangling, 1);
+    let dangling_owner_label = format!("w4-959-11-dangling-{}", std::process::id());
+    let dangling_owner = purge_owner(&dangling_request.purge_ledger, &dangling_owner_label);
     let mut publisher = MemPublisher::default();
-    let refused = virgin_coordinator("case")
+    let refused = coordinator(dangling_owner)
         .capture(&dangling_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1133,9 +1161,11 @@ fn references_and_residency_closure_preserved() {
     let mut doubled = valid_full_input();
     let second = test_blob("a", b"sealed-envelope-959-1");
     doubled.blobs.push(second);
-    let doubled_request = to_request(&doubled, 0);
+    let doubled_request = to_request(&doubled, 1);
+    let doubled_owner_label = format!("w4-959-11-doubled-{}", std::process::id());
+    let doubled_owner = purge_owner(&doubled_request.purge_ledger, &doubled_owner_label);
     let mut publisher = MemPublisher::default();
-    let refused = virgin_coordinator("case")
+    let refused = coordinator(doubled_owner)
         .capture(&doubled_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1154,9 +1184,11 @@ fn references_and_residency_closure_preserved() {
         .export_fence
         .blob_reachability_manifest
         .push(hash);
-    let duplicated_request = to_request(&duplicated_manifest, 0);
+    let duplicated_request = to_request(&duplicated_manifest, 1);
+    let manifest_owner_label = format!("w4-959-11-manifest-{}", std::process::id());
+    let manifest_owner = purge_owner(&duplicated_request.purge_ledger, &manifest_owner_label);
     let mut publisher = MemPublisher::default();
-    let refused = virgin_coordinator("case")
+    let refused = coordinator(manifest_owner)
         .capture(&duplicated_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1165,10 +1197,15 @@ fn references_and_residency_closure_preserved() {
     );
     assert!(publisher.publishes.is_empty());
     // The valid closure captures: distinct residency domains stay distinct.
+    let request = to_request(&valid_full_input(), 1);
+    let valid_owner_label = format!("w4-959-11-closed-{}", std::process::id());
+    let owner = purge_owner(&request.purge_ledger, &valid_owner_label);
     let mut publisher = MemPublisher::default();
-    virgin_coordinator("case")
-        .capture(&to_request(&valid_full_input(), 0), &mut publisher)
+    let report = coordinator(owner)
+        .capture(&request, &mut publisher)
         .expect("closed bundle captures");
+    assert_eq!(report.receipt_identity, Some(report.operation_id.clone()));
+    assert_eq!(report.suspended_operation_count, 1);
     assert_eq!(publisher.publishes.len(), 1);
 }
 
@@ -1181,8 +1218,10 @@ fn suspended_unresolved_distinguished_from_incoherent() {
     // receipt reference. The observed suspended frontier is reported beside it
     // in its own field, not smuggled into the identity as a marker string.
     let request = to_request(&valid_full_input(), 1);
+    let owner_label = format!("w4-959-12-complete-{}", std::process::id());
+    let owner = purge_owner(&request.purge_ledger, &owner_label);
     let mut publisher = MemPublisher::default();
-    let report = virgin_coordinator("case")
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("bounded unresolved with full evidence completes");
     assert_eq!(report.state, CaptureState::Complete);
@@ -1196,7 +1235,8 @@ fn suspended_unresolved_distinguished_from_incoherent() {
     incoherent.ors_snapshot = Some(ors_fence(&foreign, vec!["op-pending-959-1".to_owned()]));
     let incoherent_request = to_request(&incoherent, 1);
     let mut publisher = MemPublisher::default();
-    let refused = virgin_coordinator("case")
+    let incoherent_owner_label = format!("w4-959-12-incoherent-{}", std::process::id());
+    let refused = virgin_coordinator(&incoherent_owner_label)
         .capture(&incoherent_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1216,7 +1256,7 @@ fn suspended_unresolved_distinguished_from_incoherent() {
 // WORK_UNIT_CASE: 959/13
 #[test]
 fn config_purge_build_and_forensic_audit_ceilings_retained() {
-    let request = to_request(&valid_full_input(), 0);
+    let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher::default();
     // A full input carries one purge entry, so the bound owner is seeded with
     // that entry and the declared position is the owner's own value.
@@ -1262,9 +1302,10 @@ fn config_purge_build_and_forensic_audit_ceilings_retained() {
 // WORK_UNIT_CASE: 959/14
 #[test]
 fn no_plaintext_keys_or_live_database_exported() {
-    let request = to_request(&valid_full_input(), 0);
+    let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher::default();
-    let report = virgin_coordinator("case")
+    let owner = purge_owner(&request.purge_ledger, "w4-959-14-positive");
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("full capture completes");
     let bytes = &publisher.publishes[0].2;
@@ -1334,9 +1375,10 @@ fn real_bundle_api_with_allowed_revalidation() {
 // WORK_UNIT_CASE: 959/16
 #[test]
 fn one_publication_binds_archive_and_receipt() {
-    let request = to_request(&valid_full_input(), 0);
+    let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher::default();
-    let report = virgin_coordinator("case")
+    let owner = purge_owner(&request.purge_ledger, "w4-959-16-positive");
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("capture completes");
     assert_eq!(
@@ -1362,12 +1404,13 @@ fn one_publication_binds_archive_and_receipt() {
 // WORK_UNIT_CASE: 959/17
 #[test]
 fn lost_publication_response_reconciles_same_operation() {
-    let request = to_request(&valid_full_input(), 0);
+    let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher {
         drop_first: true,
         ..MemPublisher::default()
     };
-    let report = virgin_coordinator("case")
+    let owner = purge_owner(&request.purge_ledger, "w4-959-17-positive");
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("lost response still captures via reconcile");
     assert_eq!(publisher.publishes.len(), 1, "publish count stays 1");
@@ -1395,7 +1438,7 @@ fn bounds_refuse_before_publication_and_zero_budgets_are_invalid() {
     assert_eq!(tiny.budgets.max_artifacts, 1);
     // The fixture's tiny bounds (one page per owner, 64 bytes per owner and
     // total) refuse the full capture before any publication.
-    let mut request = to_request(&valid_full_input(), 0);
+    let mut request = to_request(&valid_full_input(), 1);
     request.plan.budgets = CaptureBudgets {
         max_pages_per_owner: tiny.budgets.max_events as u64,
         max_bytes_per_owner: tiny.budgets.max_bytes as u64,
@@ -1441,9 +1484,10 @@ fn bounds_refuse_before_publication_and_zero_budgets_are_invalid() {
 // WORK_UNIT_CASE: 959/19
 #[test]
 fn verify_only_never_restores_or_mutates() {
-    let request = to_request(&valid_full_input(), 0);
+    let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher::default();
-    let report = virgin_coordinator("case")
+    let owner = purge_owner(&request.purge_ledger, "w4-959-19-positive");
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("capture completes");
     // Verification-only takes no publisher at all: no publication is
