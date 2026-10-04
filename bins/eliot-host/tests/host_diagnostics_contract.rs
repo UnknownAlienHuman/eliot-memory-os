@@ -2640,9 +2640,19 @@ impl SinkRun {
             });
         tracing::subscriber::with_default(subscriber, emit);
         let admissions = outcomes.lock().unwrap().clone();
+        // BOTH byte counts add the healthy writer's own accounting, because the
+        // healthy arm's writer is `HealthyWriter` and never touches `sink`. Only
+        // `written` did so before: `healthy_offered` was incremented by
+        // `HealthyWriter::write` and then read NOWHERE, so a healthy run reported
+        // `offered == 0` beside a real `written`, and case 889/14's own
+        // `healthy.written == healthy.offered` obligation could never hold - it
+        // asserted a healthy sink retains every offered byte against a count
+        // that was always zero. The struct's contract is `written == offered`
+        // for a healthy sink and `written == 0` for a failing one, which holds
+        // only when both halves come from the writer that actually ran.
         Self {
             admissions,
-            offered: sink.offered_bytes(),
+            offered: sink.offered_bytes() + *healthy_offered.lock().unwrap(),
             written: sink.written_bytes() + *healthy_written.lock().unwrap(),
         }
     }
@@ -3235,11 +3245,18 @@ fn diagnostic_bounds_and_queue_admission_are_honest_about_truncation_and_drops()
     let (detail_records, in_bound_records) =
         assert_bounding_precedes_formatting_on_the_emission_path(&fixtures, tail);
 
-    // Nothing retained above may carry the removed marker, and the bounded
-    // prefixes must stay inside the two declared caps.
+    // Nothing retained from a genuinely CUT input may carry the removed marker,
+    // and the bounded prefixes must stay inside the two declared caps.
+    //
+    // `retained_marked_field` is deliberately NOT in the absence list: it comes
+    // from `marked_at_cap`, which measures exactly at the field cap with BOTH
+    // markers inside the boundary, so nothing was removed and the helper has
+    // already proved `!truncated()` and `text() == input`. Demanding the tail's
+    // absence from it asserted the opposite of its own premise - it could only
+    // pass for a product that dropped input the cap does not license it to drop
+    // - so it is checked against the retention obligation instead.
     for (retained, cap, label) in [
         (&retained_field, field_cap, "field"),
-        (&retained_marked_field, field_cap, "field"),
         (&retained_detail, detail_cap, "detail"),
     ] {
         assert!(
@@ -3252,6 +3269,17 @@ fn diagnostic_bounds_and_queue_admission_are_honest_about_truncation_and_drops()
             retained.len()
         );
     }
+    assert!(
+        retained_marked_field.len() <= field_cap,
+        "the at-cap marked field must stay within the field cap, got {} bytes for a \
+         {field_cap}-byte cap",
+        retained_marked_field.len()
+    );
+    assert!(
+        retained_marked_field.contains(&head) && retained_marked_field.contains(tail),
+        "a marker-bearing field measuring exactly at the cap keeps BOTH markers, because nothing \
+         lies past the boundary to remove; got {retained_marked_field:?}"
+    );
     assert!(
         retained_head_at_cap.ends_with(&head),
         "the input of exactly the detail cap must keep its whole tail: {retained_head_at_cap}"
@@ -3481,17 +3509,30 @@ fn assert_the_detail_surface_is_bounded_honestly(fixtures: &Case10Fixtures) -> (
 
     // Exactly the cap: 1024 pad bytes, and again with both markers. Neither is
     // cut, and neither reports truncation, which is the `>=`-versus-`>`
-    // falsifier for this surface. Neither may smuggle back what was removed,
-    // either: the removed tail begins past the cap boundary, so it is absent
-    // from what a correct cut retains.
-    for at_cap in [&fixtures.exact_detail, &fixtures.marked_detail_at_cap] {
-        let retained = assert_an_exactly_at_cap_detail_is_not_cut(at_cap, cap);
-        assert!(
-            !retained.contains(tail),
-            "an exactly-at-cap detail must retain its whole input, got a retained text that drops \
-             the marker {tail:?}"
-        );
-    }
+    // falsifier for this surface.
+    // TWO obligations, which the single loop here used to force onto one input.
+    // `exact_detail` is pure pad, so a correct non-cut retains no marker at all.
+    // `marked_detail_at_cap` carries BOTH markers and measures exactly at the
+    // cap, so its tail marker sits INSIDE the boundary and a correct non-cut
+    // must KEEP it. The loop demanded the tail's absence from both, which
+    // contradicts the assertion the loop had just proved one line earlier -
+    // `bounded.text() == exact` - and could only ever be satisfied by a product
+    // that dropped input it is required to retain. The removed-tail obligation
+    // belongs to the over-cap arm below, where the tail really is past the
+    // boundary.
+    let retained_pad = assert_an_exactly_at_cap_detail_is_not_cut(&fixtures.exact_detail, cap);
+    assert!(
+        !retained_pad.contains(head) && !retained_pad.contains(tail),
+        "an exactly-at-cap pad detail must retain its whole input and invent no marker, got \
+         {retained_pad:?}"
+    );
+    let retained_marked =
+        assert_an_exactly_at_cap_detail_is_not_cut(&fixtures.marked_detail_at_cap, cap);
+    assert!(
+        retained_marked.contains(head) && retained_marked.contains(tail),
+        "a marked detail measuring exactly at the cap keeps BOTH markers, because nothing lies \
+         past the boundary to remove; got {retained_marked:?}"
+    );
 
     let retained_at_cap = assert_a_multibyte_cut_lands_on_a_character_boundary(cap, tail);
     assert!(
@@ -7547,8 +7588,16 @@ fn assert_the_allowed_diff_is_exactly_this_cards_edit_scope() {
         reported.len(),
         "the allowed diff must not name a path twice, got: {reported:?}"
     );
+    // This obligation is a SET one - "EXACTLY these two files, each once" - and
+    // the duplicate check above can only be read that way, which is why the
+    // reported side is sorted and deduped. The expected side is declared in
+    // reading order (this contract test, then its fixture), so comparing a
+    // sorted list against it positionally failed on ordering alone while both
+    // sides held the same two paths. It is sorted here for the same reason.
+    let mut expected_scope = card_edit_scope;
+    expected_scope.sort_unstable();
     assert_eq!(
-        reported_set, card_edit_scope,
+        reported_set, expected_scope,
         "the allowed diff must be EXACTLY the two test files this card may edit - this \
          contract test and its fixture - and nothing else: the four product paths under \
          bins/eliot-host/src/ are explicitly out of this card's EDIT scope and must not be \
@@ -7623,11 +7672,20 @@ fn assert_the_fixture_cases_enumerate_exactly_this_files_markers() {
         declared.len(),
         "the fixture must declare each case id exactly once, got: {declared:?}"
     );
+    // This obligation is a SET one - "exactly 1..=22, each once" - and the
+    // duplicate check above can only be read that way, which is why `deduped`
+    // is sorted. Sorting is LEXICOGRAPHIC on the marker string, so `889/10`
+    // follows `889/1`, while the expected side below was generated in NUMERIC
+    // order; comparing the two positionally failed on ordering alone with both
+    // sides holding the same 22 markers. The expected side is therefore sorted
+    // the same way, which keeps the comparison a set comparison and leaves a
+    // genuinely missing or repeated id still failing.
+    let mut expected_ids = (1..=DECLARED_WORK_UNIT_CASE_COUNT as u64)
+        .map(|id| format!("889/{id}"))
+        .collect::<Vec<_>>();
+    expected_ids.sort_unstable();
     assert_eq!(
-        deduped,
-        (1..=DECLARED_WORK_UNIT_CASE_COUNT as u64)
-            .map(|id| format!("889/{id}"))
-            .collect::<Vec<_>>(),
+        deduped, expected_ids,
         "the fixture's case ids must be exactly 1..={DECLARED_WORK_UNIT_CASE_COUNT}, each once"
     );
 

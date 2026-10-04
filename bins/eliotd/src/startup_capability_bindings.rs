@@ -50,7 +50,7 @@
 //! an admitted request requires, so a capability that did not bind stays
 //! visibly not-ready instead of being reported as ready.
 
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{EpochId, RequestMetadata};
 
 use crate::AgentFabricDescriptor;
 
@@ -149,6 +149,19 @@ pub enum RetainedStartupBinding {
     /// semantic Session refer to the same State Fence/epoch (I1.8), so the
     /// retained proof names which epoch it belongs to instead of reading as
     /// current for every epoch the process ever lived through.
+    ///
+    /// #2560 item 4: `authority_epoch` is the contract's own [`EpochId`], not a
+    /// bare sequence. I1.8 says "the same State Fence/epoch", and an epoch in
+    /// this contract is the `(lineage_id, sequence)` tuple — the epoch-sequence
+    /// alone is not an identity, because two lineages issue unrelated sequences
+    /// at the same value (I6.10 exact-match; [`EpochId::is_same_authority`] is
+    /// the exact-tuple rule). A retained proof admitted under
+    /// `(lineage-A, sequence 1)` therefore cannot read as current after the
+    /// owner rebound to `(lineage-B, sequence 1)`, which is precisely the
+    /// "an old connection string alone is not current-generation evidence" case
+    /// the audit names. Storing the tuple here is what lets the comparison be
+    /// exact instead of scalar; keeping the scalar would move the same defect
+    /// one layer down.
     OwnerSession {
         /// Validated `sid=..;session=..` binding string.
         session_binding: String,
@@ -157,8 +170,9 @@ pub enum RetainedStartupBinding {
         /// Resource generation the authenticated owner session was proven
         /// under.
         generation: u64,
-        /// Authority epoch the authenticated owner session was proven under.
-        authority_epoch: u64,
+        /// Exact authority epoch the authenticated owner session was proven
+        /// under: the full `(lineage_id, sequence)` tuple, not the sequence.
+        authority_epoch: EpochId,
     },
     /// The verified canonical notification page noted into the board.
     NotificationSnapshot {
@@ -215,7 +229,8 @@ impl RetainedStartupBinding {
                 generation,
                 authority_epoch,
             } => format!(
-                "session={session_binding} connection={connection_id} generation={generation} authority_epoch={authority_epoch}"
+                "session={session_binding} connection={connection_id} generation={generation} authority_epoch={}/{}",
+                authority_epoch.lineage_id, authority_epoch.sequence
             ),
             Self::NotificationSnapshot { record_count } => {
                 format!("record_count={record_count}")

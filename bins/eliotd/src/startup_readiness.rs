@@ -1465,15 +1465,27 @@ fn is_generation_scoped(capability: DeclaredStartupCapability) -> bool {
 /// comparison is unchanged; only the epoch comparison stopped discarding the
 /// lineage.
 ///
-/// Two variants cannot be compared exactly and are NOT claimed to be:
-/// [`RetainedStartupBinding::AgentFabric`] and
-/// [`RetainedStartupBinding::OwnerSession`] carry bare `u64` scalars and no
-/// epoch object, so there is no lineage in them to compare. Giving them one
-/// means changing `RetainedStartupBinding` in
-/// `startup_capability_bindings.rs`, which is outside this issue's two-file
-/// scope. They keep the scalar comparison and are additionally covered by the
-/// projection-level owner token, which now does advance on a rebind; the
-/// residual gap is recorded rather than papered over.
+/// #2560 item 4: [`RetainedStartupBinding::OwnerSession`] no longer belongs to
+/// that list. It now carries the contract's own [`EpochId`] — the full
+/// `(lineage_id, sequence)` tuple — and is compared here through
+/// [`EpochId::is_same_authority`] exactly like the two Dreamer routes above,
+/// because I1.8's "the same State Fence/epoch" names the epoch, not the
+/// sequence. This closes the one mandatory slot's residual out of #2647, which
+/// recorded it as unwritable only because `startup_capability_bindings.rs` was
+/// outside that issue's two-file scope; #2560 owns that file and its audit item
+/// 4 asks for exactly this ("Bind `OwnerSessionBinding` to the exact
+/// generation/epoch/State Fence it proves … An old connection string alone is
+/// not current-generation evidence").
+///
+/// One variant still cannot be compared exactly and is NOT claimed to be:
+/// [`RetainedStartupBinding::AgentFabric`] wraps an
+/// [`AgentFabricDescriptor`](crate::AgentFabricDescriptor) that holds bare `u64`
+/// scalars and no epoch object, so there is no lineage in it to compare. Giving
+/// it one means changing the descriptor in `agent_fabric.rs` and its builder in
+/// `lib.rs`, which no audit item on this issue asks for. It keeps the scalar
+/// comparison and remains additionally covered by the projection-level owner
+/// token, which does advance on a rebind; the residual gap is recorded rather
+/// than papered over.
 fn retained_matches_owner_generation(
     retained: &RetainedStartupBinding,
     owner: &CoreOwnerState,
@@ -1495,7 +1507,10 @@ fn retained_matches_owner_generation(
             generation,
             authority_epoch,
             ..
-        } => *generation == owner.generation() && *authority_epoch == owner.authority_epoch(),
+        } => {
+            *generation == owner.generation()
+                && authority_epoch.is_same_authority(owner.identity.authority_epoch())
+        }
         RetainedStartupBinding::NotificationSnapshot { .. }
         | RetainedStartupBinding::SkillToolSource { .. }
         | RetainedStartupBinding::SkillToolBasis { .. } => true,
