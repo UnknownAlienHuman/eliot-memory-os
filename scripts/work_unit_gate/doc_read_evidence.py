@@ -138,6 +138,16 @@ BLOCK_END = "<!-- eliot-doc-read-evidence:v2:end -->"
 #   "Reject placeholder evidence in metadata" are accepted. That tolerance lives
 #   only in the descriptive arm, so the machine arm keeps the strict behaviour
 #   its callers already rely on.
+#
+#   MEASURED CEILING of that rule, so it is not read as broader than it is. It
+#   fires only when the value names one of the ten fixed whole-value literals or
+#   an angle slot, and only one content word is needed to defeat it: "placeholder
+#   fix", "the topic is tbd" and "see receipts for details about issue 2965" are
+#   all accepted today, while an evasion that names no listed literal is untouched
+#   ("n/a", "TODO: fix later", "see the diff"). Both are accepted residuals under
+#   the card's rule, which refuses a value whose ENTIRE informational content is
+#   an evasion plus filler; both are recorded rather than silently widened,
+#   because the trigger set is a contract decision this module does not own.
 _PLACEHOLDER_TOKENS = (
     "see receipt",
     "as listed above",
@@ -172,6 +182,19 @@ _PROSE_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 # reader to another artifact instead of stating the property. A value whose
 # residue is empty once the evasion token and slot references are removed is
 # an evasion plus filler, not content.
+#
+# MEASURED SCOPE, so this list is not read as stronger than it is. These words
+# are consulted only AFTER ``_EVASION_PROSE_RE`` (the ten fixed whole-value
+# literals) or ``_SLOT_REFERENCE_RE`` (an angle slot) fires, so the pointer and
+# procedural entries bite only for a value that ALSO names a listed token or a
+# slot. A pointer evasion naming none is still accepted: "n/a", "TODO: fix later",
+# "see the diff", "Review the PR for details" and "recorded in the thread above"
+# all pass today. Widening the trigger set beyond the ten literals plus angle
+# slots is a contract decision; it is recorded, not guessed at here.
+#
+# One measured asymmetry: ``_EVASION_PROSE_RE`` has no word boundary, so
+# "placeholders" matches the token, leaves residue "s", and "s" is not filler -
+# "placeholders" is accepted while the bare "placeholder" is refused.
 _PROSE_FILLER_WORDS = frozenset({
     "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and",
     "any", "are", "around", "as", "at", "attachment", "be", "because", "been",
@@ -2930,11 +2953,30 @@ PLACEHOLDER_DISCUSSING_TOPIC = "Reject placeholder evidence in metadata"
 # ``topic`` sits inside the hashed route core (``docs_router_core.route_payload``)
 # and the read receipt id is derived from the route id, so a topic-only mutation
 # applied to a body computed for ANOTHER topic cannot yield its own valid
-# receipts: it yields ROUTE_RECEIPT_MISMATCH, never a PASS. The honest way to run
-# a topic mutation that must pass is to compute a genuinely valid envelope FOR
-# that topic and mutate that; run_acceptance does exactly this for the mutation
-# names listed here and counts those rows in the reported total.
+# receipts: it yields ROUTE_RECEIPT_MISMATCH, never a PASS. The only body a
+# topic mutation can validly start from is one whose receipts were computed for
+# that same topic, and on such a body the mutation is a no-op. So these names
+# select the INPUT for an expectation row rather than adding a case:
+# ``run_acceptance`` builds a genuinely valid envelope for the listed topic and
+# runs the row against it.
+#
+# HONEST LIMIT OF THAT ROW, measured by restoring the pre-change predicate and
+# re-running this suite: ``placeholder-discussing-topic`` PASSES under the OLD
+# predicate too, so it is NOT evidence for this change - it is tautological as a
+# demonstration. It does genuinely execute ``verify``, and ``verify`` does apply
+# ``_text`` to the topic before recomputing any receipt, so the row would catch a
+# future over-broad descriptive arm; that is a forward guard, not proof. The
+# discriminating evidence for this change is ``off-literal-placeholder-topic``,
+# which fails under the old predicate, plus the direct ``descriptive-predicate``
+# assertions in ``run_acceptance``.
 _TOPIC_SCOPED_MUTATIONS = ("placeholder_discussing_topic",)
+# The topic each entry above is validated against, keyed by the same mutation
+# name. A KeyError here fails the suite loudly, which is the point: a name added
+# to ``_TOPIC_SCOPED_MUTATIONS`` without a topic cannot silently borrow another
+# row's body.
+_TOPIC_SCOPED_MUTATION_TOPICS = {
+    "placeholder_discussing_topic": PLACEHOLDER_DISCUSSING_TOPIC,
+}
 
 ACCEPTANCE_CASES: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
     ("empty", "pr_2963_empty.md", EvidenceFailure.EMPTY_DOCUMENTATION_EVIDENCE,
@@ -3031,8 +3073,9 @@ def run_acceptance(_live_root: Path) -> int:
     Prints the exact typed failure code (or PASS) per case. Exits nonzero only
     when a case did not behave as the issue requires. ``cases=N`` counts every
     executed case: the committed body fixtures, the runtime mutation
-    expectations, the concurrent-movement cases and the topic-scoped bodies
-    computed for the topic mutations named in ``_TOPIC_SCOPED_MUTATIONS``.
+    expectations and the concurrent-movement cases. A topic-scoped body is not
+    an extra case: it selects the input for one expectation row, which is
+    already counted in ``expectations``.
     """
     del _live_root
     root, base, candidate, _ = _build_acceptance_repo()
@@ -3042,11 +3085,12 @@ def run_acceptance(_live_root: Path) -> int:
         # A topic mutation that must PASS cannot run against ``valid_body``:
         # ``topic`` is inside the hashed route core, so the receipts it implies
         # differ and the row would observe ROUTE_RECEIPT_MISMATCH. Each such row
-        # therefore runs against an envelope genuinely computed for its own
-        # topic, and the mutation is then applied to that envelope, which is
-        # what the row actually demonstrates.
+        # therefore runs against an envelope genuinely computed for the topic
+        # NAMED BY THAT MUTATION. The mapping is per mutation name on purpose: a
+        # single hardcoded topic for every entry would silently run a second
+        # entry against the wrong body.
         topic_valid_bodies = {
-            mutation: _valid_envelope(root, base, candidate, PLACEHOLDER_DISCUSSING_TOPIC)
+            mutation: _valid_envelope(root, base, candidate, _TOPIC_SCOPED_MUTATION_TOPICS[mutation])
             for mutation in _TOPIC_SCOPED_MUTATIONS
         }
         expectations: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
@@ -3129,6 +3173,44 @@ def run_acceptance(_live_root: Path) -> int:
         # real verifier entry point.
         concurrent_root, concurrent_ran = _run_concurrent_acceptance(surprising)
         total += concurrent_ran
+        # Direct discriminating assertions on the descriptive discriminator.
+        #
+        # WHY THESE EXIST: ``placeholder-discussing-topic`` is tautological as
+        # evidence for this change - it passes under the pre-change predicate too,
+        # measured by restoring the old predicate and re-running this suite. These
+        # assertions are what distinguish old from new, and they pin the accepted
+        # residuals so neither direction can silently drift.
+        for refuse, accept in (
+            ("see receipts for details", "Reject placeholder evidence in metadata"),
+            ("TBD pending review", "Handle Vec<T> in the response conversion"),
+            ("placeholder text pending review", "Implement typed fallback response"),
+            ("the <topic> is recorded above", "Reject unresolved template placeholders"),
+        ):
+            for value, want_refusal in ((refuse, True), (accept, False)):
+                got = _is_placeholder_prose(value)
+                if got is not want_refusal:
+                    surprising.append(
+                        f"descriptive-predicate({value!r}): got {got}, want {want_refusal}"
+                    )
+                    print(f"  descriptive-predicate({value!r}): WRONG {got} want {want_refusal}")
+                else:
+                    print(
+                        f"  descriptive-predicate({value!r}): "
+                        f"{'REFUSED' if got else 'ACCEPTED'} as required"
+                    )
+                    total += 1
+        # Measured accepted residuals. These are NOT bugs to fix here: the card
+        # refuses a value whose ENTIRE informational content is an evasion plus
+        # filler, and each of these retains a content word or names no listed
+        # literal. They are asserted so any future widening of the trigger set is
+        # a visible decision rather than a silent behaviour change.
+        for residual in ("placeholder fix", "n/a", "see the diff", "placeholders"):
+            if _is_placeholder_prose(residual):
+                surprising.append(f"accepted-residual({residual!r}): unexpectedly refused")
+                print(f"  accepted-residual({residual!r}): UNEXPECTED-REFUSAL")
+            else:
+                print(f"  accepted-residual({residual!r}): ACCEPTED as recorded")
+                total += 1
         if surprising:
             print(f"DOC_READ_EVIDENCE_ACCEPTANCE: FAIL cases={total}: {'; '.join(surprising)}")
             return 1
