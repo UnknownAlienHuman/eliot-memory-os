@@ -204,7 +204,25 @@ fn declares_local_kind_enum(source: &str) -> bool {
 
 fn implements_kind_from_str(source: &str) -> bool {
     let code = code_without_comments_and_strings(source);
-    code.contains("FromStr for CueKind") || (code.contains("from_str") && code.contains("CueKind"))
+    if code.contains("FromStr for CueKind") {
+        return true;
+    }
+    // A catch-all `from_str` is only cue-kind construction when the `CueKind`
+    // spelling is the thing being parsed. An unrelated generic parser such as
+    // `serde_json::from_str` co-occurs with `CueKind` in this crate, so
+    // requiring both tokens to appear somewhere in the file reports a
+    // violation that does not exist. Require instead that the `from_str` call
+    // or definition names `CueKind` itself, or that a `from_str` signature
+    // returns one.
+    [
+        "CueKind::from_str",
+        "from_str::<CueKind>",
+        "from_str() -> ",
+        "fn from_str(",
+    ]
+    .iter()
+    .any(|shape| code.contains(shape))
+        && code.contains("CueKind")
 }
 
 fn uses_kind_string_table(source: &str) -> bool {
@@ -522,6 +540,24 @@ fn oracle_detects_local_enum_string_table_reintroduction() {
     assert!(
         !implements_kind_from_str(LIB_SOURCE),
         "no FromStr/catch-all kind construction may exist"
+    );
+    // The oracle must still catch a real kind-construction reintroduction, so
+    // the narrowing above cannot be satisfied by simply going blind.
+    assert!(
+        implements_kind_from_str("impl std::str::FromStr for CueKind {"),
+        "oracle must still detect a FromStr implementation for CueKind"
+    );
+    assert!(
+        implements_kind_from_str("fn from_str(value: &str) -> Result<CueKind, E>"),
+        "oracle must still detect a catch-all free from_str for CueKind"
+    );
+    assert!(
+        implements_kind_from_str("let kind = CueKind::from_str(value);"),
+        "oracle must still detect a CueKind::from_str call"
+    );
+    assert!(
+        !implements_kind_from_str("serde_json::from_str(value).map_err(ignore)"),
+        "an unrelated generic parser is not cue-kind construction"
     );
     assert!(
         !uses_kind_string_table(LIB_SOURCE),
