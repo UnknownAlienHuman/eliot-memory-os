@@ -371,19 +371,19 @@ pub fn agent_candidate_input_schema() -> Value {
 ///   field — `schema_version` and its constant already exist on this wire.
 ///   BLOCKED-BY: the *contract* is generated from this type, and
 ///   `eliot.observe` is published in the MCP tool catalogue whose
-///   `schema_sha256` and required-key set are the agent-visible wire. Making a
+///   `inputSchema` and its required-key set are the agent-visible wire. Making a
 ///   previously omittable key required changes `tools/list` output bytes for
 ///   every connected agent, which is a major incompatibility under APPENDIX-P
 ///   and needs the catalogue owner, not this crate's file scope.
 /// - `hint`'s `alias = "kind"` is a genuine W4 defect: the current decoder
-///   trial-accepts the same classification hint under two names, and APPENDIX-P
-///   requires the current decoder to fail closed on a closed control variant.
-///   But removing it breaks any producer still sending `kind`, and #708 forbids
-///   compensating with an alias, `untagged` or a default. BLOCKED-BY: renaming
-///   owner is `eliot-mcp`'s request-validation surface
-///   (`crates/surfaces/eliot-mcp/src/core.rs::decode_protected_request_bytes`),
-///   outside this issue's exclusive mutable scope, and it needs an integration
-///   turn with a named compatibility boundary.
+///   trial-accepts the same closed control variant under two names, which
+///   APPENDIX-P line 13 ("closed control variants fail when unknown") forbids.
+///   NO named legacy boundary accepts `kind` for this shape anywhere in the
+///   workspace — no versioned type, no migration descriptor wired into a
+///   decoder, no legacy reader — so the alias is the only way that spelling
+///   decodes: an unsanctioned trial-accept, not a retained compatibility row.
+///   Owner: the generated inventory row, `eliot-app` coordinating; the field
+///   doc below names the real decoder, publisher and inventory owner.
 ///
 /// The remaining `#[serde(default)]` fields stay: `task_id`,
 /// `expected_reuse_note` and `write_id` are genuinely optional agent choices,
@@ -397,26 +397,26 @@ pub struct ObserveInput {
     /// Optional first-pass classification hint. Classification never grants
     /// promotion or task authority.
     ///
-    /// W4 DEFECT, unchanged in this increment and recorded here so it is not
-    /// mistaken for an intentional compatibility alias. `alias = "kind"` makes
-    /// the *current* decoder trial-accept the same closed control variant under
-    /// two names, and APPENDIX-P requires the current decoder to fail closed on
-    /// a closed control variant while admitting aliases only at a
-    /// migration/compatibility boundary. The two spellings are also not
-    /// semantically identical here: this is an agent-supplied classification
-    /// hint on an observation, while `kind` is the Cue-kind wire name owned by
-    /// `ul/cue.rs` (#706/#831) and already retired through a named legacy
-    /// boundary. So a payload can be accepted under a name that means something
-    /// else in the sibling contract.
+    /// W4 DEFECT, unchanged in this increment and recorded here so it is not mistaken for an intentional compatibility alias.
+    /// `alias = "kind"` makes the *current* decoder trial-accept the same closed control variant under two names, while APPENDIX-P line 13
+    /// requires the current decoder to fail closed on a closed control variant and admits aliases only at a named migration/compatibility
+    /// boundary. No such boundary exists for this shape anywhere in the workspace — no versioned type, no migration descriptor wired into a
+    /// decoder, no legacy reader — so the alias is the ONLY way that spelling decodes: an unsanctioned trial-accept, not a retained
+    /// compatibility row. `deny_unknown_fields` still refuses every other unknown key, so unknown key/refuse stays distinct.
     ///
-    /// Why it is not corrected here: removing the alias breaks any producer
-    /// still sending `kind`, and #708 forbids compensating with a second alias,
-    /// `untagged`, or a default helper. Required owner is `eliot-mcp`'s
-    /// request-validation surface —
-    /// `crates/surfaces/eliot-mcp/src/core.rs::decode_protected_request_bytes` —
-    /// outside this issue's exclusive mutable scope, and it needs an
-    /// integration turn with a named compatibility boundary. Proof ceiling for
-    /// the recorded defect: source-attested only, no executed test in this lane.
+    /// The owner this record previously named is wrong and could not be the owner: `crates/surfaces/eliot-mcp/Cargo.toml` does not depend on
+    /// `eliot-types`; `decode_protected_request_bytes` is `crates/surfaces/eliot-mcp/src/contract.rs:953`, not `src/core.rs`; and that crate's own
+    /// `ObserveInput` (`contract.rs:330`) is a different, kind-tagged type that refuses `{"kind":"reuse_candidate"}` (`tests/contract.rs:664`).
+    /// Real decoder of THIS type: `crates/eliot-app/src/mcp_stdio/verification.rs:26` (`serde_json::from_value::<ObserveInput>`), reached from
+    /// `crates/eliot-app/src/mcp_stdio/dispatch.rs:910`. Real schema publisher: `crates/eliot-app/src/mcp_stdio/catalog.rs:1180` →
+    /// `crates/eliot-app/src/mcp_stdio/protocol_support.rs::observe_schema` (:111), a bare `inputSchema` with no schema digest and no external
+    /// required-key binding. No in-tree producer sends the legacy spelling: the only writer of that key emits canonical `"hint"`
+    /// (`verification.rs:86`), and `schemars` never reads `alias`, so the generated JSON Schema bytes are identical with or without it.
+    ///
+    /// Real owner: the generated inventory row (`crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`, `owner = "#692"`,
+    /// `repair_child = "#933"`, `has_alias = true`), with `eliot-app` coordinating; that inventory row is the only artefact needing regeneration.
+    /// Retained verbatim because #708 does not correct it in this increment, and no second alias, `untagged` or default is added. Proof ceiling:
+    /// source-attested only, no executed test in this lane.
     #[serde(default, alias = "kind")]
     pub hint: ObserveHint,
     /// Optional task selector. An absent task keeps the capture cold.
@@ -440,7 +440,7 @@ pub struct ObserveInput {
     /// BLOCKED-BY, unchanged in this increment and recorded here so the field is
     /// not mistaken for a retained internal default. `schema_version` is
     /// contract-required, and `dispatch_observe`
-    /// (`crates/eliot-app/src/mcp_stdio/verification.rs::dispatch_observe`, :26)
+    /// (`crates/eliot-app/src/mcp_stdio/verification.rs::dispatch_observe`, :27)
     /// already pins `OBSERVE_INPUT_SCHEMA_VERSION` and rejects every other
     /// value, so the wire version is enforced — just later than a required key
     /// would be. The `default = "default_observe_schema_version"` helper is what
@@ -453,20 +453,20 @@ pub struct ObserveInput {
     /// (`crates/eliot-app/src/mcp_stdio/protocol_support.rs::observe_schema` →
     /// `eliot_types::observe_input_schema`, :112). Making a previously
     /// omittable key required moves the published schema and therefore the
-    /// `schema_sha256` and `required` set that every connected agent sees
-    /// through `tools/list` (`crates/surfaces/eliot-mcp/src/schema.rs:60`
-    /// `descriptor::<ObserveInput>("eliot.observe", ..)` → `canonical_tool_schemas`
-    /// → `published_mcp_tool_surface` → `tools/list`). Under APPENDIX-P that is
-    /// a major incompatibility and it is owned by `eliot-mcp`, outside this
-    /// issue's exclusive mutable scope, and it needs an integration turn.
+    /// `inputSchema` `required` set every connected agent sees through `tools/list`
+    /// (`crates/eliot-app/src/mcp_stdio/dispatch.rs:226`, from `catalog.rs:1180`).
+    /// `crates/surfaces/eliot-mcp/src/schema.rs` does not publish THIS type: its
+    /// `descriptor::<ObserveInput>("eliot.observe", ..)` at `:72` describes eliot-mcp's own
+    /// kind-tagged type, and no `schema_sha256` reaches the eliot-app catalogue. A
+    /// requiredness change is still an APPENDIX-P major incompatibility owned by `eliot-app`, not this crate's file scope.
     ///
     /// W4 disposition: NOT a compatible requiredness correction, and NOT an
     /// isolated old-version representation either. No `schema_version` field is
     /// invented, and no alias/`untagged`/helper-default compensation is added;
     /// the version field already exists on this wire and the current version is
-    /// already rejected by `dispatch_observe`. Required owner:
-    /// `crates/surfaces/eliot-mcp` (`src/schema.rs::descriptor`, `src/core.rs`
-    /// request validation) plus the `eliot.observe` catalogue bump. Base SHA of
+    /// already rejected by `dispatch_observe`. Required owner is the generated
+    /// inventory row (`owner = "#692"`, `repair_child = "#933"`) with the
+    /// `eliot-app` `eliot.observe` catalogue as coordinating surface. Base SHA of
     /// this branch's merge-base with `origin/main` is recorded in the #708
     /// report.
     #[serde(default = "default_observe_schema_version")]
