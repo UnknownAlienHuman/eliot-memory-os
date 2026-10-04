@@ -7,7 +7,12 @@
 ;; (including the honest `abi-digest`). Exactly ONE `(data ...)` string
 ;; differs from `dreamer-cycle.wat`: `package-id` reports
 ;; `eliot:current@0.2.0` instead of the frozen
-;; `crate::typed_bindings::TYPED_PACKAGE_ID` `eliot:current@0.1.0`.
+;; `crate::typed_bindings::TYPED_PACKAGE_ID` `eliot:current@0.1.0`. The only
+;; other executable difference from that sibling is where the `describe`
+;; retarea sits: base 0x0c00 here, its eleven core words ending 0x0c2b, against
+;; `dreamer-cycle.wat`'s 0x0600. The type surface, the `$copy` helper,
+;; `realloc`, the whole `step` body, the other four `(data ...)` segments and
+;; the export set are identical to that sibling.
 ;;
 ;; `validate_descriptor` (typed_execution.rs:527-579) passes the world check at
 ;; :532, then compares the reported package at :537 and returns
