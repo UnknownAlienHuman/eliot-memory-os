@@ -3952,10 +3952,11 @@ fn supervision_generation() -> ResourceGeneration {
 fn supervision_fixture(suffix: &str) -> SupervisionFixture {
     let root = unique_root(suffix);
     // The disposable provider keeps its seed below the exact repository-local
-    // contour, so both contour ancestors must already exist before a key is
-    // prepared.
-    let contour = root.join(".eliot-dev").join("state");
-    std::fs::create_dir_all(&contour).expect("portable-dev state contour");
+    // contour, so the whole contour must already exist before a key is
+    // prepared: the provider refuses a missing ancestor rather than creating
+    // one for a repository-local contour it does not own.
+    let contour = root.join(".eliot-dev").join("state").join("supervision");
+    std::fs::create_dir_all(&contour).expect("portable-dev supervision contour");
     let repository_identity = UserOwnedRootLease::open_existing(&root)
         .expect("portable-dev repository root lease")
         .identity();
