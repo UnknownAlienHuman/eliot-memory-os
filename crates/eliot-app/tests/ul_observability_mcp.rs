@@ -565,8 +565,6 @@ fn write_test_config(
     let wal = slash(&runtime.join("control").join("control.redb"));
     let blobs = slash(&runtime.join("blobs"));
     let storage = format!("rocksdb:{}", slash(&runtime.join("unused-rocksdb")));
-    let repo = repository_root()?;
-    let surql = slash(&repo.join("crates/eliot-store/src/surql"));
     let exe = slash(surreal_exe);
     let bind = format!("127.0.0.1:{port}");
     let endpoint = format!("ws://127.0.0.1:{port}/rpc");
@@ -615,9 +613,6 @@ path = "{wal}"
 
 [blob_store]
 root = "{blobs}"
-
-[store]
-surql_dir = "{surql}"
 "#
     );
     fs::write(config_path, config)?;
@@ -729,14 +724,6 @@ fn wait_for_runtime_pid(path: &Path, pid: u32, timeout: Duration) -> TestResult 
         thread::sleep(Duration::from_millis(25));
     }
     Err(format!("daemon runtime report did not become ready for PID {pid}").into())
-}
-
-fn repository_root() -> TestResult<PathBuf> {
-    Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("repository root missing")?
-        .to_path_buf())
 }
 
 fn test_runtime_root() -> TestResult<PathBuf> {

@@ -3,8 +3,8 @@ use crate::{
     config::load_config,
     mcp_stdio, named_pipe_ipc,
     runtime_instance::{
-        RuntimeInstance, RuntimePublicationState, atomic_write_bytes, config_runtime_root,
-        default_config_path, store_root_from_storage,
+        RuntimeInstance, RuntimePublicationState, atomic_write_bytes, default_config_path,
+        store_root_from_storage,
     },
 };
 use anyhow::{Context, Result, bail};
