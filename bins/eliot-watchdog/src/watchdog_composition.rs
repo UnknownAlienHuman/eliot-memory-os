@@ -530,6 +530,44 @@ impl WatchdogComposition {
                                 &manifest,
                                 kernel.health_evidence(now_ms).as_ref(),
                             );
+                            // Issue #1755 (W6): the SAME closed interval also
+                            // projects into the shared
+                            // `ObservationCoverageManifest`, which until now
+                            // had no producer anywhere in the workspace. Both
+                            // identities come from the admitted Kernel port;
+                            // when either is unavailable the interval is a named
+                            // omission and no manifest is invented, so a
+                            // fabricated denominator can never reach evidence.
+                            let shared = crate::coverage_manifest_projection::
+                                publish_interval_coverage_manifest(
+                                    kernel.installation_identity(),
+                                    kernel.allowed_manifest_digest(),
+                                    &closed,
+                                );
+                            match shared {
+                                crate::coverage_manifest_projection::CoverageManifestOutcome::Published {
+                                    completeness,
+                                    streams,
+                                } => {
+                                    tracing::debug!(
+                                        event = "watchdog.shared_coverage_manifest_published",
+                                        observation = "published",
+                                        completeness = ?completeness,
+                                        streams = streams,
+                                        "shared ObservationCoverageManifest built from this interval"
+                                    );
+                                }
+                                crate::coverage_manifest_projection::CoverageManifestOutcome::Omitted(
+                                    reason,
+                                ) => {
+                                    tracing::debug!(
+                                        event = "watchdog.shared_coverage_manifest_omitted",
+                                        observation = "omitted",
+                                        reason = reason,
+                                        "no owner identity for the shared denominator; no manifest invented"
+                                    );
+                                }
+                            }
                         }
                         // I8.2 (#1755 W5): one published coverage interval is
                         // exactly one tick. Opening it here also reports a
