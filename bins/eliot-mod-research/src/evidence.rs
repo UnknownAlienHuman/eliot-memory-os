@@ -403,8 +403,17 @@ pub struct ProviderExecutionReceipt {
     pub cancellation_outcome: CancellationOutcome,
     /// Bounded secondary obligations left unresolved by the primary cause.
     pub undischarged: Vec<Obligation>,
-    /// Exact I7.20 reason code for this terminal disposition.
-    pub reason_code: &'static str,
+    /// Exact I7.20 reason code for this terminal disposition, or `None` for a
+    /// completed acquisition.
+    ///
+    /// Absent for `ProviderOutcome::Completed`: I7.20 reason codes describe
+    /// non-success dispositions, so a run that completed carries no failure
+    /// reason. It is not the empty string, because "no reason code" and "a
+    /// reason code whose value is blank" are different facts and only the
+    /// former is true of a success. It is not a success code either, because
+    /// this vocabulary defines no such code and inventing one would claim an
+    /// admission that only the owner can make.
+    pub reason_code: Option<&'static str>,
     /// Immutable raw provider evidence (stdout/stderr/exit/lineage digests).
     pub raw: RawProviderEvidence,
     /// Cancellation receipt, retained when cancellation was actually issued.
@@ -480,7 +489,10 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             evidence_observation_name(&self.stream_readback),
             cancellation_outcome_name(&self.cancellation_outcome),
             obligation_names(&self.undischarged),
-            self.reason_code,
+            // A completed acquisition renders `reason=none`, which is a stated
+            // absence rather than a blank field a reader could fill in with a
+            // code this receipt does not carry.
+            self.reason_code.unwrap_or("none"),
             self.raw.stdout.sha256.as_deref().unwrap_or("none"),
             optional_byte_count(self.raw.stdout.total_bytes),
             omission_name(self.raw.stdout.omission),
@@ -582,6 +594,11 @@ pub struct OwnerReconciliationAttempt {
 
 impl OwnerReconciliationAttempt {
     /// Records the owner's sealed answer to one served control operation.
+    ///
+    /// A verified non-success disposition is an *answer*, not a transport
+    /// failure, and it is recorded with the owner's own disposition and reason
+    /// code verbatim. Nothing here converts a refusal into a different refusal:
+    /// the reason code travels exactly as the owner sealed it.
     #[must_use]
     pub fn answered(
         control_operation: &'static str,
@@ -594,6 +611,47 @@ impl OwnerReconciliationAttempt {
             receipt_sha256: Some(receipt.receipt_digest.clone()),
             transport_failure: None,
         }
+    }
+
+    /// Returns whether this attempt asked a question about the operation's own
+    /// terminal state.
+    ///
+    /// `status`, `cancel` and `reconcile` do; `dispatch` does not. Only the
+    /// former can be answered with a statement about the operation, so only the
+    /// former is read as one.
+    #[must_use]
+    pub fn is_control_query(&self) -> bool {
+        matches!(
+            self.control_operation,
+            eliot_kernel_service::RESEARCH_PROVIDER_STATUS_OPERATION
+                | eliot_kernel_service::RESEARCH_PROVIDER_CANCEL_OPERATION
+                | eliot_kernel_service::RESEARCH_PROVIDER_RECONCILE_OPERATION
+        )
+    }
+
+    /// Returns the owner's statement about this operation's terminal state.
+    ///
+    /// This is the reconciled answer the receipt exists to carry, and it is
+    /// deliberately narrow. A control query counts as answered only when the
+    /// owner sealed a disposition that is about the operation rather than about
+    /// the presentation, and only one disposition is: `UnknownOutcome` states
+    /// that the owner still holds the operation with an unproven effect. An
+    /// `Unavailable` or `CAPABILITY_UNAVAILABLE` answer says the request was not
+    /// served here; reading it as "the operation has no owner" would convert an
+    /// absent capability into a resolved lifecycle, which is the opposite of what
+    /// an unreconciled effect requires.
+    ///
+    /// Returning `None` for every other case is the honest result: this run
+    /// cannot claim the operation was reconciled, so the receipt keeps its
+    /// explicit unknown instead.
+    #[must_use]
+    pub fn reconciled_operation_state(
+        &self,
+    ) -> Option<eliot_kernel_service::ResearchProviderDisposition> {
+        self.disposition
+            .filter(|_| self.transport_failure.is_none())
+            .filter(|_| self.is_control_query())
+            .filter(|disposition| disposition.is_unknown_operation_state())
     }
 
     /// Records that the control operation never reached the owner.
@@ -765,11 +823,264 @@ impl CancellationEvidence {
 mod tests {
     #![allow(clippy::expect_used)]
 
+    use eliot_kernel_service::{
+        RESEARCH_PROVIDER_DISPATCH_OPERATION, RESEARCH_PROVIDER_RECONCILE_OPERATION,
+        RESEARCH_PROVIDER_STATUS_OPERATION, ResearchProviderDispatchReceipt,
+    };
     use eliot_process::{ExitDisposition, ExitStatus};
 
     use crate::support::DIGEST_A;
 
     use super::*;
+
+    /// Builds one sealed owner receipt at a chosen disposition.
+    ///
+    /// Every field is fixed test material and the digest is computed through the
+    /// wire owner's own recipe, so a fixture that no longer validates fails on
+    /// the field under test rather than on a stale hand-written digest.
+    fn owner_receipt(
+        control_operation: &'static str,
+        disposition: eliot_kernel_service::ResearchProviderDisposition,
+    ) -> ResearchProviderDispatchReceipt {
+        let mut receipt = ResearchProviderDispatchReceipt {
+            wire_id: eliot_kernel_service::RESEARCH_PROVIDER_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::RESEARCH_PROVIDER_DISPATCH_WIRE_VERSION.to_owned(),
+            kind: ResearchProviderDispatchReceipt::RECEIPT_KIND.to_owned(),
+            disposition,
+            reason_code: if disposition.admits() {
+                String::new()
+            } else {
+                disposition.reason_code().to_owned()
+            },
+            operation_id: "op-24-slice-a".to_owned(),
+            cancellation_id: "cancel-24-slice-a".to_owned(),
+            request_sha256: DIGEST_A.to_owned(),
+            admitted_authority_epoch: crate::support::test_epoch(),
+            admitted_generation: 3,
+            admitted_fence: crate::support::test_fence(),
+            admitted_at_unix_ms: 1_700_000_000_000,
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt.compute_digest().expect("receipt digest");
+        let _ = control_operation;
+        receipt
+    }
+
+    // WORK_UNIT_CASE: 24/regression-4-control-reply-keeps-the-owner-answer
+    #[test]
+    fn verified_control_refusal_stays_an_owner_answer_with_its_own_reason_code() {
+        // A `status` reply the owner answered with `Unavailable`. This is the
+        // exact case that used to come back as an `EchoMismatch`, be relabelled
+        // `IDENTITY_CONFLICT` and be recorded as a transport failure.
+        let refused = owner_receipt(
+            RESEARCH_PROVIDER_STATUS_OPERATION,
+            eliot_kernel_service::ResearchProviderDisposition::Unavailable,
+        );
+        let attempt =
+            OwnerReconciliationAttempt::answered(RESEARCH_PROVIDER_STATUS_OPERATION, &refused);
+        // The owner answered. It did not go unanswered and it did not go
+        // unreached.
+        assert!(attempt.is_owner_answered());
+        assert_eq!(attempt.transport_failure, None);
+        // The disposition and the reason code are the owner's own, verbatim.
+        assert_eq!(
+            attempt.disposition,
+            Some(eliot_kernel_service::ResearchProviderDisposition::Unavailable)
+        );
+        assert_eq!(
+            attempt.reason_code.as_deref(),
+            Some(eliot_kernel_service::REASON_CAPABILITY_UNAVAILABLE)
+        );
+        // The owner's reason code is not the client's `EchoMismatch` code. Asserted
+        // against the stored value rather than through a combinator chain so the
+        // negative case reads as the one fact it is about.
+        assert_ne!(
+            attempt.reason_code.as_deref(),
+            Some(eliot_kernel_service::REASON_IDENTITY_CONFLICT),
+            "an owner-answered refusal must not be relabelled as an identity conflict"
+        );
+        // The receipt the client re-verified is retained by its exact digest.
+        assert_eq!(
+            attempt.receipt_sha256.as_deref(),
+            Some(refused.receipt_digest.as_str())
+        );
+    }
+
+    // WORK_UNIT_CASE: 24/regression-4-unknown-outcome-survives-as-the-owner-answer
+    #[test]
+    fn owner_unknown_outcome_is_read_as_the_unreconciled_operation_state() {
+        let unknown = owner_receipt(
+            RESEARCH_PROVIDER_RECONCILE_OPERATION,
+            eliot_kernel_service::ResearchProviderDisposition::UnknownOutcome,
+        );
+        let attempt =
+            OwnerReconciliationAttempt::answered(RESEARCH_PROVIDER_RECONCILE_OPERATION, &unknown);
+        assert_eq!(
+            attempt.reason_code.as_deref(),
+            Some(eliot_kernel_service::REASON_UNKNOWN_OUTCOME)
+        );
+        // This is the one disposition that states something about the operation
+        // rather than about the presentation, so it is the reconciled state.
+        assert_eq!(
+            attempt.reconciled_operation_state(),
+            Some(eliot_kernel_service::ResearchProviderDisposition::UnknownOutcome)
+        );
+    }
+
+    // WORK_UNIT_CASE: 24/regression-4-unavailable-is-not-a-resolved-lifecycle
+    #[test]
+    fn unavailable_control_reply_never_resolves_the_operation_lifecycle() {
+        // `Unavailable` is a statement about the request as presented. Reading it
+        // as "this operation has no owner" would convert an absent capability
+        // into a resolved lifecycle, which is the opposite of what an
+        // unreconciled effect requires.
+        let unavailable = owner_receipt(
+            RESEARCH_PROVIDER_STATUS_OPERATION,
+            eliot_kernel_service::ResearchProviderDisposition::Unavailable,
+        );
+        assert_eq!(
+            OwnerReconciliationAttempt::answered(RESEARCH_PROVIDER_STATUS_OPERATION, &unavailable)
+                .reconciled_operation_state(),
+            None
+        );
+        // A transport failure resolves nothing either.
+        assert_eq!(
+            OwnerReconciliationAttempt::untransportable(
+                RESEARCH_PROVIDER_STATUS_OPERATION,
+                "front door closed".to_owned()
+            )
+            .reconciled_operation_state(),
+            None
+        );
+        // And a `dispatch` answer is not an answer about a terminal state even
+        // when it is `UnknownOutcome`.
+        let dispatch_reply = owner_receipt(
+            RESEARCH_PROVIDER_DISPATCH_OPERATION,
+            eliot_kernel_service::ResearchProviderDisposition::UnknownOutcome,
+        );
+        assert_eq!(
+            OwnerReconciliationAttempt::answered(
+                RESEARCH_PROVIDER_DISPATCH_OPERATION,
+                &dispatch_reply
+            )
+            .reconciled_operation_state(),
+            None
+        );
+    }
+
+    // WORK_UNIT_CASE: 24/regression-5-unknown-stays-unknown-in-the-reconciliation-summary
+    #[test]
+    fn reconciliation_summary_renders_the_owner_disposition_and_reason_verbatim() {
+        let evidence = ReconciliationEvidence {
+            attempts: vec![OwnerReconciliationAttempt::answered(
+                RESEARCH_PROVIDER_STATUS_OPERATION,
+                &owner_receipt(
+                    RESEARCH_PROVIDER_STATUS_OPERATION,
+                    eliot_kernel_service::ResearchProviderDisposition::UnknownOutcome,
+                ),
+            )],
+        };
+        assert_eq!(
+            evidence.summary(),
+            format!(
+                "{RESEARCH_PROVIDER_STATUS_OPERATION}:UnknownOutcome:{}",
+                eliot_kernel_service::REASON_UNKNOWN_OUTCOME
+            )
+        );
+        // An unreachable owner stays visibly unreachable.
+        let unreachable = ReconciliationEvidence {
+            attempts: vec![OwnerReconciliationAttempt::untransportable(
+                RESEARCH_PROVIDER_RECONCILE_OPERATION,
+                "front door closed".to_owned(),
+            )],
+        };
+        assert_eq!(
+            unreachable.summary(),
+            format!("{RESEARCH_PROVIDER_RECONCILE_OPERATION}:unreached:front door closed")
+        );
+        // And an empty vector is stated as absent, not as a resolved operation.
+        assert_eq!(ReconciliationEvidence::not_required().summary(), "none");
+        assert!(!ReconciliationEvidence::not_required().owner_confirmed());
+    }
+
+    // WORK_UNIT_CASE: 24/regression-5-unknown-is-not-an-observed-crash
+    #[test]
+    fn unresolved_attempts_never_project_to_an_observed_crash() {
+        // Only a retained classification this bridge actually observed as a
+        // crash-class process disposition may become `ProviderOutcome::Crashed`.
+        // Everything else stays unresolved so it remains reconciliation-gated.
+        for outcome in [
+            crate::SubmittedOutcome::Unknown,
+            crate::SubmittedOutcome::ProtocolViolation,
+            crate::SubmittedOutcome::Refused,
+            crate::SubmittedOutcome::EvidenceIncomplete,
+        ] {
+            assert_eq!(
+                outcome.provider_outcome(),
+                crate::ProviderOutcome::Unknown,
+                "{outcome:?} is not an observed crash and must stay unresolved"
+            );
+            assert!(
+                outcome.requires_reconciliation(),
+                "{outcome:?} must stay reconciliation-gated"
+            );
+        }
+        // The observed states keep their own classification.
+        assert_eq!(
+            crate::SubmittedOutcome::Crashed.provider_outcome(),
+            crate::ProviderOutcome::Crashed
+        );
+        assert_eq!(
+            crate::SubmittedOutcome::TimedOut.provider_outcome(),
+            crate::ProviderOutcome::TimedOut
+        );
+        assert_eq!(
+            crate::SubmittedOutcome::Cancelled.provider_outcome(),
+            crate::ProviderOutcome::Cancelled
+        );
+        assert_eq!(
+            crate::SubmittedOutcome::Completed.provider_outcome(),
+            crate::ProviderOutcome::Completed
+        );
+        assert!(!crate::SubmittedOutcome::Crashed.requires_reconciliation());
+    }
+
+    // WORK_UNIT_CASE: 24/regression-6-completed-acquisition-has-no-degradation
+    #[test]
+    fn completed_acquisition_is_not_a_terminal_failure_projection() {
+        // `TerminalFailure` is a failure/degradation projection, so a completed
+        // run must not be constructible from one: it previously produced
+        // `outcome=Completed reason=RUNTIME_FAILED` on a run that exited zero.
+        assert!(
+            crate::TerminalFailure::outcome_degradation(crate::ProviderOutcome::Completed, None)
+                .is_none(),
+            "a completed acquisition must have no degradation record"
+        );
+        // Every non-success outcome keeps its real reason code.
+        for (outcome, expected) in [
+            (
+                crate::ProviderOutcome::Crashed,
+                eliot_kernel_service::REASON_RUNTIME_FAILED,
+            ),
+            (
+                crate::ProviderOutcome::TimedOut,
+                eliot_kernel_service::REASON_DEADLINE_EXCEEDED,
+            ),
+            (
+                crate::ProviderOutcome::Cancelled,
+                eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED,
+            ),
+            (
+                crate::ProviderOutcome::Unknown,
+                eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+            ),
+        ] {
+            let terminal = crate::TerminalFailure::outcome_degradation(outcome, None)
+                .expect("a non-success outcome is a terminal failure");
+            assert_eq!(terminal.reason_code, expected);
+            assert_eq!(terminal.outcome, outcome);
+        }
+    }
 
     fn full_stream(bytes: &[u8]) -> CapturedStream {
         CapturedStream {

@@ -6,9 +6,19 @@
 //! treats a connected pipe and a `200`-shaped reply as transport facts only:
 //! the single value it can return is a
 //! [`ResearchProviderDispatchReceipt`] that has passed the wire owner's
-//! `validate` **and** `verify_echo` against the exact dispatch this process
-//! holds. A receipt that fails either check is a typed refusal carrying the
-//! exact I7.20 reason code, never an admission.
+//! `validate` and this client's identity re-proof against the exact dispatch
+//! this process holds. A receipt that fails either check is a typed refusal
+//! carrying the exact I7.20 reason code, never an admission.
+//!
+//! The identity re-proof and the admission re-proof are separate because they
+//! answer separate questions. Identity applies to every operation: a `status`,
+//! `cancel` or `reconcile` reply is about this exact operation, and a verified
+//! non-success reply to one of those is the owner's honest answer and is
+//! returned intact. Admission applies to `research_provider.dispatch` alone:
+//! only that operation may become an execution admission, so only it requires an
+//! `Admitted` disposition. The requested operation is written into the request
+//! identity and the reply must echo that identity, so a served receipt is
+//! attributable to the control operation that asked for it.
 //!
 //! Dependency note (issue #24 boundary audit): this client is composed from
 //! the narrowest owner crates the front door is built from — `eliot-ipc` for
@@ -37,9 +47,10 @@ use eliot_ipc::{
 };
 use eliot_kernel_service::{
     RESEARCH_PROVIDER_CANCEL_OPERATION, RESEARCH_PROVIDER_DISPATCH_OPERATION,
-    RESEARCH_PROVIDER_DISPATCH_WIRE_VERSION, RESEARCH_PROVIDER_RECONCILE_OPERATION,
-    RESEARCH_PROVIDER_STATUS_OPERATION, RESEARCH_PROVIDER_WIRE_ID, ResearchProviderDispatch,
-    ResearchProviderDispatchReceipt, ResearchProviderError,
+    RESEARCH_PROVIDER_DISPATCH_WIRE_VERSION, RESEARCH_PROVIDER_OPERATIONS,
+    RESEARCH_PROVIDER_RECONCILE_OPERATION, RESEARCH_PROVIDER_STATUS_OPERATION,
+    RESEARCH_PROVIDER_WIRE_ID, ResearchProviderDispatch, ResearchProviderDispatchReceipt,
+    ResearchProviderError,
 };
 use eliot_platform_windows::{
     NamedPipePeerExpectation, ProtectedPathLease, protected_program_data_path,
@@ -231,7 +242,7 @@ impl ResearchKernelClient {
             "operation": operation,
             "dispatch": dispatch,
         });
-        self.transact(dispatch, &payload)
+        self.transact(dispatch, operation, &payload)
     }
 
     /// Requests the terminal classification of one admitted operation.
@@ -279,15 +290,16 @@ impl ResearchKernelClient {
     fn transact(
         &self,
         dispatch: &ResearchProviderDispatch,
+        operation: &str,
         payload: &Value,
     ) -> Result<ResearchProviderDispatchReceipt, ResearchKernelClientError> {
-        let request_identity = self.next_identity(dispatch, payload)?;
+        let request_identity = self.next_identity(dispatch, operation)?;
         let served = Self::block_on(self.transact_async(
             payload,
             request_identity,
             &dispatch.authority_epoch,
         ))??;
-        decode_verified_receipt(&served, dispatch)
+        decode_verified_receipt(&served, dispatch, operation)
     }
 
     /// Returns the exact request identity for one operation, bound to the live
@@ -297,22 +309,35 @@ impl ResearchKernelClient {
     /// cached value, or a task-supplied fence. The deadline and the
     /// cancellation identity are derived from the admitted operation identity,
     /// so both are stable across a retry of the same logical operation.
+    ///
+    /// The requested control operation is written into the request identity
+    /// itself, not left to be recovered from the request body: a `status`, a
+    /// `cancel` and a `reconcile` for the same operation each mint a distinct
+    /// request identity, and `validate_result_response` refuses any reply that
+    /// does not echo the exact identity it was sent under. That is what makes a
+    /// served reply attributable to the control operation that asked for it —
+    /// a receipt digest on its own cannot tell `status` from `cancel`.
+    ///
+    /// An operation outside this route's closed set is refused here rather than
+    /// defaulted: an unknown selector must not be exchanged under another
+    /// operation's identity.
     fn next_identity(
         &self,
         dispatch: &ResearchProviderDispatch,
-        payload: &Value,
+        operation: &str,
     ) -> Result<RequestIdentity, ResearchKernelClientError> {
+        if !RESEARCH_PROVIDER_OPERATIONS.contains(&operation) {
+            return Err(ResearchKernelClientError::Configuration(format!(
+                "research provider operation is not the closed route set: {operation}"
+            )));
+        }
         let fence = self.live_fence()?;
         let sequence = self
             .request_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request_id = RequestId::new(format!(
-            "{SERVICE_NAME}:{}:{}:{sequence}",
-            dispatch.operation_id,
-            payload
-                .get("operation")
-                .and_then(Value::as_str)
-                .unwrap_or(RESEARCH_PROVIDER_DISPATCH_OPERATION)
+            "{SERVICE_NAME}:{}:{operation}:{sequence}",
+            dispatch.operation_id
         ))
         .map_err(|error| ResearchKernelClientError::Configuration(error.to_string()))?;
         let now = unix_ms();
@@ -538,15 +563,33 @@ struct ServerBinding {
     generation: u64,
 }
 
-/// Decodes and re-verifies one served receipt against the held dispatch.
+/// Decodes and re-verifies one served receipt against the held dispatch and the
+/// exact operation this process asked.
 ///
-/// A well-formed receipt is not an admission: `verify_echo` re-proves the
-/// operation identity, cancellation identity, request digest, admitted
-/// generation, State Fence, and Authority Epoch. Any disagreement is a typed
-/// refusal with the exact I7.20 reason code.
+/// A well-formed receipt is not an admission. Two distinct facts are re-proved
+/// here, and keeping them apart is what makes an owner's honest refusal
+/// readable as an answer:
+///
+/// - **Identity**, for every operation. The receipt must echo this dispatch's
+///   operation identity, cancellation identity, request digest, admitted
+///   generation, State Fence, and Authority Epoch. A receipt that answers about
+///   a different operation is not this process's answer at all, so a
+///   disagreement is an identity refusal.
+/// - **Admission**, for `research_provider.dispatch` only. Only that operation
+///   may become an execution admission, so it and only it additionally requires
+///   an `Admitted` disposition.
+///
+/// A `status`, `cancel`, or `reconcile` reply is verified on identity alone and
+/// its verified non-success disposition is returned as a real owner answer. It
+/// was previously run through the same admission-only check as a dispatch, so
+/// every legitimate `CAPABILITY_UNAVAILABLE` or `UNKNOWN_OUTCOME` reply came
+/// back as an `EchoMismatch`, was relabelled `IDENTITY_CONFLICT`, and was then
+/// recorded as a transport failure — the owner's own answer laundered into a
+/// different answer, with the reason code it issued discarded.
 fn decode_verified_receipt(
     served: &Value,
     dispatch: &ResearchProviderDispatch,
+    operation: &str,
 ) -> Result<ResearchProviderDispatchReceipt, ResearchKernelClientError> {
     let body = served
         .get("payload")
@@ -566,15 +609,65 @@ fn decode_verified_receipt(
                 detail: bound(&error.to_string()),
             }
         })?;
-    receipt
-        .verify_echo(dispatch)
-        .map_err(
-            |error: ResearchProviderError| ResearchKernelClientError::UnverifiedReceipt {
+    verify_receipt_identity(&receipt, dispatch).map_err(|error: ResearchProviderError| {
+        ResearchKernelClientError::UnverifiedReceipt {
+            reason_code: echo_reason_code(error),
+            detail: bound(&error.to_string()),
+        }
+    })?;
+    if operation == RESEARCH_PROVIDER_DISPATCH_OPERATION {
+        verify_receipt_admission(&receipt).map_err(|error: ResearchProviderError| {
+            ResearchKernelClientError::UnverifiedReceipt {
                 reason_code: echo_reason_code(error),
                 detail: bound(&error.to_string()),
-            },
-        )?;
+            }
+        })?;
+    }
     Ok(receipt)
+}
+
+/// Re-proves that one receipt is about exactly the dispatch this process holds.
+///
+/// This is the half of admission that every operation shares, including the
+/// control operations. It runs the receipt's own closed shape and canonical
+/// digest check first, then compares the echoed operation identity,
+/// cancellation identity, request digest, admitted generation, State Fence and
+/// Authority Epoch (through `is_same_authority`, never a raw sequence compare).
+///
+/// The disposition is deliberately not consulted: `Admitted` and every
+/// non-success disposition are all acceptable answers to *an identity question*.
+fn verify_receipt_identity(
+    receipt: &ResearchProviderDispatchReceipt,
+    dispatch: &ResearchProviderDispatch,
+) -> Result<(), ResearchProviderError> {
+    receipt.validate()?;
+    if receipt.operation_id != dispatch.operation_id
+        || receipt.cancellation_id != dispatch.cancellation_id
+        || receipt.request_sha256 != dispatch.canonical_sha256()?
+        || receipt.admitted_generation != dispatch.process_generation
+        || receipt.admitted_fence != dispatch.state_fence
+        || !receipt
+            .admitted_authority_epoch
+            .is_same_authority(&dispatch.authority_epoch)
+    {
+        return Err(ResearchProviderError::EchoMismatch);
+    }
+    Ok(())
+}
+
+/// Requires that a receipt for `research_provider.dispatch` is an admission.
+///
+/// A dispatch reply that is not `Admitted` grants no provider capability, so it
+/// can never become an execution admission. This refusal is specific to the
+/// dispatch operation: a control reply with the same disposition is an honest
+/// answer about the operation and is returned to the caller intact.
+fn verify_receipt_admission(
+    receipt: &ResearchProviderDispatchReceipt,
+) -> Result<(), ResearchProviderError> {
+    if !receipt.disposition.admits() {
+        return Err(ResearchProviderError::EchoMismatch);
+    }
+    Ok(())
 }
 
 /// Maps one wire-owner refusal onto the exact I7.20 reason code.
