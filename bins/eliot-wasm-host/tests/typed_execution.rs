@@ -26,17 +26,16 @@
 //!   walkers and the "no synchronous compile-cancellation claim") are marked
 //!   inline at their use site.
 //!
-//! KNOWN GAP (reported, not hidden): the capsule-domain ENTRY
+//! INTEGRATION-TEST BOUNDARY: the capsule-domain entry
 //! `execute_capsule_domain_experimental` takes a `&TypedDomainRequest`, whose
-//! variant payloads are the crate-private generated bindgen types
+//! variant payloads are crate-private generated bindgen types
 //! (`crate::typed_bindings::*`; `mod typed_bindings;` is private in
-//! `src/lib.rs`). No constructor for it exists anywhere on any branch, so an
-//! integration test cannot build one. Case 3 therefore performs the whole
-//! six-world capsule drive — exact fixture preflight, per-world
-//! `ModuleContractKit`/`ModuleTestCapsule` pair bound to that fixture's
-//! digest and length, `validate`/`digest`/`ModuleTestCapsule::validate`, and
-//! the real per-world typed invocation through the real engine — and stops at
-//! the entry call, which is one line once a request constructor lands.
+//! `src/lib.rs`), so this external test cannot construct that request. The
+//! in-crate `six_world_capsule_drive::every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
+//! test constructs the requests and drives both domain entries for all six
+//! worlds through the real engine. Case 3 below separately binds each
+//! checked-in fixture to its neutral kit/capsule and executes its real
+//! `describe` export in this integration-test binary.
 
 use std::path::Path;
 
@@ -672,13 +671,36 @@ fn governed_arbitrary_and_relative_artifact_sources_are_denied() {
         "PREFLIGHT_ARBITRARY_PATH_DENIED"
     );
 
-    // Positive control: one explicit absolute local path is admitted, and the
-    // bytes and the digest describe that same buffer.
-    let absolute = must(std::env::current_dir()).join("tests/fixtures/guest.wat");
-    let (bytes, preflight) = must(read_bounded_artifact(&absolute));
+    // Positive control: compile the checked-in WAT fixture, then read those
+    // same component bytes from one owned absolute local path.
+    let expected = load_legacy_guest();
+    let absolute = std::env::temp_dir().join(format!(
+        "eliot-758-case-2-{}-{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    assert_eq!(require_absolute_artifact_path(&absolute), Ok(()));
+    let mut file = must(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&absolute),
+    );
+    let write_result = std::io::Write::write_all(&mut file, &expected);
+    drop(file);
+    if let Err(error) = write_result {
+        must(std::fs::remove_file(&absolute));
+        panic!("positive-control fixture could not be written: {error}");
+    }
+    let read_result = read_bounded_artifact(&absolute);
+    must(std::fs::remove_file(&absolute));
+    let (bytes, preflight) = must(read_result);
     assert_eq!(preflight.digest, Sha256Digest::of_bytes(&bytes));
     assert_eq!(preflight.byte_len, bytes.len() as u64);
-    assert_eq!(bytes, load_legacy_guest());
+    assert_eq!(bytes, expected);
 }
 
 // WORK_UNIT_CASE: 758/3
@@ -1624,7 +1646,7 @@ fn the_unreachable_guest_path_is_a_trap_not_a_guest_error() {
     let cooperative = cue_activation_artifact(&cooperative_guest(), &CueOptions::default());
     let limits = default_experimental_limits(Sha256Digest::of_bytes(&cooperative));
     let (receipt, _) = must(
-        run_describe(TypedWorld::DreamerCycle, &cooperative, &limits)
+        run_describe(TypedWorld::CueActivation, &cooperative, &limits)
             .map_err(|error| error.to_string()),
     );
     assert_eq!(receipt.terminal, "Completed");
