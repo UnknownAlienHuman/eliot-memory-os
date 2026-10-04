@@ -211,8 +211,8 @@ pub use user_automation_state::{
 pub use request_hash::{
     CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, admission_digest_hex, canonical_request_bytes,
     canonical_request_hash, derive_corrected_operation_id, mutation_plan_digest_hex,
-    verify_admission_digest, verify_canonical_request_hash, verify_mutation_plan_digest,
-    verify_ordering_scope_binding,
+    presented_request_hash, verify_admission_digest, verify_canonical_request_hash,
+    verify_mutation_plan_digest, verify_ordering_scope_binding,
 };
 
 pub use store_failure::{
