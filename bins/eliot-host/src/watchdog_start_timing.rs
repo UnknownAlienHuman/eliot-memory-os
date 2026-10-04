@@ -25,7 +25,7 @@
 //! start convergence loop in `watchdog_service_start.rs`
 //! (`start_installed_watchdog_with_clock`), which owns the injected-clock
 //! deadline decision and emits the timing observations there (the
-//! `watchdog.start ... expired` phases); `watchdog_start_wait` is
+//! `deadline_expired*` observation phases); `watchdog_start_wait` is
 //! additionally re-exported to `#[cfg(all(test, windows))]` for the existing
 //! exact-clamp unit assertions. Observing a pure clamp would record no owner
 //! fact.
