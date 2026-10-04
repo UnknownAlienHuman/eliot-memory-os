@@ -1243,13 +1243,13 @@ mod tests {
             assert_eq!(
                 slot(detail, unproven),
                 Some("missing"),
-                "this cell owns no {unproven} source, so forwarding binds it: {detail}"
+                "this cell owns no {unproven} source, so the forwarded binding must leave that slot at the explicit absent marker rather than invent one: {detail}"
             );
         }
         assert_eq!(
             slot(detail, "artifact"),
             artifact_slot,
-            "this cell binds no artifact before the digest outcome, and spells that absence explicitly: {detail}"
+            "the artifact slot is whatever this cell really holds at this tuple: the absent marker before the digest outcome, and the owner-held approved digest once it has one: {detail}"
         );
     }
 }
