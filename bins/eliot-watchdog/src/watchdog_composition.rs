@@ -11,7 +11,6 @@ use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
 use eliot_watchdog_core::{CoverageGapExplanation, CoverageManifestProjection, EvidenceRef};
-use redb::Database;
 
 use crate::AdmittedIsolatedDestination;
 use crate::CompositionError;
@@ -49,6 +48,7 @@ use crate::observation_coverage::{
 };
 use crate::report_gap_nonfatal;
 use crate::watchdog_spool::WatchdogSpool;
+use crate::watchdog_spool::attempt as attempt_evidence;
 use crate::watchdog_spool::backup::{
     CaptureFenceParams, SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits,
     WatchdogSpoolFence, WatchdogSpoolSnapshotPage,
@@ -707,7 +707,7 @@ impl WatchdogComposition {
                         if let Some(port) = kernel.spool_backup_port() {
                             observe_host_recovery_decision(
                                 &host,
-                                &port.spool.database,
+                                port.spool.as_ref(),
                                 &host_observation,
                             );
                         } else {
@@ -1224,7 +1224,7 @@ fn correlate_recovery_attempt(
     None
 }
 
-/// I8.3 (#1757 W10): one journal-before-effects recovery decision pass.
+/// I8.3 (#1757 W10, #1754): one journal-before-effects recovery decision pass.
 ///
 /// Runs once per tick while the observed Host target is live. The per-pass
 /// chain is `bounded_responsiveness` to `recovery_eligibility` to
@@ -1238,9 +1238,17 @@ fn correlate_recovery_attempt(
 /// belong to the Host composition lane. Every input without a production
 /// reader on this contour is an explicit named seam above (STITCH): no
 /// policy, no target, and no challenge attempt is invented, so a pass that
-/// cannot be fully bound journals nothing and refuses effects. The boundary
-/// readback is NOT such an input any more: it issues its own live query and
-/// carries an absent leg as an explicit refusal.
+/// cannot be fully bound journals nothing but the attempt and refuses effects.
+/// The boundary readback is NOT such an input any more: it issues its own live
+/// query and carries an absent leg as an explicit refusal.
+///
+/// I8.3 also requires two of the spool's record categories, and both are written
+/// here so they are produced by the live pass rather than by a fixture: the
+/// attempt this pass actually made is journalled through the owner spool right
+/// after the bounded wait, before any policy seam can stop the pass, and the
+/// pre-authorized containment request is journalled once the boundary fence
+/// admitted it. Neither record performs an effect, and neither claims a
+/// canonical Problem, Incident, or completion.
 ///
 /// All journal touches here are bounded local transactions. Nothing waits on
 /// the hung Host: the competing-attempt exclusion is the durable single-key
@@ -1251,9 +1259,10 @@ fn correlate_recovery_attempt(
 )]
 fn observe_host_recovery_decision(
     host: &Arc<dyn HostObservationSource>,
-    database: &Database,
+    spool: &WatchdogSpool,
     before: &HostObservation,
 ) {
+    let database = &spool.database;
     let now_ms = current_unix_ms().unwrap_or(0);
     // No competent attempt can be claimed yet (see the producer seam): stay
     // an explicit uncertainty, never a fabricated timeout.
@@ -1279,6 +1288,64 @@ fn observe_host_recovery_decision(
     // substituted target could never be refused here.
     let after = host.observe();
     let verdict = bounded_responsiveness(before, &wait, &attempt, &after);
+    // I8.3: "Every attempt is recorded in the Watchdog spool ... for later
+    // reconciliation." This is the attempt this pass really made over two real
+    // observations, so it is journalled before any seam below can stop the pass.
+    // It states what was and was not established — the named uncertainty is
+    // carried as itself, never resolved into a fabricated timeout or a forged
+    // answer — and it claims nothing about health, eligibility, or canonical
+    // Problem/Incident state.
+    let before_identity = attempt_evidence::target_identity_digest(before);
+    let after_identity = attempt_evidence::target_identity_digest(&after);
+    let attempt_evidence_refs = [
+        attempt_evidence::observation_evidence_ref(
+            attempt_evidence::attempt_service().as_str(),
+            host_observation_state_code(before.state),
+            before_identity.as_deref(),
+            wait.timeout_secs(),
+        ),
+        attempt_evidence::observation_evidence_ref(
+            attempt_evidence::attempt_service().as_str(),
+            host_observation_state_code(after.state),
+            after_identity.as_deref(),
+            wait.timeout_secs(),
+        ),
+    ];
+    let attempt_record = match attempt_evidence::HostAttemptRecord::new(
+        attempt_evidence::attempt_service(),
+        attempt,
+        verdict,
+        wait.timeout_secs(),
+        after_identity.or(before_identity),
+        attempt_evidence_refs.to_vec(),
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::debug!(
+                event = "watchdog.recovery_decision_attempt_not_canonical",
+                observation = "unobserved",
+                reason = %error,
+                "the bounded attempt is not a canonical restricted record; journaling nothing and refusing effects"
+            );
+            return;
+        }
+    };
+    let attempt_verdict = attempt_record.verdict_code().to_owned();
+    match spool.journal_host_attempt(now_ms.max(1), &attempt_record) {
+        Ok(entry) => tracing::debug!(
+            event = "watchdog.recovery_decision_attempt_journaled",
+            observation = "committed",
+            sequence = entry.sequence,
+            verdict = attempt_verdict,
+            "bounded Host responsiveness attempt recorded in the owner spool; no effect performed"
+        ),
+        Err(error) => tracing::debug!(
+            event = "watchdog.recovery_decision_attempt_unavailable",
+            observation = "attempted",
+            reason = %error,
+            "the bounded attempt could not be recorded in the owner spool; refusing effects"
+        ),
+    }
     // Without the installer loader there is no policy to decide under: trace
     // the seam and stop before any journal write.
     let Some(policy) = load_installed_recovery_policy() else {
@@ -1287,7 +1354,7 @@ fn observe_host_recovery_decision(
             observation = "refused",
             seam = "STITCH",
             verdict = ?verdict,
-            "no installation-approved recovery policy on this contour; journaling nothing and refusing effects"
+            "no installation-approved recovery policy on this contour; journaling no request and refusing effects"
         );
         return;
     };
@@ -1442,6 +1509,60 @@ fn observe_host_recovery_decision(
             reason = %error,
             "fenced recovery intent is open but its attempt could not be consumed from the budget"
         );
+    }
+    // I8.3: "emit a signed pre-authorized containment request to the owning
+    // Host/Kernel boundary". The fence above admitted this request, so the
+    // retained copy below names a request this Watchdog was authorized to emit.
+    // It records the request only: the owning boundary revalidates target,
+    // evidence, recipe class, current epoch, and allowed effect before any
+    // containment runs, and this pass performs none.
+    let request_evidence_refs = [
+        audit.correlation.operation_id.as_str().to_owned(),
+        intent.target.identity_digest.as_str().to_owned(),
+        intent.target.recipe_digest.as_str().to_owned(),
+    ];
+    match attempt_evidence::ContainmentRequestRecord::new(
+        attempt_evidence::attempt_service(),
+        &intent,
+        request_evidence_refs.to_vec(),
+    ) {
+        Ok(record) => match spool.journal_containment_request(now_ms.max(1), &record) {
+            Ok(entry) => tracing::debug!(
+                event = "watchdog.recovery_decision_request_journaled",
+                observation = "committed",
+                sequence = entry.sequence,
+                operation = intent.operation_id.as_str(),
+                "pre-authorized containment request recorded in the owner spool; the owning boundary decides whether to run it"
+            ),
+            Err(error) => tracing::debug!(
+                event = "watchdog.recovery_decision_request_unavailable",
+                observation = "attempted",
+                reason = %error,
+                "the fenced request is open but its retained copy could not be journaled"
+            ),
+        },
+        Err(error) => tracing::debug!(
+            event = "watchdog.recovery_decision_request_not_canonical",
+            observation = "unobserved",
+            reason = %error,
+            "the admitted request is not a canonical restricted record; no effect was requested"
+        ),
+    }
+}
+
+/// Closed wire code of one observed Host target state.
+///
+/// The attempt record's evidence references are taken over these codes, so the
+/// durable record and the trace can never state two different states for the
+/// same observation.
+fn host_observation_state_code(state: HostObservationState) -> &'static str {
+    match state {
+        HostObservationState::Running => "RUNNING",
+        HostObservationState::AbsentOrStopped => "ABSENT_OR_STOPPED",
+        HostObservationState::PidReused => "PID_REUSED",
+        HostObservationState::ImageSubstituted => "IMAGE_SUBSTITUTED",
+        HostObservationState::IdentityChanged => "IDENTITY_CHANGED",
+        HostObservationState::Unknown => "UNKNOWN",
     }
 }
 
