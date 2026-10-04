@@ -15,9 +15,10 @@ use eliot_types::{
     DelegationRequest, EvalCaseResult, EvalIntegrityFingerprintSet, EvalRun, EvalSuite,
     ForgettingOperator, ForgettingPolicy, MaterialPacketFrame, MemoryEcologyDecision,
     MemoryGravity, MemoryHandlePreview, MemoryInspectorView, MemoryLifecycleState,
-    MemoryStateTransition, MemoryVitalityScore, OBSERVE_INPUT_SCHEMA_VERSION, ObserveHint,
-    ObserveInput, OperatorCommandReceipt, OperatorQueryRequest, OperatorResultMode,
-    OperatorSnapshot, ProviderCallBudgetState, ProviderCallLedger, ProviderCallReservation,
+    MemoryStateTransition, MemoryVitalityScore, MetaIsolationRejectionRecord,
+    MetaPolicyExecutionReceipt, OBSERVE_INPUT_SCHEMA_VERSION, ObserveHint, ObserveInput,
+    OperatorCommandReceipt, OperatorQueryRequest, OperatorResultMode, OperatorSnapshot,
+    ProviderCallBudgetState, ProviderCallLedger, ProviderCallReservation,
     ProviderCallReservationState, ProviderInvocationAttempt, RecallL0Request, StrictJsonErrorKind,
     TaskAcceptanceItem, TaskCognitionView, TaskContract, TaskContractInput, UnderstandingProof,
     UnderstandingProofReceipt, VerificationRun, WorkLease, WorktreeLease, WorktreeLeaseState,
@@ -130,10 +131,17 @@ fn safety_receipt_wire() -> Value {
 // that script at run time and asserts against its own `DISPOSITIONS` set for
 // equality, and probes its protected dimensions, bypass shapes and
 // unsupported-syntax markers by name. `DISPOSITIONS` equality is the load-
-// bearing coupling; the string probes are weaker than they look, and the
-// behavioural half of "unsupported-syntax handling is the script's" is the
-// `unresolved == 0` assertion, not the probes. So: one scanner, in this file,
-// not a second shipped inventory.
+// bearing coupling; the string probes are weaker than they look. The
+// UNSUPPORTED-SYNTAX HANDLING itself is the script's by transcription rather
+// than by probe: `mask_rust` fails closed on the same six conditions the
+// script's `_mask_rust` raises on, `discovered_unsupported_macros` applies both
+// of the script's macro patterns with its `unknown`/`BLOCKED`/`NOT_SAFE` grade,
+// and `manual_decoder_impls` matches `_MANUAL_IMPL_RE` rather than the literal
+// `Deserialize<'de>`. Each of those transcriptions is behavioural, so the
+// `unresolved == 0` assertion is no longer the only behavioural half: the
+// unsupported-macro denominator fails closed at zero and each site it finds is
+// held to the script's own grade, which case 15 reads out of `_classify` at run
+// time. So: one scanner, in this file, not a second shipped inventory.
 //
 // Oracle ownership (I18-27:3, "every acceptance oracle has an owner and
 // origin"). Nothing here creates authority by assertion; each constant below
@@ -148,6 +156,10 @@ fn safety_receipt_wire() -> Value {
 //   - `EXPECTED_BARE_OPTION_SITE_COUNT` and its line list: derived by the same
 //     scan from the serde rule that a missing `Option<T>` decodes to `None`
 //     (`serde::private::de::missing_field`), with no other authority.
+//   - `EXPECTED_UNSUPPORTED_MACRO_SITE_COUNT`: zero, with the same authority as
+//     the script's refusal to classify unsupported syntax at all. It is a
+//     separate class from `DEFAULT_SITE_EXCEPTIONS`, because a macro site names
+//     no field and case 16 admits no `unknown` disposition there.
 //   - `EXPECTED_SPECIFIC_OWNER_ROWS` / `EXPECTED_OWNER_FILES` /
 //     `BREAKING_CANDIDATE_OWNER_MAP`: owner for each deferred breaking
 //     candidate is the named file; the base-object column records `n/a`
@@ -247,6 +259,14 @@ const EXPECTED_HELPER_DEFAULT_SITES: [&str; 3] = [
 
 /// The paired `default, skip_serializing_if = "..."` rows, detected by shape.
 const EXPECTED_PAIRED_DEFAULT_SITE_COUNT: usize = 44;
+
+/// The frozen `unsupported-macro` denominator in the nine-file domain: zero. A
+/// serde-like macro here generates deserialization neither this oracle nor the
+/// shipped inventory can read, which is why the inventory grades such a site
+/// `unknown` and blocks it rather than classifying it. Case 15 fails closed on
+/// the first one, the same way it fails closed on a new default site: the
+/// denominator only moves with a deliberate decision, never by drift.
+const EXPECTED_UNSUPPORTED_MACRO_SITE_COUNT: usize = 0;
 
 /// The classification vocabulary owned by `scripts/serde_boundary_inventory.py`.
 /// Case 15 asserts this equals the script's own `DISPOSITIONS`.
@@ -533,11 +553,18 @@ fn assert_fixture_declares_every_required_key<T: DeserializeOwned + std::fmt::De
 
 // ---------------------------------------------------------------------
 // The case-15/16 source oracle. It shares the shipped inventory script's
-// classification vocabulary and its unsupported-syntax rule; it does not copy
-// them. Each of the two absence classes it records is discovered in one masked
-// pass over the nine production files, computed once per process behind a
-// `OnceLock`, so the tolerated set case 19 derives from is literally the frozen
-// scan rather than a re-reading of the same source per type.
+// classification vocabulary, and it transcribes the script's
+// unsupported-syntax handling rather than shipping a second version of it:
+// `mask_rust` fails closed on the six conditions `_mask_rust` raises on,
+// `discovered_unsupported_macros` applies both of the script's macro patterns
+// with the grade `_classify` gives that kind, and `manual_decoder_impls`
+// matches `_MANUAL_IMPL_RE`. Each transcription names its script line, and
+// case 15 reads the vocabulary back out of the script at run time so the copy
+// cannot drift silently. Each of the two absence classes it records is
+// discovered in one masked pass over the nine production files, computed once
+// per process behind a `OnceLock`, so the tolerated set case 19 derives from is
+// literally the frozen scan rather than a re-reading of the same source per
+// type.
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -568,134 +595,263 @@ fn nine_file_source(file: &str) -> String {
         .unwrap_or_else(|error| panic!("{file} must be readable: {error}"))
 }
 
+/// The one way this oracle refuses source it cannot read. The detail strings
+/// are the shipped inventory's own: `_mask_rust` in
+/// `scripts/serde_boundary_inventory.py` raises
+/// `InventoryError("MALFORMED_RUST_SOURCE", detail)`, and its stated purpose is
+/// failing loudly "instead of silently mis-scanning". The script has a report to
+/// write, so it turns the raise into one `unreadable-source` row per file that
+/// `_classify` (:1901-1914) grades `unknown`, `BLOCKED` and `NOT_SAFE`; a test
+/// has a failure, so the same condition ends the scan here, named by the line
+/// and column it was found at.
+fn malformed_source(detail: &str, bytes: &[u8], at: usize) -> ! {
+    let at = at.min(bytes.len());
+    let mut line = 1usize;
+    for byte in &bytes[..at] {
+        if *byte == b'\n' {
+            line += 1;
+        }
+    }
+    let column = match bytes[..at].iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => at - newline,
+        None => at + 1,
+    };
+    let message = format!("malformed-rust-source: {detail} at line {line}, column {column}");
+    panic!("a nine-file source must mask cleanly: {message}")
+}
+
+/// The length of the character literal whose opening quote is at `at`, or `None`
+/// when these bytes are a lifetime tick or a stray quote instead. `_mask_rust`
+/// matches `'(?:\\.|[^'\\\n])'` for a character literal (:623) and its byte-char
+/// form `b'(?:\\.|[^'\\])'` (:594); `byte_char` selects the second of the two.
+///
+/// The two patterns differ in the UNESCAPED branch only: `[^'\\]` in the byte
+/// form admits a raw newline that `[^'\\\n]` in the plain form excludes, and
+/// that is the only decision `byte_char` makes here. Neither form admits an
+/// ESCAPED newline, because `\\.` cannot match one in either pattern and the
+/// script passes no `re.DOTALL`, so the escaped check below is unconditional.
+fn quoted_char_literal_len(bytes: &[u8], at: usize, byte_char: bool) -> Option<usize> {
+    let first = bytes.get(at + 1).copied()?;
+    if first == b'\\' {
+        let escaped = bytes.get(at + 2).copied()?;
+        if escaped == b'\n' {
+            return None;
+        }
+        return (bytes.get(at + 3) == Some(&b'\'')).then_some(4);
+    }
+    if first == b'\'' || (first == b'\n' && !byte_char) {
+        return None;
+    }
+    (bytes.get(at + 2) == Some(&b'\'')).then_some(3)
+}
+
+/// Blanks a `"…"` literal whose opening quote the caller has already written at
+/// `at - 1`, preserving newlines and byte offsets, and returns the offset just
+/// past its closing quote. `None` when the literal reaches a newline or the end
+/// of source without closing: `_mask_rust` stops there and raises rather than
+/// blanking the rest of the file.
+fn mask_quoted_literal(bytes: &[u8], out: &mut [u8], at: usize) -> Option<usize> {
+    let mut cursor = at;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => {
+                out[cursor] = b' ';
+                cursor += 1;
+                if cursor < bytes.len() {
+                    if bytes[cursor] == b'\n' {
+                        out[cursor] = b'\n';
+                    }
+                    cursor += 1;
+                }
+            }
+            b'"' => {
+                out[cursor] = b' ';
+                return Some(cursor + 1);
+            }
+            b'\n' => {
+                out[cursor] = b'\n';
+                return None;
+            }
+            _ => {
+                out[cursor] = b' ';
+                cursor += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Blanks a raw literal from `at`, whose body starts at `body` and whose
+/// terminator is one `"` followed by `hashes` more `#`, and returns the offset
+/// just past that terminator. `None` when the terminator never appears:
+/// `_mask_rust` searches the whole remainder of the file for it (:640, :652)
+/// and raises when that search fails, so an unclosed raw string stops this scan
+/// too.
+fn mask_raw_literal(
+    bytes: &[u8],
+    out: &mut [u8],
+    at: usize,
+    body: usize,
+    hashes: usize,
+) -> Option<usize> {
+    let terminator: Vec<u8> = std::iter::once(b'"')
+        .chain(std::iter::repeat_n(b'#', hashes))
+        .collect();
+    let found = bytes[body..]
+        .windows(terminator.len())
+        .position(|window| window == terminator)?;
+    let end = body + found + terminator.len();
+    for (source, slot) in bytes[at..end].iter().zip(&mut out[at..end]) {
+        if *source == b'\n' {
+            *slot = b'\n';
+        }
+    }
+    Some(end)
+}
+
 /// Blanks every comment and string literal while preserving byte offsets, so a
 /// `serde(default)` mentioned in a doc comment can never become a scan hit.
+///
+/// Unreadable source fails closed, on exactly the six conditions `_mask_rust`
+/// raises on: an unclosed byte-string literal (:591), byte-char literal (:596),
+/// string literal (:620), raw string literal (:642), raw byte string (:654) or
+/// block comment (:665). Each of those is a shape that otherwise blanks to
+/// end-of-line and keeps reading the rest of the file as code, which is what
+/// "instead of silently mis-scanning" names.
+///
+/// One rule is copied rather than re-derived, because it is what makes raising
+/// safe here: a `'` that opens no character literal is a lifetime tick or a
+/// stray quote, and `_mask_rust` (:622-633) KEEPS it so the surrounding code
+/// stays visible to discovery. Without that rule,
+/// `impl<'de> Deserialize<'de> for T` (the one hand-written decoder in the
+/// nine-file domain) would read as an unclosed literal.
 #[allow(clippy::too_many_lines)]
 fn mask_rust(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = vec![b' '; bytes.len()];
     let mut index = 0usize;
+    let mut line_comment = false;
+    let mut block_depth = 0usize;
+    let mut block_start = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         let next = bytes.get(index + 1).copied();
-        if byte == b'/' && next == Some(b'/') {
-            while index < bytes.len() && bytes[index] != b'\n' {
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+                out[index] = b'\n';
+            }
+            index += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_depth += 1;
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                index += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_depth -= 1;
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                index += 2;
+            } else if byte == b'\n' {
+                out[index] = b'\n';
+                index += 1;
+            } else {
+                out[index] = b' ';
                 index += 1;
             }
+            continue;
+        }
+        if byte == b'/' && next == Some(b'/') {
+            line_comment = true;
+            out[index] = b' ';
+            out[index + 1] = b' ';
+            index += 2;
             continue;
         }
         if byte == b'/' && next == Some(b'*') {
-            let mut depth = 0usize;
-            while index < bytes.len() {
-                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
-                    depth += 1;
-                    index += 2;
-                    continue;
-                }
-                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
-                    depth -= 1;
-                    index += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                index += 1;
-            }
+            block_depth = 1;
+            block_start = index;
+            out[index] = b' ';
+            out[index + 1] = b' ';
+            index += 2;
             continue;
         }
-        if byte == b'r' && matches!(next, Some(b'"' | b'#')) {
-            let mut probe = index + 1;
-            let mut hashes = 0usize;
-            while bytes.get(probe) == Some(&b'#') {
-                hashes += 1;
-                probe += 1;
+        if byte == b'b' && next == Some(b'"') {
+            let start = index;
+            out[index] = b' ';
+            out[index + 1] = b' ';
+            let Some(end) = mask_quoted_literal(bytes, &mut out, index + 2) else {
+                malformed_source("unclosed byte-string literal", bytes, start);
+            };
+            index = end;
+            continue;
+        }
+        if byte == b'b' && next == Some(b'\'') {
+            let start = index;
+            let Some(length) = quoted_char_literal_len(bytes, index + 1, true) else {
+                malformed_source("unclosed byte-char literal", bytes, start);
+            };
+            for slot in &mut out[index..=index + length] {
+                *slot = b' ';
             }
-            if bytes.get(probe) == Some(&b'"') {
-                let terminator: Vec<u8> = std::iter::once(b'"')
-                    .chain(std::iter::repeat_n(b'#', hashes))
-                    .collect();
-                let mut cursor = probe;
-                while cursor < bytes.len() && bytes[cursor] != b'\n' {
-                    if bytes[cursor..].starts_with(&terminator) {
-                        cursor += terminator.len();
-                        break;
-                    }
-                    cursor += 1;
-                }
-                while index < cursor {
-                    if bytes[index] == b'\n' {
-                        out[index] = b'\n';
-                    }
-                    index += 1;
-                }
-                continue;
-            }
+            index += length + 1;
+            continue;
         }
         if byte == b'"' {
+            let start = index;
             out[index] = b' ';
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == b'\\' {
-                    out[index] = b' ';
-                    index += 1;
-                    if index < bytes.len() {
-                        if bytes[index] == b'\n' {
-                            out[index] = b'\n';
-                        }
-                        index += 1;
-                    }
-                    continue;
-                }
-                if bytes[index] == b'"' {
-                    out[index] = b' ';
-                    index += 1;
-                    break;
-                }
-                if bytes[index] == b'\n' {
-                    out[index] = b'\n';
-                    index += 1;
-                    break;
-                }
-                out[index] = b' ';
-                index += 1;
-            }
+            let Some(end) = mask_quoted_literal(bytes, &mut out, index + 1) else {
+                malformed_source("unclosed string literal", bytes, start);
+            };
+            index = end;
             continue;
         }
         if byte == b'\'' {
-            let previous = if index == 0 { 0u8 } else { bytes[index - 1] };
-            let identifier = previous.is_ascii_alphanumeric() || previous == b'_';
-            if !identifier {
-                out[index] = b' ';
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'\\' {
-                        out[index] = b' ';
-                        index += 1;
-                        if index < bytes.len() {
-                            out[index] = b' ';
-                            index += 1;
-                        }
-                        continue;
-                    }
-                    if bytes[index] == b'\'' {
-                        out[index] = b' ';
-                        index += 1;
-                        break;
-                    }
-                    if bytes[index] == b'\n' {
-                        out[index] = b'\n';
-                        index += 1;
-                        break;
-                    }
-                    out[index] = b' ';
-                    index += 1;
+            if let Some(length) = quoted_char_literal_len(bytes, index, false) {
+                for slot in &mut out[index..index + length] {
+                    *slot = b' ';
                 }
+                index += length;
+            } else {
+                out[index] = byte;
+                index += 1;
+            }
+            continue;
+        }
+        // `_mask_rust` reads `r(#*)"` (:635) and `br(#*)"` (:647) at the `r`, so
+        // in the script the raw-byte branch is unreachable: the raw-string branch
+        // matches the `r"` of a `br"…"` first and leaves its `b` as code. The
+        // unclosed-raw-byte condition it states (:654) is mirrored here by
+        // anchoring both shapes at the `b`, which keeps an unclosed `br"…"` from
+        // being read as ordinary code.
+        if byte == b'r' || (byte == b'b' && next == Some(b'r')) {
+            let prefix = if byte == b'r' { 1 } else { 2 };
+            let mut probe = index + prefix;
+            while bytes.get(probe) == Some(&b'#') {
+                probe += 1;
+            }
+            if bytes.get(probe) == Some(&b'"') {
+                let hashes = probe - (index + prefix);
+                let detail = if prefix == 1 {
+                    "unclosed raw string literal"
+                } else {
+                    "unclosed raw byte string"
+                };
+                let Some(end) = mask_raw_literal(bytes, &mut out, index, probe + 1, hashes) else {
+                    malformed_source(detail, bytes, index);
+                };
+                index = end;
                 continue;
             }
         }
         out[index] = byte;
         index += 1;
+    }
+    if block_depth > 0 {
+        malformed_source("unclosed block comment", bytes, block_start);
     }
     String::from_utf8(out)
         .unwrap_or_else(|error| panic!("masked Rust source must stay valid UTF-8: {error}"))
@@ -840,6 +996,18 @@ fn enclosing_type_name(masked: &str, before: usize) -> Option<String> {
             index += 1;
             continue;
         };
+        // The rule set `struct_body_spans` states for the same keyword, in the same
+        // order and the same vocabulary, so the two walks cannot disagree about
+        // what a `struct`/`enum` token is. Three shapes must not read as a type:
+        // a path segment (`clippy::struct_excessive_bools`), a bare `.` on the
+        // same shape - the sibling does not need it, but this helper also matches
+        // `enum`, and `.enumerate()` would otherwise read the name `erate` - and a
+        // field name that merely begins with the keyword (`structured_bytes`).
+        let qualified = index > 0 && matches!(bytes[index - 1], b':' | b'.');
+        if qualified {
+            index += 1;
+            continue;
+        }
         let mut cursor = index + length;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
@@ -850,9 +1018,29 @@ fn enclosing_type_name(masked: &str, before: usize) -> Option<String> {
         {
             cursor += 1;
         }
-        if cursor > start {
-            found = Some(head[start..cursor].to_owned());
+        if cursor == start {
+            index = cursor.max(index + 1);
+            continue;
         }
+        let ends_a_declaration = match bytes.get(cursor) {
+            None => true,
+            Some(byte) => {
+                *byte == b'{'
+                    || *byte == b'('
+                    || *byte == b';'
+                    || *byte == b'<'
+                    || byte.is_ascii_whitespace()
+            }
+        };
+        // A name whose body already closed before `before` is not the enclosing
+        // type, so recording it would be a silently wrong name; `None` is what
+        // makes the caller's `<unresolved-enclosing-type>` sentinel fire.
+        let closed_before_caller = bytes[cursor..].contains(&b'}');
+        if !ends_a_declaration || closed_before_caller {
+            index += 1;
+            continue;
+        }
+        found = Some(head[start..cursor].to_owned());
         index = cursor.max(index + 1);
     }
     found
@@ -1314,20 +1502,258 @@ fn declared_bypass_shapes() -> Vec<String> {
     shapes
 }
 
+/// One `unsupported-macro` site in the nine-file domain, carrying the shipped
+/// inventory's classification for that kind.
+///
+/// `_MACRO_UNSUPPORTED_RE` (:682) and `_MAKE_MACRO_CALL_RE` (:683) are the two
+/// patterns the script folds into one `unsupported-macro` row per site
+/// (:1236-1288), and `_classify` (:1901-1914) gives every such row the same
+/// grade whatever it matched: `unknown`, `BLOCKED`, `NOT_SAFE`.
+///
+/// The two paths are separate on purpose. This class has no field-exact member
+/// to name - a macro site is a position, not a field - so it is never a row in
+/// `DEFAULT_SITE_EXCEPTIONS`, and case 16 holds that table to dispositions the
+/// oracle can defend per field. Case 15 asserts the separation directly, so the
+/// two cannot be merged later without an explicit decision.
+#[derive(Debug, Eq, PartialEq)]
+struct UnsupportedMacroSite {
+    /// `file:<line>:<macro name>`.
+    key: String,
+    /// The shipped kind: `unsupported-macro` (:1263).
+    kind: &'static str,
+    /// The shipped disposition for that kind: `unknown` (:1903).
+    disposition: &'static str,
+    /// The shipped repair readiness for that kind: `BLOCKED` (:1906).
+    repair_readiness: &'static str,
+    /// The shipped safety for that kind: `NOT_SAFE` (:1908).
+    safety: &'static str,
+}
+
+/// Whether a byte may start an identifier, which is what both of the script's
+/// macro patterns require of the name they capture.
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+/// Whether a byte may continue an identifier.
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The offset of the first byte at or after `at` that is not ASCII whitespace.
+/// `_MANUAL_IMPL_RE` (:672) and `_MACRO_UNSUPPORTED_RE` (:682) both separate
+/// their tokens with `\s*`, which spans lines.
+fn skip_whitespace(bytes: &[u8], at: usize) -> usize {
+    let mut cursor = at;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    cursor
+}
+
+/// The `unsupported-macro` sites in the nine-file domain, discovered from the
+/// masked source exactly as the script discovers them.
+///
+/// One name can only reach `_MACRO_UNSUPPORTED_RE` if it carries `serde`, `deser`
+/// or `Deser` AT AN OFFSET PAST ITS FIRST CHARACTER: the pattern opens with
+/// `[A-Za-z_]`, so `serde!(..)` alone does not match while `my_deser!(..)` does.
+/// Both patterns and that offset rule are mirrored here, including the second
+/// pattern's three whole names, because `serde_derive_magic` carries none of the
+/// three substrings and is therefore reachable only through it.
+///
+/// Sites are deduplicated by name and line, as the script dedups the overlap
+/// between its two patterns (:1244), and are sorted like every other discovered
+/// list in this file.
+fn discovered_unsupported_macros() -> Vec<UnsupportedMacroSite> {
+    let mut sites = Vec::new();
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for file in NINE_FILES {
+        let raw = nine_file_source(file);
+        let masked = mask_rust(&raw);
+        let bytes = masked.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if !is_identifier_byte(bytes[index]) {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let mut end = index;
+            while end < bytes.len() && is_identifier_byte(bytes[end]) {
+                end += 1;
+            }
+            let name = masked[start..end].to_owned();
+            let tail = name.get(1..).unwrap_or_default();
+            let serde_like = is_identifier_start(bytes[start])
+                && ["serde", "deser", "Deser"]
+                    .iter()
+                    .any(|needle| tail.contains(*needle));
+            let make_macro = ["make_deser", "make_serde", "serde_derive_magic"]
+                .iter()
+                .any(|candidate| *candidate == name);
+            index = end;
+            if !(serde_like || make_macro) {
+                continue;
+            }
+            let mut cursor = skip_whitespace(bytes, end);
+            if bytes.get(cursor).copied() != Some(b'!') {
+                continue;
+            }
+            cursor = skip_whitespace(bytes, cursor + 1);
+            if !matches!(bytes.get(cursor).copied(), Some(b'(' | b'[' | b'{')) {
+                continue;
+            }
+            let line = line_of(&raw, start);
+            let entry = (name, line);
+            if seen.contains(&entry) {
+                continue;
+            }
+            seen.push(entry.clone());
+            sites.push(UnsupportedMacroSite {
+                key: format!("{file}:{line}:{}", entry.0),
+                kind: "unsupported-macro",
+                disposition: "unknown",
+                repair_readiness: "BLOCKED",
+                safety: "NOT_SAFE",
+            });
+        }
+    }
+    sites.sort_by(|left, right| left.key.cmp(&right.key));
+    sites
+}
+
+/// Every offset an optional `<…>` generic argument list opening at `at` could
+/// end at, in the order `_MANUAL_IMPL_RE` tries them: its `[^;{}]*` run is
+/// greedy, so the longest run whose next byte is a `>` is tried first, and the
+/// run may cross a line because `[^;{}]` excludes only `;`, `{` and `}`.
+///
+/// An empty result means the optional group cannot match here, which is the
+/// regex's own outcome: `\s*Deserialize` cannot consume a `<`.
+fn generic_argument_ends(bytes: &[u8], at: usize) -> Vec<usize> {
+    if bytes.get(at).copied() != Some(b'<') {
+        return Vec::new();
+    }
+    let mut run_end = at + 1;
+    while run_end < bytes.len() && !matches!(bytes[run_end], b';' | b'{' | b'}') {
+        run_end += 1;
+    }
+    bytes[at + 1..run_end]
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'>')
+        .map(|(relative, _)| at + 1 + relative + 1)
+        .rev()
+        .collect()
+}
+
+/// Whether the bytes at `at` spell `word`, which every literal this oracle
+/// matches is ASCII.
+fn spells(bytes: &[u8], at: usize, word: &str) -> bool {
+    bytes
+        .get(at..at + word.len())
+        .is_some_and(|slice| slice == word.as_bytes())
+}
+
+/// The offset just past the identifier at `at`, or `None` when no identifier
+/// starts there. `_MANUAL_IMPL_RE` spells both of its name positions
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+fn identifier_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if !is_identifier_start(bytes.get(at).copied()?) {
+        return None;
+    }
+    let mut end = at + 1;
+    while end < bytes.len() && is_identifier_byte(bytes[end]) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// The offset just past the type name of the `Deserialize … for T` tail that
+/// follows at `cursor`, or `None`. `_MANUAL_IMPL_RE` allows any lifetime in the
+/// argument list, on this line or the next.
+fn deserialize_for_end(bytes: &[u8], cursor: usize) -> Option<usize> {
+    let at = skip_whitespace(bytes, cursor);
+    if !spells(bytes, at, "Deserialize") {
+        return None;
+    }
+    let after_name = skip_whitespace(bytes, at + "Deserialize".len());
+    let mut candidates = generic_argument_ends(bytes, after_name);
+    candidates.push(after_name);
+    for candidate in candidates {
+        let at = skip_whitespace(bytes, candidate);
+        if !spells(bytes, at, "for") {
+            continue;
+        }
+        if let Some(end) = type_name_end(bytes, skip_whitespace(bytes, at + "for".len())) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// The offset just past the type name of the `impl … Deserialize … for T`
+/// header that starts at `at`, or `None` when these bytes are not one. This is
+/// `_MANUAL_IMPL_RE` (:672) read without a regex engine, including its greedy
+/// optional-argument order.
+fn manual_deserialize_impl_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let head = skip_whitespace(bytes, at + "impl".len());
+    let mut candidates = generic_argument_ends(bytes, head);
+    candidates.push(head);
+    candidates
+        .into_iter()
+        .find_map(|candidate| deserialize_for_end(bytes, candidate))
+}
+
+/// The offset just past the possibly `::`-qualified type name at `at`, or `None`
+/// when none starts there. `_MANUAL_IMPL_RE` allows whitespace after each `::`.
+fn type_name_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut cursor = identifier_end(bytes, at)?;
+    while bytes.get(cursor).copied() == Some(b':') && bytes.get(cursor + 1).copied() == Some(b':') {
+        cursor = identifier_end(bytes, skip_whitespace(bytes, cursor + 2))?;
+    }
+    Some(cursor)
+}
+
+/// Whether the byte at `offset` is the first non-whitespace byte on its line.
+/// This is the `impl` anchor, and it is the only thing standing between a
+/// derive line or a doc comment that names the trait and a counted decoder,
+/// because this read is unmasked. The script has the same concern and answers it
+/// by masking comments away before it matches.
+fn starts_its_own_line(bytes: &[u8], offset: usize) -> bool {
+    bytes[..offset]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte != b'\n' && **byte != b'\r')
+        .all(u8::is_ascii_whitespace)
+}
+
 /// The hand-written `Deserialize` implementations in the nine-file domain, the
-/// `manual-visitor` bypass shape. Read from the unmasked source: masking blanks
-/// a `'de` lifetime as a character literal, so a masked line can never carry the
-/// impl header. The `impl` anchor keeps a derive line or a doc comment that names
-/// the trait from counting as one.
+/// `manual-visitor` bypass shape, one `file:line` per site.
+///
+/// This is `_MANUAL_IMPL_RE` (:672) - `impl`, an optional argument list,
+/// `Deserialize`, its own optional argument list, `for`, and a possibly
+/// qualified type name - so a decoder written with a different lifetime, or with
+/// its impl header split across lines, is found by shape and not only by the
+/// spelling `Deserialize<'de>`.
+///
+/// Read from the unmasked source, as before: this oracle's own mask keeps a
+/// lifetime tick (`mask_rust`) but blanking and re-deriving the impl header is
+/// not worth a second copy of the masking rules here. The `impl` anchor is kept
+/// for the reason given on `starts_its_own_line`.
 fn manual_decoder_impls() -> Vec<String> {
     let mut found = Vec::new();
     for file in NINE_FILES {
-        for (number, line) in nine_file_source(file).lines().enumerate() {
-            if line.trim_start().starts_with("impl")
-                && line.contains("Deserialize<'de>")
-                && line.contains(" for ")
-            {
-                found.push(format!("{file}:{}", number + 1));
+        let raw = nine_file_source(file);
+        let bytes = raw.as_bytes();
+        let mut cursor = 0usize;
+        while let Some(relative) = raw[cursor..].find("impl") {
+            let offset = cursor + relative;
+            match manual_deserialize_impl_end(bytes, offset) {
+                Some(end) if starts_its_own_line(bytes, offset) => {
+                    found.push(format!("{file}:{}", line_of(&raw, offset)));
+                    cursor = end;
+                }
+                _ => cursor = offset + "impl".len(),
             }
         }
     }
@@ -2093,6 +2519,15 @@ fn case_01_valid_current_golden_decodes_every_changed_boundary_type() {
     let _: MemoryHandlePreview = decode_fixture("memory_handle_preview_positive.json");
     let _: OperatorQueryRequest = decode_fixture("operator_query_request_positive.json");
     let _: OperatorCommandReceipt = decode_fixture("operator_command_receipt_positive.json");
+    // Two `eval.rs` members are documented as required on the wire by the
+    // declaration doc above each type (eval.rs:586-590 and :629-636) and had no
+    // golden of their own, so the omission was covered by no document at all.
+    // Both types are derive-decoded and closed, and neither carries a
+    // `serde(default)` or a hand-written decoder.
+    let _: MetaIsolationRejectionRecord =
+        decode_fixture("meta_isolation_rejection_record_positive.json");
+    let _: MetaPolicyExecutionReceipt =
+        decode_fixture("meta_policy_execution_receipt_positive.json");
 }
 
 // WORK_UNIT_CASE: 708/2
@@ -2231,6 +2666,16 @@ fn case_02_omitted_contract_required_changed_field_fails_with_the_named_error() 
         &corpus("provider_invocation_attempt_missing_timeout_class.json"),
         "timeout_class",
         "provider_invocation_attempt_missing_timeout_class.json",
+    );
+    assert_refused::<MetaIsolationRejectionRecord>(
+        &corpus("meta_isolation_rejection_record_missing_source_experiment_ref.json"),
+        "source_experiment_ref",
+        "meta_isolation_rejection_record_missing_source_experiment_ref.json",
+    );
+    assert_refused::<MetaPolicyExecutionReceipt>(
+        &corpus("meta_policy_execution_receipt_missing_operator_command_ref.json"),
+        "operator_command_ref",
+        "meta_policy_execution_receipt_missing_operator_command_ref.json",
     );
 
     // ---------------------------------------------------------------------
@@ -3037,6 +3482,41 @@ fn case_15_the_source_oracle_reuses_the_shipped_inventory_vocabulary() {
         "the shipped inventory must keep its unreadable-source kind"
     );
 
+    // The three patterns this oracle mirrors are the script's own, by name:
+    // `_MACRO_UNSUPPORTED_RE` (:682) and `_MAKE_MACRO_CALL_RE` (:683), folded
+    // into one `unsupported-macro` row per site there (:1236-1288), and
+    // `_MANUAL_IMPL_RE` (:672). Weak probes for the same reason as the two above,
+    // and stated as such.
+    for pattern in [
+        "_MACRO_UNSUPPORTED_RE",
+        "_MAKE_MACRO_CALL_RE",
+        "_MANUAL_IMPL_RE",
+    ] {
+        assert!(
+            script.contains(pattern),
+            "the shipped inventory must keep {pattern}: the oracle mirrors it"
+        );
+    }
+    // The classification those rows carry is read out of the script's own
+    // `_classify` branch for `unreadable-source` and `unsupported-macro` rather
+    // than restated here: an `unknown` row is `BLOCKED` and `NOT_SAFE`, and that
+    // is the grade `discovered_unsupported_macros` puts on every site it finds.
+    let unknown_branch = python_block(
+        &script,
+        "if kind in (\"unreadable-source\", \"unsupported-macro\"):\n        return {",
+        "\n    if test_scope:",
+    );
+    for value in [
+        "\"disposition\": \"unknown\"",
+        "\"repair_readiness\": \"BLOCKED\"",
+        "\"safety\": \"NOT_SAFE\"",
+    ] {
+        assert!(
+            unknown_branch.contains(value),
+            "the shipped unknown classification must keep {value}: {unknown_branch}"
+        );
+    }
+
     let sites = discovered_default_sites();
     let unresolved = sites
         .iter()
@@ -3183,6 +3663,38 @@ fn case_15_the_source_oracle_reuses_the_shipped_inventory_vocabulary() {
         ],
         "a new flatten, untagged or alias shape must fail closed"
     );
+
+    // Unsupported syntax: a serde-like macro in the nine-file domain generates
+    // deserialization this oracle cannot read, which is the one condition the
+    // shipped inventory refuses to classify at all. There are none today, and
+    // the first one must fail closed.
+    //
+    // Each site is asserted to carry the script's grade, and to be outside the
+    // exception table: a macro site names a position, not a field, so it cannot
+    // become a `DEFAULT_SITE_EXCEPTIONS` row, whose dispositions case 16 holds to
+    // the five the oracle can defend per field.
+    let macros = discovered_unsupported_macros();
+    for site in &macros {
+        assert!(
+            site.kind == "unsupported-macro"
+                && site.disposition == "unknown"
+                && site.repair_readiness == "BLOCKED"
+                && site.safety == "NOT_SAFE",
+            "an unsupported macro site carries the shipped grade, never a clean row: {site:?}"
+        );
+        assert!(
+            !DEFAULT_SITE_EXCEPTIONS
+                .iter()
+                .any(|(key, _disposition)| *key == site.key),
+            "an unsupported macro names no field, so it can carry no exception row: {site:?}"
+        );
+    }
+    assert_eq!(
+        macros.len(),
+        EXPECTED_UNSUPPORTED_MACRO_SITE_COUNT,
+        "a serde-like macro in the nine-file domain is unsupported syntax this oracle cannot resolve: {macros:?}"
+    );
+
     let manual = manual_decoder_impls();
     assert_eq!(
         manual.len(),
@@ -3604,6 +4116,22 @@ fn case_19_bounded_mutations_cannot_create_a_valid_object() {
     assert_fixture_declares_every_required_key::<EvalCaseResult>(
         "eval_case_result_positive.json",
         "EvalCaseResult",
+    );
+    // `MetaIsolationRejectionRecord` (eval.rs:591-604) declares nine members and
+    // the scan records neither a default site nor a bare-`Option` site on it, so
+    // every stated key is required and the helper's `required` count is 9.
+    // `MetaPolicyExecutionReceipt` (eval.rs:637-652) declares eleven, of which
+    // `resulting_candidate` (eval.rs:649) is the one bare `Option` this type
+    // keeps on purpose - the frozen `eval.rs` slice of
+    // `EXPECTED_BARE_OPTION_SITE_LINES` already enumerates it - so the stated
+    // document is fully required except for that one, and the count is 10.
+    assert_fixture_declares_every_required_key::<MetaIsolationRejectionRecord>(
+        "meta_isolation_rejection_record_positive.json",
+        "MetaIsolationRejectionRecord",
+    );
+    assert_fixture_declares_every_required_key::<MetaPolicyExecutionReceipt>(
+        "meta_policy_execution_receipt_positive.json",
+        "MetaPolicyExecutionReceipt",
     );
     assert_fixture_declares_every_required_key::<MemoryVitalityScore>(
         "memory_vitality_score_positive.json",
