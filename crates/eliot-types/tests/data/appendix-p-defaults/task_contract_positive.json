@@ -1,0 +1,19 @@
+{
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "title": "close the silent-default hole",
+  "status": "open",
+  "acceptance_items": [],
+  "action_lease_id": null,
+  "understanding_proof_hash": null,
+  "action_provenance": null,
+  "memory_grant_redemptions": [],
+  "observation_ids": [],
+  "verification_ids": [],
+  "verification_scopes": [],
+  "completion_proof": null,
+  "completion_write_id": null,
+  "memory_revision": 7,
+  "project_sequence": 11,
+  "write_id": "00000000-0000-7000-8000-000000000003"
+}

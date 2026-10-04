@@ -1,0 +1,45 @@
+{
+  "task_contract": {
+    "task_id": "00000000-0000-7000-8000-000000000002",
+    "project_id": "00000000-0000-7000-8000-000000000001",
+    "title": "close the silent-default hole",
+    "status": "open",
+    "acceptance_items": [],
+    "action_lease_id": null,
+    "understanding_proof_hash": null,
+    "action_provenance": null,
+    "memory_grant_redemptions": [],
+    "observation_ids": [],
+    "verification_ids": [],
+    "verification_scopes": [],
+    "completion_proof": null,
+    "completion_write_id": null,
+    "memory_revision": 7,
+    "project_sequence": 11,
+    "write_id": "00000000-0000-7000-8000-000000000003"
+  },
+  "task_meaning": null,
+  "active_decision_state": null,
+  "current_truth": [],
+  "epistemic_state": {
+    "supported": [],
+    "assumed": [],
+    "conflicted": [],
+    "unknown": []
+  },
+  "causal_bridge": [],
+  "negative_memory": [],
+  "selected_memory": [],
+  "suppressed_memory": [],
+  "procedural_skills": {
+    "included_skills": [],
+    "excluded_skills": [],
+    "activation_decisions": [],
+    "distractors_removed": [],
+    "required_verifiers": [],
+    "anti_scope_warnings": []
+  },
+  "packet_quality": null,
+  "understanding_outcomes": [],
+  "completion_proof": null
+}
