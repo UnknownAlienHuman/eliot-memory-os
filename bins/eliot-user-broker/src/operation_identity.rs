@@ -1746,8 +1746,22 @@ mod tests {
     }
 
     fn issuer() -> OperationIdentityIssuer {
-        OperationIdentityIssuer::bound(BINDING_DIGEST.to_owned(), test_fence())
-            .expect("test issuer")
+        let mut issuer = OperationIdentityIssuer::bound(BINDING_DIGEST.to_owned(), test_fence())
+            .expect("test issuer");
+        // Bind the stable registration generation once, while the ledger is still
+        // empty, so every non-register mint below carries its registration digest
+        // and broker epoch instead of being refused as an unbound generation.
+        issuer
+            .note_registration_binding(
+                BINDING_DIGEST,
+                1,
+                &json!({
+                    "lineage_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "sequence": 7,
+                }),
+            )
+            .expect("test registration binding");
+        issuer
     }
 
     fn fence_of(issued: &IssuedIdentity) -> Value {
