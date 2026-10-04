@@ -280,10 +280,13 @@ const EXPECTED_SPECIFIC_OWNER_ROWS: [&str; 16] = [
     "memory.rs::CompilePacketL3Request.max_tokens",
 ];
 
-/// The owner files the deferred breaking candidates belong to.
-const EXPECTED_OWNER_FILES: [&str; 5] = [
+/// The owner files the deferred decisions belong to. Sorted, and equal to the
+/// deduplicated owner column of `BREAKING_CANDIDATE_OWNER_MAP`; case 20 asserts
+/// that equality, so a new owner cannot appear without being listed here.
+const EXPECTED_OWNER_FILES: [&str; 6] = [
     "crates/eliot-app/src/cognitive_field_runner.rs",
     "crates/eliot-app/src/mcp_stdio/catalog.rs",
+    "crates/eliot-app/src/mcp_stdio/operator.rs",
     "crates/eliot-app/src/mcp_stdio/protocol_support.rs",
     "crates/eliot-store/src/canonical_store.rs",
     "crates/surfaces/eliot-mcp/src/schema.rs",
@@ -310,26 +313,26 @@ const BREAKING_CANDIDATE_OWNER_MAP: &[(&str, &str, &str, &str)] = &[
     (
         "CompilePacketToolInput.{material_frame,memory_mode}",
         "n/a",
-        "the published eliot.packet schema's generated required set and compile_packet_minimal_example",
+        "NOT a deferred breaking candidate: the frozen inventory (lifecycle.rs:324-330) records these two defaults as consistent with the hand-written CompilePacketToolInputVisitor and says \"No change\", because that visitor is the actual decoder and does not reintroduce any default. The published eliot.packet schema's required set is the surface that would observe any change; the frozen record declines the deferral.",
         "crates/surfaces/eliot-mcp/src/schema.rs",
     ),
     (
         "RecallL0Request.task_id",
         "n/a",
-        "the eliot_recall_l0 catalogue's published required set",
+        "NOT a breaking-candidate deferral: the frozen inventory retains this paired row on its own paired-disposition reasoning and does not call it a breaking candidate - only the MaterialPacketFrame row uses that wording (lifecycle.rs:27). The eliot_recall_l0 catalogue holds the published required set that would observe a change.",
         "crates/eliot-app/src/mcp_stdio/catalog.rs",
     ),
     (
         "OperatorQueryRequest.expand_depth",
         "n/a",
-        "the eliot_operator_query catalogue's published required set and its 1..=3 range check",
-        "crates/eliot-app/src/mcp_stdio/catalog.rs",
+        "the eliot.operator_query tool contract named by the frozen inventory (lifecycle.rs:289-292), whose 1..=3 range check at operator.rs:743 is the evidence this row cites; the catalogue holds only the tool name string",
+        "crates/eliot-app/src/mcp_stdio/operator.rs",
     ),
     (
         "CompilePacketL3Request.max_tokens",
         "n/a",
-        "the published eliot.packet schema and its preferred_tokens default owner",
-        "crates/eliot-app/src/mcp_stdio/protocol_support.rs",
+        "the published eliot.packet schema's pinned-out-of-required default, whose evidence is the schema projection itself and ul_contract_schema.rs::t02_packet_budget_is_an_optional_preferred_target; the frozen inventory names no file, and the previous owner cited here held no occurrence of this key",
+        "crates/surfaces/eliot-mcp/src/schema.rs",
     ),
     (
         "ObserveInput.schema_version",
@@ -362,7 +365,7 @@ const BREAKING_CANDIDATE_OWNER_MAP: &[(&str, &str, &str, &str)] = &[
         "crates/surfaces/eliot-mcp/src/schema.rs",
     ),
     (
-        "CognitiveFieldProviderPlan.{role_evidence_plan_hash,seal_attempt_id,seal_generation,authority_activation_ref,runtime_manifest_sha256,artifact_manifest_sha256}",
+        "CognitiveFieldProviderPlan.{role_evidence_plan_hash,seal_attempt_id,authority_activation_ref,runtime_manifest_sha256,artifact_manifest_sha256}",
         "n/a",
         "the plan_hash owner's blake3 digest over the emitted keys: removing a skip_serializing_if changes the sealed bytes",
         "crates/eliot-app/src/cognitive_field_runner.rs",
@@ -3679,7 +3682,7 @@ fn case_20_the_deferred_owner_map_is_complete_and_outside_this_scope() {
     owners.dedup();
     assert_eq!(
         owners,
-        EXPECTED_OWNER_FILES.to_vec(),
+        EXPECTED_OWNER_FILES.as_slice(),
         "the deferred owner set must not change without its named owner"
     );
     for entry in BREAKING_CANDIDATE_OWNER_MAP {
