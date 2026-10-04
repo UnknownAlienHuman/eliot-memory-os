@@ -9,6 +9,7 @@ license.workspace = true
 blake3.workspace = true
 eliot-bootstrap.workspace = true
 eliot-build-test-graph = { path = "../instrument/eliot-build-test-graph", version = "0.1.0" }
+eliot-agent-contracts.workspace = true
 eliot-contracts.workspace = true
 eliot-context-contracts = { path = "../smart/eliot-context-contracts", version = "0.1.0" }
 eliot-context-measurement = { path = "../smart/eliot-context-measurement", version = "0.1.0" }

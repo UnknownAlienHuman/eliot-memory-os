@@ -1,10 +1,12 @@
 use crate::{EngineError, StopCoordinationGate, WorkState};
+use eliot_agent_contracts::{AgentAttemptId, HandoffCaptureBoundary, HandoffCaptureLedger};
 use eliot_types::{
     EliotHookEvent, HookDecision, HookDecisionReason, HookEventKind, HookProcessingStatus,
     HookSpoolRecord,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 const MAX_STRING_LEN: usize = 512;
@@ -22,16 +24,52 @@ pub struct HookProcessingResult {
 pub struct EliotHookService {
     runtime_root: PathBuf,
     task_bound: bool,
+    /// Capture ledger shared with whoever owns the checkpoint commit for this
+    /// session (issue #1730).
+    ///
+    /// The pre-compaction hook is the only ELIOT-controlled boundary that
+    /// destroys conversational state, so it is the boundary that must not allow
+    /// destruction on a spool-size check alone. The ledger is shared rather than
+    /// owned because the capture must be REGISTERED by the party that commits the
+    /// checkpoint and READ by the hook that decides: a hook-local ledger could
+    /// never see a capture made elsewhere, and would therefore refuse every
+    /// compaction forever.
+    capture_ledger: Arc<Mutex<HandoffCaptureLedger>>,
 }
 
 impl EliotHookService {
     /// A service that gates. Use this only when the session is attached to an
     /// ELIOT task; see [`EliotHookService::unbound`] for the alternative.
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
+        Self::with_capture_ledger(runtime_root, true, HandoffCaptureLedger::new())
+    }
+
+    /// A service that gates against a caller-owned capture ledger (issue #1730).
+    ///
+    /// The composition root that commits the pre-compaction checkpoint holds the
+    /// same ledger, so the capture this hook requires is the one that was actually
+    /// committed and read back, not one this process invented for itself.
+    #[must_use]
+    pub fn with_capture_ledger(
+        runtime_root: impl Into<PathBuf>,
+        task_bound: bool,
+        capture_ledger: HandoffCaptureLedger,
+    ) -> Self {
         Self {
             runtime_root: runtime_root.into(),
-            task_bound: true,
+            task_bound,
+            capture_ledger: Arc::new(Mutex::new(capture_ledger)),
         }
+    }
+
+    /// Returns the shared handle to this service's capture ledger.
+    ///
+    /// The checkpoint owner registers its capture through this handle, and the
+    /// pre-compaction gate reads the registration through the same one, so the
+    /// two cannot disagree about whether a durable capture exists.
+    #[must_use]
+    pub fn capture_ledger(&self) -> Arc<Mutex<HandoffCaptureLedger>> {
+        Arc::clone(&self.capture_ledger)
     }
 
     /// The plugin is installed at user scope, so these hooks fire in every
@@ -42,10 +80,7 @@ impl EliotHookService {
     /// spooled, it just cannot deny anything.
     #[must_use]
     pub fn unbound(runtime_root: impl Into<PathBuf>) -> Self {
-        Self {
-            runtime_root: runtime_root.into(),
-            task_bound: false,
-        }
+        Self::with_capture_ledger(runtime_root, false, HandoffCaptureLedger::new())
     }
 
     /// Builds the service for a session, gating only when `ELIOT_TASK_ID`
@@ -54,10 +89,7 @@ impl EliotHookService {
     /// ELIOT's to govern.
     #[must_use]
     pub fn for_session(runtime_root: impl Into<PathBuf>, task_attached: bool) -> Self {
-        Self {
-            runtime_root: runtime_root.into(),
-            task_bound: task_attached,
-        }
+        Self::with_capture_ledger(runtime_root, task_attached, HandoffCaptureLedger::new())
     }
 
     pub fn process(
@@ -119,7 +151,7 @@ impl EliotHookService {
         match event.kind {
             HookEventKind::PreToolUse => self.evaluate_pre_tool_use(event),
             HookEventKind::PermissionRequest => Ok(evaluate_permission_request(event)),
-            HookEventKind::PreCompact => self.evaluate_pre_compact(),
+            HookEventKind::PreCompact => self.evaluate_pre_compact(event),
             HookEventKind::Stop => self.evaluate_stop(event),
             HookEventKind::SessionStart
             | HookEventKind::UserPromptSubmit
@@ -133,22 +165,86 @@ impl EliotHookService {
         }
     }
 
+    /// The pre-compaction gate: the ONLY ELIOT-controlled destructive boundary
+    /// (issue #1730, `HandoffCaptureBoundary::HostPreCompactHook`).
+    ///
+    /// Compaction destroys conversational state. Before this hook existed as a
+    /// capture site, the decision was made on spool size alone — a local resource
+    /// bound — so a session with a small spool destroyed state whose handoff
+    /// checkpoint had never been captured. The bound is still enforced; it is now
+    /// the SECOND question rather than the only one.
+    ///
+    /// The FIRST question is the capture contract's own gate:
+    /// [`HandoffCaptureLedger::admits_destructive_compaction`] answers `true` only
+    /// for a registered `HostPreCompactHook` capture whose own durable readback
+    /// names that capture identity. A boundary with no registered capture, a
+    /// capture holding only a transport acknowledgement, and a capture whose
+    /// commit response was lost all answer `false` here — which is the fail-closed
+    /// direction for a destructive operation.
+    ///
+    /// The gate is asked PER SOURCE ATTEMPT, so it reads the ledger rather than
+    /// assuming one session-wide answer. An unbound session has no ELIOT state to
+    /// lose and is allowed before this point (the same rule the other enforcement
+    /// events use); a bound session must have captured first.
+    ///
+    /// A poisoned ledger is NOT read as an absent capture and therefore NOT read
+    /// as permission: it blocks with its own reason, because an unreadable gate on
+    /// a destructive boundary is not evidence that the boundary is safe.
     fn evaluate_pre_compact(
         &self,
+        event: &EliotHookEvent,
     ) -> Result<(bool, HookProcessingStatus, Vec<HookDecisionReason>), EngineError> {
         let pending = pending_spool_count(&self.runtime_root)?;
         if pending > MAX_PENDING_SPOOL {
-            Ok(block_decision(
+            return Ok(block_decision(
                 HookProcessingStatus::FailedClosed,
                 "spool_backlog_too_large",
                 "ELIOT blocks compaction because hook spool backlog exceeds the F0 bound.",
-            ))
-        } else {
-            Ok(allow_decision(
-                "spool_bounded",
-                "ELIOT hook spool is within the F0 compaction bound.",
-            ))
+            ));
         }
+        let captures_durable = self.pre_compact_capture_is_durable(event)?;
+        if !captures_durable {
+            return Ok(block_decision(
+                HookProcessingStatus::FailedClosed,
+                "handoff_capture_required",
+                "ELIOT blocks compaction until this session's handoff checkpoint is captured \
+                 and durably read back; the pre-compaction boundary destroys conversational \
+                 state, so a missing or unproved capture is refused rather than allowed.",
+            ));
+        }
+        Ok(allow_decision(
+            "handoff_captured_and_spool_bounded",
+            "ELIOT hook spool is within the F0 compaction bound and this session's handoff \
+             checkpoint is captured with a durable readback.",
+        ))
+    }
+
+    /// Whether the pre-compaction capture this event names is registered with a
+    /// durable readback, or whether no capture is owed at all.
+    ///
+    /// `Ok(true)` covers two cases and they are deliberately different:
+    ///
+    /// * the event names a source attempt and the ledger holds that attempt's
+    ///   capture with a durable readback; or
+    /// * the event names no attempt, so there is no capture identity to check.
+    ///   A hook payload with no attempt cannot have a registered capture either,
+    ///   so refusing on that alone would block compaction for every session that
+    ///   does not report one, which is the opposite of what this gate is for. The
+    ///   caller decides what a session without an attempt means; this function
+    ///   only refuses a NAMED capture that is missing or unproved.
+    fn pre_compact_capture_is_durable(&self, event: &EliotHookEvent) -> Result<bool, EngineError> {
+        let Some(attempt) = source_attempt_of(event) else {
+            return Ok(true);
+        };
+        let ledger = self.capture_ledger.lock().map_err(|_| {
+            EngineError::WriteRejected(
+                "the handoff capture ledger is unreadable; a destructive boundary whose capture \
+                 gate cannot be read is refused rather than allowed"
+                    .to_owned(),
+            )
+        })?;
+        Ok(ledger
+            .admits_destructive_compaction(HandoffCaptureBoundary::HostPreCompactHook, &attempt))
     }
 
     fn evaluate_pre_tool_use(
@@ -219,6 +315,24 @@ impl EliotHookService {
         serde_json::to_writer_pretty(std::fs::File::create(&path)?, &record)?;
         Ok(path)
     }
+}
+
+/// The source attempt a hook event names, when it names one.
+///
+/// Read from the same admitted payload members the rest of this module reads, and
+/// only when they agree: an `attempt_id` that disagrees with `attemptId` is
+/// ambiguous and yields `None` rather than either value, because the capture
+/// ledger is keyed by this identity and a wrong key answers about the wrong
+/// attempt.
+fn source_attempt_of(event: &EliotHookEvent) -> Option<AgentAttemptId> {
+    let read = |key: &str| event.payload.get(key).and_then(Value::as_str);
+    let primary = read("attempt_id").or_else(|| read("attemptId"))?;
+    if let Some(secondary) = read("attemptId").or_else(|| read("attempt_id"))
+        && secondary != primary
+    {
+        return None;
+    }
+    AgentAttemptId::new(primary).ok()
 }
 
 fn stdout_for_decision(

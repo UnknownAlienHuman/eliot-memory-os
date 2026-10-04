@@ -1821,6 +1821,7 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-agent-contracts",
  "eliot-bootstrap",
  "eliot-build-test-graph",
  "eliot-context-contracts",
