@@ -157,6 +157,18 @@ impl ResearchProviderDisposition {
             Self::UnknownOutcome => REASON_UNKNOWN_OUTCOME,
         }
     }
+
+    /// Returns whether this disposition states something about the *operation*
+    /// rather than about the presentation.
+    ///
+    /// `UnknownOutcome` is the only disposition that does: the owner still
+    /// holds the operation, its effect is unproven, and it must be reconciled by
+    /// the stable operation identity. Every other variant — including
+    /// `Unavailable` — is a decision about the request as presented, and a
+    /// caller must not read one as an attempt's lifecycle.
+    pub const fn is_unknown_operation_state(self) -> bool {
+        matches!(self, Self::UnknownOutcome)
+    }
 }
 
 /// Typed reason one research-provider dispatch was refused or returned.
