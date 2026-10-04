@@ -723,11 +723,22 @@ pub struct SkillCandidate {
     pub evidence_refs: Vec<String>,
     pub dependency_versions: Vec<DependencyVersion>,
     pub candidate_scope: SkillScope,
+    /// Exact governance policy revision under which this candidate was
+    /// proposed. Two decisions taken under different policy revisions are
+    /// different candidates even when every other term matches, so the term
+    /// is structurally bound instead of left to the caller.
+    pub policy_revision: String,
+    /// Exact operation identity that produced this candidate. It enters
+    /// `candidate_digest`, so an exact replay of the same decision is
+    /// idempotent while a distinct operation identity produces a distinct
+    /// candidate instead of a byte-identical one.
+    pub operation_identity: String,
     pub candidate_digest: String,
     pub state_fence: StateFence,
 }
 
 impl SkillCandidate {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_view: &SkillLifecycleView,
         candidate_package_digest: String,
@@ -735,6 +746,8 @@ impl SkillCandidate {
         evidence_refs: Vec<String>,
         dependency_versions: Vec<DependencyVersion>,
         candidate_scope: SkillScope,
+        policy_revision: String,
+        operation_identity: String,
         state_fence: StateFence,
     ) -> Result<Self, SkillError> {
         let base_view_digest = base_view.identity_digest()?;
@@ -746,6 +759,8 @@ impl SkillCandidate {
             evidence_refs,
             dependency_versions,
             candidate_scope,
+            policy_revision,
+            operation_identity,
             candidate_digest: String::new(),
             state_fence,
         };
@@ -763,6 +778,8 @@ impl SkillCandidate {
             &self.evidence_refs,
             &self.dependency_versions,
             &self.candidate_scope,
+            &self.policy_revision,
+            &self.operation_identity,
             &self.state_fence,
         ))
     }
@@ -801,6 +818,11 @@ impl SkillCandidate {
             dependency.validate()?;
         }
         self.candidate_scope.validate()?;
+        // Policy revision and operation identity are mandatory binding terms:
+        // an unbound candidate could not be told apart from a decision taken
+        // under another policy revision or another operation identity.
+        text(&self.policy_revision, "candidate.policy_revision")?;
+        text(&self.operation_identity, "candidate.operation_identity")?;
         self.state_fence
             .validate()
             .map_err(|error| SkillError::Surface(error.to_string()))?;
@@ -1407,6 +1429,8 @@ impl SkillRegistry {
         evidence_refs: Vec<String>,
         dependencies: Vec<DependencyVersion>,
         candidate_scope: SkillScope,
+        policy_revision: String,
+        operation_identity: String,
         state_fence: StateFence,
     ) -> Result<SkillCandidate, SkillError> {
         let base = self.views.get(base_skill_id).ok_or(SkillError::NotFound)?;
@@ -1420,6 +1444,8 @@ impl SkillRegistry {
             evidence_refs,
             dependencies,
             candidate_scope,
+            policy_revision,
+            operation_identity,
             state_fence,
         )
     }
@@ -1517,6 +1543,11 @@ pub trait SkillLifecycleApi: Send + Sync {
     ) -> Result<Option<SkillLifecycleView>, SkillError>;
 
     /// Explicit fields mirror the public lifecycle/API contract.
+    ///
+    /// The returned `SkillCandidate` binds the caller's `policy_revision`
+    /// together with this request's own operation identity, so two proposals
+    /// that differ only in policy revision or in operation identity are
+    /// distinguishable candidates rather than byte-identical ones.
     #[allow(clippy::too_many_arguments)]
     async fn propose(
         &self,
@@ -1527,6 +1558,7 @@ pub trait SkillLifecycleApi: Send + Sync {
         evidence_refs: Vec<String>,
         dependencies: Vec<DependencyVersion>,
         scope: SkillScope,
+        policy_revision: String,
     ) -> Result<SkillCandidate, SkillError>;
 
     async fn promote(
