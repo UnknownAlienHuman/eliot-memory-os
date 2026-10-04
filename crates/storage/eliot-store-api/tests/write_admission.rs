@@ -170,6 +170,7 @@ fn bind_with_label(
     let mut params = params_for(transition);
     match field {
         "reservation_id" => params.reservation_id = label,
+        "idempotency_key" => params.idempotency_key = label,
         "recovery_owner" => params.recovery_owner = label,
         "source_id" => params.source_id = label,
         _ => params.writer_epoch.lineage_id = label,
@@ -317,17 +318,17 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "b65218b42694a3daf3d4a4878e0c971c2d4b47378db17d1022fe33750ac38775"
+        "14c988f1518cb31e4a53d364cfa52179b0ae94632907838a8e7f1b53d74abca5"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "492e2e7951923788e1bbf8b842cd8482e1997ad7e998481bcd58777e115b344f"
+        "87015529d3006ee4ca439d297ee6c763faab96562aa90b83b79a7e5850d5cd70"
     );
     // Issue #18: the frozen transition carries derived (never defaulted)
     // decision/plan digests plus the rendered source revisions.
     assert_eq!(
         from_fixture.transition.admission_digest,
-        "7cb3f14c0b151b309388d27e51d5892863428e54d10aed766a50660bbea38023"
+        "dae2a50a4de6bd289dd92b98fcbd643f7b42defef40e3bf3649ec2dee1bff469"
     );
     assert_eq!(
         from_fixture.transition.mutation_plan_digest,
@@ -627,6 +628,7 @@ fn every_item_string_and_byte_bound_holds_at_max_and_one_over() {
     );
     for field in [
         "reservation_id",
+        "idempotency_key",
         "recovery_owner",
         "source_id",
         "lineage_id",
@@ -660,20 +662,69 @@ fn every_item_string_and_byte_bound_holds_at_max_and_one_over() {
             ..
         })
     ));
-    let mut short_digest = valid_request();
-    short_digest.admission.canonical_request_hash = "d".repeat(63);
-    assert!(matches!(
-        short_digest.validate(),
-        Err(StoreError::InvalidField {
-            field: "admission.canonical_request_hash",
-            ..
-        })
-    ));
+    for length in [63, 65] {
+        for field in [
+            "admission.canonical_request_hash",
+            "admission.prepared_transition_digest",
+            "admission.reservation_token_digest",
+            "admission.expected_head_digest",
+        ] {
+            let mut request = valid_request();
+            let digest = "d".repeat(length);
+            match field {
+                "admission.canonical_request_hash" => {
+                    request.admission.canonical_request_hash = digest;
+                }
+                "admission.prepared_transition_digest" => {
+                    request.admission.prepared_transition_digest = digest;
+                }
+                "admission.reservation_token_digest" => {
+                    request.admission.reservation_token_digest = digest;
+                }
+                _ => request.admission.scopes[0].expected_head_digest = digest,
+            }
+            assert!(
+                matches!(request.validate(), Err(StoreError::InvalidField { field: actual, .. }) if actual == field),
+                "{field} rejects a {length}-byte digest at its own boundary"
+            );
+        }
+    }
+}
+
+fn assert_duplicate_raw_fields<
+    T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+>(
+    value: &T,
+) {
+    let raw = serde_json::to_string(value).unwrap();
+    assert!(serde_json::from_str::<T>(&raw).is_ok());
+    let fields = serde_json::to_value(value).unwrap();
+    for (field, value) in fields.as_object().unwrap() {
+        // Build the negative after serialization; never parse it through Value,
+        // which would erase duplicate keys before the public decoder sees them.
+        let escaped = format!(r"\u{:04x}{}", field.as_bytes()[0], &field[1..]);
+        for duplicate_key in [field.as_str(), escaped.as_str()] {
+            let duplicate = format!("{{\"{duplicate_key}\":{value},{}", &raw[1..]);
+            let error = serde_json::from_str::<T>(&duplicate)
+                .expect_err("a repeated protected key must fail decoding");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("duplicate field `{field}`")),
+                "{field} must fail for its duplicate, not unrelated missing data"
+            );
+        }
+    }
 }
 
 // WORK_UNIT_CASE: 990/9
 #[test]
 fn unknown_version_field_variant_and_duplicate_raw_keys_are_rejected() {
+    let request = valid_request();
+    assert_duplicate_raw_fields(&request);
+    assert_duplicate_raw_fields(&request.admission);
+    assert_duplicate_raw_fields(&request.admission.scopes[0]);
+    assert_duplicate_raw_fields(&request.admission.writer_epoch);
     let mut version = valid_request();
     version.admission.contract_version = 999;
     assert!(matches!(
@@ -1068,6 +1119,9 @@ fn transport_principal_and_payload_issuer_are_noninterchangeable() {
 // WORK_UNIT_CASE: 990/13
 #[test]
 fn canonical_token_or_transition_mutation_invalidates_the_binding() {
+    // This exercises the Store-owned reservation-binding view, not the bytes
+    // of an ORS WriterReservationToken. The owner-token binding required by
+    // #990 remains a separate contract obligation; this case cannot prove it.
     let request = valid_request();
     assert!(request.validate().is_ok());
     let mut transition = valid_request();
