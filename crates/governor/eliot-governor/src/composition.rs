@@ -5390,6 +5390,40 @@ pub struct PreparedMaintenanceAdmission {
     pub decision_ref: String,
 }
 
+/// The custody identity of one maintenance scope reference.
+///
+/// A maintenance scope reference names the resource INSTANCE a job ran
+/// against, so it carries that instance's resource generation:
+/// `service:lineage@sequence:generation`. Custody, though, is held by the
+/// resource and not by one generation of it, so the conflict guard in
+/// `adopt_maintenance_admission` has to compare everything except the
+/// generation.
+///
+/// Comparing the full reference instead - which is what this cell did - makes
+/// the guard unable to fire for exactly the case it exists for: when the
+/// resource generation advances, the older job's reference necessarily carries
+/// the OLD generation, so `prior.scope_ref == prepared.scope_ref` is false and
+/// a new `MaintenanceJob` is admitted while the older job's effects are still
+/// unsettled and its resource custody unreleased. The obligation this guard
+/// carries is explicit that "a generation change invalidates old applicability
+/// but does not settle an older job's possible effects or release its resource
+/// custody; reconcile that obligation before allowing conflicting work."
+///
+/// Only a trailing all-digit segment is treated as the generation. A reference
+/// in any other shape is returned unchanged, so an unrecognised spelling keeps
+/// comparing exactly as before rather than being silently widened into a
+/// broader custody claim.
+fn maintenance_custody_scope(scope_ref: &str) -> &str {
+    let Some((head, generation)) = scope_ref.rsplit_once(':') else {
+        return scope_ref;
+    };
+    if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
+        head
+    } else {
+        scope_ref
+    }
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
@@ -5602,7 +5636,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `Completed`, `Failed`) releases its scope. Any other prior job for the
     /// same family and scope — an older generation's unsettled effects as much
     /// as a same-generation duplicate — is refused until that obligation is
-    /// reconciled.
+    /// reconciled. "Same scope" here is the custody scope compared by
+    /// [`maintenance_custody_scope`], which is the scope reference without its
+    /// resource generation: comparing the full reference made this guard
+    /// unreachable for an older generation, which is the case it names.
     ///
     /// # Errors
     ///
@@ -5649,7 +5686,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     | MaintenanceJobState::Completed
                     | MaintenanceJobState::Failed
             );
-            if prior.family == prepared.family && prior.scope_ref == prepared.scope_ref && !settled
+            if prior.family == prepared.family
+                && maintenance_custody_scope(&prior.scope_ref)
+                    == maintenance_custody_scope(&prepared.scope_ref)
+                && !settled
             {
                 return Err(CompositionError::Recovery(
                     "an older maintenance job for this family and scope is not settled: reconcile its effects and release its resource custody before admitting conflicting work"
@@ -14792,5 +14832,56 @@ mod tests {
             binding.binding_digest, mutated_binding.binding_digest,
             "invocation change must move the binding digest"
         );
+    }
+
+    /// AUD3 (#1693): the conflict guard compared the FULL scope reference,
+    /// which embeds the resource generation, so it could never fire for the
+    /// cross-generation case it names: the older job necessarily carries the
+    /// old generation, the two references differ, and a new job was admitted
+    /// while the older job's effects were unsettled and its custody unreleased.
+    ///
+    /// The custody scope is the reference without its generation, so an older
+    /// generation's unsettled job now conflicts exactly as a same-generation
+    /// duplicate does.
+    #[test]
+    fn maintenance_custody_scope_ignores_only_the_resource_generation() {
+        let older = "eliotd:lineage-primary@7:41";
+        let newer = "eliotd:lineage-primary@7:42";
+        assert_ne!(
+            older, newer,
+            "the fixture must really differ by generation, or this row proves nothing"
+        );
+        assert_eq!(
+            maintenance_custody_scope(older),
+            maintenance_custody_scope(newer),
+            "an older generation's job holds the same resource custody as the new one"
+        );
+
+        // A different lineage or a different epoch sequence is a DIFFERENT
+        // resource, so its custody must not be folded into this one.
+        assert_ne!(
+            maintenance_custody_scope(older),
+            maintenance_custody_scope("eliotd:lineage-other@7:41"),
+            "another lineage holds its own custody"
+        );
+        assert_ne!(
+            maintenance_custody_scope(older),
+            maintenance_custody_scope("eliotd:lineage-primary@8:41"),
+            "another epoch sequence holds its own custody"
+        );
+
+        // A reference in an unrecognised shape compares exactly as before: it is
+        // never silently widened into a broader custody claim.
+        for unrecognised in [
+            "scope-without-a-generation",
+            "service:lineage@7:not-a-number",
+            "service:lineage@7:",
+        ] {
+            assert_eq!(
+                maintenance_custody_scope(unrecognised),
+                unrecognised,
+                "an unrecognised scope spelling must keep comparing exactly"
+            );
+        }
     }
 }
