@@ -3843,6 +3843,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             )
         })
         .collect();
+
     // SCOPE OF THIS PORT, stated exactly rather than as blanket parity. The
     // gate's own `parse_rust_markers` runs SIX distinct check families, and
     // this port covers three of them:
@@ -3904,18 +3905,23 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     // not depend on `rustc` rejecting a duplicate `fn` for a property the gate
     // checks itself.
     let mut suite_seen_test_names: Vec<(String, usize)> = Vec::new();
+
     for (offset, marker_id) in marker_candidates {
         let marker_line = offset + 1;
         let Some(marker_id) = marker_id else {
             suite_marker_defects.push(format!(
+
                 "line {marker_line}: `{}` is not an anchored `// WORK_UNIT_CASE: 789/<n>` marker of this work unit (the gate requires exactly `{marker_prefix} <digits>/<digits>` to the end of the line), so its case id cannot be bound to a test",
+
                 suite_lines[offset].trim()
             ));
             continue;
         };
         if !(1..=42).contains(&marker_id) {
             suite_marker_defects.push(format!(
+
                 "line {marker_line}: `// WORK_UNIT_CASE: 789/{marker_id}` is OUT OF RANGE, every case id must be in 1..=42"
+
             ));
             continue;
         }
@@ -3928,20 +3934,26 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             let next_line = walk + 1;
             if stripped.is_empty() {
                 reason = Some(format!(
+
                     "line {marker_line}: DETACHED BY A BLANK LINE (line {next_line}), the gate stops at a blank line before it reaches a function"
+
                 ));
                 break;
             }
             if stripped.starts_with("//") || stripped.starts_with("/*") {
                 reason = Some(format!(
+
                     "line {marker_line}: DETACHED BY AN INTERVENING COMMENT (line {next_line}: `{stripped}`), the gate stops at a comment before it reaches a function"
+
                 ));
                 break;
             }
             if stripped.starts_with("#[") {
                 if stripped.contains("ignore") {
                     reason = Some(format!(
+
                         "line {marker_line}: NOT ATTACHED TO AN EXECUTED `#[test]` FN, the marker reaches an `#[ignore]` attribute on line {next_line} before the function"
+
                     ));
                     break;
                 }
@@ -3966,6 +3978,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
                 break;
             }
             reason = Some(format!(
+
                 "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, line {next_line} is neither an attribute nor a function declaration (`{stripped}`)"
             ));
             break;
@@ -4050,6 +4063,7 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     assert!(
         suite_marker_defects.is_empty(),
         "W7 DENOMINATOR (source marker binding): every anchored `// WORK_UNIT_CASE: 789/<n>` marker in this source must be bound to its own `#[test]` fn, clear `scripts/work_unit_gate/case_binding.py` `:377-384` (`IGNORED_TEST`, `DUPLICATE_TEST_IDENTITY`) and the anti-placeholder adequacy floor `:386-424` (`EMPTY_TEST_BODY`, `UNCONDITIONAL_TRUE`, `TRIVIAL_SELF_EQUALITY`, `NO_CHECK_CONSTANT`), and carry a case id in 1..=42; {} marker(s) are not bound: {}",
+
         suite_marker_defects.len(),
         suite_marker_defects.join(" | ")
     );

@@ -50,21 +50,27 @@
 //! verdict in either direction: a startup failure can be recovered from, and a
 //! later failure is recorded rather than assumed away. It re-evaluates only the
 //! named slot, so it can neither sweep every optional provider nor block on
-//! one. The one operation that legitimately affects every slot is owner
+//! one. [`reevaluate_demanded_capabilities`] drives that same single-slot
+//! reevaluation across the whole dependency set one admitted operation
+//! actually names — the Skill path needs both its source and its basis, not
+//! one of the two — and still reattaches only the slots that are currently
+//! unavailable. The one operation that legitimately affects every slot is owner
 //! generation replacement, which goes through
-//! [`StartupReadinessProjection::invalidate_for_replaced_generation`] and is
+//! [`StartupReadinessProjection::retire_generation_scoped_bindings`] and is
 //! driven by the existing owners, not by this module.
 //!
 //! # Late completions adopt deltas, never snapshots
 //!
 //! A local-read flight prepares its operation from an immutable snapshot but
-//! returns only what it actually observed: at most one [`LocalReadinessDelta`]
-//! bound to the exact slot, owner outcome, owner/fence identity and
+//! returns only what it actually observed: a bounded [`LocalReadinessDeltas`]
+//! set carrying at most one [`LocalReadinessDelta`] per declared capability,
+//! each bound to its exact slot, owner outcome, owner/fence identity and
 //! observation tokens captured for that work.
-//! [`StartupReadinessProjection::adopt_local_delta`] files it only while that
-//! basis is still current, through the existing single-slot reevaluation. A
-//! late or conflicting delta is refused without touching the loop's
-//! requirements, other slots or their history, while the flight's own
+//! [`StartupReadinessProjection::adopt_local_deltas`] files each one through
+//! the existing single-slot reevaluation while *that delta's own* basis is
+//! still current, so a stale source observation cannot erase a fresh basis
+//! result, and a late or conflicting delta is refused without touching the
+//! loop's requirements, other slots or their history, while the flight's own
 //! read/submit outcome still settles exactly once.
 //!
 //! Architecture traceability: A2.3 (dependencies are required, optional, or
@@ -355,6 +361,77 @@ impl LocalReadinessDelta {
     }
 }
 
+/// The bounded set of per-slot observations one demand produced.
+///
+/// A single-slot delta cannot express the dependency set one operation actually
+/// requires — the Skill path needs both its tool source and its installed-Skill
+/// basis — so a refresh that only observed one of the two leaves the other slot
+/// latched at its startup failure forever. This set carries what a real demand
+/// observed, and nothing else.
+///
+/// Bounded by construction: the set holds **at most one delta per declared
+/// capability**, so it can never hold more than
+/// [`DeclaredStartupCapability::COUNT`] entries. That bound is the declared
+/// denominator that already exists, so there is no separate numeric cap, no
+/// truncation and no drop-oldest policy: a demand visits each capability the
+/// operation names once, so the set is bounded by that operation's own
+/// dependency set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalReadinessDeltas {
+    deltas: Vec<LocalReadinessDelta>,
+}
+
+impl LocalReadinessDeltas {
+    /// The empty set: a demand that reevaluated nothing observed nothing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { deltas: Vec::new() }
+    }
+
+    /// How many slot observations the set carries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.deltas.len()
+    }
+
+    /// Whether the set carries no observation at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.deltas.is_empty()
+    }
+
+    /// Iterates the observations in the order the demand reevaluated them.
+    pub fn iter(&self) -> std::slice::Iter<'_, LocalReadinessDelta> {
+        self.deltas.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a LocalReadinessDeltas {
+    type Item = &'a LocalReadinessDelta;
+    type IntoIter = std::slice::Iter<'a, LocalReadinessDelta>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// What one demand-driven multi-slot refresh produced.
+///
+/// The two values travel together because they are one decision: the refusal is
+/// what the operation must settle, and the deltas are the observations that
+/// decision was taken from. A refused operation still has to file the exact
+/// outcome it observed for *every* slot it reevaluated, so a recovered source
+/// and a failed basis are both retained instead of one erasing the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DemandRefreshOutcome {
+    /// The exact capability-specific refusal when a capability the operation
+    /// named is still unavailable, or `None` when it may proceed.
+    pub refusal: Option<String>,
+    /// The bounded per-slot observations this refresh actually produced, each
+    /// bound to the basis the loop's own projection holds.
+    pub deltas: LocalReadinessDeltas,
+}
+
 /// How one local-read delta settled against the loop's current projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalDeltaAdoption {
@@ -624,6 +701,35 @@ impl StartupReadinessProjection {
         Ok(LocalDeltaAdoption::Adopted { outcome })
     }
 
+    /// Adopts one demand's bounded delta set, delta by delta, and reports how
+    /// each one settled.
+    ///
+    /// Every delta is delegated to [`Self::adopt_local_delta`] unchanged, so
+    /// each one is judged against *its own* dependency set — the owner context
+    /// it was observed under and its own slot token — and neither one can gate,
+    /// suppress or overwrite another: a stale source delta is refused as stale
+    /// while a fresh basis result is still adopted in the same call, and vice
+    /// versa. One delta's success never short-circuits the next. An exhausted
+    /// token counter stops the walk at that delta and returns the error, so the
+    /// caller learns the set did not settle whole; the deltas already walked
+    /// stay adopted through the same single-slot filing, because a filed
+    /// observation is evidence rather than a transaction to roll back.
+    ///
+    /// The reported pairs name the declared slot each delta belongs to together
+    /// with its own [`LocalDeltaAdoption`], so a caller can report the exact
+    /// per-slot outcome without re-deriving which delta produced which row.
+    pub fn adopt_local_deltas(
+        &mut self,
+        deltas: &LocalReadinessDeltas,
+    ) -> Result<Vec<(DeclaredStartupCapability, LocalDeltaAdoption)>, LocalAdoptionTokenExhausted>
+    {
+        let mut settled = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            settled.push((delta.capability(), self.adopt_local_delta(delta)?));
+        }
+        Ok(settled)
+    }
+
     /// Retires every retained *generation-scoped* binding because the owner
     /// moved to a new generation, and returns how many slots were retired.
     ///
@@ -631,14 +737,17 @@ impl StartupReadinessProjection {
     /// generation-bound proof at once (I1.5, I14.14), so the affected slots are
     /// retired through their owner rather than left readable.
     ///
-    /// It is deliberately **not** a whole-ledger invalidation. The owner
-    /// session binding, the notification page and the Skill catalogue terms
-    /// carry no generation identity, and the authenticated owner session is the
-    /// one mandatory core capability: retiring it here would withhold core
-    /// readiness for the whole daemon on an ordinary generation advance, which
-    /// is the exact conflation this issue removes. Those three slots stay with
-    /// the owning owner that established them, which is also what
-    /// [`retained_matches_owner_generation`] already relies on.
+    /// It is deliberately **not** a whole-ledger invalidation. The notification
+    /// page and the Skill catalogue terms carry no generation identity, and the
+    /// authenticated owner session is the one mandatory core capability:
+    /// retiring it here would withhold core readiness for the whole daemon on
+    /// an ordinary generation advance, which is the exact conflation this issue
+    /// removes. Those three slots stay with the owning owner that established
+    /// them. A session proof from an earlier generation does not survive that
+    /// decision either: [`retained_matches_owner_generation`] compares the
+    /// generation and authority epoch the session was authenticated under
+    /// against the current owner context, so a replaced generation fails closed
+    /// for that one mandatory slot instead of erasing the rest of the ledger.
     ///
     /// It is not a refresh sweep: it does not re-attach, re-read or poll
     /// anything, and each retired slot keeps its prior disposition as bounded
@@ -998,41 +1107,71 @@ pub fn emit_startup_readiness_record(
     );
 }
 
-/// Re-evaluates exactly one declared capability from evidence an admitted
-/// demand produced, and reports what the reevaluation changed.
+/// Re-evaluates every currently unavailable capability one admitted demand
+/// names, and reports both the refusal and the observations that produced it.
 ///
 /// This is the demand-driven refresh an operation triggers: the operation names
-/// the capability it actually needs, the owning caller supplies the re-run of
-/// that capability's real attach, and the owner's own outcome is filed here.
-/// Only the named slot is touched, so a demand never sweeps every optional
+/// the exact capability set it actually needs, the owning caller supplies the
+/// re-run of each capability's real attach, and every owner's own outcome is
+/// filed here through the existing single-slot
+/// [`StartupReadinessProjection::reevaluate_capability`]. Naming only one slot
+/// of a two-slot dependency set would leave the other one latched at its
+/// startup failure, so the whole named set is walked in order and each
+/// currently unavailable slot is refreshed independently — a source recovery
+/// never infers, and never substitutes for, a basis result.
+///
+/// Only the named slots are touched, so a demand never sweeps every optional
 /// provider and never blocks on one it does not use.
 ///
 /// `reattach` is called **only** when the slot is currently unavailable, so the
 /// healthy path performs no work at all and an available capability is never
-/// re-proved for an operation that already has it. This function performs no IO
-/// itself: the attach belongs to the owner, which is why it arrives as a closure
-/// rather than being called from here.
-pub fn reevaluate_demanded_capability<F>(
-    projection: &mut StartupReadinessProjection,
-    capability: DeclaredStartupCapability,
-    reattach: F,
-) -> Result<CapabilityRefreshOutcome, LocalAdoptionTokenExhausted>
+/// re-proved for an operation that already has it. A capability repeated in
+/// `required` is visited once. This function performs no IO itself: the attach
+/// belongs to the owner, which is why it arrives as a closure rather than being
+/// called from here.
+///
+/// The availability decision runs against a working copy of `snapshot`, so no
+/// shared state is mutated here, while each returned delta is prepared on
+/// `snapshot` itself — the basis the loop actually holds — and therefore proves
+/// its own owner and slot tokens. The refusal comes from the existing
+/// [`refuse_unavailable_capabilities`] against that working copy, so an empty
+/// `required` still refuses and the refusal still names the owner's exact
+/// fail-closed reason.
+pub fn reevaluate_demanded_capabilities<F>(
+    snapshot: &StartupReadinessProjection,
+    required: &[DeclaredStartupCapability],
+    mut reattach: F,
+) -> Result<DemandRefreshOutcome, LocalAdoptionTokenExhausted>
 where
-    F: FnOnce() -> Result<RetainedStartupBinding, String>,
+    F: FnMut(DeclaredStartupCapability) -> Result<RetainedStartupBinding, String>,
 {
-    if projection
-        .capability_available_for_operation(capability)
-        .is_available()
-    {
-        return Ok(CapabilityRefreshOutcome::Rebound {
-            previously_bound: true,
-        });
+    let mut working = snapshot.clone();
+    let mut deltas = LocalReadinessDeltas::empty();
+    // One visit per declared capability, bounded by the same declared
+    // denominator: a repeated name is neither retested nor reattached twice.
+    let mut visited = [false; DeclaredStartupCapability::COUNT];
+    for capability in required {
+        let index = capability.index();
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        if working
+            .capability_available_for_operation(*capability)
+            .is_available()
+        {
+            continue;
+        }
+        let refresh = CapabilityRefresh {
+            capability: *capability,
+            reason: StartupRefreshReason::CapabilityDemanded,
+            observed: reattach(*capability),
+        };
+        working.reevaluate_capability(&refresh)?;
+        deltas.deltas.push(snapshot.prepare_local_delta(refresh));
     }
-    projection.reevaluate_capability(&CapabilityRefresh {
-        capability,
-        reason: StartupRefreshReason::CapabilityDemanded,
-        observed: reattach(),
-    })
+    let refusal = refuse_unavailable_capabilities(&working, required);
+    Ok(DemandRefreshOutcome { refusal, deltas })
 }
 
 /// Returns the exact capability-specific refusal when any capability one
@@ -1093,12 +1232,25 @@ fn disposition_for_refresh(refresh: &CapabilityRefresh) -> StartupBindingDisposi
     }
 }
 
-/// Whether a declared slot's retained proof carries owner generation identity.
+/// Whether a declared slot's retained proof is revoked by a generation advance.
 ///
-/// The three that do are the two Dreamer route contexts and the agent-fabric
-/// descriptor. The owner session binding, the notification page and the Skill
-/// catalogue terms do not, and are left to the owning owner that established
-/// them; the check below never invents a revocation the owner did not report.
+/// This is the retirement scope, not the freshness check. It is `true` for
+/// exactly the three retained variants that carry generation identity and are
+/// revoked together when the owner moves:
+/// [`RetainedStartupBinding::DreamerIntakeRoute`],
+/// [`RetainedStartupBinding::DreamerModelRoute`] and
+/// [`RetainedStartupBinding::AgentFabric`].
+///
+/// It is `false` for the remaining four declared slots, for two distinct
+/// reasons. The owner session binding is compared rather than retired:
+/// [`retained_matches_owner_generation`] holds the generation and authority
+/// epoch its own authenticated attach proved against the current owner state,
+/// so a session admitted at an earlier generation or epoch fails closed for
+/// that one mandatory slot without withholding core readiness for the whole
+/// daemon here. The notification page and the Skill catalogue terms carry no
+/// generation or epoch at all, so they stay with the owning owner that
+/// established them; the check never invents a revocation the owner did not
+/// report.
 fn is_generation_scoped(capability: DeclaredStartupCapability) -> bool {
     matches!(
         capability,
@@ -1111,11 +1263,18 @@ fn is_generation_scoped(capability: DeclaredStartupCapability) -> bool {
 /// Whether a retained proof was admitted under the current owner generation.
 ///
 /// Only the retained evidence that actually carries generation or epoch
-/// identity is checked. The owner session binding string, the notification page
-/// and the Skill catalogue terms are not generation-scoped, so this returns
-/// `true` for them and lets the owning owner's own revocation or generation
-/// replacement decide their validity — the check never invents a revocation
-/// the owner did not report.
+/// identity is checked. The notification page and the Skill catalogue terms are
+/// not generation-scoped, so this returns `true` for them and lets the owning
+/// owner's own revocation decide their validity — the check never invents a
+/// revocation the owner did not report.
+///
+/// The owner session binding carries the exact generation and authority epoch
+/// its own authenticated attach proved, and it is compared here rather than
+/// trusted: "Session exists only while transport identity and semantic Session
+/// refer to the same State Fence/epoch" (I1.8). A retained session string from
+/// an earlier generation or epoch is therefore not current-generation evidence,
+/// which is what stops an old connection from keeping the one mandatory core
+/// capability readable after the owner moved.
 fn retained_matches_owner_generation(
     retained: &RetainedStartupBinding,
     owner: &CoreOwnerState,
@@ -1130,8 +1289,12 @@ fn retained_matches_owner_generation(
             descriptor.generation == owner.generation
                 && descriptor.authority_epoch == owner.authority_epoch
         }
-        RetainedStartupBinding::OwnerSession { .. }
-        | RetainedStartupBinding::NotificationSnapshot { .. }
+        RetainedStartupBinding::OwnerSession {
+            generation,
+            authority_epoch,
+            ..
+        } => *generation == owner.generation && *authority_epoch == owner.authority_epoch,
+        RetainedStartupBinding::NotificationSnapshot { .. }
         | RetainedStartupBinding::SkillToolSource { .. }
         | RetainedStartupBinding::SkillToolBasis { .. } => true,
     }

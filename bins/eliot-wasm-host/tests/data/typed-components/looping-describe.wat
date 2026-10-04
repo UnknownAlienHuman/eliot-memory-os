@@ -2,25 +2,35 @@
 ;; exhaustion, including descriptor/initialization".
 ;;
 ;; The descriptor call -- not only the later domain call -- is untrusted
-;; execution. `describe_dreamer_cycle` (typed_execution.rs:1792-1825) runs
+;; execution. `describe_dreamer_cycle`
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `describe_dreamer_cycle`, lines 1809-1842) runs
 ;; `DreamerCycle::instantiate` and then `call_describe` inside the one
-;; guarded envelope of `run_guarded` (:1561-1593), so the same fuel budget,
-;; store resource ceilings and epoch deadline apply at descriptor time exactly
+;; guarded envelope of `run_guarded` (same file, lines 1578-1610), so the same
+;; fuel budget, store resource ceilings and epoch deadline apply at descriptor
+;; time exactly
 ;; as at invoke time (issue #758 P6.2: "The descriptor call and component
 ;; initialization are untrusted execution and must receive the same applicable
 ;; limits").
 ;;
 ;; This component's `describe` has no exit. With the admitted
-;; `CancellationPolicy::EpochAndFuel`, `typed_fuel_budget` (:1390-1395) yields
-;; `limits.max_fuel` from its `Some` arm at :1392 and `new_store` installs that
-;; budget with `store.set_fuel` at :1419-1422, so the call ends in
-;; `wasmtime::Trap::OutOfFuel`, mapped by `map_call_error` (:1287-1303,
-;; through `trap_termination`'s `Trap::OutOfFuel` arm at :1279) to
+;; `CancellationPolicy::EpochAndFuel`, `typed_fuel_budget` (same file, lines
+;; 1407-1412) yields
+;; `limits.max_fuel` from its `Some` arm at same-file line 1409 and `new_store`
+;; installs that budget with `store.set_fuel` at same-file lines 1436-1439, so
+;; the call ends in
+;; `wasmtime::Trap::OutOfFuel`, mapped by `map_call_error`
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `map_call_error`,
+;; lines 1304-1320,
+;; through `trap_termination`'s `Trap::OutOfFuel` arm at same-file line 1296,
+;; `wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,`) to
 ;; `EngineTermination::FuelExhausted` and reported as
 ;; `TypedExecutionError::Engine("FuelExhausted")` staged at
-;; `TypedStage::Descriptor` (:1810-1815). If fuel is not metered, the epoch pump
-;; (`EpochDriver::spawn`, :1508-1539) stops it instead and the same site
-;; reports `Engine("EpochDeadline")`. Either way no descriptor value is ever
+;; `TypedStage::Descriptor` (same file, lines 1827-1832). If fuel is not
+;; metered, the epoch pump
+;; (`EpochDriver::spawn`, same file lines 1525-1556) stops it instead and the
+;; same site reports `Engine("EpochDeadline")`. Either way no descriptor value
+;; is ever
 ;; returned and no receipt can be produced.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
@@ -149,10 +159,10 @@
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor shape. The signature is the
     ;; single `i32` retptr that `canon lift` of a record flattening to more than
-    ;; `MAX_FLAT_FUNC_RESULTS` (1) core values demands: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; `MAX_FLAT_FUNC_RESULTS` (1) core values demands: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;;
     ;; Never terminates, and that is the entire obligation of this file. No
     ;; retptr region is written and no descriptor value is produced: what this
@@ -184,10 +194,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

@@ -8,11 +8,13 @@
 ;; limits, not only the later domain call").
 ;;
 ;; The core module declares a `(start ...)` function whose loop has no exit.
-;; `describe_dreamer_cycle` (typed_execution.rs:1792-1825) runs
+;; `describe_dreamer_cycle` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `describe_dreamer_cycle`, lines 1809-1842) runs
 ;; `DreamerCycle::instantiate` inside `run_guarded`, so the admitted fuel
-;; budget (`typed_fuel_budget`, :1390-1395), the store resource ceilings
-;; (`new_store`, :1397-1426) and the epoch deadline (`EpochDriver::spawn`,
-;; :1508-1539) all apply to it exactly as they apply to the later `describe`
+;; budget (`typed_fuel_budget`, same file lines 1407-1412), the store resource
+;; ceilings (`new_store`, same file lines 1414-1443) and the epoch deadline
+;; (`EpochDriver::spawn`, same file lines 1525-1556) all apply to it exactly as
+;; they apply to the later `describe`
 ;; call. The engine therefore genuinely terminates this instantiation: with
 ;; `EpochAndFuel` it is `wasmtime::Trap::OutOfFuel`
 ;; (wasmtime-environ-47.0.4 `trap_encoding.rs`:145, "all fuel consumed by
@@ -21,28 +23,42 @@
 ;;
 ;; WHAT THE HOST REPORTS: the typed fuel/epoch cause this case requires.
 ;; `describe_dreamer_cycle` routes the instantiate failure through
-;; `map_instantiate_error` (:1305-1338, applied at :1801-1806), which
+;; `map_instantiate_error` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `map_instantiate_error`, lines 1322-1355, applied at same-file
+;; lines 1818-1823), which
 ;; classifies in this order:
-;; `store.data().limit_hit` first (:1309-1311), then
-;; `is_instance_limit_error` (:1315-1317, which needs "instance" plus
-;; "limit"/"maximum" -- wasmtime_provider.rs:767-770), then the shared
+;; `store.data().limit_hit` first (same file lines 1326-1328), then
+;; `is_instance_limit_error` (same-file lines 1332-1334, which needs "instance"
+;; plus -- `bins/eliot-wasm-host/src/wasmtime_provider.rs`, fn
+;; `is_instance_limit_error`, lines 767-770, the only `wasmtime_provider.rs` in
+;; the repository -- "limit"/"maximum"), then the shared
 ;; `trap_termination` classifier
-;; (:1326-1328), and only then the substring fallbacks for "import"
-;; (:1330-1331), "export"/"missing"/"type" (:1332-1335). Component initialization is
+;; (same-file lines 1343-1345), and only then the substring fallbacks for
+;; "import" (same-file lines 1347-1348),
+;; "export"/"missing"/"type" (same-file lines 1349-1352). Component
+;; initialization is
 ;; untrusted execution too and runs inside the same guarded envelope as the
 ;; descriptor call, so an instantiation the engine terminates with a real trap
 ;; carries the owner-typed cause read from the real engine trap code, never
-;; from message text: `trap_termination` (:1276-1285) maps
-;; `Trap::OutOfFuel` to `EngineTermination::FuelExhausted` (:1279) and
-;; `Trap::Interrupt` to `EngineTermination::EpochDeadline` (:1280).
+;; from message text: `trap_termination`
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `trap_termination`, lines 1293-1302) maps
+;; `Trap::OutOfFuel` to `EngineTermination::FuelExhausted` (same-file line 1296,
+;; `wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,`) and
+;; `Trap::Interrupt` to `EngineTermination::EpochDeadline` (same-file line 1297,
+;; `wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,`).
 ;;
 ;; So this fixture denies with `Engine("FuelExhausted")` under the default
 ;; `EpochAndFuel` policy and `Engine("EpochDeadline")` under
 ;; `CancellationPolicy::EpochInterruption`, both staged `TypedStage::Instantiate`
-;; by the `staged` wrapper at :1800-1806. The untyped
-;; `Engine("instantiate:component-error")` (:1336) is now only the fallback
+;; by the `staged` wrapper at `bins/eliot-wasm-host/src/typed_execution.rs`
+;; lines 1817-1823. The untyped
+;; `Engine("instantiate:component-error")` (same file line 1353) is now only the
+;; fallback
 ;; for an engine error that is not a trap at all. This is the same classifier
-;; `map_call_error` (:1287-1303) applies to the later `describe`/domain leg, so
+;; `map_call_error` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `map_call_error`, lines 1304-1320) applies to the later `describe`/domain
+;; leg, so
 ;; both untrusted-execution legs carry the same typed cause.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
@@ -156,10 +172,12 @@
     ;; Component initialization that never returns. A core-module start function
     ;; is ordinary untrusted guest execution that runs inside
     ;; `DreamerCycle::instantiate`, i.e. inside the one guarded envelope of
-    ;; `run_guarded` (typed_execution.rs:1561-1593) and therefore under the same
+    ;; `run_guarded` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+    ;; fn `run_guarded`, lines 1578-1610) and therefore under the same
     ;; fuel budget, store resource ceilings and epoch deadline as `describe`
-    ;; (`typed_fuel_budget`, :1390-1395; `new_store`, :1397-1426;
-    ;; `EpochDriver::spawn`, :1508-1539). It touches no memory and calls nothing, so only
+    ;; (`typed_fuel_budget`, same file lines 1407-1412; `new_store`, same file
+    ;; lines 1414-1443;
+    ;; `EpochDriver::spawn`, same file lines 1525-1556). It touches no memory and calls nothing, so only
     ;; fuel exhaustion or the epoch deadline can stop it. The two exports below
     ;; are never reached, which is the point, and each names its whole
     ;; difference from `dreamer-cycle.wat`: `step` is that fixture's `step`
@@ -204,10 +222,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
@@ -243,10 +261,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

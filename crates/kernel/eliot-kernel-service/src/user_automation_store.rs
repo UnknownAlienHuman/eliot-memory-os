@@ -914,6 +914,16 @@ impl AutomationDenominatorWalk {
     }
 }
 
+/// Owner read revision of one named response: the audit digest of the exact
+/// revision-head set the owner returned with it.
+fn heads_read_revision(heads: &[RevisionHead]) -> Result<String, StoreError> {
+    let observed_heads: Vec<(String, u64)> = heads
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    audit_heads_digest(&observed_heads)
+}
+
 /// Decodes the owner-issued denominator coverage of one paged read.
 ///
 /// The `completeness` block is mandatory: a page that omits it cannot be read
@@ -1017,11 +1027,7 @@ fn denominator_coverage(
             "truncated page omitted the owner-issued continuation",
         ));
     }
-    let observed_heads: Vec<(String, u64)> = heads
-        .iter()
-        .map(|head| (head.key.as_str().to_owned(), head.revision))
-        .collect();
-    if read_revision != audit_heads_digest(&observed_heads)? {
+    if read_revision != heads_read_revision(heads)? {
         return Err(StoreError::RevisionConflict);
     }
     Ok(AutomationDenominatorCoverage {
@@ -1384,15 +1390,27 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
     }
 
     /// Projects the status read from the current revision row.
+    ///
+    /// The current revision and the execution denominator are separate owner
+    /// reads, so both must name one owner read revision: a concurrent edit or
+    /// retirement between them fails closed with `RevisionConflict` instead of
+    /// pairing a configuration from one owner state with a denominator from
+    /// another (#2808). An empty obligation set is therefore proven under the
+    /// same revision as the configuration it is reported with.
     async fn read_status_outcome(
         &self,
         request: &UserAutomationStoreRequest,
         automation_id: &str,
     ) -> Result<UserAutomationStoreOutcome, StoreError> {
-        let revision = self.read_current_revision(request, automation_id).await?;
+        let (revision, current_read_revision) = self
+            .read_current_revision_at(request, automation_id)
+            .await?;
         let execution = self
             .execution_projection(&request.context.state_fence, automation_id, &revision)
             .await?;
+        if execution.read_revision != current_read_revision {
+            return Err(StoreError::RevisionConflict);
+        }
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::Status {
                 revision: Box::new(revision),
@@ -1552,6 +1570,20 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         request: &UserAutomationStoreRequest,
         automation_id: &str,
     ) -> Result<UserAutomationRevision, StoreError> {
+        Ok(self
+            .read_current_revision_at(request, automation_id)
+            .await?
+            .0)
+    }
+
+    /// Reads the current revision together with the owner read revision (the
+    /// digest of the response's revision heads, the same derivation a paged
+    /// denominator's `read_revision` is checked against) it was selected under.
+    async fn read_current_revision_at(
+        &self,
+        request: &UserAutomationStoreRequest,
+        automation_id: &str,
+    ) -> Result<(UserAutomationRevision, String), StoreError> {
         let query = automation_read_request(
             QUERY_CURRENT.to_owned(),
             Some(automation_id.to_owned()),
@@ -1559,7 +1591,9 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             1,
             request.context.state_fence.clone(),
         )?;
-        let payload = self.client.execute_named(query).await?.payload;
+        let response = self.client.execute_named(query).await?;
+        let read_revision = heads_read_revision(&response.revision_heads)?;
+        let payload = response.payload;
         let current = payload.get(eliot_store_api::AUTOMATION_PAGE_CURRENT);
         let revision_id = current
             .and_then(|current| current.get("revision"))
@@ -1568,8 +1602,10 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 field: "automation.automation_id",
                 reason: "unknown automation",
             })?;
-        self.read_revision_document(&request.context.state_fence, automation_id, revision_id)
-            .await
+        let revision = self
+            .read_revision_document(&request.context.state_fence, automation_id, revision_id)
+            .await?;
+        Ok((revision, read_revision))
     }
 
     /// Reads one immutable revision document and validates it through

@@ -20,13 +20,13 @@ use crate::error::{KernelError, KernelResult};
 
 /// Architecture digest from the accepted normative-pair receipt.
 pub const CURRENT_ARCHITECTURE_SOURCE_DIGEST: &str =
-    "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a";
+    "a3c5b2028d9df89a53cd565f8ff493484be74078e4efd7b534c0f1c3169577c7";
 /// Implementation digest from the accepted normative-pair receipt.
 pub const CURRENT_IMPLEMENTATION_SOURCE_DIGEST: &str =
-    "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89";
+    "ead4ceff2db254e4202c8fa7ae167225a6f65b720c222075ada61fc45fc407a4";
 /// Pair identity from `docs/normative-pair.toml`.
 pub const CURRENT_NORMATIVE_PAIR_KEY: &str =
-    "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea";
+    "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1";
 
 /// Authenticated Kernel health evidence consumed by Host and native-worker.
 ///
@@ -232,4 +232,1131 @@ fn is_lower_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_runtime_contracts::{
+        GenerationCutoverState, HealthDimension, HealthVector, ModuleGenerationState,
+        ServiceProcessState,
+    };
+
+    use super::{
+        CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+        CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+    };
+    use crate::error::{KernelError, KernelResult};
+    use crate::module::compatibility_handshake::{
+        AcceptedCompatibilityEvidence, CompatibilityEnvelope, DurableCompatibilityState,
+        HANDSHAKE_ENVELOPE_VERSION, NORMATIVE_SEAL_DOMAIN, NormativePairReceipt,
+        StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+    };
+    use crate::module::process_health::{
+        CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
+    };
+
+    /// The accepted external receipt, embedded at compile time.
+    ///
+    /// `docs/normative-pair.toml` is the single authority for this module's
+    /// current normative identity, so the guard reads the receipt's own bytes
+    /// instead of trusting another compiled constant as a proxy for it. Five
+    /// hops from `src/module/`; the four-hop form borrowed from `eliot-bootstrap`
+    /// resolves to `crates/docs/` and does not exist.
+    const RECEIPT_TOML: &str = include_str!("../../../../../docs/normative-pair.toml");
+
+    /// Returns the value of exactly one `key = "value"` assignment line.
+    ///
+    /// Matching on the key alone is load-bearing. A naive `contains` is
+    /// ambiguous in this file: `pair_key_algorithm` (:10) and `pair_key_input`
+    /// (:11) both precede `pair_key` (:12), so a first-hit scan returns the
+    /// algorithm name and the guard would redden for a reason that looks like
+    /// drift; `supersedes_architecture_sha256` (:28) and
+    /// `supersedes_implementation_sha256` (:29) embed the target keys as
+    /// suffixes. Splitting on the first `=` and comparing the trimmed key side
+    /// keeps that discrimination without pinning the spacing around `=`, so a
+    /// receipt reformatted to `key="value"` still parses instead of failing as
+    /// if the key had been renamed. Exactly one match is required: zero means
+    /// the key was renamed, more than one means the receipt grew an ambiguous
+    /// spelling, and both are drift rather than a value to pick from.
+    ///
+    /// A trailing `#` comment is stripped before the quotes are trimmed, since
+    /// none of the receipt's values may legitimately contain one.
+    fn receipt_value(receipt: &str, key: &str) -> String {
+        let values: Vec<&str> = receipt
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                (name.trim() == key).then_some(value)
+            })
+            .collect();
+        assert_eq!(
+            values.len(),
+            1,
+            "docs/normative-pair.toml must hold exactly one `{key}` assignment, found {}",
+            values.len()
+        );
+        let assigned = values[0];
+        let uncommented = assigned.split_once('#').map_or(assigned, |(head, _)| head);
+        uncommented.trim().trim_matches('"').to_owned()
+    }
+
+    /// Returns this module's compiled triple beside the receipt's triple.
+    fn receipt_identities(receipt: &str) -> ([String; 3], [String; 3]) {
+        let compiled = [
+            CURRENT_ARCHITECTURE_SOURCE_DIGEST.to_owned(),
+            CURRENT_IMPLEMENTATION_SOURCE_DIGEST.to_owned(),
+            CURRENT_NORMATIVE_PAIR_KEY.to_owned(),
+        ];
+        let accepted = [
+            receipt_value(receipt, "architecture_sha256"),
+            receipt_value(receipt, "implementation_sha256"),
+            receipt_value(receipt, "pair_key"),
+        ];
+        (compiled, accepted)
+    }
+
+    /// Recomputes the pair key from the compiled digests under the handshake's
+    /// domain-separated, NUL-terminated rule, which the receipt must agree with.
+    ///
+    /// The rule itself lives in the handshake module, not in the receipt: the
+    /// receipt only records its `pair_key_algorithm` and `pair_key_input`
+    /// vocabulary. Reusing the handshake's domain tag keeps the two derivations
+    /// from being able to diverge.
+    ///
+    /// The `sha256:` prefix is required: `sha256_hex` returns 64 bare hex
+    /// characters while the receipt stores `"sha256:ab2011bd..."`. Without it
+    /// the comparison could never succeed, and it would fail in exactly the
+    /// "looks like drift" shape this guard exists to catch. The domain tag is
+    /// reused from the handshake rather than re-hardcoded.
+    fn compiled_pair_key() -> String {
+        format!(
+            "sha256:{}",
+            eliot_contracts::sha256_hex(
+                format!(
+                    "{NORMATIVE_SEAL_DOMAIN}\0{CURRENT_ARCHITECTURE_SOURCE_DIGEST}\0{CURRENT_IMPLEMENTATION_SOURCE_DIGEST}\0"
+                )
+                .as_bytes()
+            )
+        )
+    }
+
+    /// Positive: the re-pinned constants are the accepted receipt, as one
+    /// atomic triple, and the receipt's key is their derivation.
+    #[test]
+    fn compiled_normative_pair_equals_the_accepted_receipt() {
+        let (compiled, accepted) = receipt_identities(RECEIPT_TOML);
+        assert_eq!(
+            compiled, accepted,
+            "the compiled normative pair must equal the accepted receipt, all three fields at once"
+        );
+        // Recomputing from the compiled pair is not sufficient on its own: the
+        // previously compiled digests are internally self-consistent, so this
+        // half only bites because it is compared against the receipt's key.
+        assert_eq!(
+            compiled_pair_key(),
+            accepted[2],
+            "the accepted pair key must be the derivation of the compiled digests"
+        );
+    }
+
+    /// Refusal: one altered field in the receipt fails the guard closed.
+    ///
+    /// The mutation is applied to an in-memory copy of the embedded receipt
+    /// text, never to `docs/normative-pair.toml`, so the guard is exercised
+    /// without a second owner of the constant and without an on-disk edit.
+    ///
+    /// What this proves is narrow and is stated as such: the extraction and the
+    /// triple comparison are not vacuous, because a single-field disagreement
+    /// between the receipt and the compiled constants is detected. It does not
+    /// claim that production rejects anything: the compiled constants and the
+    /// on-disk receipt are both untouched here, and the only thing that fails is
+    /// this mutated copy.
+    #[test]
+    fn altered_receipt_digest_is_refused_by_the_compiled_identity() {
+        let altered = RECEIPT_TOML.replacen(
+            "a3c5b2028d9df89a53cd565f8ff493484be74078e4efd7b534c0f1c3169577c7",
+            "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
+            1,
+        );
+        assert_ne!(
+            altered, RECEIPT_TOML,
+            "the mutated in-memory receipt must differ from the embedded bytes"
+        );
+        let (compiled, accepted) = receipt_identities(&altered);
+        assert_ne!(
+            compiled, accepted,
+            "one altered receipt digest must fail the compiled identity"
+        );
+        // The compiled constants still match the REAL receipt, so the only thing
+        // that moved above is the in-memory copy. Comparing `compiled[0]` with
+        // `CURRENT_ARCHITECTURE_SOURCE_DIGEST` would be tautological: `compiled`
+        // is built from that constant at the array literal, so it can never fail.
+        assert_eq!(
+            compiled,
+            receipt_identities(RECEIPT_TOML).1,
+            "only the in-memory receipt copy may differ from the compiled identity"
+        );
+        assert_eq!(
+            accepted[0],
+            "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+        );
+        // The untouched half still matches, which is what makes this a
+        // single-field disagreement rather than a wholesale rewrite.
+        assert_eq!(compiled[1], accepted[1]);
+    }
+
+    /// Refusal: the triple this module compiled before the re-pin is no longer
+    /// the identity it admits.
+    ///
+    /// `validate` compares the carrier's pair key, the compatibility evidence's
+    /// architecture digest and the carrier's implementation digest against these
+    /// three constants with `!=`, so a carrier stamped with the previously
+    /// compiled pair is refused exactly when it differs from them. This asserts
+    /// that difference on the compiled triple alone;
+    /// `receipt_stamped_carrier_is_accepted_and_the_previous_pair_is_rejected`
+    /// carries the same pair onto a real `KernelRuntimeHealthEvidence` and shows
+    /// `validate` refusing it.
+    ///
+    /// `PREVIOUS_PAIR` is a HISTORICAL FIXTURE, not a second source of truth:
+    /// nothing reads it except these assertions, and it is deliberately not
+    /// compared against the receipt, because it is the identity the receipt
+    /// replaced. It fires only on an exact reversion to the values this module
+    /// used to compile.
+    #[test]
+    fn previously_compiled_pair_is_not_the_admitted_identity() {
+        let (compiled, _) = receipt_identities(RECEIPT_TOML);
+        for (previous, current) in PREVIOUS_PAIR.iter().zip(&compiled) {
+            assert_ne!(
+                previous, current,
+                "a carrier stamped with the previously compiled pair must not match the admitted identity"
+            );
+        }
+    }
+
+    /// The pair this module compiled before the re-pin: the pre-#1067
+    /// Architecture digest, Implementation digest and receipt pair key, in the
+    /// same order as the compiled triple in `receipt_identities`.
+    const PREVIOUS_PAIR: [&str; 3] = [
+        "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
+        "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89",
+        "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
+    ];
+
+    /// Lineage the handshake fixtures run in, mirroring the fixture lineage in
+    /// `compatibility_handshake`'s own tests.
+    const FIXTURE_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// Contract-set digest the fixture handshake negotiates. It never enters the
+    /// normative pair, so any lowercase SHA-256 shape is a legal stand-in for the
+    /// real contract-set digest; what the carrier gates on is the shape.
+    const FIXTURE_CONTRACT_SET_DIGEST: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The lineage-aware epoch both fixture envelopes present.
+    fn fixture_epoch() -> KernelResult<EpochId> {
+        let lineage =
+            EpochLineageId::new(FIXTURE_LINEAGE).map_err(|_| KernelError::InvalidField {
+                field: "runtime_health.fixture.lineage_id",
+                reason: "must be a canonical lowercase hyphenated UUID",
+            })?;
+        let Some(sequence) = NonZeroU64::new(3) else {
+            return Err(KernelError::InvalidField {
+                field: "runtime_health.fixture.sequence",
+                reason: "must be greater than zero",
+            });
+        };
+        EpochId::new(lineage, sequence).map_err(|_| KernelError::InvalidField {
+            field: "runtime_health.fixture.authority_epoch",
+            reason: "must be a valid lineage-aware epoch",
+        })
+    }
+
+    /// Admits one genuine handshake whose Architecture digest is
+    /// `architecture_source_digest` and returns the real
+    /// `AcceptedCompatibilityEvidence` the carrier consumes.
+    ///
+    /// The construction sequence mirrors `compatibility_handshake`'s own
+    /// `mod tests` exactly, because that module is the only owner of these
+    /// constructors: a `VersionRange` protocol pair that overlaps durable state
+    /// (`1..=3` against `2..=4`), a canonical-format pair that also overlaps
+    /// (`6..=9` against `5..=7`), one required capability the candidate offers,
+    /// `Additive` migration on both sides, and a `NormativePairReceipt` sealed
+    /// with `expected_seal_tag` so the seal genuinely verifies against the
+    /// compiled Implementation half.
+    ///
+    /// Nothing fabricates the evidence's private fields: it is whatever
+    /// `admit_handshake` returns after gating all nine I1.12 fields in order.
+    fn admitted_evidence(
+        architecture_source_digest: &str,
+    ) -> KernelResult<AcceptedCompatibilityEvidence> {
+        let epoch = fixture_epoch()?;
+        let receipt = NormativePairReceipt::new(
+            architecture_source_digest,
+            expected_seal_tag(architecture_source_digest),
+        )?;
+        let candidate = CompatibilityEnvelope::new(
+            VersionRange::new(1, 3)?,
+            FIXTURE_CONTRACT_SET_DIGEST,
+            VersionRange::new(6, 9)?,
+            architecture_source_digest,
+            receipt,
+            ResourceGeneration::genesis(),
+            epoch.clone(),
+            vec!["blob.read".to_owned()],
+            vec!["blob.prefetch".to_owned()],
+            StateMigrationClass::Additive,
+        )?;
+        let durable = DurableCompatibilityState::new(
+            VersionRange::new(2, 4)?,
+            FIXTURE_CONTRACT_SET_DIGEST,
+            VersionRange::new(5, 7)?,
+            architecture_source_digest,
+            epoch,
+            vec!["blob.read".to_owned()],
+            StateMigrationClass::Additive,
+        )?;
+        admit_handshake(&candidate, &durable).map_err(|_| KernelError::InvalidField {
+            field: "runtime_health.fixture.handshake",
+            reason: "a receipt-stamped candidate must be admitted",
+        })
+    }
+
+    /// Wraps admitted evidence in one owner-produced carrier stamped with the
+    /// supplied normative-pair identity.
+    ///
+    /// The epoch and generation are taken from the evidence itself, so the
+    /// carrier's `runtime_health.compatibility_evidence` binding gate holds and
+    /// the only thing this helper varies is the identity triple the carrier
+    /// presents.
+    fn stamped_carrier(
+        evidence: AcceptedCompatibilityEvidence,
+        normative_pair_key: &str,
+        implementation_source_digest: &str,
+    ) -> KernelResult<KernelRuntimeHealthEvidence> {
+        let process_health = ProcessHealthStatus::new(
+            "kernel-front-door",
+            ServiceProcessState::Ready,
+            ProcessHealthVector::new(HealthVector::healthy(), HealthDimension::Healthy),
+            ModuleGenerationState::Active,
+            GenerationCutoverState::Completed,
+        )?;
+        KernelRuntimeHealthEvidence::new(
+            "OPEN",
+            evidence.authority_epoch().clone(),
+            evidence.module_generation(),
+            evidence,
+            normative_pair_key,
+            implementation_source_digest,
+            process_health,
+            vec![CapabilityReadiness::new(
+                "blob.read",
+                vec![
+                    HealthDimensionKind::Liveness,
+                    HealthDimensionKind::Compatibility,
+                ],
+            )?],
+            false,
+        )
+    }
+
+    /// Acceptance, at the carrier level rather than the receipt-string level:
+    /// a `KernelRuntimeHealthEvidence` stamped with the accepted receipt's
+    /// normative pair passes `validate`, and the same carrier stamped with the
+    /// pair this module compiled before the re-pin is refused by it.
+    ///
+    /// The two halves are mutually dependent on the compiled constants, so
+    /// neither can pass by accident: with the previous constants restored, the
+    /// accept half would fail the normative-pair gate and the reject half would
+    /// be admitted. Both halves move real objects - the accept half is built
+    /// from an `admit_handshake` result, not from a literal - so this is a
+    /// statement about the carrier's behaviour, not about the constants alone.
+    #[test]
+    fn receipt_stamped_carrier_is_accepted_and_the_previous_pair_is_rejected() -> KernelResult<()> {
+        // Accept half: the accepted receipt's own Architecture half is admitted
+        // by the compatibility gate, then accepted by the carrier validator.
+        let carrier = stamped_carrier(
+            admitted_evidence(CURRENT_ARCHITECTURE_SOURCE_DIGEST)?,
+            CURRENT_NORMATIVE_PAIR_KEY,
+            CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+        )?;
+        // `new` already validated; revalidate so the assertion is on `validate`
+        // itself, the boundary a deserialized carrier is re-checked at.
+        carrier.validate()?;
+        let accepted = carrier.compatibility_evidence();
+        assert_eq!(accepted.envelope_version(), HANDSHAKE_ENVELOPE_VERSION);
+        assert_eq!(accepted.protocol_version(), 3);
+        assert_eq!(accepted.canonical_format_version(), 7);
+        assert_eq!(
+            accepted.architecture_source_digest(),
+            CURRENT_ARCHITECTURE_SOURCE_DIGEST
+        );
+        assert_eq!(
+            accepted.seal_tag(),
+            expected_seal_tag(CURRENT_ARCHITECTURE_SOURCE_DIGEST)
+        );
+
+        // Reject half: the previously compiled Architecture half, genuinely
+        // admitted through the same sequence.
+        let previous = admitted_evidence(PREVIOUS_PAIR[0])?;
+        // Its seal verifies, so the refusal below is the normative-pair gate and
+        // not the earlier seal gate: the only wrong thing about this carrier is
+        // the identity it presents.
+        assert_eq!(previous.seal_tag(), expected_seal_tag(PREVIOUS_PAIR[0]));
+        let Err(KernelError::InvalidField { field, reason }) =
+            stamped_carrier(previous, PREVIOUS_PAIR[2], PREVIOUS_PAIR[1])
+        else {
+            panic!("a carrier stamped with the previously compiled pair must be refused");
+        };
+        assert_eq!(field, "runtime_health.normative_pair");
+        assert_eq!(reason, "does not match the accepted normative pair");
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Consumer enumeration guard (issue #1067, card `MAKE` clause, second
+    // sentence: "Extend that guard to enumerate every production current-pair
+    // consumer ... so a new current-pair literal outside the owner fails
+    // it.").
+    //
+    // WHAT THIS MEASURES, AND WHY IT IS NOT THE CARD'S LIST. The card
+    // (`cards/1067.md:17` and the `DONE` clause at `:25`) names seven
+    // consumers. Two of the seven are NOT production consumers on this tree,
+    // and four production consumers the card does not name exist. Both facts
+    // were measured, not assumed:
+    //
+    //   * `crates/meta/eliot-runtime-status/src/runtime_health_status.rs`
+    //     touches the owner constants only at `:105-106`, `:131-152` and
+    //     `:182-183`, every one of which is after the `#[cfg(test)]` at
+    //     `:100`. It is a test fixture, not a production consumer.
+    //   * `bins/eliot-native-worker/src/kernel_admission_client.rs` touches
+    //     them only at `:1584` and `:1660-1661`, all after the
+    //     `#[cfg(test)]` at `:1555`. Also test-only.
+    //   * `crates/foundation/eliot-contracts/src/capability_cell_registry.rs`
+    //     (`:59-60`), `bins/eliot-kernel/src/composition_bootstrap.rs`
+    //     (`:76`) and `bins/eliot-mod-research/src/capability_cell.rs`
+    //     (`:51`) are production and each restates the accepted pair key as
+    //     its own literal; the card names none of them.
+    //   * `crates/meta/eliot-runtime-status/src/capability_cell_readback.rs`
+    //     (`:23`, `:188`) is a fourth production consumer, and a fifth thing
+    //     the card does not name: it reads the RESTATED `EXPECTED_NORMATIVE_PAIR_KEY`
+    //     rather than the owner, and carries no literal of its own.
+    //
+    // This test asserts the MEASURED set, not the card's set. Asserting the
+    // card's seven would encode a known falsehood as a pass condition. The
+    // divergence is stated here and in the work report rather than silently
+    // reconciled, because correcting the card is not this file's to do.
+    //
+    // MECHANISM. Every consumer source below is embedded with `include_str!`,
+    // exactly as `RECEIPT_TOML` is at the top of this module. That is a
+    // deliberate choice over reading the files at test time: `include_str!`
+    // resolves at COMPILE time, so a consumer file that is renamed, moved or
+    // deleted breaks the build instead of silently dropping out of the
+    // enumeration and turning this guard green by omission. It also keeps the
+    // test hermetic - no filesystem access, no `std::fs`, no shell, and no
+    // live-run dependency on the working directory.
+
+    /// The owner of the current normative identity: this module.
+    const OWNER_SOURCE: &str = include_str!("runtime_health.rs");
+    /// The handshake that seals against the owner's implementation digest.
+    const HANDSHAKE_SOURCE: &str = include_str!("compatibility_handshake.rs");
+    /// The owner crate's public re-export of the three constants.
+    const KERNEL_CORE_LIB_SOURCE: &str = include_str!("../lib.rs");
+    /// Bootstrap snapshot capture.
+    const BOOTSTRAP_CAPTURE_SOURCE: &str =
+        include_str!("../../../../../crates/foundation/eliot-bootstrap/src/capture.rs");
+    /// The receipt parser the bootstrap capture delegates to.
+    const BOOTSTRAP_NORMATIVE_SOURCE: &str =
+        include_str!("../../../../../crates/foundation/eliot-bootstrap/src/normative.rs");
+    /// The runtime-compiler expected-pair comparison.
+    const RUNTIME_COMPILER_SOURCE: &str =
+        include_str!("../../../../../workspace/tools/eliot-runtime-compiler/src/lib.rs");
+    /// The snapshot-draft consumer of the accepted pair.
+    const BOOTSTRAP_DRAFT_SOURCE: &str =
+        include_str!("../../../../../bins/eliot/src/bootstrap_draft.rs");
+    /// The instrument runner, which embeds the receipt bytes themselves.
+    const TESTD_REGISTRY_SOURCE: &str = include_str!(
+        "../../../../../crates/instrument/eliot-instrument-runner/src/testd_registry.rs"
+    );
+    /// Kernel frame dispatch.
+    const FRAME_DISPATCH_SOURCE: &str =
+        include_str!("../../../../../bins/eliot-kernel/src/frame_dispatch.rs");
+    /// Kernel generation recovery.
+    const GENERATION_RECOVERY_SOURCE: &str =
+        include_str!("../../../../../bins/eliot-kernel/src/generation_recovery.rs");
+    /// The capability-cell registry that restates the pair key as a literal.
+    const CAPABILITY_CELL_REGISTRY_SOURCE: &str = include_str!(
+        "../../../../../crates/foundation/eliot-contracts/src/capability_cell_registry.rs"
+    );
+    /// The readback that consumes that restated constant.
+    const CAPABILITY_CELL_READBACK_SOURCE: &str = include_str!(
+        "../../../../../crates/meta/eliot-runtime-status/src/capability_cell_readback.rs"
+    );
+    /// The Kernel-composed registry projection carrying an embedded literal.
+    const COMPOSITION_BOOTSTRAP_SOURCE: &str =
+        include_str!("../../../../../bins/eliot-kernel/src/composition_bootstrap.rs");
+    /// The research-provider registry projection carrying an embedded literal.
+    const RESEARCH_CAPABILITY_CELL_SOURCE: &str =
+        include_str!("../../../../../bins/eliot-mod-research/src/capability_cell.rs");
+    /// Named by the card as a production consumer; measured test-only.
+    const RUNTIME_HEALTH_STATUS_SOURCE: &str = include_str!(
+        "../../../../../crates/meta/eliot-runtime-status/src/runtime_health_status.rs"
+    );
+    /// Named by the card as a production consumer; measured test-only.
+    const KERNEL_ADMISSION_CLIENT_SOURCE: &str =
+        include_str!("../../../../../bins/eliot-native-worker/src/kernel_admission_client.rs");
+
+    /// The three names that make up the owner's compiled identity.
+    const OWNER_CONSTANT_NAMES: [&str; 3] = [
+        "CURRENT_ARCHITECTURE_SOURCE_DIGEST",
+        "CURRENT_IMPLEMENTATION_SOURCE_DIGEST",
+        "CURRENT_NORMATIVE_PAIR_KEY",
+    ];
+
+    /// How a production source binds the current normative identity.
+    ///
+    /// The first three variants are the only bindings that can survive a
+    /// re-pin without an edit outside the owner. `RestatedConstant` and
+    /// `RestatedLiteral` are MEASURED DEBT, not an aspiration: they are real
+    /// production consumers that bind the identity somewhere other than the
+    /// owner. They are enumerated explicitly so that the debt is visible and
+    /// bounded, and so that a FOURTH such source - a genuinely new
+    /// current-pair literal outside the owner - fails this guard instead of
+    /// joining them unnoticed. `Unbound` exists so that a consumer which
+    /// stops binding the current identity at all is reported as its own
+    /// condition rather than being absorbed into the debt.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PairBinding {
+        /// Declares the three owner constants. This module.
+        OwnerDeclaration,
+        /// Reads one of the three owner constants.
+        OwnerConstant,
+        /// Reads the accepted receipt through the bootstrap parser.
+        ReceiptDerived,
+        /// Reads the RESTATED `EXPECTED_NORMATIVE_PAIR_KEY`, carrying no literal.
+        RestatedConstant,
+        /// Carries a pair-key-shaped literal of its own.
+        RestatedLiteral,
+        /// Binds nothing at all: no owner constant, no receipt read, no
+        /// literal. Present so that a source which stops binding the current
+        /// identity is reported as such instead of being silently bucketed
+        /// with the restated-constant debt.
+        Unbound,
+    }
+
+    /// Returns every pair-key-shaped string literal in `source`.
+    ///
+    /// Shape, not value: `"sha256:` followed by exactly 64 lowercase hex
+    /// digits and a closing quote. The closing quote is what makes the match
+    /// precise - several files in this repository quote `sha256:<hex>` inside
+    /// prose as a placeholder for "some digest", and a scan that accepted a
+    /// bare `(sha256:...)` would flag those. Restricting to a quoted literal
+    /// keeps the signal on real embedded values.
+    fn pair_key_literals(source: &str) -> Vec<&str> {
+        let bytes = source.as_bytes();
+        let mut literals = Vec::new();
+        // `"sha256:` is eight bytes including the opening quote.
+        for (start, _) in source.match_indices("\"sha256:") {
+            let hex = start + 8;
+            let Some(end) = hex.checked_add(64) else {
+                continue;
+            };
+            if end >= bytes.len() || bytes[end] != b'"' {
+                continue;
+            }
+            let candidate = &bytes[hex..end];
+            if candidate
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            {
+                // Safe to slice: all 64 bytes were just checked to be ASCII.
+                literals.push(&source[hex..end]);
+            }
+        }
+        literals
+    }
+
+    /// Classifies how `source` binds the current normative identity.
+    ///
+    /// Pure: it takes text and returns a verdict, so it is unit-testable
+    /// directly with both an owner-reading input and a literal-bearing one
+    /// without a file on disk. That is what gives the negative case below its
+    /// teeth.
+    ///
+    /// Order is load-bearing and runs worst-case-last. `OwnerDeclaration` is
+    /// tested first because this module necessarily contains the literal as
+    /// well as the names; `RestatedLiteral` is tested before
+    /// `RestatedConstant` because a source that does both is carrying its own
+    /// literal, which is the worse condition and the one a reader must see.
+    fn classify_pair_binding(source: &str) -> PairBinding {
+        let declares_owner = OWNER_CONSTANT_NAMES
+            .iter()
+            .all(|name| source.contains(&format!("pub const {name}")));
+        if declares_owner {
+            return PairBinding::OwnerDeclaration;
+        }
+        if OWNER_CONSTANT_NAMES
+            .iter()
+            .any(|name| source.contains(name))
+        {
+            return PairBinding::OwnerConstant;
+        }
+        if source.contains("parse_normative_pair_receipt") || source.contains("load_normative_pair")
+        {
+            return PairBinding::ReceiptDerived;
+        }
+        if !pair_key_literals(source).is_empty() {
+            return PairBinding::RestatedLiteral;
+        }
+        if source.contains("EXPECTED_NORMATIVE_PAIR_KEY") {
+            return PairBinding::RestatedConstant;
+        }
+        PairBinding::Unbound
+    }
+
+    /// The production sources whose owner-constant or receipt binding was
+    /// measured, with the needle each one is DECLARED to carry and the branch
+    /// it is DECLARED to take.
+    ///
+    /// This is the INDEPENDENT expectation. It is written out by hand from the
+    /// measurements above and is deliberately not derived from the same scan
+    /// that produces the actual result, so a change in either one has to be
+    /// reconciled by a human rather than cancelling out.
+    ///
+    /// The middle column is a NEEDLE, not prose: the enumeration asserts that
+    /// each source really contains it inside its production prefix, so
+    /// renaming or dropping the declared touchpoint reddens this test instead
+    /// of silently leaving the column decorative. The line references live in
+    /// the comment above each row.
+    const EXPECTED_PRODUCTION_CONSUMERS: [(&str, &str, PairBinding); 14] = [
+        // The owner itself. `pub const CURRENT_NORMATIVE_PAIR_KEY` (:22,:25,:28).
+        (
+            "crates/kernel/eliot-kernel-core/src/module/runtime_health.rs",
+            "CURRENT_NORMATIVE_PAIR_KEY",
+            PairBinding::OwnerDeclaration,
+        ),
+        // Seals against the owner's implementation digest: `expected_seal_tag` (:48).
+        (
+            "crates/kernel/eliot-kernel-core/src/module/compatibility_handshake.rs",
+            "expected_seal_tag",
+            PairBinding::OwnerConstant,
+        ),
+        // Re-exports all three: `pub use` (:115-116).
+        (
+            "crates/kernel/eliot-kernel-core/src/lib.rs",
+            "CURRENT_ARCHITECTURE_SOURCE_DIGEST",
+            PairBinding::OwnerConstant,
+        ),
+        // Kernel frame dispatch: `runtime_compatibility_evidence` (:98,:471,:472).
+        (
+            "bins/eliot-kernel/src/frame_dispatch.rs",
+            "runtime_compatibility_evidence",
+            PairBinding::OwnerConstant,
+        ),
+        // Kernel generation recovery: `DurableCompatibilityState::new` (:187).
+        (
+            "bins/eliot-kernel/src/generation_recovery.rs",
+            "DurableCompatibilityState",
+            PairBinding::OwnerConstant,
+        ),
+        // Bootstrap snapshot capture: `load_normative_pair` (:144,:184,:302).
+        (
+            "crates/foundation/eliot-bootstrap/src/capture.rs",
+            "load_normative_pair",
+            PairBinding::ReceiptDerived,
+        ),
+        // The receipt parser itself: `parse_normative_pair_receipt` (:90,:101).
+        (
+            "crates/foundation/eliot-bootstrap/src/normative.rs",
+            "parse_normative_pair_receipt",
+            PairBinding::ReceiptDerived,
+        ),
+        // Runtime-compiler expected-pair comparison: `load_normative_pair` (:2,:3080).
+        (
+            "workspace/tools/eliot-runtime-compiler/src/lib.rs",
+            "load_normative_pair",
+            PairBinding::ReceiptDerived,
+        ),
+        // Snapshot draft: `load_normative_pair` (:16,:111).
+        (
+            "bins/eliot/src/bootstrap_draft.rs",
+            "load_normative_pair",
+            PairBinding::ReceiptDerived,
+        ),
+        // Instrument runner; embeds the receipt bytes: `NORMATIVE_PAIR_RECEIPT` (:32,:197,:459,:503).
+        (
+            "crates/instrument/eliot-instrument-runner/src/testd_registry.rs",
+            "NORMATIVE_PAIR_RECEIPT",
+            PairBinding::ReceiptDerived,
+        ),
+        // MEASURED DEBT: restates the accepted pair key as its own literal,
+        // `EXPECTED_NORMATIVE_PAIR_KEY` (:59-60), consumed (:286,:291,:1148).
+        (
+            "crates/foundation/eliot-contracts/src/capability_cell_registry.rs",
+            "EXPECTED_NORMATIVE_PAIR_KEY",
+            PairBinding::RestatedLiteral,
+        ),
+        // MEASURED DEBT: embedded registry projection carrying `"pair_key"` (:76).
+        (
+            "bins/eliot-kernel/src/composition_bootstrap.rs",
+            "pair_key",
+            PairBinding::RestatedLiteral,
+        ),
+        // MEASURED DEBT: embedded registry projection carrying `"pair_key"` (:51).
+        (
+            "bins/eliot-mod-research/src/capability_cell.rs",
+            "pair_key",
+            PairBinding::RestatedLiteral,
+        ),
+        // MEASURED DEBT: consumes the restated constant, carries no literal (:23,:188).
+        (
+            "crates/meta/eliot-runtime-status/src/capability_cell_readback.rs",
+            "EXPECTED_NORMATIVE_PAIR_KEY",
+            PairBinding::RestatedConstant,
+        ),
+    ];
+
+    /// The production sources DECLARED to bind outside the owner, by path.
+    ///
+    /// Kept as its own list so the debt has one place to be counted, and keyed
+    /// by PATH rather than by binding kind so the closed-set property is about
+    /// identity: a named file that stops carrying its declared binding, or a new
+    /// file that starts carrying one, both fail. The count assertion in
+    /// `every_production_current_pair_consumer_is_enumerated` uses its length,
+    /// so the two lists cannot drift apart in size.
+    const DECLARED_BINDINGS_OUTSIDE_OWNER: [(&str, PairBinding); 4] = [
+        (
+            "crates/foundation/eliot-contracts/src/capability_cell_registry.rs",
+            PairBinding::RestatedLiteral,
+        ),
+        (
+            "bins/eliot-kernel/src/composition_bootstrap.rs",
+            PairBinding::RestatedLiteral,
+        ),
+        (
+            "bins/eliot-mod-research/src/capability_cell.rs",
+            PairBinding::RestatedLiteral,
+        ),
+        (
+            "crates/meta/eliot-runtime-status/src/capability_cell_readback.rs",
+            PairBinding::RestatedConstant,
+        ),
+    ];
+
+    /// Returns whether the line at `index` OPENS this file's test region.
+    ///
+    /// Split out of `production_prefix` so the rule is stated once, without the
+    /// byte-offset arithmetic wrapped around it.
+    ///
+    /// `#[cfg(test)]` annotates a single item at least as often as it opens a
+    /// module, so it is a boundary only when the item it annotates is itself a
+    /// `mod`. Blank lines and further attributes may sit between the attribute
+    /// and its item, so the item is the first following line that is neither.
+    fn opens_test_region(lines: &[&str], index: usize) -> bool {
+        let trimmed = lines[index].trim();
+        if trimmed.starts_with("#[cfg(test)]") {
+            return lines[index + 1..]
+                .iter()
+                .map(|line| line.trim())
+                .find(|candidate| !candidate.is_empty() && !candidate.starts_with('#'))
+                .is_some_and(|item| item.starts_with("mod "));
+        }
+        // A bare `mod tests` / `mod <name>_tests` with no attribute above it.
+        trimmed
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.split([' ', '{', '(', ';']).next())
+            .is_some_and(|name| name == "tests" || name.ends_with("_tests"))
+    }
+
+    /// Returns the text before the line that opens this file's test region.
+    ///
+    /// Used only to separate production from test text, and it matches WHOLE
+    /// LINES, not a bare substring: a doc comment or string literal that merely
+    /// mentions `#[cfg(test)]` earlier in the file must not truncate the
+    /// production prefix, or a real production consumer would be silently
+    /// reclassified as test-only.
+    ///
+    /// The boundary is the first line that opens a test MODULE, not the first
+    /// line carrying a test annotation. Those are different things, and
+    /// treating the annotation as the boundary measurably reclassifies a real
+    /// production consumer: `bins/eliot-kernel/src/composition_bootstrap.rs:41`
+    /// puts `#[cfg(test)]` on a lone test-only `use super::{...}` import, so an
+    /// annotation-shaped boundary lands at `:41` and drops that file's actual
+    /// production literal - the `"pair_key"` in the generated registry
+    /// projection at `:76` - out of the production prefix. Under this rule the
+    /// same file has no test region at all, so it is classified whole and
+    /// `:76` stays in production, which is the measured truth.
+    ///
+    /// A file with no test region yields its whole text. That is the correct
+    /// answer for such a file rather than a fallback.
+    fn production_prefix(source: &str) -> &str {
+        let lines: Vec<&str> = source.lines().collect();
+        let boundary = (0..lines.len())
+            .find(|index| opens_test_region(&lines, *index))
+            .map_or(source.len(), |index| {
+                // Every line contributes its own bytes plus the newline that
+                // `lines` removed, hence the `+ index`.
+                source.lines().take(index).map(str::len).sum::<usize>() + index
+            });
+        &source[..boundary]
+    }
+
+    /// The measured scan set: every consumer source this guard reads, keyed by
+    /// its full repository-relative path.
+    ///
+    /// This array and `EXPECTED_PRODUCTION_CONSUMERS` are TWO SEPARATE
+    /// LITERALS, and they must stay separate. The independence is the entire
+    /// point of the guard: the strings below are the bytes the scan actually
+    /// measured, while the table is what a human declares that measurement
+    /// should have been, so a source added to one and not the other fails the
+    /// length assertion and the per-row identity assertion instead of silently
+    /// reconciling with itself. Collapsing them into one array would make every
+    /// comparison below tautological.
+    ///
+    /// The identity form matches the table's for the same reason. Short
+    /// basenames are ambiguous across this set - `capability_cell.rs`,
+    /// `capability_cell_registry.rs` and `capability_cell_readback.rs` are three
+    /// different consumers, and `lib.rs` alone appears twice - so a per-row
+    /// `assert_eq!` over basenames compares spelling rather than identity, and
+    /// its result depends on the two lists happening to be in the same order
+    /// for reasons no reader can check.
+    fn scanned_sources() -> [(&'static str, &'static str); 14] {
+        [
+            (
+                "crates/kernel/eliot-kernel-core/src/module/runtime_health.rs",
+                OWNER_SOURCE,
+            ),
+            (
+                "crates/kernel/eliot-kernel-core/src/module/compatibility_handshake.rs",
+                HANDSHAKE_SOURCE,
+            ),
+            (
+                "crates/kernel/eliot-kernel-core/src/lib.rs",
+                KERNEL_CORE_LIB_SOURCE,
+            ),
+            (
+                "bins/eliot-kernel/src/frame_dispatch.rs",
+                FRAME_DISPATCH_SOURCE,
+            ),
+            (
+                "bins/eliot-kernel/src/generation_recovery.rs",
+                GENERATION_RECOVERY_SOURCE,
+            ),
+            (
+                "crates/foundation/eliot-bootstrap/src/capture.rs",
+                BOOTSTRAP_CAPTURE_SOURCE,
+            ),
+            (
+                "crates/foundation/eliot-bootstrap/src/normative.rs",
+                BOOTSTRAP_NORMATIVE_SOURCE,
+            ),
+            (
+                "workspace/tools/eliot-runtime-compiler/src/lib.rs",
+                RUNTIME_COMPILER_SOURCE,
+            ),
+            ("bins/eliot/src/bootstrap_draft.rs", BOOTSTRAP_DRAFT_SOURCE),
+            (
+                "crates/instrument/eliot-instrument-runner/src/testd_registry.rs",
+                TESTD_REGISTRY_SOURCE,
+            ),
+            (
+                "crates/foundation/eliot-contracts/src/capability_cell_registry.rs",
+                CAPABILITY_CELL_REGISTRY_SOURCE,
+            ),
+            (
+                "bins/eliot-kernel/src/composition_bootstrap.rs",
+                COMPOSITION_BOOTSTRAP_SOURCE,
+            ),
+            (
+                "bins/eliot-mod-research/src/capability_cell.rs",
+                RESEARCH_CAPABILITY_CELL_SOURCE,
+            ),
+            (
+                "crates/meta/eliot-runtime-status/src/capability_cell_readback.rs",
+                CAPABILITY_CELL_READBACK_SOURCE,
+            ),
+        ]
+    }
+
+    /// Returns whether `binding` reaches the current identity through the owner
+    /// or the accepted receipt, rather than restating it locally.
+    ///
+    /// The enumeration's counting half and the closed-debt half partition the
+    /// same population, so they must not each carry their own private copy of
+    /// the split: the first asserts `owner_bound + declared == total`, the
+    /// second asserts the complement is exactly the declared debt. One shared
+    /// predicate keeps the halves complementary by construction instead of by
+    /// two lists that happen to agree today.
+    fn binds_through_owner_or_receipt(binding: PairBinding) -> bool {
+        matches!(
+            binding,
+            PairBinding::OwnerDeclaration
+                | PairBinding::OwnerConstant
+                | PairBinding::ReceiptDerived
+        )
+    }
+
+    /// Enumerates every measured production current-pair consumer and checks
+    /// each against its independently declared branch.
+    ///
+    /// Positive: the owner and every owner-reading consumer really do read the
+    /// compiled owner, and each measured source lands on exactly the branch
+    /// declared for it in `EXPECTED_PRODUCTION_CONSUMERS`.
+    #[test]
+    fn every_production_current_pair_consumer_is_enumerated() {
+        let sources = scanned_sources();
+
+        // The scan set and the hand-declared set must be the same size and
+        // agree on identity. Without this a source could be added to one list
+        // and not the other, and the enumeration would quietly stop being
+        // complete.
+        assert_eq!(
+            sources.len(),
+            EXPECTED_PRODUCTION_CONSUMERS.len(),
+            "the scanned consumer set and the independently declared set must be the same size"
+        );
+
+        let mut owner_bound = 0;
+        for ((file, source), (expected_file, needle, expected_binding)) in
+            sources.iter().zip(&EXPECTED_PRODUCTION_CONSUMERS)
+        {
+            assert_eq!(
+                file, expected_file,
+                "the scanned consumer set and the declared set disagree on identity"
+            );
+            // The declared needle must really be in the PRODUCTION text. Without
+            // this the middle column is prose: renaming or dropping the declared
+            // touchpoint would leave the guard green while its stated
+            // expectation had quietly stopped describing the code.
+            assert!(
+                production_prefix(source).contains(needle),
+                "{file} no longer contains its declared touchpoint {needle:?} outside \
+                 its test module, so this enumeration's expectation is out of date"
+            );
+            // Classified on the PRODUCTION PREFIX, not on the whole file: a
+            // source whose only binding sits inside its test region does not
+            // bind the production identity at all, and scoring it from test
+            // text would credit production with a consumer it does not have.
+            let actual = classify_pair_binding(production_prefix(source));
+            assert_eq!(
+                actual, *expected_binding,
+                "{file} ({needle}) no longer binds the current pair the way this \
+                 enumeration declares it does"
+            );
+            if binds_through_owner_or_receipt(actual) {
+                owner_bound += 1;
+            }
+        }
+
+        // Exact, not `>=`. This is the count the DONE clause turns on: the
+        // number of measured consumers that bind the current identity through
+        // the owner or the receipt. It fails if an owner-reading consumer
+        // migrates to its own literal, and it fails if the debt list and the
+        // owner-reading population stop summing to the whole enumeration.
+        assert_eq!(
+            owner_bound + DECLARED_BINDINGS_OUTSIDE_OWNER.len(),
+            EXPECTED_PRODUCTION_CONSUMERS.len(),
+            "every enumerated consumer is either owner-bound or declared debt"
+        );
+        assert!(
+            owner_bound > 0,
+            "at least one enumerated consumer must read the owner; found none"
+        );
+    }
+
+    /// Fail-closed: the debt is exact, so a NEW current-pair literal outside
+    /// the owner fails this guard.
+    ///
+    /// This is the property the card asks for - "so a new current-pair literal
+    /// outside the owner fails it" (`cards/1067.md:17`) - expressed as a closed
+    /// set. Each measured non-owner binding must be one the enumeration already
+    /// declares; a source binding outside the owner that is not in
+    /// `DECLARED_BINDINGS_OUTSIDE_OWNER` is undeclared debt and fails here.
+    ///
+    /// The input is MEASURED, not copied from the expectation. Filtering
+    /// `EXPECTED_PRODUCTION_CONSUMERS` here would make the assertion a copy of
+    /// the table it polices: it could only ever re-derive the declaration, and a
+    /// scanned source that genuinely changed its binding could not fail it.
+    /// Classification therefore runs over each scanned source's own production
+    /// prefix here, which is what gives the check teeth; the table it is checked
+    /// against stays the independent literal.
+    #[test]
+    fn a_current_pair_binding_outside_the_owner_must_be_declared() {
+        // Negative control: a genuinely NEW current-pair literal owner, which is
+        // the condition `cards/1067.md:17` requires this guard to catch. It is
+        // paired with the measured scan rather than added to it, because a file
+        // that does not exist cannot be embedded by `include_str!`.
+        const NEW_LITERAL_OWNER: &str =
+            "crates/meta/eliot-runtime-status/src/capability_cell_projection.rs";
+        const NEW_LITERAL_OWNER_SOURCE: &str = r#"
+            const EXPECTED_NORMATIVE_PAIR_KEY: &str =
+                "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1";
+        "#;
+        let measured: Vec<(&str, PairBinding)> = scanned_sources()
+            .iter()
+            .map(|(file, source)| (*file, classify_pair_binding(production_prefix(source))))
+            .filter(|(_, binding)| !binds_through_owner_or_receipt(*binding))
+            .collect();
+
+        assert_eq!(
+            measured.len(),
+            DECLARED_BINDINGS_OUTSIDE_OWNER.len(),
+            "every production binding outside the owner must be declared in \
+             DECLARED_BINDINGS_OUTSIDE_OWNER; undeclared: {:?}",
+            measured.iter().map(|(file, _)| *file).collect::<Vec<_>>()
+        );
+        for (file, binding) in &measured {
+            // Matched BY PATH, not by binding kind: kind-only matching would let
+            // one declared RestatedLiteral stand in for any other, so a new
+            // literal owner could appear while this loop stayed green.
+            assert!(
+                DECLARED_BINDINGS_OUTSIDE_OWNER.contains(&(*file, *binding)),
+                "{file} binds the current pair outside the owner as {binding:?}, which is not declared"
+            );
+        }
+
+        // Positive control on the predicate the loop above uses: a MEASURED row
+        // must be found by it. Without this the negative control below could
+        // pass merely because the predicate rejects everything.
+        let Some(first_measured) = measured.first().copied() else {
+            panic!("a measured non-owner binding must exist for this guard to have teeth");
+        };
+        assert!(
+            DECLARED_BINDINGS_OUTSIDE_OWNER.contains(&first_measured),
+            "a measured debt row must be found by the same predicate the negative \
+             control fails, or that control is vacuous"
+        );
+
+        assert_eq!(
+            classify_pair_binding(NEW_LITERAL_OWNER_SOURCE),
+            PairBinding::RestatedLiteral,
+            "a new source carrying its own pair-key literal must classify as RestatedLiteral"
+        );
+        assert!(
+            !binds_through_owner_or_receipt(classify_pair_binding(NEW_LITERAL_OWNER_SOURCE)),
+            "a new literal owner binds outside the owner, so the closed-set \
+             predicate must apply to it"
+        );
+        assert!(
+            !DECLARED_BINDINGS_OUTSIDE_OWNER
+                .iter()
+                .any(|(file, _)| *file == NEW_LITERAL_OWNER),
+            "the negative control's path must not already be declared, or the \
+             control would prove nothing"
+        );
+        assert!(
+            !DECLARED_BINDINGS_OUTSIDE_OWNER
+                .contains(&(NEW_LITERAL_OWNER, PairBinding::RestatedLiteral)),
+            "a new current-pair literal outside the owner matches no declared row, \
+             which is why adding one to a scanned source fails this guard"
+        );
+    }
+
+    /// Refusal: a literal-bearing source is detected, and name matching on the
+    /// owner's three constants alone would miss it.
+    ///
+    /// The input is built around `EXPECTED_NORMATIVE_PAIR_KEY` deliberately.
+    /// That is the name a scan matching only `CURRENT_ARCHITECTURE_SOURCE_
+    /// DIGEST` / `CURRENT_IMPLEMENTATION_SOURCE_DIGEST` /
+    /// `CURRENT_NORMATIVE_PAIR_KEY` cannot see, and it is the exact shape of
+    /// the three measured production literal owners. So this negative case
+    /// proves two things at once: that the classifier returns a non-empty
+    /// literal hit set for literal-bearing text, and that the owner-constant
+    /// name check does not fire on it - which is what makes the literal check
+    /// load-bearing rather than redundant.
+    ///
+    /// The positive half is the mirror: the same classifier must accept a
+    /// source that reads the owner, so the negative half cannot pass merely
+    /// because the classifier rejects everything.
+    #[test]
+    fn a_restated_pair_literal_is_detected_where_owner_name_matching_misses_it() {
+        const LITERAL_BEARING: &str = r#"
+            pub const EXPECTED_NORMATIVE_PAIR_KEY: &str =
+                "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1";
+        "#;
+        const OWNER_READING: &str = r"
+            let pair_key = eliot_kernel_core::CURRENT_NORMATIVE_PAIR_KEY;
+        ";
+
+        // The literal is really there, and it is the ACCEPTED value, so this
+        // is not a miss caused by a stale fixture. `pair_key_literals` returns
+        // the 64 hex digits without the `sha256:` prefix it matched on, hence
+        // the strip; comparing against the owner's own constant is what ties
+        // the detected literal to the current identity rather than to some
+        // arbitrary well-formed digest.
+        const PAIR_KEY_PREFIX: &str = "sha256:";
+
+        // The prefix is asserted rather than unwrapped, so the slice below cannot
+        // panic and the constant's own shape is part of what the test states.
+        assert!(
+            CURRENT_NORMATIVE_PAIR_KEY.starts_with(PAIR_KEY_PREFIX),
+            "the owner pair key carries the sha256: prefix"
+        );
+        let accepted_hex = &CURRENT_NORMATIVE_PAIR_KEY[PAIR_KEY_PREFIX.len()..];
+        assert_eq!(
+            pair_key_literals(LITERAL_BEARING),
+            vec![accepted_hex],
+            "a quoted pair-key literal must be found in literal-bearing text"
+        );
+
+        // The owner-constant name check does NOT fire here. This is the
+        // assertion that gives the literal check its necessity.
+        assert!(
+            !OWNER_CONSTANT_NAMES
+                .iter()
+                .any(|name| LITERAL_BEARING.contains(name)),
+            "the negative fixture must not mention an owner constant, or it \
+             would prove nothing about literal detection"
+        );
+        assert_eq!(
+            classify_pair_binding(LITERAL_BEARING),
+            PairBinding::RestatedLiteral,
+            "a source carrying its own pair-key literal must classify as RestatedLiteral"
+        );
+        assert!(
+            pair_key_literals(OWNER_READING).is_empty(),
+            "a source that reads the owner carries no literal of its own"
+        );
+        assert_eq!(
+            classify_pair_binding(OWNER_READING),
+            PairBinding::OwnerConstant,
+            "a source reading the owner constant must classify as OwnerConstant"
+        );
+    }
+
+    /// Pins the measured contradiction with the card's list.
+    ///
+    /// `cards/1067.md:17` names `runtime_health_status` and
+    /// `kernel_admission_client` as production consumers. Both are measured
+    /// test-only: every reference to an owner constant in either file sits
+    /// after its `#[cfg(test)]`. Asserting that here means the enumeration
+    /// cannot quietly start counting them as production, and it records in
+    /// code why this guard's expected set differs from the card's.
+    #[test]
+    fn the_card_named_runtime_health_consumers_are_test_only() {
+        for (file, source) in [
+            (
+                "crates/meta/eliot-runtime-status/src/runtime_health_status.rs",
+                RUNTIME_HEALTH_STATUS_SOURCE,
+            ),
+            (
+                "bins/eliot-native-worker/src/kernel_admission_client.rs",
+                KERNEL_ADMISSION_CLIENT_SOURCE,
+            ),
+        ] {
+            assert!(
+                source.contains("CURRENT_NORMATIVE_PAIR_KEY"),
+                "{file} must still reference an owner constant for this \
+                 boundary to mean anything"
+            );
+            assert!(
+                !production_prefix(source).contains("CURRENT_NORMATIVE_PAIR_KEY"),
+                "{file} reads the owner constant outside its test module, so it IS a \
+                 production consumer after all and this enumeration's expected set is \
+                 out of date"
+            );
+        }
+    }
 }

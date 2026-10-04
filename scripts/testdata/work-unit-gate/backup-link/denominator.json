@@ -32,7 +32,7 @@
     {
       "manifest": "bins/eliot-kernel/Cargo.toml",
       "base_blob_sha256": "b88fc87a8726ce7c20099c273347b1623b92e7f44677a666eb366f0654f48edf",
-      "current_blob_sha256": "9f583f31dde807900fcf5e7508365c5a141f08fb53c5bf4cf4620ca6754760e1",
+      "current_blob_sha256": "98f9bd7849de8c29be920cc40350892269f267129fe3d4d4bd239d80bbd3465e",
       "byte_identical_since_base": false
     },
     {
@@ -74,7 +74,7 @@
     {
       "manifest": "Cargo.lock",
       "base_blob_sha256": "8694704b293ac155f6a073c19734c72de81564719570abf5bc1bdfe4719118d3",
-      "current_blob_sha256": "5208b8ac926d257f3dee28eecb9fbc62b5c4cb99b2451b4dc963c0615730dad2",
+      "current_blob_sha256": "0bd6dfa8bd935a93fd7797a7ca1cb2e5350cf2a02d5fa89ceb733b485783fc75",
       "byte_identical_since_base": false
     }
   ],
@@ -83,7 +83,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-backup",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 36,
+      "line": 24,
       "symbol": "BackupBundle",
       "declaration": "eliot-backup = { path = \"../../crates/storage/eliot-backup\", version = \"0.1.0\" }"
     },
@@ -91,7 +91,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-ipc",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 41,
+      "line": 29,
       "symbol": "TransportError",
       "declaration": "eliot-ipc.workspace = true"
     },
@@ -99,7 +99,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-protocol",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 63,
+      "line": 51,
       "symbol": "Frame",
       "declaration": "eliot-protocol.workspace = true"
     },
@@ -107,7 +107,7 @@
       "consumer": "eliot-kernel",
       "dependency": "eliot-store-api",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 70,
+      "line": 58,
       "symbol": "WriteReceipt",
       "declaration": "eliot-store-api.workspace = true"
     },
@@ -212,5 +212,5 @@
       "declaration": "eliot-blob-api.workspace = true"
     }
   ],
-  "denominator_digest": "d53fa78cee1cd697d18ad4c62aaff72448107d47dcd963c5b4c990303766c409"
+  "denominator_digest": "81a40f28de01741b4b0db5a679402d889d8c7f041d531362c80de56279a90c0c"
 }

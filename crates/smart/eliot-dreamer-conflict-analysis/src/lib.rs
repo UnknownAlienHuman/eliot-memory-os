@@ -226,7 +226,7 @@
 //! admission rather than assessed against nothing. Nothing here raises a
 //! ceiling: an unverifiable input keeps the unverified/unknown result.
 //!
-//! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here,
+//! Test coverage note: 68 of 68 `WORK_UNIT_CASE 673/*` cases are bound here,
 //! plus two unnumbered cases that enter [`analyze_conflict`] for the
 //! declared-but-absent member of that qualified one-position set and prove the
 //! analyzer's own two legs of it — `Partial` naming the absent member and its
@@ -236,7 +236,7 @@
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts while a single position whose
 //! second member is declared but still open is, 673/5 duplicate and changed
-//! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
+//! identities fail closed, 673/6 complete/partial/stale/blocked
 //! denominators stay explicit, 673/7 exact replay preserves digest while
 //! changed content moves it, 673/8 no model, tool, store, peer, Concilium,
 //! or decision mutation, 673/9 independent families stay two roots,
@@ -276,6 +276,16 @@
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
 //! closed, 673/56 exact pre-handler receipt plus seven preservation dimensions,
 //! 673/57 failed and unknown dimensions stay independent without borrowing,
+//! 673/58 complete analysis unresolved without external receipt,
+//! its complete outcome carries no hub rejection hint, and the exact
+//! `AuthorityCeiling` note literal is retained with every preservation
+//! dimension passing unaveraged; the external-receipt reopen condition
+//! and the live hit rate under load gap both stay named among the
+//! conditions production emits, both rival positions keep their own
+//! source handles, unknowns and assumptions stay verbatim, the fixed
+//! candidate-only proof note is unchanged, and the recommended
+//! `DecisionOwnerKind::Multiple` owner, still owed owner-scoped evidence,
+//! names the boundary that must decide later,
 //! 673/60 irrelevant order preserves digest, 673/61 exact and one-over
 //! limits fail closed, 673/62 cancellation and deadline emit blocked/stale,
 //! 673/64 every expected position and objection stays visible,
@@ -291,14 +301,20 @@
 //! names the Human and Task Controller owner, 673/49 authority and effect
 //! disagreement names the Governor owner, 673/50 intent-satisfiability
 //! disagreement names the Architecture and Implementation owner, 673/52
-//! privacy handling names the security and privacy owner, 673/54 owner
+//! privacy handling names the security and privacy owner,
+//! 673/53 unknown and multiple owner conflict, 673/54 owner
 //! recommendation carries a naming-only rationale and contract with no
 //! assignment or authority, 673/55 complete analysis stays unresolved
 //! without an external receipt and retains a supplied receipt verbatim,
+//! 673/59 partial/abstention/stale/blocked/rejected distinct,
 //! 673/63 diagnostics stay bounded and redacted).
-//! The remaining 3 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/53,
-//! 673/58, 673/59.
+//! This note is a source-coverage statement only: it records that every number
+//! in 1..68 is bound to exactly one numbered test, which is why the two
+//! unnumbered tests stay unnumbered. It does not claim those tests were
+//! executed or observed passing, and it does not close #673; executed-pass
+//! evidence belongs to the later test phase. Workspace admission (#969),
+//! Product Pulse, and Edge proof are separate concerns that this note does not
+//! cover, because none of them is part of the 68-case matrix.
 
 #![forbid(unsafe_code)]
 
@@ -6854,6 +6870,7 @@ mod tests {
 
     // WORK_UNIT_CASE: 673/3
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn case_03_empty_and_single_position_are_not_conflicts() {
         let receipt = test_receipt();
         let owners = BTreeSet::from([SourceId::new("source-a").expect("valid source")]);
@@ -7078,13 +7095,13 @@ mod tests {
     /// yields a `Partial` candidate, the absent member is NAMED rather than only
     /// counted, and the declared width is reported.
     ///
-    /// This is a distinct case from `case_03`, which proves the two legs
-    /// required by test-matrix row 3 at the CONTRACT boundary (a one-position
-    /// set is refused without a qualifier and constructs with one) plus the
-    /// `AuthoritativeAbsence` refusal. What `case_03` never enters is the
-    /// analyzer itself for this shape, so nothing here would fail if the notes
-    /// counted the absent member without naming it, dropped it, or reported a
-    /// narrower denominator than the set declares.
+    /// This is a distinct case from `case_03`, which drives the same
+    /// declared-but-absent set through `analyze_conflict` but checks only the
+    /// outcome, the declared width, and the preservation report. What `case_03`
+    /// never checks is that the absent member is NAMED — that `source-b` appears
+    /// in the incompleteness note and in the coverage verdict note — so nothing
+    /// there would fail if the notes counted the absent member without naming
+    /// it. That is exactly what these two legs add.
     #[test]
     fn declared_absent_member_is_named_and_partial_under_allow_partial() {
         let conflict = test_qualified_missing_rival_set();
@@ -11698,6 +11715,127 @@ mod tests {
         assert_eq!(candidate.resolution_status, None);
     }
 
+    // WORK_UNIT_CASE: 673/53
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_53_unknown_and_multiple_owner_conflict_stay_unnamed() {
+        let multiple = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("owner recommendation analysis: {err:?}"),
+        };
+        assert_eq!(
+            multiple.recommended_owner.kind,
+            DecisionOwnerKind::Multiple,
+            "several unresolved owners name Multiple instead of one decider"
+        );
+        assert_eq!(
+            multiple.recommended_owner.rationale, "multiple unresolved owners remain in conflict",
+            "the multiple-owner rationale names the unresolved owner set"
+        );
+        assert_eq!(
+            multiple.recommended_owner.contract_needed,
+            "owner-scoped evidence for each unresolved owner",
+            "each unresolved owner is named as needing its own evidence"
+        );
+        assert_eq!(
+            multiple.recommended_owner.owner_handle, "source-a",
+            "the recommendation mirrors the set's own decision_owner verbatim"
+        );
+        assert!(
+            multiple.resolution_status.is_none(),
+            "an owner recommendation is not a resolution: {:?}",
+            multiple.resolution_status
+        );
+        // The same helper set family with one authority owner and a decision
+        // owner outside it: the multiple-owner leg needs more than one owner,
+        // so the analysis falls through to the unnamed-owner leg rather than
+        // adopting the conflict-kind default.
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-b").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("valid conflict set");
+        let unknown = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("owner recommendation analysis: {err:?}"),
+        };
+        assert_eq!(
+            unknown.recommended_owner.kind,
+            DecisionOwnerKind::Unknown,
+            "a decision owner outside the set's own authority owners names none"
+        );
+        assert_eq!(
+            unknown.recommended_owner.rationale,
+            "the set names a decision owner outside its own authority owner set, so no single owner can be named from the grounded evidence",
+            "the unnamed-owner rationale names the authority gap verbatim"
+        );
+        assert_eq!(
+            unknown.recommended_owner.contract_needed,
+            "authority owner set containing the decision owner, or an owner-issued assignment naming the decider",
+            "the unnamed-owner contract names what would make a decider nameable"
+        );
+        assert_eq!(
+            unknown.recommended_owner.owner_handle, "source-b",
+            "the unnamed recommendation still carries the set's own decision_owner handle"
+        );
+        let authority = unknown
+            .preservation
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.dimension == PreservationDimension::AuthorityCeiling)
+            .expect("authority ceiling verdict stays addressable");
+        assert!(
+            authority
+                .note
+                .contains("no owner could be named from the grounded evidence"),
+            "the authority verdict names the gap the unnamed owner leaves: {}",
+            authority.note
+        );
+        assert!(
+            unknown.preservation.overall().is_ok(),
+            "naming no owner is not a preservation failure"
+        );
+        assert!(
+            unknown.resolution_status.is_none(),
+            "an unnamed owner is not a resolution: {:?}",
+            unknown.resolution_status
+        );
+    }
+
     // WORK_UNIT_CASE: 673/54
     #[test]
     fn case_54_owner_recommendation_is_naming_only_contract() {
@@ -11827,6 +11965,106 @@ mod tests {
         assert!(matches!(err, ConflictAnalysisError::Digest { .. }));
     }
 
+    // WORK_UNIT_CASE: 673/58
+    #[test]
+    fn case_58_complete_analysis_remains_unresolved_without_external_receipt() {
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("complete unresolved analysis: {err:?}"),
+        };
+        let supplements = test_supplements();
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Complete,
+            "analysis completeness is about coverage, never about resolution"
+        );
+        assert!(
+            candidate.resolution_status.is_none(),
+            "no external resolution receipt was supplied, so none is retained: {:?}",
+            candidate.resolution_status
+        );
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            None,
+            "a complete unresolved analysis is not a hub rejection"
+        );
+        let authority = candidate
+            .preservation
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.dimension == PreservationDimension::AuthorityCeiling)
+            .expect("authority ceiling verdict stays addressable");
+        assert_eq!(
+            authority.note,
+            "candidate claims no authority beyond proposal; recommendation names the external owner",
+            "a complete analysis with a named external owner claims no authority beyond a proposal"
+        );
+        assert!(
+            candidate.preservation.overall().is_ok(),
+            "every preservation dimension passes on its own, with no averaging"
+        );
+        assert!(
+            candidate
+                .invalidation_conditions
+                .iter()
+                .any(|condition| condition
+                    == "if an external resolution receipt arrives, retain it with dissent"),
+            "the analysis names the external receipt it is still waiting for: {:?}",
+            candidate.invalidation_conditions
+        );
+        assert!(
+            candidate
+                .invalidation_conditions
+                .iter()
+                .any(|condition| condition.contains("hit rate under load")),
+            "the named gap stays live in the reopen conditions: {:?}",
+            candidate.invalidation_conditions
+        );
+        assert_eq!(
+            candidate.positions.len(),
+            2,
+            "both rival positions survive the complete analysis"
+        );
+        let sources: Vec<&str> = candidate
+            .positions
+            .iter()
+            .map(|position| position.source_handle.as_str())
+            .collect();
+        assert!(
+            sources.contains(&"source-a") && sources.contains(&"source-b"),
+            "each preserved position keeps its own source handle: {sources:?}"
+        );
+        assert_eq!(
+            candidate.unknowns, supplements.unknowns,
+            "the supplied unknown is retained verbatim, unresolved"
+        );
+        assert_eq!(
+            candidate.assumptions, supplements.assumptions,
+            "the supplied assumption is retained verbatim, unresolved"
+        );
+        assert_eq!(
+            candidate.note, CONFLICT_PROOF_NOTE,
+            "the emitted note is the fixed candidate-only proof note, not a decision"
+        );
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::Multiple,
+            "the complete analysis names the unresolved owner set as the boundary that must decide later; naming is not assignment"
+        );
+        assert_eq!(
+            candidate.recommended_owner.contract_needed,
+            "owner-scoped evidence for each unresolved owner",
+            "the named owners each still owe their own scoped evidence"
+        );
+    }
+
     // WORK_UNIT_CASE: 673/63
     #[test]
     fn case_63_diagnostics_stay_bounded_and_redacted() {
@@ -11886,6 +12124,253 @@ mod tests {
         assert!(
             !err.to_string().chars().any(char::is_control),
             "error diagnostics stay printable: {err:?}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/59
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_59_five_terminal_outcomes_stay_distinct() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        // Row 59 asks that partial/abstention/stale/blocked/rejected stay
+        // distinct. The early-terminal dispatch checks cancellation and the
+        // frozen deadline first and returns before the incompleteness leg, and
+        // the three lifecycle legs are disjoint from one another, so no single
+        // input can reach two of these five: each one needs its own input, and
+        // each result is then pinned to its own distinct terminal value below,
+        // so the five can never collapse into one value renamed.
+        let mut partial_policy = test_policy();
+        partial_policy.allow_partial = true;
+        let partial = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_qualified_missing_rival_set(),
+            &test_qualified_missing_rival_supplements(),
+            &partial_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("partial-route analysis: {err:?}"),
+        };
+        // The closed-set route no other case drives: `Resolved` with empty
+        // residue on both axes is exactly `is_closed`, and that is the shape
+        // `validate_shape` admits.
+        let closed_receipt = test_receipt();
+        let closed = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::new(),
+            unresolved_owners: BTreeSet::new(),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Resolved,
+            receipt_digest: closed_receipt.bundle_digest.clone(),
+        })
+        .expect("a resolved set with empty residue on both axes is a valid closed set");
+        let abstention = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &closed,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("closed-set analysis: {err:?}"),
+        };
+        let mut stale_policy = test_policy();
+        stale_policy.observation_time_ms = Some(1_800_000_000_000);
+        stale_policy.deadline_ms = Some(1_800_000_000_000);
+        let stale = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &stale_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("past-deadline analysis: {err:?}"),
+        };
+        let mut blocked_policy = test_policy();
+        blocked_policy.cancelled = true;
+        let blocked = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &blocked_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cancelled analysis: {err:?}"),
+        };
+        // The decided-set route no other case drives either: `Decided` is
+        // refused unconditionally and short-circuits the other two legs, with
+        // everything else held at the plain two-position shape.
+        let decided_receipt = test_receipt();
+        let decided = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Decided,
+            receipt_digest: decided_receipt.bundle_digest.clone(),
+        })
+        .expect("valid conflict set");
+        let rejected = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &decided,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("decided-set analysis: {err:?}"),
+        };
+        assert_eq!(
+            partial.outcome,
+            ConflictOutcome::Partial,
+            "a declared-but-absent open member keeps the analysis incomplete, and partial emission is admitted"
+        );
+        assert_eq!(
+            abstention.outcome,
+            ConflictOutcome::Abstention,
+            "a set its owner already closed with empty residue leaves no open conflict, so no analysis and no partial path is offered"
+        );
+        assert_eq!(
+            stale.outcome,
+            ConflictOutcome::Stale,
+            "an observation at or past the frozen deadline is stale, never blocked"
+        );
+        assert_eq!(
+            blocked.outcome,
+            ConflictOutcome::Blocked,
+            "a cancelled request is blocked; cancellation is checked before the deadline"
+        );
+        assert_eq!(
+            rejected.outcome,
+            ConflictOutcome::Rejected,
+            "a set its named owner already decided is handed back to that boundary, never re-decided here"
+        );
+        // The two lifecycle notes are compared for exact equality against the
+        // literals `check_lifecycle_boundary` returns; neither is trimmed and
+        // neither is matched as a substring, so a reworded note fails here.
+        assert_eq!(
+            abstention.note,
+            "the set is closed with empty residue, so no open conflict is left to analyze and no partial path is offered",
+            "the abstention note is the exact lifecycle literal, compared for equality"
+        );
+        assert_eq!(
+            rejected.note,
+            "the set is already decided by its named owner; this cell reissues no decision and hands the request back to that boundary",
+            "the rejection note is the exact lifecycle literal, compared for equality"
+        );
+        let spellings: BTreeSet<&'static str> = [
+            partial.outcome,
+            abstention.outcome,
+            stale.outcome,
+            blocked.outcome,
+            rejected.outcome,
+        ]
+        .iter()
+        .map(|outcome| outcome.as_str())
+        .collect();
+        assert_eq!(
+            spellings.len(),
+            5,
+            "no two of the five share a canonical spelling: {spellings:?}"
+        );
+        let partial_hint =
+            outcome_rejection_hint(&partial.outcome).expect("a partial analysis carries a hint");
+        let stale_hint =
+            outcome_rejection_hint(&stale.outcome).expect("a stale analysis carries a hint");
+        let blocked_hint =
+            outcome_rejection_hint(&blocked.outcome).expect("a blocked analysis carries a hint");
+        let abstention_hint =
+            outcome_rejection_hint(&abstention.outcome).expect("an abstention carries a hint");
+        let rejected_hint =
+            outcome_rejection_hint(&rejected.outcome).expect("a rejection carries a hint");
+        let mut coverage_hints: Vec<CurationRejectionCode> = Vec::new();
+        for hint in [partial_hint, stale_hint, blocked_hint] {
+            if !coverage_hints.contains(&hint) {
+                coverage_hints.push(hint);
+            }
+        }
+        assert!(
+            coverage_hints.contains(&CurationRejectionCode::PreservationFailed)
+                && coverage_hints.contains(&CurationRejectionCode::DeadlineExceeded)
+                && coverage_hints.contains(&CurationRejectionCode::Cancelled),
+            "the three coverage hints are exactly PreservationFailed, DeadlineExceeded and Cancelled: {coverage_hints:?}"
+        );
+        assert_eq!(
+            abstention_hint, rejected_hint,
+            "Abstention and Rejected deliberately share one hint, so the lossy hub code cannot separate the two boundary handoffs and the typed ConflictOutcome stays the only lossless discriminator"
+        );
+        assert_eq!(
+            abstention_hint,
+            CurationRejectionCode::IdentityMismatch,
+            "both boundary handoffs name the identity-mismatch code the closed hub vocabulary offers"
+        );
+        assert!(
+            stale.resolution_status.is_none(),
+            "the early-terminal dispatch resolves nothing: {:?}",
+            stale.resolution_status
+        );
+        assert!(
+            stale.recommended_probes.is_empty(),
+            "the early-terminal dispatch is handed an empty probe list: {}",
+            stale.recommended_probes.len()
+        );
+        assert!(
+            blocked.resolution_status.is_none(),
+            "a cancelled request resolves nothing: {:?}",
+            blocked.resolution_status
+        );
+        assert!(
+            blocked.recommended_probes.is_empty(),
+            "a cancelled request is handed an empty probe list: {}",
+            blocked.recommended_probes.len()
         );
     }
 }

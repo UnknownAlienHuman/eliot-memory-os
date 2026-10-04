@@ -1,0 +1,489 @@
+{
+  "schema_version": 2,
+  "binding": {
+    "task_id": "task-868-context-quality-migration",
+    "attempt_id": "attempt-868-w2-current-payload",
+    "scope_id": "crates/smart/eliot-context/tests/data",
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 7,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "decision_id": "decision-868-current-scorecard",
+    "operation_id": null
+  },
+  "output": {
+    "recipe_digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "fence_digest": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "admitted_digest": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    "rendered_digest": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+    "serializer_id": "serde-json",
+    "serializer_version": "1",
+    "serializer_options_digest": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+    "route_id": "route-868-reference-current-payload",
+    "evidence_revisions": [
+      "revision-868-task-acceptance-source",
+      "revision-868-active-directive-source",
+      "revision-868-protected-floor-source"
+    ],
+    "omission_handles": [
+      "omission-handle-868-route-expansion-path"
+    ]
+  },
+  "applicability": {
+    "resolved": [
+      "TASK_ACCEPTANCE",
+      "ROUTE",
+      "IMPACT",
+      "GOVERNANCE_PROFILE",
+      "PROTECTED_FLOOR",
+      "ACTIVE_DIRECTIVE"
+    ],
+    "unknown": []
+  },
+  "results": [
+    {
+      "schema_version": 2,
+      "dimension": "ACCEPTANCE_DECISION_COVERAGE",
+      "state": "PASSED",
+      "rule_revision": "rule-revision-868-acceptance-decision-coverage",
+      "required_evidence": [
+        "evidence-868-acceptance-criteria",
+        "evidence-868-decision-record"
+      ],
+      "evidence": [
+        "evidence-868-acceptance-criteria",
+        "evidence-868-decision-record"
+      ],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "CAUSAL_OPERATIONAL_SUFFICIENCY",
+      "state": "FAILED",
+      "rule_revision": "rule-revision-868-causal-operational-sufficiency",
+      "required_evidence": [
+        "evidence-868-causal-chain-members"
+      ],
+      "evidence": [
+        "evidence-868-causal-chain-members"
+      ],
+      "measurements": [],
+      "failed_invariant": "invariant-868-causal-operational-sufficiency-closure",
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "EXACT_ANCHOR_PROVENANCE_COVERAGE",
+      "state": "PASSED",
+      "rule_revision": "rule-revision-868-exact-anchor-provenance-coverage",
+      "required_evidence": [
+        "evidence-868-anchor-span",
+        "evidence-868-anchor-provenance",
+        "evidence-868-anchor-source-snapshot"
+      ],
+      "evidence": [
+        "evidence-868-anchor-span",
+        "evidence-868-anchor-provenance",
+        "evidence-868-anchor-source-snapshot"
+      ],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "FRESHNESS_STATE_FENCE_COHERENCE",
+      "state": "PASSED",
+      "rule_revision": "rule-revision-868-freshness-state-fence-coherence",
+      "required_evidence": [
+        "evidence-868-admission-revision-head",
+        "evidence-868-fence-coherence-sample"
+      ],
+      "evidence": [
+        "evidence-868-admission-revision-head",
+        "evidence-868-fence-coherence-sample"
+      ],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "RIVALS_CONFLICTS_UNKNOWNS_VISIBILITY",
+      "state": "UNKNOWN",
+      "rule_revision": "rule-revision-868-rivals-conflicts-unknowns-visibility",
+      "required_evidence": [
+        "evidence-868-rival-claims",
+        "evidence-868-conflict-adjudication",
+        "evidence-868-unknown-inventory"
+      ],
+      "evidence": [
+        "evidence-868-unknown-inventory"
+      ],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [
+        "evidence-868-rival-claims",
+        "evidence-868-conflict-adjudication"
+      ],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "NEGATIVE_MEMORY_INVARIANT_COVERAGE",
+      "state": "FAILED",
+      "rule_revision": "rule-revision-868-negative-memory-invariant-coverage",
+      "required_evidence": [
+        "evidence-868-negative-memory-members",
+        "evidence-868-invariant-membership"
+      ],
+      "evidence": [
+        "evidence-868-invariant-membership"
+      ],
+      "measurements": [],
+      "failed_invariant": "invariant-868-negative-memory-coverage-floor",
+      "unknown_evidence": [
+        "evidence-868-negative-memory-members"
+      ],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "VERIFIER_ACTION_READINESS",
+      "state": "PASSED",
+      "rule_revision": "rule-revision-868-verifier-action-readiness",
+      "required_evidence": [
+        "evidence-868-verifier-action-surface",
+        "evidence-868-verifier-readiness"
+      ],
+      "evidence": [
+        "evidence-868-verifier-action-surface",
+        "evidence-868-verifier-readiness"
+      ],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "ROUTE_ACCESSIBILITY_LAYOUT_RISK",
+      "state": {
+        "DEGRADED": {
+          "reason": "the compiled route renders the recalled expansion section as a bounded handle instead of inline text, so the layout risk of that section is measured rather than absent"
+        }
+      },
+      "rule_revision": "rule-revision-868-route-accessibility-layout-risk",
+      "required_evidence": [
+        "evidence-868-route-layout"
+      ],
+      "evidence": [
+        "evidence-868-route-layout"
+      ],
+      "measurements": [],
+      "failed_invariant": "invariant-868-route-accessibility-layout-risk",
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "INSTRUCTION_SUFFICIENCY",
+      "state": "UNKNOWN",
+      "rule_revision": "rule-revision-868-instruction-sufficiency",
+      "required_evidence": [
+        "evidence-868-active-directive-set",
+        "evidence-868-instruction-coverage"
+      ],
+      "evidence": [],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [
+        "evidence-868-active-directive-set",
+        "evidence-868-instruction-coverage"
+      ],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "PAYLOAD_HANDLE_RECONSTRUCTION_COST",
+      "state": "PASSED",
+      "rule_revision": "rule-revision-868-payload-handle-reconstruction-cost",
+      "required_evidence": [
+        "evidence-868-payload-handle-cost-members"
+      ],
+      "evidence": [
+        "evidence-868-payload-handle-cost-members"
+      ],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "KNOWN_OMISSIONS_EXPANSION_PATHS",
+      "state": {
+        "NOT_APPLICABLE": {
+          "reason": "the governing route admits no expansion path for this packet, so the omissions carried here are terminal for the compiled output and no expansion member set exists to grade"
+        }
+      },
+      "rule_revision": "rule-revision-868-known-omissions-expansion-paths",
+      "required_evidence": [
+        "evidence-868-omission-expansion-paths"
+      ],
+      "evidence": [],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    },
+    {
+      "schema_version": 2,
+      "dimension": "TELEMETRY_MEASUREMENT_COST_COVERAGE",
+      "state": {
+        "DEGRADED": {
+          "reason": "measurement coverage for the rendered expansion handle is recorded at whole-unit granularity only, so the cost of that handle is bounded rather than measured exactly"
+        }
+      },
+      "rule_revision": "rule-revision-868-telemetry-measurement-cost-coverage",
+      "required_evidence": [
+        "evidence-868-measurement-coverage"
+      ],
+      "evidence": [],
+      "measurements": [],
+      "failed_invariant": null,
+      "unknown_evidence": [
+        "evidence-868-measurement-coverage"
+      ],
+      "proof_ceiling": "OBSERVATION",
+      "invalidation": null,
+      "binding": {
+        "task_id": "task-868-context-quality-migration",
+        "attempt_id": "attempt-868-w2-current-payload",
+        "scope_id": "crates/smart/eliot-context/tests/data",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 7,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "decision_id": "decision-868-current-scorecard",
+        "operation_id": null
+      }
+    }
+  ]
+}
