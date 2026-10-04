@@ -74,9 +74,9 @@ use eliot_store_surreal::{
     admit_handshake,
     diagnostics::{
         BoundedEventLog, BridgeBoundary, BridgeDiagnosticEvent, BridgeIdentity,
-        MAX_DIAGNOSTIC_EVENTS, RequestOutcome, classify_response, dispatch_boundary,
-        emit_lifecycle, install_startup_subscriber, is_admitted_operation, operation_name,
-        report_events, startup_subscriber_installed,
+        MAX_DIAGNOSTIC_EVENTS, RequestOutcome, SinkDisposition, classify_response,
+        dispatch_boundary, emit_lifecycle, install_startup_subscriber, is_admitted_operation,
+        operation_name, report_events, startup_subscriber_installed, with_scoped_sink,
     },
     dispatch_with_log, launch_config_digest, require_semantic_ready_for_pipe,
     validate_request_frame_with_log,
@@ -720,8 +720,99 @@ fn one_bounded_startup_subscriber_owner_and_scoped_capture() {
         2,
         "clearing the buffer preserves the drop accounting"
     );
+
+    assert_sink_delivery_is_observable(&sink_sample());
 }
 
+/// A capture that the sink tests deliver unchanged.
+fn sink_sample() -> BoundedEventLog {
+    let mut retained = BoundedEventLog::new();
+    for index in 0..3 {
+        emit_lifecycle(
+            &mut retained,
+            BridgeBoundary::Startup,
+            "startup",
+            &BridgeIdentity::new().with_generation(&format!("sink-{index}")),
+            None,
+        );
+    }
+    assert_eq!(retained.len(), 3, "the sink sample retains its own events");
+    retained
+}
+
+/// The sink is observable, so the failed-sink guarantee is measured rather
+/// than asserted: the same `report_events` delivery that writes to the process
+/// sink is driven against a scoped sink that accepts, then against one that
+/// refuses every write.
+fn assert_sink_delivery_is_observable(retained: &BoundedEventLog) {
+    let delivered = u64::try_from(retained.len()).expect("event count fits in u64");
+    let ((), accepting) = with_scoped_sink(SinkDisposition::Retain, || report_events(retained));
+    assert_eq!(
+        accepting.delivered(),
+        delivered,
+        "an accepting sink is offered exactly one delivery per retained event"
+    );
+    assert_eq!(
+        accepting.lines().len(),
+        retained.len(),
+        "an accepting sink retains one rendered line per delivered event"
+    );
+    assert_eq!(
+        accepting.refused_writes(),
+        0,
+        "an accepting sink refuses nothing"
+    );
+    assert!(
+        accepting
+            .lines()
+            .iter()
+            .all(|line| line.starts_with("eliot-store-surreal: ")),
+        "a scoped sink observes the exact production fallback line"
+    );
+
+    let ((), refusing) = with_scoped_sink(SinkDisposition::RefuseEveryWrite, || {
+        report_events(retained);
+    });
+    assert_eq!(
+        refusing.delivered(),
+        accepting.delivered(),
+        "a refusing sink is offered exactly the deliveries an accepting one was"
+    );
+    assert_eq!(
+        refusing.refused_writes(),
+        refusing.delivered(),
+        "every refused write is counted exactly once"
+    );
+    assert!(
+        refusing.lines().is_empty(),
+        "a sink that refuses every write retains nothing and fabricates no line"
+    );
+    assert_eq!(
+        retained.len(),
+        3,
+        "a refused sink cannot consume, truncate or mutate the caller's capture"
+    );
+    assert_eq!(
+        retained.dropped(),
+        0,
+        "a refused sink cannot invent a Store retry or a dropped event"
+    );
+    assert!(
+        startup_subscriber_installed(),
+        "a refusing sink leaves the single owner installed"
+    );
+    assert!(
+        !install_startup_subscriber(),
+        "a refusing sink never manufactures a second owner or an error loop"
+    );
+
+    let ((), after_close) = with_scoped_sink(SinkDisposition::Retain, || report_events(retained));
+    assert_eq!(
+        after_close.delivered(),
+        accepting.delivered(),
+        "a later, independent window observes its own deliveries only"
+    );
+}
 // WORK_UNIT_CASE: 742/3
 #[test]
 fn semantic_readiness_preserves_the_exact_generation_and_stays_distinct() {
