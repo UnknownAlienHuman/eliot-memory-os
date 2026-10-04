@@ -2481,7 +2481,17 @@ mod control_plane_diagnostics_tests {
                         .map(|captured| captured.request_id.clone())
                 })
                 .unwrap_or_default();
-            let field = |name: &str| visitor.fields.get(name).cloned().unwrap_or_default();
+            // A missing or RENAMED field is a red test, never an empty string.
+            // With `unwrap_or_default()` a production rename would make every
+            // `== 0` and `is_empty()` absence in this module pass while proving
+            // nothing, because the renamed field would simply read as absent.
+            let field = |name: &str| {
+                visitor
+                    .fields
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("a captured record must carry the field {name}"))
+            };
             if let Ok(mut records) = self.records.lock() {
                 records.push(CapturedRecord {
                     event: field("event"),
@@ -2693,6 +2703,14 @@ mod control_plane_diagnostics_tests {
     /// Drives the composition's own `KernelService` to `Ready` through its
     /// published lifecycle API, so the reserve assertions below run against
     /// the real owner the control plane transitions.
+    ///
+    /// SYNTHETIC RECEIPT, DISCLOSED: `KernelReadyReceipt` is the owner's own
+    /// output type and there is no second publisher of it on this surface, so the
+    /// receipt handed to `publish_ready` below is authored by this fixture. The
+    /// lifecycle calls are production's and the assertions are about the reserve
+    /// the control plane then observes, never about the authenticity of the
+    /// receipt's fields. The card's DEFER clause is what sanctions this:
+    /// `#[cfg(windows)]`-only kernel-owner execution is out of proof scope.
     fn ready_reserve_composition(
         root: &std::path::Path,
     ) -> Result<KernelComposition, Box<dyn std::error::Error>> {
@@ -3169,11 +3187,6 @@ mod control_plane_diagnostics_tests {
             kernel.control_capacity(),
             0,
             "the held protected slots are now consumed, and exhaustion is visible"
-        );
-        assert_eq!(
-            kernel.control_capacity(),
-            0,
-            "a repeated observation cannot acquire, refill or underflow the reserve"
         );
         let exhaustion_records = capture.take();
         assert_capacity_records(&exhaustion_records, 0, 2);
@@ -3702,9 +3715,18 @@ mod control_plane_diagnostics_tests {
             1,
             "one failed transition yields exactly one terminal record"
         );
+        // Anchored to the LITERAL, not only to the mapper that produced the
+        // rendered code: `assert_eq!(code, control_transition_terminal_code(&x))`
+        // compares production against itself and stays green if the
+        // `ReadinessNotProven` arm is deleted or renamed. The literal is the same
+        // one this module already pins for this same refusal at :3364.
         assert_eq!(
             owned_terminals[0].code,
             control_transition_terminal_code(&owned)
+        );
+        assert_eq!(
+            owned_terminals[0].code, "CONTROL_READINESS_NOT_PROVEN",
+            "the one terminal of this refused readiness probe is the stable readiness code"
         );
 
         // The same transition as a subordinate phase of a request: it keeps its

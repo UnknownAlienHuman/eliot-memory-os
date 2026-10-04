@@ -1617,7 +1617,10 @@ mod tests {
     // one terminal each generation operation owns.
     //
     // Governing handles, read from the routed bundle
-    // `.eliot/docs-read-bundle-903.md`:
+    // `.eliot/docs-read-bundle.md` (read receipt
+    // sha256:f7f6664699fb6c81022a58d4c1a5f1619409893fba520754d92eae7094fd9f48; a copy
+    // sits beside this delivery as v2/issues/903/docs-read-bundle-run8.md, because
+    // `.eliot/` is gitignored and no reader or CI job can resolve a path in it):
     //
     // I1.8 (exact ownership and call paths) - "Kernel verifies identity,
     // authority, State Fence, idempotency, ordering and runtime generation"
@@ -2059,11 +2062,14 @@ mod tests {
         assert_eq!(after_route.active_generation(), decision.new_generation());
         // The superseded epoch is nowhere current in the published snapshot.
         assert_eq!(after.epoch(), &new_epoch);
-        assert!(!after_route.authority_epoch().is_same_authority(&old_epoch));
-        assert!(!other_route.authority_epoch().is_same_authority(&old_epoch));
-        // Both registered scopes are re-fenced at the issued epoch.
+        // Both registered scopes are re-fenced at the issued epoch, and BOTH
+        // positives come before the absences that scan them, on their own
+        // bindings: `other_route` is proven non-empty by its own re-fence
+        // assertion, never by `after_route`'s.
         assert!(after_route.authority_epoch().is_same_authority(&new_epoch));
         assert!(other_route.authority_epoch().is_same_authority(&new_epoch));
+        assert!(!after_route.authority_epoch().is_same_authority(&old_epoch));
+        assert!(!other_route.authority_epoch().is_same_authority(&old_epoch));
 
         // The Kernel's own projection reads the same candidate and the same
         // issued epoch off the committed route and the live service epoch.
@@ -2117,7 +2123,11 @@ mod tests {
             .lines()
             .find(|line| line.contains("kernel.terminal_error"))
             .unwrap_or("");
-        assert_eq!(rendered_field(terminal, "code"), code);
+        // Anchored to the literal, not to `code`: `code` IS
+        // `generation_snapshot_terminal_code` applied to the very error this call
+        // returned, so comparing the rendered field against it would stay green if
+        // the mapper changed. :2109 above is what ties the mapper to the literal.
+        assert_eq!(rendered_field(terminal, "code"), "SNAPSHOT_PLATFORM");
         // Whole-surface absence, not a hand-listed string set: the cutover
         // vocabulary belongs to :481 and a read terminal reusing it would put
         // one of these on the surface.

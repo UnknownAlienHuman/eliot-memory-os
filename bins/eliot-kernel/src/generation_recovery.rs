@@ -1438,16 +1438,31 @@ mod generation_recovery_diagnostics_tests {
         );
         assert_no_persist_phase_reported(&published, &text);
 
-        // The refused stage write left no durable evidence under its own
-        // identity: the collision was refused before the write transaction
-        // committed.
+        // The refused stage write left no COMMITTED evidence under its own
+        // identity.
+        //
+        // NON-VACUITY DISCLOSURE, and it is the store's own contract rather than a
+        // guess: `latest_generation_cutovers` is documented as returning "the
+        // bounded latest committed route set from canonical current operational
+        // records" and skips every row whose phase is not `Active`
+        // (crates/kernel/eliot-ors/src/store.rs:33154-33156 and :33170-33172). The
+        // only row this test stages is `Armed` (:1397) and the refused write never
+        // commits, so this read CANNOT carry the refused id whether or not the
+        // stage write succeeded. It is therefore NOT the evidence that the refusal
+        // happened, and it is asserted as an explicit id-set membership rather
+        // than as a scan, so that it cannot be read as one. The refusal itself is
+        // proved by the typed error above, by `assert_no_persist_phase_reported`,
+        // and by the untouched live fence asserted below.
+        let committed_rows = store
+            .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            .expect("read back committed cutovers");
+        let committed_ids: Vec<&str> = committed_rows
+            .iter()
+            .map(|snapshot| snapshot.record().cutover_id.as_str())
+            .collect();
         assert!(
-            store
-                .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
-                .expect("read back cutovers")
-                .iter()
-                .all(|snapshot| snapshot.record().cutover_id != decision.cutover_id()),
-            "a refused stage write left durable evidence behind"
+            !committed_ids.contains(&decision.cutover_id()),
+            "a refused stage write left a COMMITTED row behind: {committed_ids:?}"
         );
 
         // Order-sensitive: every live value compared here is written AFTER the

@@ -762,7 +762,7 @@ mod runtime_identity_diagnostics_tests {
             .unwrap_or_default();
         assert!(
             !record.contains(image_name.as_str()),
-            "an image path reached the diagnostics surface (runtime_identity.rs:34)"
+            "an image path reached the diagnostics surface (runtime_identity.rs:35)"
         );
     }
 
@@ -934,7 +934,7 @@ mod runtime_identity_diagnostics_tests {
     // (runtime_identity.rs:42) takes `&'static str` and is the only caller of
     // `bound_field` in this file (runtime_identity.rs:44-45); every production
     // call site supplies a short literal (runtime_identity.rs:59, :63, :100,
-    // :104, :114, :121, :136, :139, :141, :191), so no production path feeds it
+    // :104, :114, :121, :125, :136, :139, :141, :191), so no production path feeds it
     // an oversized or a nested value. The legs below drive `observe_identity`
     // itself, so the bound is exercised where production applies it and is never
     // restated inside a test helper.
@@ -1018,9 +1018,10 @@ mod runtime_identity_diagnostics_tests {
     // ---------------------------------------------------------------------
     // Appended legs, closing the residual defects an adversarial read found in
     // `identity_observation_bounds_oversized_and_nested_field_values` above.
-    // They are APPENDED rather than woven into that function, but the band :293
-    // to :1004 is NOT shift-proof: the later `print_stderr` allow round added 12
-    // lines inside it, moving :490 to :1004 by +12. No citation lands there.
+    // They are APPENDED rather than woven into that function, and the band they
+    // occupy is NOT shift-proof: the `print_stderr` allow round added lines above
+    // them inside the same band. No citation in this file lands inside it, which
+    // is the property that matters and is checked by reading, not asserted here.
     //
     // Why the filler above is two-byte, and what the bound actually guarantees.
     // `bounded_value` (kernel_diagnostics.rs:453) screens at :455 and only

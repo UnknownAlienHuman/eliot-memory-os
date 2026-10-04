@@ -1155,8 +1155,16 @@ fn six_file_boundary_denominator_is_complete() {
     let mut unbound: Vec<u64> = Vec::new();
     for (row, (case, name, _)) in rows.iter().zip(&marked) {
         assert!(
-            row["span"].is_string() && row["file"].is_string(),
-            "boundary row for case {case} must pin both a span and its production file"
+            row["span"]
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+                && row["file"]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            "boundary row for case {case} must pin a NON-EMPTY span and its production file: an \
+             empty span satisfies BOTH halves of this row vacuously, because \
+             `match_indices(\"\")` yields every position in `token_present` and \
+             `body.contains(\"\")` is unconditionally true in `case_reads_span`"
         );
         // The assertions above make each of these a real string, so the empty
         // default is unreachable rather than a silent pass.
@@ -2112,6 +2120,13 @@ fn reserve_lifecycle_vocabulary_stays_distinct() {
     // Exhaustion and admission closure are distinct members of the same closed
     // vocabulary; neither is reachable from this surface, and neither is
     // substituted for the readiness refusal.
+    // FIXTURE GUARD, NOT PRODUCTION EVIDENCE, and the distinction matters: these
+    // three operands are values this file's own fixture supplies, so no
+    // production input reaches them. They are kept because the two assertions
+    // below bind `emitted`, `exhausted` and `closed` POSITIONALLY to one
+    // production capture (:2109 asserts production carries `emitted`, :2118
+    // asserts production carries neither of the others), and a fixture that
+    // collapsed two of its three codes would silently retarget both bindings.
     assert_ne!(emitted, exhausted);
     assert_ne!(emitted, closed);
     assert_ne!(exhausted, closed);
@@ -3019,10 +3034,17 @@ fn sink_failure_drop_and_disable_preserve_calls_and_results() {
 // section only prevents incompatible lifecycle meanings."
 // Pins that the instrumented paths yield deterministic semantic fields and
 // causal order (two independent compositions emit the identical ordered record
-// sequence and return byte-identical results), and that the delivery's diff
-// against `main` is diagnostic-only: nothing outside the observation vocabulary
-// changed, so every production event, terminal, reserve, health, state and error
-// result is byte-identical to `main`.
+// sequence and return byte-identical results).
+//
+// WHAT THIS CASE DOES NOT CLAIM, after an adversarial read: it does NOT compare
+// anything to `main`. Two compositions of the SAME build agreeing is determinism,
+// not a diff against the base, and a git diff is not a runtime assertion. The
+// diagnostic-only property is proved elsewhere and structurally, not here: every
+// hunk of the delivery lies inside a `#[cfg(test)]` module (the six production
+// files are insertions-only, numstat deletions 0), so no production line was
+// removed or rewritten; and case 1's `events_by_file` denominator pins every
+// `kernel.*` literal in the six modules against the frozen fixture vocabulary, so
+// an added or renamed event would fail there rather than here.
 #[test]
 fn instrumented_paths_are_deterministic_and_diagnostic_only() {
     let fx = fixture();
@@ -3050,6 +3072,18 @@ fn instrumented_paths_are_deterministic_and_diagnostic_only() {
     assert_eq!(
         first_records, second_records,
         "two compositions must emit the identical ordered semantic record sequence"
+    );
+    // Bounded output. This proof existed on `main` in the single test this file
+    // carried before the 30-case matrix replaced it, and the rewrite dropped it
+    // without a successor: a diagnostic capture that grows without bound would
+    // satisfy every ordering and absence assertion in this file while becoming
+    // a denial-of-service surface, so the bound is re-asserted here on both the
+    // construction capture and the drive capture.
+    assert!(
+        first_text.len() < 8 * 1024 && first_drive_text.len() < 8 * 1024,
+        "diagnostic capture must stay bounded, got {} and {} bytes",
+        first_text.len(),
+        first_drive_text.len()
     );
     assert_causal_order(
         &first_text,
