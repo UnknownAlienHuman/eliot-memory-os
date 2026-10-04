@@ -182,10 +182,11 @@ fn check_digest(value: &str, field: &str) -> Result<(), SpoolError> {
 
 /// Redacted payload class of one fenced spool record.
 ///
-/// Mirrors `WatchdogSpoolPayloadKind` (`Heartbeat`, `Gap`, `Recovery`; intents
-/// project to the `Recovery` class at export) with the spool-local intent
-/// variants kept distinct so the denominator can mark them incomplete. The
-/// class carries no payload bytes by construction.
+/// Mirrors `WatchdogSpoolPayloadKind` (`Heartbeat`, `Gap`, `Recovery`; intents,
+/// Host attempts, and containment requests project to the `Recovery` class at
+/// export) with the spool-local restricted variants kept distinct so the
+/// denominator can mark them incomplete. The class carries no payload bytes by
+/// construction.
 ///
 /// The derived encoding is the fence's own digest representation (see the
 /// `derive_content_digest` docs), not a wire format: nothing decodes it.
@@ -201,6 +202,10 @@ pub enum SpoolFenceEntryKind {
     ProblemIntent,
     /// Spool-local incident intent awaiting Governor reconciliation.
     IncidentIntent,
+    /// Spool-local bounded Host responsiveness/recovery attempt record.
+    HostAttempt,
+    /// Spool-local pre-authorized containment request record.
+    ContainmentRequest,
 }
 
 impl SpoolFenceEntryKind {
@@ -213,6 +218,8 @@ impl SpoolFenceEntryKind {
             Self::Recovery => "recovery",
             Self::ProblemIntent => "problem_intent",
             Self::IncidentIntent => "incident_intent",
+            Self::HostAttempt => "host_attempt",
+            Self::ContainmentRequest => "containment_request",
         }
     }
 
@@ -230,19 +237,26 @@ impl SpoolFenceEntryKind {
             WatchdogSpoolPayload::Recovery { .. } => Self::Recovery,
             WatchdogSpoolPayload::ProblemIntent { .. } => Self::ProblemIntent,
             WatchdogSpoolPayload::IncidentIntent { .. } => Self::IncidentIntent,
+            WatchdogSpoolPayload::HostAttempt { .. } => Self::HostAttempt,
+            WatchdogSpoolPayload::ContainmentRequest { .. } => Self::ContainmentRequest,
         }
     }
 
     /// True for records that invalidate complete historical coverage.
     ///
-    /// Any `Gap`, `Recovery`, or unreconciled intent in scope marks the fence
-    /// denominator incomplete; such records are never dropped and no pre-gap
-    /// entry is fabricated.
+    /// Any `Gap`, `Recovery`, unreconciled intent, Host attempt, or containment
+    /// request in scope marks the fence denominator incomplete; such records are
+    /// never dropped and no pre-gap entry is fabricated.
     #[must_use]
     pub const fn marks_incomplete(self) -> bool {
         match self {
             Self::Heartbeat => false,
-            Self::Gap | Self::Recovery | Self::ProblemIntent | Self::IncidentIntent => true,
+            Self::Gap
+            | Self::Recovery
+            | Self::ProblemIntent
+            | Self::IncidentIntent
+            | Self::HostAttempt
+            | Self::ContainmentRequest => true,
         }
     }
 }
@@ -297,6 +311,43 @@ pub enum SpoolMarkerDetail {
         /// Exact observed Governor-unavailability reason that opened the
         /// episode, preserved verbatim from the retained record.
         governor_unavailable_reason: GapRecoveryReason,
+    },
+    /// Bounded Host responsiveness/recovery attempt with its closed
+    /// attempt/uncertainty/verdict codes, granted interval, observed target
+    /// identity digest, and observation evidence digests.
+    ///
+    /// The uncertainty code travels verbatim for the same reason the intent's
+    /// reason does: an attempt that resolved nothing must stay readable as the
+    /// named uncertainty it actually was, never as a bare non-answer.
+    Attempt {
+        /// Closed attempt outcome code.
+        attempt: String,
+        /// Closed uncertainty code, or `None` when the attempt resolved none.
+        uncertainty: Option<String>,
+        /// Closed responsiveness verdict code.
+        verdict: String,
+        /// Bounded interval the attempt was granted, in seconds.
+        bounded_wait_secs: u64,
+        /// Digest of the observed target identity, when one was observed.
+        target_identity_digest: Option<String>,
+        /// Observation digests the classification was made from.
+        evidence_refs: Vec<String>,
+    },
+    /// Pre-authorized containment request with its stable operation identity
+    /// and the target bounds the owning boundary revalidates.
+    ContainmentRequest {
+        /// Stable identity of the recovery operation this request belongs to.
+        operation_id: String,
+        /// Digest of the installer-approved recipe the request names.
+        recipe_digest: String,
+        /// Digest of the Host-issued owner epoch the request is bound to.
+        owner_epoch_digest: String,
+        /// Digest of the approved registration the boundary revalidates.
+        registration_digest: String,
+        /// Digest of the challenge-time observed process identity.
+        target_identity_digest: String,
+        /// Evidence digests the request carries.
+        evidence_refs: Vec<String>,
     },
 }
 
@@ -1016,7 +1067,9 @@ fn entry_service(payload: &WatchdogSpoolPayload) -> &str {
         | WatchdogSpoolPayload::Gap { service, .. }
         | WatchdogSpoolPayload::Recovery { service, .. }
         | WatchdogSpoolPayload::ProblemIntent { service, .. }
-        | WatchdogSpoolPayload::IncidentIntent { service, .. } => service,
+        | WatchdogSpoolPayload::IncidentIntent { service, .. }
+        | WatchdogSpoolPayload::HostAttempt { service, .. }
+        | WatchdogSpoolPayload::ContainmentRequest { service, .. } => service,
     }
 }
 
@@ -1140,6 +1193,38 @@ fn marker_detail(payload: &WatchdogSpoolPayload) -> Result<Option<SpoolMarkerDet
             lineage_generation: *lineage_generation,
             lineage_epoch: *lineage_epoch,
             governor_unavailable_reason: *governor_unavailable_reason,
+        }),
+        WatchdogSpoolPayload::HostAttempt {
+            attempt,
+            uncertainty,
+            verdict,
+            bounded_wait_secs,
+            target_identity_digest,
+            evidence_refs,
+            ..
+        } => Some(SpoolMarkerDetail::Attempt {
+            attempt: attempt.clone(),
+            uncertainty: uncertainty.clone(),
+            verdict: verdict.clone(),
+            bounded_wait_secs: *bounded_wait_secs,
+            target_identity_digest: target_identity_digest.clone(),
+            evidence_refs: evidence_refs.clone(),
+        }),
+        WatchdogSpoolPayload::ContainmentRequest {
+            operation_id,
+            recipe_digest,
+            owner_epoch_digest,
+            registration_digest,
+            target_identity_digest,
+            evidence_refs,
+            ..
+        } => Some(SpoolMarkerDetail::ContainmentRequest {
+            operation_id: operation_id.clone(),
+            recipe_digest: recipe_digest.clone(),
+            owner_epoch_digest: owner_epoch_digest.clone(),
+            registration_digest: registration_digest.clone(),
+            target_identity_digest: target_identity_digest.clone(),
+            evidence_refs: evidence_refs.clone(),
         }),
     };
     if let Some(detail) = detail.as_ref() {
