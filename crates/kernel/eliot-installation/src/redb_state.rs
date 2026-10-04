@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::canary_removal::{
-    CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalOperation, CanaryRemovalOperationVersion,
+    CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalEffectState, CanaryRemovalOperation,
+    CanaryRemovalOperationVersion, CanaryRemovalStage, CanaryRemovalTerminalReceipt,
     canary_removal_operation_id,
 };
 use super::package_planner::{
@@ -51,6 +52,8 @@ const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("installation_transactions_v7");
 const CANARY_REMOVAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("canary_removal_operations_v1");
+const CANARY_REMOVAL_TERMINAL_RECEIPTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("canary_removal_terminal_receipts_v1");
 const PUBLICATION_JOURNAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("source_bundle_publication_journal_v1");
 const SETUP_BINDING_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("setup_bindings_v1");
@@ -1110,6 +1113,56 @@ impl RedbInstallationTransactionStore {
         self.load_canary_removal_operation(&removal_transaction_id)
     }
 
+    /// Loads the owner-issued terminal receipt for one exact canary-removal
+    /// operation identity.
+    ///
+    /// The receipt is the installation owner's durable record that the
+    /// terminal registry retirement for that removal operation committed, and
+    /// it binds the removal operation identity to the retired generation, the
+    /// registry revision it replaced and the registry revision and content
+    /// digest it produced. Crash recovery recognises an already-retired
+    /// removal target by comparing that bound identity against the LIVE
+    /// registry projection, so an unrelated registry mutation after the
+    /// terminal commit no longer invalidates recovery forever; the recorded
+    /// content digest is compared against that live projection as well, but only
+    /// while the live projection still carries the revision the receipt recorded,
+    /// so a receipt that does not describe the registry it claims to describe
+    /// cannot close the operation while the one that merely predates unrelated
+    /// activity still can.
+    ///
+    /// A genuinely absent key is `Ok(None)` and means only that this store
+    /// holds no terminal receipt under that removal identity; it is NOT
+    /// evidence that the registry retirement committed. Any redb failure other
+    /// than an absent key is propagated, and a stored row that does not decode
+    /// under the current wire version is refused instead of being defaulted.
+    /// The read is short-lived and read-only, exactly like
+    /// [`Self::load_canary_removal_operation`].
+    pub(crate) fn load_canary_removal_terminal_receipt(
+        &self,
+        removal_transaction_id: &PlatformHandle,
+    ) -> Result<Option<CanaryRemovalTerminalReceipt>, InstallationError> {
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(CANARY_REMOVAL_TERMINAL_RECEIPTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(removal_transaction_id.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let receipt = decode_canary_removal_terminal_receipt(value.value())?;
+        if receipt.removal_transaction_id != *removal_transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(Some(receipt))
+    }
+
     /// Persists one freshly admitted canary-removal operation.
     ///
     /// A removal operation is never rewritten over an existing row: reusing the
@@ -1152,8 +1205,10 @@ impl RedbInstallationTransactionStore {
     ///
     /// This is the same durable discipline the installation transaction store
     /// already uses: an expected revision plus a checksum of the exact current
-    /// bytes, exactly one revision step per save, and a refused identity change
-    /// of the frozen plan or the removal operation identity.
+    /// bytes, exactly one revision step per save, a refused identity change of
+    /// the frozen plan or the removal operation identity, and a forward-only
+    /// floor over the per-row evidence, the stage and the one recorded reconcile
+    /// deadline derived from the row this call has already decoded.
     pub(crate) fn compare_and_save_canary_removal_operation(
         &mut self,
         expected: &CanaryRemovalOperationVersion,
@@ -1200,6 +1255,431 @@ impl RedbInstallationTransactionStore {
                 || current.plan.plan_digest != operation.plan.plan_digest
             {
                 return Err(InstallationError::IdentityConflict);
+            }
+            Self::validate_canary_removal_operation_transition(&current, operation)?;
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Refuses a canary-removal save that walks durable evidence backwards.
+    ///
+    /// `CanaryRemovalOperation::validate` is a STATELESS validator: it re-derives
+    /// the stage from the row evidence it is handed and has no memory of the row
+    /// this save replaces, so a record that walks a row backwards is fully valid
+    /// on its own terms. The revision and checksum guards above catch a
+    /// CONCURRENT writer only, because every caller derives its `expected` from
+    /// its own pre-mutation copy and therefore already holds the row it is
+    /// replacing. This floor is the missing half, and it is the same discipline
+    /// `validate_publication_journal_transition` applies to the publication
+    /// journal: it is derived from the `current` row this call has ALREADY
+    /// decoded, so it adds no second read, no second transaction and no second
+    /// decode, and it refuses with the SAME existing
+    /// [`InstallationError::IdentityConflict`] — no new error variant, no schema
+    /// change, no migration, no second refusal path and no second validator type.
+    ///
+    /// Rows are matched one-to-one by `effect_id`, which is the binding the owner
+    /// itself re-checks against its own frozen plan; positional index equality is
+    /// never assumed. `CanaryRemovalOperation::admit` creates exactly one
+    /// `Pending` row per frozen plan row and `CanaryRemovalPlan::validate`
+    /// re-derives the plan digest over the whole effect graph, so the frozen
+    /// denominator cannot grow or shrink under one removal identity: an incoming
+    /// row with no stored counterpart is a DIFFERENT denominator and is refused
+    /// rather than read as a legitimate insert.
+    fn validate_canary_removal_operation_transition(
+        current: &CanaryRemovalOperation,
+        proposed: &CanaryRemovalOperation,
+    ) -> Result<(), InstallationError> {
+        // The bounded reconcile wait is taken ONCE, at admission
+        // (`CanaryRemovalOperation::admit`), and is thereafter only read through
+        // `reconcile_budget_exhausted`, which derives its remaining window from
+        // this recorded value. A later save that moved it would not extend the
+        // evidence, it would restart the budget for the same operation identity:
+        // a recomputed deadline buys an unbounded wait that the recorded one
+        // exists to prevent.
+        if proposed.reconcile_deadline_ms != current.reconcile_deadline_ms {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if !Self::canary_removal_stage_advances(current.stage, proposed.stage) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // Together with the per-row lookup below this makes the binding
+        // one-to-one: `effect_id` is unique inside one plan, so equal counts plus
+        // one stored counterpart per incoming row can neither drop a stored row
+        // nor admit an extra one.
+        if proposed.effect_progress.len() != current.effect_progress.len() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        for progress in &proposed.effect_progress {
+            let stored = current
+                .effect_progress
+                .iter()
+                .find(|row| row.effect_id == progress.effect_id)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if !Self::canary_removal_row_state_advances(&stored.state, &progress.state) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            // The row's own attempt counter is forward-only too. For an
+            // `IntentCommitted` row `CanaryRemovalOperation::validate` pins it
+            // equal to the plan row's bound, so this is the same comparison; for
+            // every other state the progress row carries no attempt of its own,
+            // and the bound is then the only durable record of how many attempts
+            // this removal identity already spent on that row.
+            //
+            // That counter is also forward-only by AT MOST ONE step per save,
+            // which is a DELTA and cannot live in the owner's stateless
+            // `CanaryRemovalOperation::validate`: that validator is handed the
+            // proposed rows alone and has no memory of the rows this record
+            // replaces. This floor is handed the decoded `current` record as well
+            // and reads both halves of this comparison out of it, with no second
+            // read, no second transaction and no second decode. The rule is
+            // needed at all because `CanaryRemovalPlan::computed_digest`
+            // normalises `bound.attempt` back to its plan-time value before
+            // hashing, so a record-to-record `plan_digest` comparison is blind to
+            // this member by construction, while `CanaryRemovalEffectBound::validate`
+            // admits ANY non-zero `max_attempts`: a wider contour could therefore
+            // skip an attempt number this identity never spent and reach a
+            // `commit_intent` the owner itself never performs (`attempt.next()`,
+            // or no advance at all). `saturating_add` keeps the ceiling row exact
+            // without wrapping — at `u32::MAX` nothing can advance to, and
+            // `attempt <= max_attempts` admits nothing above it.
+            let current_row = current
+                .plan
+                .effects
+                .iter()
+                .find(|row| row.effect_id == progress.effect_id)
+                .ok_or(InstallationError::IdentityConflict)?;
+            let proposed_row = proposed
+                .plan
+                .effects
+                .iter()
+                .find(|row| row.effect_id == progress.effect_id)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if proposed_row.bound.attempt < current_row.bound.attempt
+                || proposed_row.bound.attempt > current_row.bound.attempt.saturating_add(1)
+                || proposed_row.bound.max_attempts != current_row.bound.max_attempts
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
+    /// Forward-only ordering for one durable canary-removal row.
+    ///
+    /// The ordering is read from the owner's own variant set
+    /// (`canary_removal.rs`'s `CanaryRemovalEffectState`): `Pending` is the open
+    /// row, `IntentCommitted` is the exact intent made durable BEFORE the
+    /// mutating call, `Unknown` is an unresolved external outcome and `Resolved`
+    /// is an authoritative owner verdict.
+    ///
+    /// Refused, each for the reason the owner's own code gives:
+    ///
+    /// * `Resolved -> Pending` and `Resolved -> IntentCommitted`. This is the
+    ///   measured regression. `advance` picks the FIRST non-`Resolved` row out of
+    ///   that row's CURRENT state alone — the terminal registry record excepted,
+    ///   which it breaks on before any drive — and drives it again with no memory
+    ///   of the verdict it already carried, and the stage floor below cannot see
+    ///   what it re-drives, because that floor reads the STAGE and the stage is a
+    ///   pure projection of the proposed rows: `expected_stage` counts `open` from
+    ///   the non-resolved rows and `started` from exactly three members — an
+    ///   `IntentCommitted` row, a `Resolved { Removed }` row and an `Unknown` row
+    ///   — while the `Absent` and `Retained` dispositions contribute to neither.
+    ///   A walk-back therefore always raises `open` and lowers `started` only when
+    ///   it came from `Removed`, so the pairs a NON-TERMINAL record can be walked
+    ///   back into are `Admitted -> Admitted`, `Admitted -> Executing` and
+    ///   `Executing -> Executing`, all three of which the stage floor admits. A fourth
+    ///   pair follows from the same premise and is refused TWICE over: a `Remove`
+    ///   row closed as `Resolved { Removed }` counts one `started`, so walking it
+    ///   back to `Pending` yields `Executing -> Admitted`, which
+    ///   `canary_removal_stage_advances` refuses as well as this arm.
+    /// * What that re-drive costs is a SECOND visit to an owner that already
+    ///   reported this row's postcondition, NOT a second mutating call. For a
+    ///   `Remove` row `advance_row` reconciles BEFORE it executes, so a row whose
+    ///   owner still answers with authoritative absence is closed again as
+    ///   `Absent` and returned without ever reaching `port.execute`, and it spends
+    ///   no attempt of the row's frozen bound either, because that attempt is
+    ///   admitted only after the same readback. A `Retain` row is re-read rather
+    ///   than re-executed, and an owner that no longer reports its admitted object
+    ///   strands it as `Unknown`. Either way the visit is a second one for an
+    ///   effect whose postcondition this identity already holds, and what the
+    ///   walk-back really destroys is the recorded verdict: the row stops
+    ///   reporting the disposition and the evidence its owner produced.
+    /// * `IntentCommitted -> Pending`, which forgets the intent that was made
+    ///   durable before the mutating call and lets the row be re-driven with no
+    ///   recorded intent.
+    /// * `Unknown -> Pending` and `Unknown -> IntentCommitted`, which forget or
+    ///   re-arm an outcome the owner could not classify. `crates/kernel/AGENTS.md`:
+    ///   "Unknown commit/effect remains reconciling; never retry blindly", and
+    ///   `docs/architecture/I05-19-write-submission-execution-and-receipts.md:63`:
+    ///   a PROVEN rollback may retry the same operation. This owner proves that
+    ///   through its own reconcile-before-execute readback and retries from
+    ///   `IntentCommitted`, never from an outcome it could not read.
+    ///
+    /// Admitted on purpose. `Resolved -> Unknown` and the same state again are
+    /// transitions the owner's own drive performs; `Unknown -> Resolved` is not,
+    /// and this floor records that honestly instead of claiming otherwise.
+    ///
+    /// * `Unknown -> Resolved` is UNREACHABLE from the owner code as it stands,
+    ///   and that is measured, not assumed. `advance` selects the FIRST
+    ///   non-`Resolved` row and returns before touching it when that row is
+    ///   `Unknown`, and again returns whenever ANY row of the record is `Unknown`,
+    ///   so `finish_with_readback` and `prove_every_row_before_terminal` cannot
+    ///   run while a row is `Unknown`. The three `resolve_row` call sites all sit
+    ///   below that early return, in `advance_row` and `read_retained_row`, which
+    ///   are reached only for a row that is `Pending` or `IntentCommitted`; and
+    ///   the one direct `Resolved` write outside `resolve_row` — the terminal
+    ///   registry row the final readback closes — is reached on the same
+    ///   no-`Unknown`-row precondition.
+    /// * It is admitted anyway because this floor STATES the store's accepted
+    ///   transitions, and every pair whose TARGET is `Unknown` or `Resolved` is
+    ///   admitted here from all four sources, so the only thing this arm refuses is
+    ///   a row that walks backwards. `CanaryRemovalOperation::validate` admits
+    ///   this pairing on its own terms — its `Resolved` arm asks for a well-formed
+    ///   evidence list that is not empty (`handles(evidence, ..., true)`) and a
+    ///   disposition the frozen action admits, and it never looks at what the row
+    ///   held before — so refusing it here would refuse a write the owner itself
+    ///   considers valid, and would STRAND the row rather than delay it:
+    ///   `Resolved` is the only target an `Unknown` row has besides itself, so a
+    ///   refusal leaves a durable row that no later save under this identity can
+    ///   close. The cost of admitting it is zero, because the owner still cannot
+    ///   invent a verdict: `validate` pins the action/disposition pairing one layer
+    ///   up — a `Retain` row closes only as `Retained`, an out-of-scope row not at
+    ///   all — and this floor relies on that bar rather than re-deriving a second
+    ///   one.
+    /// * `Resolved -> Unknown`. `prove_every_row_before_terminal` re-reads EVERY
+    ///   row of an already resolved denominator immediately before the terminal
+    ///   commit and records the typed reconciling disposition for a row it can no
+    ///   longer prove. That ADDS an uncertainty the durable row did not carry; it
+    ///   does not re-drive the effect, and refusing it would discard the owner's
+    ///   observation and leave the stored row asserting a completeness that is no
+    ///   longer true.
+    /// * the same state again: a same-state save discards no evidence, and the
+    ///   terminal registry row is rewritten in place by the final readback when a
+    ///   completed operation is replayed.
+    fn canary_removal_row_state_advances(
+        current: &CanaryRemovalEffectState,
+        proposed: &CanaryRemovalEffectState,
+    ) -> bool {
+        if matches!(
+            (current, proposed),
+            (
+                CanaryRemovalEffectState::Resolved { .. },
+                CanaryRemovalEffectState::Pending
+                    | CanaryRemovalEffectState::IntentCommitted { .. }
+            ) | (
+                CanaryRemovalEffectState::IntentCommitted { .. },
+                CanaryRemovalEffectState::Pending
+            ) | (
+                CanaryRemovalEffectState::Unknown { .. },
+                CanaryRemovalEffectState::Pending
+                    | CanaryRemovalEffectState::IntentCommitted { .. }
+            )
+        ) {
+            return false;
+        }
+        // An attempt counter is itself a forward dimension of the row, because
+        // `commit_intent` spends exactly one attempt of the row's own bound per
+        // admitted retry. A rewound counter would re-run an attempt number this
+        // removal identity already spent.
+        !matches!(
+            (current, proposed),
+            (
+                CanaryRemovalEffectState::IntentCommitted {
+                    attempt: current_attempt,
+                    ..
+                },
+                CanaryRemovalEffectState::IntentCommitted {
+                    attempt: proposed_attempt,
+                    ..
+                }
+            ) if *proposed_attempt < *current_attempt
+        )
+    }
+
+    /// Forward-only ordering for one removal operation's durable stage.
+    ///
+    /// The stage is never authored freely. `CanaryRemovalOperation::validate`
+    /// re-derives it from the per-row evidence and runs BEFORE this floor on every
+    /// save, so a stage pair this floor admits is always a pair whose TARGET the
+    /// owner's own validator already proved from the rows being written. What this
+    /// floor adds is the half `expected_stage` cannot supply, because it is a pure
+    /// projection of the PROPOSED rows: the stage the REPLACED row held.
+    ///
+    /// The transitions the owner performs, read off its own call sites:
+    ///
+    /// * `commit_intent` opens `Executing` on the row it makes an intent durable
+    ///   for (`Pending` on a fresh drive, `IntentCommitted` on a resumed one), so
+    ///   a drive moves `Admitted -> Executing` on its first mutating row and
+    ///   stays `Executing` across the rest of the denominator.
+    /// * `resolve_row` authors no stage at all — it closes one row and
+    ///   `validate()` derives the stage from that row — so the pairs it can
+    ///   produce are `Admitted -> Admitted`, `Admitted -> Completed`,
+    ///   `Executing -> Executing` and `Executing -> Completed`.
+    /// * `unknown_row` opens `Reconciling` from `Admitted`, `Executing` or
+    ///   `Completed`.
+    /// * the terminal readback opens `Completed`, and `advance` reaches it only
+    ///   when no row of the denominator is `Unknown`.
+    ///
+    /// `Completed -> Reconciling` is therefore the one backward move the owner
+    /// performs, and it is admitted rather than closed. Replaying an already
+    /// `Completed` operation through `apply_canary_removal`, which has no
+    /// `Completed` early return unlike `recover_canary_removal`, re-reads every
+    /// row of the denominator, and a row that can no longer be proved becomes
+    /// `Unknown` under the SAME removal identity with its blocking effect named.
+    /// Refusing that save would not preserve the terminal claim: the save carries
+    /// no replacement, so the observation would be discarded and the stored row
+    /// would keep reporting `Completed` for a denominator the owner has just
+    /// failed to prove. It re-drives nothing either: the `Unknown` row of a
+    /// reconciling record is always the first non-`Resolved` row of the
+    /// denominator — `unknown_row` only ever marks the row `advance` is currently
+    /// driving, and the terminal readback's own `unknown_row` runs only after the
+    /// same no-`Unknown`-row checks — so `advance` breaks on it before
+    /// `advance_row` and issues no mutating call at all, and the per-row floor
+    /// above it still refuses to move a `Resolved` row back to `Pending` or
+    /// `IntentCommitted`.
+    ///
+    /// The rule this floor enforces, in one place, over the whole admitted set:
+    ///
+    /// * From `Admitted`, `Executing` or `Completed` the floor admits that same
+    ///   stage again, `Reconciling`, and every stage of the `Admitted` <
+    ///   `Executing` < `Completed` chain at or above where the record already
+    ///   stands: `Admitted -> Executing` and `Admitted -> Completed`,
+    ///   `Executing -> Completed`, and nothing downward. `Completed` is the
+    ///   terminal end of that chain and is never walked back into it, so
+    ///   `Completed -> Admitted` and `Completed -> Executing` are refused and
+    ///   `Reconciling` is the only stage a terminal record can be moved to.
+    /// * `Reconciling` runs the chain the other way: it admits itself and the two
+    ///   weaker claims `Admitted` and `Executing`, and refuses `Completed`, the
+    ///   strongest of the three. A floor that admitted `Reconciling -> Completed`
+    ///   while refusing `Reconciling -> Executing` ranked a stronger claim below a
+    ///   weaker one, which is the indefensible ordering this floor exists to
+    ///   prevent.
+    ///
+    /// The `unknown` axis is outside that ordering, and `expected_stage` derives it
+    /// FIRST: an `Unknown` row increments `open`, `unknown` and `started`
+    /// together, so a record holding one derives `Reconciling` whatever else it
+    /// holds, while `Admitted` is `unknown == 0, open > 0, started == 0`,
+    /// `Executing` is `unknown == 0, open > 0, started > 0` and `Completed` is
+    /// `unknown == 0, open == 0` — so each of the three asserts that no outcome
+    /// is left unobserved, which is the one thing `Reconciling` asserts the
+    /// opposite of. No ordered stage can be DERIVED while a row is `Unknown`, which
+    /// is why `Reconciling -> Admitted` and `Reconciling -> Executing` are not
+    /// protections this floor has to make: `validate()` re-derives the target stage
+    /// from exactly the rows being written, on the line before this floor runs, so
+    /// a pair out of `Reconciling` can only be proposed by a save that has
+    /// already closed the last `Unknown` row.
+    ///
+    /// `Reconciling -> Completed` is refused even though the owner's own
+    /// `validate()` admits it, and it is the ONE pair at which this floor is
+    /// narrower than the owner's validator: it is the one pair in which the store
+    /// would be asked to author the terminal claim in the SAME save that leaves
+    /// the reconciling stage. The shape that would ask for it is measured rather
+    /// than guessed: a reconcile that closes the last `Unknown` row of a
+    /// denominator whose every other row is already `Resolved` leaves
+    /// `expected_stage` with `open == 0`, which derives `Completed` in that same
+    /// save. That row is the terminal registry row whenever no other row is left
+    /// open, because nothing resolves it before `finish_with_readback`, and unlike
+    /// the two pairs above there is then no intermediate save that could carry the
+    /// closure — this floor refuses that shape outright. Whether that state is
+    /// reachable at all, and whether the pair belongs in this floor, are questions
+    /// for a reconciliation this owner does not have; no save the owner performs
+    /// today proposes it (see the reachability facts below).
+    ///
+    /// Two measured reachability facts close off what this documentation would
+    /// otherwise have to guess at, and the first is why this arm refuses no save
+    /// the owner performs today. `advance` returns before `advance_row` and before
+    /// the terminal readback whenever ANY row is `Unknown`, and `resolve_row` has
+    /// no caller outside `advance_row` and `read_retained_row`, so no save the
+    /// owner performs today leaves the reconciling stage at all. The second fact
+    /// belongs to the `Executing -> Admitted` refusal in the arm below:
+    /// `expected_stage` CAN derive `Admitted` from an `Executing` record, when a
+    /// resumed `IntentCommitted` row closes as `Absent` — a disposition that
+    /// contributes to neither `open` nor `started` — while another row of the
+    /// denominator is still open. That save is refused twice over: `resolve_row`
+    /// leaves the record at `Executing`, so `validate()` fails its own
+    /// `stage != expected` comparison before the store is reached at all, and this
+    /// floor refuses `Executing -> Admitted` as well. No owner save performs it
+    /// today, and it belongs to the owner's `expected_stage` and `resolve_row`
+    /// pair rather than to this floor.
+    fn canary_removal_stage_advances(
+        current: CanaryRemovalStage,
+        proposed: CanaryRemovalStage,
+    ) -> bool {
+        matches!(
+            (current, proposed),
+            (
+                CanaryRemovalStage::Admitted,
+                CanaryRemovalStage::Admitted
+                    | CanaryRemovalStage::Executing
+                    | CanaryRemovalStage::Reconciling
+                    | CanaryRemovalStage::Completed
+            ) | (
+                CanaryRemovalStage::Executing,
+                CanaryRemovalStage::Executing
+                    | CanaryRemovalStage::Reconciling
+                    | CanaryRemovalStage::Completed
+            ) | (
+                CanaryRemovalStage::Reconciling,
+                CanaryRemovalStage::Reconciling
+                    | CanaryRemovalStage::Admitted
+                    | CanaryRemovalStage::Executing
+            ) | (
+                CanaryRemovalStage::Completed,
+                CanaryRemovalStage::Completed | CanaryRemovalStage::Reconciling
+            )
+        )
+    }
+
+    /// Persists one owner-issued canary-removal terminal receipt.
+    ///
+    /// The receipt records that the terminal registry retirement for this exact
+    /// removal operation identity committed, binding that identity to the
+    /// retired generation, the predecessor registry revision and the resulting
+    /// registry revision and content digest. It is written after the caller
+    /// re-loads the registry and proves the target absent with active, LKG and
+    /// survivors unchanged.
+    ///
+    /// A terminal receipt is written ONCE per removal operation identity and is
+    /// immutable afterwards, which is why there is no compare-and-save revision
+    /// here (unlike the still-advancing removal operation row): the terminal
+    /// effect happens exactly once, so its record is either absent, already
+    /// exactly this receipt, or a conflicting claim. Re-saving the identical
+    /// encoded receipt is an idempotent success so a retry after a lost commit
+    /// response cannot fork a second record; any DIFFERENT receipt under the
+    /// same removal identity is refused as an
+    /// [`InstallationError::IdentityConflict`] and the stored row is left
+    /// untouched.
+    pub(crate) fn save_canary_removal_terminal_receipt(
+        &mut self,
+        receipt: &CanaryRemovalTerminalReceipt,
+    ) -> Result<(), InstallationError> {
+        receipt.validate()?;
+        let bytes = encode_canary_removal_terminal_receipt(receipt)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(CANARY_REMOVAL_TERMINAL_RECEIPTS)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let key = receipt.removal_transaction_id.as_str();
+            if let Some(existing) = table
+                .get(key)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?
+            {
+                // Decoded first so an unreadable stored row is reported as the
+                // corruption or migration it is, never as a mere difference.
+                decode_canary_removal_terminal_receipt(existing.value())?;
+                if existing.value() != bytes.as_slice() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                return Ok(());
             }
             table
                 .insert(key, bytes.as_slice())
@@ -1591,6 +2071,63 @@ fn decode_canary_removal_operation(
         })?;
     envelope.operation.validate()?;
     Ok(envelope.operation)
+}
+
+/// Serializes one terminal receipt with the same canonical discipline as
+/// [`encode_canary_removal_operation`]: the receipt's own declared field order
+/// is the exact stored byte string, so a re-save of the same receipt is
+/// byte-identical and a different claim under the same removal identity is
+/// byte-distinguishable.
+fn encode_canary_removal_terminal_receipt(
+    receipt: &CanaryRemovalTerminalReceipt,
+) -> Result<Vec<u8>, InstallationError> {
+    serde_json::to_vec(receipt).map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })
+}
+
+/// Decodes one stored terminal receipt exactly as
+/// [`decode_canary_removal_operation`] decodes a stored removal operation:
+/// JSON bytes to a probed value, an explicit wire-version discriminator
+/// checked against the current `CANARY_REMOVAL_WIRE_VERSION`, a strict
+/// whole-record shape decode, and the owner's own `validate()`. A record under
+/// an unknown wire version is refused as
+/// [`InstallationError::MigrationRequired`] rather than partially read, and
+/// nothing is defaulted.
+fn decode_canary_removal_terminal_receipt(
+    bytes: &[u8],
+) -> Result<CanaryRemovalTerminalReceipt, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    let version = value.get("canary_removal_wire_version").ok_or_else(|| {
+        InstallationError::MigrationRequired {
+            reason: "canary-removal terminal receipt predates the required wire discriminator"
+                .to_owned(),
+        }
+    })?;
+    let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
+        InstallationError::MigrationRequired {
+            reason: "canary-removal terminal receipt has an unsupported wire discriminator"
+                .to_owned(),
+        }
+    })?;
+    if version != CANARY_REMOVAL_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "canary-removal terminal receipt wire {version} cannot be read as {CANARY_REMOVAL_WIRE_VERSION}"
+            ),
+        });
+    }
+    let receipt: CanaryRemovalTerminalReceipt =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!(
+                "canary-removal terminal receipt record is not the strict current shape: {error}"
+            ),
+        })?;
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 #[derive(Serialize, Deserialize)]

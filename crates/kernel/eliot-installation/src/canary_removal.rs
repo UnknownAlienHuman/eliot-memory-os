@@ -9,16 +9,37 @@
 //! the `unknown_outcome`/`reconciling` discipline, `I7.20` owns the typed
 //! disposition plus next permitted action, and `I15.4` owns the secret
 //! boundary: no secret value, credential ciphertext or provider output crosses
-//! a plan, an effect row, a durable progress entry or a status projection.
+//! a plan, an effect row, a durable progress entry, a printed plan envelope, a
+//! terminal receipt or a status projection.
 //!
-//! Planning is strictly read-only. `plan_canary_removal` resolves the target
-//! from the accepted installation registry and the original transaction's own
-//! effect receipts and creates no file, secret, service, reservation or
-//! transaction row. Admission records one durable removal operation together
-//! with the one absolute deadline of its bounded reconcile wait, and execution
-//! revalidates the retained resource identity immediately before each mutation,
-//! persists the exact intent before the call and the observed result before
-//! advancing.
+//! Planning creates no file, secret, service, reservation or transaction row,
+//! and `plan_canary_removal` resolves the target from the accepted installation
+//! registry and the original transaction's own effect receipts by reading them
+//! only: its one registry use is `RedbInstallationRegistry::load`
+//! (`redb_state.rs:298`), a `begin_read` transaction, and the transaction side
+//! reads through the coordinator's own `RedbInstallationTransactionStore`,
+//! which holds a path and reaches redb only as a `ReadOnlyDatabase`
+//! (`redb_state.rs:1040`), so no registry revision advances and no registry row
+//! is written here. The registry FILE is the one thing planning is not read-only
+//! about, and that is the seam's parameter type rather than this body:
+//! `plan_canary_removal` takes `registry: &RedbInstallationRegistry`, that
+//! struct's only redb field is a `Database` (`installation_registry.rs:92`)
+//! which every constructor supplies (`redb_state.rs:140,154`), and the one
+//! read-only registry entry point this crate publishes, `inspect_existing_at`
+//! (`redb_state.rs:265`), returns an `ApprovedGenerationRegistry` VALUE whose
+//! `ReadOnlyDatabase` is opened and dropped inside that call
+//! (`redb_state.rs:291,294`), so no `&RedbInstallationRegistry` can be taken
+//! from it — the registry therefore reaches this function as redb's exclusive
+//! writer handle, and redb 4.1.0 `Drop for Database`
+//! (`redb::db::Database::drop` → `ensure_allocator_state_table_and_trim`)
+//! commits a quick-repair transaction that rewrites its own `allocator_state`
+//! system table when that handle drops, once before this body runs and again
+//! after it. That is redb's own bookkeeping, not a domain mutation: it advances
+//! no revision and writes no registry row.
+//! Admission records one durable removal operation together with the one
+//! absolute deadline of its bounded reconcile wait, and execution revalidates
+//! the retained resource identity immediately before each mutation, persists the
+//! exact intent before the call and the observed result before advancing.
 //!
 //! The reconcile wait is bounded by that single recorded deadline rather than by
 //! a caller-chosen or per-attempt budget. A resumed or retried reconcile reads
@@ -30,6 +51,35 @@
 //! observed. Expiry therefore produces visible incomplete recovery state and
 //! can never author a green `Completed`; only a per-row authoritative readback
 //! can.
+//!
+//! No row of the frozen denominator is closed by the plan. Admission opens every
+//! row unresolved, and a row this owner drives is closed only on its own owner's
+//! readback; the terminal registry retirement is proved by re-loading the
+//! registry afterwards and by the owner-issued `CanaryRemovalTerminalReceipt`
+//! this operation persists — never by the `revision + 1` arithmetic of the call
+//! that issued it, which identifies no operation and would let an unrelated
+//! registry mutation pass for this one's work.
+//!
+//! Two categories in that denominator are shared surfaces no owner in this
+//! crate can observe from outside the plan, and this module names them instead
+//! of inventing one: `CanaryEvidenceRoot` (a derived filesystem root the effect
+//! port cannot address as a bare path) and `StoreObjects` (canonical Store/Blob
+//! objects, whose owner this crate has no dependency on). Both rows are
+//! classified `OutOfScope`: each stays in the denominator carrying the
+//! owner-recorded identity and ownership evidence that show it is not this
+//! removal's to destroy, and neither can be closed by a readback, because no
+//! owner this crate can reach reports anything about them and evidence this
+//! module minted for itself would only restate its own row identity and a
+//! comparison that cannot fail is not a readback. That does NOT leave apply
+//! free to proceed. `order_band` ranks such a row ahead of every row that can
+//! mutate, `advance` drives it before any of them, and `readback_request`
+//! answers it with `IncompleteObservation`, so a plan carrying these rows is
+//! refused; what the classification buys is that the refusal is typed,
+//! attributable and tied to a row that is still counted in the reported
+//! denominator. `Unsupported` stays reserved for a required cleanup this owner
+//! cannot perform and is caught earlier, by `revalidate_fence`'s own guard
+//! before any row is driven. The two are different classifications with
+//! different refusal sites and both refuse.
 
 use std::collections::BTreeSet;
 
@@ -61,7 +111,31 @@ use super::{
 /// as a typed resource in the frozen removal graph. Older records require
 /// explicit migration; neither deadlines nor resource classifications are
 /// synthesized as defaults.
+///
+/// Version 3 also carries the `OutOfScope` action, which is purely additive: it
+/// introduces a classification and does not change an existing one's meaning,
+/// so it forces no revision of the wire version. A record admitted before it
+/// existed still parses and still validates — but it is not silently resumed,
+/// because `require_quiesced_owner_effects` now pins the two shared
+/// owner-derived categories to `OutOfScope` and refuses an older record that
+/// froze them as `Unsupported`. That is a refusal, not a silent reclassification:
+/// nothing in this owner re-labels a frozen row, and no row is dropped.
 pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
+
+/// Contract member of the printed canary-removal plan envelope.
+///
+/// The envelope is the one versioned document that carries a frozen plan from
+/// planning into apply, so it names the installation contract this crate
+/// implements. The `scope` member is deliberately NOT declared here: that label
+/// belongs to the surface that publishes the document, so the owner carries the
+/// caller's handle instead of restating its vocabulary.
+const CANARY_REMOVAL_PLAN_CONTRACT: &str = "eliot.kernel.installation";
+
+/// Status member of the printed canary-removal plan envelope.
+///
+/// It names the document kind, so a status projection, a plan envelope and a
+/// terminal receipt can never be read as one another by accident.
+const CANARY_REMOVAL_PLAN_STATUS: &str = "CANARY_REMOVAL_PLAN";
 
 /// Canonical prefix of every derived canary-removal operation identity.
 const CANARY_REMOVAL_OPERATION_PREFIX: &str = "canary-removal/v1:";
@@ -77,12 +151,32 @@ const CANARY_REMOVAL_ROW_MAX_ATTEMPTS: u32 = 2;
 /// Bounded wall-clock window in which one admitted canary-removal operation may
 /// keep driving and reconciling its own removal rows.
 ///
-/// This is the same absolute injected-clock shape the crate already uses for
-/// one bounded SCM start convergence window. The deadline is computed once from
-/// the observed clock when the operation is admitted, persisted with the
-/// operation and never recomputed, so a resumed reconcile re-derives its
-/// remaining window from that recorded deadline instead of restarting the
-/// budget. Expiry is not a resolution: it only refuses to drive further, which
+/// The clock this window is measured against is the SYSTEM wall clock, and this
+/// module has no other one: `wall_clock_millis` reads `SystemTime::now()`
+/// against `UNIX_EPOCH` at every observation, so the clock is neither monotonic
+/// nor injectable, and there is no seam in this crate that a caller or a test
+/// can substitute. The one absolute shape it does share with the crate's bounded
+/// SCM start convergence window is the recorded-deadline discipline below, not
+/// the clock: that window's timestamp is a `now_ms` parameter on
+/// `InstallationCoordinator::drive_effect_at` and
+/// `drive_all_effects_until_blocked_at`, whose production callers pass the same
+/// `wall_clock_millis()`, whereas this window is read by
+/// `reconcile_budget_exhausted`, which takes only the operation and calls the
+/// system clock itself. No proof in this crate can therefore substitute that
+/// clock and expire this window on demand; a durable record whose recorded value
+/// was built by hand is a forged record, not a deadline this owner moved.
+///
+/// The deadline is computed once from the observed clock when the operation is
+/// admitted, persisted with the operation and never recomputed, and the durable
+/// compare-and-save path refuses any change to it, so a resumed reconcile
+/// re-derives its remaining window from that recorded deadline instead of
+/// restarting the budget. What a non-monotonic clock does reopen is elapsed
+/// time: the recorded value is an absolute instant, so a system clock that steps
+/// backwards past it makes `reconcile_budget_exhausted` false again and re-opens
+/// the window for THIS SAME removal identity, with no second admission and no new
+/// identity. That is a property of the clock, not a budget this owner can bound.
+///
+/// Expiry is not a resolution: it only refuses to drive further, which
 /// preserves the durable incomplete recovery and its blocking effect exactly as
 /// observed.
 const CANARY_REMOVAL_RECONCILE_TIMEOUT_MS: u64 = 30_000;
@@ -117,8 +211,20 @@ pub enum CanaryRemovalResource {
     /// Host-owned Phase-B live overlay materialized for this generation.
     PhaseBLiveOverlay,
     /// Per-installation canary evidence root derived from the runtime roots.
+    ///
+    /// The row is classified `OutOfScope`: it is a shared per-installation
+    /// surface that is neither this removal's responsibility to remove nor
+    /// anything an owner in this crate can prove, so it is named with its
+    /// owner-recorded identity instead of being reported as retained and proved.
     CanaryEvidenceRoot,
-    /// Canonical Store and Blob objects written by this generation.
+    /// The canonical Store and Blob objects this generation wrote.
+    ///
+    /// The row is classified `OutOfScope`: `I3.15` gives the canonical Store
+    /// later installation and capability observations rather than this
+    /// transaction's operational authority, and this crate declares no Store or
+    /// Blob dependency at all, so the objects are named with the generation's
+    /// owner-recorded Store binding instead of being reported as retained and
+    /// proved.
     StoreObjects,
     /// The approved-generation registry record for this generation.
     GenerationRegistryRecord,
@@ -146,12 +252,74 @@ pub enum CanaryRemovalResourceOrigin {
 pub enum CanaryRemovalAction {
     /// This owner removes the exact transaction-created identity.
     Remove,
-    /// The resource survives this removal unchanged.
+    /// The resource survives this removal unchanged, and the owner that holds it
+    /// reads it back before this operation may close.
     Retain,
     /// The resource is required for a complete removal, but this owner has no
     /// admitted removal path for it. It stays in the denominator and blocks
     /// apply; it is never dropped from the plan.
     Unsupported,
+    /// The resource is a shared or preexisting surface that this removal is
+    /// neither responsible to remove nor able to prove.
+    ///
+    /// Issue #1138's removal algorithm step 2 is the whole of this
+    /// classification, and its three clauses separate three different things:
+    /// "Classify shared/preexisting resources as retained; NAME ALL OUT-OF-SCOPE
+    /// CATEGORIES WITH EVIDENCE. Unsupported required cleanup blocks apply—it
+    /// must not disappear from the denominator." The first clause describes a
+    /// shared surface this removal leaves alone AND reads back through its own
+    /// owner, which is `Retain`; the second clause describes a category no owner
+    /// in this crate can observe at all, which is this variant; the third names
+    /// the required cleanup this owner cannot perform, which is `Unsupported`.
+    /// All three clauses refuse rather than wave the removal through, at
+    /// different sites and with different messages: the required cleanup is
+    /// caught by the `Unsupported` guard in `revalidate_fence`, before any row is
+    /// driven, while a row of this class is caught later, by `readback_request`
+    /// inside the per-row drive. The two are different classifications with
+    /// different refusal sites, not one that blocks and one that does not.
+    ///
+    /// A row of this class is NAMED in the denominator — with the
+    /// owner-recorded identity that shows it is not this removal's to destroy,
+    /// its ownership evidence and its reconciliation query all frozen in the
+    /// plan — rather than dropped from it.
+    ///
+    /// It is deliberately never reported as `Retain` and proved. `Retain` is a
+    /// READBACK outcome: the row's own owner reported the resource still present
+    /// under its admitted identity, and this operation closes such a row only on
+    /// that owner's verdict. No owner this crate can reach reports anything at
+    /// all about these surfaces, so a `Retain` row here would advertise a proof
+    /// that does not exist.
+    ///
+    /// Being classified `OutOfScope` therefore never lets the removal proceed:
+    /// there is no owner readback that could be satisfied in place of the
+    /// refusal, so the refusal stands. `order_band` ranks every row that names
+    /// no installer effect and is not the terminal registry record into band 0,
+    /// which is exactly the shape of these two rows, so `freeze_effect_graph`
+    /// places them ahead of every row that can mutate; `advance` drives the
+    /// first row that is not `Resolved`, and `CanaryRemovalOperation::validate`
+    /// admits no disposition that could put one of them there, so a plan
+    /// carrying these rows cannot get past one. `advance_row` routes every
+    /// non-`Remove` row to `read_retained_row`, which calls `readback_request`
+    /// before its first `port.reconcile`, and `readback_request` answers a row
+    /// with no installer effect and no owner that can observe it with
+    /// `InstallationError::IncompleteObservation`. `apply_canary_removal`
+    /// therefore returns that typed refusal for every plan carrying these rows
+    /// that reaches the drive: no owner is asked and no mutating call is issued,
+    /// and the only durable write ahead of the refusal is the admission record
+    /// `admit_or_resume` created.
+    ///
+    /// What the classification buys is three properties that hold BECAUSE of it,
+    /// not in spite of it. The refusal is TYPED and ATTRIBUTABLE: it names the
+    /// exact row and its closed category, where dropping the row would leave the
+    /// denominator silently short and reporting one as `Retain` would forge a
+    /// verdict. The row stays visible in the reported denominator: admission
+    /// opens it `Pending`, `expected_stage` counts it in `open`, so `Completed`
+    /// is unreachable while it stands, and `unknown_row` cannot be used to close
+    /// it either because it has no external outcome to be unknown. And the reason
+    /// it cannot be closed is carried in the plan as the owner-recorded identity
+    /// and ownership evidence rather than asserted by a handle this module minted
+    /// about itself.
+    OutOfScope,
 }
 
 /// Postcondition one removal row must authoritatively prove.
@@ -309,7 +477,9 @@ impl CanaryRemovalEffect {
                 CanaryRemovalAction::Remove,
                 CanaryRemovalPostcondition::Absent
             ) | (
-                CanaryRemovalAction::Retain | CanaryRemovalAction::Unsupported,
+                CanaryRemovalAction::Retain
+                    | CanaryRemovalAction::Unsupported
+                    | CanaryRemovalAction::OutOfScope,
                 CanaryRemovalPostcondition::Retained
             )
         );
@@ -325,6 +495,14 @@ impl CanaryRemovalEffect {
         if self.origin == CanaryRemovalResourceOrigin::ForeignToThisRemoval
             && self.install_effect_index.is_some()
         {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // An out-of-scope row names a shared surface, and an installer-effect
+        // index names one effect of the original install transaction's own
+        // roster, which its own owner CAN observe. A row carrying both would
+        // claim this removal is unable to prove a resource it in fact installed,
+        // so the combination is refused here instead of being classified.
+        if self.action == CanaryRemovalAction::OutOfScope && self.install_effect_index.is_some() {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
@@ -456,10 +634,21 @@ impl CanaryRemovalBuildBinding {
 /// resource identity the accepted registry or the original transaction can
 /// describe has one row, so a closed resource category spans one row per
 /// roster effect that names it, and every row that is not removed carries an
-/// explicit `RETAINED` or `UNSUPPORTED` action. Owner-derived rows
-/// (`CanaryEvidenceRoot`, `StoreObjects`, `GenerationRegistryRecord`) appear
-/// exactly once per `require_quiesced_owner_effects`, which runs at the
-/// destructive gates rather than inside plan validation.
+/// explicit `RETAINED`, `UNSUPPORTED` or `OUT_OF_SCOPE` action. Owner-derived
+/// rows (`CanaryEvidenceRoot`, `StoreObjects`, `GenerationRegistryRecord`)
+/// appear exactly once per `require_quiesced_owner_effects`, which runs at the
+/// destructive gates rather than inside plan validation. Of those three,
+/// `GenerationRegistryRecord` is removed and `CanaryEvidenceRoot` and
+/// `StoreObjects` are classified `OUT_OF_SCOPE`: they are named with their
+/// owner-recorded identity and evidence, and no owner in this crate can observe
+/// them, so no owner verdict can close one. Both of those classifications
+/// REFUSE the drive rather than wave it through, and they refuse at different
+/// sites with different messages: a required cleanup this owner cannot perform
+/// is `UNSUPPORTED` and is caught by the guard in `revalidate_fence` before any
+/// row is driven, while an `OUT_OF_SCOPE` row is caught by `readback_request`
+/// once `advance` reaches it — which is why `order_band` ranks it ahead of every
+/// row that can mutate. A plan carrying either refuses to apply, and
+/// `Completed` is unreachable while the row stands.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanaryRemovalPlan {
@@ -493,7 +682,27 @@ pub struct CanaryRemovalPlan {
 
 impl CanaryRemovalPlan {
     /// Recomputes the domain-separated plan digest over every plan member
-    /// except the digest itself.
+    /// except the digest itself and each row's spent attempt counter.
+    ///
+    /// `bound.attempt` is durable PROGRESS, not plan identity.
+    /// `commit_intent` spends one attempt of a row's own bound by writing the
+    /// advanced bound back into the plan row, and the store freezes
+    /// `plan_digest` for the life of the operation, so a digest that covered the
+    /// counter would re-derive a different value than the recorded one on the very
+    /// next `validate()` after a resume — refusing the operation before the store
+    /// is ever reached. That is why the counter is normalized here instead of the
+    /// digest being recomputed at the write: the frozen digest is the identity the
+    /// durable record is keyed by, and re-deriving it per save would mint a second
+    /// identity for one removal.
+    ///
+    /// Normalizing rather than dropping the member is deliberate. It keeps the
+    /// digest total over `CanaryRemovalEffect` — no shadow projection of the row
+    /// exists that could silently stop covering a field added to it later — and it
+    /// keeps `bound.max_attempts`, the admitted execution contour, inside the
+    /// digest, because that member does not move. What the normalization costs is
+    /// exactly the numbering of the attempt, never the number of attempts this
+    /// identity may spend: a caller that froze a higher starting attempt spends its
+    /// contour sooner, not more.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
         #[derive(Serialize)]
         struct DigestInput<'a> {
@@ -511,6 +720,16 @@ impl CanaryRemovalPlan {
             effects: &'a [CanaryRemovalEffect],
         }
 
+        // Every frozen row is stamped with the plan-time attempt
+        // `CanaryRemovalEffectBound::new()` gives it, so normalizing each row back
+        // to exactly that makes the digest a function of the frozen plan alone,
+        // whichever attempt this operation has since spent on a row.
+        let frozen_attempt = CanaryRemovalEffectBound::new().attempt;
+        let mut frozen_effects = self.effects.clone();
+        for effect in &mut frozen_effects {
+            effect.bound.attempt = frozen_attempt;
+        }
+
         let bytes = super::canonical_json_bytes(&DigestInput {
             canary_removal_wire_version: self.canary_removal_wire_version,
             removal_transaction_id: &self.removal_transaction_id,
@@ -523,7 +742,7 @@ impl CanaryRemovalPlan {
             registry_revision: self.registry_revision,
             request: &self.request,
             quiesce: &self.quiesce,
-            effects: &self.effects,
+            effects: &frozen_effects,
         })
         .map_err(|error| InstallationError::InvalidField {
             field: "canary_removal.plan.plan_digest".to_owned(),
@@ -533,6 +752,14 @@ impl CanaryRemovalPlan {
     }
 
     /// Validates the plan without performing any external effect.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one stateless validator keeps the wire version, the removal identity, the digest \
+                  re-derivation, the quiesce bounds, the retirement barrier, the frozen row order, \
+                  every row's shape and every row's postcondition in a single auditable pass, and \
+                  splitting it would scatter one decision across functions that each see only part \
+                  of the plan"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         if self.canary_removal_wire_version != CANARY_REMOVAL_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
@@ -636,8 +863,315 @@ impl CanaryRemovalPlan {
                 "the terminal registry record must stay inside the removal denominator".to_owned(),
             ));
         }
+        // The FROZEN ORDER is a property of the document, not only of the producer
+        // that froze it. `plan_canary_removal` runs `order_effect_graph` before it
+        // seals the digest, but `load_plan` accepts an untrusted import, and
+        // `advance` selects the next row purely by array position. Without this
+        // check a caller-supplied plan could place a mutating row ahead of a row
+        // no owner can read back, and the guarantee `order_band` states - that such
+        // a row is DETECTED before any destructive call - would hold only for
+        // plans this owner produced. Re-deriving through the SAME function is the
+        // whole check: no second ordering scheme and no new member.
+        let mut ordered = self.effects.clone();
+        order_effect_graph(&mut ordered);
+        let frozen = ordered
+            .iter()
+            .map(|row| row.effect_id.as_str())
+            .collect::<Vec<_>>();
+        if self
+            .effects
+            .iter()
+            .map(|row| row.effect_id.as_str())
+            .ne(frozen)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         if self.computed_digest()? != self.plan_digest {
             return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Versioned wire envelope carrying one frozen canary-removal plan.
+///
+/// Planning creates no file, secret, service, reservation or transaction row and
+/// produces this document; the only write planning performs is the redb
+/// bookkeeping the module header discloses, and it comes from the registry
+/// handle the planning seam admits, not from the pass this document records.
+/// Apply accepts exactly this document and re-validates the plan it carries
+/// before the first destructive call. The
+/// envelope exists because a bare plan is not self-describing on a
+/// pipe: without the fixed `contract`, `contract_version`, `status`, `completed`
+/// and `scope` members, a plan file could be a completed planning pass, a status
+/// projection or a terminal receipt and the owner would have to guess which.
+///
+/// No member of this envelope or of the plan it carries is a secret value,
+/// credential ciphertext or provider output: every member is an identity
+/// handle, a digest or a typed class, which is what lets both be printed and
+/// persisted under `I15.4`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryRemovalPlanEnvelope {
+    /// Contract this document belongs to; fixed to `CANARY_REMOVAL_PLAN_CONTRACT`.
+    pub contract: PlatformHandle,
+    /// Versioned wire discriminator this document was produced under.
+    pub contract_version: ContractVersion,
+    /// Document kind; fixed to `CANARY_REMOVAL_PLAN_STATUS`.
+    pub status: PlatformHandle,
+    /// Whether the planning pass that produced this document completed.
+    ///
+    /// Planning creates no file, secret, service, reservation or transaction row,
+    /// so a completed envelope is the only shape the owner admits.
+    pub completed: bool,
+    /// Bounded effect scope label of the publishing surface.
+    ///
+    /// It is carried, not redefined: the owner checks only that the member is a
+    /// well-formed non-empty handle, because the vocabulary of that label belongs
+    /// to the surface that publishes the document, not to this crate.
+    pub scope: PlatformHandle,
+    /// The frozen, read-only removal plan this envelope carries.
+    pub plan: CanaryRemovalPlan,
+}
+
+impl CanaryRemovalPlanEnvelope {
+    /// Builds the completed envelope for one already-frozen plan.
+    ///
+    /// `scope` is the publishing surface's own bounded-effect label and is stored
+    /// verbatim; this owner never derives or rewrites it. The envelope is
+    /// validated here so a printed document is always one the owner admits.
+    pub fn new(scope: PlatformHandle, plan: CanaryRemovalPlan) -> Result<Self, InstallationError> {
+        let envelope = Self {
+            contract: handle_ref(CANARY_REMOVAL_PLAN_CONTRACT)?,
+            contract_version: CANARY_REMOVAL_WIRE_VERSION,
+            status: handle_ref(CANARY_REMOVAL_PLAN_STATUS)?,
+            completed: true,
+            scope,
+            plan,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Refuses any document whose fixed members or plan are not current.
+    ///
+    /// The plan's own `validate()` runs last and is therefore the final word: it
+    /// re-derives the plan digest, the removal operation identity and the whole
+    /// frozen effect graph from the document the caller handed over, so an
+    /// envelope can never lend authority to a plan this owner would not admit
+    /// itself.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.plan.canary_removal_wire_version != CANARY_REMOVAL_WIRE_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "canary-removal plan envelope carries plan wire {} and cannot be read as {}",
+                    self.plan.canary_removal_wire_version, CANARY_REMOVAL_WIRE_VERSION
+                ),
+            });
+        }
+        // The envelope's own wire discriminator is checked against the same
+        // constant the plan member is: a document that declares another wire
+        // version is refused as a migration rather than admitted with the
+        // mismatch silently ignored.
+        if self.contract_version != CANARY_REMOVAL_WIRE_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "canary-removal plan envelope declares wire {} and cannot be read as {}",
+                    self.contract_version, CANARY_REMOVAL_WIRE_VERSION
+                ),
+            });
+        }
+        // Planning creates no file, secret, service, reservation or transaction
+        // row, so an envelope claiming an incomplete planning pass is refused
+        // rather than admitted as a partial plan.
+        if !self.completed {
+            return Err(InstallationError::InvalidField {
+                field: "canary_removal.plan_envelope.completed".to_owned(),
+                reason: "must be exactly true for a completed read-only planning pass".to_owned(),
+            });
+        }
+        if self.status != handle_ref(CANARY_REMOVAL_PLAN_STATUS)?
+            || self.contract != handle_ref(CANARY_REMOVAL_PLAN_CONTRACT)?
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        handle(&self.scope, "canary_removal.plan_envelope.scope")?;
+        self.plan.validate()
+    }
+
+    /// Returns the frozen plan this envelope carries.
+    #[must_use]
+    pub fn into_plan(self) -> CanaryRemovalPlan {
+        self.plan
+    }
+}
+
+/// Owner-issued terminal record of one committed canary removal.
+///
+/// The terminal registry retirement is the one irreversible step of a removal,
+/// and `I5.19` admits exactly one way to learn that it committed: by its
+/// operation identity, never by counting revisions. This receipt is that record.
+/// It binds this removal operation identity to the generation it retired, the
+/// registry revision the plan was admitted against, and the revision and content
+/// digest of the projection the retirement actually produced, together with the
+/// serving pointers and the survivor set observed in that same reloaded
+/// projection.
+///
+/// Every member is an identity handle, a revision counter or a digest, so the
+/// receipt is safe to persist, to re-read during recovery and to project in a
+/// status disposition under `I15.4`. It carries no secret value, credential
+/// ciphertext or provider output.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryRemovalTerminalReceipt {
+    /// Versioned wire discriminator for this receipt.
+    pub canary_removal_wire_version: ContractVersion,
+    /// Sole durable removal operation identity this terminal record belongs to.
+    pub removal_transaction_id: PlatformHandle,
+    /// Exact generation this removal retired.
+    pub generation: PlatformHandle,
+    /// Registry revision the removal was admitted against.
+    pub predecessor_registry_revision: u64,
+    /// Registry revision the reloaded post-retirement projection carries.
+    pub resulting_registry_revision: u64,
+    /// Content digest of the reloaded post-retirement projection.
+    pub resulting_registry_content_digest: PlatformHandle,
+    /// Active generation observed in the reloaded projection.
+    pub active_generation: Option<PlatformHandle>,
+    /// Last-known-good generation observed in the reloaded projection.
+    pub last_known_good_generation: Option<PlatformHandle>,
+    /// Generations the reloaded projection still carries besides the target.
+    pub surviving_generations: Vec<PlatformHandle>,
+}
+
+impl CanaryRemovalTerminalReceipt {
+    /// Recomputes the domain-separated digest over every receipt member except
+    /// the recorded registry content digest itself.
+    ///
+    /// The content digest is excluded for the same reason
+    /// [`CanaryRemovalPlan::computed_digest`] excludes `plan_digest`: it is the
+    /// digest of the projection this receipt describes, not a member of the
+    /// receipt's own identity, so folding it back in would let a changed
+    /// projection mint a matching receipt identity.
+    pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        #[derive(Serialize)]
+        struct DigestInput<'a> {
+            canary_removal_wire_version: ContractVersion,
+            removal_transaction_id: &'a PlatformHandle,
+            generation: &'a PlatformHandle,
+            predecessor_registry_revision: u64,
+            resulting_registry_revision: u64,
+            active_generation: &'a Option<PlatformHandle>,
+            last_known_good_generation: &'a Option<PlatformHandle>,
+            surviving_generations: &'a [PlatformHandle],
+        }
+
+        let bytes = super::canonical_json_bytes(&DigestInput {
+            canary_removal_wire_version: self.canary_removal_wire_version,
+            removal_transaction_id: &self.removal_transaction_id,
+            generation: &self.generation,
+            predecessor_registry_revision: self.predecessor_registry_revision,
+            resulting_registry_revision: self.resulting_registry_revision,
+            active_generation: &self.active_generation,
+            last_known_good_generation: &self.last_known_good_generation,
+            surviving_generations: &self.surviving_generations,
+        })
+        .map_err(|error| InstallationError::InvalidField {
+            field: "canary_removal.terminal_receipt.resulting_registry_content_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| platform_error(&error))
+    }
+
+    /// Validates one terminal receipt without consulting the registry.
+    ///
+    /// Every check here is a property of the receipt alone, so nothing here can
+    /// establish that the receipt describes the owner's live projection. That
+    /// separate question is answered by the caller, and this is what the two
+    /// callers in this module actually do:
+    ///
+    /// * `terminal_receipt_recognises_retirement` re-reads the projection,
+    ///   establishes the target's absence there, and applies `resulting_registry_revision`
+    ///   only as a MONOTONITY FLOOR (`projection.revision() < that` refuses), because the
+    ///   live projection may legitimately have advanced past the retirement.
+    /// * `terminal_receipt_digest` re-reads the projection after the retirement and, when the
+    ///   live projection still carries EXACTLY the revision this receipt recorded, compares the
+    ///   recorded `resulting_registry_content_digest` against that projection's own identity
+    ///   before the receipt is reused as terminal evidence.
+    ///
+    /// The recorded content digest is therefore load-bearing, and it is compared
+    /// with the existing projection-identity scheme rather than recomputed here:
+    /// `computed_digest` excludes it by design (see above), so a receipt whose
+    /// digest does not match the registry it claims to describe keeps its own
+    /// well-formed identity and is still refused by that comparison. The
+    /// revision guard is not a weakening of it — a linear registry that has
+    /// advanced past `resulting_registry_revision` is carrying unrelated
+    /// activity, which is exactly the case the monotonicity floor exists to admit,
+    /// and the terminal state on such a projection is proved independently by
+    /// `terminal_proofs_hold`.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.canary_removal_wire_version != CANARY_REMOVAL_WIRE_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "canary-removal terminal receipt wire {} cannot be read as {}",
+                    self.canary_removal_wire_version, CANARY_REMOVAL_WIRE_VERSION
+                ),
+            });
+        }
+        handle(
+            &self.removal_transaction_id,
+            "canary_removal.terminal_receipt.removal_transaction_id",
+        )?;
+        handle(
+            &self.generation,
+            "canary_removal.terminal_receipt.generation",
+        )?;
+        sha256_handle(
+            &self.resulting_registry_content_digest,
+            "canary_removal.terminal_receipt.resulting_registry_content_digest",
+        )?;
+        if self.predecessor_registry_revision == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "canary_removal.terminal_receipt.predecessor_registry_revision".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        // The retirement committed one revision past the projection the plan was
+        // admitted against. A receipt that did not move the registry forward
+        // describes no committed terminal effect.
+        if self.resulting_registry_revision <= self.predecessor_registry_revision {
+            return Err(InstallationError::InvalidField {
+                field: "canary_removal.terminal_receipt.resulting_registry_revision".to_owned(),
+                reason: "must be strictly greater than the predecessor registry revision"
+                    .to_owned(),
+            });
+        }
+        // A retired generation that still serves production or is still the
+        // designated last-known-good contradicts the retirement this receipt
+        // claims to record.
+        if self.active_generation.as_ref() == Some(&self.generation)
+            || self.last_known_good_generation.as_ref() == Some(&self.generation)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        handles(
+            &self.surviving_generations,
+            "canary_removal.terminal_receipt.surviving_generations",
+            false,
+        )?;
+        for (index, generation) in self.surviving_generations.iter().enumerate() {
+            if generation == &self.generation {
+                return Err(InstallationError::IdentityConflict);
+            }
+            // Sorted order gives one survivor set exactly one serialization, so a
+            // re-saved receipt under the same removal identity is byte-identical
+            // and a reordered survivor set reads as a conflicting claim.
+            if index > 0 && self.surviving_generations[index - 1].as_str() > generation.as_str() {
+                return Err(InstallationError::InvalidField {
+                    field: "canary_removal.terminal_receipt.surviving_generations".to_owned(),
+                    reason: "must be sorted so one survivor set has one serialization".to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -675,6 +1209,31 @@ pub enum CanaryRemovalEffectDisposition {
 }
 
 /// Durable per-row state of one admitted canary-removal operation.
+///
+/// The `state` tag is the sole discriminant, and `deny_unknown_fields` makes the
+/// three MEMBER-CARRYING variants strictly decoded: an `IntentCommitted`, a
+/// `Resolved` or an `Unknown` payload is refused when it carries a key beside the
+/// declared ones, and each member of those three reaches the durable record as the
+/// exact field [`CanaryRemovalOperation::validate`] checks.
+///
+/// `Pending` is the one variant this attribute does NOT cover, and the gap is
+/// serde's rather than this owner's. It is a UNIT variant, and serde derives an
+/// internally tagged unit variant through its `InternallyTaggedUnitVisitor`, whose
+/// `visit_map` consumes and discards every remaining key before returning
+/// `Ok(())`. So `{"state":"PENDING","attempt":3}` decodes as `Pending` instead of
+/// being refused, and no attribute placed on this enum changes that:
+/// `deny_unknown_fields` is read where the STRUCT variants are deserialized and is
+/// never consulted for a unit variant.
+///
+/// Nothing rides in that discarded key, which is why this is recorded rather than
+/// fixed. The tag stays the only discriminant, so no other member of this enum can
+/// be smuggled in beside it, and the one value that could have travelled there —
+/// the spent attempt — enters the durable record only through `IntentCommitted`,
+/// whose `attempt` is strictly decoded and is pinned by
+/// [`CanaryRemovalOperation::validate`] to the plan row's own
+/// [`CanaryRemovalEffect::bound`]. A `PENDING` payload naming an attempt therefore
+/// records nothing at all, which is the honest outcome for a row that admits no
+/// intent yet.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -683,6 +1242,10 @@ pub enum CanaryRemovalEffectDisposition {
 )]
 pub enum CanaryRemovalEffectState {
     /// No removal intent has been committed for this row.
+    ///
+    /// A unit variant, so serde's internally tagged unit visitor accepts and
+    /// discards any further key beside the `state` tag. See this enum's own
+    /// documentation for exactly what that admits and why nothing rides in it.
     Pending,
     /// The exact intent was durably committed before the mutating call.
     IntentCommitted {
@@ -737,16 +1300,29 @@ pub struct CanaryRemovalOperation {
     pub effect_progress: Vec<CanaryRemovalEffectProgress>,
     /// Exact removal effect that currently blocks the terminal disposition.
     pub blocking_effect_id: Option<PlatformHandle>,
-    /// Absolute injected-clock deadline of this operation's bounded reconcile
-    /// wait.
+    /// Absolute deadline of this operation's bounded reconcile wait, measured
+    /// on the system wall clock.
     ///
-    /// It is computed once at admission and never recomputed, so a resumed
-    /// reconcile re-derives its remaining window from this recorded value
-    /// instead of restarting the budget. It is a bound on driving, not a
-    /// resolution: reaching it leaves every unresolved row, the blocking
-    /// effect and the non-terminal stage exactly as observed.
+    /// The clock is not injected and not test-controllable:
+    /// [`super::wall_clock_millis`] is the system clock, so this member records
+    /// an absolute instant that no caller and no test in this crate can choose.
+    ///
+    /// It is computed once at admission and never recomputed, and the durable
+    /// compare-and-save path refuses a change to it, so a resumed reconcile
+    /// re-derives its remaining window from this recorded value instead of
+    /// restarting the budget. It is a bound on driving, not a resolution:
+    /// reaching it leaves every unresolved row, the blocking effect and the
+    /// non-terminal stage exactly as observed. Because the clock behind it is
+    /// not monotonic, a backwards step re-opens the window for this same
+    /// removal identity; only the recorded value is immutable, not elapsed time.
     pub reconcile_deadline_ms: u64,
-    /// Monotonic state revision used by the durable compare-and-save path.
+
+    /// Durable state revision used by the durable compare-and-save path.
+    ///
+    /// This is a stored counter, not a clock: it is incremented by one per
+    /// durable save and never re-derived from any time source, so unlike
+    /// `reconcile_deadline_ms` above it is monotonic by construction and is not
+    /// affected by a backwards system clock.
     pub revision: u64,
 }
 
@@ -756,16 +1332,17 @@ impl CanaryRemovalOperation {
         plan.validate()?;
         let mut effect_progress = Vec::with_capacity(plan.effects.len());
         for effect in &plan.effects {
+            // Every row of the denominator starts unresolved, whatever its
+            // planned action. A `Retain`, `Unsupported` or `OutOfScope` row is
+            // not closed by the plan: its `ownership_evidence` records who owns
+            // the resource at plan time, which is not the same claim as having
+            // read the resource back from that owner. Admitting such a row as
+            // already resolved would let a plan-time string stand in for the
+            // owner's own readback and would make `Completed` reachable without
+            // ever touching the resource.
             effect_progress.push(CanaryRemovalEffectProgress {
                 effect_id: effect.effect_id.clone(),
-                state: if effect.action == CanaryRemovalAction::Remove {
-                    CanaryRemovalEffectState::Pending
-                } else {
-                    CanaryRemovalEffectState::Resolved {
-                        disposition: CanaryRemovalEffectDisposition::Retained,
-                        evidence: effect.ownership_evidence.clone(),
-                    }
-                },
+                state: CanaryRemovalEffectState::Pending,
             });
         }
         let operation = Self {
@@ -787,6 +1364,13 @@ impl CanaryRemovalOperation {
     }
 
     /// Validates the durable operation against its own frozen plan.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one stateless validator keeps the wire version, the identity binding, every row, the \
+                  two attempt-ordering rules, the blocking-effect rule and the derived stage in a \
+                  single auditable pass, and splitting it would scatter one decision across functions \
+                  that each see only part of the record"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         if self.canary_removal_wire_version != CANARY_REMOVAL_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
@@ -821,8 +1405,31 @@ impl CanaryRemovalOperation {
             if progress.effect_id != effect.effect_id {
                 return Err(InstallationError::IdentityConflict);
             }
+            // The attempt this row may hold is bounded by the row's OWN frozen
+            // contour, not by a crate constant: `CanaryRemovalEffectBound::validate`
+            // admits any non-zero `max_attempts` and a plan document carrying a
+            // wider one is admitted here on its own terms, so a window derived
+            // from `CANARY_REMOVAL_ROW_MAX_ATTEMPTS` would refuse this owner's own
+            // save the moment such a row legitimately reached its third attempt.
+            // What bounds a single record is therefore only its contour.
+            //
+            // The ADVANCE rule - that the counter moves by at most one between two
+            // records - is deliberately NOT here. This validator is STATELESS: it is
+            // handed the proposed rows and has no memory of the rows this record
+            // replaces, so it cannot see a delta at all. That rule belongs to the
+            // store's transition floor, `validate_canary_removal_operation_transition`,
+            // which is handed the decoded `current` record as well and is the only
+            // place a delta exists to be checked. It is needed because
+            // `CanaryRemovalPlan::computed_digest` normalises `attempt` back to the
+            // plan-time value before hashing, so a record-to-record `plan_digest`
+            // comparison is blind to this member by construction.
             let admissible = match &progress.state {
-                CanaryRemovalEffectState::Pending => effect.action == CanaryRemovalAction::Remove,
+                // Admission opens every row unresolved, and a row only closes on
+                // the outcome its own owner reported for it. `Pending` therefore
+                // names "not yet read back", which every action admits; the
+                // mutating states below stay exclusive to `Remove` rows so a
+                // retained resource can never be checkpointed or cancelled.
+                CanaryRemovalEffectState::Pending => true,
                 CanaryRemovalEffectState::IntentCommitted {
                     attempt,
                     intent_digest,
@@ -838,6 +1445,15 @@ impl CanaryRemovalOperation {
                     evidence,
                 } => {
                     handles(evidence, "canary_removal.progress.evidence", true)?;
+                    // `OutOfScope` is deliberately absent from the retained arm.
+                    // `Resolved` is the state that records "an authoritative
+                    // readback proved this row's exact postcondition", so admitting
+                    // it here would make an out-of-scope row readable as retained
+                    // and proved — the one thing its classification exists to
+                    // prevent, since no owner in this crate can report anything
+                    // about these surfaces. The row therefore cannot be closed by
+                    // any disposition at all, and `unknown_row` cannot be used to
+                    // close it either: it has no external outcome to be unknown.
                     matches!(
                         (effect.action, *disposition),
                         (
@@ -852,7 +1468,19 @@ impl CanaryRemovalOperation {
                 }
                 CanaryRemovalEffectState::Unknown { pending_ref } => {
                     handle(pending_ref, "canary_removal.progress.pending_ref")?;
-                    effect.action == CanaryRemovalAction::Remove
+                    // A row this owner promised to leave intact has just as
+                    // unobservable an external outcome as one it drove, so `Retain`
+                    // is admitted beside `Remove` here. Refusing that pairing made
+                    // `unknown_row` fail this very `validate()`, persist nothing and
+                    // hand its caller a bare `IdentityConflict` instead of the typed
+                    // reconciling disposition this state exists to record — so a
+                    // drifted retained resource could not report itself at all.
+                    // `Unsupported` and `OutOfScope` stay out: neither has an owner
+                    // readback that could report anything, so neither can reach here.
+                    matches!(
+                        effect.action,
+                        CanaryRemovalAction::Remove | CanaryRemovalAction::Retain
+                    )
                 }
             };
             if !admissible {
@@ -867,6 +1495,42 @@ impl CanaryRemovalOperation {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        // The one direction of `blocking_effect_id` this owner states, completing
+        // the check above: an operation that carries a row whose external outcome
+        // is unresolved HAS a blocking effect, and it is one of those unresolved
+        // rows. A record that keeps an unknown outcome while naming no such row
+        // projects a primary uncertainty through `CanaryRemovalStatus` with no
+        // durable row to reconcile, and the whole content of the typed reconciling
+        // disposition is that named row.
+        //
+        // The converse is deliberately NOT stated. `resolve_row` closes a row on
+        // its owner's verdict without clearing `blocking_effect_id`, so a record
+        // may still name a row that is no longer unresolved, and the store's own
+        // transition floor admits exactly that reconciliation precisely because it
+        // must never be narrower than this validator. Requiring an unresolved row
+        // for every named id would refuse that save, and it closes no hole this
+        // direction leaves open.
+        //
+        // It lives HERE, beside the row-identity check above, because this function
+        // runs on BOTH sides of every durable operation: the store's decode calls
+        // it on a loaded record, `compare_and_save` calls it on the proposed one
+        // and `CanaryRemovalOperationVersion::of` calls it on the expected one. A
+        // rule held only in the store's transition validator would leave an
+        // ALREADY WRITTEN record whose blocking id was cleared permanently
+        // readable through `load_canary_removal_operation` and
+        // `canary_removal_status`, which never reach that validator at all.
+        let carries_unknown = self
+            .effect_progress
+            .iter()
+            .any(|progress| matches!(progress.state, CanaryRemovalEffectState::Unknown { .. }));
+        if carries_unknown
+            && !self.effect_progress.iter().any(|progress| {
+                matches!(progress.state, CanaryRemovalEffectState::Unknown { .. })
+                    && Some(&progress.effect_id) == self.blocking_effect_id.as_ref()
+            })
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         self.expected_stage()?;
         Ok(())
     }
@@ -875,56 +1539,74 @@ impl CanaryRemovalOperation {
     ///
     /// The stage is never authored independently: a green stage over an
     /// unresolved effect is refused here and can never be persisted. `Completed`
-    /// is admitted only when no `REMOVE` row is still open, which is the
-    /// terminal registry record's own resolved state together with the
-    /// authoritative readback of every row before it.
+    /// is admitted only when no row of the frozen denominator is still
+    /// unresolved, which is what the terminal registry record's own resolution
+    /// together with the authoritative readback of every other row achieves.
     ///
-    /// Only `action == Remove` rows are counted at all, so `Retained` never
-    /// reaches the counters: the guard above `continue`s past every retained or
-    /// unsupported row, and `validate` refuses `(Remove, Retained)` before it
-    /// ever calls this function. `Retained` is the admission-time disposition
-    /// of a row this removal deliberately leaves intact, carrying that row's
-    /// ownership evidence; it is a decision this plan already made, not an
-    /// unfinished row, so it can neither keep the operation open nor count as
-    /// work this operation performed.
+    /// EVERY row is counted, whatever its planned action. A retained, shared,
+    /// preexisting or owner-derived row is part of the removal denominator, so
+    /// leaving it out of these counters would let `Completed` be reached while
+    /// such a row had never been read back from the owner that holds it. The
+    /// three dispositions of a resolved row are therefore accounted for
+    /// deliberately:
     ///
-    /// The other two dispositions are the row's own postcondition read back
-    /// from the resource's own owner, and each is accounted for deliberately:
+    /// * `Retained` is a readback outcome, not a plan-time decision: the row's
+    ///   own owner reported the resource still present under its admitted
+    ///   identity. It is closed and it is not evidence that this operation drove
+    ///   a mutation, so it contributes to neither counter.
+    /// * `Absent` asserts the POSTCONDITION and nothing else: the exact admitted
+    ///   object is authoritatively absent, with the evidence its own owner
+    ///   reported. It deliberately makes no claim about whether a removal
+    ///   mutation was issued under this identity, because the durable row
+    ///   cannot always answer that. Today `resolve_row` writes it from exactly
+    ///   one site — the reconcile-before-execute pass in `advance_row` — and at
+    ///   that site the row's prior durable state is `Pending` on a fresh drive
+    ///   OR `IntentCommitted` on a resumed one, which already carries the
+    ///   `intent_digest` recording that a mutating call WAS issued. So "the row
+    ///   was still `Pending`" describes only half of today's writes; on a
+    ///   resumed row a mutation was issued, and the disposition is still
+    ///   `Absent` because the owner's verdict proves the postcondition and not
+    ///   the attempt history.
     ///
-    /// * `Absent` is the idempotent-resume outcome. `resolve_row` writes it when
-    ///   the row was still `Pending`, meaning the reconcile-before-execute pass
-    ///   already proved the exact admitted object authoritatively absent and no
-    ///   mutation was ever issued under this operation identity. The row's
-    ///   declared postcondition (`CanaryRemovalPostcondition::Absent`) is
-    ///   therefore satisfied, so it is closed and contributes nothing to
-    ///   `open`; and because this identity never issued a mutation for it, it is
-    ///   not evidence that this operation drove work, so it contributes nothing
-    ///   to `started` either.
+    ///   This matters most for a future reconciliation of an `Unknown` row.
+    ///   `unknown_row` OVERWRITES `IntentCommitted` with `Unknown { pending_ref }`,
+    ///   which retains no attempt and no intent digest, so after an unknown
+    ///   outcome whether a mutation was issued is unrecoverable from the durable
+    ///   row. A reconciliation that reads the object back as authoritatively
+    ///   absent with non-empty evidence must therefore write `Absent`, NOT
+    ///   `Removed`: `Removed`'s own definition is that the removal mutation WAS
+    ///   issued and read back, and on post-unknown evidence that is an assertion
+    ///   about a fact this row no longer holds. `Absent` is the honest disposition
+    ///   for a `Remove` row on that evidence, and it needs no relaxation of
+    ///   `validate`, which already admits `Absent` for every `Remove` row.
+    ///
+    ///   The row's declared postcondition (`CanaryRemovalPostcondition::Absent`)
+    ///   is satisfied either way, so it is closed and contributes nothing to
+    ///   `open`; and it is not evidence that this operation drove work, so it
+    ///   contributes nothing to `started` either.
     /// * `Removed` is closed for the same reason, but it *is* evidence that this
-    ///   operation executed, so it keeps the stage at `Executing` while the
-    ///   terminal registry row is still open. Counting a resolved row as open
-    ///   instead would keep `open` above zero for every plan that removes
-    ///   anything, so `Completed` would be unreachable and the terminal registry
-    ///   retirement could never be recorded as a durable outcome.
+    ///   operation executed, so it keeps the stage at `Executing` while any other
+    ///   row is still open. Counting a resolved row as open instead would keep
+    ///   `open` above zero for every plan that removes anything, so `Completed`
+    ///   would be unreachable and the terminal registry retirement could never
+    ///   be recorded as a durable outcome. `Removed` is only ever the correct
+    ///   disposition where this operation can point at the mutation it issued —
+    ///   the post-execute readback in `advance_row`, and the terminal registry
+    ///   record closed in `finish_with_readback` on the owner's own receipt. It
+    ///   is never a fallback for an outcome this row cannot attribute.
     ///
-    /// `open == 0` therefore means "no removal row is still unresolved", which
-    /// is what authorises the terminal commit. It does not mean "every resource
-    /// was deleted": the terminal registry retirement is a record about the
-    /// approved-generation activation record for this generation, and the
-    /// independently retried idempotent path above (`recover_canary_removal`
-    /// returning an already `Completed` projection untouched) is what makes
-    /// reaching it safe. What the terminal commit asserts is that every
-    /// `Remove` row's exact postcondition was observed from its own owner and
-    /// that no `Remove` row is still open - never that a retained resource was
-    /// removed.
+    /// `open == 0` therefore means "no row of the removal denominator is still
+    /// unresolved", which is what authorises the terminal commit. It does not
+    /// mean "every resource was deleted": the terminal registry retirement is a
+    /// record about the approved-generation activation record for this
+    /// generation, and the independently retried idempotent path
+    /// (`recover_canary_removal` returning an already `Completed` projection
+    /// untouched) is what makes reaching it safe.
     fn expected_stage(&self) -> Result<(), InstallationError> {
         let mut open = 0_usize;
         let mut unknown = 0_usize;
         let mut started = 0_usize;
-        for (effect, progress) in self.plan.effects.iter().zip(&self.effect_progress) {
-            if effect.action != CanaryRemovalAction::Remove {
-                continue;
-            }
+        for progress in &self.effect_progress {
             match progress.state {
                 CanaryRemovalEffectState::Pending => open += 1,
                 CanaryRemovalEffectState::IntentCommitted { .. } => {
@@ -934,27 +1616,15 @@ impl CanaryRemovalOperation {
                 // A resolved row is no longer open: its exact postcondition was
                 // already read back from the resource's own owner. `Removed`
                 // still proves that this operation executed, so it keeps the
-                // stage at `EXECUTING` while the terminal registry row is still
-                // pending. Counting a resolved row as open instead would keep
-                // `open` above zero for every plan that removes anything, so
-                // `Completed` would be unreachable and the terminal registry
-                // retirement could never be recorded as a durable outcome.
+                // stage at `Executing` while the terminal registry row is still
+                // pending. See the method documentation for why each disposition
+                // is accounted for the way it is.
                 CanaryRemovalEffectState::Resolved {
                     disposition: CanaryRemovalEffectDisposition::Removed,
                     ..
                 } => {
                     started += 1;
                 }
-                // `Absent` is the idempotent-resume outcome: the resource's own
-                // owner already proved the exact admitted object absent, so this
-                // operation identity never issued a mutation for the row. It is
-                // closed and it is not evidence that this operation drove work,
-                // so it contributes to neither counter. `Retained` is listed
-                // here only for exhaustiveness: `validate` refuses
-                // `(Remove, Retained)` and the guard above already skipped
-                // every non-`Remove` row, so it cannot reach this loop. See the
-                // method documentation for why each disposition is accounted
-                // for the way it is.
                 CanaryRemovalEffectState::Resolved {
                     disposition:
                         CanaryRemovalEffectDisposition::Absent
@@ -1013,22 +1683,22 @@ impl CanaryRemovalOperation {
                 }
             }
         }
-        let removals_resolved =
-            self.plan
-                .effects
-                .iter()
-                .zip(&self.effect_progress)
-                .all(|(effect, progress)| {
-                    effect.action != CanaryRemovalAction::Remove
-                        || matches!(progress.state, CanaryRemovalEffectState::Resolved { .. })
-                });
+        // Completeness is judged against the whole frozen denominator, not only the
+        // rows that happen to be removed: a retained, shared, preexisting or
+        // owner-derived row that has not been read back yet still needs the
+        // owner-driven pass, so this operation must not advertise the final
+        // independent readback as the next permitted action.
+        let denominator_resolved = self
+            .effect_progress
+            .iter()
+            .all(|progress| matches!(progress.state, CanaryRemovalEffectState::Resolved { .. }));
         let next_permitted_action = match self.stage {
             CanaryRemovalStage::Completed => CanaryRemovalNextAction::Readback,
             CanaryRemovalStage::Reconciling if cleanup_uncertainty.is_some() => {
                 CanaryRemovalNextAction::ManualRecovery
             }
             CanaryRemovalStage::Reconciling | CanaryRemovalStage::Executing => {
-                if removals_resolved {
+                if denominator_resolved {
                     CanaryRemovalNextAction::Readback
                 } else {
                     CanaryRemovalNextAction::Reconcile
@@ -1151,9 +1821,20 @@ pub fn canary_removal_operation_id(
 /// Resolves the exact installed canary target and returns the frozen,
 /// read-only removal plan.
 ///
-/// This step loads the accepted installation registry, the original
-/// transaction and any already admitted removal record read-only and creates
-/// no file, secret, service, reservation or transaction row. A foreign,
+/// This step creates no file, secret, service, reservation or transaction row,
+/// and its own registry use is a read: the accepted installation registry is
+/// loaded exactly once through `RedbInstallationRegistry::load`
+/// (`redb_state.rs:298`), which begins a read transaction, while the original
+/// transaction and any already admitted removal record are read through the
+/// store the coordinator already owns. What is not read-only is the registry
+/// FILE, and the cause is this seam's parameter type plus the caller's
+/// construction of it, never this body: `registry` is
+/// `&RedbInstallationRegistry`, a type whose only redb field is a `Database`
+/// and whose every constructor supplies one, so the caller hands in redb's
+/// exclusive writer handle and redb 4.1.0
+/// `Drop for Database` commits its own `allocator_state` quick-repair
+/// transaction on drop — incurred before this body runs and again after it.
+/// The module header carries that measured chain in full. A foreign,
 /// ambiguous, replaced, production or last-known-good target is refused here,
 /// before any destructive path exists. A target without an observed
 /// activation-owner handoff to a serving safe generation is refused here as
@@ -1461,8 +2142,10 @@ fn require_complete_effect_coverage(
 /// * **Canary leases, sessions and routes.** The authority that can admit this
 ///   canary's leases, sessions and routes is the transaction's own supervision
 ///   authority. Its stable lease scope identity is validated in either strict
-///   binding state, and when the authority is provisioned the existing owner's
-///   own `validate()` is run against the ORIGINAL recorded receipt - the owner
+///   binding state by the launch descriptor's own validator, which the re-loaded
+///   transaction ran before this function was reached, and when the authority is
+///   provisioned the existing owner's own `validate()` is run against the
+///   ORIGINAL recorded receipt - the owner
 ///   compares its recorded `watchdog_admission_template_digest` and
 ///   `provision_receipt_digest` itself. Nothing here recomputes a fresh digest
 ///   to stand in for that check, and nothing re-mints a lease, session or route
@@ -1475,12 +2158,18 @@ fn require_complete_effect_coverage(
 ///   receipt - is refused outright. A held intent together with that receipt
 ///   is retained historical provenance, not a pending projection.
 ///
-/// The owner-derived rows are re-derived here and compared identity for
-/// identity against the frozen plan. That is what stops a plan from naming a
+/// The plan's declared `build` binding is compared against the same
+/// re-derived binding here, so a plan cannot freeze artifact digests the
+/// installed transaction does not carry.
+///
+/// The owner-derived rows are compared here, identity for identity AND action
+/// for action, against the frozen plan. That is what stops a plan from naming a
 /// substituted canary evidence root or a substituted Store/Blob object set and
 /// still presenting itself as a complete owner-effect inventory, and it is what
-/// keeps the shared and foreign rows `Retain` instead of letting a plan claim
-/// to delete another generation's durable state.
+/// pins the two shared surfaces with no owner readback to `OutOfScope` instead
+/// of letting a plan present an unobservable surface as one this removal
+/// retained and proved. The shared and foreign rows stay non-`Remove`, so no
+/// plan can claim to delete another generation's durable state.
 ///
 /// Every failure is a refusal that leaves the durable incomplete recovery and
 /// its blocking effect exactly as observed. A canary whose lease authority is
@@ -1516,10 +2205,6 @@ fn require_quiesced_owner_effects(
         ));
     }
     let launch = &install.candidate_manifest.runtime_launch;
-    // The lease/session/route admission authority of this exact generation. The
-    // stable scope identity is validated in either strict binding state, so a
-    // Phase-A candidate that never received a live overlay is still covered.
-    let lease_scope = handle_ref(launch.supervision_lease_scope_id())?;
     if launch.generation != install.candidate_manifest.generation {
         return Err(InstallationError::IdentityConflict);
     }
@@ -1552,19 +2237,51 @@ fn require_quiesced_owner_effects(
         // The authority must be this canary's own, in this installation. A
         // neighbour's or a foreign installation's authority is refused here
         // instead of being revoked under the wrong identity.
+        //
+        // The lease scope is deliberately NOT compared here, and there is no
+        // second comparison elsewhere that stands in for one.
+        // `RuntimeLaunchDescriptor::supervision_lease_scope_id` returns
+        // `SupervisionAuthorityBinding::scope_id`, which for a provisioned
+        // binding returns `authority.supervision_lease_scope_id` itself, so a
+        // comparison against `authority.supervision_lease_scope_id` compares
+        // that one recorded value with itself and can never refuse anything. The
+        // scope's own integrity belongs to the existing owners and is already
+        // checked on this path: the `authority.validate()` above rejects a
+        // blank, untrimmed or control-charactered scope and re-derives both
+        // `watchdog_admission_template_digest` and `provision_receipt_digest`
+        // against the ORIGINAL recorded receipt, and the launch descriptor's own
+        // validator - which the re-loaded transaction ran before this function was
+        // reached - validates the scope handle in either strict binding state.
         let installation = &plan.installation_epoch.installation;
-        if authority.supervision_lease_scope_id != lease_scope.as_str()
-            || authority.candidate_generation != plan.generation.as_str()
+        if authority.candidate_generation != plan.generation.as_str()
             || authority.trust_anchor.installation_id != installation.as_str()
         {
             return Err(InstallationError::IdentityConflict);
         }
     }
-    // The owner-derived rows, re-derived from the transaction and compared to
-    // the frozen plan. Each category must appear exactly once, its identity
-    // must be the one this transaction's own manifest derives, and the shared
-    // or foreign rows must still be `Retain` so no plan can claim to delete
-    // another generation's durable state.
+    // The plan's own build binding is re-derived here from the re-loaded
+    // transaction and compared against the frozen member. `plan_digest` already
+    // covers `build`, so a caller could otherwise freeze ANY host, kernel,
+    // canonical-Store or Store-bridge digest and have apply admit the document:
+    // nothing else in this module reads `plan.build`. Comparing it here makes
+    // the "the exact build identity a removal is bound to" claim an enforced
+    // one instead of a transitively-implied consequence of `manifest_digest`.
+    if plan.build != CanaryRemovalBuildBinding::from_manifest(&install.candidate_manifest)? {
+        return Err(InstallationError::IdentityConflict);
+    }
+    // The owner-derived rows, compared to the frozen plan. Each category must
+    // appear exactly once, its identity must be the one this transaction's own
+    // manifest derives, and the shared or foreign rows must carry exactly the
+    // action this owner admits for them: `OutOfScope` for the two shared
+    // surfaces no owner in this crate can observe, so no plan can present an
+    // unobservable surface as a retained one this removal proved and no plan
+    // can drop either one by classifying it as required cleanup this owner
+    // cannot perform, and `Remove` only for the terminal registry record. The
+    // check is on the row's PRESENCE and on its CLASSIFICATION together: a plan
+    // that omits one of these two categories is refused exactly as a plan that
+    // relabels one of them is. The plan's ownership claim is compared in the same
+    // loop for the two categories whose claim is that re-derived identity, so a
+    // substituted claim cannot ride in beside a correct identity.
     let expected_owners = [
         (
             CanaryRemovalResource::CanaryEvidenceRoot,
@@ -1573,12 +2290,17 @@ fn require_quiesced_owner_effects(
                 .runtime_launch
                 .runtime_state_roots
                 .canary_evidence_root()?,
-            CanaryRemovalAction::Retain,
+            CanaryRemovalAction::OutOfScope,
         ),
         (
+            // The Store identity is the generation's own owner-recorded Store
+            // bridge binding, re-derived here from the transaction rather than
+            // compared with the plan's own row, so a plan that froze a
+            // substituted Store identity is refused here.
             CanaryRemovalResource::StoreObjects,
-            install.candidate_manifest.generation.clone(),
-            CanaryRemovalAction::Retain,
+            CanaryRemovalBuildBinding::from_manifest(&install.candidate_manifest)?
+                .store_bridge_artifact_digest,
+            CanaryRemovalAction::OutOfScope,
         ),
         (
             CanaryRemovalResource::GenerationRegistryRecord,
@@ -1600,6 +2322,48 @@ fn require_quiesced_owner_effects(
             });
         }
         if row.resource_identity != identity || row.action != action {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // The plan's own ownership CLAIM is compared here as well, in this same
+        // loop, through this same `IdentityConflict`, and only for the two
+        // categories whose claim IS the identity this owner re-derives.
+        //
+        // Before this, `ownership_evidence` was read for SHAPE only —
+        // non-empty and handle-valid, by `CanaryRemovalEffect::validate` — plus
+        // disjointness from `reference_users`. Nothing compared it to anything
+        // observed, so a plan whose owner-derived row carried an arbitrary,
+        // owner-never-reported handle passed this fence as long as
+        // `resource_identity` was right, and a string this module minted about
+        // itself stood in for evidence. A synthetic handle is not evidence.
+        //
+        // The containment below is an equality in an untouched plan, not a new
+        // rule about what evidence may be. `canary_evidence_row` mints
+        // `ownership_evidence: vec![root]` from the very value it takes as
+        // `resource_identity`, and `store_objects_row` mints
+        // `vec![owner_recorded_store_binding]` from the very
+        // `CanaryRemovalBuildBinding::from_manifest` member it takes as
+        // `resource_identity`. Those are the two expressions re-derived at the
+        // two entries above from the transaction the durable store holds, so a
+        // plan this owner produced always contains them and an untouched plan is
+        // never refused here.
+        //
+        // `GenerationRegistryRecord` is deliberately NOT constrained, because
+        // its claim is not the owner's re-derived identity: `registry_record_row`
+        // mints `canary-removal/evidence/registry-record:{generation}`, a handle
+        // this module invented about itself whose only input is the generation,
+        // while the identity re-derived for that category is the generation
+        // itself. Requiring the generation in that row's evidence would refuse
+        // this owner's own untouched plans, so the claim there stays
+        // shape-checked only. What that row's evidence would take is the card's
+        // own decision — an owner-issued terminal receipt binding the removal
+        // operation id, generation, predecessor revision and resulting
+        // revision/content digest, or `Unsupported` so the fence guard blocks
+        // apply — and neither is a comparison this function may invent.
+        if matches!(
+            category,
+            CanaryRemovalResource::CanaryEvidenceRoot | CanaryRemovalResource::StoreObjects
+        ) && !row.ownership_evidence.contains(&identity)
+        {
             return Err(InstallationError::IdentityConflict);
         }
     }
@@ -1672,9 +2436,20 @@ fn observe_admission_fence(
 ///
 /// The window is re-derived from the durable operation state, never from a
 /// fresh per-call budget, so a resumed or retried reconcile can neither restart
-/// nor extend it. Every path that could issue a destructive call consults this
-/// first: at expiry the drive is refused and the durable incomplete recovery is
-/// preserved unchanged.
+/// nor extend the RECORDED value: the store's compare-and-save path refuses any
+/// change to it, and this function takes only the operation, never a caller
+/// supplied instant.
+///
+/// The bound it enforces is wall-clock, not elapsed time. The clock read here is
+/// the system clock (see [`super::wall_clock_millis`]), so it is not monotonic
+/// and not injectable; a system clock that steps backwards past the recorded
+/// deadline makes this return false again and re-opens the window for this SAME
+/// removal identity, with no new admission and no new identity. That is a
+/// property of the clock, and it is not something this check can close.
+///
+/// Every path that could issue a destructive call consults this first: at expiry
+/// the drive is refused and the durable incomplete recovery is preserved
+/// unchanged.
 fn reconcile_budget_exhausted(operation: &CanaryRemovalOperation) -> bool {
     wall_clock_millis() >= operation.reconcile_deadline_ms
 }
@@ -1822,7 +2597,9 @@ fn surviving_generations(
 /// surviving generation still references it; a shared or preexisting row is
 /// `RETAINED` with its ownership evidence; a transaction-created row this owner
 /// has no admitted removal path for is `UNSUPPORTED` and therefore blocks
-/// apply instead of leaving the denominator.
+/// apply instead of leaving the denominator. The two shared surfaces appended
+/// below, which no owner in this crate can read back at all, are `OUT_OF_SCOPE`:
+/// named with their owner-recorded evidence, and neither removed nor proved.
 #[allow(
     clippy::too_many_lines,
     reason = "all install effects are classified against one frozen removal denominator"
@@ -1930,7 +2707,7 @@ fn freeze_effect_graph(
         });
     }
     rows.push(canary_evidence_row(install, survivors)?);
-    rows.push(store_objects_row(&install.candidate_manifest.generation)?);
+    rows.push(store_objects_row(install)?);
     rows.push(registry_record_row(&install.candidate_manifest.generation)?);
     order_effect_graph(&mut rows);
     Ok(rows)
@@ -2011,6 +2788,83 @@ fn reconciliation_query(
     .map_err(|error| platform_error(&error))
 }
 
+/// Freezes the `CanaryEvidenceRoot` row as `OutOfScope`, because no owner in
+/// this crate can observe this root from outside the plan.
+///
+/// Issue #1138's removal algorithm step 2 requires the out-of-scope categories
+/// to be NAMED WITH EVIDENCE rather than dropped from the denominator, and this
+/// row is named: its category, its `ForeignToThisRemoval` origin, the exact root
+/// the runtime topology derives, its reference users, its bound and its
+/// reconciliation query are all frozen here and bound by `plan_digest`, so the
+/// surface cannot disappear from the denominator and cannot be relabelled as
+/// something this removal removed or proved.
+///
+/// The row stays in the denominator, and two of its members are still load-
+/// bearing. Its `resource_identity` is the exact root the runtime topology
+/// derives, and that identity is compared identity for identity against the
+/// transaction the durable store holds — but `revalidate_fence` does not make
+/// that comparison itself. The comparison lives in
+/// `require_quiesced_owner_effects`, in its `expected_owners` loop, which
+/// re-derives this category's root from the transaction; `revalidate_fence`
+/// reaches it only by calling that function (as do
+/// `reobserve_before_mutation` before each mutating call and
+/// `finish_with_readback` before the terminal retirement). A plan that froze a
+/// substituted root is therefore refused, by that function and not by the
+/// entry-point fence's own text.
+///
+/// Its `ownership_evidence` is that same root, and the same loop requires it to
+/// CONTAIN the re-derived root as well. That is an equality in an untouched plan
+/// rather than a new rule: the `vec![root]` minted below is the very value taken
+/// as `resource_identity`, so requiring it is what stops a plan from keeping the
+/// admitted root while replacing the claim about who holds it with a handle no
+/// owner ever reported.
+///
+/// Its `reference_users` are the survivor set this plan committed to keep, and
+/// that set is the only record of it: THAT pin does live in `revalidate_fence`
+/// itself, as the `planned_survivors(plan)? != observed_survivors(&projection,
+/// plan)` comparison before the terminal commit, and `terminal_proofs_hold`
+/// then requires every member of it to still be projected. What the row cannot
+/// do is observe the root itself.
+///
+/// The readback it used to carry re-derived `canary_evidence_root()` from the
+/// manifest the plan froze and compared it with the row the plan had set from
+/// that very expression. `revalidate_fence` proves
+/// `candidate_manifest_digest(&install.candidate_manifest)? == plan.manifest_digest`
+/// before any row is driven, so that comparison could not fail. Deleting the
+/// root from disk after planning leaves both sides byte-identical, which means
+/// the readback could not observe the one thing it existed to observe.
+///
+/// `InstallationEffectPort` cannot supply the missing observation. Its complete
+/// method set is: `fresh_service_registration_nonce`,
+/// `fresh_ownership_secret_reference`, `prepare_ownership_secret`,
+/// `prepare_user_mode_authority`, `has_prepared_user_mode_authority`,
+/// `discard_prepared_user_mode_authority`, `provision_ownership_secret`,
+/// `execute`, `execute_service`, `inspect`, `reconcile`,
+/// `delete_ownership_secret` and `ownership_secret_absent`. Only `inspect` and
+/// `reconcile` return an observation, both require an `&InstallationEffectRequest`,
+/// and the only constructor of that request in this crate is `effect_request`,
+/// which clones one entry of the original install transaction's own
+/// `installer_effects` roster. No parameter of any of the thirteen methods is a
+/// bare filesystem root path, and `InstallerEffectPlan` has no variant that names
+/// one independently of a transaction-owned installer effect.
+///
+/// `reconcile` does read a root for real — the production adapter falls through
+/// to `reconcile_primitive`, which calls `WindowsInstallerRootPrimitive::inspect`
+/// on the requested root — but only for a request addressed to that row's own
+/// `CreateRoot`/`ApplyAcl` effect, and the identity it reports is a digest over
+/// the observed root object snapshot, never the root path. This row's
+/// `resource_identity` IS a path, so that observation has nothing to be compared
+/// against, and its `ForeignToThisRemoval` origin is refused outright by
+/// `classify_observation`, which admits `Matching` only for a row this
+/// transaction created or adopted. That row already exists: `freeze_effect_graph`
+/// derives an `InstallationRoot` row from the same `CreateRoot` effect, and that
+/// row carries exactly this comparison against the owner's own verdict. A second
+/// row pointed at the same effect would duplicate one installer effect across two
+/// rows, which `require_complete_effect_coverage` refuses.
+///
+/// So this owner records the surface, names the missing capability in the
+/// classification itself, and reports it as out of scope rather than comparing a
+/// string with itself.
 fn canary_evidence_row(
     install: &InstallationTransaction,
     survivors: &[PlatformHandle],
@@ -2021,11 +2875,6 @@ fn canary_evidence_row(
         .runtime_state_roots
         .canary_evidence_root()?;
     let reference_users = survivors.to_vec();
-    let action = classify_action(
-        CanaryRemovalResourceOrigin::ForeignToThisRemoval,
-        !reference_users.is_empty(),
-        false,
-    );
     let query = format!(
         "canary-removal/reconcile/canary-evidence-root:{}",
         install.transaction_id.as_str()
@@ -2037,7 +2886,7 @@ fn canary_evidence_row(
         ))?,
         category: CanaryRemovalResource::CanaryEvidenceRoot,
         origin: CanaryRemovalResourceOrigin::ForeignToThisRemoval,
-        action,
+        action: CanaryRemovalAction::OutOfScope,
         resource_identity: root.clone(),
         ownership_evidence: vec![root],
         reference_users,
@@ -2049,19 +2898,90 @@ fn canary_evidence_row(
     })
 }
 
+/// Freezes the `StoreObjects` row as `OutOfScope`, because no Store or Blob
+/// owner is reachable from this crate.
+///
+/// Issue #1138's removal algorithm step 2 requires the out-of-scope categories
+/// to be NAMED WITH EVIDENCE rather than dropped from the denominator, and this
+/// row is named: its category, its `ForeignToThisRemoval` origin, the
+/// generation's own owner-recorded Store binding, its bound and its
+/// reconciliation query are all frozen here and bound by `plan_digest`.
+///
+/// The row stays in the denominator with the generation's owner-recorded Store
+/// binding as its identity, because it accounts for a resource this removal does
+/// not destroy. That identity is still compared against the binding the
+/// transaction the durable store holds derives, so a plan that froze a
+/// substituted Store identity is refused — but `revalidate_fence` does not make
+/// that comparison itself. The comparison lives in
+/// `require_quiesced_owner_effects`, in its `expected_owners` loop, which
+/// re-derives this category's Store binding from the transaction;
+/// `revalidate_fence` reaches it only by calling that function (as do
+/// `reobserve_before_mutation` before each mutating call and
+/// `finish_with_readback` before the terminal retirement). What the row cannot
+/// do is enumerate or observe the canonical Store and Blob objects a generation
+/// actually wrote, and no readback may stand in for that.
+///
+/// The row's `ownership_evidence` is that same owner-recorded binding, and the
+/// same loop requires it to CONTAIN the re-derived binding as well. In an
+/// untouched plan that is an equality, not a new rule: the
+/// `vec![owner_recorded_store_binding]` minted below is the very value taken as
+/// `resource_identity`. That is what replaced the
+/// `canary-removal/evidence/store-owner:{generation}` handle this card's DO NOT
+/// calls out: a claim the owner minted about itself could only restate this
+/// row's own identity and so could never fail, whereas the manifest's approved
+/// Store bridge binding is an artifact digest the installation transaction
+/// durably carried and that apply can therefore disagree with.
+///
+/// Why there is no owner readback, measured rather than assumed:
+///
+/// * `crates/kernel/eliot-installation/Cargo.toml` declares eliot-config,
+///   eliot-contracts, eliot-ipc, eliot-platform, eliot-platform-windows,
+///   eliot-protocol, eliot-runtime-contracts, redb, schemars, serde, `serde_json`,
+///   sha2, thiserror and tokio. There is no Store or Blob dependency, so this
+///   crate cannot name the canonical Store or Blob owner at all.
+/// * `git grep -n "trait .*Store\|trait .*Blob" -- crates/kernel/eliot-installation/`
+///   returns exactly one hit: `pub trait InstallationTransactionStore`, which is
+///   the installation transaction store, not the canonical Store owner.
+/// * The generation-scoped owner reads DO exist in this repository, in
+///   `crates/storage/eliot-blob-api`: `BlobLiveSetProof` with its
+///   `LiveSetCompleteness`, `BlobReachabilityRequest`/`BlobReachabilityView`,
+///   `BlobGcRequest`/`BlobGcReceipt`, `BlobReferenceRequest`/
+///   `BlobReferenceObservation`, `BlobHealth`, and `BlobLocator` carrying
+///   `root_generation` and `path_generation`. They are fenced by a
+///   `BlobRootLease` whose `root_generation` selects the generation, so a
+///   Store/Blob row readback is a real capability in this repository — it is
+///   simply not reachable from here. Adding this crate as a consumer of that API
+///   is the bounded adapter extension the issue's own lane 3 requires to be
+///   "serialized with its owner", so it is out of scope for this card and is not
+///   done here.
+/// * `I3.15` draws the same boundary in normative prose: "Canonical Store
+///   receives only later installation/capability observations and policy
+///   decisions, not the transaction's operational authority." Reading
+///   generation-scoped canonical Store or Blob objects from here would make this
+///   crate that owner, which the card forbids.
+///
+/// A handle this module minted for itself would be worth nothing: it could only
+/// restate this row's own generation identity, so it could never fail when the
+/// binding the plan froze stopped matching what the transaction holds. Evidence
+/// that cannot fail is not evidence, and the row is therefore classified
+/// `OutOfScope` and named with the evidence the owner actually recorded, instead
+/// of being dropped from the denominator or reported as a retained surface this
+/// removal proved.
 fn store_objects_row(
-    generation: &PlatformHandle,
+    install: &InstallationTransaction,
 ) -> Result<CanaryRemovalEffect, InstallationError> {
-    let evidence = PlatformHandle::new(format!("canary-removal/evidence/store-owner:{generation}"))
-        .map_err(|error| platform_error(&error))?;
+    let generation = &install.candidate_manifest.generation;
+    let owner_recorded_store_binding =
+        CanaryRemovalBuildBinding::from_manifest(&install.candidate_manifest)?
+            .store_bridge_artifact_digest;
     let query = format!("canary-removal/reconcile/store-owner:{generation}");
     Ok(CanaryRemovalEffect {
         effect_id: handle_ref(&format!("canary-removal/effect/store-objects:{generation}"))?,
         category: CanaryRemovalResource::StoreObjects,
         origin: CanaryRemovalResourceOrigin::ForeignToThisRemoval,
-        action: CanaryRemovalAction::Retain,
-        resource_identity: generation.clone(),
-        ownership_evidence: vec![evidence],
+        action: CanaryRemovalAction::OutOfScope,
+        resource_identity: owner_recorded_store_binding.clone(),
+        ownership_evidence: vec![owner_recorded_store_binding],
         reference_users: Vec::new(),
         prerequisites: Vec::new(),
         expected_postcondition: CanaryRemovalPostcondition::Retained,
@@ -2071,6 +2991,25 @@ fn store_objects_row(
     })
 }
 
+/// Freezes the terminal `GenerationRegistryRecord` row, which is `Remove`.
+///
+/// Unlike the two `OutOfScope` rows beside it, this row's `ownership_evidence`
+/// is NOT the owner's re-derived identity, so the `expected_owners` loop in
+/// `require_quiesced_owner_effects` deliberately does not constrain it. The
+/// handle minted below is one this module invented about itself from the
+/// generation alone, while the identity re-derived for this category is the
+/// generation itself, so requiring the generation to appear in this row's
+/// evidence would refuse this owner's own untouched plans.
+///
+/// The row's real identity claim is proved elsewhere and by observation rather
+/// than by a plan string: `resource_identity` is compared against the
+/// transaction's own generation, and the terminal effect is proved by the
+/// owner-issued `CanaryRemovalTerminalReceipt` binding this removal operation
+/// id, the generation, the predecessor revision and the resulting revision and
+/// content digest, re-read from the projection after the retirement. Replacing
+/// this evidence handle with something an owner actually issued, or classifying
+/// the row `Unsupported` so the existing fence guard blocks apply, is the card's
+/// own decision and is not taken here.
 fn registry_record_row(
     generation: &PlatformHandle,
 ) -> Result<CanaryRemovalEffect, InstallationError> {
@@ -2104,23 +3043,25 @@ fn registry_record_row(
 /// installer/Host owner, so it cannot commit before every resource outcome is
 /// observed. Keeping it last is also what leaves the running coordinator, its
 /// journal and its recovery key available until the final readback finishes.
+///
+/// EVERY row is placed by the same four-band key, not only the removed ones. A
+/// retained, shared, preexisting or owner-derived row that was left unplaced
+/// would sort behind the terminal record and then never be re-read before the
+/// operation commits, so each row is ranked rather than given a fallback
+/// position. Within one band, rows keep `effect_id` order so the frozen graph is
+/// deterministic, and `prerequisites` is then exactly the set of rows positioned
+/// before each row. See `order_band` for what the four bands are and why they
+/// are in that order.
 fn order_effect_graph(rows: &mut [CanaryRemovalEffect]) {
-    let mut removals = rows
+    rows.sort_by(|left, right| {
+        order_band(left)
+            .cmp(&order_band(right))
+            .then_with(|| left.effect_id.cmp(&right.effect_id))
+    });
+    let order = rows
         .iter()
-        .filter(|row| {
-            row.action == CanaryRemovalAction::Remove
-                && row.category != CanaryRemovalResource::GenerationRegistryRecord
-        })
         .map(|row| row.effect_id.clone())
         .collect::<Vec<_>>();
-    removals.sort();
-    let mut order = removals;
-    let registry_rows = rows
-        .iter()
-        .filter(|row| row.category == CanaryRemovalResource::GenerationRegistryRecord)
-        .map(|row| row.effect_id.clone())
-        .collect::<Vec<_>>();
-    order.extend(registry_rows);
     for row in rows.iter_mut() {
         row.prerequisites = order
             .iter()
@@ -2128,12 +3069,51 @@ fn order_effect_graph(rows: &mut [CanaryRemovalEffect]) {
             .cloned()
             .collect();
     }
-    rows.sort_by_key(|row| {
-        order
-            .iter()
-            .position(|id| id == &row.effect_id)
-            .unwrap_or(usize::MAX)
-    });
+}
+
+/// Execution band of one removal row, ordered by WHAT THE ROW CAN DO rather than
+/// by what class it was given, because only a mutating row can make this drive
+/// irreversible:
+///
+/// * **Band 0 — a row no owner this crate can reach can read back.** It carries no
+///   installer effect and is not the terminal registry record, which is exactly
+///   the shape `readback_request` refuses: there is no owner to ask and no
+///   evidence any owner could report, so the drive cannot close it. `advance_row`
+///   refuses such a row before it can reach `port.execute` — through
+///   `read_retained_row` for a non-`Remove` row, and through its own
+///   "names no installer effect" guard for a `Remove` one.
+/// * **Band 1 — the only rows that mutate.** `Remove` with an installer effect is
+///   the sole shape `advance_row` drives through `reobserve_before_mutation`,
+///   `commit_intent` and `port.execute`.
+/// * **Band 2 — read-only and readable.** A non-`Remove` row WITH an installer
+///   effect is read once through the owner that holds the resource and closed as
+///   `Retained`; it can neither mutate nor be refused for want of a readback.
+/// * **Band 3 — the terminal registry record**, the hand-off of control.
+///
+/// Band 0 therefore precedes band 1 for the only reason that matters: a row that
+/// cannot be read back is DETECTED before any destructive call is issued. While
+/// `StoreObjects` and `CanaryEvidenceRoot` were `Unsupported`, `revalidate_fence`
+/// refused them before any row was driven; classified `OutOfScope` they are no
+/// longer a required cleanup, that fence does not fire for them, and the refusal
+/// became `readback_request`'s inside the per-row drive. Ranking them beside the
+/// `Remove` rows — behind them, as an action-only key puts them — would place that
+/// refusal after every destructive row had already been driven, which is the
+/// regression this order removes. Readable `Retain` rows keep their existing
+/// position AFTER the mutating rows, so the only ordering change is the one the
+/// refusal requires.
+///
+/// Every row falls into exactly one band, which is what guarantees that no row can
+/// end up behind the terminal registry record.
+fn order_band(row: &CanaryRemovalEffect) -> u8 {
+    if row.category == CanaryRemovalResource::GenerationRegistryRecord {
+        3
+    } else if row.install_effect_index.is_none() {
+        0
+    } else if row.action == CanaryRemovalAction::Remove {
+        1
+    } else {
+        2
+    }
 }
 
 fn load_operation<P>(
@@ -2178,12 +3158,62 @@ where
     Ok(operation)
 }
 
+/// Builds the one typed refusal for a frozen row this owner cannot drive.
+///
+/// The row is named, its closed category is named, and the missing OWNER
+/// CAPABILITY is named, because those are the three different things a reader has
+/// to tell apart.
+///
+/// The only row shape this builder refuses is a REQUIRED CLEANUP this owner
+/// cannot perform: a transaction-owned resource the plan names as
+/// `UNSUPPORTED`, which issue #1138's removal algorithm step 2 says "blocks
+/// apply—it must not disappear from the denominator". It is deliberately the
+/// ONLY arm left. `StoreObjects` and `CanaryEvidenceRoot` used to have their own
+/// arms here because the frozen graph used to classify them `UNSUPPORTED`, which
+/// made a shared surface look like a required cleanup. They no longer do: they
+/// are `OUT_OF_SCOPE`, and `require_quiesced_owner_effects` runs before this
+/// builder's caller and pins both categories to exactly that action. A row of
+/// either category reaching this builder would already have been refused upstream,
+/// so keeping arms for them here would be branches no plan can reach. The measured
+/// reason each one needs no readback lives with its own row constructor:
+/// `canary_evidence_row` names the thirteen-method `InstallationEffectPort` set
+/// and the fact that its `resource_identity` is a path no port method accepts,
+/// and `store_objects_row` names the absent Store/Blob dependency and the
+/// generation-scoped reads that do exist in `crates/storage/eliot-blob-api` but
+/// are unreachable from here, with the same `I3.15` boundary quoted in both.
+///
+/// The failure stays the existing `InstallationError::IncompleteObservation`:
+/// the type is unchanged, there is no second refusal path and no wrapper enum,
+/// because a required cleanup this owner cannot perform leaves the observation
+/// incomplete rather than failed.
+fn unsupported_cleanup_refusal(row: &CanaryRemovalEffect) -> InstallationError {
+    InstallationError::IncompleteObservation(format!(
+        "the frozen plan names a required cleanup this owner cannot perform: removal row {} carries \
+         category {:?} as UNSUPPORTED because this owner has no admitted removal path for that \
+         transaction-owned resource; apply is refused before any row is driven and no removal \
+         evidence is minted for it. A SHARED or PREEXISTING surface this owner cannot observe is \
+         not a required cleanup and is never refused here: it is named in the denominator as \
+         OUT_OF_SCOPE instead",
+        row.effect_id.as_str(),
+        row.category
+    ))
+}
+
 /// Revalidates the durable fence before any destructive action: the exact
 /// installed transaction and its active-verified finished stage, the re-observed drain
 /// evidence (applied effects, no pending external change, no held activation
 /// intent), the current registry revision, the target's still-retired
 /// position, any pending activation, and the required re-observed
 /// activation-owner retirement handoff a dependent stop/delete has to follow.
+///
+/// A target the registry has ALREADY stopped carrying is recognised through the
+/// same rule and never through its absence: either this identity's own
+/// owner-issued terminal receipt is on file and passes every check, or this
+/// operation's own pre-terminal rows are all resolved and the live projection
+/// still proves the terminal state, which admits the repair that re-mints the
+/// receipt a pre-receipt crash lost. Anything else refuses and names what is
+/// missing. Both admitted states skip the admission fence and the revision pin
+/// because the terminal step has already committed.
 #[allow(
     clippy::too_many_lines,
     reason = "the pre-destructive fence keeps every drift check in one auditable boundary"
@@ -2197,15 +3227,10 @@ where
     P: InstallationEffectPort,
 {
     let plan = &operation.plan;
-    if plan
-        .effects
-        .iter()
-        .any(|row| row.action == CanaryRemovalAction::Unsupported)
-    {
-        return Err(InstallationError::IncompleteObservation(
-            "the frozen plan names a required cleanup this owner cannot perform".to_owned(),
-        ));
-    }
+    // The `Unsupported` guard runs below, against `already_retired`, so that a
+    // REQUIRED CLEANUP this owner cannot perform blocks a NEW destructive drive
+    // without stranding an operation whose terminal effect already committed.
+    // See the guard at its own site for why that distinction is load bearing.
     let install = coordinator
         .store()
         .load(&plan.install_transaction_id)?
@@ -2251,9 +3276,15 @@ where
     projection.validate()?;
     // The target generation record is the one registry member a completed
     // removal may make absent, and only as its terminal step. Its absence is
-    // therefore also the accepted evidence that the terminal registry
-    // projection already committed before a crash lost this operation's final
-    // save; every other drift stays a conflict.
+    // therefore the observation that the terminal registry retirement already
+    // committed before a crash lost this operation's final save — but absence
+    // alone names no operation, so neither branch below treats it as a proof.
+    // A receipt this owner issued for this exact removal identity is what
+    // attributes the effect; when that receipt does not exist yet, the crash fell
+    // BEFORE it was written and the attribution comes instead from this
+    // operation's own resolved pre-terminal rows plus the live terminal proofs.
+    // Registry drift that happened after the commit is unrelated activity and is
+    // not drift of this removal, which is why neither branch reads a revision.
     let already_retired = match resolve_approved_generation(&projection, &plan.generation) {
         Ok(target) => {
             if target.active
@@ -2272,16 +3303,66 @@ where
             false
         }
         Err(InstallationError::IncompleteObservation(_)) => {
-            if projection.revision() != plan.registry_revision.saturating_add(1) {
-                return Err(InstallationError::IncompleteObservation(
-                    "the removal target is absent from the registry without a committed terminal removal"
-                        .to_owned(),
-                ));
+            match terminal_receipt_recognises_retirement(coordinator, &projection, plan)? {
+                TerminalRetirementEvidence::ReceiptOnFile => true,
+                // A crash between the terminal commit and the receipt save leaves
+                // the target absent with nothing on file. That absence names no
+                // operation, so it is admitted ONLY when this operation's own
+                // pre-terminal rows are already resolved and the live projection
+                // still proves the terminal state: then the drive that re-enters
+                // re-reads and re-mints the missing receipt instead of assuming
+                // the effect, and issues no second destructive call.
+                TerminalRetirementEvidence::NoReceiptOnFile => {
+                    pre_receipt_crash_window_is_repairable(operation, &projection)?
+                }
             }
-            true
         }
         Err(error) => return Err(error),
     };
+    // One guard, and it refuses before any row is driven. It now refuses exactly
+    // one shape: a REQUIRED CLEANUP this owner cannot perform, which issue
+    // #1138's removal algorithm step 2 says "blocks apply—it must not disappear
+    // from the denominator". The refusal names the blocking row's identity and
+    // its closed category, and it says explicitly that a shared or preexisting
+    // surface this owner cannot observe is not such a cleanup.
+    //
+    // What can still produce such a row, measured rather than assumed:
+    // `freeze_effect_graph` cannot, at plan time. Every category whose
+    // `removal_supported` is false — `CreateRoot`, `ApplyAcl`,
+    // `RegisterService`, `StartService`, `MaterializePhaseB` — is also `shared`,
+    // so its `reference_users` is the observed survivor set; and `plan_canary_removal`
+    // refuses a target with no settled handoff to a serving generation other than
+    // itself, which requires that generation to be present in the registry
+    // (`approved_generation_registry.rs` `validate` and `validate_terminal_activation`),
+    // so the survivor set is never empty and `classify_action` always returns
+    // `Retain` for those rows. A SHARED surface is therefore never the producer.
+    // The producer is an EXTERNALLY SUPPLIED PLAN: `apply_canary_removal` admits
+    // whatever `CanaryRemovalPlanEnvelope` a caller hands it, `CanaryRemovalPlan::validate`
+    // admits an `Unsupported` row on a transaction-created installer-effect
+    // category, and `computed_digest` is public, so such a document is
+    // constructible. This guard is that document's only production reader, which
+    // is why the variant and the guard both stay.
+    //
+    // It is gated on `!already_retired` for the same reason the admission fence
+    // and the revision pin are. A required cleanup this owner cannot perform
+    // blocks a NEW destructive drive, which is what the issue requires: the row
+    // stays in the denominator and apply refuses rather than minting evidence no
+    // owner issued. It must NOT block the path that repairs an operation whose
+    // terminal effect ALREADY committed. Refusing there would strand the
+    // operation forever: the terminal registry commit and the owner-issued
+    // receipt are separate durable writes, so a crash between them leaves an
+    // absent target that only this path can reconcile. Blocking it would trade a
+    // truthful refusal for an unrecoverable wedge and would make the card's own
+    // crash-resume guarantee — recover the SAME operation by its terminal receipt
+    // with no second destructive mutation — impossible to reach at all.
+    if !already_retired
+        && let Some(row) = plan
+            .effects
+            .iter()
+            .find(|row| row.action == CanaryRemovalAction::Unsupported)
+    {
+        return Err(unsupported_cleanup_refusal(row));
+    }
     // The admission fence is re-observed before the revision pin: a pending
     // activation staged for the dying generation after the plan was frozen is
     // a fence refusal naming the exact race, not a generic revision drift. All
@@ -2296,7 +3377,258 @@ where
             actual: projection.revision(),
         });
     }
+    // The survivor set the plan committed to keep is PINNED on every path that can
+    // reach `terminal_proofs_hold`, but the pin has two forms and only one of
+    // them is an equality, because the registry state the two paths present is
+    // not the same.
+    //
+    // Before this operation's terminal retirement commits, the revision pin above
+    // makes THIS projection the exact projection the frozen plan was resolved
+    // against, so the committed set is re-derived from the registry and must
+    // EQUAL the set the plan carries in its `CanaryEvidenceRoot` row. That row is
+    // the ONLY record of the plan-time survivor set and nothing else re-derives
+    // it, so without this comparison a plan that silently dropped a survivor from
+    // its own committed set would still pass the terminal proof: a SMALLER
+    // committed set is trivially a subset of the live one, and the proof's
+    // superset test can no longer distinguish "unrelated activity added a
+    // generation this plan could not have named" from "this plan promised to keep
+    // fewer generations than it did". That equality is the strong form, and it is
+    // the only one available while the plan's own revision is still live.
+    //
+    // Once the retirement HAS committed, the plan-time projection no longer
+    // exists to compare against: the target is already absent, the registry has
+    // moved past `plan.registry_revision`, and unrelated activity may legitimately
+    // have admitted or retired a generation in between. Demanding EQUALITY there
+    // would re-introduce exactly the crash wedge the terminal receipt exists to
+    // remove — the same reason `terminal_receipt_recognises_retirement` treats its
+    // recorded revision as a monotonicity FLOOR rather than an equality. On that
+    // path the committed set cannot be re-derived, so the strongest relation
+    // available is the one `terminal_proofs_hold` applies: every generation the
+    // plan promised to keep must still be projected. This same fence has ALREADY
+    // applied exactly that relation, higher up, through
+    // `pre_receipt_crash_window_is_repairable` — so the committed set is pinned
+    // on this path too, and a survivor that vanished is refused here rather than
+    // after a receipt was minted. Repeating the subset test at this site would be
+    // a branch that cannot fail.
+    if !already_retired && planned_survivors(plan)? != observed_survivors(&projection, plan) {
+        return Err(InstallationError::IdentityConflict);
+    }
     Ok(install)
+}
+
+/// What this owner holds for its own removal identity once the target is
+/// already absent from the live registry projection.
+///
+/// The distinction is the whole point: absence alone attributes nothing, so a
+/// missing receipt is reported as a MISSING RECEIPT and never as a proof, and
+/// the caller decides from this operation's own durable evidence whether the
+/// pre-receipt crash window is repairable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalRetirementEvidence {
+    /// This identity's own owner-issued terminal receipt is on file and passed
+    /// every check below, so the terminal effect is attributed to this
+    /// operation.
+    ReceiptOnFile,
+    /// No terminal receipt exists for this identity. This is NOT evidence that
+    /// this removal committed anything; it only names what is missing.
+    NoReceiptOnFile,
+}
+
+/// Recognises an already-retired target ONLY by this removal operation's own
+/// owner-issued terminal receipt.
+///
+/// The target generation record is the one registry member a completed removal
+/// may make absent, and only as its terminal step. Its absence is therefore the
+/// evidence that the terminal retirement already committed — but absence proves
+/// nothing about WHICH removal did it, so this owner reads the terminal receipt it
+/// issued for this exact removal identity and lets that receipt, not the live
+/// projection, carry the attribution. This is the same discipline the approved-
+/// generation registry applies to a committed cutover: the pointer cannot tell a
+/// replay from a different operation that selected the same target, so the
+/// operation-bound receipt is the durable record that makes the effect
+/// attributable.
+///
+/// Two bindings are stable under unrelated registry activity and are required:
+/// the receipt names this plan's retired generation, and it records the registry
+/// revision this plan was admitted against. The live projection's role is only
+/// the monotonicity floor `receipt.resulting_registry_revision` records plus the
+/// target's absence, which the caller already establishes; the recorded content
+/// digest is not compared HERE, because a digest of the whole live projection
+/// moves on any unrelated mutation and this gate must still resume this operation
+/// after one. It is compared where the two are actually comparable — in
+/// `terminal_receipt_digest`, against the projection the closing call reloaded,
+/// and only while that projection still carries the revision the receipt recorded
+/// — so a receipt that does not describe the registry it claims to describe still
+/// cannot close the operation. The receipt's own digest is never recomputed here
+/// to stand in for that check.
+///
+/// A `None` receipt is reported as [`TerminalRetirementEvidence::NoReceiptOnFile`], which
+/// is a statement about this owner's records and not about the registry: absence
+/// names no operation, so nothing here treats it as a committed effect. The
+/// caller decides whether the operation's own durable per-row progress plus the
+/// live terminal proofs make that missing record repairable, and it refuses
+/// otherwise rather than driving a destructive pass or minting a receipt on the
+/// strength of an absence.
+fn terminal_receipt_recognises_retirement<P>(
+    coordinator: &InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    projection: &ApprovedGenerationRegistry,
+    plan: &CanaryRemovalPlan,
+) -> Result<TerminalRetirementEvidence, InstallationError>
+where
+    P: InstallationEffectPort,
+{
+    let Some(receipt) = coordinator
+        .store()
+        .load_canary_removal_terminal_receipt(&plan.removal_transaction_id)?
+    else {
+        return Ok(TerminalRetirementEvidence::NoReceiptOnFile);
+    };
+    receipt.validate()?;
+    if receipt.generation != plan.generation
+        || receipt.predecessor_registry_revision != plan.registry_revision
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    // Monotonicity, not equality: the retirement moved the registry forward to
+    // `resulting_registry_revision`, so a live projection behind that floor is an
+    // observation about the projection rather than a conflict with this removal's
+    // inputs, while a projection that has advanced past it is exactly the
+    // unrelated-activity case that must still resume this same operation.
+    if projection.revision() < receipt.resulting_registry_revision {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "the live registry revision {} is behind the terminal revision {} this removal already recorded",
+            projection.revision(),
+            receipt.resulting_registry_revision
+        )));
+    }
+    Ok(TerminalRetirementEvidence::ReceiptOnFile)
+}
+
+/// Decides whether a crash between the terminal registry commit and this
+/// operation's final save left a repairable operation behind.
+///
+/// The target's absence from the registry is NOT evidence here, exactly as
+/// `terminal_receipt_recognises_retirement` refuses to treat it as one: absence
+/// names no operation. What makes the repair lawful is this operation's OWN
+/// durable per-row progress read together with the live terminal proofs:
+///
+/// * every row the frozen plan positions before the terminal registry record is
+///   already `Resolved`, so the drive this call re-enters issues no mutating
+///   call at all — `advance` finds nothing left to drive before the terminal
+///   record, goes straight to the read-only re-proof, and the retirement block
+///   in `finish_with_readback` is skipped because the record is already absent;
+///   and
+/// * the live projection still proves the terminal state this plan committed
+///   to — target absent, serving pointers unchanged, and every survivor the
+///   frozen plan committed to keep still projected by the reloaded registry.
+///   That is a SUPERSET check, not an equality: a survivor that has VANISHED
+///   fails it, while a generation unrelated activity added afterwards is not a
+///   member the plan could have named and must not couple this proof to it.
+///   This is the very check `finish_with_readback` applies to the projection it
+///   reloads before minting anything.
+///
+/// Either condition failing keeps a typed refusal that says which one failed,
+/// so this owner never drives a destructive pass and never mints a terminal
+/// receipt on the strength of a target's absence.
+fn pre_receipt_crash_window_is_repairable(
+    operation: &CanaryRemovalOperation,
+    projection: &ApprovedGenerationRegistry,
+) -> Result<bool, InstallationError> {
+    let terminal_row = terminal_registry_row_position(&operation.plan)?;
+    let every_pre_terminal_row_resolved = operation
+        .effect_progress
+        .get(..terminal_row)
+        .is_some_and(|rows| {
+            rows.iter()
+                .all(|progress| matches!(progress.state, CanaryRemovalEffectState::Resolved { .. }))
+        });
+    if !every_pre_terminal_row_resolved {
+        return Err(InstallationError::IncompleteObservation(
+            "the removal target is absent from the registry, this removal operation holds no committed terminal receipt for it, and a removal effect positioned before the terminal registry record is still unresolved; this owner will not drive a destructive pass, and will not mint a terminal receipt, on the strength of the target's absence alone"
+                .to_owned(),
+        ));
+    }
+    if !terminal_proofs_hold(projection, &operation.plan)? {
+        return Err(InstallationError::IncompleteObservation(
+            "the removal target is absent from the registry, this removal operation holds no committed terminal receipt for it, and the live registry no longer proves the terminal state this frozen plan committed to; this owner will not mint a terminal receipt on the strength of the target's absence alone"
+                .to_owned(),
+        ));
+    }
+    Ok(true)
+}
+
+/// Position of the one terminal registry record row in the frozen graph.
+///
+/// `order_band` places that category last, so this is the last position of the
+/// frozen order. It is resolved by category rather than by position so the
+/// per-row drive, the entry fence and the pre-receipt repair check all ask the
+/// same question of the same plan instead of each carrying its own copy of the
+/// rule.
+fn terminal_registry_row_position(plan: &CanaryRemovalPlan) -> Result<usize, InstallationError> {
+    plan.effects
+        .iter()
+        .position(|row| row.category == CanaryRemovalResource::GenerationRegistryRecord)
+        .ok_or(InstallationError::IncompleteObservation(
+            "the frozen plan lost its terminal registry record".to_owned(),
+        ))
+}
+
+/// Reports whether one live projection proves the terminal state the frozen
+/// plan committed to: the target absent, both serving pointers exactly as
+/// planned, and every generation the plan promised to keep still carried.
+///
+/// This is the single terminal proof in this module and both callers apply it
+/// to a projection they reloaded themselves — the entry fence to decide whether
+/// a missing terminal receipt is repairable, and `finish_with_readback` before
+/// it mints or reuses a receipt. The caller owns `projection.validate()`.
+///
+/// The observed side comes from a registry read and the expected side from the
+/// frozen, digest-bound plan, so the comparison is independent of the projection
+/// it checks rather than a copy of it.
+///
+/// The survivor comparison is a SUPERSET test, not equality, for the same reason
+/// the recorded revision is a monotonicity floor rather than an equality: a
+/// generation admitted or retired by unrelated registry activity after this
+/// removal committed is not a survivor the plan could have named, so demanding
+/// that the live set equal the frozen one would wedge recovery of an
+/// already-committed terminal effect on activity that has nothing to do with it.
+/// The frozen set is the set this removal committed to keep, so that is the set
+/// that must still be present: a survivor that vanished fails the subset.
+///
+/// A subset test is only as trustworthy as the set it starts from, so the frozen
+/// set is tied to a registry read on BOTH of the paths that reach this function,
+/// by whichever relation each path can actually support:
+///
+/// * before this operation's terminal retirement commits, the entry fence
+///   re-derives the survivor set from the projection the plan's own registry
+///   revision identifies and refuses a plan whose committed set is not EXACTLY
+///   that set (`revalidate_fence`). That equality is the strong form: it is what
+///   detects a plan that dropped a survivor from its own committed set, which a
+///   subset test cannot detect, because a dropped survivor leaves the remaining
+///   set a valid subset.
+/// * after the retirement has committed, the plan-time projection no longer
+///   exists, so the committed set can no longer be re-derived and EQUALITY would
+///   be unsupportable — the registry has moved on and unrelated activity may
+///   legitimately have admitted or retired a generation, exactly as
+///   `terminal_receipt_recognises_retirement`'s monotonicity floor already
+///   admits. On that path the frozen set can only be required to still be
+///   PRESENT, and the same entry fence has already required exactly that,
+///   higher up, through `pre_receipt_crash_window_is_repairable`. So the expected
+///   side of the superset test below is pinned on that path too, and a survivor
+///   that vanished is refused before any receipt is minted rather than after.
+fn terminal_proofs_hold(
+    projection: &ApprovedGenerationRegistry,
+    plan: &CanaryRemovalPlan,
+) -> Result<bool, InstallationError> {
+    if resolve_approved_generation(projection, &plan.generation).is_ok() {
+        return Ok(false);
+    }
+    Ok(
+        projection.active_generation() == plan.quiesce.active_generation.as_ref()
+            && projection.last_known_good_generation()
+                == plan.quiesce.last_known_good_generation.as_ref()
+            && planned_survivors(plan)?.is_subset(&observed_survivors(projection, plan)),
+    )
 }
 
 /// Drives the dependency-ordered removal effects and the terminal readback.
@@ -2309,16 +3641,9 @@ fn advance<P>(
 where
     P: InstallationEffectPort,
 {
-    let registry_row = operation
-        .plan
-        .effects
-        .iter()
-        .position(|row| row.category == CanaryRemovalResource::GenerationRegistryRecord)
-        .ok_or(InstallationError::IncompleteObservation(
-            "the frozen plan lost its terminal registry record".to_owned(),
-        ))?;
+    let registry_row = terminal_registry_row_position(&operation.plan)?;
     for _ in 0..operation.plan.effects.len() {
-        let Some(position) = (0..registry_row).find(|position| {
+        let Some(position) = (0..operation.plan.effects.len()).find(|position| {
             !matches!(
                 operation.effect_progress[*position].state,
                 CanaryRemovalEffectState::Resolved { .. }
@@ -2332,28 +3657,43 @@ where
         ) {
             break;
         }
+        // The terminal registry record is not driven row by row: it carries no
+        // installer effect, it is the hand-off of control, and its outcome is
+        // whatever `finish_with_readback` commits after it re-reads every other
+        // row. Leaving it unresolved here is what keeps it the last durable step.
+        if position == registry_row {
+            break;
+        }
         advance_row(coordinator, registry, operation, install, position)?;
     }
-    if operation
+    // The blocking effect is the FIRST unresolved-outcome row, and one pass over
+    // the durable progress names it. A second scan behind an `.any(...)` over the
+    // identical predicate could only ever find what that scan already proved, so
+    // its `ok_or` was a branch that could not fire: this is the file's existing
+    // `let Some(..) else` shape, and the returned `blocking` is the same row the
+    // predicate selects.
+    if let Some(blocking) = operation
         .effect_progress
         .iter()
-        .any(|progress| matches!(progress.state, CanaryRemovalEffectState::Unknown { .. }))
+        .find(|progress| matches!(progress.state, CanaryRemovalEffectState::Unknown { .. }))
     {
-        operation.blocking_effect_id = Some(
-            operation
-                .effect_progress
-                .iter()
-                .find(|progress| matches!(progress.state, CanaryRemovalEffectState::Unknown { .. }))
-                .ok_or(InstallationError::IncompleteObservation(
-                    "blocking effect is absent from durable progress".to_owned(),
-                ))?
-                .effect_id
-                .clone(),
-        );
+        operation.blocking_effect_id = Some(blocking.effect_id.clone());
         operation.validate()?;
         return Ok(());
     }
     if operation.effect_progress[..registry_row]
+        .iter()
+        .any(|progress| !matches!(progress.state, CanaryRemovalEffectState::Resolved { .. }))
+    {
+        operation.validate()?;
+        return Ok(());
+    }
+    // The terminal record keeps the last position in the order, so this is a
+    // completeness fence rather than a normal exit: if any row were ever
+    // positioned behind the hand-off record, that row would have to be read back
+    // after the surviving owner already took control. Refusing here keeps such a
+    // plan short of the terminal commit instead of silently reordering around it.
+    if operation.effect_progress[(registry_row + 1)..]
         .iter()
         .any(|progress| !matches!(progress.state, CanaryRemovalEffectState::Resolved { .. }))
     {
@@ -2440,6 +3780,29 @@ fn reobserve_before_mutation(
 /// the recorded reconcile deadline, the admission fence, the canary's own owner
 /// effects and the installer-effect coverage, so none of them can be inherited
 /// from the entry-point observation after changing mid-drive.
+///
+/// A row this plan does NOT remove takes the other branch entirely: it never
+/// reaches `reobserve_before_mutation`, `commit_intent` or `port.execute`. It is
+/// either read back once through the owner that holds it and resolved as
+/// `Retained`, or — when no owner this crate can reach observes its surface —
+/// refused by `readback_request`. `order_band` places such a row ahead of every
+/// row that can mutate precisely so that this refusal lands before any destructive
+/// call; that ordering is what keeps it a refusal rather than an ordering
+/// regression. It is not by itself a claim that the drive can continue
+/// afterwards, and it cannot: the same refusal recurs on every later drive of the
+/// same identity, because the missing observation is a property of the row's
+/// category rather than of the attempt.
+/// Issuing a rollback for a resource the plan admitted as surviving would mutate
+/// exactly the resource the plan promised to leave intact.
+///
+/// The destructive branch keeps reconcile-before-execute, the committed intent,
+/// the mutating call, the post-call readback and both refusals in one function
+/// because splitting them would scatter a single pre-destructive boundary across
+/// two, which is the shape this file's other fences deliberately avoid.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the destructive branch keeps reconcile, intent, execute, readback and both refusals in one auditable boundary"
+)]
 fn advance_row<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
@@ -2456,9 +3819,15 @@ where
         .get(position)
         .ok_or(InstallationError::IdentityConflict)?
         .clone();
-    let index = row
-        .install_effect_index
-        .ok_or(InstallationError::IdentityConflict)?;
+    if row.action != CanaryRemovalAction::Remove {
+        return read_retained_row(coordinator, operation, position, &row);
+    }
+    let Some(index) = row.install_effect_index else {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "removal row {} claims to remove a resource it names no installer effect for",
+            row.effect_id.as_str()
+        )));
+    };
     let install_index = usize::try_from(index).map_err(|_| InstallationError::IdentityConflict)?;
     let resume = matches!(
         operation.effect_progress[position].state,
@@ -2484,14 +3853,25 @@ where
                         readback_ref("unavailable", &row)?,
                     );
                 }
-                resolve_row(store, operation, position, evidence)?;
+                resolve_row(
+                    store,
+                    operation,
+                    position,
+                    CanaryRemovalEffectDisposition::Absent,
+                    evidence,
+                )?;
                 return Ok(());
             }
             RowClassification::Matching => {}
             RowClassification::Conflict => return Err(InstallationError::IdentityConflict),
         },
         other => {
-            unknown_row(store, operation, position, port_pending(other))?;
+            unknown_row(
+                store,
+                operation,
+                position,
+                port_pending(other).map_err(|error| platform_error(&error))?,
+            )?;
             return Ok(());
         }
     }
@@ -2520,7 +3900,13 @@ where
                         readback_ref("unavailable", &row)?,
                     )?;
                 } else {
-                    resolve_row(store, operation, position, evidence)?;
+                    resolve_row(
+                        store,
+                        operation,
+                        position,
+                        CanaryRemovalEffectDisposition::Removed,
+                        evidence,
+                    )?;
                 }
             }
             RowClassification::Matching => {
@@ -2533,14 +3919,163 @@ where
             }
             RowClassification::Conflict => return Err(InstallationError::IdentityConflict),
         },
-        other => unknown_row(store, operation, position, port_pending(other))?,
+        other => unknown_row(
+            store,
+            operation,
+            position,
+            port_pending(other).map_err(|error| platform_error(&error))?,
+        )?,
     }
     Ok(())
 }
 
+/// Reads one row this removal does not destroy back through the owner that holds
+/// it, and closes it as `Retained` only on that owner's own verdict.
+///
+/// The transaction is re-loaded from the durable store inside this function, so
+/// the identity compared here is the one the store holds now rather than the one
+/// the entry-point fence happened to read. A row that cannot be classified stays
+/// `Unknown` under the same removal identity with its blocking effect named, so
+/// a retained resource that drifted between plan and readback blocks `Completed`
+/// instead of passing on plan-time evidence.
+fn read_retained_row<P>(
+    coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    operation: &mut CanaryRemovalOperation,
+    position: usize,
+    row: &CanaryRemovalEffect,
+) -> Result<(), InstallationError>
+where
+    P: InstallationEffectPort,
+{
+    let observed_install = reload_install(coordinator.store(), &operation.plan)?;
+    match readback_request(&observed_install, row)? {
+        RowReadback::InstallerEffect(request) => {
+            let observed = match coordinator.port.reconcile(&request) {
+                PortOutcome::Known(observed) => observed,
+                other => {
+                    unknown_row(
+                        coordinator.store_mut(),
+                        operation,
+                        position,
+                        port_pending(other).map_err(|error| platform_error(&error))?,
+                    )?;
+                    return Ok(());
+                }
+            };
+            match classify_observation(&observed, row) {
+                RowClassification::Matching => resolve_row(
+                    coordinator.store_mut(),
+                    operation,
+                    position,
+                    CanaryRemovalEffectDisposition::Retained,
+                    matching_evidence(&observed),
+                ),
+                // A retained row whose owner reports a different object, or
+                // reports the admitted object gone, has not proved its
+                // `Retained` postcondition. That is drift, not progress.
+                RowClassification::Absent(_) | RowClassification::Conflict => unknown_row(
+                    coordinator.store_mut(),
+                    operation,
+                    position,
+                    readback_ref("retained-unproven", row)?,
+                ),
+            }
+        }
+        RowReadback::TerminalRegistryRecord => {
+            Err(InstallationError::IncompleteObservation(format!(
+                "the terminal registry record {} cannot be read back as a retained row",
+                row.effect_id.as_str()
+            )))
+        }
+    }
+}
+
+/// Re-loads and re-validates the installed transaction from the durable store.
+///
+/// Every place in this module that compares an identity against the installation
+/// transaction — the retained-row drive and the terminal pre-commit quiesce
+/// observation — reads the transaction the store holds at that moment rather than
+/// a value an earlier step threaded through the drive. A transaction replaced or
+/// rebound mid-drive therefore refuses that comparison instead of being inherited
+/// from an earlier observation.
+///
+/// The effect-port readbacks are the exception and stay as they were: a port
+/// request is built from the transaction the entry fence admitted, because the
+/// request's own effect position and bound attempt must address the row as this
+/// operation admitted it.
+fn reload_install(
+    store: &RedbInstallationTransactionStore,
+    plan: &CanaryRemovalPlan,
+) -> Result<InstallationTransaction, InstallationError> {
+    let install = store.load(&plan.install_transaction_id)?.ok_or(
+        InstallationError::TransactionNotFound {
+            transaction_id: plan.install_transaction_id.as_str().to_owned(),
+        },
+    )?;
+    install.validate()?;
+    Ok(install)
+}
+
+/// Reduces one classified readback to the evidence handles the owner reported.
+///
+/// This is the single evidence reducer for every readback a removal drive
+/// accepts, and it is deliberately total over the three observation classes so
+/// that the caller never has to re-derive which list an owner verdict carries:
+///
+/// * a still-present exact object contributes its `postcondition_digest` followed by the
+///   owner's own `evidence`;
+/// * an authoritatively absent object contributes its observed-precondition digest
+///   followed by the owner's own `evidence` — the same handles, in the same order, the
+///   removal path contributed before the per-row postcondition check existed, so a
+///   removed row's recorded evidence is unchanged by that check;
+/// * a mismatched observation contributes only its `pending_ref`, because a conflict is
+///   a typed refusal rather than a proof and never reaches a resolved row.
+fn matching_evidence(observed: &InstallationEffectObservation) -> Vec<PlatformHandle> {
+    match observed {
+        InstallationEffectObservation::Matching {
+            evidence,
+            postcondition_digest,
+            ..
+        } => {
+            let mut recorded = vec![postcondition_digest.clone()];
+            recorded.extend(evidence.iter().cloned());
+            recorded
+        }
+        InstallationEffectObservation::Absent {
+            observed_precondition,
+            evidence,
+            ..
+        } => {
+            let mut recorded = vec![observed_precondition.digest.clone()];
+            recorded.extend(evidence.iter().cloned());
+            recorded
+        }
+        InstallationEffectObservation::Mismatch { pending_ref } => vec![pending_ref.clone()],
+    }
+}
+
+/// Reduces an accumulated readback list to distinct handles, keeping readback order.
+///
+/// Two rows' owners can legitimately report the same evidence handle, while the
+/// durable per-row evidence requires unique handles; dropping the later repeats
+/// keeps the list a faithful record of what was observed without letting a repeat
+/// readback masquerade as a conflict.
+fn unique_handles(values: Vec<PlatformHandle>) -> Vec<PlatformHandle> {
+    let mut seen: BTreeSet<PlatformHandle> = BTreeSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+/// Authoritative verdict one resource owner returned for one removal row.
 enum RowClassification {
+    /// The owner proved the exact previously admitted object absent, and reported
+    /// the evidence that proves it.
     Absent(Vec<PlatformHandle>),
+    /// The owner still reports the admitted object under its admitted identity.
     Matching,
+    /// The owner proved something else, or could not prove the row's own identity.
     Conflict,
 }
 
@@ -2563,9 +4098,25 @@ fn classify_observation(
             external_identity,
             ..
         } => {
-            if *disposition != super::InstallationEffectDisposition::CreatedByTransaction
-                || external_identity != &row.resource_identity
-            {
+            // The owner must report the ownership class the FROZEN ROW itself
+            // records, read from the install transaction's own effect receipt: a
+            // row this transaction created can only read back as created by it,
+            // and a row the transaction adopted can only read back as the
+            // preexisting object it adopted. Both classes still require the exact
+            // admitted external identity, so a substituted object is refused
+            // either way. Requiring `CreatedByTransaction` unconditionally would
+            // make the owner's honest answer for an adopted row a conflict, and
+            // an adopted row would then never resolve at all.
+            let ownership_matches = match row.origin {
+                CanaryRemovalResourceOrigin::CreatedByInstallTransaction => {
+                    *disposition == super::InstallationEffectDisposition::CreatedByTransaction
+                }
+                CanaryRemovalResourceOrigin::PreexistingAtInstall => {
+                    *disposition == super::InstallationEffectDisposition::PreexistingMatching
+                }
+                CanaryRemovalResourceOrigin::ForeignToThisRemoval => false,
+            };
+            if !ownership_matches || external_identity != &row.resource_identity {
                 RowClassification::Conflict
             } else {
                 RowClassification::Matching
@@ -2606,6 +4157,15 @@ fn handle_ref(value: &str) -> Result<PlatformHandle, InstallationError> {
 }
 
 /// Commits the exact removal intent before the mutating call.
+///
+/// The advanced bound is mirrored back into the plan row, so the row's durable
+/// record of how many attempts this removal identity already spent on it stays in
+/// one place and `CanaryRemovalOperation::validate`'s
+/// `attempt == effect.bound.attempt` invariant holds for the write below. Writing
+/// it there is safe against the frozen `plan_digest` only because
+/// `CanaryRemovalPlan::computed_digest` normalizes this exact member back to its
+/// plan-time value; removing that normalization would wedge every resumed attempt
+/// at the `validate()` on the next line, before the store is reached.
 fn commit_intent(
     store: &mut RedbInstallationTransactionStore,
     operation: &mut CanaryRemovalOperation,
@@ -2632,23 +4192,23 @@ fn commit_intent(
     store.compare_and_save_canary_removal_operation(&expected, operation)
 }
 
+/// Closes one row with the disposition its own owner reported.
+///
+/// The disposition is a caller-supplied owner verdict, never a derivation from
+/// the plan: `Absent` and `Removed` come from an effect port that proved the
+/// exact admitted object gone, and `Retained` from an owner that reported it
+/// still present under its admitted identity. `CanaryRemovalOperation::validate`
+/// then refuses any pairing the frozen action does not admit.
 fn resolve_row(
     store: &mut RedbInstallationTransactionStore,
     operation: &mut CanaryRemovalOperation,
     position: usize,
+    disposition: CanaryRemovalEffectDisposition,
     evidence: Vec<PlatformHandle>,
 ) -> Result<(), InstallationError> {
     let expected = CanaryRemovalOperationVersion::of(operation)?;
-    let removed = matches!(
-        operation.effect_progress[position].state,
-        CanaryRemovalEffectState::IntentCommitted { .. }
-    );
     operation.effect_progress[position].state = CanaryRemovalEffectState::Resolved {
-        disposition: if removed {
-            CanaryRemovalEffectDisposition::Removed
-        } else {
-            CanaryRemovalEffectDisposition::Absent
-        },
+        disposition,
         evidence,
     };
     operation.revision = next_revision(expected.revision)?;
@@ -2680,38 +4240,137 @@ fn next_revision(expected: u64) -> Result<u64, InstallationError> {
         })
 }
 
-/// Builds the readback request for one already-executed plan row, or `None`
-/// when that row names no installation effect and therefore has nothing to read
-/// back from its owner.
+/// The owner readback selected for one frozen removal row.
+///
+/// Only an owner that exists appears here. A category no owner can answer for is
+/// refused by `readback_request` rather than given a variant that would carry no
+/// evidence.
+enum RowReadback {
+    /// Reconcile the exact installer effect through the effect port.
+    ///
+    /// The request is boxed because `InstallationEffectRequest` is far larger
+    /// than the other shape, and an unboxed variant that size would make every
+    /// copy of this enum — one per row, every drive — pay for the largest member.
+    InstallerEffect(Box<InstallationEffectRequest>),
+    /// Proved by the post-retirement registry reload, never before it.
+    TerminalRegistryRecord,
+}
+
+/// Selects the owner readback for one already-executed plan row.
 ///
 /// The row's own `install_effect_index` selects which exact effect of the
 /// transaction is reconciled, and the row's own bound attempt and resource
 /// identity supply the preconditions, so the readback is addressed to THIS row
 /// rather than to a position in a list this loop happens to be walking.
+///
+/// The REQUEST SHAPE is derived from the row's own frozen `action`, so the two
+/// call sites — the per-row retained-row drive and the terminal readback — can
+/// never disagree about how a row is asked about:
+///
+/// * a `Remove` row is read back through the exact-identity ROLLBACK request it is
+///   removed by. That is a genuine destructive-intent readback and the owner's
+///   validator admits a rollback arm for every plan variant a `Remove` row can
+///   name, because a `Remove` row only exists for a variant this owner supports
+///   removing.
+/// * a row this removal does NOT destroy is READ, not rolled back. Asking its
+///   owner for a rollback would ask the owner to destroy a resource the plan
+///   promised to leave intact, and the owner's own validator refusing that is the
+///   validator being right: `InstallationEffectRequest::validate` has no rollback
+///   arm for an `ApplyAcl` row at all, and none for a `CreateRoot` row without an
+///   ownership secret, so every plan that retains a root or an ACL — which is
+///   every plan, because `freeze_effect_graph` marks both shared and the survivor
+///   set is never empty — would be refused before its terminal tail. Such a row is
+///   therefore read back through the APPLY-shaped request the installation
+///   transaction itself built and validated for that exact effect position when it
+///   applied it: the same `InstallationEffectAction::Apply` with an absent
+///   `expected_external_identity` the owner's own apply, reconcile-before-execute
+///   and aborted-apply paths use. No arm was invented and no request field was
+///   relaxed to reach it.
+///
+/// An apply-shaped request carries no expected external identity, so the
+/// exact-identity guard sits in the VERDICT instead: `classify_observation` still
+/// refuses the row unless the owner reports `Matching` with
+/// `external_identity == row.resource_identity` AND the ownership class the row
+/// itself records, so a substituted path, PID or service name is still a conflict
+/// and can never become `Retained`.
+///
+/// A row with no installer effect is NOT skipped, and it is also never invented
+/// for one. Each such category names the owner that can answer for it, and this
+/// selector refuses the ones that name none: `GenerationRegistryRecord` is proved
+/// by the post-retirement registry reload. `CanaryEvidenceRoot` and
+/// `StoreObjects` are classified `OutOfScope` and name no such owner — no owner
+/// in this crate can observe a bare filesystem root path or a generation-scoped
+/// canonical Store/Blob object — so asking is impossible and this is the refusal
+/// the drive says if such a row is ever reached here. It is deliberately NOT
+/// `unsupported_cleanup_refusal`: that builder describes a required cleanup this
+/// owner cannot perform, and a shared surface is not one. The two categories also
+/// have their own measured reason written out beside their row constructors.
+/// Any other category with no installer effect is refused too, because a row in
+/// this denominator that no owner can be asked about would otherwise leave
+/// `Completed` reachable without it.
 fn readback_request(
     install: &InstallationTransaction,
     row: &CanaryRemovalEffect,
-) -> Result<Option<InstallationEffectRequest>, InstallationError> {
+) -> Result<RowReadback, InstallationError> {
     let Some(index) = row.install_effect_index else {
-        return Ok(None);
+        return match row.category {
+            CanaryRemovalResource::GenerationRegistryRecord => {
+                Ok(RowReadback::TerminalRegistryRecord)
+            }
+            other => Err(InstallationError::IncompleteObservation(format!(
+                "removal row {} names category {other:?} with action {:?} and no installer effect \
+                 to reconcile, and no owner this crate can reach observes that surface at all, so \
+                 there is no readback to request and no evidence any owner could report for it",
+                row.effect_id.as_str(),
+                row.action
+            ))),
+        };
     };
     let install_index = usize::try_from(index).map_err(|_| InstallationError::IdentityConflict)?;
-    Ok(Some(effect_request(
+    let (action, expected_external_identity) = if row.action == CanaryRemovalAction::Remove {
+        (
+            InstallationEffectAction::Rollback,
+            Some(row.resource_identity.clone()),
+        )
+    } else {
+        (InstallationEffectAction::Apply, None)
+    };
+    Ok(RowReadback::InstallerEffect(Box::new(effect_request(
         install,
         install_index,
         row.bound.attempt,
-        InstallationEffectAction::Rollback,
-        Some(row.resource_identity.clone()),
-    )?))
+        action,
+        expected_external_identity,
+    )?)))
 }
 
-/// Finishes by independent readback, then commits the terminal registry
-/// projection under the expected registry revision.
+/// Finishes by independent readback of the whole denominator, then commits the
+/// terminal registry projection under the expected registry revision and proves
+/// that commit from the owner's own reloaded projection.
 ///
-/// The readback runs against the resource's own owner and is separate from the
-/// mutating call, so a green stage can never come from a lost response. A
-/// readback that cannot prove absence preserves the original identity and the
-/// safe next action instead of reporting a clean removal.
+/// The readback runs against each row's real owner and is separate from the
+/// mutating call, so a green stage can never come from a lost response. It walks
+/// EVERY row of `0..effects.len()`, including the retained, shared and preexisting
+/// rows, so `Completed` cannot be reached while a resource the plan promised to
+/// leave intact has never been observed. Each row is proved against the
+/// postcondition the frozen plan declared for that row, so a retained row is
+/// proved still present under its admitted identity and is never asked to be
+/// absent. A row with no owner that can answer for it is not walked past either:
+/// `readback_request` refuses it, so the operation stays short of the terminal
+/// commit with its identity and unresolved rows intact. A row that CANNOT BE
+/// PROVED does not merely return an empty evidence list either: the walk reports
+/// `None`, the caller stops before the terminal registry commit, and the row's
+/// typed `Unknown` disposition — original removal identity kept, blocking effect
+/// named, safe next action recorded — is what this call reports. That is the
+/// difference between "this denominator is fully observed" and "I could not
+/// observe one row of it", and only the caller of the terminal registry retirement
+/// must not confuse the two.
+///
+/// This tail is also the only place a terminal receipt can be minted, so it is
+/// the repair path for a crash that lost that receipt: the per-row readback and
+/// the post-retirement terminal proof below both re-run against projections this
+/// call reloads, and the retirement block is skipped because the registry record
+/// is already absent. Nothing here issues a mutating call on that path.
 fn finish_with_readback<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
@@ -2722,49 +4381,35 @@ fn finish_with_readback<P>(
 where
     P: InstallationEffectPort,
 {
-    let mut readback_evidence = Vec::new();
-    for position in 0..registry_row {
-        let row = operation.plan.effects[position].clone();
-        let Some(request) = readback_request(install, &row)? else {
-            continue;
-        };
-        let InstallationCoordinator { port, store } = coordinator;
-        match port.reconcile(&request) {
-            PortOutcome::Known(InstallationEffectObservation::Absent {
-                evidence,
-                observed_precondition,
-                ..
-            }) => {
-                if evidence.is_empty() {
-                    return unknown_row(
-                        store,
-                        operation,
-                        position,
-                        readback_ref("unavailable", &row)?,
-                    );
-                }
-                readback_evidence.push(observed_precondition.digest);
-                readback_evidence.extend(evidence);
-            }
-            PortOutcome::Known(_) => {
-                return unknown_row(
-                    store,
-                    operation,
-                    position,
-                    readback_ref("still-present", &row)?,
-                );
-            }
-            other => {
-                return unknown_row(store, operation, position, port_pending(other));
-            }
-        }
-    }
-    // The terminal projection is the last durable step and is idempotent: a
-    // retry after a crash between the registry commit and this operation's
-    // final save observes the record already absent and only re-commits the
-    // terminal evidence.
-    let current = registry.load()?;
-    if resolve_approved_generation(&current, &operation.plan.generation).is_ok() {
+    // The terminal registry retirement is the ONE mutating call left in this
+    // operation, so the walk above must have proved every row of the denominator
+    // before control reaches it. `None` means it did not: one row could not be
+    // proved, that row's typed `Unknown` disposition is already durable with the
+    // original removal identity and its blocking effect, and the only correct
+    // action here is to stop. Returning early is what keeps an unproved
+    // denominator from retiring the registry — the terminal commit, the reload
+    // below and the receipt mint are all unreachable on this path, which is the
+    // whole reason the walk reports the difference rather than an empty list.
+    let Some(mut readback_evidence) =
+        prove_every_row_before_terminal(coordinator, operation, install, registry_row)?
+    else {
+        return Ok(());
+    };
+    // The terminal projection is the last durable step, and a crash anywhere
+    // between its commit and this operation's final save is repaired by
+    // RE-PROVING, never by assuming the effect. A crash BEFORE the receipt was
+    // written leaves the target absent with nothing on file; the entry fence
+    // admits exactly that state only when this operation's own pre-terminal rows
+    // are all already resolved and the live projection still proves the terminal
+    // state, so the drive below re-reads every row, re-proves the terminal state
+    // against the projection it reloads here, and mints the missing receipt. A
+    // crash AFTER the receipt was written reuses that originally recorded
+    // receipt below instead of minting a second claim for the same committed
+    // effect. Neither path issues a second terminal mutation: the retirement
+    // block below is skipped precisely because the record is already absent, and
+    // the per-row drive issued no mutating call to get here.
+    let before = registry.load()?;
+    if resolve_approved_generation(&before, &operation.plan.generation).is_ok() {
         // The terminal registry retirement is the one mutating call left in
         // this operation, and it is issued after the per-row readback loop, not
         // at the entry fence. Both the bounded reconcile deadline and the
@@ -2782,20 +4427,14 @@ where
                 operation.plan.effects[registry_row].effect_id.as_str()
             )));
         }
-        observe_admission_fence(&current, &operation.plan)?;
+        observe_admission_fence(&before, &operation.plan)?;
         // The owner effects are re-observed here as well, against a transaction
         // re-loaded from the durable store, so a pending write, ORS operation,
         // outbox row or possible external effect, or a rebound lease/session/route
         // authority, staged during the per-row readback refuses the terminal
         // commit rather than being inherited from the entry observation. Like the
         // two refusals above, this one writes nothing.
-        let observed_install = coordinator
-            .store()
-            .load(&operation.plan.install_transaction_id)?
-            .ok_or(InstallationError::TransactionNotFound {
-                transaction_id: operation.plan.install_transaction_id.as_str().to_owned(),
-            })?;
-        observed_install.validate()?;
+        let observed_install = reload_install(coordinator.store(), &operation.plan)?;
         require_quiesced_owner_effects(&observed_install, &operation.plan)?;
         require_complete_effect_coverage(&observed_install, &operation.plan)?;
         let terminal = registry.mutate_atomic(operation.plan.registry_revision, |projection| {
@@ -2825,14 +4464,34 @@ where
             Err(error) => return Err(error),
         }
     }
+    // The terminal effect is proved by re-loading the registry AFTER the
+    // retirement and comparing what that independent projection actually says,
+    // never by the revision arithmetic of the call that issued it. This is the
+    // same `terminal_proofs_hold` check the entry fence applies when it decides
+    // whether a missing receipt is repairable, so the repair path and the mint
+    // path can never disagree about what the terminal state is.
+    let current = registry.load()?;
+    current.validate()?;
+    if !terminal_proofs_hold(&current, &operation.plan)? {
+        return unknown_row(
+            coordinator.store_mut(),
+            operation,
+            registry_row,
+            readback_ref(
+                "registry-terminal-unproven",
+                &operation.plan.effects[registry_row],
+            )?,
+        );
+    }
+    let receipt_digest = terminal_receipt_digest(coordinator, &current, operation)?;
     let expected = CanaryRemovalOperationVersion::of(operation)?;
-    readback_evidence.push(handle_ref(&format!(
-        "canary-removal/readback/registry-terminal:{}",
-        operation.plan.generation.as_str()
-    ))?);
+    // The registry row's evidence is the digest of the owner-issued terminal
+    // receipt, so the terminal effect is bound to this removal identity and to
+    // the projection the retirement actually produced.
+    readback_evidence.push(receipt_digest);
     operation.effect_progress[registry_row].state = CanaryRemovalEffectState::Resolved {
         disposition: CanaryRemovalEffectDisposition::Removed,
-        evidence: readback_evidence,
+        evidence: unique_handles(readback_evidence),
     };
     operation.blocking_effect_id = None;
     operation.stage = CanaryRemovalStage::Completed;
@@ -2841,4 +4500,242 @@ where
     coordinator
         .store_mut()
         .compare_and_save_canary_removal_operation(&expected, operation)
+}
+
+/// Re-reads EVERY row of the whole denominator through its own owner and returns
+/// the accumulated readback evidence, or `None` when a row could not be proved.
+///
+/// This runs before the terminal registry mutation, so a row that cannot be
+/// proved keeps the operation in the typed partial/unknown disposition with the
+/// original removal identity, and no terminal commit is attempted on an
+/// unproved denominator.
+///
+/// `Some(evidence)` means the WHOLE denominator was proved; `None` means it was
+/// not, and the caller must not proceed as though it had. Returning an empty
+/// vector instead would be indistinguishable from a denominator that proved
+/// nothing, and this caller's next acts — the terminal registry retirement, the
+/// post-retirement reload and the terminal receipt mint — are all irreversible
+/// or durable. The `None` is what stops them.
+///
+/// Every row of `0..effects.len()` is walked. A row is never skipped and never
+/// counted as proved without its own owner's verdict.
+fn prove_every_row_before_terminal<P>(
+    coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    operation: &mut CanaryRemovalOperation,
+    install: &InstallationTransaction,
+    registry_row: usize,
+) -> Result<Option<Vec<PlatformHandle>>, InstallationError>
+where
+    P: InstallationEffectPort,
+{
+    let mut readback_evidence = Vec::new();
+    for position in 0..operation.plan.effects.len() {
+        let row = operation.plan.effects[position].clone();
+        match readback_request(install, &row)? {
+            RowReadback::InstallerEffect(request) => {
+                let observed = match coordinator.port.reconcile(&request) {
+                    PortOutcome::Known(observed) => observed,
+                    other => {
+                        unknown_row(
+                            coordinator.store_mut(),
+                            operation,
+                            position,
+                            port_pending(other).map_err(|error| platform_error(&error))?,
+                        )?;
+                        return Ok(None);
+                    }
+                };
+                // Each row is proved against the postcondition the FROZEN PLAN
+                // itself declared for that row, through the same classifier and
+                // the same evidence reducer the per-row drive uses: a removed row
+                // must read back authoritatively absent with evidence, and a
+                // retained row must read back still present under its admitted
+                // identity. Absence is the wrong question for a retained row —
+                // demanding it would require removing exactly the resource the
+                // plan promised to leave intact, so the terminal commit would be
+                // unreachable for every plan that retains an installer effect.
+                let proved = match (
+                    row.expected_postcondition,
+                    classify_observation(&observed, &row),
+                ) {
+                    (CanaryRemovalPostcondition::Absent, RowClassification::Absent(evidence)) => {
+                        !evidence.is_empty()
+                    }
+                    (CanaryRemovalPostcondition::Retained, RowClassification::Matching) => true,
+                    _ => false,
+                };
+                if !proved {
+                    unknown_row(
+                        coordinator.store_mut(),
+                        operation,
+                        position,
+                        readback_ref("unproven-postcondition", &row)?,
+                    )?;
+                    return Ok(None);
+                }
+                readback_evidence.extend(matching_evidence(&observed));
+            }
+            RowReadback::TerminalRegistryRecord => {
+                // The hand-off record has no pre-commit readback: it is proved by
+                // the post-retirement reload below, and refusing here would make
+                // that proof unreachable. This is the only position allowed to
+                // carry it.
+                if position != registry_row {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "removal row {} claims to be the terminal registry record",
+                        row.effect_id.as_str()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(Some(readback_evidence))
+}
+
+/// Returns the digest of the owner-issued terminal receipt for this removal,
+/// reusing an already recorded receipt and minting one only when none exists.
+///
+/// The terminal effect is attributed by that receipt, bound to this removal
+/// identity, and never by the revision arithmetic of the call that issued it. A
+/// receipt this identity ALREADY holds is the evidence and is validated against
+/// the plan here — it is never reminted from the projection as it stands now,
+/// because reminting would mint a second, different claim for an effect that
+/// already committed and the store's immutable-receipt rule would then refuse
+/// every later recovery of this operation under the same identity.
+///
+/// `current` is the projection this owner reloaded AFTER the terminal registry
+/// mutation, so a minted receipt records what that mutation produced. It is also
+/// the one site where a recorded receipt and the live projection coexist on the
+/// path that closes the operation, so it is where the recorded registry CONTENT
+/// DIGEST becomes load-bearing: see the comparison below.
+fn terminal_receipt_digest<P>(
+    coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    current: &ApprovedGenerationRegistry,
+    operation: &CanaryRemovalOperation,
+) -> Result<PlatformHandle, InstallationError>
+where
+    P: InstallationEffectPort,
+{
+    let recorded_receipt = coordinator
+        .store()
+        .load_canary_removal_terminal_receipt(&operation.removal_transaction_id)?;
+    if let Some(recorded) = recorded_receipt {
+        recorded.validate()?;
+        if recorded.generation != operation.plan.generation
+            || recorded.predecessor_registry_revision != operation.plan.registry_revision
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // The recorded content digest is compared against the LIVE projection
+        // with the existing `registry_projection_identity` scheme that minted it
+        // — never recomputed from the receipt — so a receipt whose digest does
+        // not describe the registry it claims to describe cannot carry this
+        // operation to `Completed`.
+        //
+        // The revision guard keeps that comparison honest rather than brittle.
+        // While the live projection still carries EXACTLY the revision this
+        // receipt recorded, both describe the same committed linear history and
+        // the digests must be equal; a difference there is a substituted or
+        // corrupted registry. A projection that has ADVANCED past
+        // `resulting_registry_revision` is the case
+        // `terminal_receipt_recognises_retirement` admits through its monotonicity
+        // floor: it carries unrelated activity, the recorded digest describes a
+        // projection that is no longer live, and there is nothing to compare it
+        // against, so refusing there would re-introduce the crash wedge this
+        // receipt exists to remove. On such a projection the terminal state is
+        // proved independently by `terminal_proofs_hold`, from that live
+        // projection's own target absence, serving pointers and survivor set.
+        if current.revision() == recorded.resulting_registry_revision {
+            let live_content_digest = super::registry_projection_identity(current)?;
+            if recorded.resulting_registry_content_digest != live_content_digest {
+                return Err(InstallationError::IncompleteObservation(format!(
+                    "the terminal receipt recorded for removal {} describes registry revision {} with content digest {}, but the live registry at that same revision carries content digest {}; this owner will not close the operation on a receipt that does not describe the registry it claims to describe",
+                    operation.removal_transaction_id.as_str(),
+                    recorded.resulting_registry_revision,
+                    recorded.resulting_registry_content_digest.as_str(),
+                    live_content_digest.as_str()
+                )));
+            }
+        }
+        return recorded.computed_digest();
+    }
+    // The receipt's own validator requires one survivor set to have exactly one
+    // serialization, and the registry stores generations in approval order, so
+    // the set is sorted here instead of being handed over in an order the
+    // receipt itself would refuse.
+    let mut surviving = surviving_generations(current, &operation.plan.generation);
+    surviving.sort();
+    let receipt = CanaryRemovalTerminalReceipt {
+        canary_removal_wire_version: CANARY_REMOVAL_WIRE_VERSION,
+        removal_transaction_id: operation.removal_transaction_id.clone(),
+        generation: operation.plan.generation.clone(),
+        predecessor_registry_revision: operation.plan.registry_revision,
+        resulting_registry_revision: current.revision(),
+        resulting_registry_content_digest: super::registry_projection_identity(current)?,
+        active_generation: current.active_generation().cloned(),
+        last_known_good_generation: current.last_known_good_generation().cloned(),
+        surviving_generations: surviving,
+    };
+    receipt.validate()?;
+    let digest = receipt.computed_digest()?;
+    // The receipt is written BEFORE the operation row is closed, so a crash in
+    // between leaves a durable terminal record and an unresolved operation row
+    // rather than a resolved row with no record behind it. Re-running the tail
+    // finds that record and reuses it. The store's rule is write-once per
+    // removal identity, so this mint is itself idempotent: a byte-identical
+    // re-mint is accepted as a success and only a DIFFERING receipt under the
+    // same identity is refused.
+    coordinator
+        .store_mut()
+        .save_canary_removal_terminal_receipt(&receipt)?;
+    Ok(digest)
+}
+
+/// Returns the observed set of surviving generations in a live projection.
+///
+/// This is the existing `surviving_generations` helper applied to the projection
+/// the owner just reloaded, with the removal target excluded, so the observed
+/// survivor set is derived by exactly the one function that produced the
+/// plan-time set.
+fn observed_survivors(
+    projection: &ApprovedGenerationRegistry,
+    plan: &CanaryRemovalPlan,
+) -> BTreeSet<PlatformHandle> {
+    surviving_generations(projection, &plan.generation)
+        .into_iter()
+        .collect()
+}
+
+/// Returns the survivor set the frozen plan committed to.
+///
+/// The expected set is read from the plan's own digest-bound
+/// `CanaryEvidenceRoot` row, whose `reference_users` are the survivor set
+/// `freeze_effect_graph` observed when the plan was frozen. Comparing the
+/// reloaded registry against that frozen set is what makes the terminal check
+/// independent of the projection being checked: the observed side comes from a
+/// registry read, the expected side from an artifact whose identity the plan
+/// digest already binds. `terminal_proofs_hold` requires this set to be present
+/// in the reloaded projection, not to equal it, so unrelated registry activity
+/// that adds a generation this plan could not have named does not wedge
+/// recovery. Because the set comes from the plan rather than from the registry,
+/// `revalidate_fence` re-derives it from the plan-time projection and refuses a
+/// plan whose committed set does not match that projection exactly, on every
+/// path that runs while the registry still carries the plan's own revision. Once
+/// the terminal retirement has committed, that projection no longer exists, so
+/// the set can only be required to still be present; the same fence has already
+/// applied that relation through `pre_receipt_crash_window_is_repairable` before
+/// `terminal_proofs_hold` can be reached. See the comment at that pin for why
+/// equality is deliberately not demanded there.
+fn planned_survivors(
+    plan: &CanaryRemovalPlan,
+) -> Result<BTreeSet<PlatformHandle>, InstallationError> {
+    let row = plan
+        .effects
+        .iter()
+        .find(|row| row.category == CanaryRemovalResource::CanaryEvidenceRoot)
+        .ok_or(InstallationError::IncompleteObservation(
+            "the frozen plan carries no canary-evidence row and therefore no survivor set it committed to"
+                .to_owned(),
+        ))?;
+    Ok(row.reference_users.iter().cloned().collect())
 }
