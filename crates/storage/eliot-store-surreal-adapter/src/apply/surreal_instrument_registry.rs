@@ -53,21 +53,27 @@ pub(super) struct InstrumentRegistryWrites {
     pub(super) heads: Vec<InstrumentRegistryHeadWrite>,
 }
 
+/// Creates the instrument-registry head table if the provider has not.
+///
+/// The statement text is the owner's published
+/// [`crate::schema::INSTRUMENT_REGISTRY_TABLES_DDL`] constant, issued verbatim:
+/// the bytes this operation executes are exactly the bytes
+/// `crate::schema_inventory::EMBEDDED_SCHEMA_BODIES` publishes, so the body's
+/// recorded digest describes the DDL that reaches the provider instead of a
+/// second, informal copy of it (issue #1221 acceptance A1).
 async fn ensure_instrument_registry_table(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
 ) -> Result<(), AdapterError> {
-    let ddl = format!(
-        "DEFINE TABLE IF NOT EXISTS {INSTRUMENT_REGISTRY} SCHEMAFULL; \
-         DEFINE FIELD IF NOT EXISTS snapshot_json ON {INSTRUMENT_REGISTRY} TYPE string; \
-         DEFINE FIELD IF NOT EXISTS revision ON {INSTRUMENT_REGISTRY} TYPE int; \
-         DEFINE FIELD IF NOT EXISTS state_fence ON {INSTRUMENT_REGISTRY} TYPE object; \
-         DEFINE FIELD IF NOT EXISTS scope_id ON {INSTRUMENT_REGISTRY} TYPE string; \
-         DEFINE FIELD IF NOT EXISTS task_id ON {INSTRUMENT_REGISTRY} TYPE option<string>;"
-    );
-    client::query(db, config, "schema.ensure", &ddl, Map::new())
-        .await
-        .map(|_| ())
+    client::query(
+        db,
+        config,
+        "schema.ensure",
+        schema::INSTRUMENT_REGISTRY_TABLES_DDL,
+        Map::new(),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Pre-computes instrument-registry head writes (issue #1814 W1.2).

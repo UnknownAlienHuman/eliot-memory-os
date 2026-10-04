@@ -112,20 +112,66 @@ fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutio
     .map_err(|_| ProcessExecutionError::UnknownOutcome)
 }
 
-/// Drives one already-resolved future to completion on the calling thread.
+/// P-04-owned wall-clock ceiling for the two sink calls whose request carries no
+/// typed wait budget of its own: `open` and `readback`.
 ///
-/// The drain/finalize path is synchronous, while the sink port is async; this
-/// spins the future with `yield_now` and performs no sleeping, no retry, and
-/// no I/O of its own. Provider-side time is bounded by the wait budget carried
-/// in each sink request, never by this driver.
-fn block_on_sink<F: Future>(future: F) -> F::Output {
+/// The append/finalize/abort requests carry the session's typed budgets
+/// ([`ProcessStreamSinkLimits::max_append_wait_ms`] and siblings) and those
+/// remain the bound for them.  `open` and `readback` have no such field, so the
+/// bound has to be owned here rather than inherited from a provider that is
+/// allowed to never answer.
+const SINK_UNBUDGETED_WAIT_MS: u64 = 2_000;
+
+/// One bounded drive of a provider sink future.
+///
+/// [`SinkDrive::DeadlineElapsed`] is deliberately NOT a provider answer: a
+/// provider that stays pending past the P-04-owned deadline has told us nothing
+/// about whether it persisted anything, so every call site must treat it as its
+/// own typed gap rather than adopt a fabricated result.
+enum SinkDrive<T> {
+    Ready(T),
+    DeadlineElapsed,
+}
+
+/// Drives one sink future to completion under a real P-04-owned deadline.
+///
+/// The drain/finalize path is synchronous while the sink port is async, so this
+/// polls the provider future on the calling thread — but never without a bound.
+/// The old driver looped on a noop waker with no elapsed-time check, which meant
+/// a hung, buggy or merely reactor-dependent provider could park the pipe-drain
+/// thread forever, let the OS pipe fill, and block the child: the typed wait
+/// budget in the request is advisory to the provider and cannot bound P-04's own
+/// poll loop.
+///
+/// Here the wall-clock deadline is checked on every `Pending` poll, the first
+/// wait parks the thread rather than hot-spinning it, and expiry is reported as
+/// [`SinkDrive::DeadlineElapsed`] so the caller latches its exact persistence
+/// gap and keeps draining.  This driver still performs no I/O, no retry, and no
+/// provider decision of its own.
+fn drive_sink_bounded<F: Future>(future: F, wait_budget_ms: u64) -> SinkDrive<F::Output> {
     let mut future = std::pin::pin!(future);
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
+    let deadline = Instant::now() + Duration::from_millis(wait_budget_ms);
+    let mut park = Duration::ZERO;
     loop {
         match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
+            Poll::Ready(output) => return SinkDrive::Ready(output),
+            Poll::Pending => {
+                if Instant::now() >= deadline {
+                    return SinkDrive::DeadlineElapsed;
+                }
+                // Yield once, then back off to a capped park: a future that is
+                // merely slow must not be turned into a hot loop that starves
+                // the reader thread's own work.
+                if park.is_zero() {
+                    std::thread::yield_now();
+                    park = Duration::from_micros(50);
+                } else {
+                    std::thread::sleep(park.min(Duration::from_millis(2)));
+                    park = park.saturating_mul(2);
+                }
+            }
         }
     }
 }
@@ -286,13 +332,20 @@ impl StreamSinkPump {
             ProcessStreamDigestAlgorithm::Sha256,
         )
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
-        let session = block_on_sink(self.client.open(request)).map_err(|error| {
-            if matches!(error, ProcessStreamSinkError::ProviderUnavailable) {
-                ProcessExecutionError::Unavailable("stream sink open unavailable".to_owned())
-            } else {
-                ProcessExecutionError::UnknownOutcome
+        let session = match drive_sink_bounded(self.client.open(request), SINK_UNBUDGETED_WAIT_MS) {
+            SinkDrive::Ready(Ok(session)) => session,
+            // A provider that never answers and a provider that reports
+            // unavailability are the same observation from P-04: no session
+            // exists, so this pump drops out and the stream keeps its documented
+            // `SourceUnavailable` path.  Neither may claim a durable source.
+            SinkDrive::Ready(Err(ProcessStreamSinkError::ProviderUnavailable))
+            | SinkDrive::DeadlineElapsed => {
+                return Err(ProcessExecutionError::Unavailable(
+                    "stream sink open unavailable".to_owned(),
+                ));
             }
-        })?;
+            SinkDrive::Ready(Err(_)) => return Err(ProcessExecutionError::UnknownOutcome),
+        };
         self.session = Some(session);
         Ok(())
     }
@@ -362,11 +415,12 @@ impl StreamSinkPump {
             self.admitted_bytes(),
         )
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let wait_budget = self.limits.max_finalize_wait_ms();
         let request = ProcessStreamSinkFinalizeRequest::new(
             session.terminal_id().clone(),
             self.next_sequence,
             self.next_offset,
-            self.limits.max_finalize_wait_ms(),
+            wait_budget,
             StreamTransportStatus::Complete,
             self.admitted_sha256(),
             self.admitted_bytes(),
@@ -375,7 +429,16 @@ impl StreamSinkPump {
             self.finalize_gaps(),
         )
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
-        match block_on_sink(self.client.finalize(session.clone(), request)) {
+        let finalize =
+            match drive_sink_bounded(self.client.finalize(session.clone(), request), wait_budget) {
+                SinkDrive::Ready(result) => result,
+                // A finalize that outlives its own typed budget is an unavailable
+                // provider for this settle, not a completed terminal.  Falling into
+                // the same readback reconcile keeps the drain thread bounded and
+                // still refuses to mint a second receipt.
+                SinkDrive::DeadlineElapsed => Err(ProcessStreamSinkError::ProviderUnavailable),
+            };
+        match finalize {
             Ok(terminal) => self.adopt_terminal(terminal),
             Err(
                 error @ (ProcessStreamSinkError::ProviderUnavailable
@@ -443,8 +506,14 @@ impl StreamSinkPump {
         let Some(session) = self.session.clone() else {
             return Err(ProcessExecutionError::UnknownOutcome);
         };
-        block_on_sink(self.client.readback(session))
-            .map_err(|_| ProcessExecutionError::UnknownOutcome)
+        // Cleanup/readback must never hang its caller either: an unanswered
+        // readback is reported, never waited on indefinitely.
+        match drive_sink_bounded(self.client.readback(session), SINK_UNBUDGETED_WAIT_MS) {
+            SinkDrive::Ready(Ok(readback)) => Ok(readback),
+            SinkDrive::Ready(Err(_)) | SinkDrive::DeadlineElapsed => {
+                Err(ProcessExecutionError::UnknownOutcome)
+            }
+        }
     }
 
     /// Returns the admitted-byte count covered by the terminal (or so far).
@@ -523,7 +592,20 @@ impl StreamSinkPump {
             piece.to_vec(),
             wait_budget,
         );
-        match block_on_sink(self.client.append(session.clone(), request)) {
+        let disposition =
+            match drive_sink_bounded(self.client.append(session.clone(), request), wait_budget) {
+                SinkDrive::Ready(result) => result,
+                // The provider stayed pending past the session's own typed append
+                // budget.  Latch the exact same pressure gap a provider-reported
+                // deadline would, shed the remainder, and return to the drain
+                // thread: persistence is bounded, the pipe keeps draining, and no
+                // byte is claimed as durably admitted.
+                SinkDrive::DeadlineElapsed => {
+                    self.backpressured = true;
+                    return Ok(SinkAppendOutcome::ShedTimeout);
+                }
+            };
+        match disposition {
             Ok(
                 ProcessStreamSinkAppendDisposition::Accepted { .. }
                 | ProcessStreamSinkAppendDisposition::Replayed { .. },
@@ -627,7 +709,15 @@ impl StreamSinkPump {
             gaps,
         )
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
-        match block_on_sink(self.client.abort(session.clone(), request)) {
+        let settle =
+            match drive_sink_bounded(self.client.abort(session.clone(), request), wait_budget) {
+                SinkDrive::Ready(result) => result,
+                // An abort that outlives its own typed budget is an unavailable
+                // provider for this settle, not a terminal: reconcile by readback
+                // instead of minting a receipt nobody confirmed.
+                SinkDrive::DeadlineElapsed => Err(ProcessStreamSinkError::ProviderUnavailable),
+            };
+        match settle {
             Ok(terminal) => self.adopt_terminal(terminal),
             Err(
                 error @ (ProcessStreamSinkError::ProviderUnavailable
@@ -654,9 +744,16 @@ impl StreamSinkPump {
         &mut self,
         session: &ProcessStreamSinkSession,
     ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
-        match block_on_sink(self.client.readback(session.clone())) {
-            Ok(ProcessStreamSinkReadback::Terminal { terminal }) => self.adopt_terminal(terminal),
-            Ok(_) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        match drive_sink_bounded(
+            self.client.readback(session.clone()),
+            SINK_UNBUDGETED_WAIT_MS,
+        ) {
+            SinkDrive::Ready(Ok(ProcessStreamSinkReadback::Terminal { terminal })) => {
+                self.adopt_terminal(terminal)
+            }
+            SinkDrive::Ready(Ok(_) | Err(_)) | SinkDrive::DeadlineElapsed => {
+                Err(ProcessExecutionError::UnknownOutcome)
+            }
         }
     }
 }
@@ -1664,6 +1761,37 @@ impl WindowsProcessExecutor {
             launch_admission: Some(launch_admission),
             kernel_outer_binding_required: true,
             stream_sink: None,
+            operations: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(std::collections::BTreeSet::new()),
+            capture_limit: DEFAULT_CAPTURE_LIMIT,
+        }
+    }
+
+    /// Creates one Kernel executor that composes BOTH the launch-admission /
+    /// outer-Job requirement AND the single accepted stream sink.
+    ///
+    /// The two contours were previously reachable only through separate
+    /// constructors, so any single call had to pick one: the production Kernel
+    /// gateway picked launch admission, which left every ordinary-effect stream
+    /// on the `SourceUnavailable` path with no immutable source locator and no
+    /// ready receipt, and no caller could compose both without duplicating this
+    /// struct's field set. This constructor closes that split so the launch
+    /// contour and the persistence contour cannot be chosen independently again.
+    ///
+    /// Exactly one sink client is accepted: there is no second sink, no
+    /// fallback-to-`None` variant here, and no way to attach the sink after the
+    /// first launch.
+    #[must_use]
+    pub fn new_with_launch_admission_and_stream_sink(
+        authority: Arc<dyn DispatchValidationPort>,
+        launch_admission: Arc<dyn ProcessLaunchAdmission>,
+        stream_sink: Arc<dyn ProcessStreamSinkClient>,
+    ) -> Self {
+        Self {
+            authority,
+            launch_admission: Some(launch_admission),
+            kernel_outer_binding_required: true,
+            stream_sink: Some(stream_sink),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -8311,6 +8439,310 @@ mod tests {
         );
         assert_eq!(fake.terminal_count(), 1);
         Ok(())
+    }
+
+    use eliot_process::{
+        ContractError, ProcessLaunchAdmission, ProcessStreamKind, ProcessStreamSinkError,
+        ProcessStreamSinkLimits, SuspendedLaunchEvidence,
+    };
+
+    /// A sink client whose persistence futures never resolve.
+    ///
+    /// This is the exact provider shape an unbounded driver cannot survive: a
+    /// hung, buggy or reactor-dependent provider that stays `Pending` forever
+    /// while holding nothing. No byte, session or terminal is ever produced,
+    /// and the noop waker can never make it ready.
+    #[derive(Clone, Copy)]
+    struct Hangs(u8);
+
+    impl Hangs {
+        const OPEN: Self = Self(1);
+        const APPEND: Self = Self(2);
+        const FINALIZE: Self = Self(4);
+        const ABORT: Self = Self(8);
+        const READBACK: Self = Self(16);
+        const ALL: Self = Self(31);
+
+        fn contains(self, other: Self) -> bool {
+            self.0 & other.0 == other.0
+        }
+    }
+
+    struct HangingStreamSink {
+        hangs: Hangs,
+        inner: FakeStreamSink,
+    }
+
+    impl HangingStreamSink {
+        /// A provider that never answers anything at all.
+        fn all_pending() -> Self {
+            Self::new(Hangs(Hangs::ALL.0))
+        }
+
+        /// A provider that answers `open` and then never persists a byte.
+        fn hangs_on_append() -> Self {
+            Self::new(Hangs(Hangs::ALL.0 - Hangs::OPEN.0))
+        }
+
+        /// A provider that admits bytes normally and then stops answering at
+        /// the terminal settle.
+        fn hangs_at_settle() -> Self {
+            Self::new(Hangs(
+                Hangs::FINALIZE.0 | Hangs::ABORT.0 | Hangs::READBACK.0,
+            ))
+        }
+
+        fn new(hangs: Hangs) -> Self {
+            Self {
+                hangs,
+                inner: FakeStreamSink::new(),
+            }
+        }
+
+        fn never<T: Send + 'static>() -> eliot_process::ProcessStreamSinkFuture<'static, T> {
+            Box::pin(std::future::pending::<
+                Result<T, eliot_process::ProcessStreamSinkError>,
+            >())
+        }
+    }
+
+    impl eliot_process::ProcessStreamSinkClient for HangingStreamSink {
+        fn open(
+            &self,
+            request: eliot_process::ProcessStreamSinkOpenRequest,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkSession>
+        {
+            if self.hangs.contains(Hangs::OPEN) {
+                return Self::never();
+            }
+            self.inner.open(request)
+        }
+
+        fn append(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            request: eliot_process::ProcessStreamSinkAppend,
+        ) -> eliot_process::ProcessStreamSinkFuture<
+            '_,
+            eliot_process::ProcessStreamSinkAppendDisposition,
+        > {
+            if self.hangs.contains(Hangs::APPEND) {
+                return Self::never();
+            }
+            self.inner.append(session, request)
+        }
+
+        fn finalize(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            request: eliot_process::ProcessStreamSinkFinalizeRequest,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkTerminal>
+        {
+            if self.hangs.contains(Hangs::FINALIZE) {
+                return Self::never();
+            }
+            self.inner.finalize(session, request)
+        }
+
+        fn abort(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            request: eliot_process::ProcessStreamSinkAbortRequest,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkTerminal>
+        {
+            if self.hangs.contains(Hangs::ABORT) {
+                return Self::never();
+            }
+            self.inner.abort(session, request)
+        }
+
+        fn readback(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkReadback>
+        {
+            if self.hangs.contains(Hangs::READBACK) {
+                return Self::never();
+            }
+            self.inner.readback(session)
+        }
+
+        fn reconcile(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            outcome: eliot_process::ProcessStreamSinkUnknownOutcome,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkReadback>
+        {
+            if self.hangs.contains(Hangs::READBACK) {
+                return Self::never();
+            }
+            self.inner.reconcile(session, outcome)
+        }
+    }
+
+    /// Sink limits whose typed wait budgets are short enough to keep the
+    /// bounded-driver proofs fast while still being real non-zero budgets.
+    fn fast_sink_limits() -> Result<ProcessStreamSinkLimits, ProcessStreamSinkError> {
+        ProcessStreamSinkLimits::new(8_192, 1 << 20, 64, 4_096, 8, 65_536, 25, 25, 25)
+    }
+
+    /// #1812 defect 2: a provider whose persistence future never resolves must
+    /// not park the pipe-drain thread. Append sheds under the session's own
+    /// typed budget and latches the exact pressure gap, so the drain thread
+    /// returns to the OS pipe and the child is never blocked by persistence.
+    ///
+    /// The elapsed-time assertions are the point of the test: without a real
+    /// deadline each call below would never return at all.
+    #[test]
+    fn append_sheds_and_latches_when_the_provider_never_answers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant as TestInstant;
+
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> =
+            Arc::new(HangingStreamSink::hangs_on_append());
+        let mut pump = super::StreamSinkPump::new(
+            client,
+            sink_test_binding("1812-append-hang")?,
+            ProcessStreamKind::Stdout,
+            sink_test_policy()?,
+            fast_sink_limits()?,
+        );
+        pump.open()?;
+        assert!(pump.is_open());
+
+        let started = TestInstant::now();
+        assert_eq!(
+            pump.append(b"never-persisted-prefix")?,
+            super::SinkAppendOutcome::ShedTimeout
+        );
+        let first = started.elapsed();
+        // The latched gap is exact and durable on the pump: nothing was
+        // admitted, everything was offered, and the tail now sheds locally
+        // with no provider I/O at all.
+        assert_eq!(pump.admitted_bytes(), 0);
+        assert_eq!(pump.offered_bytes(), 22);
+        assert!(pump.backpressure_observed());
+        assert_eq!(
+            pump.append(b"after-the-latch")?,
+            super::SinkAppendOutcome::ShedClosed
+        );
+
+        // A second shed costs nothing because the latch already holds: this is
+        // the difference between a bounded shed and a bounded retry loop.
+        let again = TestInstant::now();
+        assert_eq!(
+            pump.append(b"still-shed")?,
+            super::SinkAppendOutcome::ShedClosed
+        );
+        assert!(
+            again.elapsed() < first,
+            "a latched shed must not repeat the provider wait"
+        );
+        Ok(())
+    }
+
+    /// #1812 defect 2: a finalize that never answers mints NO terminal and no
+    /// evidence. The bounded driver reports the deadline as an unavailable
+    /// provider, the readback reconcile is bounded too, and the operator gets
+    /// an honest unknown instead of a fabricated receipt.
+    #[test]
+    fn finalize_never_mints_a_terminal_when_the_provider_never_answers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> =
+            Arc::new(HangingStreamSink::hangs_at_settle());
+        let mut pump = super::StreamSinkPump::new(
+            client,
+            sink_test_binding("1812-finalize-hang")?,
+            ProcessStreamKind::Stdout,
+            sink_test_policy()?,
+            fast_sink_limits()?,
+        );
+        pump.open()?;
+        assert_eq!(
+            pump.append(b"admitted-before-the-hang")?,
+            super::SinkAppendOutcome::Admitted
+        );
+        assert!(matches!(
+            pump.finalize_eof(),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        assert!(pump.terminal().is_none());
+        assert!(pump.evidence().is_none());
+        // A cancel-before-EOF settle is bounded on the same terms.
+        assert!(matches!(
+            pump.abort_cancelled(),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        assert!(pump.terminal().is_none());
+        Ok(())
+    }
+
+    /// #1812 defect 2: an open that never answers is reported as unavailable
+    /// rather than waited on. The P-04-owned un-budgeted ceiling governs it,
+    /// and the honest result is the same documented `SourceUnavailable` path a
+    /// provider-reported outage takes — never a durable source nobody confirmed.
+    #[test]
+    fn open_reports_unavailable_instead_of_waiting_forever()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> =
+            Arc::new(HangingStreamSink::all_pending());
+        let mut pump = super::StreamSinkPump::new(
+            client,
+            sink_test_binding("1812-open-hang")?,
+            ProcessStreamKind::Stdout,
+            sink_test_policy()?,
+            fast_sink_limits()?,
+        );
+        assert!(matches!(
+            pump.open(),
+            Err(ProcessExecutionError::Unavailable(message))
+                if message == "stream sink open unavailable"
+        ));
+        assert!(!pump.is_open());
+        assert!(pump.terminal().is_none());
+        // With no session there is nothing to offer: an append still fails
+        // closed rather than silently buffering unpersisted bytes.
+        assert!(matches!(
+            pump.append(b"after-a-hung-open"),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        Ok(())
+    }
+
+    /// #1812 defect 1: the launch-admission contour and the stream-sink contour
+    /// are composed by one closed constructor, so a Kernel executor can no
+    /// longer be built with one and silently lack the other.
+    #[test]
+    fn the_launch_admission_constructor_composes_the_stream_sink() {
+        struct RefusingAdmission;
+
+        impl ProcessLaunchAdmission for RefusingAdmission {
+            fn validate_launch(
+                &self,
+                _request: &ProcessRequest,
+                _observed: &SuspendedProcessIdentity,
+                _launch: &SuspendedLaunchEvidence,
+            ) -> Result<(), ContractError> {
+                Err(ContractError::InvalidValue {
+                    field: "launch",
+                    reason: "test admission must not be consulted here",
+                })
+            }
+        }
+
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> =
+            Arc::new(HangingStreamSink::all_pending());
+        let executor = super::WindowsProcessExecutor::new_with_launch_admission_and_stream_sink(
+            Arc::new(DummyPort),
+            Arc::new(RefusingAdmission),
+            Arc::clone(&client),
+        );
+        // Both contours are held at once, and the outer-Job requirement that
+        // the plain launch-admission constructor sets is not lost by attaching
+        // the sink.
+        assert!(executor.stream_sink.is_some());
+        assert!(executor.launch_admission.is_some());
+        assert!(executor.kernel_outer_binding_required);
     }
 
     /// Scoped temporary directory removed on drop, so an assert failure can
