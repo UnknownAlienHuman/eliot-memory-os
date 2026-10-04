@@ -3712,4 +3712,345 @@ mod tests {
             .is_ok()
         );
     }
+
+    // WORK_UNIT_CASE: 742/5
+    #[test]
+    fn named_catalogue_rejection_records_only_validated_operation_manifest_identity() {
+        use crate::diagnostics::RequestOutcome;
+        use eliot_store_api::{NamedReadOperation, ReadConsistency, ScopeId};
+
+        // Deterministic manifest-rejection fixture: the activated read entry
+        // for `GetRevisionHeads` declares `requires_scope_id: false`, so a
+        // scope-bearing request is refused by the generated catalogue gate
+        // (`validate_read_against_catalogue`) before any provider I/O. The
+        // real ingress path runs here, so the private
+        // `enforce_admitted_operation_with_log` seam emits into a
+        // caller-owned `BoundedEventLog` instead of the process sink.
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetRevisionHeads,
+            scope_id: Some(ScopeId::new("scope-742-case5").expect("scope")),
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence,
+            parameters: std::collections::BTreeMap::new(),
+        };
+        let identity = session_identity(&context, "idem-742-case5");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Named { request: read },
+        );
+        let mut events = BoundedEventLog::new();
+        let error = validate_request_frame_with_log(&mut session, &frame, &mut events)
+            .expect_err("a scope-bearing named read is refused before dispatch");
+        assert!(
+            error.contains("operation does not address a scope"),
+            "the catalogue refuses the undeclared scope, never a generic error: {error}"
+        );
+        assert_eq!(events.len(), 1, "one catalogue record");
+        assert_eq!(events.dropped(), 0, "no record dropped");
+        let record = events.last().expect("catalogue record");
+        assert_eq!(record.boundary(), BridgeBoundary::CatalogueAdmission);
+        assert_eq!(record.operation(), "named");
+        assert_eq!(record.outcome(), RequestOutcome::ValidationRejected);
+        // A named read carries no validated operation identity and no
+        // operation-manifest digest, so the record carries neither: the
+        // refused scope, the parameters and the fence never become identity.
+        assert!(record.identity().request_id().is_none());
+        assert!(record.identity().operation_id().is_none());
+        assert!(record.identity().idempotency_ref().is_none());
+        assert!(record.identity().manifest_digest().is_none());
+        assert!(!record.identity().fence_present());
+        assert!(record.identity().generation().is_none());
+        assert!(record.identity().evidence_ref().is_none());
+        assert!(record.reason().is_none());
+        assert!(record.recovery().is_none());
+        assert!(record.receipt_status().is_none());
+        assert!(record.failure_disposition().is_none());
+        let rendered = format!("{record}");
+        assert!(
+            !rendered.contains("scope-742-case5"),
+            "the refused scope never reaches a rendered record: {rendered}"
+        );
+        assert!(
+            !rendered.contains("idem-742-case5"),
+            "the caller's idempotency key never reaches a record: {rendered}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 742/9
+    #[test]
+    fn schema_migration_lifecycle_stays_distinct_from_degraded_operation() {
+        // `apply_initial_schema_migration` needs a live provider child and
+        // owns its own local log, so its two emission shapes (lib.rs:611-617
+        // and lib.rs:620-626) are driven here through the same production
+        // entries with the same closed vocabulary. Each claim is proved by the
+        // helper that owns it, so a reader can see which property lives where;
+        // this case only composes them in the order they build on each other.
+        let generation = "gen9";
+        let (migrated_outcome, refused_outcome) = migration_lifecycle_emission_shapes(generation);
+        let (migration_refusal, degraded_refusal) = migration_and_degraded_failure_fixtures();
+        refusal_ledger_keeps_distinct_typed_dispositions(
+            &migration_refusal,
+            &degraded_refusal,
+            migrated_outcome,
+            refused_outcome,
+        );
+        readiness_states_stay_distinct_while_both_deny_the_pipe(generation);
+    }
+
+    /// Schema-migration emission shapes: the lifecycle observation carries the
+    /// generation, the validation refusal carries no identity, and the two stay
+    /// distinct. Returns both lifecycle outcomes so the ledger and readiness
+    /// claims can show that no degraded refusal record reuses either of them.
+    fn migration_lifecycle_emission_shapes(
+        generation: &str,
+    ) -> (
+        crate::diagnostics::RequestOutcome,
+        crate::diagnostics::RequestOutcome,
+    ) {
+        use crate::diagnostics::RequestOutcome;
+
+        let mut migration_events = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut migration_events,
+            BridgeBoundary::SchemaMigration,
+            "schema_migration",
+            &BridgeIdentity::new().with_generation(generation),
+            None,
+        );
+        emit_validation_rejected(
+            &mut migration_events,
+            BridgeBoundary::SchemaMigration,
+            "schema_migration",
+            &BridgeIdentity::new(),
+            None,
+        );
+        assert_eq!(migration_events.len(), 2, "two migration records");
+        assert_eq!(migration_events.dropped(), 0);
+        let migrated = migration_events.iter().next().expect("migrated record");
+        let refused = migration_events.last().expect("refused record");
+        assert_eq!(migrated.boundary(), BridgeBoundary::SchemaMigration);
+        assert_eq!(refused.boundary(), BridgeBoundary::SchemaMigration);
+        assert_eq!(migrated.operation(), "schema_migration");
+        assert_eq!(refused.operation(), "schema_migration");
+        assert_eq!(migrated.outcome(), RequestOutcome::LifecycleObserved);
+        assert_eq!(refused.outcome(), RequestOutcome::ValidationRejected);
+        assert_eq!(migrated.identity().generation(), Some(generation));
+        assert!(refused.identity().generation().is_none());
+        assert_ne!(migrated.outcome(), refused.outcome());
+        (migrated.outcome(), refused.outcome())
+    }
+
+    /// The two degraded fixtures: a migration-required refusal and a plain
+    /// provider-unavailable refusal are separate typed failures that both
+    /// satisfy the failure contract and both classify as `NotAttempted`, so no
+    /// downstream projection ever has to inspect their prose.
+    fn migration_and_degraded_failure_fixtures() -> (Response, Response) {
+        use crate::diagnostics::RequestOutcome;
+        use crate::diagnostics::classify_response;
+        use eliot_store_api::{StoreEvidenceHandles, StoreFailure, StoreReasonCode};
+
+        let migration_required = StoreFailure {
+            contract_revision: eliot_store_api::STORE_FAILURE_CONTRACT_REVISION.to_owned(),
+            disposition: StoreFailureDisposition::MigrationRequired,
+            reason_code: StoreReasonCode::new("MIGRATION_REQUIRED").expect("reason"),
+            request_id: None,
+            operation_id: None,
+            idempotency_key_ref_or_digest: None,
+            state_fence_ref_or_exact_safe_projection: None,
+            mutation_disposition: StoreMutationDisposition::NotAttempted,
+            retry_directive: StoreRetryDirective::MigrateThenRetryNewIdentity,
+            recovery_action: StoreRecoveryAction::RunSchemaMigration,
+            conflict: None,
+            retry_after_ms: None,
+            retry_after_dependency_revision: None,
+            evidence_handles: StoreEvidenceHandles::default(),
+            evidence_ref: None,
+            human_detail: None,
+        };
+        let degraded = StoreFailure {
+            disposition: StoreFailureDisposition::Unavailable,
+            reason_code: StoreReasonCode::new("PROVIDER_UNAVAILABLE").expect("reason"),
+            recovery_action: StoreRecoveryAction::RestoreStoreConnectivity,
+            ..migration_required.clone()
+        };
+        // Both fixtures satisfy the failure contract, so the outcomes below are
+        // read from contract-valid failures only.
+        assert!(migration_required.validate().is_ok());
+        assert!(degraded.validate().is_ok());
+        let migration_refusal = Response::Failure {
+            failure: migration_required,
+        };
+        let degraded_refusal = Response::Failure { failure: degraded };
+        let migration_outcome = classify_response(&migration_refusal);
+        let degraded_outcome = classify_response(&degraded_refusal);
+        assert_eq!(migration_outcome, RequestOutcome::NotAttempted);
+        assert_eq!(degraded_outcome, RequestOutcome::NotAttempted);
+        (migration_refusal, degraded_refusal)
+    }
+
+    /// Ledger completeness: each refusal is recorded on the readiness
+    /// request's own result boundary rather than on the schema-migration
+    /// boundary, and the two records keep distinct typed dispositions and
+    /// recovery actions instead of collapsing onto one another.
+    fn refusal_ledger_keeps_distinct_typed_dispositions(
+        migration_refusal: &Response,
+        degraded_refusal: &Response,
+        migrated_outcome: crate::diagnostics::RequestOutcome,
+        refused_outcome: crate::diagnostics::RequestOutcome,
+    ) {
+        use crate::diagnostics::dispatch_boundary;
+        use crate::diagnostics::emit_dispatch_outcome;
+
+        // The migration-required refusal is recorded on the request's own
+        // result boundary, not on the schema-migration boundary.
+        let readiness_request = Request::Readiness;
+        let mut operation_events = BoundedEventLog::new();
+        emit_dispatch_outcome(
+            &mut operation_events,
+            dispatch_boundary(&readiness_request),
+            operation_name(&readiness_request),
+            &BridgeIdentity::new(),
+            migration_refusal,
+        );
+        let not_attempted = operation_events.last().expect("operation record");
+        let migration_disposition = not_attempted.failure_disposition();
+        assert_ne!(not_attempted.boundary(), BridgeBoundary::SchemaMigration);
+        assert_ne!(not_attempted.outcome(), migrated_outcome);
+        assert_ne!(not_attempted.outcome(), refused_outcome);
+        let expected_disposition = Some(StoreFailureDisposition::MigrationRequired);
+        assert_eq!(migration_disposition, expected_disposition);
+        let expected_recovery = Some(StoreRecoveryAction::RunSchemaMigration);
+        assert_eq!(not_attempted.recovery(), expected_recovery);
+
+        // The degraded refusal keeps its own typed disposition even though it
+        // shares the `NotAttempted` outcome, so the two never collapse.
+        let mut degraded_events = BoundedEventLog::new();
+        emit_dispatch_outcome(
+            &mut degraded_events,
+            dispatch_boundary(&readiness_request),
+            operation_name(&readiness_request),
+            &BridgeIdentity::new(),
+            degraded_refusal,
+        );
+        let unavailable = degraded_events.last().expect("degraded record");
+        let degraded_disposition = Some(StoreFailureDisposition::Unavailable);
+        assert_ne!(unavailable.failure_disposition(), migration_disposition);
+        assert_eq!(
+            unavailable.failure_disposition(),
+            degraded_disposition,
+            "the degraded refusal keeps its own typed disposition"
+        );
+        assert_ne!(unavailable.outcome(), migrated_outcome);
+    }
+
+    /// Readiness distinctness: migration-required and unavailable stay two
+    /// separate typed states and the pipe gate refuses both. This helper owns
+    /// only that distinction; the closed boundary-set ledger is counted where
+    /// it is enumerated, not inside a readiness helper.
+    fn readiness_states_stay_distinct_while_both_deny_the_pipe(generation: &str) {
+        let observed = Some("gen8".to_owned());
+        let migration_readiness =
+            ReadinessReceipt::migration_required(generation.to_owned(), observed);
+        let degraded_readiness = ReadinessReceipt::unavailable();
+        assert_ne!(
+            migration_readiness.status, degraded_readiness.status,
+            "distinct states"
+        );
+        let migration_gate = require_semantic_ready_for_pipe(&migration_readiness, generation);
+        let degraded_gate = require_semantic_ready_for_pipe(&degraded_readiness, generation);
+        assert!(migration_gate.is_err(), "pipe denied while migrating");
+        assert!(degraded_gate.is_err(), "pipe denied while degraded");
+    }
+
+    // WORK_UNIT_CASE: 742/18
+    #[test]
+    fn dispatch_validation_records_the_expected_bounded_manifest_rejection() {
+        use crate::diagnostics::RequestOutcome;
+
+        // Deterministic manifest-rejection fixture: the prepared transition
+        // carries a valid-shaped operation-manifest digest that is not the
+        // active catalogue set digest, so the private catalogue gate refuses
+        // the frame before any provider I/O. Actual ingress validation runs
+        // here and the emitted `CatalogueAdmission` record is read back from
+        // the caller-owned log.
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let rejected_manifest = "742-case18-manifest-digest";
+        let transition = mutation_transition(&fence, rejected_manifest);
+        let identity = session_identity(&context, &transition.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        let mut events = BoundedEventLog::new();
+        let error = validate_request_frame_with_log(&mut session, &frame, &mut events)
+            .expect_err("a stale operation-manifest digest is refused before dispatch");
+        // The fixture carries a non-empty named plan (`CaptureObservation`), so
+        // `validate_transition_against_catalogue` takes the named-plan arm
+        // (eliot-store-api operation_catalogue.rs:1065-1068) and
+        // `validate_named_plan_manifest_and_erasure` compares the carried
+        // digest against the active set digest first
+        // (operation_catalogue.rs:1151-1154), returning
+        // `StoreError::ManifestMismatch` — "operation manifest digest
+        // mismatch". `UnknownOperation` is raised later, per resolved command
+        // (operation_catalogue.rs:1069-1070), and this fixture's command does
+        // resolve, so exactly one message is reachable here.
+        assert!(
+            error.contains("operation manifest digest mismatch"),
+            "the set-digest check refuses this stale digest, never a generic error: {error}"
+        );
+        assert_eq!(events.len(), 1, "one catalogue record");
+        assert_eq!(events.dropped(), 0, "no record dropped");
+        let record = events.last().expect("catalogue record");
+        assert_eq!(record.boundary(), BridgeBoundary::CatalogueAdmission);
+        assert_eq!(record.operation(), "apply");
+        assert_eq!(record.outcome(), RequestOutcome::ValidationRejected);
+        // Exactly the validated operation/manifest identity travels: the
+        // transport request id, the operation identity, the validated
+        // idempotency reference and the refused manifest digest.
+        let recorded = record.identity();
+        let request_identity = recorded
+            .request_id()
+            .map(eliot_contracts::RequestId::as_str);
+        let operation_identity = recorded
+            .operation_id()
+            .map(eliot_contracts::OperationId::as_str);
+        assert_eq!(request_identity, Some("request-dispatch"));
+        assert_eq!(operation_identity, Some("op-bridge"));
+        assert_eq!(recorded.idempotency_ref(), Some("idem-bridge"));
+        assert_eq!(recorded.manifest_digest(), Some(rejected_manifest));
+        // The scope, the fence, the plan content and the refusal prose are
+        // not validated record identity and never reach the record.
+        assert!(!recorded.fence_present());
+        assert!(recorded.generation().is_none());
+        assert!(recorded.evidence_ref().is_none());
+        assert!(record.reason().is_none());
+        assert!(record.recovery().is_none());
+        assert!(record.receipt_status().is_none());
+        assert!(record.failure_disposition().is_none());
+        let rendered = format!("{record}");
+        assert!(
+            !rendered.contains("scope-bridge"),
+            "the validated scope never reaches a rendered record: {rendered}"
+        );
+        assert!(
+            !rendered.contains("CaptureObservation"),
+            "the refused plan content never reaches a rendered record: {rendered}"
+        );
+    }
 }
