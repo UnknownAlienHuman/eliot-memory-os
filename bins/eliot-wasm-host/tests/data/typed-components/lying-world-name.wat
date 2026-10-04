@@ -6,7 +6,11 @@
 ;; descriptor field it reports is the true frozen `dreamer-cycle` identity
 ;; (including the honest `abi-digest`). Exactly ONE `(data ...)` string
 ;; differs from `dreamer-cycle.wat`: `world-name` reports `cycle-dreamer`
-;; instead of `dreamer-cycle`.
+;; instead of `dreamer-cycle`. The only other executable difference from that
+;; sibling is where the `describe` retarea sits: base 0x0c00 here, its eleven
+;; core words ending 0x0c2b, against `dreamer-cycle.wat`'s 0x0600. The type
+;; surface, the `$copy` helper, `realloc`, the whole `step` body, the other
+;; four `(data ...)` segments and the export set are identical to that sibling.
 ;;
 ;; `validate_descriptor` (typed_execution.rs:527-579) compares the reported
 ;; world against the selected world FIRST, at :532, and returns
