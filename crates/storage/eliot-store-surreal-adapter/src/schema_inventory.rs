@@ -126,7 +126,7 @@ impl EmbeddedSchemaBody {
 /// order: the executable graph first (v1 baseline, the v1-to-v2 additive
 /// delta, the v2 fresh-database baseline), then the bodies this owner
 /// declares but does not admit.
-pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
+pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 13] = [
     EmbeddedSchemaBody {
         const_name: "SCHEMA_DDL",
         migration_id: Some(schema::MIGRATION_ID_V1),
@@ -225,6 +225,36 @@ pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
         ddl: schema::LEARNING_TABLES_DDL,
         disposition: BodyDisposition::DeclaredNotAdmitted,
         note: "learning body; the learning_record table is created by the closed learning ensure-tables operation, so this body is declared but has no migration identity",
+        pinned_sha256: None,
+    },
+    EmbeddedSchemaBody {
+        const_name: "RECOVERY_TABLES_DDL",
+        migration_id: None,
+        generation: None,
+        predecessor_generation: None,
+        ddl: schema::RECOVERY_TABLES_DDL,
+        disposition: BodyDisposition::DeclaredNotAdmitted,
+        note: "recovery-owner/recovery-job body; these tables are carried by the admitted v1-to-v2 delta under the migration identity SCHEMA_MIGRATION_V1_TO_V2_DDL, which is the same bytes, so this canonical spelling is declared with no identity of its own. Published under issue #1221 acceptance A1: the alias row already recorded these bytes, but the body every other baseline list names had no entry under its own name",
+        pinned_sha256: None,
+    },
+    EmbeddedSchemaBody {
+        const_name: "ERASURE_TABLES_DDL",
+        migration_id: None,
+        generation: None,
+        predecessor_generation: None,
+        ddl: schema::ERASURE_TABLES_DDL,
+        disposition: BodyDisposition::DeclaredNotAdmitted,
+        note: "erasure intent/outcome body; these tables are carried by the declared-not-admitted v2-to-v3 delta under the migration identity SCHEMA_MIGRATION_V2_TO_V3_DDL, which is the same bytes, so this canonical spelling is declared with no identity of its own. Published under issue #1221 acceptance A1 for the same reason as RECOVERY_TABLES_DDL",
+        pinned_sha256: None,
+    },
+    EmbeddedSchemaBody {
+        const_name: "INSTRUMENT_REGISTRY_TABLES_DDL",
+        migration_id: None,
+        generation: None,
+        predecessor_generation: None,
+        ddl: schema::INSTRUMENT_REGISTRY_TABLES_DDL,
+        disposition: BodyDisposition::DeclaredNotAdmitted,
+        note: "instrument-registry head body; the instrument_registry table is created by the closed instrument-registry ensure-tables operation, which issues this exact constant, so this body is declared but has no migration identity. Published under issue #1221 acceptance A1: before this row the ensure operation formatted the same six statements inline and the body appeared in no inventory entry, leaving a physical table of this owner's own ALL_TABLES denominator with no owner, disposition, generation or digest",
         pinned_sha256: None,
     },
 ];
@@ -512,13 +542,19 @@ pub(crate) static MIGRATION_EXECUTORS: [MigrationExecutor; 3] = [
 ];
 
 /// Every configuration key that could name a migration directory.
+///
+/// Both keys are `Deleted`, so current configuration can no longer select a
+/// migration root (issue #1221 work item W4, acceptance A2). A `Deleted` row
+/// keeps the root it used to name, because `validate_adjacent_roots` requires
+/// every declared non-executable root to have a recorded consumer and a deleted
+/// key is that recorded consumer.
 pub(crate) static CONFIG_MIGRATION_PATHS: [ConfigMigrationPath; 2] = [
     ConfigMigrationPath {
         key: "store.surql_dir",
         default_value: "crates/eliot-store/src/surql",
-        state: ConfigKeyState::Current,
+        state: ConfigKeyState::Deleted,
         selects_root: Some("crates/eliot-store/src/surql"),
-        note: "the only current configuration key that names a schema directory; it selects the legacy named-operation root, which this owner declares non-executable and never executes, and the current adapter resolves nothing from it",
+        note: "deleted under issue #1221 work item W4; its default selected the legacy named-operation root, which this owner declares non-executable and never executed. GovernorConfig is deny_unknown_fields and no longer has a store member at all, so a document that still carries the key is refused rather than defaulted, and the key is absent from eliot_types::config::StoreConfig",
     },
     ConfigMigrationPath {
         key: "store.migrations_dir",
@@ -530,13 +566,20 @@ pub(crate) static CONFIG_MIGRATION_PATHS: [ConfigMigrationPath; 2] = [
 ];
 
 /// Every packaging, installation or release consumer of a migration root.
-pub(crate) static PACKAGE_RELEASE_CONSUMERS: [PackageReleaseConsumer; 2] = [
-    PackageReleaseConsumer {
-        location: "crates/eliot-app/src/commands/operations.rs::daemon_init_default",
-        action: PackagingAction::StagesDirectory,
-        root: "crates/eliot-store/src/surql",
-        note: "the installed-default packaging path: it resolves config.store.surql_dir, copies the whole legacy .surql tree into <eliot_home>/resources/surql with copy_resource_tree, and writes the copied path back into the installed config, so it stages a root this owner declares non-executable",
-    },
+///
+/// The installed-default packaging path
+/// `crates/eliot-app/src/commands/operations.rs::daemon_init_default` is
+/// deliberately absent: it used to resolve `config.store.surql_dir`,
+/// `copy_resource_tree` the whole legacy `.surql` tree into
+/// `<eliot_home>/resources/surql` and write the copied path back into the
+/// installed configuration. Issue #1221 work item W4 deleted that staging along
+/// with the key, so the command no longer reads, stages or names any migration
+/// root and there is nothing for this class to record. The
+/// `crates/eliot-store/src/surql` root keeps its recorded consumer through
+/// `CONFIG_MIGRATION_PATHS[0]`, which `root_has_recorded_consumer` accepts as a
+/// `Deleted` key, so the root is still not an orphan with no discovered
+/// consumer.
+pub(crate) static PACKAGE_RELEASE_CONSUMERS: [PackageReleaseConsumer; 1] = [
     PackageReleaseConsumer {
         location: "scripts/build-eliot-windows-x64-release.ps1",
         action: PackagingAction::RefusesDirectory,
@@ -2158,4 +2201,274 @@ fn admit_published_body(
         }
     }
     Ok(body)
+}
+
+// -- Executed inventory coverage -----------------------------------------
+//
+// The maintenance invariant at the top of this module — "every DDL constant
+// declared in [`crate::schema`] must appear in exactly one inventory entry" —
+// was, until issue #1221 acceptance A1, true of no executed case at all: this
+// module had no test, and its only production consumer
+// (`apply.rs::admit_migration`) runs solely against a live provider. That is
+// exactly how a body added on 2026-10-01 could execute DDL with no owner, no
+// disposition, no generation and no digest for a full release. The cases below
+// execute the invariant from the module's own denominators, so the omission is
+// now visible without a provider.
+#[cfg(test)]
+mod inventory_coverage_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// Reads every DDL-body constant name declared in [`crate::schema`].
+    ///
+    /// The denominator is the module's own source text, not a list written
+    /// beside it, so a body added to `schema.rs` is in scope for the check
+    /// without anybody editing the check. Both spellings are collected: a raw
+    /// string body (`SCHEMA_DDL`, `SCHEMA_DDL_V2`, `*_TABLES_DDL`) and an alias
+    /// (`SCHEMA_MIGRATION_V1_TO_V2_DDL = RECOVERY_TABLES_DDL`), because A1
+    /// requires an owner for the alias under its own migration identity too.
+    /// The `_SHA256` constants are excluded: a pinned digest is not a body.
+    fn schema_ddl_constant_names() -> Vec<String> {
+        let mut names = Vec::new();
+        for line in include_str!("schema.rs").lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let Some(rest) = trimmed.strip_prefix("pub(crate) const ") else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once(':') else {
+                continue;
+            };
+            if name.contains("_DDL") && !name.ends_with("_SHA256") {
+                names.push(name.to_owned());
+            }
+        }
+        assert!(
+            names.len() >= 13,
+            "the schema DDL denominator collapsed to {} names, so the census is reading something other than the declared constants: {names:?}",
+            names.len()
+        );
+        names
+    }
+
+    /// `WORK_UNIT_CASE 1221/1` — every DDL constant this owner declares has
+    /// exactly one published entry, and every published entry names a constant
+    /// that exists. This is the A1 invariant, executed.
+    #[test]
+    fn every_declared_schema_ddl_body_has_exactly_one_owner() {
+        let declared = schema_ddl_constant_names();
+        for name in &declared {
+            let owners: Vec<&EmbeddedSchemaBody> = EMBEDDED_SCHEMA_BODIES
+                .iter()
+                .filter(|body| body.const_name == name)
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "DDL constant {name} is published {} times in EMBEDDED_SCHEMA_BODIES; acceptance A1 requires exactly one exact owner, consumer/disposition, schema generation and digest",
+                owners.len()
+            );
+            let body = owners[0];
+            assert!(
+                !body.note.trim().is_empty(),
+                "the entry for {name} records no disposition reason"
+            );
+            assert!(
+                !body.ddl.trim().is_empty(),
+                "the entry for {name} publishes empty DDL bytes"
+            );
+        }
+        for body in &EMBEDDED_SCHEMA_BODIES {
+            assert!(
+                declared.iter().any(|name| name == body.const_name),
+                "EMBEDDED_SCHEMA_BODIES publishes {}, which crate::schema no longer declares; the entry is stale and would name a body with no bytes",
+                body.const_name
+            );
+        }
+    }
+
+    /// `WORK_UNIT_CASE 1221/2` — the instrument-registry head body is published,
+    /// carries the disposition that keeps it out of the executable graph, and
+    /// its bytes are the bytes the ensure operation issues.
+    ///
+    /// The body restates the `instrument_registry` table name as a literal, so
+    /// Rust cannot link it to [`schema::table::INSTRUMENT_REGISTRY`]. This case
+    /// is that link: a rename of the owned table constant without a matching
+    /// edit of the published body fails here instead of creating a body for one
+    /// table while the owner's denominator declares another.
+    #[test]
+    fn instrument_registry_body_is_published_and_declares_the_owned_table() {
+        let body = embedded_body_by_const_name("INSTRUMENT_REGISTRY_TABLES_DDL")
+            .expect("the instrument-registry body is published under issue #1221 A1");
+        assert_eq!(body.ddl, schema::INSTRUMENT_REGISTRY_TABLES_DDL);
+        assert_eq!(
+            body.disposition,
+            BodyDisposition::DeclaredNotAdmitted,
+            "the ensure-tables body is not a migration plan and must stay outside the executable graph"
+        );
+        assert!(body.migration_id.is_none());
+        assert!(schema::table::ALL_TABLES.contains(&schema::table::INSTRUMENT_REGISTRY));
+        let table = schema::table::INSTRUMENT_REGISTRY;
+        assert!(
+            body.ddl
+                .contains(&format!("DEFINE TABLE IF NOT EXISTS {table} SCHEMAFULL")),
+            "the published body does not define the owner's declared table {table}"
+        );
+        for field in [
+            "snapshot_json",
+            "revision",
+            "state_fence",
+            "scope_id",
+            "task_id",
+        ] {
+            assert!(
+                body.ddl.contains(&format!(
+                    "DEFINE FIELD IF NOT EXISTS {field} ON {table} TYPE"
+                )),
+                "the published body lost its {field} field declaration"
+            );
+        }
+    }
+
+    /// `WORK_UNIT_CASE 1221/3` — the adjacent-class record closes, and the two
+    /// A2/W4 properties hold as executed facts: no current configuration key
+    /// selects a migration root, and no current packaging path stages one.
+    #[test]
+    fn no_current_configuration_or_packaging_path_selects_a_migration_root() {
+        validate_adjacent_classes().expect("the adjacent-class record must close");
+        for path in &CONFIG_MIGRATION_PATHS {
+            assert_ne!(
+                path.state,
+                ConfigKeyState::Current,
+                "configuration key {} still selects the migration root {}; issue #1221 W4/A2 requires current configuration to select none",
+                path.key,
+                path.default_value
+            );
+        }
+        for consumer in &PACKAGE_RELEASE_CONSUMERS {
+            assert_ne!(
+                consumer.action,
+                PackagingAction::StagesDirectory,
+                "packaging consumer {} still stages the migration root {}",
+                consumer.location,
+                consumer.root
+            );
+        }
+        for root in &NON_EXECUTABLE_MIGRATION_ROOTS {
+            assert!(
+                root_has_recorded_consumer(root.path),
+                "the non-executable root {} is named by no recorded configuration path and no recorded packaging consumer, which is the orphan shape acceptance A3 refuses",
+                root.path
+            );
+        }
+    }
+
+    /// `WORK_UNIT_CASE 1221/4` — the deleted configuration key stays a recorded,
+    /// answerable identity: the gate refuses it as a recorded adjacent body
+    /// rather than letting it fall through to an unknown identity.
+    ///
+    /// Deleting the key from the configuration type is not the same as erasing
+    /// it from the owner's record. Keeping the row means a caller that still
+    /// presents `store.surql_dir` is told which class it belongs to and why the
+    /// current owner admits none of it.
+    #[test]
+    fn deleted_configuration_key_is_refused_as_a_recorded_adjacent_body() {
+        let refusal = resolve_executable_body("store.surql_dir", "", "", "")
+            .expect_err("a deleted configuration key is not an executable body");
+        assert!(
+            matches!(refusal, ExecutableBodyRefusal::NotAnAdjacentBody { .. }),
+            "unexpected refusal for the deleted key: {refusal}"
+        );
+        let legacy_root =
+            resolve_executable_body("crates/eliot-store/src/surql/000_schema.surql", "", "", "")
+                .expect_err("a legacy migration root is not an executable body");
+        assert!(
+            matches!(legacy_root, ExecutableBodyRefusal::NonExecutableRoot { .. }),
+            "unexpected refusal for a legacy root file: {legacy_root}"
+        );
+        let published = resolve_executable_body("INSTRUMENT_REGISTRY_TABLES_DDL", "", "", "")
+            .expect_err("a declared-not-admitted body is refused");
+        assert!(
+            matches!(published, ExecutableBodyRefusal::DeclaredNotAdmitted { .. }),
+            "unexpected refusal for the instrument-registry body: {published}"
+        );
+    }
+
+    /// Whether this row's note declares that its bytes are the same bytes as
+    /// another published row's.
+    ///
+    /// Two rows may legitimately carry one digest: a canonical body and the
+    /// migration identity that applies the same bytes under a different name
+    /// (`RECOVERY_TABLES_DDL` and `SCHEMA_MIGRATION_V1_TO_V2_DDL`). What is not
+    /// legitimate is two rows sharing a digest with neither row saying so, which
+    /// is what this predicate separates.
+    fn alias_of(body: &EmbeddedSchemaBody) -> bool {
+        EMBEDDED_SCHEMA_BODIES.iter().any(|other| {
+            other.const_name != body.const_name
+                && other.ddl == body.ddl
+                && other.note.contains(body.const_name)
+        })
+    }
+
+    /// Whether every row sharing this row's bytes names it in its own note, so a
+    /// reader of either row learns the two are one body from the record alone.
+    fn alias_partner_declares(body: &EmbeddedSchemaBody) -> bool {
+        EMBEDDED_SCHEMA_BODIES
+            .iter()
+            .filter(|other| other.const_name != body.const_name && other.ddl == body.ddl)
+            .all(|other| body.note.contains(other.const_name))
+    }
+
+    /// `WORK_UNIT_CASE 1221/5` — every published body has its own identity and
+    /// its own derived digest, and every digest is the digest of the bytes the
+    /// entry publishes. A repeated digest is admitted only between two rows
+    /// that each name the other, which is the alias case and not a silent
+    /// duplicate.
+    #[test]
+    fn every_published_body_has_one_name_and_one_derived_digest() {
+        let mut digests: Vec<String> = Vec::new();
+        for body in &EMBEDDED_SCHEMA_BODIES {
+            let digest = body.body_sha256();
+            assert_eq!(
+                digest,
+                sha256_hex(body.ddl.as_bytes()),
+                "the digest of {} is not derived from its own published bytes",
+                body.const_name
+            );
+            assert_eq!(
+                digest.len(),
+                64,
+                "{} has a malformed digest",
+                body.const_name
+            );
+            assert!(
+                digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{} has a non-lowercase-hex digest",
+                body.const_name
+            );
+            assert!(
+                !digests.contains(&digest) || alias_of(body) && alias_partner_declares(body),
+                "{} shares its DDL digest with another published body without either row declaring the alias, so the digest does not identify one body",
+                body.const_name
+            );
+            digests.push(digest);
+        }
+        let mut names: Vec<&str> = EMBEDDED_SCHEMA_BODIES
+            .iter()
+            .map(|body| body.const_name)
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "two published bodies share a constant name"
+        );
+    }
 }

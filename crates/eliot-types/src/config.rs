@@ -23,7 +23,9 @@ pub struct GovernorConfig {
     pub db: DbConfig,
     pub control_wal: ControlWalConfig,
     pub blob_store: BlobStoreConfig,
-    pub store: StoreConfig,
+    // The former `store` member is deleted with both of its keys (issue #1221,
+    // work item W4); see the note on `StoreConfig` below. `deny_unknown_fields`
+    // turns a document that still carries `[store]` into a refusal.
     #[serde(default)]
     pub supervision: RuntimeSupervisionConfig,
     #[serde(default)]
@@ -197,20 +199,30 @@ pub struct BlobStoreConfig {
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
 /// and duplicate member keys are already refused by the derived `MapAccess`.
 ///
-/// `migrations_dir` is deleted (issue #1221, work item W4). It was the only
-/// current configuration key that named a legacy migration root: its default
-/// was `crates/eliot-store/migrations`, and `eliot-governor daemon
-/// init-default` resolved it and staged that root into the installed runtime
-/// resources. The current Store schema-generation owner
+/// BOTH members of the former `StoreConfig` are deleted (issue #1221, work item
+/// W4, acceptance A2). They were the only current configuration keys that named
+/// a legacy migration root:
+///
+/// - `migrations_dir`, default `crates/eliot-store/migrations`;
+/// - `surql_dir`, default `crates/eliot-store/src/surql`.
+///
+/// `eliot-governor daemon init-default` resolved both and staged them into the
+/// installed runtime resources, which is precisely the selection path issue
+/// #1221 W4 assigns to be removed from current config, launch, packaging and
+/// restore. The current Store schema-generation owner
 /// (`eliot-store-surreal-adapter`) embeds its own migration graph and resolves
-/// nothing from the filesystem, so current configuration can no longer select a
-/// root or legacy migration root. `deny_unknown_fields` keeps a document that
-/// still carries `migrations_dir` a refusal rather than a silent default.
+/// nothing from the filesystem, so no current key selects a migration root.
+/// `deny_unknown_fields` on `GovernorConfig` keeps a document that still carries
+/// a `[store]` table a refusal rather than a silent default, so the deletion is
+/// observable instead of ignored.
+///
+/// The type itself is retained as an empty deny-unknown-fields struct so the
+/// deleted member keys stay nameable in documentation and in the owner's
+/// `CONFIG_MIGRATION_PATHS` record without leaving a public constructor that
+/// could grow a new migration-path key back.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StoreConfig {
-    pub surql_dir: String,
-}
+pub struct StoreConfig {}
 
 impl GovernorConfig {
     /// Returns true when this configuration can claim the reserved store by
@@ -268,7 +280,8 @@ impl GovernorConfig {
         require_non_empty("db.surreal.log_level", &self.db.surreal.log_level)?;
         require_non_empty("control_wal.path", &self.control_wal.path)?;
         require_non_empty("blob_store.root", &self.blob_store.root)?;
-        require_non_empty("store.surql_dir", &self.store.surql_dir)?;
+        // `store.surql_dir` validation is deleted with the key (issue #1221
+        // work item W4): there is no migration path left to require non-empty.
         if self.supervision.watchdog_interval_ms == 0 {
             return Err(ConfigError::ZeroField {
                 field: "supervision.watchdog_interval_ms",
@@ -474,9 +487,6 @@ impl Default for GovernorConfig {
             },
             blob_store: BlobStoreConfig {
                 root: ".eliot-governor/blobs".to_owned(),
-            },
-            store: StoreConfig {
-                surql_dir: "crates/eliot-store/src/surql".to_owned(),
             },
             supervision: RuntimeSupervisionConfig::default(),
             delegation_calibration: DelegationCalibrationConfig::default(),
@@ -1003,5 +1013,65 @@ mod tests {
         config.db.surreal.bind = "127.0.0.1:08000".to_owned();
         config.db.surreal.endpoint = "ws://127.0.0.1:08000/rpc".to_owned();
         config.validate()
+    }
+
+    /// A configuration document that still names a migration directory is
+    /// REFUSED, not defaulted (issue #1221 work item W4, acceptance A2).
+    ///
+    /// Deleting the keys is only half of A2. The other half is that a document
+    /// carrying one cannot select a root by being tolerated: `store.surql_dir`
+    /// defaulted to the legacy named-operation root and `store.migrations_dir`
+    /// to the legacy migrations root, and `eliot-governor daemon init-default`
+    /// staged whichever it read. Both keys are gone from `GovernorConfig`
+    /// entirely, so `deny_unknown_fields` turns each remaining spelling into a
+    /// decode failure, which is the only outcome in which an operator cannot
+    /// ship a legacy root into an installed runtime.
+    #[test]
+    fn a_document_naming_a_migration_directory_is_refused() {
+        let Ok(accepted) = serde_json::to_value(GovernorConfig::default()) else {
+            panic!("the default configuration must serialize");
+        };
+        assert!(
+            accepted.get("store").is_none(),
+            "the default configuration must not carry a store section: {accepted}"
+        );
+
+        let cases: [(&str, &[(&str, &str)]); 3] = [
+            (
+                "store.surql_dir",
+                &[("surql_dir", "crates/eliot-store/src/surql")],
+            ),
+            (
+                "store.migrations_dir",
+                &[("migrations_dir", "crates/eliot-store/migrations")],
+            ),
+            ("an empty store table", &[]),
+        ];
+        for (case, members) in cases {
+            let Some(object) = accepted.as_object() else {
+                panic!("the default configuration must be a JSON object");
+            };
+            let mut full = object.clone();
+            let store = full
+                .entry("store".to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            let Some(store) = store.as_object_mut() else {
+                panic!("the store section must be a JSON object");
+            };
+            // `members` is a `&[(&str, &str)]` slice, so the pattern destructures
+            // by reference: binding `&(key, value)` yields `&str`, which both
+            // `String::from` and `to_owned` accept. Leaving the pattern as
+            // `(key, value)` binds `&&str`, which does not coerce here because
+            // `String::from` is generic over `Into<String>` rather than taking
+            // `&str` directly.
+            for &(key, value) in members {
+                store.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+            }
+            let decoded = serde_json::from_value::<GovernorConfig>(serde_json::Value::Object(full));
+            assert!(
+                decoded.is_err(),
+                "a document carrying {case} must be refused, not decoded into a default"
+            );
+        }
     }
 }
