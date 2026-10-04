@@ -34,6 +34,7 @@
     "overflow": 18446744073709551615
   },
   "expected_dependencies": [
+    "eliot-kernel-core",
     "eliot-platform",
     "eliot-platform-windows",
     "eliot-protocol",
