@@ -940,8 +940,10 @@ def self_test() -> None:
     2. A traversal/absolute/separator/shell-injection battery is rejected
        before any command exists.
 
-    No subprocess, no network, no repository mutation. The remaining
-    764 cases (1-2, 5-21 plus manual-dispatch evidence) stay deferred.
+    These checks are separate from the unit-test matrix, which covers the 19
+    offline cases 1-15 and 17-20. Cases 16 and 21 are deferred: both need the
+    out-of-scope workflow, and 21 also needs an authorized manual dispatch.
+    Neither test surface claims live component or workflow evidence.
     """
     fixture = {"eliot-context-compiler-wasm": {"manifest": "x"}}
     calls: list[list[str]] = []
@@ -1051,10 +1053,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 unrelated_prefixes=evidence_paths(evidence["unrelated_prefixes"], required=False),
                 dependents=evidence_map(evidence["dependents"]),
             )
-            # Zero-selected stays explicit no-work and non-green; no module or
-            # execution is ever fabricated here.
+            # Selection is planning evidence only. Both SELECTED and NO_WORK
+            # remain non-green; neither disposition fabricates execution.
             payload.update(
-                status="PASS" if selection.disposition == "SELECTED" else "FAIL",
+                status="FAIL",
                 selected=list(selection.selected), disposition=selection.disposition,
                 reason=selection.reason,
             )
@@ -1198,6 +1200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"WASM_COMPONENT_LANE: {payload.get('status')} "
               f"reason={payload.get('reason', disposition or 'OK')} "
               f"proof={payload['proof_ceiling']}")
+        if payload.get("schema") == RECEIPT_SCHEMA:
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return 0 if payload.get("status") == "PASS" else 1
 
 

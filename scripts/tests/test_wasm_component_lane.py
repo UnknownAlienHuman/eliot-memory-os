@@ -1017,16 +1017,30 @@ class WasmComponentLaneTests(unittest.TestCase):
                 for index in (1, 2):
                     out = scratch / f"receipt-{index}.json"
                     buffer = io.StringIO()
+                    invocation = [
+                        "--build", module,
+                        "--registry", str(registry_path),
+                        "--base-sha", base_sha,
+                        "--head-sha", head_sha,
+                    ]
+                    if index == 1:
+                        invocation.extend(("--receipt-out", str(out)))
+                    # The cache-hit invocation below keeps the default CLI
+                    # options, matching the Justfile's text-mode call.
                     with mock.patch.object(lane, "_run", fake_gate):
                         with contextlib.redirect_stdout(buffer):
-                            exit_code = lane.main([
-                                "--build", module,
-                                "--registry", str(registry_path),
-                                "--receipt-out", str(out),
-                                "--base-sha", base_sha,
-                                "--head-sha", head_sha,
-                            ])
-                    receipts.append((exit_code, json.loads(out.read_text(encoding="utf-8"))))
+                            exit_code = lane.main(invocation)
+                    lines = buffer.getvalue().splitlines()
+                    self.assertEqual(len(lines), 2)
+                    self.assertTrue(lines[0].startswith("WASM_COMPONENT_LANE: PASS "))
+                    receipt = json.loads(lines[1])
+                    self.assertEqual(receipt["schema"], lane.RECEIPT_SCHEMA)
+                    self.assertEqual(
+                        lines[1], json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+                    if index == 1:
+                        self.assertEqual(
+                            json.loads(out.read_text(encoding="utf-8")), receipt)
+                    receipts.append((exit_code, receipt))
             finally:
                 tempfile.tempdir = previous_tempdir
             self.assertEqual(Path(tempfile.tempdir), Path(previous_tempdir))
@@ -1158,8 +1172,21 @@ class WasmComponentLaneTests(unittest.TestCase):
             ("unknown_module", ["--build", "eliot-not-registered-wasm", "--registry", None],
              "OK", {"reason": "UNKNOWN_MODULE", "expect_no_command": True}),
             ("no_work_select", ["--select", "--registry", None, "--changed", "CHANGED"], "OK",
-             {"reason": "UNRELATED_CHANGE_NO_WORK", "disposition": "NO_WORK", "selected": [],
+             {"status": "FAIL", "reason": "UNRELATED_CHANGE_NO_WORK",
+              "disposition": "NO_WORK", "selected": [],
               "expect_no_command": True}),
+            (
+                "selected_select",
+                ["--select", "--registry", None, "--changed", "SELECTED_CHANGED"],
+                "OK",
+                {
+                    "status": "FAIL",
+                    "reason": "AFFECTED_WITH_DEPENDENTS",
+                    "disposition": "SELECTED",
+                    "selected": [module],
+                    "expect_no_command": True,
+                },
+            ),
             ("failed_build", ["--build", module, "--registry", None], "TOOL_FAILED",
              {"execution_disposition": "FAILED"}),
             ("cancelled_test", ["--test", module, "--registry", None], "TOOL_CANCELLED",
@@ -1182,11 +1209,22 @@ class WasmComponentLaneTests(unittest.TestCase):
                     "unrelated_prefixes": ["README.md"],
                     "dependents": {},
                 }), encoding="utf-8")
+                selected_changed_path = scratch / "selected-changed.json"
+                selected_changed_path.write_text(json.dumps({
+                    "paths": ["crates/smart/eliot-context-compiler-wasm/src/lib.rs"],
+                    "shared_prefixes": [],
+                    "native_contract_prefixes": {},
+                    "unrelated_prefixes": [],
+                    "dependents": {},
+                }), encoding="utf-8")
                 payloads = []
+                stdout_by_scenario = {}
                 for index, (label, argv, tool_status, expected) in enumerate(scenarios):
                     with self.subTest(scenario=label):
                         invocation = [
-                            part if part != "CHANGED" else str(changed_path) for part in argv
+                            str(changed_path) if part == "CHANGED" else
+                            str(selected_changed_path) if part == "SELECTED_CHANGED" else part
+                            for part in argv
                         ]
                         invocation = [
                             str(registry_path) if part is None else part for part in invocation
@@ -1203,12 +1241,15 @@ class WasmComponentLaneTests(unittest.TestCase):
                                 ])
                         payload = json.loads(receipt_path.read_text(encoding="utf-8"))
                         payloads.append(payload)
+                        stdout_by_scenario[label] = buffer.getvalue()
                         self.assertNotEqual(exit_code, 0)
                         self.assertNotEqual(payload.get("status"), "PASS")
                         self.assertEqual(payload.get("proof_ceiling"), ceiling)
                         self.assertEqual(state_keys(payload) & forbidden_state_keys, set())
                         if "reason" in expected:
                             self.assertEqual(payload.get("reason"), expected["reason"])
+                        if "status" in expected:
+                            self.assertEqual(payload.get("status"), expected["status"])
                         if "disposition" in expected:
                             self.assertEqual(payload.get("disposition"), expected["disposition"])
                         if "selected" in expected:
@@ -1243,6 +1284,11 @@ class WasmComponentLaneTests(unittest.TestCase):
                 {payload["proof_ceiling"] for payload in payloads}, {ceiling})
             self.assertEqual(
                 [payload for payload in payloads if payload.get("status") == "PASS"], [])
+            for label in ("no_work_select", "selected_select"):
+                with self.subTest(selection_text_output=label):
+                    lines = stdout_by_scenario[label].splitlines()
+                    self.assertEqual(len(lines), 1)
+                    self.assertTrue(lines[0].startswith("WASM_COMPONENT_LANE: FAIL "))
 
     # WORK_UNIT_CASE: 764/4
     def test_traversal_absolute_separator_shell_injection_fail_before_commands(self):
