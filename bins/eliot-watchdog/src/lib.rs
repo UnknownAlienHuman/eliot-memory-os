@@ -59,6 +59,7 @@ const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 mod audit_anchor_sink;
 mod backup_control;
+mod coverage_manifest_projection;
 mod diagnostics;
 mod health_projection;
 mod heartbeat_transport;
@@ -1639,6 +1640,20 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     /// to the value the sensor admitted at startup, so a sensor without a bound
     /// installation declines to publish rather than minting for an unknown one.
     fn installation_identity(&self) -> Option<&str> {
+        None
+    }
+
+    /// The allowed Tool/Facet manifest revision this installation is admitted
+    /// against, when the port's owner knows it.
+    ///
+    /// The shared `ObservationCoverageManifest` binds an
+    /// `allowed_manifest_digest` into its denominator, and that value has a
+    /// single owner: the admission owner that resolved the allowed manifest
+    /// revision for this installation. The Watchdog does not own a Tool/Facet
+    /// manifest and must never mint one, so a port without that owner returns
+    /// `None` and the interval projects no manifest at all - a named omission,
+    /// never a substituted or default digest.
+    fn allowed_manifest_digest(&self) -> Option<&str> {
         None
     }
 

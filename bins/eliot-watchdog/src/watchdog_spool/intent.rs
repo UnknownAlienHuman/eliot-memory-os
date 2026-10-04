@@ -662,7 +662,9 @@ impl WatchdogIntentClass {
             WatchdogSpoolPayload::IncidentIntent { .. } => Ok(Self::Incident),
             WatchdogSpoolPayload::Heartbeat { .. }
             | WatchdogSpoolPayload::Gap { .. }
-            | WatchdogSpoolPayload::Recovery { .. } => Err(SpoolError::Corrupt(
+            | WatchdogSpoolPayload::Recovery { .. }
+            | WatchdogSpoolPayload::HostAttempt { .. }
+            | WatchdogSpoolPayload::ContainmentRequest { .. } => Err(SpoolError::Corrupt(
                 "watchdog spool record is not an intent payload".to_owned(),
             )),
         }
@@ -1862,7 +1864,9 @@ pub(crate) fn check_stored_intent_payload(
     match payload {
         WatchdogSpoolPayload::Heartbeat { .. }
         | WatchdogSpoolPayload::Gap { .. }
-        | WatchdogSpoolPayload::Recovery { .. } => Ok(()),
+        | WatchdogSpoolPayload::Recovery { .. }
+        | WatchdogSpoolPayload::HostAttempt { .. }
+        | WatchdogSpoolPayload::ContainmentRequest { .. } => Ok(()),
         WatchdogSpoolPayload::ProblemIntent {
             service,
             evidence_refs,

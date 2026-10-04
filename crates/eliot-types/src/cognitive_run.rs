@@ -47,6 +47,28 @@ fn require_cognitive_run_schema_version(
     }
 }
 
+/// Decodes a cognitive-run `schema_version` and refuses anything but the
+/// single supported version, at the byte boundary.
+///
+/// Issue #935 Implementation 3: version selection must be checked where the
+/// bytes are decoded, not only where a caller remembered to call
+/// `validate_schema_version`. Every one of the four run records already had that
+/// method and four boundary call sites already used it, but the derived
+/// `Deserialize` accepted ANY string - so a caller added later, or a record read
+/// through a path nobody audited, silently produced current-shaped data from an
+/// unsupported version. This closes that structurally: an unsupported or
+/// misselected version now fails during decode, before the value can reach any
+/// admission, status or Finish comparison.
+fn deserialize_cognitive_run_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let found = String::deserialize(deserializer)?;
+    require_cognitive_run_schema_version("cognitive-run record", &found)
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+    Ok(found)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveInvocationRole {
@@ -89,6 +111,7 @@ pub struct CognitiveRunCallPlan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRunContract {
+    #[serde(deserialize_with = "deserialize_cognitive_run_schema_version")]
     pub schema_version: String,
     pub harness_version: String,
     pub instance_name: String,
@@ -207,6 +230,7 @@ pub struct CognitiveHostObservation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveToolObservation {
+    #[serde(deserialize_with = "deserialize_cognitive_run_schema_version")]
     pub schema_version: String,
     pub run_id: String,
     /// No legacy wire form omits this field: the owner producer always seals the
@@ -257,6 +281,7 @@ pub enum CognitiveRunCallStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRunAttempt {
+    #[serde(deserialize_with = "deserialize_cognitive_run_schema_version")]
     pub schema_version: String,
     pub run_id: String,
     pub call_id: String,
@@ -286,6 +311,7 @@ impl CognitiveRunAttempt {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRunTerminal {
+    #[serde(deserialize_with = "deserialize_cognitive_run_schema_version")]
     pub schema_version: String,
     pub run_id: String,
     pub call_id: String,
@@ -320,6 +346,7 @@ impl CognitiveRunTerminal {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRawVerifierEvidence {
+    #[serde(deserialize_with = "deserialize_cognitive_run_schema_version")]
     pub schema_version: String,
     pub run_id: String,
     pub call_id: String,

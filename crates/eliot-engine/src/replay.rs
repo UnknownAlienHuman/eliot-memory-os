@@ -720,6 +720,21 @@ impl ReplayRunnerService {
     pub fn validate_canonical_execution_identity(
         execution: &CanonicalReplayExecutionRecord,
     ) -> Result<(), EngineError> {
+        // The evaluation-integrity receipt is part of the canonical identity, not
+        // an optional annotation beside it. Presence, seal integrity and the exact
+        // run/record binding are checked BEFORE any hash comparison, so dropping the
+        // receipt or substituting a foreign self-consistent one can no longer leave
+        // the record "exact" (issue #1922). Staleness is deliberately NOT an
+        // identity error: it is recomputed downstream by
+        // [`replay_evidence_disposition`] so an old record stays readable while
+        // never supporting a load-bearing claim.
+        let disposition = replay_evidence_disposition(execution);
+        if disposition.validity == ReplayEvidenceValidity::Unknown {
+            return Err(EngineError::WriteRejected(format!(
+                "canonical replay execution identity is not bound to its evaluation-integrity receipt: {}",
+                disposition.blocking_reasons.join("; ")
+            )));
+        }
         let expected_hash = replay_result_hash(
             &execution.run.sealed_input_hash,
             execution.run.baseline_ref.as_deref().unwrap_or_default(),
@@ -772,12 +787,169 @@ const REPLAY_ONLY_EVIDENCE_ORIGIN: &str = "replay-only";
 /// The deciding oracle is the sealed replay evaluator; no Kernel semantic
 /// oracle exists on this path.
 const REPLAY_EVALUATION_ORACLE_OWNER: &str = concat!(module_path!(), "::ReplayRunnerService");
+/// Version of the deciding oracle, sealed into the receipt body.
+///
+/// I18.47 names `evaluator/oracle` a load-bearing invalidation dimension, so a
+/// retained receipt whose sealed oracle version differs from the current one is
+/// `STALE` until declared equivalence or exact re-execution is proved.
+pub const REPLAY_EVALUATION_ORACLE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPLAY_CANONICAL_ROUTE: &str =
     concat!(module_path!(), "::ReplayRunnerService::run_canonical");
 const REPLAY_EVALUATION_ACCEPTANCE_RELATION: &str =
     "required replay measurement matches sealed canonical evidence or the replay safety gate";
 const REPLAY_ONLY_PROOF_CEILING: &str = "REPLAY_ONLY";
 const REPLAY_EVALUATION_INCONCLUSIVE_STATUS: &str = "INCONCLUSIVE";
+
+/// Current-validity verdict for one sealed replay evaluation-integrity receipt.
+///
+/// The receipt body is immutable; this is the recomputed current disposition a
+/// load-bearing consumer reads (I18.47). `Current` means the receipt is present,
+/// intact, bound to this exact run, and no load-bearing invalidation dimension
+/// has drifted since it was sealed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayEvidenceValidity {
+    /// Present, sealed, run-bound, and no invalidation dimension has drifted.
+    Current,
+    /// The receipt is intact but a load-bearing dimension drifted, so it can no
+    /// longer support a current claim until equivalence or re-execution.
+    Stale,
+    /// Absent, unsealed, foreign, or otherwise not usable as evidence.
+    Unknown,
+}
+
+/// Causal blocking reasons carried by [`ReplayEvidenceDisposition`].
+pub const REPLAY_EVIDENCE_ABSENT: &str =
+    "canonical replay record carries no evaluation-integrity receipt";
+pub const REPLAY_EVIDENCE_SEAL_BROKEN: &str =
+    "evaluation-integrity receipt seal does not verify against its body";
+pub const REPLAY_EVIDENCE_FOREIGN_RUN: &str =
+    "evaluation-integrity receipt is not bound to this replay run";
+pub const REPLAY_EVIDENCE_FOREIGN_RECORD: &str =
+    "evaluation-integrity receipt does not bind this canonical execution record";
+pub const REPLAY_EVIDENCE_ORACLE_OWNER_DRIFT: &str =
+    "sealed replay oracle owner differs from the current oracle owner";
+pub const REPLAY_EVIDENCE_ORACLE_VERSION_DRIFT: &str =
+    "sealed replay oracle version differs from the current oracle version";
+pub const REPLAY_EVIDENCE_ROUTE_DRIFT: &str =
+    "sealed replay route differs from the current canonical replay route";
+pub const REPLAY_EVIDENCE_PRODUCT_IDENTITY_DRIFT: &str =
+    "sealed replay Product Identity differs from the current run Product Identity";
+pub const REPLAY_EVIDENCE_REPLAY_ONLY_UNCORROBORATED: &str = "replay-only INCONCLUSIVE evaluation evidence carries no declared second route or Human disposition";
+
+/// Current-validity projection over an immutable replay receipt.
+///
+/// Historical bytes are never rewritten: this is recomputed on every read, so a
+/// receipt sealed under an earlier oracle is reported `STALE` instead of being
+/// served back as a current load-bearing result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayEvidenceDisposition {
+    /// Recomputed validity of the sealed receipt.
+    pub validity: ReplayEvidenceValidity,
+    /// The receipt's own recorded proof ceiling, verbatim.
+    pub proof_ceiling: String,
+    /// The receipt's own recorded status, verbatim.
+    pub recorded_status: String,
+    /// True when the sealed receipt claims a measured-validity state.
+    pub measured_validity_claimed: bool,
+    /// Causal reasons this evidence may not support a load-bearing claim.
+    pub blocking_reasons: Vec<String>,
+}
+
+impl ReplayEvidenceDisposition {
+    /// Returns whether the sealed receipt is intact, bound and drift-free.
+    ///
+    /// This says nothing about whether the evidence may support a LOAD-BEARING
+    /// claim: a `Current` replay-only `INCONCLUSIVE` receipt is perfectly intact
+    /// and still cannot alone promote live Product Proof (I18.47). That ceiling
+    /// is lifted only by a declared second route or Human disposition, which the
+    /// meta gate evaluates against its own input.
+    #[must_use]
+    pub fn is_current_evidence(&self) -> bool {
+        self.validity == ReplayEvidenceValidity::Current
+    }
+}
+
+/// Recomputes the current validity of a canonical replay record's receipt.
+///
+/// Self-consistency of historical bytes is not current validity: the seal proves
+/// only that the body was not edited after sealing. This verifies presence,
+/// seal integrity and the exact run/record binding, then compares the sealed
+/// oracle owner, oracle version, route and Product Identity against the current
+/// ones, because I18.47 makes each of those a load-bearing invalidation
+/// dimension. The receipt is never modified.
+#[must_use]
+pub fn replay_evidence_disposition(
+    execution: &CanonicalReplayExecutionRecord,
+) -> ReplayEvidenceDisposition {
+    let run = &execution.run;
+    let mut drift = Vec::new();
+    let Some(receipt) = run.evaluation_integrity_receipt.as_ref() else {
+        return ReplayEvidenceDisposition {
+            validity: ReplayEvidenceValidity::Unknown,
+            proof_ceiling: String::new(),
+            recorded_status: String::new(),
+            measured_validity_claimed: false,
+            blocking_reasons: vec![REPLAY_EVIDENCE_ABSENT.to_owned()],
+        };
+    };
+    let mut blocking_reasons = Vec::new();
+    if !receipt.verify_seal() {
+        blocking_reasons.push(REPLAY_EVIDENCE_SEAL_BROKEN.to_owned());
+    }
+    if receipt.evidence_family != format!("replay-exact:{}", run.sealed_input_hash) {
+        blocking_reasons.push(REPLAY_EVIDENCE_FOREIGN_RUN.to_owned());
+    }
+    // The receipt must bind the exact identities this canonical record carries,
+    // so a foreign but self-consistent receipt cannot stand in for it.
+    let expected_dependencies = vec![
+        format!("evaluator_hash:{}", execution.evaluator_hash),
+        format!("profile_hash:{}", execution.profile_hash),
+        format!("context_hash:{}", execution.context_hash),
+        format!(
+            "observation_evidence_hash:{}",
+            execution.observation_evidence_hash
+        ),
+    ];
+    let expected_product_identity = format!(
+        "eliot-memory-os/eliot-replay-evaluator:product:{}",
+        run.project_id
+    );
+    if receipt.shared_dependencies != expected_dependencies {
+        blocking_reasons.push(REPLAY_EVIDENCE_FOREIGN_RECORD.to_owned());
+    }
+    if receipt.product_identity != expected_product_identity {
+        blocking_reasons.push(REPLAY_EVIDENCE_PRODUCT_IDENTITY_DRIFT.to_owned());
+    }
+    if receipt.oracle_owner != REPLAY_EVALUATION_ORACLE_OWNER {
+        blocking_reasons.push(REPLAY_EVIDENCE_ORACLE_OWNER_DRIFT.to_owned());
+    }
+    if receipt.actual_route != REPLAY_CANONICAL_ROUTE {
+        blocking_reasons.push(REPLAY_EVIDENCE_ROUTE_DRIFT.to_owned());
+    }
+    // Only the VERSION is a staleness dimension rather than a foreignness one: the
+    // same oracle at an earlier build is drifted evidence, whereas a different
+    // oracle owner, route or Product Identity is not this system's evidence at
+    // all and must never be read as merely stale.
+    if receipt.oracle_version != REPLAY_EVALUATION_ORACLE_VERSION {
+        drift.push(REPLAY_EVIDENCE_ORACLE_VERSION_DRIFT);
+    }
+    let measured_validity_claimed = receipt.status == "MEASURED";
+    let validity = if !blocking_reasons.is_empty() {
+        ReplayEvidenceValidity::Unknown
+    } else if !drift.is_empty() {
+        ReplayEvidenceValidity::Stale
+    } else {
+        ReplayEvidenceValidity::Current
+    };
+    blocking_reasons.extend(drift.into_iter().map(str::to_owned));
+    ReplayEvidenceDisposition {
+        validity,
+        proof_ceiling: receipt.proof_ceiling.clone(),
+        recorded_status: receipt.status.clone(),
+        measured_validity_claimed,
+        blocking_reasons,
+    }
+}
 
 /// Derive the canonical sealed-input and observation-evidence hashes for one
 /// canonical replay input.
@@ -833,6 +1005,7 @@ fn replay_evaluation_integrity_receipt(
             input.sealed_set.set.project_id
         ),
         oracle_owner: REPLAY_EVALUATION_ORACLE_OWNER.to_owned(),
+        oracle_version: REPLAY_EVALUATION_ORACLE_VERSION.to_owned(),
         acceptance_relation: REPLAY_EVALUATION_ACCEPTANCE_RELATION.to_owned(),
         evidence_family: format!("replay-exact:{sealed_input_hash}"),
         shared_dependencies: vec![
