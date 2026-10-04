@@ -1,0 +1,8 @@
+{
+  "command": "backup.verify",
+  "status": "cancelled",
+  "idempotency_key": "synthetic-idempotency-key-verify-0004",
+  "code": "CANCELLATION_UNCONFIRMED",
+  "owner_cleanup_state": "not-supplied",
+  "reason": "capture owner cancelled the verification"
+}
