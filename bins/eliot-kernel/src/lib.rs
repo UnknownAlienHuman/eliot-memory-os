@@ -5703,5 +5703,41 @@ mod tests;
 #[path = "tests/local_read_claim.rs"]
 mod local_read_claim_tests;
 
+// #901: the daemon live-receipt, launch, descendant and identity observation
+// boundaries live in private modules whose helpers are `pub(crate)`, so their
+// proof is crate-internal in the same shape as the pair above. These add no
+// owner and broaden no authority; they only reach code an integration test
+// cannot see.
+#[cfg(test)]
+#[path = "tests/process_supervision_daemon_receipt.rs"]
+mod process_supervision_daemon_receipt_tests;
+
+// The same crate-internal capsule shape for the launch, registration-order and
+// replay boundaries, and for the descendant/lease/reconcile boundaries. Each
+// executes existing owners; none adds an owner or broadens authority.
+#[cfg(test)]
+#[path = "tests/process_supervision_launch.rs"]
+mod process_supervision_launch_tests;
+
+#[cfg(test)]
+#[path = "tests/process_supervision_lifecycle.rs"]
+mod process_supervision_lifecycle_tests;
+
+// The identity and lease-evidence boundaries. The `activation_lifecycle` module
+// these observations reach is private and its helpers are `pub(crate)`, so an
+// integration test under `bins/eliot-kernel/tests/` cannot see them.
+#[cfg(test)]
+#[path = "tests/process_supervision_identity.rs"]
+mod process_supervision_identity_tests;
+
+// The unknown-outcome boundary. `reconcile_origin_grant_effect` and the cancel
+// arm are `pub(crate)` in a private module, so the proof is crate-internal for
+// the same reason as the four capsules above. Its cases 7 and 20 are owned by
+// the integration suite; the tests here are supplementary and carry no case
+// number.
+#[cfg(test)]
+#[path = "tests/process_supervision_unknown_outcome.rs"]
+mod process_supervision_unknown_outcome_tests;
+
 // Store implementation E2E belongs to the Store/Host boundary. Kernel tests
 // exercise only the neutral descriptor and route/fence behavior.
