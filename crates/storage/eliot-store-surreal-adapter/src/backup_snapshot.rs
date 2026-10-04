@@ -5544,3 +5544,1316 @@ mod snapshot_budget_tests {
         assert_eq!(states.last_trusted_owner_observation, Some(11));
     }
 }
+#[cfg(test)]
+mod snapshot_capture_contention_tests {
+    #![allow(clippy::expect_used)]
+
+    //! Contention, drift, cancellation and close evidence of one frozen capture.
+    //!
+    //! The seven cases drive this module's private entry points — the only place
+    //! they are reachable — against a [`SnapshotState`] the fixture installs in the
+    //! process-global registry under the exact digest its own begin request
+    //! computes. Nothing here adds a provider seam, a field, a constant or a
+    //! dev-dependency: every value a case reads is one production code already
+    //! retains, and every transition a case observes is one production code already
+    //! owns. Where a case needs a second point observation it derives the moved
+    //! [`CapturePoint`] from the retained one, which is what a provider that advanced
+    //! between the two reads returns.
+    //!
+    //! The fixture is a `Drop` owner, so no case leaks registry state into the next
+    //! one, and every case serializes on the guard below because the registry — and
+    //! with it the owner clock [`CaptureRegistry::last_trusted_owner_observation`] —
+    //! is process memory shared by every case in this binary.
+
+    use std::future::{Future, pending};
+    use std::num::NonZeroU64;
+    use std::sync::MutexGuard;
+    use std::task::{Context, Poll, Waker};
+
+    use eliot_store_api::{
+        CONTRACT_VERSION, EventInterval, OrderingScopeId, RevisionKey, ScopeRevisionView,
+        SnapshotBounds, SnapshotSourceIdentity,
+    };
+
+    use super::*;
+
+    /// Canonical fixture lineage: `EpochLineageId` admits only canonical UUID text.
+    const FIXTURE_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    /// The one scope the fixture capture is bound to.
+    const FIXTURE_SCOPE: &str = "scope-snapshot-capture";
+    /// Owner-issued schema generation the fixture point binds.
+    const FIXTURE_GENERATION: &str = "eliot.generation.capture-fixture";
+    /// The one admitted member a non-empty fixture capture observes.
+    const FIXTURE_MEMBER_ID: &str = "member-capture-fixture";
+    /// Exact observed content bytes of one fixture member.
+    const FIXTURE_BYTE_COUNT: u64 = 7;
+    /// The fixture capture's own declared duration bound, in milliseconds.
+    ///
+    /// It is the capture's own admitted value, so it is also the retained close
+    /// record's replay horizon, which is what the close case releases against.
+    const FIXTURE_DURATION_MS: u64 = 60_000;
+    /// The commit sequence of the point a fixture capture is bound to.
+    const FIXTURE_COMMIT_SEQUENCE: u64 = 11;
+
+    /// Serializes the cases that read or write the process-global capture
+    /// registry, so no case can observe another case's entries, charges or owner
+    /// clock. A poisoned guard is taken as a plain one: poisoning here says nothing
+    /// about a capture, and each case's own assertions decide pass or fail.
+    fn registry_serial() -> MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        match SERIAL.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The window a fixture capture is installed under.
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Window {
+        /// A window this owner still vouches for.
+        Live,
+        /// A window whose absolute expiry has already passed, so the capture is
+        /// fail-closed expired and cannot be served.
+        Closed,
+    }
+
+    /// The retained evidence a case reads back, field by field.
+    ///
+    /// [`SnapshotState`] has no `Debug` and no `PartialEq` by design, so no case
+    /// may format or whole-compare it. This projection names every field the
+    /// acceptance requires to be read back, so "unchanged" is an exact comparison
+    /// of named values rather than a claim.
+    #[derive(Debug, Eq, PartialEq)]
+    struct Evidence {
+        /// The retained ledger: ordered reason labels, the transient flag, and the
+        /// three counters frozen when the first reason was recorded.
+        ledger: Option<(Vec<&'static str>, bool, u64, u64, u64)>,
+        /// The frozen terminal close: completeness, member and byte counts, the
+        /// validation revision, and the bounded replay horizon.
+        terminal: Option<(SnapshotCompleteness, u64, u64, u64, u64)>,
+        /// The observed member count while the payload is still retained.
+        payload_members: Option<usize>,
+        /// The one in-flight call slot: claim identity, request kind, revision.
+        claim: Option<(u64, &'static str, u64)>,
+        /// The retained page response: cursor index, cumulative members, cumulative
+        /// bytes, terminal flag.
+        last_page: Option<(u64, u64, u64, bool)>,
+        pages_served: u64,
+        members_served: u64,
+        bytes_served: u64,
+        progress_revision: u64,
+        incarnation: u64,
+    }
+
+    impl Evidence {
+        /// The ordered reason ledger, or an empty ledger when none is retained.
+        fn reasons(&self) -> &[&'static str] {
+            self.ledger
+                .as_ref()
+                .map_or(&[], |(reasons, _, _, _, _)| reasons.as_slice())
+        }
+    }
+
+    /// Whether the retained reason ledger still keeps one capture from `Complete`.
+    fn blocks_completeness(states: &CaptureRegistry, digest: &str) -> bool {
+        states
+            .get(digest)
+            .and_then(|state| state.interruption.as_ref())
+            .is_some_and(CaptureInterruption::blocks_completeness)
+    }
+
+    /// Reads one installed entry back through the explicit projection above.
+    fn evidence(states: &CaptureRegistry, digest: &str) -> Evidence {
+        let state = states
+            .get(digest)
+            .expect("the fixture entry stays installed while a case reads it back");
+        Evidence {
+            ledger: state.interruption.as_ref().map(|entry| {
+                (
+                    entry.reasons.iter().copied().map(reason_label).collect(),
+                    entry.transient_resolved,
+                    entry.pages_served,
+                    entry.members_served,
+                    entry.bytes_served,
+                )
+            }),
+            terminal: state.terminal.as_ref().map(|closed| {
+                (
+                    closed.receipt.completeness,
+                    closed.receipt.member_count,
+                    closed.receipt.byte_count,
+                    closed.receipt.validation_revision,
+                    closed.retained_until_ms,
+                )
+            }),
+            payload_members: state
+                .payload
+                .as_ref()
+                .map(|payload| payload.ordered_members.len()),
+            claim: state.claim.as_ref().map(|slot| {
+                (
+                    slot.claim_id,
+                    call_kind_label(slot.kind),
+                    slot.expected_revision,
+                )
+            }),
+            last_page: state.last_page.as_ref().map(|page| {
+                (
+                    page.cursor.page_index,
+                    page.coverage.cumulative_members,
+                    page.cumulative_bytes,
+                    page.is_last,
+                )
+            }),
+            pages_served: state.pages_served,
+            members_served: state.members_served,
+            bytes_served: state.bytes_served,
+            progress_revision: state.progress_revision,
+            incarnation: state.incarnation,
+        }
+    }
+
+    /// The stable label one closed reason renders as in a case's readback.
+    fn reason_label(reason: InterruptionReason) -> &'static str {
+        match reason {
+            InterruptionReason::WindowClosed => "WindowClosed",
+            InterruptionReason::PointMoved => "PointMoved",
+            InterruptionReason::PageBound => "PageBound",
+            InterruptionReason::CaptureExhausted => "CaptureExhausted",
+            InterruptionReason::ProviderReadFailed => "ProviderReadFailed",
+            InterruptionReason::ResponseTooLarge => "ResponseTooLarge",
+        }
+    }
+
+    /// The stable label one closed request kind renders as in a case's readback.
+    fn call_kind_label(kind: CaptureCallKind) -> &'static str {
+        match kind {
+            CaptureCallKind::Page => "Page",
+            CaptureCallKind::End => "End",
+        }
+    }
+
+    /// The recorded charge of one named dimension, read back through the owner's
+    /// own diagnostics projection rather than through its fields.
+    fn charged(states: &CaptureRegistry, dimension: BudgetDimension) -> u64 {
+        states
+            .budget
+            .diagnostics()
+            .dimensions
+            .iter()
+            .find(|entry| entry.field == dimension.field())
+            .map(|entry| entry.charged)
+            .expect("every accounted dimension is reported by name")
+    }
+
+    /// The greatest successful charge of one named dimension.
+    fn high_water(states: &CaptureRegistry, dimension: BudgetDimension) -> u64 {
+        states
+            .budget
+            .diagnostics()
+            .dimensions
+            .iter()
+            .find(|entry| entry.field == dimension.field())
+            .map(|entry| entry.high_water)
+            .expect("every accounted dimension is reported by name")
+    }
+
+    /// Extracts the one refusal a typed transition returned.
+    fn refusal<T>(result: Result<T, StoreError>, what: &str) -> StoreError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("{what} must be refused"),
+        }
+    }
+
+    /// Extracts the one claim a page admission acquired.
+    fn claimed(admission: Result<PageAdmission, StoreError>, what: &str) -> CaptureCallClaim {
+        match admission {
+            Ok(PageAdmission::Claimed(claim)) => claim,
+            Ok(PageAdmission::Replay(_)) => panic!("{what} must acquire a claim, not replay"),
+            Err(error) => panic!("{what} must acquire a claim, got {error:?}"),
+        }
+    }
+
+    /// Extracts the one claim and window observation a close admission acquired.
+    fn claimed_close(
+        admission: Result<CloseAdmission, StoreError>,
+        what: &str,
+    ) -> (CaptureCallClaim, bool) {
+        match admission {
+            Ok(CloseAdmission::Claimed(claim, window_closed)) => (claim, window_closed),
+            Ok(CloseAdmission::Replay(_)) => panic!("{what} must acquire a claim, not replay"),
+            Err(error) => panic!("{what} must acquire a claim, got {error:?}"),
+        }
+    }
+
+    /// One real fence, built from the contracts' own constructors so no fence
+    /// field is defaulted by hand.
+    fn fixture_fence() -> StateFence {
+        StateFence::new(
+            eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new(FIXTURE_LINEAGE)
+                    .expect("the fixture lineage is canonical UUID text"),
+                NonZeroU64::new(1).expect("a fixture epoch sequence is non-zero"),
+            )
+            .expect("the fixture epoch is valid"),
+            eliot_contracts::ResourceGeneration::genesis(),
+        )
+    }
+
+    /// One real member with real residency metadata and real digests.
+    fn fixture_member(member_id: &str) -> SnapshotMember {
+        SnapshotMember {
+            member_id: member_id.to_owned(),
+            member_type: SnapshotMemberType::Record,
+            content_digest: sha256_hex(member_id.as_bytes()),
+            residency: BlobResidency {
+                domain: BlobResidencyDomain::InlineCanonical,
+                residency_digest: sha256_hex(format!("residency-{member_id}").as_bytes()),
+                byte_count: FIXTURE_BYTE_COUNT,
+            },
+            reference_digest: None,
+        }
+    }
+
+    /// One bound point of the fixture's admitted generation.
+    fn fixture_point(next_commit_sequence: u64) -> CapturePoint {
+        CapturePoint {
+            state_fence: fixture_fence(),
+            next_commit_sequence,
+            next_outbox_sequence: next_commit_sequence.saturating_add(1),
+            schema_generation: FIXTURE_GENERATION.to_owned(),
+        }
+    }
+
+    /// One real begin request, unique per ordinal so each case's computed digest
+    /// is its own registry key.
+    fn fixture_begin(
+        ordinal: u64,
+        members: &[SnapshotMember],
+        expires_at_unix_ms: i64,
+    ) -> SnapshotBeginRequest {
+        let fence = fixture_fence();
+        SnapshotBeginRequest {
+            contract_version: CONTRACT_VERSION,
+            operation: OperationIdentity {
+                operation_id: OperationId::new(format!("op-capture-{ordinal}"))
+                    .expect("the fixture operation identity is valid"),
+                idempotency_key: format!("idem-capture-{ordinal}"),
+                canonical_request_hash: sha256_hex(format!("hash-{ordinal}").as_bytes()),
+            },
+            source: SnapshotSourceIdentity {
+                installation_id: "installation-capture-fixture".to_owned(),
+                store_id: "eliot".to_owned(),
+                schema: "eliot".to_owned(),
+                generation: eliot_contracts::ResourceGeneration::genesis(),
+            },
+            scope: ScopeRevisionView {
+                scope_id: ScopeId::new(FIXTURE_SCOPE).expect("the fixture scope identity is valid"),
+                revision_heads: vec![RevisionHead {
+                    key: RevisionKey::new("scope:capture-fixture")
+                        .expect("the fixture revision key is valid"),
+                    revision: 1,
+                    state_fence: fence.clone(),
+                }],
+                ordering_heads: vec![OrderingHead {
+                    scope: OrderingScopeId::new(FIXTURE_SCOPE)
+                        .expect("the fixture ordering scope is valid"),
+                    sequence: 1,
+                    state_fence: fence.clone(),
+                }],
+                state_fence: fence,
+            },
+            event_interval: EventInterval {
+                first_sequence: 1,
+                last_sequence: 2,
+            },
+            denominator: SnapshotDenominator {
+                members: members.to_vec(),
+                is_complete: true,
+            },
+            bounds: SnapshotBounds {
+                max_members: 64,
+                max_bytes: 4096,
+                max_pages: 4,
+                max_work: 64,
+                max_duration_ms: FIXTURE_DURATION_MS,
+            },
+            expires_at_unix_ms,
+            privacy_proof_refs: vec!["proof:capture-fixture".to_owned()],
+        }
+    }
+
+    /// One request context carrying the fixture's own fence.
+    fn fixture_context() -> RequestMeta {
+        RequestMeta {
+            request_id: eliot_contracts::RequestId::new("request-capture-fixture")
+                .expect("the fixture request identity is valid"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product-capture-fixture")
+                .expect("the fixture product identity is valid"),
+            source_id: eliot_contracts::SourceId::new("source-capture-fixture")
+                .expect("the fixture source identity is valid"),
+            state_fence: fixture_fence(),
+            clock: eliot_contracts::ClockReading::default(),
+        }
+    }
+
+    /// One capture frozen exactly as a real publish leaves it, plus the identity a
+    /// case must present to reach it.
+    struct FrozenCapture {
+        digest: String,
+        issued: SnapshotHandle,
+        cursor: SnapshotCursor,
+        state: SnapshotState,
+        opened_at_ms: u64,
+    }
+
+    /// Freezes one capture under its own begin request's digest.
+    ///
+    /// Every retained field is one a real publish derives: the issued handle and
+    /// point, the enumeration proof, the observed totals, the settled retained
+    /// charge, and the response bound issued from the request's own admitted
+    /// `bounds.max_bytes`.
+    fn frozen_capture(ordinal: u64, members: Vec<SnapshotMember>, window: Window) -> FrozenCapture {
+        let opened_at_ms = crate::write_execution::current_time_ms();
+        assert!(
+            opened_at_ms > 0,
+            "the owner clock must observe a positive instant before a window is judged"
+        );
+        let expires_at_unix_ms = match window {
+            Window::Live => i64::try_from(opened_at_ms.saturating_add(FIXTURE_DURATION_MS * 10))
+                .expect("a live fixture window always fits in i64"),
+            Window::Closed => 1,
+        };
+        let begin = fixture_begin(ordinal, &members, expires_at_unix_ms);
+        begin
+            .validate()
+            .expect("the fixture begin request is a real admitted request");
+        let digest = begin
+            .compute_digest()
+            .expect("the fixture begin request is serializable");
+        let response_ceiling_bytes = capture_response_ceiling(&begin)
+            .expect("the fixture request's response bound is admissible")
+            .max_bytes();
+        let member_count =
+            u64::try_from(members.len()).expect("a fixture member count always fits in u64");
+        let total_bytes = members.iter().fold(0_u64, |total, member| {
+            total.saturating_add(member.residency.byte_count)
+        });
+        let charged_capture_bytes = total_bytes.saturating_add(RETAINED_PAGE_BYTES);
+        let issued = SnapshotHandle {
+            consistency_point: consistency_point(
+                &digest,
+                &sha256_hex(FIXTURE_GENERATION.as_bytes()),
+            ),
+            snapshot_digest: digest.clone(),
+            operation_id: begin.operation.operation_id.clone(),
+            idempotency_key: begin.operation.idempotency_key.clone(),
+        };
+        let cursor = SnapshotCursor {
+            handle_digest: digest.clone(),
+            page_index: 0,
+            cumulative_members: 0,
+            cumulative_bytes: 0,
+        };
+        let state = SnapshotState {
+            issued: issued.clone(),
+            incarnation: next_incarnation(),
+            begin,
+            point: fixture_point(FIXTURE_COMMIT_SEQUENCE),
+            enumeration: Some(EnumerationEvidence {
+                classes_read: captured_member_classes().count(),
+                members_read: members.len(),
+            }),
+            interruption: None,
+            claim: None,
+            progress_revision: 1,
+            payload: Some(CapturePayload {
+                ordered_members: members,
+            }),
+            last_page: None,
+            terminal: None,
+            total_bytes,
+            total_pages: member_count.div_ceil(SNAPSHOT_PAGE_CHUNK),
+            pages_served: 0,
+            members_served: 0,
+            bytes_served: 0,
+            last_digest: digest.clone(),
+            opened_at_ms,
+            charged_capture_bytes,
+            response_ceiling_bytes,
+        };
+        FrozenCapture {
+            digest,
+            issued,
+            cursor,
+            state,
+            opened_at_ms,
+        }
+    }
+
+    /// One installed capture entry, owned by the case for exactly its lifetime.
+    struct CaptureFixture {
+        digest: String,
+        issued: SnapshotHandle,
+        ctx: RequestMeta,
+        cursor: SnapshotCursor,
+        incarnation: u64,
+        opened_at_ms: u64,
+        charged_capture_bytes: u64,
+    }
+
+    impl CaptureFixture {
+        /// Installs one capture, holding exactly the units an installed capture
+        /// holds after its begin settled: the live-capture slot, the settled
+        /// retained payload bytes, and the terminal-record space reserved before the
+        /// capture was opened. The transient enumeration allowance and the
+        /// in-progress begin unit are already returned by a real publish, so the
+        /// fixture does not take them, and it records the retirement deadline before
+        /// the entry becomes visible so the entry stays reclaimable.
+        fn install(ordinal: u64, members: Vec<SnapshotMember>, window: Window) -> Self {
+            let frozen = frozen_capture(ordinal, members, window);
+            let mut states = lock_registry().expect("the fixture holds no other registry lock");
+            assert!(
+                !states.captures.contains_key(&frozen.digest),
+                "each fixture ordinal must own a digest of its own"
+            );
+            states
+                .budget
+                .reserve(BudgetDimension::LiveCaptures, 1)
+                .expect("one live-capture slot is available");
+            states
+                .budget
+                .reserve(
+                    BudgetDimension::RetainedBytes,
+                    frozen.state.charged_capture_bytes,
+                )
+                .expect("the settled retained allowance is available");
+            states
+                .budget
+                .reserve(BudgetDimension::TerminalEntries, 1)
+                .expect("one terminal-record entry is available");
+            states
+                .budget
+                .reserve(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES)
+                .expect("one terminal-record allowance is available");
+            states.expiry.insert(ExpiryDeadline {
+                at_ms: fail_closed_deadline(frozen.opened_at_ms, FIXTURE_DURATION_MS)
+                    .min(u64::try_from(frozen.state.begin.expires_at_unix_ms).unwrap_or(0)),
+                stage: ExpiryStage::Retire,
+                digest: frozen.digest.clone(),
+            });
+            let charged_capture_bytes = frozen.state.charged_capture_bytes;
+            let incarnation = frozen.state.incarnation;
+            states.captures.insert(frozen.digest.clone(), frozen.state);
+            drop(states);
+            Self {
+                digest: frozen.digest,
+                issued: frozen.issued,
+                ctx: fixture_context(),
+                cursor: frozen.cursor,
+                incarnation,
+                opened_at_ms: frozen.opened_at_ms,
+                charged_capture_bytes,
+            }
+        }
+
+        /// The registry digest this capture is installed under.
+        fn digest(&self) -> &str {
+            &self.digest
+        }
+
+        /// The owner-issued handle a request must present.
+        fn handle(&self) -> SnapshotHandle {
+            self.issued.clone()
+        }
+
+        /// The first continuation cursor of this capture.
+        fn cursor(&self) -> SnapshotCursor {
+            self.cursor.clone()
+        }
+
+        /// The exact bound point this capture is frozen at.
+        fn point(&self) -> CapturePoint {
+            self.read(|state| state.point.clone())
+        }
+
+        /// The same point after the canonical store advanced under it.
+        fn moved_point(&self) -> CapturePoint {
+            let mut point = self.point();
+            point.next_commit_sequence = point.next_commit_sequence.saturating_add(1);
+            point.next_outbox_sequence = point.next_outbox_sequence.saturating_add(1);
+            point
+        }
+
+        /// The observation this capture was opened at.
+        fn opened_at_ms(&self) -> u64 {
+            self.opened_at_ms
+        }
+
+        /// The instance at which this capture's terminal record stops being
+        /// replayable.
+        fn retained_until_ms(&self) -> u64 {
+            fail_closed_deadline(self.opened_at_ms, FIXTURE_DURATION_MS)
+        }
+
+        /// The retained allowance this capture currently charges.
+        fn charged_capture_bytes(&self) -> u64 {
+            self.charged_capture_bytes
+        }
+
+        /// Reads one field of the installed entry.
+        fn read<T>(&self, read: impl FnOnce(&SnapshotState) -> T) -> T {
+            let states = lock_registry().expect("the fixture holds no other registry lock");
+            read(
+                states
+                    .get(&self.digest)
+                    .expect("the fixture entry is installed"),
+            )
+        }
+
+        /// Runs one page admission under a lock the caller already holds.
+        fn admit_page_in(&self, states: &mut CaptureRegistry) -> Result<PageAdmission, StoreError> {
+            prepare_page(states, &self.digest, &self.issued, &self.ctx, &self.cursor)
+        }
+
+        /// Runs one page admission exactly as the request path runs it.
+        fn admit_page(&self) -> Result<PageAdmission, StoreError> {
+            self.admit_page_in(&mut lock_registry().expect("registry lock is free"))
+        }
+
+        /// Runs one close admission exactly as the request path runs it.
+        fn admit_close(&self) -> Result<CloseAdmission, StoreError> {
+            let mut states = lock_registry().expect("registry lock is free");
+            prepare_close(&mut states, &self.digest, &self.issued, &self.ctx)
+        }
+
+        /// Acquires this capture's one page claim.
+        fn claim_page(&self) -> CaptureCallClaim {
+            claimed(self.admit_page(), "the first page call")
+        }
+
+        /// Acquires this capture's one close claim, with the window observation
+        /// [`prepare_close`] recorded for it.
+        fn claim_close(&self) -> (CaptureCallClaim, bool) {
+            claimed_close(self.admit_close(), "the close call")
+        }
+    }
+
+    impl Drop for CaptureFixture {
+        fn drop(&mut self) {
+            let Ok(mut states) = registry().lock() else {
+                return;
+            };
+            states
+                .expiry
+                .retain(|deadline| deadline.digest != self.digest);
+            let Some(state) = states.captures.remove(&self.digest) else {
+                return;
+            };
+            if state.claim.is_some() {
+                // Production never removes a claimed entry: a live claim keeps its
+                // deadline re-armed instead. A fixture has to remove its entry, so
+                // the in-flight call unit that entry held is returned here rather
+                // than leaked into the process-global vector.
+                states.budget.release(BudgetDimension::ActivePageCalls, 1);
+            }
+            if state.terminal.is_some() {
+                // The accounted terminal transition already returned the live-capture
+                // slot and the retained payload bytes, so only the terminal record's
+                // own units go away with the entry.
+                states.budget.release(BudgetDimension::TerminalEntries, 1);
+                states
+                    .budget
+                    .release(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES);
+                return;
+            }
+            states.budget.release(BudgetDimension::LiveCaptures, 1);
+            states
+                .budget
+                .release(BudgetDimension::RetainedBytes, state.charged_capture_bytes);
+            states.budget.release(BudgetDimension::TerminalEntries, 1);
+            states
+                .budget
+                .release(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES);
+        }
+    }
+
+    /// One page call suspended inside its provider await, exactly as
+    /// [`read_snapshot_page`] holds its claim there: the registry lock is released
+    /// before the await and the claim is the only in-flight ownership across it.
+    /// Nothing resumes this future, so its post-await transition is unreachable and
+    /// the claim is released only by the destructor a cancelled frame runs.
+    async fn page_call_awaiting_the_provider(
+        fixture: &CaptureFixture,
+    ) -> Result<SnapshotPage, StoreError> {
+        let mut claim = {
+            let mut states = lock_registry().expect("the fixture holds no other lock");
+            claimed(fixture.admit_page_in(&mut states), "the awaited page call")
+        };
+        let observed: CapturePoint = pending().await;
+        finish_page(&mut claim, &observed, fixture.cursor())
+    }
+
+    /// Asserts that two readbacks agree on every field except the reason ledger,
+    /// which each case asserts itself because recording a reason is the only change
+    /// these transitions are allowed to make.
+    fn assert_only_the_ledger_changed(before: &Evidence, after: &Evidence) {
+        assert_eq!(
+            after.terminal, before.terminal,
+            "the terminal record changed"
+        );
+        assert_eq!(
+            after.payload_members, before.payload_members,
+            "the retained payload changed"
+        );
+        assert_eq!(after.claim, before.claim, "the call slot changed");
+        assert_eq!(
+            after.last_page, before.last_page,
+            "the retained page changed"
+        );
+        assert_eq!(after.pages_served, before.pages_served, "pages moved");
+        assert_eq!(after.members_served, before.members_served, "members moved");
+        assert_eq!(after.bytes_served, before.bytes_served, "bytes moved");
+        assert_eq!(
+            after.incarnation, before.incarnation,
+            "the incarnation moved"
+        );
+    }
+
+    /// Asserts that every served counter is exactly where the fixture installed it.
+    fn assert_nothing_was_served(evidence: &Evidence) {
+        assert_eq!(evidence.pages_served, 0, "no page may be accounted");
+        assert_eq!(evidence.members_served, 0, "no member may be accounted");
+        assert_eq!(evidence.bytes_served, 0, "no byte may be accounted");
+        assert_eq!(evidence.last_page, None, "no page may be retained");
+    }
+
+    #[test]
+    fn drift_during_await_records_point_moved_and_freezes_the_capture() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(1, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let mut claim = fixture.claim_page();
+        let (before, held) = {
+            let states = lock_registry().expect("registry lock is free");
+            let state = states.get(fixture.digest()).expect("installed");
+            assert!(
+                !capture_is_retired(state, fixture.opened_at_ms()),
+                "the live fixture window must still be servable"
+            );
+            (
+                evidence(&states, fixture.digest()),
+                charged(&states, BudgetDimension::ActivePageCalls),
+            )
+        };
+        assert_eq!(
+            before.claim,
+            Some((claim.claim_id, "Page", before.progress_revision)),
+            "the claim is bound to the progress revision it was validated against"
+        );
+
+        let moved = fixture.moved_point();
+        let error = refusal(
+            finish_page(&mut claim, &moved, fixture.cursor()),
+            "a page whose point moved under it",
+        );
+        assert!(
+            matches!(error, StoreError::Unavailable),
+            "a moved point is refused, got {error:?}"
+        );
+
+        let states = lock_registry().expect("registry lock is free");
+        let after = evidence(&states, fixture.digest());
+        assert_eq!(
+            after.reasons(),
+            ["PointMoved"],
+            "the first causal failure is retained at index 0"
+        );
+        let (reasons, resolved, frozen_pages, frozen_members, frozen_bytes) = after
+            .ledger
+            .clone()
+            .expect("the interruption entry is retained");
+        assert_eq!(reasons, ["PointMoved"]);
+        assert!(!resolved, "a point movement is never resolved away");
+        assert_eq!(
+            (frozen_pages, frozen_members, frozen_bytes),
+            (0, 0, 0),
+            "the ledger freezes the counters as they stood"
+        );
+        assert_only_the_ledger_changed(&before, &after);
+        assert_nothing_was_served(&after);
+        assert!(after.terminal.is_none(), "no receipt may be frozen");
+        assert_eq!(
+            after.progress_revision,
+            before.progress_revision + 1,
+            "recording the reason is observable progress"
+        );
+        assert_eq!(
+            after.claim, None,
+            "the refusal settles exactly its own claim"
+        );
+        assert!(
+            states.captures.contains_key(fixture.digest()),
+            "the entry is retained, not deleted"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::ActivePageCalls),
+            held - 1,
+            "the in-flight call charge is returned"
+        );
+    }
+
+    #[test]
+    fn expiry_records_window_closed_and_accounts_rather_than_deletes() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(2, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Closed);
+        let before = {
+            let states = lock_registry().expect("registry lock is free");
+            let state = states.get(fixture.digest()).expect("installed");
+            assert!(
+                capture_is_retired(state, fixture.opened_at_ms()),
+                "the fixture window is fail-closed expired at its own observation"
+            );
+            evidence(&states, fixture.digest())
+        };
+
+        let error = refusal(fixture.admit_page(), "a page against a closed window");
+        assert!(
+            matches!(error, StoreError::Unavailable),
+            "a closed window is refused, got {error:?}"
+        );
+
+        let recorded = {
+            let states = lock_registry().expect("registry lock is free");
+            evidence(&states, fixture.digest())
+        };
+        assert_eq!(
+            recorded.reasons(),
+            ["WindowClosed"],
+            "the closed window is the first causal failure"
+        );
+        assert_only_the_ledger_changed(&before, &recorded);
+        assert_nothing_was_served(&recorded);
+        assert!(
+            recorded.terminal.is_none(),
+            "a page refusal freezes no receipt"
+        );
+
+        // The accounted payload-to-terminal transition, driven at the first instant
+        // after the capture's own replay horizon.
+        let mut states = lock_registry().expect("registry lock is free");
+        let live_before = charged(&states, BudgetDimension::LiveCaptures);
+        let bytes_before = charged(&states, BudgetDimension::RetainedBytes);
+        assert!(
+            account_expiry(
+                &mut states,
+                fixture.digest(),
+                fixture.retained_until_ms().saturating_add(1)
+            ),
+            "the due retirement deadline settles"
+        );
+        assert!(
+            states.captures.contains_key(fixture.digest()),
+            "expiry accounts the transition instead of deleting the evidence"
+        );
+        let retired = evidence(&states, fixture.digest());
+        assert_eq!(
+            retired.terminal,
+            Some((
+                SnapshotCompleteness::Expired,
+                0,
+                0,
+                SNAPSHOT_VALIDATION_REVISION,
+                fixture.retained_until_ms()
+            )),
+            "the derived receipt is frozen whole, with the capture's own horizon"
+        );
+        assert_eq!(
+            retired.payload_members, None,
+            "the heavy payload is freed by the accounted transition"
+        );
+        assert_eq!(retired.reasons(), ["WindowClosed"]);
+        assert_nothing_was_served(&retired);
+        assert_eq!(
+            charged(&states, BudgetDimension::LiveCaptures),
+            live_before - 1,
+            "the live-capture slot is returned by the terminal transition"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::RetainedBytes),
+            bytes_before - fixture.charged_capture_bytes(),
+            "the settled retained charge is returned with the payload"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_page_call_releases_only_its_own_claim_slot() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(3, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let (before, charge_before, high_water_before) = {
+            let states = lock_registry().expect("registry lock is free");
+            (
+                evidence(&states, fixture.digest()),
+                charged(&states, BudgetDimension::ActivePageCalls),
+                high_water(&states, BudgetDimension::ActivePageCalls),
+            )
+        };
+
+        // One poll of a frame that acquired the claim and is suspended inside its
+        // provider await, then cancellation: the future is dropped unresumed, which
+        // runs exactly the destructor a cancelled generator frame runs.
+        let mut call = Box::pin(page_call_awaiting_the_provider(&fixture));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(call.as_mut().poll(&mut context), Poll::Pending),
+            "the frame must still be suspended inside its provider await"
+        );
+        drop(call);
+
+        let states = lock_registry().expect("registry lock is free");
+        let after = evidence(&states, fixture.digest());
+        assert_eq!(
+            after, before,
+            "a cancelled frame performed nothing: every retained value is unchanged"
+        );
+        assert!(
+            states
+                .get(fixture.digest())
+                .expect("installed")
+                .claim
+                .is_none(),
+            "the cancelled frame released its own claim slot"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::ActivePageCalls),
+            charge_before,
+            "the in-flight call charge is returned"
+        );
+        assert!(
+            high_water(&states, BudgetDimension::ActivePageCalls) > high_water_before,
+            "the charge really was taken before it was returned"
+        );
+    }
+
+    /// One order of the two reasons, asserted with its own fixture.
+    fn transient_after_permanent(
+        ordinal: u64,
+        permanent: InterruptionReason,
+        transient: InterruptionReason,
+        expected: [&'static str; 2],
+    ) {
+        let fixture = CaptureFixture::install(
+            ordinal,
+            vec![fixture_member(FIXTURE_MEMBER_ID)],
+            Window::Live,
+        );
+        let mut states = lock_registry().expect("registry lock is free");
+        let before = evidence(&states, fixture.digest());
+        merge_interruption(
+            &mut states,
+            fixture.digest(),
+            fixture.incarnation,
+            permanent,
+        );
+        merge_interruption(
+            &mut states,
+            fixture.digest(),
+            fixture.incarnation,
+            transient,
+        );
+        resolve_transient_read(&mut states, fixture.digest(), fixture.incarnation);
+        let after = evidence(&states, fixture.digest());
+        assert_eq!(
+            after.reasons(),
+            expected,
+            "the merge is monotone: nothing is replaced and nothing is removed"
+        );
+        assert_eq!(
+            after.ledger.as_ref().map(|entry| entry.1),
+            Some(false),
+            "a terminal reason is retained, so the transient read is never resolved away"
+        );
+        assert!(
+            blocks_completeness(&states, fixture.digest()),
+            "a retained terminal reason keeps the capture from Complete"
+        );
+        assert_only_the_ledger_changed(&before, &after);
+        assert_nothing_was_served(&after);
+        assert_eq!(
+            after.progress_revision, 1,
+            "appending beside an existing entry is not new observable progress"
+        );
+    }
+
+    #[test]
+    fn a_transient_read_never_replaces_a_permanent_reason_in_either_order() {
+        let _serial = registry_serial();
+        transient_after_permanent(
+            41,
+            InterruptionReason::PointMoved,
+            InterruptionReason::ProviderReadFailed,
+            ["PointMoved", "ProviderReadFailed"],
+        );
+        transient_after_permanent(
+            42,
+            InterruptionReason::ProviderReadFailed,
+            InterruptionReason::PointMoved,
+            ["ProviderReadFailed", "PointMoved"],
+        );
+
+        // The control that proves the two assertions above are discriminating: the
+        // same resolution does apply when the transient read is the only reason.
+        let sole =
+            CaptureFixture::install(43, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let mut states = lock_registry().expect("registry lock is free");
+        let before = evidence(&states, sole.digest());
+        merge_interruption(
+            &mut states,
+            sole.digest(),
+            sole.incarnation,
+            InterruptionReason::ProviderReadFailed,
+        );
+        resolve_transient_read(&mut states, sole.digest(), sole.incarnation);
+        let resolved = evidence(&states, sole.digest());
+        assert_eq!(resolved.reasons(), ["ProviderReadFailed"]);
+        assert_eq!(
+            resolved.ledger.as_ref().map(|entry| entry.1),
+            Some(true),
+            "a sole transient read is resolvable"
+        );
+        assert!(
+            !blocks_completeness(&states, sole.digest()),
+            "a resolved transient read observed nothing about the source"
+        );
+        assert_only_the_ledger_changed(&before, &resolved);
+    }
+
+    /// Gives the installed slot a successor's claim identity, then proves the
+    /// original claim no longer describes it and annotates nothing.
+    fn stale_claim_identity_is_refused(
+        states: &mut CaptureRegistry,
+        fixture: &CaptureFixture,
+        claim: &CaptureCallClaim,
+    ) {
+        let slot = states
+            .get_mut(fixture.digest())
+            .expect("installed")
+            .claim
+            .as_mut()
+            .expect("the first call still owns the slot");
+        slot.claim_id = slot.claim_id.saturating_add(1_000);
+        let state = states.get(fixture.digest()).expect("installed");
+        assert!(
+            matches!(
+                resolve_claim(state, claim),
+                Err(StoreError::RevisionConflict)
+            ),
+            "a stale claim identity is refused"
+        );
+        assert!(
+            state.interruption.is_none(),
+            "a stale claim identity annotates nothing"
+        );
+    }
+
+    /// Gives the installed slot a successor's progress revision, then proves the
+    /// original claim no longer describes it and annotates nothing.
+    fn stale_expected_revision_is_refused(
+        states: &mut CaptureRegistry,
+        fixture: &CaptureFixture,
+        claim: &CaptureCallClaim,
+    ) {
+        let slot = states
+            .get_mut(fixture.digest())
+            .expect("installed")
+            .claim
+            .as_mut()
+            .expect("the slot is still occupied");
+        slot.expected_revision = slot.expected_revision.saturating_add(1);
+        let state = states.get(fixture.digest()).expect("installed");
+        assert!(
+            matches!(
+                resolve_claim(state, claim),
+                Err(StoreError::RevisionConflict)
+            ),
+            "a stale expected revision is refused"
+        );
+        assert!(
+            state.interruption.is_none(),
+            "a stale expected revision annotates nothing"
+        );
+    }
+
+    /// Moves the installed entry to a successor incarnation, then proves the
+    /// original claim names a different capture and annotates nothing.
+    fn stale_incarnation_is_refused(
+        states: &mut CaptureRegistry,
+        fixture: &CaptureFixture,
+        claim: &CaptureCallClaim,
+    ) {
+        let state = states.get_mut(fixture.digest()).expect("installed");
+        state.incarnation = state.incarnation.saturating_add(1);
+        assert!(
+            matches!(
+                resolve_claim(state, claim),
+                Err(StoreError::IdentityConflict)
+            ),
+            "a claim from another incarnation names a different capture"
+        );
+        assert!(
+            state.interruption.is_none(),
+            "a stale incarnation annotates nothing"
+        );
+    }
+
+    #[test]
+    fn an_overlapping_owner_is_refused_and_a_superseded_claim_releases_nothing() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(51, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let first = fixture.claim_page();
+        let (admitted, held) = {
+            let states = lock_registry().expect("registry lock is free");
+            (
+                evidence(&states, fixture.digest()),
+                charged(&states, BudgetDimension::ActivePageCalls),
+            )
+        };
+        assert_eq!(
+            admitted.claim,
+            Some((first.claim_id, "Page", admitted.progress_revision))
+        );
+
+        let overlapping_page = refusal(fixture.admit_page(), "the second page call");
+        assert!(
+            matches!(overlapping_page, StoreError::RevisionConflict),
+            "an overlapping page call is refused as pending, got {overlapping_page:?}"
+        );
+        let overlapping_close = refusal(fixture.admit_close(), "the overlapping close call");
+        assert!(
+            matches!(overlapping_close, StoreError::RevisionConflict),
+            "an overlapping close call is refused as pending, got {overlapping_close:?}"
+        );
+        assert!(
+            matches!(capture_claim_pending(), StoreError::RevisionConflict),
+            "the typed pending outcome is a revision conflict"
+        );
+
+        // A stale claim identity, a stale expected revision and a stale incarnation
+        // are each refused by `resolve_claim`, and none of them annotates anything.
+        let mut states = lock_registry().expect("registry lock is free");
+        stale_claim_identity_is_refused(&mut states, &fixture, &first);
+        stale_expected_revision_is_refused(&mut states, &fixture, &first);
+        stale_incarnation_is_refused(&mut states, &fixture, &first);
+
+        let refused = evidence(&states, fixture.digest());
+        assert_eq!(refused.ledger, None, "no refusal recorded any reason");
+        assert_eq!(refused.terminal, None, "no refusal closed the capture");
+        assert_nothing_was_served(&refused);
+        assert_eq!(
+            refused.progress_revision, admitted.progress_revision,
+            "no refusal moved observable progress"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::ActivePageCalls),
+            held,
+            "no refusal took or returned a call charge"
+        );
+
+        // Dropping the superseded claim releases nothing: the units its slot no
+        // longer describes were already returned by the release that replaced it.
+        drop(first);
+        assert!(
+            states
+                .get(fixture.digest())
+                .expect("installed")
+                .claim
+                .is_some(),
+            "a superseded claim cannot release its successor's slot"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::ActivePageCalls),
+            held,
+            "a superseded claim returns no charge"
+        );
+    }
+
+    #[test]
+    fn a_close_freezes_its_receipt_replays_it_and_releases_it_after_the_horizon() {
+        let _serial = registry_serial();
+        let moved =
+            CaptureFixture::install(61, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let (mut claim, window_closed) = moved.claim_close();
+        assert!(!window_closed, "the fixture window is still open");
+        let moved_point = moved.moved_point();
+        let receipt = close_capture(&mut claim, Some(&moved_point))
+            .expect("a moved observation still owes the caller an exact receipt");
+        assert_eq!(receipt.completeness, SnapshotCompleteness::Partial);
+        assert!(!receipt.is_complete(), "a moved capture is never complete");
+
+        let retained_until_ms = moved.read(|state| {
+            let closed = state
+                .terminal
+                .as_ref()
+                .expect("the terminal close is frozen with its entry");
+            assert_eq!(closed.receipt, receipt, "the whole receipt is frozen");
+            assert_eq!(closed.retained_until_ms, moved.retained_until_ms());
+            assert!(state.payload.is_none(), "the heavy payload is freed");
+            closed.retained_until_ms
+        });
+
+        // An exact repeated end is answered from that record, not re-derived.
+        match moved
+            .admit_close()
+            .expect("the retained record answers a repeated end")
+        {
+            CloseAdmission::Replay(replayed) => assert_eq!(replayed, receipt),
+            CloseAdmission::Claimed(_, _) => panic!("a closed capture never re-claims"),
+        }
+
+        // The horizon is exclusive: at it the record is still retained, and past it
+        // the record goes away without a fabricated receipt.
+        let mut states = lock_registry().expect("registry lock is free");
+        let entries_before = charged(&states, BudgetDimension::TerminalEntries);
+        let terminal_bytes_before = charged(&states, BudgetDimension::TerminalBytes);
+        assert!(
+            !release_terminal_record(&mut states, moved.digest(), retained_until_ms),
+            "the replay horizon is exclusive at the exact instant"
+        );
+        assert!(
+            release_terminal_record(&mut states, moved.digest(), retained_until_ms + 1),
+            "the record is released once its horizon has passed"
+        );
+        assert!(
+            !states.captures.contains_key(moved.digest()),
+            "the entry went away with the record"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::TerminalEntries),
+            entries_before - 1,
+            "the terminal-record entry unit went away with the record"
+        );
+        assert_eq!(
+            charged(&states, BudgetDimension::TerminalBytes),
+            terminal_bytes_before - TERMINAL_ENTRY_BYTES,
+            "the terminal-record byte allowance went away with the record"
+        );
+        drop(states);
+        let refusal = refusal(moved.admit_close(), "a close after the replay horizon");
+        assert!(
+            matches!(
+                refusal,
+                StoreError::InvalidField {
+                    field: "snapshot.snapshot_digest",
+                    ..
+                }
+            ),
+            "no receipt is fabricated for a capture whose payload is gone, got {refusal:?}"
+        );
+
+        // A close under a window that had already closed never re-reads the bound
+        // point, and freezes the derived `Expired` receipt instead.
+        let expired =
+            CaptureFixture::install(62, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Closed);
+        let (mut claim, window_closed) = expired.claim_close();
+        assert!(
+            window_closed,
+            "the closed window is recorded by the admission"
+        );
+        let receipt = close_capture(&mut claim, None)
+            .expect("a closed window still owes the caller an exact receipt");
+        assert_eq!(receipt.completeness, SnapshotCompleteness::Expired);
+        assert_eq!(
+            receipt.member_count, 0,
+            "no member was ever served under a closed window"
+        );
+        let states = lock_registry().expect("registry lock is free");
+        let closed = states
+            .get(expired.digest())
+            .expect("installed")
+            .terminal
+            .as_ref()
+            .expect("the terminal close is frozen with its entry");
+        assert_eq!(closed.receipt, receipt);
+        let recorded = evidence(&states, expired.digest());
+        assert_eq!(
+            recorded.reasons(),
+            ["WindowClosed"],
+            "the closed window is recorded, never a fabricated point movement"
+        );
+        assert_eq!(recorded.payload_members, None, "the payload is freed");
+    }
+
+    #[test]
+    fn a_complete_capture_and_an_authoritative_zero_member_close_both_hold() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(71, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let mut claim = fixture.claim_page();
+        let point = fixture.point();
+        let page =
+            finish_page(&mut claim, &point, fixture.cursor()).expect("the unchanged point serves");
+        assert!(
+            page.is_last,
+            "one observed member closes the capture in one page"
+        );
+        assert_eq!(page.coverage.state, SnapshotPageState::Complete);
+        assert_eq!(page.coverage.cumulative_members, 1);
+        assert_eq!(page.coverage.denominator_members, 1);
+        assert_eq!(page.cumulative_bytes, FIXTURE_BYTE_COUNT);
+        assert_eq!(page.cumulative_work, 1);
+        assert_eq!(
+            page.handle,
+            fixture.handle(),
+            "the page echoes the issued handle"
+        );
+        assert_eq!(page.members, vec![fixture_member(FIXTURE_MEMBER_ID)]);
+        let served = {
+            let states = lock_registry().expect("registry lock is free");
+            evidence(&states, fixture.digest())
+        };
+        assert_eq!(served.pages_served, 1);
+        assert_eq!(served.members_served, 1);
+        assert_eq!(served.bytes_served, FIXTURE_BYTE_COUNT);
+        assert_eq!(served.claim, None, "the served page settles its own claim");
+
+        let (mut claim, window_closed) = fixture.claim_close();
+        assert!(!window_closed);
+        let receipt = close_capture(&mut claim, Some(&point))
+            .expect("the bound point still holds, so the capture closes Complete");
+        assert_eq!(receipt.completeness, SnapshotCompleteness::Complete);
+        assert_eq!(receipt.member_count, 1);
+        assert_eq!(receipt.byte_count, FIXTURE_BYTE_COUNT);
+        assert_eq!(receipt.validation_revision, SNAPSHOT_VALIDATION_REVISION);
+        assert!(receipt.is_complete());
+
+        // The authoritative zero-member capture: the enumeration read every
+        // admitted canonical class and found nothing, so the close is Complete
+        // rather than a fabricated empty page.
+        let empty = CaptureFixture::install(72, Vec::new(), Window::Live);
+        let refusal = refusal(empty.admit_page(), "a page against a zero-member capture");
+        assert!(
+            matches!(
+                refusal,
+                StoreError::Empty {
+                    field: "snapshot.members"
+                }
+            ),
+            "no page is fabricated for an authoritatively empty capture, got {refusal:?}"
+        );
+        let (mut claim, window_closed) = empty.claim_close();
+        assert!(!window_closed);
+        let empty_point = empty.point();
+        let receipt = close_capture(&mut claim, Some(&empty_point))
+            .expect("an authoritative zero-member capture closes Complete");
+        assert_eq!(receipt.completeness, SnapshotCompleteness::Complete);
+        assert_eq!(receipt.member_count, 0);
+        assert_eq!(receipt.byte_count, 0);
+        assert!(receipt.is_complete());
+    }
+}
