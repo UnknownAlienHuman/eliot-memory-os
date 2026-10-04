@@ -2332,7 +2332,8 @@
         "S65",
         "S66"
       ],
-      "declared_site_count_matches_freeze": false,
+      "declared_site_count_matches_freeze": true,
+      "declared_site_count_matches_freeze_measurement": "re-measured on this file's present bytes, so the flag is true and rests on its own evidence: counting this file's 107 inventory rows whose family is job-iocp-spawn yields 37; the thirty-seven entries of frozen_site_ids above are set-identical AND order-identical to those 37 rows; frozen_sites reads 37; sites_with_adjacent_safety reads 37; bounded_families[job-iocp-spawn].sites reads 37; deferred_families_not_implemented_this_wave[job-iocp-spawn].site_count reads 37; and sites_without_production_caller below lists 5 of those 37 rows (S26..S30), which is a separate measurement about caller reach and not a count mismatch. sites_with_exact_raw_signature is the one counter that legitimately reads 36, because S65 (job_process_ids, span 2858) is a raw-pointer dereference whose raw_signature is null; that is a signature-coverage figure, not a declared-site-count cross-check, and it is what a signature-only count of this family would yield. The false value this flag previously carried matched no counter anywhere in the file and was corrected here rather than left to describe a failure that did not occur.",
       "wrapper_owners": [
         "crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::attach",
         "crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::shutdown",
@@ -2417,7 +2418,8 @@
         "S69",
         "S86"
       ],
-      "declared_site_count_matches_freeze": false,
+      "declared_site_count_matches_freeze": true,
+      "declared_site_count_matches_freeze_measurement": "re-measured on this file's present bytes, so the flag is true and rests on its own evidence: counting this file's 107 inventory rows whose family is notify-move-file yields 5; the five entries of frozen_site_ids above are set-identical AND order-identical to those 5 rows; frozen_sites reads 5; sites_with_adjacent_safety reads 5; sites_with_exact_raw_signature reads 5; bounded_families[notify-move-file].sites reads 5; deferred_families_not_implemented_this_wave[notify-move-file].site_count reads 5; and sites_without_production_caller below lists 3 of those 5 rows (S67, S68, S69), which is a separate measurement about caller reach and not a count mismatch. All five rows are FFI-bearing, so no signature-coverage adjustment applies to this family. The false value this flag previously carried matched no counter anywhere in the file and was corrected here rather than left to describe a failure that did not occur.",
       "wrapper_owners": [
         "crates/eliot-windows-ipc/src/lib.rs::DirectoryMutationGuard::drop",
         "crates/eliot-windows-ipc/src/lib.rs::DirectoryMutationGuard::mutation_detected",
@@ -2577,7 +2579,7 @@
       "family": "job/IOCP/spawn supervision - sites frozen and bounded in this inventory; executed Windows fixture evidence is TEST-PHASE",
       "family_id": "job-iocp-spawn",
       "site_count": 37,
-      "site_count_basis": "counted from this file's own inventory rows whose family is job-iocp-spawn, which agrees with the family_evidence row of that name (frozen_sites 37, thirty-seven frozen_site_ids) and its declared_site_count_matches_freeze false; the bounded_families row for this family says 36 and is off by one, which is pre-existing and is recorded in deferred_family_counter_note rather than rewritten here",
+      "site_count_basis": "counted from this file's own inventory rows whose family is job-iocp-spawn, which agrees with the family_evidence row of that name (frozen_sites 37, thirty-seven frozen_site_ids) and with its bounded_families row (sites 37), so all three counters read 37 and declared_site_count_matches_freeze for this family is true; the 36 that a signature-only counter yields because S65 (job_process_ids, span 2858) has raw_signature null is a superseded historical figure, recorded as provenance in deferred_family_counter_note and not a live disagreement",
       "status": "INCOMPLETE_PENDING_MIGRATION",
       "deferred_basis": "wave-2 verbatim wording, retained as written so the original claim is not lost; family_id is this inventory's own slug for the same family, keyed to the family_evidence and bounded_families rows of that name",
       "obligation": "the issued obligation remains incomplete for this family: issue #789 verification requires that every acquisition, error, panic, cancel and late-completion path has exactly one close owner or an explicit unresolved-ownership disposition, that prepared, synchronous, pending, unknown-submit, cancel-requested, observed terminal and unresolved states remain distinct, and that a late completion cannot affect a new frame, Session or reused buffer. This fixture proves none of that by execution: sites S26..S30 and S34..S66 are frozen with bounds, adjacent SAFETY evidence and callers, and the five sites without a production caller are recorded, but no executed Windows fixture drives this family, so the completion-reconciled cleanup of the IOCP observer and the job/tree guards is unestablished.",
@@ -2593,7 +2595,7 @@
       "family": "notify/move file - sites frozen and bounded in this inventory; executed Windows fixture evidence is TEST-PHASE",
       "family_id": "notify-move-file",
       "site_count": 5,
-      "site_count_basis": "counted from this file's own inventory rows whose family is notify-move-file, which agrees with the family_evidence row of that name (frozen_sites 5, five frozen_site_ids) and its declared_site_count_matches_freeze false; the bounded_families row for this family says 4 and is off by one, which is pre-existing and is recorded in deferred_family_counter_note rather than rewritten here",
+      "site_count_basis": "counted from this file's own inventory rows whose family is notify-move-file, which agrees with the family_evidence row of that name (frozen_sites 5, five frozen_site_ids) and with its bounded_families row (sites 5), so all three counters read 5 and declared_site_count_matches_freeze for this family is true; the 4 is a superseded historical figure that predates S1 (RetirablePinnedFile::retire, span 783-790) joining this family, recorded as provenance in deferred_family_counter_note and not a live disagreement",
       "status": "INCOMPLETE_PENDING_MIGRATION",
       "deferred_basis": "wave-2 verbatim wording, retained as written so the original claim is not lost; family_id is this inventory's own slug for the same family, keyed to the family_evidence and bounded_families rows of that name",
       "obligation": "the issued obligation remains incomplete for this family: issue #789 verification requires that a mutation-detecting change-notification guard and an atomic same-volume replacement prove their exact terminal ownership before any pinned file, directory handle or replacement buffer is released, that a zero return from the native move or dispose call leaves the object unretired rather than treating the failed call as a successful cleanup, and that partial I/O never becomes complete semantic success. This fixture proves none of that by execution: sites S1, S67..S69 and S86 are frozen with bounds, adjacent SAFETY evidence and callers, and the three sites without a production caller are recorded, but no executed Windows fixture drives this family, so the recursive-mutation and atomic-replacement round trip is unestablished.",
@@ -2625,7 +2627,7 @@
     }
   ],
   "deferred_family_correction": "wave 2 listed these five families as not implemented at all, which contradicted the frozen sites it carried for them in the same file. The accurate statement is that their sites, wrappers, callers, ADR dispositions and exact raw signatures are frozen and bounded here, and only their executed Windows fixture evidence remains unproven. The five records in deferred_families_not_implemented_this_wave are that statement in structured form: each carries its wave-2 wording verbatim in family, this inventory's own family_id, an explicit INCOMPLETE_PENDING_MIGRATION status so the obligation is recorded as not complete, the specific invariant left unproven, the destination owner where the repository names one, and an honest null with a search basis where it does not. The five are the only records carrying INCOMPLETE_PENDING_MIGRATION status; credential and shared-handle-core carry no such record, and neither is asserted here to be complete by executed evidence.",
-  "deferred_family_counter_note": "site_count in each record above is measured against this inventory and family_evidence, which agree row-for-row at 6, 25, 37, 5 and 13 for a total of 86 sites across the five families. The 70 in the wave-2 sentence below is wave 2's own count measured at the wave-2 freeze and is not this file's denominator, and the pre-existing bounded_families rows for job-iocp-spawn (36) and notify-move-file (4) disagree with the inventory by one site each; that disagreement is pre-existing, predates this change and is not created here, and it is left for the inventory re-derivation owner rather than silently rewritten in a section this change does not own. wave 2's 70 is retained in deferred_family_correction as historical prose about wave 2, not as a current count.",
+  "deferred_family_counter_note": "site_count in each record above is measured against this inventory and family_evidence, which agree row-for-row at 6, 25, 37, 5 and 13 for a total of 86 sites across the five families. The 70 in the wave-2 sentence below is wave 2's own count measured at the wave-2 freeze and is not this file's denominator. wave 2's 70 is retained in deferred_family_correction as historical prose about wave 2, not as a current count. There is no live counter disagreement in this file. Every counter that describes the present inventory reads the same number for each of the seven families: the 107 inventory rows counted by family give credential 18, oplock-async 6, pipe-process-identity 25, job-iocp-spawn 37, notify-move-file 5, security-pipe-server-dacl 13 and shared-handle-core 3; bounded_families[].sites reads 18, 6, 25, 37, 5, 13 and 3 for those same seven families; and family_evidence[].frozen_sites reads 18, 6, 25, 37, 5, 13 and 3, with frozen_site_ids set-identical AND order-identical to the measured inventory rows in all seven cases. PROVENANCE of the superseded 36 and 4, which are historical figures and not live values: bounded_families[].sites carried 36 for job-iocp-spawn and 4 for notify-move-file in revision a70fd5a3d6c409c798d5d7d80079b1c742e05d54, and both rows were later re-derived to 37 and 5, at which point they became consistent with the inventory. The 36 is what counting only signature-bearing rows of that family yields: the family has 37 rows and exactly one of them, S65 (job_process_ids, span 2858, a raw-pointer dereference of *const JOBOBJECT_BASIC_PROCESS_ID_LIST whose raw_signature is null because raw_signature is defined only for windows-sys declarations), has no raw_signature, so 37 minus 1 is 36. The 4 predates the present notify-move-file membership rather than under-counting it: at a70fd5a3d that family held four rows (DirectoryMutationGuard::watch, DirectoryMutationGuard::mutation_detected, DirectoryMutationGuard::drop and atomic_replace_file, the last being S84, span 2427-2433), and S1 (RetirablePinnedFile::retire, span 783-790, SetFileInformationByHandle, now moved into this family) was added afterwards, both S1 and S43 carrying added_after_freeze a70fd5a3d6c409c798d5d7d80079b1c742e05d54. Atomic_replace_file was itself re-identified as S86 (MoveFileExW, span 3375-3381) in the later re-derivation that also produced the present 107-row inventory, which went 105 rows to 107 by adding S106 and S107 in security-pipe-server-dacl and not by dropping a notify-move-file row. Both superseded figures are recorded here as provenance for the earlier count and as the reason a signature-only counter and a stale family membership each undercounted by one; neither is a current disagreement, and nothing in this file needs to be left to the inventory re-derivation owner because there is nothing outstanding to hand off.",
   "deferred_family_correction_wave_2_note": "the '70 frozen sites' figure in deferred_family_correction is wave 2's own historical count; the current per-family counts are in site_count on each record and are stated in deferred_family_counter_note.",
   "migration_required": [
     {
@@ -3700,6 +3702,10 @@
         {
           "caller": "crates/eliot-windows-ipc/src/lib.rs::tests::process_tree_guard_terminates_attached_child (test-only; no production caller on main)",
           "state": "test-only-annotated"
+        },
+        {
+          "caller": "crates/eliot-app/tests/multi_agent_access.rs:903 (OwnedChild::spawn, match ProcessTreeGuard::attach(child.id()); test-only because the file is an integration test under tests/, so the classification of this site is unchanged - every caller is still test-only)",
+          "state": "test-only-annotated"
         }
       ],
       "cases": [
@@ -3735,6 +3741,10 @@
       "callers": [
         {
           "caller": "crates/eliot-windows-ipc/src/lib.rs::tests::process_tree_guard_terminates_attached_child (test-only; no production caller on main)",
+          "state": "test-only-annotated"
+        },
+        {
+          "caller": "crates/eliot-app/tests/multi_agent_access.rs:903 (OwnedChild::spawn, match ProcessTreeGuard::attach(child.id()); test-only because the file is an integration test under tests/, so the classification of this site is unchanged - every caller is still test-only)",
           "state": "test-only-annotated"
         }
       ],
@@ -3772,6 +3782,10 @@
         {
           "caller": "crates/eliot-windows-ipc/src/lib.rs::tests::process_tree_guard_terminates_attached_child (test-only; no production caller on main)",
           "state": "test-only-annotated"
+        },
+        {
+          "caller": "crates/eliot-app/tests/multi_agent_access.rs:903 (OwnedChild::spawn, match ProcessTreeGuard::attach(child.id()); test-only because the file is an integration test under tests/, so the classification of this site is unchanged - every caller is still test-only)",
+          "state": "test-only-annotated"
         }
       ],
       "cases": [
@@ -3807,6 +3821,10 @@
       "callers": [
         {
           "caller": "crates/eliot-windows-ipc/src/lib.rs::tests::process_tree_guard_terminates_attached_child (test-only; no production caller on main)",
+          "state": "test-only-annotated"
+        },
+        {
+          "caller": "crates/eliot-app/tests/multi_agent_access.rs:903 (OwnedChild::spawn, match ProcessTreeGuard::attach(child.id()); test-only because the file is an integration test under tests/, so the classification of this site is unchanged - every caller is still test-only)",
           "state": "test-only-annotated"
         }
       ],

@@ -512,8 +512,7 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                 .position(|line| line.trim_start().starts_with(&declaration))
                 .unwrap_or_else(|| {
                     panic!(
-                        "CASE IDENTITY (source_test exists): case {id} names source_test `{name}`, \
-                         but no `fn {name}(` is declared in unsafe_family_boundaries.rs"
+                        "CASE IDENTITY (source_test exists): case {id} names source_test `{name}`, but no `fn {name}(` is declared in unsafe_family_boundaries.rs"
                     )
                 });
             let mut has_test_attribute = false;
@@ -530,10 +529,7 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
             }
             assert!(
                 has_test_attribute,
-                "CASE IDENTITY (source_test is a test): case {id} names source_test `{name}`, but \
-                 the `fn {name}(` declaration in unsafe_family_boundaries.rs carries no \
-                 contiguous `#[test]` or `#[tokio::test]` attribute above it, so it is not a test \
-                 function and proves no title"
+                "CASE IDENTITY (source_test is a test): case {id} names source_test `{name}`, but the `fn {name}(` declaration in unsafe_family_boundaries.rs carries no contiguous `#[test]` or `#[tokio::test]` attribute above it, so it is not a test function and proves no title"
             );
             // Fact 2: the flag is an honest verdict about the binding.
             // `false` is a clean, full match and MUST carry a non-empty
@@ -567,11 +563,7 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                     .unwrap_or_default();
                 assert!(
                     !justification.trim().is_empty(),
-                    "CASE IDENTITY (full match justified): case {id} declares title_mismatch=false \
-                     over the real test `{name}`, so it must carry a non-empty \
-                     `full_match_justification` (or `binding_note`) explaining why that test fully \
-                     proves the title; this code can verify the binding is real, not that the test \
-                     proves the title, so the `false` flag must be a recorded, reviewable claim"
+                    "CASE IDENTITY (full match justified): case {id} declares title_mismatch=false over the real test `{name}`, so it must carry a non-empty `full_match_justification` (or `binding_note`) explaining why that test fully proves the title; this code can verify the binding is real, not that the test proves the title, so the `false` flag must be a recorded, reviewable claim"
                 );
             }
             // Fact 4: `registry_marker` is cross-checked against the anchored
@@ -663,13 +655,7 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                     || names_this_test("full_match_justification");
                 assert!(
                     bound_marker == own_marker || recorded_repoint,
-                    "CASE IDENTITY (registry marker agreement): case {id} claims registry_marker \
-                     `{claimed_marker}` over source_test `{name}`, but the anchored marker actually \
-                     bound to that test in unsafe_family_boundaries.rs is `{bound_marker}`, not its \
-                     own case marker `{own_marker}`; a re-pointed row must record WHY in \
-                     `binding_note`, `title_mismatch_reason` or `full_match_justification` AND that \
-                     note must name source_test `{name}`, otherwise the row is not internally \
-                     consistent about which case its test proves"
+                    "CASE IDENTITY (registry marker agreement): case {id} claims registry_marker `{claimed_marker}` over source_test `{name}`, but the anchored marker actually bound to that test in unsafe_family_boundaries.rs is `{bound_marker}`, not its own case marker `{own_marker}`; a re-pointed row must record WHY in `binding_note`, `title_mismatch_reason` or `full_match_justification` AND that note must name source_test `{name}`, otherwise the row is not internally consistent about which case its test proves"
                 );
             }
         } else {
