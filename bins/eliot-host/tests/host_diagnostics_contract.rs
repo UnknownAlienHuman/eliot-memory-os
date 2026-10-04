@@ -943,14 +943,16 @@ fn assert_the_stop_and_sighting_stay_two_scoped_host_request_records(
     // sighting names no `AdmittedEvent` and reaches no admission, so this window
     // holds two request records and exactly one admission record; the admission is
     // read by its own name below rather than being swept into the request count.
-    let request_records = text
+    let request_records: Vec<&str> = text
         .lines()
         .filter(|line| line.contains("event=\"host.request\""))
-        .count();
+        .collect();
     assert_eq!(
-        request_records, 2,
-        "one projection must emit exactly one request record, got {request_records} of them in: \
-         {text}"
+        request_records.len(),
+        2,
+        "one projection must emit exactly one request record, got {} of them in: \
+         {text}",
+        request_records.len()
     );
     assert_eq!(
         text.matches("event=\"host.request\"").count(),
@@ -961,13 +963,18 @@ fn assert_the_stop_and_sighting_stay_two_scoped_host_request_records(
     // The component identity is stamped on every record from the owner's own
     // constant, never from a caller-supplied string.
     assert_eq!(
-        text.matches(&format!("service=\"{}\"", eliot_host::SERVICE_NAME))
+        request_records
+            .iter()
+            .filter(|line| line.contains(&format!("service=\"{}\"", eliot_host::SERVICE_NAME)))
             .count(),
         2,
         "every projected record must name the Host service component, got: {text}"
     );
     assert_eq!(
-        text.matches("phase=\"scm_dispatch\"").count(),
+        request_records
+            .iter()
+            .filter(|line| line.contains("phase=\"scm_dispatch\""))
+            .count(),
         2,
         "every projected record must carry the phase it was constructed with, got: {text}"
     );
@@ -1278,12 +1285,10 @@ fn rendered_field<'a>(record: &'a str, key: &str) -> Option<&'a str> {
 
 // WORK_UNIT_CASE: 889/7
 #[test]
-fn host_request_evidence_progress_slots_stay_five_distinct_records() {
-    // Behaviour under test: `observed`, `admitted`, `process_started`,
-    // `semantically_ready` and `durable_committed` are five distinct evidence
-    // classes and each reaches the wire as its own record under its own
-    // `HostRequestEvidence::as_str()` name. A facade that collapsed two of
-    // them into one record or one shared name fails here.
+fn host_request_evidence_progress_slots_stay_distinct() {
+    // Behaviour under test: four externally constructible evidence classes
+    // reach the wire as distinct records. `semantically_ready` remains a fifth
+    // distinct vocabulary class, source-proven below without a fabricated host.
     //
     // `admitted` is driven through the real `HostLaunchOptions::parse`
     // producer, so the installation/generation identities it stamps are the
@@ -1318,22 +1323,20 @@ fn host_request_evidence_progress_slots_stay_five_distinct_records() {
     let expected_installation = options.installation().as_str().to_owned();
     let expected_generation = options.transaction_plan_generation().to_string();
 
-    // The independent expected set is built from the variants' own stable
-    // names, never from the list of constructors under test, so a change to a
-    // constructor cannot silently redefine what "distinct" means.
+    // The independent runtime expected set is built from the four constructors
+    // this target can execute, never from their captured output.
     let expected = [
         HostRequestEvidence::Observed.as_str(),
         HostRequestEvidence::Admitted.as_str(),
         HostRequestEvidence::ProcessStarted.as_str(),
-        HostRequestEvidence::SemanticallyReady.as_str(),
         HostRequestEvidence::DurableCommitted.as_str(),
     ];
 
     // Four of the five slots are constructible from an external test target.
     // `semantically_ready` takes `&HostComposition`, whose only constructor
     // (`HostComposition::open`) needs an installed SystemService root; that
-    // slot is proven below by its emitted name and by the facade's own
-    // construction source, never by a faked host.
+    // slot is proven below by its own stable name and the facade's construction
+    // source, never by a faked host or a claim that this capture emitted it.
     let (emitted, captured_text) = capture_request_evidence(&[
         HostRequestProjection::observed(EntrypointStage::Startup),
         HostRequestProjection::admitted(EntrypointStage::LaunchConfig, &options),
@@ -1375,6 +1378,12 @@ fn host_request_evidence_progress_slots_stay_five_distinct_records() {
         "the unreachable readiness slot must stay bound to its own name and to the facade's \
          own host running state"
     );
+    for runtime_class in &expected {
+        assert_ne!(
+            runnable, *runtime_class,
+            "semantic readiness must remain distinct from each captured class"
+        );
+    }
     assert_distinct_progress_evidence_classes(&emitted, &expected, &captured_text);
 }
 
@@ -1458,10 +1467,9 @@ fn assert_no_progress_record_claims_a_running_state(captured_text: &str) {
     }
 }
 
-/// The progress classes this case could really emit must be mutually distinct:
-/// each expected name appears on exactly one emitted record, no two emitted
-/// records share a name, exactly the constructible classes emitted, and every
-/// emitted name is one of the five progress classes.
+/// The four runtime-constructible progress classes must be mutually distinct;
+/// readiness is checked separately against every emitted class and its source
+/// binding, because this external target cannot construct a real Host.
 fn assert_distinct_progress_evidence_classes(
     emitted: &[String],
     expected: &[&str],
@@ -1491,13 +1499,13 @@ fn assert_distinct_progress_evidence_classes(
     }
     assert_eq!(
         emitted.len(),
-        expected.len() - 1,
+        expected.len(),
         "the four constructible progress slots must emit four records, got {emitted:?}"
     );
     for name in emitted {
         assert!(
             expected.contains(&name.as_str()),
-            "emitted evidence {name:?} is not one of the five progress classes {expected:?}"
+            "emitted evidence {name:?} is not one of the four captured progress classes {expected:?}"
         );
     }
 }
@@ -1659,7 +1667,7 @@ fn assert_terminal_records_bind_nothing_they_were_never_given(captured_text: &st
         "an absent reason renders the empty placeholder, never a code: {unattributed}"
     );
     assert!(
-        unattributed.contains("request=status"),
+        unattributed.contains("request=\"status\""),
         "the attached console request identity must survive: {unattributed}"
     );
 
@@ -1669,7 +1677,7 @@ fn assert_terminal_records_bind_nothing_they_were_never_given(captured_text: &st
         "a proven no-effect cancellation asserts nothing it was not given: {cancelled}"
     );
     assert!(
-        cancelled.contains("request=stop"),
+        cancelled.contains("request=\"stop\""),
         "the attached console request identity must survive: {cancelled}"
     );
     let unknown = request_record_carrying(captured_text, HostRequestEvidence::Unknown.as_str());
@@ -2180,7 +2188,7 @@ fn tracing_never_corrupts_console_stdout_framing() {
 
 // ------------------------------------------------------------------ canaries --
 
-/// One sentinel describing the channel it was poured into, and where.
+/// One test-owned marker for a bounded text channel.
 struct Canary {
     channel: &'static str,
     value: String,
@@ -2195,32 +2203,25 @@ impl Canary {
     }
 }
 
-/// Pours one sentinel into a channel by manufacturing the real value that
-/// channel holds at a real call site, so the sweep sends genuine product
-/// material (a credential string, a bearer token, a `KEY=value` environment
-/// entry, a connection string, a source payload, a user payload, a model
-/// payload) rather than a marker the facade could never have received.
+/// Pours one explicitly nonsecret, test-owned marker through the shape of the
+/// channel the facade receives, rather than a genuine credential, environment
+/// value, connection string, source, user, or model payload.
 ///
-/// The bearer token is built from a value THIS test owns -- the marker it was
-/// handed -- and never from the machine's environment. It previously read the
-/// first `PATH` entry and fell back to the plain sentinel, which made the
-/// poured value depend on the host and left a later `contains("Bearer ")`
-/// assertion red on any host without `PATH`. No call site in this product
-/// builds a bearer token out of `PATH`; the shape that matters is the scheme
-/// prefix, and the secret behind it is one the test minted.
+/// The bearer-shaped marker is built from this test's value, never from the
+/// machine's environment. An earlier revision read the first `PATH` entry and
+/// fell back to the plain marker, making the fixture host-dependent and leaving
+/// `contains("Bearer ")` false on hosts without PATH. No product call site
+/// builds a token out of PATH; the scheme prefix is the shape under test and
+/// the suffix is a dummy marker.
 ///
-/// Returns the channel it poured into together with the value it poured, so a
-/// sweep can assert against an independently reconstructed expected sentinel
-/// instead of reusing the value it just built.
+/// Returns the channel and exact marker poured, so assertions compare against
+/// the input rather than a value reconstructed from captured output.
 fn pour(channel: &'static str, marker: &str) -> Canary {
     let seed = Canary::new(channel, marker);
     let value = match channel {
-        // A bearer token at a real call site: an authorization header value
-        // whose scheme prefix the facade is handed verbatim.
-        "TOKEN" => format!("Bearer {marker}-889-11-SECRET"),
-        // Every other channel is the sentinel verbatim: a credential string, a
-        // connection string, an environment entry, or a raw source/user/model
-        // payload.
+        // A bearer-shaped test marker, not a real credential.
+        "TOKEN" => format!("Bearer {marker}-889-11-DUMMY!"),
+        // Every remaining channel value is the explicitly nonsecret marker.
         _ => seed.value.clone(),
     };
     Canary { channel, value }
@@ -2642,7 +2643,7 @@ impl SinkRun {
         let admissions = outcomes.lock().unwrap().clone();
         Self {
             admissions,
-            offered: sink.offered_bytes(),
+            offered: sink.offered_bytes() + *healthy_offered.lock().unwrap(),
             written: sink.written_bytes() + *healthy_written.lock().unwrap(),
         }
     }
@@ -3481,16 +3482,11 @@ fn assert_the_detail_surface_is_bounded_honestly(fixtures: &Case10Fixtures) -> (
 
     // Exactly the cap: 1024 pad bytes, and again with both markers. Neither is
     // cut, and neither reports truncation, which is the `>=`-versus-`>`
-    // falsifier for this surface. Neither may smuggle back what was removed,
-    // either: the removed tail begins past the cap boundary, so it is absent
-    // from what a correct cut retains.
+    // falsifier for this surface; the marked input proves a marker at the cap
+    // boundary is retained.
     for at_cap in [&fixtures.exact_detail, &fixtures.marked_detail_at_cap] {
         let retained = assert_an_exactly_at_cap_detail_is_not_cut(at_cap, cap);
-        assert!(
-            !retained.contains(tail),
-            "an exactly-at-cap detail must retain its whole input, got a retained text that drops \
-             the marker {tail:?}"
-        );
+        assert_eq!(retained, at_cap.as_str());
     }
 
     let retained_at_cap = assert_a_multibyte_cut_lands_on_a_character_boundary(cap, tail);
@@ -4011,20 +4007,19 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
     // under a formatter's Debug rendering: those categories have no channel
     // here, which is a property of the vocabulary and is proved below.
     //
-    // HONEST SCOPE, and the correction this case exists to make. It previously
-    // poured four IN-BOUND secrets (MEASURED: 21, 27, 22 and 21 bytes -- all far
-    // under the 1024-byte detail bound) and then asserted, for every record, that
-    // `!record.whole().contains(value)`. That asserts the OPPOSITE of the
-    // product's truth: `truncate_to` bounds SIZE only, `bound_detail` never
+    // HONEST SCOPE, and the correction this case exists to make. It pours four
+    // IN-BOUND, explicitly nonsecret DUMMY!-prefixed markers (MEASURED: 21, 27,
+    // 22 and 21 bytes -- all far under the 1024-byte detail bound) and asserts
+    // that the product records them verbatim. That is the product's truth:
+    // `truncate_to` bounds SIZE only, `bound_detail` never
     // inspects content for secrets, and `observe_entrypoint_with_detail` writes
     // `detail = bounded.text()` -- the retained prefix VERBATIM. The module
     // header says so in as many words: "Callers must pass only nonsecret
-    // material; bounding limits size, not sensitivity (I15.4)". An in-bound
-    // value a caller hands the facade IS recorded, and the RESIDUE arm at the
-    // bottom of this case now asserts exactly that, with `detail_truncated ==
-    // "false"`. Absence is therefore claimed only for material the bound
-    // genuinely REMOVED: the over-cap `secret_tail` that begins past the cap
-    // boundary.
+    // material; bounding limits size, not sensitivity (I15.4)". A marker this
+    // test hands the facade IS recorded, and the RESIDUE arm below asserts that
+    // with `detail_truncated == "false"`. Raw assertions prove size only; the
+    // typed HostError capture separately tests category canaries. Absence is
+    // claimed only for the synthetic over-cap tail beyond the cap boundary.
     //
     // Falsifiable by construction: the absence assertions run over each
     // record's WHOLE text (its target plus every field name and value), and
@@ -4034,20 +4029,18 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
     // reporting a truncation flag it did not perform. Neither arm can pass
     // vacuously: the facade has to keep recording for the residue arm to be
     // able to fail.
-    let marker = "CANARY";
+    let marker = "DUMMY!";
     let credential = pour("CREDENTIAL", marker);
     let token = pour("TOKEN", marker);
     let environment = pour("ENVIRONMENT", marker);
     let connection = pour("CONNECTION", marker);
 
     // MEASURED before any absence arm is trusted: every poured value is
-    // IN BOUND. If one of them crossed the cap the two arms below would be
-    // arguing about different material, and the residue arm would silently
-    // stop describing the in-bound case. MEASURED: the 21-byte credential and
-    // the 21-byte connection sentinels, the 22-byte environment entry, and the
-    // 27-byte bearer token ("Bearer " + "CANARY-889-11-SECRET") all fit, and the
-    // token carries its scheme prefix plus a secret this test minted -- no
-    // machine environment is read to build any of them.
+    // IN BOUND. If one crossed the cap the residue arm would silently stop
+    // describing the in-bound case. MEASURED: the 21-byte credential and
+    // connection markers, the 22-byte environment marker, and the 27-byte
+    // bearer-shaped DUMMY! marker all fit; no machine environment or real
+    // credential is read to build them.
     //
     // The in-bound lengths are also pinned here, so the MEASURED prose above is
     // an assertion rather than a note: a future edit to `pour` that made one of
@@ -4083,20 +4076,20 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
         token.value
     );
 
-    // An over-cap secret whose removed tail is a distinctive sentinel. The
-    // facade cannot have retained that tail under its own bound, so its total
-    // absence over every record is a real absence claim, not a naming trick.
-    // MEASURED: `credential.value` is the 21-byte CREDENTIAL sentinel, so 128
+    // An over-cap nonsecret detail fixture whose removed tail is distinctive.
+    // The facade cannot have retained that tail under its own bound, so its
+    // total absence over every record is a real absence claim, not a naming
+    // trick. MEASURED: `credential.value` is the 21-byte DUMMY! marker, so 128
     // copies plus the 21-byte tail is 2688 + 21 = 2709 bytes against a
     // 1024-byte bound: the cut lands inside the repeat run at byte 1024 and the
     // tail starts at byte 2688, 1664 bytes past the boundary. 64 copies
     // (1344 + 21 = 1365) also exceeds the bound but by only 341 bytes; 128
     // keeps the margin unambiguous.
-    let secret_tail = "REMOVED-889-11-SECRET";
+    let secret_tail = "REMOVED-889-11-DUMMY!";
     let over_cap_secret = credential.value.repeat(OVER_CAP_SECRET_REPEATS) + secret_tail;
     assert!(
         over_cap_secret.len() > 2 * MAX_DIAGNOSTIC_DETAIL_BYTES,
-        "the over-cap secret fixture must clear the declared bound by a clear margin, got {} bytes against a {} byte bound",
+        "the over-cap synthetic detail fixture must clear the declared bound by a clear margin, got {} bytes against a {} byte bound",
         over_cap_secret.len(),
         MAX_DIAGNOSTIC_DETAIL_BYTES
     );
@@ -4111,6 +4104,15 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
         &connection,
         &over_cap_secret,
     );
+    let error_canaries = [
+        "credential=TEST-ONLY-889-11-CREDENTIAL",
+        "token=Bearer TEST-ONLY-889-11-TOKEN",
+        "environment=TEST_ONLY_889_11=ENVIRONMENT",
+        "connection=postgres://test-only:889-11-connection@invalid/db",
+    ];
+    let error_payload = error_canaries.join(" | ");
+    let typed_failure_records =
+        assert_typed_host_error_payload_is_not_projected(&error_payload, &error_canaries);
 
     // Phase A, the removed-material absence claim: every channel really was
     // poured, the removed tail really begins past the cap boundary, and that
@@ -4151,9 +4153,10 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
     // caller-side (I15.4) and this file cannot observe it, so no assertion here
     // claims it.
 
-    // Phase C, the closed field surface: the four secret categories have NO
-    // field of their own on any swept event, so there is nowhere to put one.
+    // Phase C, the closed field surface: no captured facade event has a field
+    // of its own for a secret category.
     assert_the_secret_categories_have_no_slot_of_their_own(&records);
+    assert_the_secret_categories_have_no_slot_of_their_own(&typed_failure_records);
 
     // Phase D, no record may carry an arbitrary error Debug/Display rendering,
     // and every reason the facade ACTUALLY projected is one of its frozen
@@ -4167,8 +4170,9 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
     assert_the_sweep_saw_every_event_it_is_reasoning_about(&records);
 
     // THE PRODUCT'S REAL BEHAVIOUR, stated as such, and the half of this case
-    // that had it backwards: the in-bound credential, bearer token, environment
-    // entry and connection string this sweep poured ARE RECORDED, verbatim,
+    // that had it backwards: the in-bound nonsecret DUMMY! markers representing
+    // credential, token, environment and connection categories ARE RECORDED,
+    // verbatim,
     // each with `detail_truncated == "false"` and its own byte length. This is
     // not a defect being papered over and not a scrubbing rule this case claims
     // to have. `truncate_to` bounds SIZE only, `bound_detail` never inspects
@@ -4186,8 +4190,8 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
     // it. The guarantee is caller-side redaction plus size bounding, never
     // automatic scrubbing.
     //
-    // These four assertions can all fail. A product that began redacting
-    // in-bound secrets fails the `detail` equality; one that began cutting an
+    // These four assertions can all fail. A product that changes handling of
+    // the in-bound nonsecret fixtures fails the `detail` equality; one that began cutting an
     // in-bound value fails the truncation flag; one that began reporting a
     // truncation it did not perform fails the same flag; one that began
     // reporting a bound instead of the truth fails `detail_bytes`.
@@ -4205,13 +4209,12 @@ fn credential_token_environment_and_connection_canaries_are_bounded_and_carry_no
 /// The capture phase of case 889/11: every facade emission surface that case is
 /// about, poured once.
 ///
-/// The stage-detail channel is fed a genuine credential, a genuine bearer token,
-/// a genuine environment entry, and a genuine connection string -- each of the
-/// four is IN BOUND, so the facade is required to copy it verbatim, which is
-/// what the residue arm later proves. The bounded code channel is fed the same
-/// four values, so the absence and closed-surface arms are asked about both
-/// bounded surfaces. The over-cap secret rides the detail channel alone, which
-/// is what makes the removed-material absence claim specific to one record.
+/// The stage-detail channel is fed explicit nonsecret DUMMY! markers standing
+/// in for credential categories, and the facade copies these fixtures verbatim.
+/// The bounded code channel is fed the same marker values, so raw assertions
+/// cover size and truncation, not auto-redaction. Typed error canaries use a
+/// separate capture through the failure projection. The over-cap fixture rides
+/// the detail channel alone, which makes the removed-material claim specific.
 ///
 /// Returns the capture, which every later phase of the case reads.
 fn capture_the_secret_canary_sweep(
@@ -4331,7 +4334,7 @@ fn assert_the_removed_secret_tail_is_absent_from_every_record<'a>(
          tail is genuinely removed, got {over_cap_run_bytes} bytes"
     );
     // The FULL removed tail is absent from EVERY record's whole text. This one
-    // is an honest absence claim over the whole capture: `REMOVED-889-11-SECRET`
+    // is an honest absence claim over the whole capture: `REMOVED-889-11-DUMMY!`
     // is a distinctive sentinel that no in-bound value in this capture can
     // contain, so sweeping every record is what proves the tail did not merely
     // vanish from the record that carried it -- it vanished everywhere.
@@ -4351,7 +4354,7 @@ fn assert_the_removed_secret_tail_is_absent_from_every_record<'a>(
             record.event == "host.entrypoint_stage"
                 && record.field("detail_truncated") == Some("true")
         })
-        .expect("the over-cap secret must have been reported as truncated")
+        .expect("the over-cap detail must have been reported as truncated")
 }
 
 /// The record that carried the over-cap secret is bounded, REPORTED, and honest
@@ -4379,27 +4382,22 @@ fn assert_the_truncated_secret_reports_its_length_and_no_fragment(
     // FRAGMENT ABSENCE, SCOPED TO THE RECORD THAT CARRIES THE OVER-CAP SECRET.
     //
     // FIXED (was guaranteed red). This arm used to sweep EVERY record in the
-    // capture for `secret_tail.strip_prefix("REMOVED-")`, i.e. the 15-byte
-    // fragment `889-11-SECRET`. `pour("TOKEN", marker)` builds the in-bound
-    // bearer token as `"Bearer CANARY-889-11-SECRET"`, which CONTAINS that
-    // fragment verbatim; that token is poured IN-BOUND, and the residue arm
-    // REQUIRES it to be recorded verbatim with `detail_truncated == "false"`.
-    // So the two arms were mutually exclusive by construction and the sweep
-    // could only ever fire -- it asserted the opposite of the truth, the same
-    // defect the DELETED in-bound sweep had. Option (a) was taken rather than
-    // (b): the fragment is scoped to the one record that actually carries the
-    // over-cap bounded secret, exactly like the sibling full-tail sweep, rather
-    // than changing the in-bound token's value -- changing that value would
-    // change what the residue arm proves.
+    // capture for `secret_tail.strip_prefix("REMOVED-")`, i.e. the 13-byte
+    // fragment `889-11-DUMMY!`. `pour("TOKEN", marker)` builds the in-bound
+    // bearer-shaped test marker as `"Bearer DUMMY!-889-11-DUMMY!"`, which
+    // CONTAINS that fragment verbatim; that marker is poured IN-BOUND, and the
+    // residue arm REQUIRES it to be recorded verbatim with
+    // `detail_truncated == "false"`. So the two arms would be mutually
+    // exclusive if the fragment were checked across all records. The fragment
+    // is scoped to the one record that carries the over-cap bounded fixture.
     //
     // STILL FALSIFIABLE. A product that leaked the removed tail -- by raising
     // `MAX_DIAGNOSTIC_DETAIL_BYTES`, by cutting late, by truncating the whole
     // record instead of just the detail, or by writing the original input into a
     // second slot -- makes this FAIL, because the removed material could then
-    // appear in this record's whole text. The scope is honest precisely because
-    // that record is the only one the bound ever touched: `secret_tail` begins
-    // 1664 bytes past the cap boundary of `over_cap_secret` and is carried by no
-    // other value poured into this capture.
+    // appear in this record's whole text. `secret_tail` begins 1664 bytes past
+    // the cap boundary of `over_cap_secret` and is carried by no other value in
+    // this capture.
     let removed_fragment = secret_tail
         .strip_prefix("REMOVED-")
         .expect("the removed tail must keep its REMOVED- prefix");
@@ -4429,19 +4427,8 @@ fn assert_the_truncated_secret_reports_its_length_and_no_fragment(
 /// substring rule would be satisfied-or-broken by unrelated field names rather
 /// than by the slot the product actually declares.
 fn assert_the_secret_categories_have_no_slot_of_their_own(records: &[CapturedRecord]) {
-    for event in [
-        "host.entrypoint_stage",
-        "host.terminal_error",
-        "host.request",
-    ] {
-        let scoped: Vec<&CapturedRecord> = records
-            .iter()
-            .filter(|record| record.event == event)
-            .collect();
-        assert!(
-            !scoped.is_empty(),
-            "the sweep must have captured at least one {event} record"
-        );
+    assert!(!records.is_empty(), "the field sweep must capture records");
+    for record in records {
         for slot in [
             "credential",
             "credentials",
@@ -4460,13 +4447,59 @@ fn assert_the_secret_categories_have_no_slot_of_their_own(records: &[CapturedRec
             "bearer",
         ] {
             assert!(
-                !scoped
-                    .iter()
-                    .any(|record| record.field_names().split('|').any(|name| name == slot)),
-                "the closed field surface of {event} must carry no {slot} slot"
+                !record.field_names().split('|').any(|name| name == slot),
+                "the closed field surface of {} must carry no {slot} slot",
+                record.event
             );
         }
     }
+}
+
+fn assert_typed_host_error_payload_is_not_projected(
+    error_payload: &str,
+    canaries: &[&str],
+) -> Vec<CapturedRecord> {
+    assert!(!canaries.is_empty(), "the typed error must carry canaries");
+    let error = HostError::Platform(error_payload.to_owned());
+    let records = capture_emitted_records(|| {
+        let projection = HostRequestProjection::failed(EntrypointStage::LaunchConfig, &error)
+            .with_operation(AdmittedEvent::ServiceStart);
+        observe_host_request(&projection);
+    });
+    let failed_requests: Vec<&CapturedRecord> = records
+        .iter()
+        .filter(|record| {
+            record.event == "host.request" && record.field("evidence") == Some("failed")
+        })
+        .collect();
+    assert_eq!(
+        failed_requests.len(),
+        1,
+        "the typed Platform error must produce one failed request record"
+    );
+    assert_eq!(
+        failed_requests[0].field("reason"),
+        Some("platform"),
+        "the typed failure must project its fixed reason, not its payload"
+    );
+    assert_eq!(
+        failed_requests[0].field("reason_missing"),
+        Some("false"),
+        "the typed failure reason must be explicitly present"
+    );
+    for canary in canaries {
+        assert!(
+            error_payload.contains(*canary),
+            "error payload must carry {canary:?}"
+        );
+        assert!(
+            records.iter().all(|record| {
+                !record.event.contains(*canary) && !record.whole().contains(*canary)
+            }),
+            "typed error canary {canary:?} must be absent from every captured record"
+        );
+    }
+    records
 }
 
 /// No record may carry an arbitrary error Debug/Display rendering, and every
@@ -4688,33 +4721,27 @@ fn assert_the_in_bound_canaries_are_recorded_verbatim(
 // WORK_UNIT_CASE: 889/12
 #[test]
 fn source_user_and_model_payloads_have_no_dedicated_field_and_lose_only_over_cap_material() {
-    // Behaviour under test: source, user, and model payloads have no place in
-    // the facade's closed field surface, and the facade never reads a
-    // provider, a source, or a model to obtain one. The payload channels are
-    // swept with over-cap sentinels, so what the records are asked about is
-    // the removed part of each payload -- the part that provably cannot be
-    // retained under the declared bound.
+    // Behaviour under test: source, user, and model categories have no place in
+    // the facade's closed field surface, and the facade never reads a provider,
+    // source, or model to obtain them. Raw channels receive over-cap DUMMY!
+    // markers only; a typed HostError capture below separately checks explicit
+    // test-only source/user/model canaries on the failure projection.
     //
     // (The name this case used to carry -- "..._never_reach_a_record" -- claimed
     // total absence, which is false: its own residue arm below proves the
     // in-bound payload IS recorded. The name now says what the case proves.)
     //
-    // HONEST SCOPE: a payload a caller passes to a bounded detail channel is
-    // not scrubbed by this product; `bound_detail` bounds size, not
-    // sensitivity, so an in-bound payload appears in the detail field verbatim.
-    // The exclusion rule is therefore proved where the product actually keeps
-    // it -- the closed field surface -- and over the removed tail of an
-    // over-cap payload. Asserting that no in-bound payload text is recorded
-    // would be asserting a rule this product does not have, and asserting that
-    // the RETAINED PREFIX of an over-cap payload is absent would be asserting
-    // the opposite of the truth: the product is required to copy that prefix
-    // verbatim, so absence is claimed only for what the bound removed.
+    // HONEST SCOPE: these DUMMY!-prefixed values are synthetic nonsecret
+    // markers, not real source/user/model content. Bounded detail/code APIs
+    // limit size, not sensitivity, so this raw sweep proves removed-tail and
+    // field-slot absence only; the typed failure capture covers payload
+    // exclusion on the actual HostError projection path.
     //
     // Falsifiable by construction: the absence assertions run over each
     // record's WHOLE text, and the case fails the moment any removed tail
     // survives or a payload slot appears. The positive arms fail the moment the
     // facade stops recording, so the sweep cannot pass vacuously.
-    let marker = "CANARY";
+    let marker = "DUMMY!";
 
     // One over-cap payload per channel, each carrying a distinctive tail placed
     // BEYOND the cap boundary. These are the values whose tails the absence
@@ -4741,6 +4768,14 @@ fn source_user_and_model_payloads_have_no_dedicated_field_and_lose_only_over_cap
 
     // Phase 1, the capture: both bounded channels plus the widest record.
     let records = capture_the_payload_sweep(&payload_tails);
+    let error_canaries = [
+        "source=TEST-ONLY-889-12-SOURCE",
+        "user=TEST-ONLY-889-12-USER",
+        "model=TEST-ONLY-889-12-MODEL",
+    ];
+    let error_payload = error_canaries.join(" | ");
+    let typed_failure_records =
+        assert_typed_host_error_payload_is_not_projected(&error_payload, &error_canaries);
 
     // Phase 2, the removed-material absence claim: no record carries the
     // removed tail of any over-cap payload, nor any fragment of one, so a
@@ -4755,6 +4790,7 @@ fn source_user_and_model_payloads_have_no_dedicated_field_and_lose_only_over_cap
     // field vocabulary is closed, so a source/user/model slot cannot appear at
     // all.
     assert_the_payload_channels_have_no_slot_of_their_own(&records);
+    assert_the_payload_channels_have_no_slot_of_their_own(&typed_failure_records);
 
     // Phase 5, the sweep is non-vacuous: it really saw one stage record per
     // payload detail, one terminal record per payload code, and one request
@@ -4829,9 +4865,9 @@ fn build_the_over_cap_payload_fixtures(marker: &str) -> Vec<(&'static str, Strin
     payload_tails
 }
 
-/// The capture phase of case 889/12: one raw payload per channel through the
-/// free-text detail channel, the same three payloads through the bounded code
-/// channel, and the two identity-only request projections.
+/// The capture phase of case 889/12: one synthetic nonsecret DUMMY! marker per
+/// channel through the free-text detail and bounded code channels, plus two
+/// identity-only request projections. Typed canaries use the failure capture.
 ///
 /// The widest record is built from the identities a call site already holds, so
 /// no payload is handed to it at all.
@@ -4841,11 +4877,11 @@ fn capture_the_payload_sweep(
     payload_tails: &[(&'static str, String, String)],
 ) -> Vec<CapturedRecord> {
     capture_emitted_records(|| {
-        // A raw source payload in the free-text detail channel.
+        // A nonsecret marker standing in for the source category.
         observe_entrypoint_with_detail(EntrypointStage::Startup, &payload_tails[0].2);
-        // A raw user payload in the free-text detail channel.
+        // A nonsecret marker standing in for the user category.
         observe_entrypoint_with_detail(EntrypointStage::LaunchConfig, &payload_tails[1].2);
-        // A raw model payload in the free-text detail channel.
+        // A nonsecret marker standing in for the model category.
         observe_entrypoint_with_detail(EntrypointStage::ConsoleLoop, &payload_tails[2].2);
         // The bounded code channel carries payloads too: it is bounded and
         // reported, never a passthrough.
@@ -4886,8 +4922,8 @@ fn assert_no_payload_tail_or_fragment_reaches_a_record(
     records: &[CapturedRecord],
     payload_tails: &[(&'static str, String, String)],
 ) {
-    // DELETED (was impossible): a sweep for "CANARY-", "-SOURCE-", "-USER-" and
-    // "-MODEL-" over every record. `CANARY-` is the first seven bytes of the
+    // DELETED (was impossible): a sweep for "DUMMY!-", "-SOURCE-", "-USER-" and
+    // "-MODEL-" over every record. `DUMMY!-` is the first seven bytes of the
     // RETAINED PREFIX of each over-cap payload and `-SOURCE-`/`-USER-`/`-MODEL-`
     // are interior to it, and `observe_entrypoint_with_detail` writes
     // `detail = bounded.text()` -- so the product is REQUIRED to carry them.
@@ -7526,8 +7562,8 @@ fn host_diagnostics_allowed_diff_has_no_lifecycle_unsafe_or_authority_mutation()
 fn assert_the_allowed_diff_is_exactly_this_cards_edit_scope() {
     let fixture = contract_fixture();
     let card_edit_scope = [
-        "bins/eliot-host/tests/host_diagnostics_contract.rs",
         "bins/eliot-host/tests/data/host_diagnostics_cases.json",
+        "bins/eliot-host/tests/host_diagnostics_contract.rs",
     ];
     let reported: Vec<&str> = fixture["allowed_diff"]
         .as_array()
