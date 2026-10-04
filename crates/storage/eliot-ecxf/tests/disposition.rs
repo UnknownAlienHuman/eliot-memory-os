@@ -1,20 +1,23 @@
 //! Explicit-disposition proof for `eliot-ecxf` (issue #1716).
 //!
-//! The crate is currently reachable from no production binary and has no
-//! admitted contract surface or selected process owner. Until the owning
-//! decision (delete, or admit with a bounded non-runtime support role bound
-//! to the governed export path of #1871) lands, this test pins the explicit
-//! `[package.metadata.eliot].workspace_admission` disposition plus the
-//! current no-production-binary consumer state, so the crate cannot become a
-//! silent production fallback.
+//! Disposition: KEEP with one reachable owner. `eliot-backup` is the only
+//! workspace package that selects the crate (its governed
+//! `export_ecxf_package` is the single ECXF/1 builder, #1871), and it reaches
+//! production only through that edge: no production binary declares the
+//! crate directly. This test pins the recorded
+//! `[package.metadata.eliot].workspace_admission` disposition plus that exact
+//! consumer state, so the crate can neither become a silent production
+//! fallback nor gain a second, ungoverned owner.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 const PACKAGE: &str = "eliot-ecxf";
-const EXPECTED_ADMISSION: &str = "unreachable pending explicit owner disposition per #1716";
+const EXPECTED_ADMISSION: &str = "#1716 disposition: KEEP with reachable owner eliot-backup";
+/// Exact workspace consumer allowlist: the governed export owner only.
+const REACHABLE_OWNERS: [&str; 1] = ["crates/storage/eliot-backup: dependencies.eliot-ecxf"];
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,9 +39,7 @@ fn workspace_root() -> Result<PathBuf, Box<dyn Error>> {
     }
 }
 
-fn production_dependency_selects_package(
-    manifest: &std::path::Path,
-) -> Result<Vec<String>, Box<dyn Error>> {
+fn production_dependency_selects_package(manifest: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     fn scan_table(
         table: &toml::map::Map<String, toml::Value>,
         section: &str,
@@ -87,7 +88,7 @@ fn owner_disposition_is_recorded() -> TestResult {
     let text = std::fs::read_to_string(manifest_dir().join("Cargo.toml"))?;
     assert!(
         text.contains(EXPECTED_ADMISSION),
-        "workspace_admission must record the #1716 pending-disposition state"
+        "workspace_admission must record the #1716 KEEP disposition and its reachable owner"
     );
     Ok(())
 }
@@ -112,7 +113,33 @@ fn no_production_binary_selects_the_crate() -> TestResult {
     }
     assert!(
         offenders.is_empty(),
-        "production binary selects {PACKAGE} without an owner admission: {offenders:?}"
+        "production binary selects {PACKAGE} directly instead of through its owner: {offenders:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_reachable_owner_is_the_only_workspace_consumer() -> TestResult {
+    let root = workspace_root()?;
+    let workspace: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml"))?)?;
+    let members = workspace
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .ok_or("workspace members not found")?;
+    let mut consumers = Vec::new();
+    for member in members {
+        let member = member.as_str().ok_or("workspace member is not a path")?;
+        for selection in
+            production_dependency_selects_package(&root.join(member).join("Cargo.toml"))?
+        {
+            consumers.push(format!("{member}: {selection}"));
+        }
+    }
+    assert_eq!(
+        consumers, REACHABLE_OWNERS,
+        "{PACKAGE} must be selected only by its governed export owner"
     );
     Ok(())
 }
