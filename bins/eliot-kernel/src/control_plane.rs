@@ -2349,4 +2349,1432 @@ mod control_plane_diagnostics_tests {
             "control_plan_gap"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Control-reserve axis proof (F-LOG-KERNEL-4, #903; cases T13..T17 and
+    // T21..T23).
+    //
+    // Every premise below names a PRODUCTION subject and reads a value that
+    // subject produced. Some operands are fixture-supplied INPUTS to a
+    // production subject rather than things that subject emitted: the control
+    // requests, the lease holder states named at the distinctness claims, and
+    // the hand-listed `TransportError` value array are all built here and then
+    // handed to a production owner. What is claimed is never a comparison of
+    // two objects this module invented for its own comparison.
+    //   * `KernelServiceError` / `TransportError` results come out of the real
+    //     `KernelService`, `PeerIdentity` and `KernelControlRequest` owners;
+    //   * the reserve counters come from the composition's own runtime port and
+    //     front door, and the rendered `kernel.*` records come from the real
+    //     #895 facade through the subscriber `install_diagnostic_capture()` installs;
+    //   * absence claims scan the whole captured `eliot_kernel::diagnostics`
+    //     surface of the measured step, never a hand-listed string set, and
+    //     every absence is preceded by a positive count on the same surface.
+    //
+    // These are the platform-independent tier: nothing between here and the
+    // closing brace is `#[cfg]`-gated, so all seven tests build and run on a
+    // non-Windows target. #903 defers the `#[cfg(windows)]`-only kernel-owner
+    // and daemon-launch execution to the platform-gated tier, so nothing here
+    // proves live cutover, real owner evidence, or real reserve recovery.
+    // ---------------------------------------------------------------------
+
+    /// One rendered `#895` facade record, read back off the emission itself.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CapturedRecord {
+        event: String,
+        outcome: String,
+        code: String,
+        capacity: String,
+        request_id: String,
+    }
+
+    /// The operation identity the facade published for one span
+    /// (`kernel_diagnostics.rs::operation_context`, :647).
+    #[derive(Clone, Debug, Default)]
+    struct CapturedSpan {
+        request_id: String,
+    }
+
+    #[derive(Default)]
+    struct FieldCapture {
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // A `Debug` rendering of a string field carries its quotes; the
+            // captured surface stores the rendered field text itself.
+            let rendered = format!("{value:?}");
+            self.fields.insert(
+                field.name().to_owned(),
+                rendered.trim_matches('"').to_owned(),
+            );
+        }
+    }
+
+    /// Captures the facade's whole rendered surface for the measured step.
+    struct DiagnosticCaptureLayer {
+        records: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for DiagnosticCaptureLayer
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldCapture::default();
+            attributes.record(&mut visitor);
+            if let Some(span) = context.span(id) {
+                span.extensions_mut().insert(CapturedSpan {
+                    request_id: visitor
+                        .fields
+                        .get("request_id")
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
+        }
+
+        /// `control_plane.rs:261` re-records `request_id` on the live span
+        /// after the request validated, so the captured operation identity has
+        /// to follow the record, not only the span declaration.
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldCapture::default();
+            values.record(&mut visitor);
+            if let Some(span) = context.span(id)
+                && let Some(captured) = span.extensions_mut().get_mut::<CapturedSpan>()
+                && let Some(request_id) = visitor.fields.get("request_id")
+            {
+                captured.request_id = request_id.clone();
+            }
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != crate::kernel_diagnostics::KERNEL_DIAGNOSTICS_TARGET {
+                return;
+            }
+            let mut visitor = FieldCapture::default();
+            event.record(&mut visitor);
+            let request_id = context
+                .event_span(event)
+                .and_then(|span| {
+                    span.extensions()
+                        .get::<CapturedSpan>()
+                        .map(|captured| captured.request_id.clone())
+                })
+                .unwrap_or_default();
+            let field = |name: &str| visitor.fields.get(name).cloned().unwrap_or_default();
+            if let Ok(mut records) = self.records.lock() {
+                records.push(CapturedRecord {
+                    event: field("event"),
+                    outcome: field("outcome"),
+                    code: field("code"),
+                    capacity: field("capacity"),
+                    request_id,
+                });
+            }
+        }
+    }
+
+    /// Scoped capture of the facade surface; the guard keeps the scoped
+    /// subscriber installed for exactly the measured step.
+    struct DiagnosticCapture {
+        records: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl DiagnosticCapture {
+        /// Returns and clears everything the facade rendered so far.
+        fn take(&self) -> Vec<CapturedRecord> {
+            self.records
+                .lock()
+                .map(|mut records| std::mem::take(&mut *records))
+                .unwrap_or_default()
+        }
+    }
+
+    fn install_diagnostic_capture() -> DiagnosticCapture {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(DiagnosticCaptureLayer {
+            records: std::sync::Arc::clone(&records),
+        });
+        DiagnosticCapture {
+            records,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// Counts the whole captured surface for one event name.
+    fn event_count(records: &[CapturedRecord], event: &str) -> usize {
+        records
+            .iter()
+            .filter(|record| record.event == event)
+            .count()
+    }
+
+    /// Returns the one record the captured surface carries for `event`.
+    fn find_event<'records>(
+        records: &'records [CapturedRecord],
+        event: &str,
+    ) -> &'records CapturedRecord {
+        records
+            .iter()
+            .find(|record| record.event == event)
+            .unwrap_or_else(|| panic!("the captured surface must render {event}"))
+    }
+
+    /// Every terminal the captured surface rendered, read off its own record.
+    fn terminal_records(records: &[CapturedRecord]) -> Vec<&CapturedRecord> {
+        records
+            .iter()
+            .filter(|record| record.event == "kernel.terminal_error")
+            .collect()
+    }
+
+    /// The production error value of a refused reserve or transition call.
+    fn reserve_refusal<T>(
+        result: Result<T, KernelServiceError>,
+        refusal: &str,
+    ) -> Result<KernelServiceError, Box<dyn std::error::Error>> {
+        match result {
+            Ok(_) => Err(std::io::Error::other(refusal).into()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    fn reserve_test_root(name: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-control-reserve-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    /// One nonce-free candidate contour that the production
+    /// `HostKernelCandidateBinding::validate` admits.
+    fn reserve_candidate()
+    -> Result<eliot_kernel_service::HostKernelCandidateBinding, Box<dyn std::error::Error>> {
+        use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId};
+        use eliot_kernel_service::{
+            HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostProcessBinding,
+            RestartBudget,
+        };
+        use eliot_platform::PlatformHandle;
+        use eliot_runtime_contracts::{
+            RegisteredActivityWakePolicy, SupervisionJournalEpoch,
+            SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+        };
+
+        let incarnation = SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:903".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-903".to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: "host-lineage-903".to_owned(),
+                sequence: 1,
+            },
+            activation_id: "activation-903".to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-903".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: "kernel-lineage-903".to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-903".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        }
+        .with_derived_ids()?;
+        Ok(eliot_kernel_service::HostKernelCandidateBinding {
+            installation_id: PlatformHandle::new("installation-903")?,
+            host_epoch: AuthorityEpoch::new(1)?,
+            kernel_epoch: EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")?,
+                std::num::NonZeroU64::new(1)
+                    .ok_or_else(|| std::io::Error::other("the test epoch is non-zero"))?,
+            )?,
+            activation_id: PlatformHandle::new("activation-903")?,
+            artifact_hash: PlatformHandle::new("artifact-903")?,
+            config_hash: PlatformHandle::new("config-903")?,
+            job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-903")?,
+            pipe_identity: PlatformHandle::new("\\\\.\\pipe\\eliot-kernel-903")?,
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\eliot\\host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: HostJobIdentity {
+                    name: "Local\\Eliot-Host-Kernel-903".to_owned(),
+                },
+                root: HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: "C:\\eliot\\kernel.exe".to_owned(),
+                    },
+                    executable: HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            supervision_incarnation: incarnation,
+            restart_budget: RestartBudget::new(1, 1)?,
+            agent_bridge_admission: None,
+            containment_action: None,
+        })
+    }
+
+    /// One authenticated control request whose canonical digest the production
+    /// `KernelControlRequest::with_computed_digest` computed.
+    fn reserve_control_request(
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+    ) -> Result<eliot_kernel_service::KernelControlRequest, Box<dyn std::error::Error>> {
+        eliot_kernel_service::KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: eliot_platform::PlatformHandle::new("control-message-903")?,
+            sequence: 7,
+            peer_process_id: 7,
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: eliot_kernel_service::KernelControlCommand::ProbeReady,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(Into::into)
+    }
+
+    /// The composition's own service lock, borrowed for one production call.
+    type ReserveService<'kernel> =
+        std::sync::MutexGuard<'kernel, eliot_kernel_service::KernelService>;
+
+    fn reserve_service(kernel: &KernelComposition) -> Result<ReserveService<'_>, std::io::Error> {
+        kernel
+            .service
+            .lock()
+            .map_err(|_| std::io::Error::other("composition service lock poisoned"))
+    }
+
+    /// Drives the composition's own `KernelService` to `Ready` through its
+    /// published lifecycle API, so the reserve assertions below run against
+    /// the real owner the control plane transitions.
+    fn ready_reserve_composition(
+        root: &std::path::Path,
+    ) -> Result<KernelComposition, Box<dyn std::error::Error>> {
+        let kernel = KernelComposition::new(KernelConfig::new(root))?;
+        let candidate = reserve_candidate()?;
+        let permit = eliot_kernel_service::KernelActivationPermit {
+            operation_id: eliot_platform::PlatformHandle::new("activation-operation-903")?,
+            candidate_binding_digest: candidate.compute_digest()?,
+            prior_kernel_disposition_digest: "b".repeat(64),
+            journal_transaction_id: eliot_platform::PlatformHandle::new("journal-transaction-903")?,
+            journal_sequence: 7,
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+            authority_epoch: candidate.kernel_epoch.clone(),
+            activation_nonce: eliot_platform::KernelActivationNonce::new(
+                eliot_platform::PlatformHandle::new("a".repeat(64))?,
+            )?,
+        };
+        {
+            let mut service = reserve_service(&kernel)?;
+            service.reconcile(candidate.clone())?;
+            service.apply(eliot_kernel_service::KernelControlCommand::Shadow)?;
+            service.apply(eliot_kernel_service::KernelControlCommand::PrepareHandoff)?;
+            let activation = service.activate_permit(
+                &permit,
+                eliot_contracts::ResourceGeneration::genesis(),
+                "c".repeat(64),
+            )?;
+            service.publish_ready(eliot_kernel_service::KernelReadyReceipt {
+                activation_id: candidate.activation_id.clone(),
+                activation_operation_id: activation.operation_id.clone(),
+                activation_nonce_digest: activation.activation_nonce_digest.clone(),
+                process: eliot_kernel_service::ProcessObservation {
+                    process_id: eliot_platform::PlatformHandle::new("pid:42:start:10")?,
+                    job_object_id: candidate.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: eliot_runtime_contracts::HealthVector::healthy(),
+                    evidence_refs: vec![eliot_platform::PlatformHandle::new("process-evidence")?],
+                },
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                evidence_refs: vec![eliot_platform::PlatformHandle::new("ready-903")?],
+            })?;
+        }
+        Ok(kernel)
+    }
+
+    /// The bounded capacity record a read rendered must carry the port value
+    /// and must not carry an outcome or a terminal claim.
+    fn assert_capacity_records(
+        records: &[CapturedRecord],
+        expected_capacity: usize,
+        expected_records: usize,
+    ) {
+        let observed: Vec<&CapturedRecord> = records
+            .iter()
+            .filter(|record| record.event == "kernel.control.capacity_observed")
+            .collect();
+        assert_eq!(
+            observed.len(),
+            expected_records,
+            "each observation renders exactly one bounded capacity record"
+        );
+        for record in observed {
+            assert_eq!(
+                record.capacity,
+                expected_capacity.to_string(),
+                "the rendered count is the port value, not an invented number"
+            );
+            assert!(
+                record.outcome.is_empty() && record.code.is_empty(),
+                "a capacity observation carries no outcome and no terminal claim"
+            );
+        }
+    }
+
+    /// A received control request is recorded once, never admitted, refused
+    /// before any lifecycle-transition attempt, and denied under exactly one
+    /// terminal bound to the operation the denial itself names. Every premise
+    /// reads the rendered record or the production error value; nothing here
+    /// compares two objects this module built for itself.
+    ///
+    /// The `transition_failed` absence is what pins the peer gate at
+    /// `control_plane.rs:319` BEFORE the transition gateway at `:993`: a
+    /// boundary that reached the gateway would render a `transition_failed`
+    /// per refused request and still leave `terminal_records` at 1, because
+    /// `:993` passes `emit_terminal = false`.
+    fn assert_request_denied_not_admitted(
+        records: &[CapturedRecord],
+        expected_code: &str,
+        expected_request_id: &str,
+    ) {
+        assert_eq!(
+            event_count(records, "kernel.control.request_received"),
+            1,
+            "the boundary records the request exactly once"
+        );
+        assert_eq!(
+            find_event(records, "kernel.control.request_received").outcome,
+            "attempt",
+            "a received request is an attempt, never an admission"
+        );
+        assert_eq!(
+            event_count(records, "kernel.control.request_admitted"),
+            0,
+            "the whole captured surface must render no admission for a refused request"
+        );
+        assert_eq!(
+            event_count(records, "kernel.control.transition_failed"),
+            0,
+            "the refused request must never reach the transition gateway"
+        );
+        assert_eq!(
+            event_count(records, "kernel.control.transition_committed"),
+            0,
+            "the refused request must never commit a lifecycle transition"
+        );
+        assert_eq!(
+            event_count(records, "kernel.control.request_denied"),
+            1,
+            "the boundary records the denial exactly once"
+        );
+        let denied = find_event(records, "kernel.control.request_denied");
+        assert_eq!(denied.outcome, "rejected");
+        let terminals = terminal_records(records);
+        assert_eq!(
+            terminals.len(),
+            1,
+            "one underlying failed operation has one designated terminal"
+        );
+        assert_eq!(terminals[0].code, expected_code);
+        assert_eq!(
+            terminals[0].request_id, expected_request_id,
+            "the terminal must carry the operation its own record names"
+        );
+        assert_eq!(terminals[0].request_id, denied.request_id);
+    }
+
+    /// T13 and T23.
+    ///
+    /// I14.20 (I14-20:86-87), "Ready work admission":
+    /// `BLOCKED_DEPENDENCY → READY`,
+    /// `READY → ADMITTED | DEFERRED_CAPACITY |
+    /// CANCELLED | STALE` - a received request is a separate machine state
+    /// from an admission. I14.20 (I14-20:81) also states "`REOPENED` is a new
+    /// lifecycle revision, not a rewrite of the prior `FinishDecision`", the
+    /// same discipline this boundary keeps for a changed payload under one
+    /// operation identity. I1.8 (I01-08:18): "No component alone can invent
+    /// semantics, authorize them and commit them."
+    ///
+    /// Production comparisons:
+    /// * `control_plane.rs:267` renders `kernel.control.request_received`
+    ///   ("attempt") before any admission check, while `:273` is the only
+    ///   renderer of `kernel.control.request_admitted` and is reachable only
+    ///   from an `Ok` response;
+    /// * `control_plane.rs:277` renders the denial ("rejected") and `:291-296`
+    ///   emits the one terminal under the same operation span;
+    /// * `crates/kernel/eliot-kernel-service/src/protocol.rs:1573-1580` refuses
+    ///   a changed same-operation payload digest, and `:1484` is the production
+    ///   `validate` both cases are measured against;
+    /// * `control_plane.rs:318` maps that refusal to
+    ///   `TransportError::SessionFenced`, and `control_plane.rs:319` refuses a
+    ///   composition that cannot prove peer identity;
+    /// * `crates/kernel/eliot-kernel-service/src/lifecycle.rs:1396` is the
+    ///   reserve acquisition neither refused request reaches.
+    ///
+    /// LIMIT (T13, PARTIAL): only the negative `request_admitted` leg runs.
+    /// `kernel.control.request_admitted` at `control_plane.rs:273` is never
+    /// executed anywhere in this module - it is only ever asserted `== 0`.
+    /// Reaching it needs a `validate()`-passing request, a proven
+    /// `peer.process_binding()`, agreement on sequence, peer process id, pipe
+    /// identity, process id and start time and image path
+    /// (`control_plane.rs:323-331`), and on Windows additionally
+    /// `validate_candidate_process_binding` (`control_plane.rs:332-334`). The
+    /// `PeerIdentity::Unavailable` fixture short-circuits at
+    /// `control_plane.rs:319`, so the admitted leg is unreachable from here.
+    ///
+    /// LIMIT (T23, PARTIAL): the same-operation conflict IS typed below the
+    /// boundary - `KernelServiceError::InvalidField { field:
+    /// "control.payload_digest" }` from
+    /// `crates/kernel/eliot-kernel-service/src/protocol.rs:1573-1580`, asserted
+    /// directly below - but it collapses at the boundary to
+    /// `TransportError::SessionFenced` (`control_plane.rs:316-318`), the same
+    /// code as 60 other `SessionFenced` sites in
+    /// `apply_control_request_inner`. So what is proved is that the typed cause
+    /// exists and that the boundary's refusal code is stable, not that the
+    /// boundary preserves the conflict's distinct identity.
+    #[tokio::test]
+    async fn control_request_is_recorded_and_denied_without_becoming_a_reserve_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("request-vs-admission")?;
+        let kernel = KernelComposition::new(KernelConfig::new(&root))?;
+        let candidate = reserve_candidate()?;
+        let (state_before, reserve_before) = {
+            let service = reserve_service(&kernel)?;
+            (service.state(), service.available_control())
+        };
+
+        // The exact request Host would send for this operation: its canonical
+        // digest is the one production computed (`protocol.rs:1478`).
+        let exact = reserve_control_request(&candidate)?;
+        // The same operation identity with a changed payload: identical
+        // `message_id` and `sequence`, different canonical digest.
+        let mut changed = exact.clone();
+        changed.payload_digest = "d".repeat(64);
+        let changed_refusal = reserve_refusal(
+            changed.validate(),
+            "a changed same-operation payload must be refused",
+        )?;
+        assert!(
+            matches!(
+                changed_refusal,
+                KernelServiceError::InvalidField {
+                    field: "control.payload_digest",
+                    ..
+                }
+            ),
+            "production names the changed-payload field"
+        );
+        assert_ne!(exact.payload_digest, changed.payload_digest);
+
+        let unproven_peer = PeerIdentity::Unavailable {
+            reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
+        };
+        let capture = install_diagnostic_capture();
+
+        let exact_result = kernel
+            .apply_control_request(exact.clone(), &unproven_peer, exact.sequence)
+            .await;
+        assert_eq!(
+            exact_result,
+            Err(TransportError::PeerIdentityUnavailable),
+            "a validated request is still refused when peer identity is unproven"
+        );
+        let exact_records = capture.take();
+        assert_request_denied_not_admitted(
+            &exact_records,
+            control_request_terminal_code(&TransportError::PeerIdentityUnavailable),
+            exact.message_id.as_str(),
+        );
+
+        let changed_result = kernel
+            .apply_control_request(changed, &unproven_peer, exact.sequence)
+            .await;
+        assert_eq!(
+            changed_result,
+            Err(TransportError::SessionFenced),
+            "the changed payload is refused before the peer gate"
+        );
+        let changed_records = capture.take();
+        // An unvalidated request never publishes an operation identity, so the
+        // terminal cannot name a request the boundary never accepted
+        // (`control_plane.rs:248` and `:259-266`).
+        assert_request_denied_not_admitted(
+            &changed_records,
+            control_request_terminal_code(&TransportError::SessionFenced),
+            "unavailable",
+        );
+
+        // Neither refusal is a reserve admission: the lifecycle owner and the
+        // front-door reserve are byte-identical before and after both steps.
+        let service = reserve_service(&kernel)?;
+        assert_eq!(service.state(), state_before);
+        assert_eq!(service.available_control(), reserve_before);
+        drop(service);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// T21.
+    ///
+    /// I14.21 (I14-21:4, :8): "connection fails during commit; ... if unknown →
+    /// pause Ordering Scope, preserve operation and open Problem State" - never
+    /// a blind duplicate effect. I14.20 (I14-20:36-37): "... ambiguous effect
+    /// remains `UNKNOWN_OUTCOME` until reconciliation produces a final
+    /// receipt/disposition". I16.17 (I16-17:12) requires the emitted record to
+    /// carry "facts/unknowns/conflicts", and I16-17 (I16-17:34): "Operational
+    /// logs never become verifier evidence by themselves", so the unknown stays
+    /// unknown under its own code.
+    ///
+    /// LIMIT: only the code table is proved for this case. Nothing in this
+    /// module ever executes `apply_control_request` with an
+    /// `UnknownOutcome`-producing subject, so no captured-surface leg of T21
+    /// runs; `TransportError::UnknownOutcome` is asserted here as a value
+    /// handed to the two production functions, never as one production
+    /// produced. The `ControlRequestFailure::from` leg is likewise a
+    /// hand-built input, not an observed boundary outcome.
+    ///
+    /// Production comparisons: `control_plane.rs:87` renders the stable
+    /// `control_unknown_outcome` code for `TransportError::UnknownOutcome`;
+    /// `control_plane.rs:106-110` is the production conversion that must keep
+    /// that exact variant instead of synthesising an outcome;
+    /// `control_plane.rs:74-95` is the only request-boundary code table, and
+    /// `lost_control_expected_codes()` supplies one value per variant the code table names today.
+    #[test]
+    fn lost_control_response_stays_unknown_under_its_own_terminal() {
+        assert_eq!(
+            control_request_terminal_code(&TransportError::UnknownOutcome),
+            "control_unknown_outcome",
+            "control_plane.rs:87 is the stable code for a lost response"
+        );
+        assert!(
+            matches!(
+                ControlRequestFailure::from(TransportError::UnknownOutcome),
+                ControlRequestFailure::Transport(TransportError::UnknownOutcome)
+            ),
+            "control_plane.rs:106-110 must preserve the exact variant"
+        );
+
+        // One production value per `TransportError` variant this module lists. The
+        // `lost_control_expected_codes()` list is hand-listed, so it does NOT
+        // establish the table's completeness: a `TransportError` variant added to
+        // production would never reach it. What is established is that every
+        // variant listed here maps to a stable code, that no refusal code reads
+        // as success, and that the one collision among them is declared.
+        let refusals = [
+            TransportError::InvalidLimits,
+            TransportError::UnauthenticatedPeer,
+            TransportError::PeerIdentityUnavailable,
+            TransportError::Protocol(eliot_protocol::ProtocolError::InvalidField {
+                field: "control.frame",
+                reason: "fixed test value",
+            }),
+            TransportError::SessionFenced,
+            TransportError::Backpressure,
+            TransportError::AttributedBackpressure(eliot_ipc::BackpressureSignal::new(
+                "control-reserve-bytes",
+                "retry-under-same-identity",
+                "normal-lane-work",
+            )),
+            TransportError::Timeout,
+            TransportError::Cancelled,
+            TransportError::InvalidPipeName,
+            TransportError::UnknownOutcome,
+            TransportError::Io("pipe-canary".to_owned()),
+            TransportError::PlanGap {
+                dependency: "dep",
+                reason: "reason",
+            },
+            TransportError::UnknownRequest,
+            TransportError::IdentityConflict,
+            TransportError::LegacyCorrelationUnresolved,
+            TransportError::RegistryFull,
+        ];
+        let expected_codes = lost_control_expected_codes();
+        assert_eq!(
+            expected_codes.len(),
+            refusals.len(),
+            "the expected-code list must stay aligned with the listed refusals, or \
+             the per-refusal presence assertion below would bind the wrong pair"
+        );
+        let mut codes = std::collections::BTreeSet::new();
+        for (refusal_index, refusal) in refusals.iter().enumerate() {
+            let code = control_request_terminal_code(refusal);
+            let expected = expected_codes[refusal_index];
+            assert_eq!(
+                code, expected,
+                "each listed refusal must render the code `lost_control_expected_codes()` \
+                 declares for it at the same index; an empty or blank code would make \
+                 the success-token absence below vacuous"
+            );
+            for success_token in ["success", "admitted", "committed", "ok", "ready"] {
+                assert!(
+                    !code.contains(success_token),
+                    "a refusal code must never read as a success claim: {code}"
+                );
+            }
+            codes.insert(code);
+        }
+        assert_eq!(
+            codes.len(),
+            refusals.len() - 1,
+            "exactly one declared arm shares a code across the 17 listed variants"
+        );
+        // The count above cannot say WHICH pair collides, so the collision is
+        // asserted directly against the production arm.
+        assert_eq!(
+            control_request_terminal_code(&TransportError::Backpressure),
+            control_request_terminal_code(&TransportError::AttributedBackpressure(
+                eliot_ipc::BackpressureSignal::new(
+                    "control-reserve-bytes",
+                    "retry-under-same-identity",
+                    "normal-lane-work",
+                )
+            )),
+            "control_plane.rs:81-83 is the one arm that shares a code (bare and \
+             attributed backpressure)"
+        );
+        // A lost response is not a fenced session: the two stay typed apart, so
+        // an unknown outcome is never replayed as a fresh denial.
+        assert_ne!(
+            control_request_terminal_code(&TransportError::UnknownOutcome),
+            control_request_terminal_code(&TransportError::SessionFenced)
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::IdentityConflict),
+            "control_identity_conflict",
+            "control_plane.rs:91 keeps a same-operation conflict typed"
+        );
+    }
+
+    /// T14.
+    ///
+    /// I14.3 (I14-03:27): "Normal workload cannot consume it". I14.24
+    /// (I14-24:43), truncated after the `control/recovery remains` cell:
+    /// "Control Reserve
+    /// threatened | stop normal/background admission and shed rebuildable work |
+    /// control/recovery remains" - which only holds if a diagnostic read
+    /// neither consumes the reserve nor reports normal capacity as protected.
+    ///
+    /// LIMIT: the #903 checklist item 14 reads "normal work cannot be promoted
+    /// to protected control by diagnostics". What is executed is the promotion
+    /// path in the one direction production exposes: the protected read is
+    /// shown not to consume the reserve, and saturating the control reserve is
+    /// shown not to touch the normal lane (`Runtime::spawn`, the normal-lane
+    /// admission at `crates/kernel/eliot-runtime/src/lib.rs:878`). Nothing here
+    /// measures the reverse direction, because production exposes no API that
+    /// admits a `Data`-class workload into the `ProtectedControl` lane.
+    ///
+    /// Production comparisons: `control_plane.rs:1547-1552` reads
+    /// `Runtime::available_capacity(ExecutionClass::ProtectedControl)`
+    /// (`crates/kernel/eliot-runtime/src/lib.rs:1006`) and returns it, and
+    /// `control_plane.rs:116-126` renders the bounded `kernel.control.capacity_observed`
+    /// record; `crates/kernel/eliot-runtime/src/lib.rs:891-902` and `:904` are
+    /// the protected-slot admission path as this workspace calls it -
+    /// `spawn_in` is `pub` on the public `Runtime`, so the workspace call
+    /// sites at `:887` and `:900` are a workspace fact, not an ownership fact -
+    /// `:878` is the normal-lane admission path; the composition's own reserve
+    /// sizes are `bins/eliot-kernel/src/composition_bootstrap.rs:1882-1883`.
+    #[tokio::test]
+    async fn control_capacity_observation_never_acquires_the_protected_reserve()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("capacity-read")?;
+        let kernel = KernelComposition::new(KernelConfig::new(&root))?;
+        let capture = install_diagnostic_capture();
+
+        let observed = kernel.control_capacity();
+        assert_eq!(
+            observed, 1,
+            "composition_bootstrap.rs:1883 fixes one protected control slot"
+        );
+        assert_eq!(
+            observed,
+            kernel
+                .runtime
+                .available_capacity(eliot_runtime::ExecutionClass::ProtectedControl),
+            "control_plane.rs:1548-1550 must return the runtime port value unchanged"
+        );
+        let observed_records = capture.take();
+        assert_capacity_records(&observed_records, observed, 1);
+
+        // The read did not consume the reserve: every slot it reported can
+        // still be admitted through the production protected spawn path.
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut handles = Vec::new();
+        for _ in 0..observed {
+            let notify = std::sync::Arc::clone(&notify);
+            let disposition = kernel.runtime.spawn_control(
+                "control-reserve-observation-proof",
+                move |_token| async move {
+                    notify.notified().await;
+                    Ok(())
+                },
+            );
+            assert!(
+                disposition.is_admitted(),
+                "the reported capacity must still admit protected control work"
+            );
+            handles.push(disposition.into_handle().ok_or_else(|| {
+                std::io::Error::other("an admitted disposition carries its handle")
+            })?);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            kernel.control_capacity(),
+            0,
+            "the held protected slots are now consumed, and exhaustion is visible"
+        );
+        assert_eq!(
+            kernel.control_capacity(),
+            0,
+            "a repeated observation cannot acquire, refill or underflow the reserve"
+        );
+        let exhaustion_records = capture.take();
+        assert_capacity_records(&exhaustion_records, 0, 2);
+
+        // Normal work keeps its own lane: exhausting the control reserve leaves
+        // the normal partition untouched, so the observation never promoted
+        // normal work into protected control.
+        assert_eq!(
+            kernel
+                .runtime
+                .available_capacity(eliot_runtime::ExecutionClass::Data),
+            4,
+            "composition_bootstrap.rs:1882 fixes four normal slots"
+        );
+        assert!(
+            kernel
+                .runtime
+                .spawn(
+                    "normal-lane-observation-proof",
+                    |_token| async move { Ok(()) }
+                )
+                .is_admitted(),
+            "normal work stays admissible while the control reserve reads zero"
+        );
+
+        for handle in &handles {
+            handle.cancellation().force_abort();
+        }
+        for handle in handles {
+            let _ = handle.join().await;
+        }
+        assert_eq!(
+            kernel.control_capacity(),
+            observed,
+            "released protected slots return to the reserve; the read never resized it"
+        );
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// T16.
+    ///
+    /// I14.24 (I14-24:43), the complete row: "Control Reserve
+    /// threatened | stop normal/background admission and shed rebuildable work
+    /// | control/recovery remains | release
+    /// resources; identify runaway owner" - a degradation closes normal
+    /// admission, not the protected lane and not the whole Kernel. I14.20
+    /// (I14-20:11) keeps `READY ↔ DEGRADED` a named service state, and I13.11
+    /// (I13-11:6, :9) requires the record to compile a problem model
+    /// ("symptom/severity; ... exact evidence/log handles"), which is why the
+    /// degradation and the total-failure classes keep separate stable codes.
+    ///
+    /// LIMIT: the `DEGRADED` vs `FAILED` separation asserted below rests on
+    /// PRODUCTION, not on I14.20. I14-20:13 lists
+    /// `STARTING | RECOVERING | READY | DEGRADED | QUIESCING → FAILED`, so the
+    /// vocabulary expressly PERMITS a `DEGRADED` service to transition to
+    /// `FAILED`; it does not declare the two mutually exclusive. What is proved
+    /// here is the narrower, observable claim: one `Degrade` transition commits
+    /// a `Degraded` state, emits no terminal, and leaves normal admission
+    /// closed while protected control stays open. Whether a degraded service
+    /// may later become `Failed` is not decided by this test.
+    ///
+    /// LIMIT: `KernelServiceError::Core` maps to `CONTROL_CORE` at
+    /// `control_plane.rs:64`, and that mapping is asserted here against a
+    /// production-constructed `Core` value, but no boundary assertion for it
+    /// exists. `KernelService::apply` never constructs
+    /// `KernelServiceError::Core`; production builds it only at
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:1444` (inside
+    /// `issue_control_receipt`) and
+    /// `crates/kernel/eliot-kernel-service/src/storage_replacement.rs:1745`,
+    /// neither of which any command on the transition gateway dispatches to.
+    /// Only the code table is proved for `Core`.
+    ///
+    /// Production comparisons: `control_plane.rs:175-210` is the transition
+    /// wrapper under test; `control_plane.rs:52-65` is the code table;
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:1339` closes normal
+    /// admission outside `Ready` and `:1384-1388` keeps protected control open
+    /// in `Ready | Degraded`; the state values come from
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:69-92`.
+    #[test]
+    fn degraded_kernel_keeps_protected_control_open_and_is_not_a_total_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("degradation")?;
+        let kernel = ready_reserve_composition(&root)?;
+        let capture = install_diagnostic_capture();
+
+        let degraded =
+            kernel.apply_control(eliot_kernel_service::KernelControlCommand::Degrade(
+                eliot_platform::PlatformHandle::new("reserve-degraded-903")?,
+            ))?;
+        assert_eq!(degraded, eliot_kernel_service::KernelServiceState::Degraded);
+        let committed = capture.take();
+        assert_eq!(
+            event_count(&committed, "kernel.control.transition_committed"),
+            1,
+            "a degradation is a committed transition, not a failure"
+        );
+        assert_eq!(
+            find_event(&committed, "kernel.control.transition_committed").outcome,
+            "success"
+        );
+        assert!(
+            terminal_records(&committed).is_empty(),
+            "a degraded component must not report a terminal for the whole Kernel"
+        );
+
+        let service = reserve_service(&kernel)?;
+        assert_eq!(
+            service.state(),
+            eliot_kernel_service::KernelServiceState::Degraded
+        );
+        assert_ne!(
+            service.state(),
+            eliot_kernel_service::KernelServiceState::Failed,
+            "the degraded service state is not the whole-Kernel Failed state"
+        );
+        let normal_refusal = reserve_refusal(
+            service.acquire_admission(),
+            "normal admission must close while degraded",
+        )?;
+        assert!(matches!(
+            normal_refusal,
+            KernelServiceError::AdmissionClosed(eliot_kernel_service::KernelServiceState::Degraded)
+        ));
+        let protected = service.acquire_protected_control("drain:reserve-degraded-903")?;
+        assert_eq!(protected.operation_id(), "drain:reserve-degraded-903");
+        protected.release();
+
+        // The stable codes keep the reserve degradation apart from the two
+        // whole-Kernel failure classes.
+        assert_eq!(
+            control_transition_terminal_code(&normal_refusal),
+            "CONTROL_ADMISSION_CLOSED"
+        );
+        assert_ne!(
+            control_transition_terminal_code(&normal_refusal),
+            control_transition_terminal_code(&KernelServiceError::Platform(
+                "reserve degraded".to_owned()
+            ))
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::Platform(
+                "reserve degraded".to_owned()
+            )),
+            "CONTROL_PLATFORM"
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::Core(
+                eliot_kernel_core::KernelError::InvalidField {
+                    field: "control_reserve",
+                    reason: "fixed test value",
+                }
+            )),
+            "CONTROL_CORE"
+        );
+        drop(service);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Readiness is never fabricated from capacity: a caller-shaped claim stays
+    /// unproven and the captured surface renders no admission for it.
+    fn assert_probe_readiness_not_fabricated(
+        kernel: &KernelComposition,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let capture = install_diagnostic_capture();
+        let probe = reserve_refusal(
+            kernel.apply_control(eliot_kernel_service::KernelControlCommand::ProbeReady),
+            "a caller-shaped readiness claim must stay unproven",
+        )?;
+        let records = capture.take();
+        assert_eq!(event_count(&records, "kernel.control.transition_failed"), 1);
+        assert_eq!(
+            event_count(&records, "kernel.control.transition_committed"),
+            0,
+            "the whole captured surface must render no committed transition"
+        );
+        assert_eq!(
+            event_count(&records, "kernel.control.request_admitted"),
+            0,
+            "the whole captured surface must render no admission"
+        );
+        let terminals = terminal_records(&records);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].code, control_transition_terminal_code(&probe));
+        assert_eq!(terminals[0].code, "CONTROL_READINESS_NOT_PROVEN");
+        Ok(())
+    }
+
+    /// T15 and T17.
+    ///
+    /// I14.3 (I14-03:29): "Admission checks the exact bottleneck vector rather
+    /// than one scalar percentage; exhaustion ... may independently close
+    /// normal/background admission while preserving the applicable
+    /// recovery/control lane. Each disposition names the exhausted resource
+    /// and the work shed, deferred or quarantined." I14.20 (I14-20:91-94)
+    /// "Admission reservation": `STAGED_INACTIVE → ACTIVE | RELEASED | EXPIRED |
+    /// RECONCILING` - four dispositions, not two. I13.11 (I13-11:13) requires
+    /// the brief to carry "current hypotheses and unknowns", so exhaustion is
+    /// reported and readiness is never manufactured from it.
+    ///
+    /// LIMIT: this proves exhaustion is VISIBLE and readiness is not
+    /// fabricated from it. It does not execute the four dispositions of the
+    /// reservation machine above; `STAGED_INACTIVE`, `ACTIVE` and
+    /// `RECONCILING` are not states this composition's reserve reaches. See the
+    /// LIMIT on `runtime_lease_dispositions_stay_distinct_under_production_state_legality`
+    /// for which words of the checklist's reserve-disposition item production
+    /// does not represent at all.
+    ///
+    /// Production comparisons: `crates/kernel/eliot-kernel-service/src/lifecycle.rs:1396`
+    /// is the protected acquisition, `:1443` is the only mapping that yields
+    /// `KernelServiceError::ControlReserveExhausted`, and `control_plane.rs:62`
+    /// renders it as `CONTROL_RESERVE_EXHAUSTED`;
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs:1206-1210`
+    /// is the legacy acquisition that saturates it;
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:628-633` is the
+    /// refusal of a caller-shaped readiness claim - its own comment at `:629-630`
+    /// reads "A wire command cannot carry a caller-shaped readiness receipt" -
+    /// and `control_plane.rs:58` renders it;
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:500` is the state
+    /// read that must stay unchanged across an exhaustion refusal.
+    #[test]
+    fn reserve_exhaustion_is_visible_without_fabricating_readiness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("exhaustion")?;
+        let kernel = ready_reserve_composition(&root)?;
+
+        let mut held = Vec::new();
+        let capacity = reserve_service(&kernel)?.available_control();
+        assert_eq!(
+            capacity, 4,
+            "composition_bootstrap.rs:1765 builds the front door with four \
+             protected slots (control_reserve_front_door.rs:1048)"
+        );
+        for index in 0..capacity {
+            let lease = {
+                let service = reserve_service(&kernel)?;
+                service.acquire_protected_control(&format!("drain:reserve-exhaustion-{index}"))?
+            };
+            held.push(lease);
+        }
+        let service = reserve_service(&kernel)?;
+        assert_eq!(
+            service.available_control(),
+            0,
+            "every admitted lease consumed exactly one protected slot"
+        );
+        // A DIRECT call on the service owner. This call does not cross
+        // `apply_control_with_terminal` (`control_plane.rs:183-210`), so nothing
+        // here observes what the transition boundary would emit for it, and
+        // deleting every `CONTROL_CORE` emission from the request/transition
+        // boundary would go undetected by this case.
+        let exhaustion = reserve_refusal(
+            service.acquire_protected_control("drain:reserve-exhaustion-overflow"),
+            "one admission past the reserve capacity must be refused",
+        )?;
+        assert!(
+            matches!(
+                exhaustion,
+                KernelServiceError::Core(
+                    eliot_kernel_core::KernelError::ProtectedReserveExhausted { .. }
+                )
+            ),
+            "the typed protected exhaustion reaches the service owner"
+        );
+        // Exhaustion is a reserve disposition, not a lifecycle transition.
+        assert_eq!(
+            service.state(),
+            eliot_kernel_service::KernelServiceState::Ready
+        );
+        assert_ne!(
+            service.state(),
+            eliot_kernel_service::KernelServiceState::Failed
+        );
+        assert_eq!(service.available_control(), 0);
+
+        // The legacy issuance path names the exhausted reserve itself, so the
+        // reserve-specific terminal exists and stays apart from the two
+        // whole-Kernel failure codes.
+        let legacy = reserve_refusal(
+            service.issue_control_receipt(
+                eliot_contracts::ContractId::new("reserve-exhaustion-903")?,
+                eliot_kernel_core::RouteScope::new("control")?,
+                0,
+                None,
+            ),
+            "a saturated reserve must refuse a control receipt issuance",
+        )?;
+        assert!(matches!(
+            legacy,
+            KernelServiceError::ControlReserveExhausted
+        ));
+        assert_eq!(
+            control_transition_terminal_code(&legacy),
+            "CONTROL_RESERVE_EXHAUSTED"
+        );
+        assert_ne!(
+            control_transition_terminal_code(&legacy),
+            control_transition_terminal_code(&KernelServiceError::Platform(
+                "reserve exhausted".to_owned()
+            ))
+        );
+        assert_ne!(
+            control_transition_terminal_code(&legacy),
+            control_transition_terminal_code(&exhaustion)
+        );
+
+        // Released capacity returns to the reserve; the observation and the
+        // refusal never resized it.
+        drop(held);
+        assert_eq!(service.available_control(), capacity);
+        drop(service);
+
+        // Readiness is never fabricated from capacity or from a release: the
+        // probe stays refused and the captured surface renders no admission.
+        assert_probe_readiness_not_fabricated(&kernel)?;
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// T15 (runtime-lease dispositions) and the single-terminal discipline of
+    /// the axis.
+    ///
+    /// The axis proved here is RUNTIME-LEASE state, not admission-reservation
+    /// disposition. I14.20 (I14-20:91-94) "Admission reservation":
+    /// `STAGED_INACTIVE → ACTIVE | RELEASED | EXPIRED |
+    /// RECONCILING`, and (I14-20:99) "Release, expiry and recovery reuse the
+    /// same reservation identity and produce a receipt". I14.3 (I14-03:29)
+    /// requires every reserve disposition to name the exhausted resource and
+    /// the work shed, deferred or quarantined. I1.8 (I01-08:18): "No component
+    /// alone can invent semantics, authorize them and commit them."
+    ///
+    /// LIMIT: the checklist item reads "admitted/consumed/released/expired
+    /// reserve distinct". Production does not represent the "admitted" or
+    /// "consumed" words of that item: `CapacityClass`
+    /// (`crates/foundation/eliot-runtime-contracts/src/control_reserve.rs:17-24`)
+    /// has exactly three variants - `NormalWorkload`, `ProtectedControl`,
+    /// `EmergencyLastResort` - and carries no admit/consume state; and
+    /// `PermitTerminalDisposition`
+    /// (`crates/foundation/eliot-runtime-contracts/src/control_reserve.rs:973-984`)
+    /// has exactly five variants with no `Expired` member. `LeaseState::Expired`
+    /// exists (`crates/foundation/eliot-runtime-contracts/src/lib.rs:1109`) but
+    /// is a RUNTIME-LEASE state that no reserve permit terminal carries. This
+    /// test therefore proves distinctness of the runtime-lease dispositions
+    /// `Released | Expired | Revoked | Superseded` and of the five
+    /// permit-terminal dispositions. It does not prove the checklist's
+    /// four-word reserve-disposition item, and the "expired" word is proved
+    /// only on the runtime-lease axis.
+    ///
+    /// Production comparisons: `control_plane.rs:1650-1659` is the terminal
+    /// predicate over the lease states; `control_plane.rs:1632-1635` keeps the
+    /// renewed, expired and superseded counts in separate bounded fields;
+    /// `crates/foundation/eliot-runtime-contracts/src/lib.rs:1154-1186` is the
+    /// production state legality that keeps the dispositions apart;
+    /// `crates/foundation/eliot-runtime-contracts/src/control_reserve.rs:973-984`
+    /// is the production permit-terminal vocabulary;
+    /// `control_plane.rs:1684-1700` derives the one reservation identity.
+    #[test]
+    fn runtime_lease_dispositions_stay_distinct_under_production_state_legality()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_runtime_contracts::{LeaseState, PermitTerminalDisposition};
+
+        let candidate = reserve_candidate()?;
+        let lease_id = runtime_lease_id_for_candidate(&candidate)?;
+        assert_eq!(
+            lease_id,
+            format!(
+                "runtime-lease:{}:activation-lineage-903:1",
+                candidate.activation_id.as_str()
+            ),
+            "control_plane.rs:1694 derives one reservation identity"
+        );
+        let fence = StateFence::new(
+            candidate.kernel_epoch.clone(),
+            eliot_contracts::ResourceGeneration::genesis(),
+        );
+        let active = eliot_runtime_contracts::RuntimeLease {
+            lease_id: lease_id.clone(),
+            scope_ref: candidate.activation_id.as_str().to_owned(),
+            authority_epoch: candidate.kernel_epoch.clone(),
+            state_fence: fence,
+            state: LeaseState::Active,
+            expires_at_ms: 60_000,
+        };
+
+        // One active hold reaches four different dispositions. What is asserted is
+        // that production's legality matrix admits each of them, returns the
+        // requested state, and refuses the resurrection edges. It is
+        // deliberately NOT asserted that the four resulting `state` values
+        // differ from each other: `RuntimeLease::transition_to` assigns
+        // `state: next` verbatim
+        // (`crates/foundation/eliot-runtime-contracts/src/lib.rs:1183`), so a
+        // pairwise `state` inequality here would compare two enum constants
+        // this test itself named at the four `transition_to` call sites, and
+        // would stay green with the whole legality matrix replaced by
+        // `let legal = true;`. `LeaseState` is a plain fieldless enum
+        // (`:1104-1114`) and exposes no production surface on which the four
+        // could collide, so there is nothing further to assert here.
+        let released = active.transition_to(LeaseState::Released)?;
+        let expired = active.transition_to(LeaseState::Expired)?;
+        let revoked = active.transition_to(LeaseState::Revoked)?;
+        let superseded = active.transition_to(LeaseState::Superseded)?;
+        assert_eq!(released.state, LeaseState::Released);
+        assert_eq!(expired.state, LeaseState::Expired);
+        assert_eq!(revoked.state, LeaseState::Revoked);
+        assert_eq!(superseded.state, LeaseState::Superseded);
+        // A terminal disposition is never re-admitted, so release and expiry
+        // cannot silently become one another.
+        assert!(released.transition_to(LeaseState::Active).is_err());
+        assert!(expired.transition_to(LeaseState::Released).is_err());
+        assert!(revoked.transition_to(LeaseState::Active).is_err());
+        assert!(superseded.transition_to(LeaseState::Active).is_err());
+        // The production predicate groups the terminal set but keeps the
+        // non-terminal holds out of it. The two loops below together classify
+        // all nine `LeaseState` variants production declares
+        // (`crates/foundation/eliot-runtime-contracts/src/lib.rs:1104-1114`).
+        for terminal in [
+            LeaseState::Released,
+            LeaseState::Expired,
+            LeaseState::Revoked,
+            LeaseState::Superseded,
+            LeaseState::Closed,
+        ] {
+            assert!(
+                runtime_lease_is_terminal(terminal),
+                "control_plane.rs:1650 must accept {terminal:?} as terminal"
+            );
+        }
+        for held in [
+            LeaseState::Requested,
+            LeaseState::Active,
+            LeaseState::Expiring,
+            LeaseState::Reconciling,
+        ] {
+            assert!(
+                !runtime_lease_is_terminal(held),
+                "control_plane.rs:1650 must keep {held:?} non-terminal"
+            );
+        }
+        // Every permit-terminal disposition production declares
+        // (`control_reserve.rs:973-984` - exactly five variants) is listed
+        // here, and each keeps its own frozen contract name. The `insert`
+        // assertion in the loop over them is the whole check; no separate
+        // length equality could fail once it passes.
+        let dispositions = [
+            PermitTerminalDisposition::Released,
+            PermitTerminalDisposition::ReconciledReleased,
+            PermitTerminalDisposition::LeakSuspected,
+            PermitTerminalDisposition::StaleOwner,
+            PermitTerminalDisposition::Unknown,
+        ];
+        let mut contract_names = std::collections::BTreeSet::new();
+        for disposition in dispositions {
+            assert!(
+                contract_names.insert(disposition.as_contract_str()),
+                "every permit-terminal disposition keeps its own frozen name"
+            );
+        }
+        assert_ne!(
+            PermitTerminalDisposition::Unknown.as_contract_str(),
+            PermitTerminalDisposition::Released.as_contract_str()
+        );
+        Ok(())
+    }
+
+    /// Single designated terminal per operation across the axis.
+    ///
+    /// The one designated terminal per operation is stated by the facade itself:
+    /// `kernel_diagnostics.rs:683` (mirrored verbatim at
+    /// `bins/eliot-host/src/host_diagnostics.rs:603`) - "One underlying failed
+    /// operation yields exactly one terminal record here; the current span is
+    /// preserved for existing callers". I1.8 (I01-08:18): Kernel verifies and
+    /// commits; no component alone authorizes and commits.
+    ///
+    /// Production comparisons: `control_plane.rs:201-206` emits the terminal
+    /// only for the caller that owns it, `control_plane.rs:993` is the
+    /// request-boundary call that passes `false` because
+    /// `ControlRequestFailure::Transition` (`:99-104`) hands terminal
+    /// ownership back to the boundary, and
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:628-633` is the
+    /// refusal both legs share, and its own comment at `:629-630` reads "A wire
+    /// command cannot carry a caller-shaped readiness receipt".
+    ///
+    /// LIMIT: `owned` and `delegated` are the SAME `KernelControlCommand`
+    /// value, so "one underlying failure" is supplied by this test rather than
+    /// observed as two independent productions of one cause. What is proved is
+    /// the ownership split - one terminal from the owning caller, none from the
+    /// delegating one - not the convergence of two separately observed causes.
+    #[test]
+    fn one_failed_transition_emits_exactly_one_designated_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("single-terminal")?;
+        let kernel = KernelComposition::new(KernelConfig::new(&root))?;
+        // ORDERING CONSTRAINT: install the capture BEFORE creating `context`.
+        // `DiagnosticCaptureLayer::on_new_span` only fires for spans declared
+        // while the subscriber is installed, so a span created first has no
+        // `CapturedSpan` extension, `on_event` finds `None` at the
+        // `span.extensions()` read, and the delegated leg's records silently
+        // fall back to `request_id == ""`. No assertion below depends on that
+        // field, but any future one added here would read `""` for a
+        // non-obvious reason. Installing first costs nothing and removes the
+        // trap.
+        let capture = install_diagnostic_capture();
+        let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+
+        // The transition gateway owns the terminal for its own operation.
+        let owned = reserve_refusal(
+            kernel.apply_control(eliot_kernel_service::KernelControlCommand::ProbeReady),
+            "an unauthenticated readiness probe must be refused",
+        )?;
+        let owned_records = capture.take();
+        assert_eq!(
+            event_count(&owned_records, "kernel.control.transition_failed"),
+            1
+        );
+        assert_eq!(
+            find_event(&owned_records, "kernel.control.transition_failed").outcome,
+            "rejected"
+        );
+        let owned_terminals = terminal_records(&owned_records);
+        assert_eq!(
+            owned_terminals.len(),
+            1,
+            "one failed transition yields exactly one terminal record"
+        );
+        assert_eq!(
+            owned_terminals[0].code,
+            control_transition_terminal_code(&owned)
+        );
+
+        // The same transition as a subordinate phase of a request: it keeps its
+        // correlation record and emits no second terminal.
+        let delegated = reserve_refusal(
+            kernel.apply_control_with_terminal(
+                eliot_kernel_service::KernelControlCommand::ProbeReady,
+                false,
+                &context,
+            ),
+            "the subordinate transition must be refused the same way",
+        )?;
+        let delegated_records = capture.take();
+        assert_eq!(
+            event_count(&delegated_records, "kernel.control.transition_failed"),
+            1
+        );
+        assert!(
+            terminal_records(&delegated_records).is_empty(),
+            "a subordinate transition must not re-emit an owned terminal"
+        );
+        // One underlying failure, one cause and one code, whichever leg owns
+        // the terminal.
+        assert_eq!(
+            control_transition_terminal_code(&owned),
+            control_transition_terminal_code(&delegated)
+        );
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    // The code each of the 17 refusals listed by
+    // `lost_control_response_stays_unknown_under_its_own_terminal` must render,
+    // in the same order as that test lists them. The note that follows is that
+    // test's own comment, moved here with each positional phrase rewritten to
+    // name its target; "that test" throughout it means the test named here.
+    //
+    // Positive-before-absence, per element. `control_request_terminal_code`
+    // returns `&'static str` and every arm of it is a non-empty table literal
+    // (16 arms, 16 distinct literals, measured), so that test's success-token
+    // absence loop cannot in fact be reached with an empty code. That is a
+    // property of the signature and the table, not evidence that test
+    // produces, so the code each listed refusal should render is asserted
+    // first, on the same `code` binding, before any success token is tested
+    // against it. This list restates those 17 refusals in the same order; an
+    // arm that renders empty, blank, or another arm's text now fails on
+    // presence instead of passing an absence that never had a value to bite
+    // on. It still does NOT establish table completeness (see that test's
+    // comment on its `refusals` list), and that test's `codes` set-count
+    // assertion independently bounds the codes actually produced.
+    fn lost_control_expected_codes() -> [&'static str; 17] {
+        [
+            "control_invalid_limits",
+            "control_unauthenticated_peer",
+            "control_peer_unavailable",
+            "control_protocol",
+            "control_fenced",
+            "control_backpressure",
+            "control_backpressure",
+            "control_timeout",
+            "control_cancelled",
+            "control_invalid_pipe",
+            "control_unknown_outcome",
+            "control_io",
+            "control_plan_gap",
+            "control_unknown_request",
+            "control_identity_conflict",
+            "control_legacy_correlation_unresolved",
+            "control_registry_full",
+        ]
+    }
 }

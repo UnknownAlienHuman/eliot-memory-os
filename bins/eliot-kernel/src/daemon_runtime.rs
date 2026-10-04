@@ -3767,3 +3767,1656 @@ mod daemon_manifest_restart_admission_tests {
         );
     }
 }
+
+/// Issue #903 (F-LOG-KERNEL-4) daemon-lifecycle observation proof: case 6 (an
+/// activation request is not an owner observation), case 19 (liveness is not
+/// semantic readiness), case 18 (the armed daemon states stay distinct, two of
+/// them sharing one outcome literal) and case 22 (an exact replay is a readback,
+/// not a duplicate transition success).
+///
+/// WHY THIS IS ITS OWN `#[cfg(test)]` MODULE rather than four more tests inside
+/// `daemon_manifest_restart_admission_tests`: that module is
+/// `#[cfg(all(test, windows))]` (issue #1884), so a test living in it is not
+/// merely DEFERRED on another target — it does not exist there, and nothing
+/// about its header says so. Here the whole block is `#[cfg(test)]` on every
+/// target, and each test that needs a `#[cfg(windows)]` ITEM is gated on that
+/// item individually. The per-test matrix, stated rather than implied:
+///
+/// * `an_alive_daemon_without_a_receipt_and_a_running_status_never_reaches_readiness`
+///   (case 19) — EVERY target. It reaches no platform-gated production item:
+///   `mark_daemon_ready` (:2184) and the readiness predicate (:507) carry no
+///   platform attribute, and the rest is source text. The three verdicts it
+///   asserts are all decided by the one guard at :2204 on every target, because
+///   the two arms above it (:2190-2192 and :2198-2203) are `#[cfg(windows)]` and
+///   are not reached by any arm here. The bound supervision contour it records is
+///   a `#[cfg(windows)]` field (`daemon_supervision.rs:458-459`), so its three
+///   writes are routed through one `#[cfg]`-gated fixture item and the arms
+///   differ only in the receipt and status slots off Windows.
+/// * `an_activation_request_is_not_an_owner_readiness_observation` (case 6) —
+///   `#[cfg(windows)]`. Its captured owner-leg refusal is the
+///   `supervision_unproven` verdict (:2198-2203), which exists only where the
+///   supervision slot exists.
+/// * `the_daemon_lifecycle_states_stay_distinct_and_liveness_is_never_promoted`
+///   (case 18) — `#[cfg(windows)]`. It drives `await_daemon_ready` (attribute at
+///   :531, definition at :532), which is compiled on no other target.
+/// * `an_exact_replay_returns_the_recorded_outcome_without_a_second_transition`
+///   (case 22) — `#[cfg(windows)]`. What it measures IS that readback arm: the
+///   three owner slots at :2190-2192 do not exist off Windows, the supervision
+///   slot it restores does not exist off Windows, and its exactness tail reads
+///   the receipt comparison at `daemon_runtime.rs:557` inside the same `#[cfg(windows)]` wait. Off
+///   Windows `mark_daemon_ready` has no readback arm, so there is nothing there
+///   for this test to be honest about.
+///
+/// Every premise below is read back through the SAME `self.daemon_runtime`
+/// mutex production writes through (daemon_supervision.rs:454-479), holding the
+/// real `DaemonRuntimeStatus` and the real `ProcessStartReceipt`, and every
+/// observed record is the bytes the real `KernelComposition` emitted through
+/// the #895 facade's own `tracing` seam. Apart from the three comparisons that
+/// announce themselves, where they are used, as NON-VACUITY CONTROLS on a
+/// comparison that IS falsifiable (the two distinct fixture receipts in case 22,
+/// the two distinct enum values in case 19, and the pairwise distinctness of the
+/// five read-back statuses in case 18, which only makes the word "collapsed"
+/// meaningful there), no premise compares two objects this test built on its
+/// own, so a production change reddens it.
+///
+/// The two load-bearing distinctions are: an activation REQUEST is not an owner
+/// OBSERVATION, and LIVENESS is not READINESS.
+///
+/// Doc anchors, CONDENSED from the read fragments in
+/// `.eliot/docs-read-bundle-903.md` — the fragments' own line breaks are
+/// reflowed to fit a comment, their `→` glyphs are reproduced as they are
+/// spelled, and `...` marks fragment lines a quote skips:
+/// * I14.20: "Process liveness/readiness and capability-generation state
+///   remain separate."
+/// * I14.20 service process (the `Service process` transition block, ONE SOURCE
+///   LINE PER QUOTED SPAN so that no punctuation is invented between transitions):
+///   "STOPPED → STARTING", "STARTING → RECOVERING | READY", ... "READY | DEGRADED → QUIESCING → STOPPED".
+/// * I1.5: "The activation is not reported fully healthy merely because Host
+///   and Kernel are alive."
+/// * I1.5: "An installed agent shim, hook, plugin or MCP bridge is a
+///   demand-start trigger only; it stores no semantic state or authority."
+/// * I14.21: "Human/Doctor chooses evidence-backed reconciliation; no blind
+///   duplicate effect."
+/// * I1.8: "Kernel rechecks only properties it owns and binds the
+///   activation/staging receipt to the same `admission_decision_digest`."
+///
+/// What this proof is NOT, and says so rather than faking: the card DEFERs live
+/// `#[cfg(windows)]` kernel-owner and daemon-launch EXECUTION, so no test here
+/// launches a process, mints a store row or drives a real Host. The diagnostic
+/// semantics are proved through the recorded owner slots and the emitted
+/// records, which is what a synthetic owner evidence claim means here. Case 18
+/// is NOT PROVEN as the card words it — one rendezvous deciding five lifecycle
+/// states including a draining and a stopped daemon — and this block says which
+/// part of it is measured and which part is not, rather than pretending to the
+/// difference.
+#[cfg(test)]
+mod daemon_lifecycle_observation_tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "the only sites these two lints reach in this module are source_between's two exact-spelling boundary lookups, where a failed lookup means a pinned production spelling is gone and this proof's premise is void rather than a production fault reported to an operator; every other fixture path spells its failure as assert!, a let-else panic, or unwrap_or_else(|_| panic!) carrying its own message, so unwrap_used covers no call site here at all"
+    )]
+
+    use super::*;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use super::super::{DaemonRuntimeState, KernelConfig};
+
+    // The bound supervision contour is a `#[cfg(windows)]` OWNER SLOT
+    // (`daemon_supervision.rs:458-459`) and the crate root re-exports its type
+    // only under `#[cfg(windows)]` (lib.rs:371-373), so every fixture import
+    // that exists only to build that contour is gated with it. Case 19 is the
+    // one cross-platform test and it records the contour through one
+    // `#[cfg]`-gated fixture item, asserting the same three verdicts without it
+    // elsewhere.
+    #[cfg(windows)]
+    use super::super::DaemonSupervisionContour;
+    #[cfg(windows)]
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    #[cfg(windows)]
+    use eliot_kernel_service::KernelActivationReceipt;
+    #[cfg(windows)]
+    use eliot_runtime_contracts::{
+        RegisteredActivityWakePolicy, SupervisionGenerationBinding, SupervisionJournalEpoch,
+        SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+    };
+
+    /// This file's own source, resolved at compile time, so a running Kernel
+    /// never locates a file to read it. Read by the source pins in cases 6 and
+    /// 19; identical in shape to the reader in
+    /// `daemon_manifest_restart_admission_tests`, duplicated per module rather
+    /// than shared, because that module's readers are `#[cfg(windows)]`.
+    const THIS_FILE: &str = include_str!("daemon_runtime.rs");
+
+    /// One exact span of this file's source, from an exact opening spelling to
+    /// the exact spelling that follows it.
+    ///
+    /// Both boundaries are exact spellings, so a moved or renamed decision fails
+    /// the lookup instead of silently proving an empty slice. A source pin
+    /// written inside this module cannot satisfy itself from a test module's
+    /// own prose the way a whole-file scan can, because the boundaries are
+    /// production signatures.
+    fn source_between(open: &str, close: &str) -> &'static str {
+        let start = THIS_FILE
+            .find(open)
+            .expect("the opening spelling is not in this file");
+        let end = THIS_FILE[start..]
+            .find(close)
+            .map(|offset| start + offset)
+            .expect("the closing spelling does not follow the opening one");
+        &THIS_FILE[start..end]
+    }
+
+    /// Bounded root guard for one fixture composition. Returned FIRST by
+    /// `daemon_case_kernel`, so the composition (which holds the fixture's open
+    /// ORS file) drops before the guard removes the work root.
+    struct DaemonCaseRoot(PathBuf);
+
+    impl DaemonCaseRoot {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for DaemonCaseRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn daemon_case_root(tag: &str) -> DaemonCaseRoot {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-903-daemon-case-{tag}-{pid}-{now}",
+            pid = std::process::id(),
+            now = super::super::unix_ms()
+        ));
+        assert!(
+            std::fs::create_dir_all(&root).is_ok(),
+            "the fixture work root is creatable"
+        );
+        DaemonCaseRoot(root)
+    }
+
+    /// One real `KernelComposition` over a real (empty) work root, so every
+    /// daemon observation below is emitted by the production owner and not by a
+    /// stand-in.
+    fn daemon_case_kernel(tag: &str) -> (DaemonCaseRoot, KernelComposition) {
+        let root = daemon_case_root(tag);
+        let Ok(kernel) = KernelComposition::new(KernelConfig::new(root.path())) else {
+            panic!("the fixture work root does not assemble a kernel composition")
+        };
+        (root, kernel)
+    }
+
+    /// The owner's own daemon-state guard, so every premise reads the record
+    /// production writes through the same lock.
+    fn daemon_case_state(kernel: &KernelComposition) -> MutexGuard<'_, DaemonRuntimeState> {
+        kernel
+            .daemon_runtime
+            .lock()
+            .unwrap_or_else(|_| panic!("the daemon runtime lock is poisoned"))
+    }
+
+    /// A platform handle for the contour fixture. `#[cfg(windows)]` with the
+    /// contour slot it only feeds.
+    #[cfg(windows)]
+    fn daemon_case_handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value)
+            .unwrap_or_else(|_| panic!("the fixture value is not an accepted platform handle"))
+    }
+
+    #[cfg(windows)]
+    fn daemon_case_generation(generation: u64) -> ResourceGeneration {
+        ResourceGeneration::new(generation)
+            .unwrap_or_else(|_| panic!("the fixture generation is not a resource generation"))
+    }
+
+    #[cfg(windows)]
+    fn daemon_case_epoch() -> EpochId {
+        let Ok(lineage) = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000") else {
+            panic!("the fixture epoch lineage is accepted")
+        };
+        let Some(sequence) = std::num::NonZeroU64::new(1) else {
+            panic!("one is a non-zero sequence")
+        };
+        EpochId::new(lineage, sequence).unwrap_or_else(|_| panic!("the fixture epoch is an epoch"))
+    }
+
+    /// One real `ProcessStartReceipt` for the given admitted generation, decoded
+    /// through the contract's own `Deserialize` and then accepted by its own
+    /// `validate`, so the fixture is a receipt production could hold rather than
+    /// a value this test decided was one. Nothing here decides liveness: the
+    /// receipt is the executor's record, and the whole point of case 19 is that
+    /// holding it is not readiness.
+    fn daemon_case_receipt(generation: u64) -> ProcessStartReceipt {
+        // The wire shape is built first so the decoded type is named at the
+        // ONE call site that decodes it: `from_value` is generic, so a bare call
+        // inside this `match` leaves `T` unconstrained (E0282) and the arms
+        // mismatch (E0308) even though the annotation is right there.
+        let wire = serde_json::json!({
+            "binding": {
+                "operation_id": "eliotd-903-receipt-operation",
+                "process_tree_id": "eliotd-903-receipt-tree",
+                "job_id": "eliotd-903-receipt-job",
+                "image_id": "eliotd-903-receipt-image",
+                "session_id": "eliotd-903-receipt-session",
+                "generation": generation,
+                "action_lease_ref": "eliotd-903-receipt-lease",
+                "authority_id": "eliotd",
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
+                "state_fence": {
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
+                    "generation": generation,
+                    "nonce": "eliotd-903-receipt-fence"
+                },
+                "request_digest": "a".repeat(64),
+                "permit_digest": "b".repeat(64),
+                "effect_digest": "c".repeat(64),
+                "validation_revision": 1
+            },
+            "identity": {
+                "suspended": {
+                    "process_id": "eliotd-903-receipt-process",
+                    "process_tree_id": "eliotd-903-receipt-tree",
+                    "job_id": "eliotd-903-receipt-job",
+                    "image_id": "eliotd-903-receipt-image",
+                    "session_id": "eliotd-903-receipt-session",
+                    "generation": generation,
+                    "physical": {
+                        "process_id": 4501,
+                        "start_time_100ns": 1,
+                        "image_path": r"C:\ProgramData\Eliot\bin\eliotd.exe",
+                        "executor_job_name": r"Local\Eliot-P04-903"
+                    },
+                    "created_suspended_at_unix_ms": 1,
+                    "executable_sha256": "a".repeat(64)
+                },
+                "resumed_at_unix_ms": 2
+            },
+            "lifecycle": "running"
+        });
+        match serde_json::from_value::<ProcessStartReceipt>(wire) {
+            Ok(receipt) => {
+                assert!(
+                    receipt.validate().is_ok(),
+                    "the fixture receipt satisfies the contract validator"
+                );
+                receipt
+            }
+            Err(error) => panic!("the fixture process start receipt decodes: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn daemon_case_incarnation() -> SupervisionLeaseIncarnationBinding {
+        let epoch = SupervisionJournalEpoch {
+            lineage_id: "host-lineage-903".to_owned(),
+            sequence: 1,
+        };
+        (SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:903".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-903".to_owned(),
+            host_epoch: epoch.clone(),
+            activation_id: "activation-903".to_owned(),
+            activation_generation: epoch.clone(),
+            kernel_generation: epoch.clone(),
+            watchdog_epoch: epoch,
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        })
+        .with_derived_ids()
+        .unwrap_or_else(|_| panic!("the fixture supervision incarnation is not a sealed one"))
+    }
+
+    /// One real bound supervision contour: the third slot the owner's readiness
+    /// verdict reads (`daemon_runtime.rs:2192`). Case 22 proves that removing it
+    /// changes that verdict, so it is fixture data and not decoration.
+    ///
+    /// `#[cfg(windows)]` with that slot: the field it fills does not exist on
+    /// another target (`daemon_supervision.rs:458-459`), so a fixture for it
+    /// would not compile there and case 19 records it under the same gate.
+    #[cfg(windows)]
+    fn daemon_case_contour(generation: u64) -> DaemonSupervisionContour {
+        DaemonSupervisionContour {
+            candidate_digest: "a".repeat(64),
+            incarnation: daemon_case_incarnation(),
+            activation: KernelActivationReceipt {
+                operation_id: daemon_case_handle("eliot-903-activation-operation"),
+                candidate_binding_digest: "a".repeat(64),
+                prior_kernel_disposition_digest: "b".repeat(64),
+                journal_transaction_id: daemon_case_handle("eliot-903-journal-transaction"),
+                journal_sequence: 1,
+                generation: daemon_case_generation(generation),
+                authority_epoch: daemon_case_epoch(),
+                activation_nonce_digest: "c".repeat(64),
+            },
+            generation_binding: SupervisionGenerationBinding {
+                target_id: "eliot-903-artifact".to_owned(),
+                target_generation: daemon_case_generation(generation),
+                module_id: "eliotd".to_owned(),
+                module_generation: daemon_case_generation(generation),
+                process_id: "pid:4501:start:1".to_owned(),
+                process_generation: daemon_case_generation(generation),
+            },
+            state_fence: StateFence::new(daemon_case_epoch(), daemon_case_generation(generation)),
+        }
+    }
+
+    /// The bound supervision write, as ONE fixture ITEM rather than three
+    /// per-statement attributes: attributes on expressions are still unstable
+    /// (rust-lang/rust#15701), so a `#[cfg]` sitting on
+    /// `state.supervision = Some(...)` is rejected in that position and the
+    /// gate has to be a declaration instead.
+    ///
+    /// On Windows this writes the same contour the arms wrote before into the
+    /// third slot production's own guard reads (`daemon_runtime.rs:2192`).
+    /// Off Windows the field does not exist at all
+    /// (`daemon_supervision.rs:458-459`), so the non-Windows twin below
+    /// performs no write and names no supervision type in its signature — that
+    /// is what lets the shared call site be written once and stay legal on
+    /// both targets, leaving each arm differing only in its receipt and status
+    /// slots exactly as before.
+    #[cfg(windows)]
+    fn daemon_case_bind_supervision(state: &mut MutexGuard<'_, DaemonRuntimeState>) {
+        state.supervision = Some(daemon_case_contour(1));
+    }
+
+    /// The same call where the slot does not exist. An empty body with no
+    /// supervision type in its signature is deliberate: naming one would not
+    /// compile off Windows.
+    #[cfg(not(windows))]
+    fn daemon_case_bind_supervision(_state: &mut MutexGuard<'_, DaemonRuntimeState>) {}
+
+    // Capture seam. Per-file duplication of the #895 `tracing` sink, which is
+    // the house pattern for a crate-internal proof file.
+    #[derive(Clone, Default)]
+    struct DaemonCaseSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for DaemonCaseSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.bytes.lock() {
+                Ok(mut bytes) => bytes.extend_from_slice(buf),
+                Err(_) => return Err(std::io::Error::other("the capture lock is poisoned")),
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `run` with the real facade subscriber installed over an in-memory
+    /// sink and returns the bytes production actually emitted. The subscriber is
+    /// the #895 writer shape, so what is captured is the record a reader of the
+    /// installed stderr sink would see.
+    fn daemon_case_capture_with<F, R>(run: F) -> (String, R)
+    where
+        F: FnOnce() -> R,
+    {
+        let sink = DaemonCaseSink::default();
+        let writer_sink = sink.clone();
+        let result = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer_sink.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, run)
+        };
+        let bytes = sink
+            .bytes
+            .lock()
+            .unwrap_or_else(|_| panic!("the capture lock is poisoned"))
+            .clone();
+        (String::from_utf8_lossy(&bytes).into_owned(), result)
+    }
+
+    /// EVERY `event="` value on the WHOLE captured surface, in emission order.
+    ///
+    /// Absence claims in this block read this whole list (and the raw bytes),
+    /// never a hand-listed set of names, so an event added under a spelling this
+    /// test never anticipated still appears in the comparison.
+    fn daemon_case_events(logs: &str) -> Vec<String> {
+        let needle = "event=\"";
+        logs.match_indices(needle)
+            .map(|(at, _matched)| &logs[at + needle.len()..])
+            .filter_map(|rest| rest.find('"').map(|end| rest[..end].to_owned()))
+            .collect()
+    }
+
+    /// The `kernel.daemon.*` records on the captured surface, in emission order.
+    ///
+    /// The daemon observation namespace is this issue's whole claim in this
+    /// block, and it is read as a NAMESPACE rather than as a hand-listed set of
+    /// names: a record added under a spelling no assertion here anticipates
+    /// still appears in the comparison and breaks it. Records another subsystem
+    /// emits on the same contour — the audit cascade's own terminal, for one —
+    /// are deliberately outside it, because they are not this file's
+    /// observation and pinning them here would measure another owner's
+    /// behaviour. The absence claims read the WHOLE raw surface, not this list.
+    fn daemon_case_daemon_events(logs: &str) -> Vec<String> {
+        daemon_case_events(logs)
+            .into_iter()
+            .filter(|event| event.starts_with("kernel.daemon."))
+            .collect()
+    }
+
+    /// The `outcome` value production emitted for one event, read back out of
+    /// the captured line.
+    fn daemon_case_outcome(logs: &str, event: &str) -> String {
+        let needle = format!("event=\"{event}\"");
+        let Some(line) = logs.lines().find(|line| line.contains(&needle)) else {
+            panic!("no captured line carries {needle}: {logs}");
+        };
+        let key = "outcome=\"";
+        let Some(at) = line.rfind(key) else {
+            panic!("the captured line for {event} carries no outcome: {line}");
+        };
+        let at = at + key.len();
+        let Some(end) = line[at..].find('"') else {
+            panic!("the captured outcome for {event} is unterminated: {line}");
+        };
+        line[at..at + end].to_owned()
+    }
+
+    /// Drives the REAL `KernelComposition::await_daemon_ready` over the recorded
+    /// owner slots, with `awaited` as the receipt the caller claims to be
+    /// waiting on and `recorded` as the receipt the owner actually holds.
+    ///
+    /// Splitting the two is the whole of the exactness claim: the production
+    /// comparison at `daemon_runtime.rs:557` is
+    /// `state.receipt.as_ref() == Some(launched)`, so a different recorded
+    /// receipt must refuse rather than satisfy. Nothing here waits on a real
+    /// process; the timeout arm is a real timed wait that expires because no
+    /// owner observation arrives, which is exactly the unanswered request.
+    ///
+    /// `#[cfg(windows)]` with `await_daemon_ready` itself (attribute at :531),
+    /// which is the only production item this helper reaches; the tests that
+    /// need it (cases 18 and 22) carry the same gate individually.
+    #[cfg(windows)]
+    fn daemon_case_await(
+        kernel: &KernelComposition,
+        recorded: DaemonRuntimeStatus,
+        held: &ProcessStartReceipt,
+        awaited: &ProcessStartReceipt,
+        timeout: Duration,
+    ) -> (String, Result<(), KernelBuildError>) {
+        {
+            let mut state = daemon_case_state(kernel);
+            state.status = recorded;
+            state.receipt = Some(held.clone());
+            state.supervision = Some(daemon_case_contour(1));
+        }
+        daemon_case_capture_with(|| {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                panic!("a current-thread runtime is available for the rendezvous")
+            };
+            runtime.block_on(kernel.await_daemon_ready(awaited, timeout, &tracing::Span::none()))
+        })
+    }
+
+    /// The daemon lifecycle's own discriminating label.
+    ///
+    /// The `match` is exhaustive on purpose and carries NO wildcard arm, so a
+    /// variant added to `DaemonRuntimeStatus` (`daemon_supervision.rs:36-43`)
+    /// makes this stop compiling until it is classified. That is what makes the
+    /// vocabulary claim below a checked fact rather than an assertion about a
+    /// shape nobody enumerated.
+    fn daemon_case_state_label(status: &DaemonRuntimeStatus) -> &'static str {
+        match status {
+            DaemonRuntimeStatus::NotLaunched => "not_launched",
+            DaemonRuntimeStatus::Launching => "launching",
+            DaemonRuntimeStatus::Running => "running",
+            DaemonRuntimeStatus::Ready => "ready",
+            DaemonRuntimeStatus::Degraded(_) => "degraded",
+            DaemonRuntimeStatus::Failed(_) => "failed",
+        }
+    }
+
+    /// `daemon_supervision.rs` read at compile time, for the ONE production
+    /// decision this file does not own: whether a planned shutdown is a failure
+    /// to retry. It is read here rather than called because
+    /// `daemon_owner_restart_lifecycle` is a private `const fn` of that module
+    /// (`daemon_supervision.rs:173`) and a test may not widen its visibility.
+    ///
+    /// `#[cfg(windows)]` because the decision it reads is itself
+    /// `#[cfg(windows)]` (`daemon_supervision.rs:172`) and is not compiled on
+    /// another target; case 18, its only reader, carries the same gate. The
+    /// health-view codes read alongside it in `health_view.rs` are NOT gated
+    /// there, and are noted at their own pin.
+    #[cfg(windows)]
+    const DAEMON_SUPERVISION_SOURCE: &str = include_str!("daemon_supervision.rs");
+
+    /// `health_view.rs` read at compile time, for the ONE owner that keeps
+    /// `Draining` and `Stopped` apart as they reach an operator: the bounded
+    /// `KernelActivationView.service_state` code map. `health_view.rs` belongs to
+    /// another writer and is only ever READ here; `kernel_service_state_code` is
+    /// a module-private `const fn` (`health_view.rs:74`) whose result is
+    /// reachable only through a real `activation_operational_view` call, which
+    /// needs the owner's live state machine, so the source pin is what this file
+    /// can measure without widening visibility or driving a lifecycle.
+    #[cfg(windows)]
+    const HEALTH_VIEW_SOURCE: &str = include_str!("health_view.rs");
+
+    /// One span of [`DAEMON_SUPERVISION_SOURCE`], from an exact opening spelling to
+    /// the exact spelling that follows it.
+    ///
+    /// Both boundaries are exact spellings, so a moved or renamed decision fails
+    /// the lookup instead of silently proving an empty slice. This is a second
+    /// reader rather than a second scheme: the `source_between` above is bound to
+    /// `THIS_FILE`, and the decision this case measures is not in this file.
+    #[cfg(windows)]
+    fn supervision_source_between(open: &str, close: &str) -> &'static str {
+        let Some(start) = DAEMON_SUPERVISION_SOURCE.find(open) else {
+            panic!("the opening spelling is in daemon_supervision.rs");
+        };
+        let Some(offset) = DAEMON_SUPERVISION_SOURCE[start..].find(close) else {
+            panic!("the closing spelling follows the opening one in daemon_supervision.rs");
+        };
+        &DAEMON_SUPERVISION_SOURCE[start..start + offset]
+    }
+
+    /// LIVENESS IS NOT READINESS (case 19).
+    ///
+    /// Every target. `mark_daemon_ready` (:2184) carries no platform attribute, and
+    /// all three verdicts asserted below are decided by its one guard at
+    /// :2204 on every target — the two arms above that guard (the `already_ready`
+    /// readback at :2190-2192 and the `supervision_unproven` refusal at
+    /// :2198-2203) are `#[cfg(windows)]` and no arm here reaches either. The
+    /// bound supervision contour is recorded under `#[cfg(windows)]` because the
+    /// slot is `#[cfg(windows)]` (`daemon_supervision.rs:458-459`); off Windows
+    /// the arms differ only in the receipt and status slots and the verdicts are
+    /// the same three.
+    ///
+    /// Docs, condensed from the read fragments (line breaks reflowed; the
+    /// fragments' own spelling otherwise reproduced):
+    /// * I14.20: "Process liveness/readiness and capability-generation state
+    ///   remain separate."
+    /// * I1.5: "The activation is not reported fully healthy merely because Host
+    ///   and Kernel are alive."
+    /// * I1.5: "An installed agent shim, hook, plugin or MCP bridge is a
+    ///   demand-start trigger only; it stores no semantic state or authority."
+    ///
+    /// The causal property: a daemon that holds the executor's exact
+    /// `ProcessStartReceipt` — and, where the slot exists, a bound supervision
+    /// contour — is ALIVE, and neither of those facts nor the `Running` status
+    /// alone reaches the owner's readiness verdict, because the verdict promotes
+    /// only from a `Running` state that still holds its receipt (:2204).
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each liveness arm, its readback and its source pin are one measured order"
+    )]
+    fn an_alive_daemon_without_a_receipt_and_a_running_status_never_reaches_readiness() {
+        let (_root, kernel) = daemon_case_kernel("liveness-not-readiness");
+        let receipt = daemon_case_receipt(1);
+
+        // ARM ONE. Every liveness coordinate production reads is present: the
+        // exact executor receipt and, where the slot exists, the bound
+        // supervision contour. Only the semantic status differs, and it is the
+        // STARTING one. A mutation that read `!= Ready` here instead of
+        // `!= Running`, or that dropped the receipt clause, promotes this daemon
+        // and fails the assertions.
+        {
+            let mut state = daemon_case_state(&kernel);
+            state.status = DaemonRuntimeStatus::Launching;
+            state.receipt = Some(receipt.clone());
+            daemon_case_bind_supervision(&mut state);
+        }
+        let (starting_logs, starting) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(
+            matches!(&starting, Err(KernelServiceError::ReadinessNotProven)),
+            "a STARTING daemon must not reach the readiness verdict: {starting:?}"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&starting_logs),
+            vec!["kernel.daemon.ready_reported".to_owned()],
+            "the whole captured daemon surface of a refused owner report: {starting_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&starting_logs, "kernel.daemon.ready_reported"),
+            "readiness_unproven",
+            "{starting_logs}"
+        );
+        // The readback is production's own record, through the lock production
+        // writes through: the refusal applied nothing.
+        {
+            let state = daemon_case_state(&kernel);
+            assert_eq!(
+                state.status,
+                DaemonRuntimeStatus::Launching,
+                "the refused report promoted the recorded daemon status"
+            );
+            assert_eq!(
+                state.receipt.as_ref(),
+                Some(&receipt),
+                "the refused report disturbed the recorded receipt"
+            );
+        }
+        assert!(
+            !kernel.daemon_ready(),
+            "the recorded status {} is not the one the readiness predicate accepts",
+            daemon_case_state_label(&DaemonRuntimeStatus::Launching),
+        );
+
+        // ARM TWO. The other half of the same guard: the status IS the live
+        // `Running` one and the supervision contour is bound, but the owner
+        // holds NO receipt, so there is no process the readiness report could be
+        // about. Liveness was asserted by this test, not proven by the owner.
+        {
+            let mut state = daemon_case_state(&kernel);
+            state.status = DaemonRuntimeStatus::Running;
+            state.receipt = None;
+            daemon_case_bind_supervision(&mut state);
+        }
+        let (receiptless_logs, receiptless) =
+            daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(
+            matches!(&receiptless, Err(KernelServiceError::ReadinessNotProven)),
+            "a Running status with no receipt must not reach the readiness verdict: {receiptless:?}"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&receiptless_logs),
+            vec!["kernel.daemon.ready_reported".to_owned()],
+            "{receiptless_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&receiptless_logs, "kernel.daemon.ready_reported"),
+            "readiness_unproven",
+            "{receiptless_logs}"
+        );
+        {
+            let state = daemon_case_state(&kernel);
+            assert_eq!(
+                state.status,
+                DaemonRuntimeStatus::Running,
+                "the refused report promoted the recorded daemon status"
+            );
+            assert!(
+                state.receipt.is_none(),
+                "the refused report installed a receipt the owner never held"
+            );
+        }
+        assert!(
+            !kernel.daemon_ready(),
+            "a Running daemon with no receipt is not the readiness the predicate accepts; the recorded status is {}",
+            daemon_case_state_label(&DaemonRuntimeStatus::Running),
+        );
+
+        // ABSENCE over the WHOLE captured surface of both refused arms, not a
+        // hand-listed name set. The mutation each one breaks is a `ready_proven`
+        // emission on a refused arm: the only `ready_proven` callsite in this
+        // file is daemon_runtime.rs:2215, which production reaches ONLY after the
+        // guard at :2204 passed. The positive role of both scans is the
+        // `ready_reported` record each capture is asserted to carry above.
+        for (label, logs) in [
+            ("the STARTING arm", &starting_logs),
+            ("the receipt-less arm", &receiptless_logs),
+        ] {
+            assert!(
+                !logs.contains("ready_proven"),
+                "{label} reached the readiness verdict in the whole capture: {logs}"
+            );
+            assert!(
+                !logs.contains("_requested"),
+                "{label} recorded a request observation on the owner-observation leg: {logs}"
+            );
+        }
+
+        // ARM THREE. The same composition, the same receipt and, where the slot
+        // exists, the same bound supervision contour, with the status the owner
+        // actually records before accepting an authenticated ready report. This
+        // is the only positive arm, and it is what makes the two refusals above
+        // measurements rather than a pair of always-false assertions.
+        {
+            let mut state = daemon_case_state(&kernel);
+            state.status = DaemonRuntimeStatus::Running;
+            state.receipt = Some(receipt.clone());
+            daemon_case_bind_supervision(&mut state);
+        }
+        let (accepted_logs, accepted) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(
+            accepted.is_ok(),
+            "the accepted owner report must succeed with the same live evidence: {accepted:?}"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&accepted_logs),
+            vec!["kernel.daemon.ready_proven".to_owned()],
+            "the whole captured daemon surface of an accepted owner report: {accepted_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&accepted_logs, "kernel.daemon.ready_proven"),
+            "success",
+            "{accepted_logs}"
+        );
+        assert!(
+            kernel.daemon_ready(),
+            "the recorded status {} is now the one the readiness predicate accepts",
+            daemon_case_state_label(&DaemonRuntimeStatus::Ready),
+        );
+
+        // WHICH SLOT PRODUCTION READS, measured on the production source of the
+        // owner's own guard rather than described. A guard that consulted a
+        // different slot, or one whose promotion wrote a different status, breaks
+        // these spellings.
+        let owner = source_between(
+            "    pub fn mark_daemon_ready(&self) -> Result<(), KernelServiceError> {",
+            "    /// Records a bounded authenticated daemon degradation.",
+        );
+        assert!(
+            owner.contains(
+                "if state.receipt.is_none() || state.status != DaemonRuntimeStatus::Running {"
+            ),
+            "the owner no longer refuses on the receipt slot AND the Running status"
+        );
+        let Some(guard) = owner
+            .find("if state.receipt.is_none() || state.status != DaemonRuntimeStatus::Running {")
+        else {
+            panic!("the owner's refusal guard is present");
+        };
+        let Some(promote) = owner.find("state.status = DaemonRuntimeStatus::Ready;") else {
+            panic!("the owner still promotes the recorded status to Ready");
+        };
+        assert!(
+            guard < promote,
+            "the owner promotes the recorded status before it refuses on the status slot"
+        );
+        // And the public verdict is decided by that same slot alone, through the
+        // owner's own predicate, which matches `Ready` and nothing else.
+        let verdict = source_between(
+            "    /// Returns whether `eliotd` has completed its authenticated ready report.",
+            "    fn daemon_failure_error(&self, reason: String) -> KernelBuildError {",
+        );
+        assert!(
+            verdict.contains("daemon_status_proves_ready(&state.status)"),
+            "the public readiness verdict no longer reads the recorded status through the owner's predicate"
+        );
+        assert!(
+            !verdict.contains("state.receipt"),
+            "the public readiness verdict now consults the receipt slot, so a live process would decide readiness"
+        );
+        assert!(daemon_status_proves_ready(&DaemonRuntimeStatus::Ready));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Running));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Launching));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Degraded(
+            String::new()
+        )));
+        // Not vacuously unequal: the status comparison the readbacks above rely
+        // on is a real one, so "the recorded status changed" would be measurable.
+        assert_ne!(
+            DaemonRuntimeStatus::Ready,
+            DaemonRuntimeStatus::Running,
+            "the daemon status compares equal regardless of the recorded value, so every readback above would measure nothing"
+        );
+    }
+
+    /// AN ACTIVATION REQUEST IS NOT AN OWNER OBSERVATION (case 6).
+    ///
+    /// `#[cfg(windows)]`: the captured owner-leg refusal asserted below is the
+    /// `supervision_unproven` verdict (:2198-2203), which is compiled only where
+    /// the supervision slot is (`daemon_supervision.rs:458-459`). The request-leg
+    /// source pins above it are not platform-specific; they are gated with the
+    /// capture they share rather than split into a second test over the same
+    /// source.
+    ///
+    /// Docs, condensed from the read fragments (line breaks reflowed; the
+    /// fragments' own `→` glyphs reproduced):
+    /// * I1.5: "An installed agent shim, hook, plugin or MCP bridge is a
+    ///   demand-start trigger only; it stores no semantic state or authority."
+    /// * I1.5 activation contour (two consecutive `→`-led steps of that
+    ///   fragment's activation block): "→ start only the remaining capabilities
+    ///   required by the admitted request → return the activation/readiness
+    ///   delta to the caller."
+    /// * I1.8: "Kernel rechecks only properties it owns and binds the
+    ///   activation/staging receipt to the same `admission_decision_digest`."
+    /// * I14.20: "Process liveness/readiness and capability-generation state
+    ///   remain separate."
+    ///
+    /// The causal property: the request legs (`recovery_requested` at :1791,
+    /// `await_requested` at :549) and the owner-observation legs
+    /// (`ready_reported` at :2195/:2201/:2206 and `ready_proven` at :2215) are
+    /// four different production callsites with four disjoint event names, so a
+    /// mutation that emitted a request observation where the owner observation
+    /// belongs — or the reverse — reddens both the captured record and the
+    /// source pins.
+    #[test]
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the two legs, the captured record and the disjointness pins are one measured order"
+    )]
+    fn an_activation_request_is_not_an_owner_readiness_observation() {
+        let (_root, kernel) = daemon_case_kernel("request-versus-observation");
+
+        // THE REQUEST LEG is real and it is recorded BEFORE the operation it
+        // requests runs. This is measured on production source because the card
+        // DEFERS live daemon-launch execution: driving `recover_eliotd` would
+        // launch a process, and a claim about a launch this test never performs
+        // is not a claim it can make.
+        let request = source_between(
+            "    async fn recover_eliotd_in_context(",
+            "    /// Bounded disposition, fresh binding, and readiness rendezvous; every",
+        );
+        assert!(
+            request.contains(
+                "observe_daemon_runtime_in_context(\"kernel.daemon.recovery_requested\", \"attempt\", context);"
+            ),
+            "the recovery request leg no longer records its own bounded request before doing anything"
+        );
+        let Some(asked) = request.find("\"kernel.daemon.recovery_requested\"") else {
+            panic!("the recovery request literal is present");
+        };
+        let Some(ran) = request.find(".recover_eliotd_inner(") else {
+            panic!("the recovery request leg no longer reaches the recovery it requests");
+        };
+        assert!(
+            asked < ran,
+            "the recovery request observation is now recorded after the recovery it requested; both offsets are located in this one request slice, and the call needle is the leading-dot spelling because production puts `match self` on :1793 and `.recover_eliotd_inner(` on :1794, so `self.recover_eliotd_inner(` is never contiguous"
+        );
+        // The request leg answers a QUESTION. It carries no readiness claim and
+        // no owner verdict, so it may never name either owner event.
+        for owner_event in ["kernel.daemon.ready_proven", "kernel.daemon.ready_reported"] {
+            assert!(
+                !request.contains(owner_event),
+                "the recovery request leg records the owner observation `{owner_event}`"
+            );
+        }
+        let rendezvous = source_between(
+            "    pub(crate) async fn await_daemon_ready(",
+            "    pub(super) async fn close_previous_daemon_process(",
+        );
+        assert!(
+            rendezvous.contains(
+                "observe_daemon_runtime_in_context(\"kernel.daemon.await_requested\", \"attempt\", context);"
+            ),
+            "the readiness rendezvous no longer records its own request before waiting"
+        );
+        for owner_event in ["kernel.daemon.ready_proven", "kernel.daemon.ready_reported"] {
+            assert!(
+                !rendezvous.contains(owner_event),
+                "the readiness rendezvous records the owner observation `{owner_event}` while only waiting"
+            );
+        }
+
+        // THE OWNER-OBSERVATION LEG is a real, separate callsite with its own
+        // vocabulary: three refusals on the report and one acceptance, and not
+        // one request-shaped name. Counted over this function's own source
+        // slice, which starts at its signature, so this test's comments cannot
+        // satisfy the count.
+        let owner = source_between(
+            "    pub fn mark_daemon_ready(&self) -> Result<(), KernelServiceError> {",
+            "    /// Records a bounded authenticated daemon degradation.",
+        );
+        assert_eq!(
+            owner.matches("kernel.daemon.").count(),
+            4,
+            "the owner-observation leg no longer carries exactly its four bounded records"
+        );
+        assert_eq!(
+            owner.matches("\"kernel.daemon.ready_proven\"").count(),
+            1,
+            "the owner-observation leg no longer claims readiness at exactly one place"
+        );
+        assert_eq!(
+            owner.matches("\"kernel.daemon.ready_reported\"").count(),
+            3,
+            "the owner-observation leg no longer names its own refusals at three places"
+        );
+        assert!(
+            !owner.contains("_requested"),
+            "the owner-observation leg now records a request observation"
+        );
+        // The two vocabularies are DISJOINT as EVENT names, which is what makes
+        // a mutation that swapped one leg's record for the other's a loud red.
+        // The EVENT name is the discriminator and not the outcome, because the
+        // outcome vocabulary genuinely overlaps: `recovery_committed` and
+        // `ready_proven` both report `success`. That overlap is measured below
+        // rather than papered over, and it is exactly why this case is an
+        // event-level claim.
+        let request_events: [&str; 2] = [
+            "kernel.daemon.recovery_requested",
+            "kernel.daemon.await_requested",
+        ];
+        let observation_events: [&str; 2] =
+            ["kernel.daemon.ready_reported", "kernel.daemon.ready_proven"];
+        for request_event in request_events {
+            assert!(
+                !owner.contains(request_event),
+                "the owner-observation leg records the request event `{request_event}`"
+            );
+        }
+        // And the positive direction: each owner-observation name is written on
+        // the owner leg, so the disjointness above is not satisfied by deleting
+        // the owner's own vocabulary instead.
+        for observation_event in observation_events {
+            assert!(
+                owner.contains(observation_event),
+                "the owner-observation leg no longer records `{observation_event}` at all"
+            );
+        }
+        assert!(
+            request.contains("\"kernel.daemon.recovery_committed\"")
+                && request.contains("\"kernel.daemon.recovery_failed\""),
+            "the recovery request leg no longer names its own commit and failure outcomes separately from its request"
+        );
+        // The overlap itself, asserted rather than described: the same outcome
+        // literal is used by one record on each leg, so the event name is the
+        // only thing that keeps the legs apart.
+        assert!(
+            request.contains(
+                "\"kernel.daemon.recovery_committed\",\n                    \"success\","
+            ) && owner.contains("\"kernel.daemon.ready_proven\", \"success\""),
+            "the shared `success` outcome literal is no longer what the two legs both report, so the overlap note above is stale"
+        );
+
+        // The record the owner leg ACTUALLY emits, captured from the real owner,
+        // for both of its verdict shapes. The exact list is the whole captured
+        // event surface, so the request leg appearing here — under any spelling
+        // this test never listed — breaks the equality.
+        {
+            let mut state = daemon_case_state(&kernel);
+            state.status = DaemonRuntimeStatus::Running;
+            state.receipt = Some(daemon_case_receipt(1));
+        }
+        let (unproven_logs, unproven) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(unproven.is_err(), "{unproven:?}");
+        assert_eq!(
+            daemon_case_daemon_events(&unproven_logs),
+            vec!["kernel.daemon.ready_reported".to_owned()],
+            "the owner leg's refusal record is not exactly one owner-observation event: {unproven_logs}"
+        );
+        {
+            let mut state = daemon_case_state(&kernel);
+            state.status = DaemonRuntimeStatus::Running;
+            state.receipt = Some(daemon_case_receipt(1));
+            state.supervision = Some(daemon_case_contour(1));
+        }
+        let (proven_logs, proven) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(proven.is_ok(), "{proven:?}");
+        assert_eq!(
+            daemon_case_daemon_events(&proven_logs),
+            vec!["kernel.daemon.ready_proven".to_owned()],
+            "the owner leg's acceptance record is not exactly one owner-observation event: {proven_logs}"
+        );
+        // REGRESSION GUARD (absence), over the WHOLE captured surface of both
+        // owner-leg records. The mutation each breaks is an emission of a
+        // REQUEST event from `mark_daemon_ready`: the request vocabulary
+        // reachable from this file is written only at :549 and :1791, and the one
+        // other request event in the composition is the launch module's own
+        // `kernel.daemon.launch_requested` (`daemon_process_launch.rs:127`, its
+        // own facade), so any request-shaped name appearing on the owner leg is a
+        // leg swap. The positive role of both scans is the single-event equality
+        // each capture is asserted to carry above.
+        for logs in [&unproven_logs, &proven_logs] {
+            assert!(
+                !logs.contains("_requested"),
+                "the owner-observation leg emitted a request record: {logs}"
+            );
+        }
+    }
+
+    /// THE ARMED DAEMON STATES STAY DISTINCT (case 18), with LIVENESS never
+    /// promoted to READINESS and an unanswered request staying unknown.
+    ///
+    /// `#[cfg(windows)]`: it drives `await_daemon_ready` (attribute at :531),
+    /// the rendezvous it measures, and records the `#[cfg(windows)]` supervision
+    /// slot through the same fixture helper.
+    ///
+    /// WHAT IS MEASURED, in the shape the code actually has and not in the
+    /// shape the card words it: one production rendezvous decides FIVE ARMED
+    /// daemon states out of the recorded owner slots — NOT a REQUESTED, a
+    /// STARTING, a READY, a DRAINING, a STOPPING and a FAILED one. Two of the
+    /// five share ONE outcome literal (`NotLaunched` and `Launching` both reach
+    /// `not_launched`, pinned by design at :573), and DRAINING and STOPPED are
+    /// not deciders of this rendezvous at all: `DaemonRuntimeStatus`
+    /// (`daemon_supervision.rs:36-43`) has no such variants, so no state this
+    /// owner records can be draining or stopped. That pair is therefore measured
+    /// where its owner decides it, at the end of this test, and this file does
+    /// not claim the rendezvous distinguishes them.
+    ///
+    /// Docs, condensed from the read fragments (line breaks reflowed; the
+    /// fragments' own `→` glyphs reproduced; `...` marks lines a quote skips):
+    /// * I14.20 service process (one source line per quoted span): "STOPPED →
+    ///   STARTING", "STARTING → RECOVERING | READY", ... "READY | DEGRADED →
+    ///   QUIESCING → STOPPED", and "Process liveness/readiness and capability-generation state remain separate."
+    /// * I14.24 containment-matrix ROW for the `eliotd` crash, reflowed from the
+    ///   fragment's table row onto comment lines: "| `eliotd` crash | Kernel
+    ///   revokes daemon epoch | external effects stop; recovery/control remain |
+    ///   compatible daemon generation; rebuild hot mirrors |"
+    /// * I14.21: "if unknown → pause Ordering Scope, preserve operation and open
+    ///   Problem State; Human/Doctor chooses evidence-backed reconciliation; no
+    ///   blind duplicate effect."
+    /// * I1.3: "A persistent Doctor agent is prohibited."
+    ///
+    /// The causal property: the owner status slot is the discriminator of the
+    /// rendezvous, each armed state reaches its own recorded verdict through it,
+    /// the wait never reaches the readiness verdict on its own authority, and a
+    /// `Running` daemon that never reports stays unknown until the wait itself
+    /// expires into a refusal — never into a synthesised readiness.
+    #[test]
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "five measured verdicts, the unanswered request and the draining/stopped pins are one order"
+    )]
+    fn the_daemon_lifecycle_states_stay_distinct_and_liveness_is_never_promoted() {
+        let (_root, kernel) = daemon_case_kernel("five-lifecycle-states");
+        let canary = "degraded-903-owner-status-canary";
+        let exact = daemon_case_receipt(1);
+        let unanswered = Duration::from_millis(1);
+
+        // Each arm records the SAME exact executor receipt and the SAME bound
+        // supervision contour, and differs only in the owner's recorded status,
+        // so every difference in the verdict below is attributable to the slot
+        // production reads and to nothing this test supplied.
+        let arms: Vec<(DaemonRuntimeStatus, bool, &str, &str)> = vec![
+            (
+                DaemonRuntimeStatus::NotLaunched,
+                false,
+                "kernel.daemon.await_rejected",
+                "not_launched",
+            ),
+            (
+                DaemonRuntimeStatus::Launching,
+                false,
+                "kernel.daemon.await_rejected",
+                "not_launched",
+            ),
+            (
+                DaemonRuntimeStatus::Ready,
+                true,
+                "kernel.daemon.await_satisfied",
+                "success",
+            ),
+            (
+                DaemonRuntimeStatus::Degraded(canary.to_owned()),
+                false,
+                "kernel.daemon.await_rejected",
+                "degraded_before_ready",
+            ),
+            (
+                DaemonRuntimeStatus::Failed(canary.to_owned()),
+                false,
+                "kernel.daemon.await_rejected",
+                "failed_before_ready",
+            ),
+        ];
+
+        // `measured` is filled ONLY from what production did: the recorded status
+        // production wrote and this test read back through the same mutex, the
+        // outcome token parsed out of the captured line for whichever verdict
+        // EVENT production actually emitted, and the `Result` the real
+        // rendezvous returned. The fixture's own expectations are compared
+        // against production one arm at a time below and are never copied into
+        // `measured`, so no comparison over `measured` can be satisfied by two
+        // values this test supplied.
+        let mut measured: Vec<(DaemonRuntimeStatus, String, bool)> = Vec::new();
+        let mut captures: Vec<String> = Vec::new();
+        for (status, expected_ok, expected_event, expected_outcome) in &arms {
+            let (logs, outcome) =
+                daemon_case_await(&kernel, status.clone(), &exact, &exact, unanswered);
+            // The REQUEST leg precedes the decision in every arm: the wait is
+            // recorded as a request first, so a satisfied wait is a request plus
+            // an answer, never an answer standing in for a request.
+            assert_eq!(
+                daemon_case_daemon_events(&logs),
+                vec![
+                    "kernel.daemon.await_requested".to_owned(),
+                    (*expected_event).to_owned(),
+                ],
+                "the rendezvous surface for the {} arm is not the request then its own verdict: {logs}",
+                daemon_case_state_label(status),
+            );
+            assert_eq!(
+                daemon_case_outcome(&logs, expected_event),
+                *expected_outcome,
+                "the {} arm verdict changed: {logs}",
+                daemon_case_state_label(status),
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                *expected_ok,
+                "the {} arm reached the wrong result: {outcome:?}",
+                daemon_case_state_label(status),
+            );
+            // The readback is production's own record: a rejected verdict applied
+            // nothing to the slot it decided on. It is the value the pairwise
+            // discriminator comparison below runs on, taken from the lock
+            // production writes through rather than from the armed fixture.
+            let recorded = {
+                let state = daemon_case_state(&kernel);
+                assert_eq!(
+                    &state.status,
+                    status,
+                    "the {} arm rewrote the recorded daemon status",
+                    daemon_case_state_label(status),
+                );
+                assert_eq!(
+                    state.receipt.as_ref(),
+                    Some(&exact),
+                    "the {} arm rewrote the recorded receipt",
+                    daemon_case_state_label(status),
+                );
+                state.status.clone()
+            };
+            // And the verdict EVENT is read off the captured surface rather than
+            // off the fixture: the equality above proved the daemon surface is
+            // exactly the request record plus one verdict record, so the record at
+            // index 1 is the one production emitted.
+            let Some(verdict_event) = daemon_case_daemon_events(&logs).get(1).cloned() else {
+                panic!(
+                    "the {} arm emitted no verdict record: {logs}",
+                    daemon_case_state_label(status)
+                );
+            };
+            measured.push((
+                recorded,
+                daemon_case_outcome(&logs, &verdict_event),
+                outcome.is_ok(),
+            ));
+            captures.push(logs);
+        }
+
+        // THE STATES ARE DISTINCT FROM ONE ANOTHER, not collapsed into a
+        // ready/not-ready pair. TWO measurements, both over production values:
+        //
+        // * the DISCRIMINATOR — the `DaemonRuntimeStatus` production wrote into
+        //   the owner record and this test read back through the same mutex — is
+        //   pairwise distinct across the five arms. This one is a NON-VACUITY
+        //   CONTROL on the word "collapsed" in the next bullet, and is labelled
+        //   as such: five different armed states would still produce five
+        //   different recorded statuses whether or not production treated them
+        //   alike, so on its own it pins no production decision.
+        // * the RECORD — the outcome production emitted for whichever event it
+        //   emitted, read out of that captured line, together with the `Result`
+        //   the real rendezvous returned — must be exactly the set of verdicts
+        //   this owner produces. THIS is the falsifiable half: a production that
+        //   merged two states onto one verdict, or invented a verdict nobody
+        //   emits, reddens it, and neither value in it was supplied here.
+        for (index, (left_status, _left_outcome, _left_ok)) in measured.iter().enumerate() {
+            for (right_status, _right_outcome, _right_ok) in &measured[index + 1..] {
+                assert_ne!(
+                    left_status,
+                    right_status,
+                    "the armed daemon states no longer read back as distinct recorded statuses: {} and {}",
+                    daemon_case_state_label(left_status),
+                    daemon_case_state_label(right_status),
+                );
+            }
+        }
+        let mut verdicts: Vec<(&str, bool)> = Vec::new();
+        for (_recorded_status, outcome, ok) in &measured {
+            let key = (outcome.as_str(), *ok);
+            if !verdicts.contains(&key) {
+                verdicts.push(key);
+            }
+        }
+        assert_eq!(
+            verdicts,
+            vec![
+                ("not_launched", false),
+                ("success", true),
+                ("degraded_before_ready", false),
+                ("failed_before_ready", false),
+            ],
+            "the recorded verdicts are no longer exactly the set this owner produces"
+        );
+
+        // MEASURED LIMIT, reported rather than hidden: production's OUTCOME
+        // vocabulary collapses REQUESTED and STARTING onto ONE literal, because
+        // `await_daemon_ready` reaches both through the single
+        // `NotLaunched | Launching` arm at :573. What is measured here is the
+        // CAPTURED SURFACE of those two arms and the RECORDS production holds for
+        // them — not this test's fixture: the `await_rejected` outcome production
+        // emitted is the same for both, and the recorded statuses production
+        // holds are two different records. So a production that later SPLIT the
+        // literal reddens the equality below and this note is then stale rather
+        // than silently wrong; a split that also RENAMED the verdict event
+        // reddens the per-arm event equality inside the arm loop instead. It is
+        // not an endorsement of the collapse.
+        assert_eq!(
+            daemon_case_outcome(&captures[0], "kernel.daemon.await_rejected"),
+            daemon_case_outcome(&captures[1], "kernel.daemon.await_rejected"),
+            "the outcome vocabulary now separates REQUESTED from STARTING, so this limit note is stale"
+        );
+        assert_ne!(
+            measured[0].0, measured[1].0,
+            "the two arms sharing one outcome literal no longer hold two different recorded daemon statuses, so the collapse above is no longer a collapse"
+        );
+
+        // AN UNANSWERED REQUEST STAYS UNKNOWN. The `Running` arm is the live,
+        // not-ready daemon whose owner never reported: the wait is a real timed
+        // wait that expires, and the expired wait is a refusal with its own
+        // bounded outcome. Production never synthesises a readiness for it and
+        // never synthesises a success either — the owner's own status slot is
+        // what records what happened.
+        let (timeout_logs, timeout) = daemon_case_await(
+            &kernel,
+            DaemonRuntimeStatus::Running,
+            &exact,
+            &exact,
+            unanswered,
+        );
+        assert!(
+            timeout.is_err(),
+            "a live daemon that never reported satisfied the readiness wait"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&timeout_logs),
+            vec![
+                "kernel.daemon.await_requested".to_owned(),
+                "kernel.daemon.await_rejected".to_owned(),
+            ],
+            "the unanswered request is not a request plus its own refusal: {timeout_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&timeout_logs, "kernel.daemon.await_rejected"),
+            "timeout",
+            "{timeout_logs}"
+        );
+        captures.push(timeout_logs);
+
+        // REGRESSION GUARD (absence), over the WHOLE captured surface of every
+        // arm above rather than a hand-listed name set. The mutation each breaks
+        // is a readiness claim emitted by the WAIT itself: the four
+        // `observe_daemon_runtime_in_context` callsites of `await_daemon_ready`
+        // (:549, :595, :604, :613) name only `await_requested`,
+        // `await_satisfied` and `await_rejected`, so any owner-readiness name on
+        // this surface is the wait deciding readiness on the owner's behalf. The
+        // positive role of the scan is the six request-plus-verdict records
+        // asserted above.
+        for (index, logs) in captures.iter().enumerate() {
+            assert!(
+                !logs.contains("ready_proven"),
+                "the rendezvous arm {index} claimed readiness on the owner's behalf: {logs}"
+            );
+            assert!(
+                !logs.contains("ready_reported"),
+                "the rendezvous arm {index} recorded an owner readiness report it cannot own: {logs}"
+            );
+            // REGRESSION GUARD (absence), the same surface: the owner's status
+            // payload. The mutation each breaks is an emission carrying
+            // `status.to_string()` or the rejection `reason` — the rejection at
+            // :563-565 builds an error string from it, and that string is
+            // returned, never logged. The positive role is the six records each
+            // capture is asserted to carry above.
+            assert!(
+                !logs.contains(canary),
+                "the owner's daemon status payload reached the sink on arm {index}: {logs}"
+            );
+        }
+
+        // DRAINING AND STOPPED ARE NOT A LIVE OR READY STATE, AND THE OWNER
+        // LIFECYCLE KEEPS THE TWO TOGETHER AS ONE PLANNED SHUTDOWN. That pair
+        // has no `DaemonRuntimeStatus` variant at all — the exhaustive label
+        // match in `daemon_case_state_label` is the evidence, because it carries
+        // no wildcard arm and adding a variant would stop this file compiling —
+        // so production's own decision for it lives in the supervision module
+        // and is read there: `daemon_owner_restart_lifecycle`
+        // (daemon_supervision.rs:173) maps `Draining` and `Stopped` onto ONE
+        // shared arm producing `PlannedShutdown` and never `Running`, and that
+        // mapped value is what `daemon_refuses_replacement` (:204) compares
+        // against `Running`. It is read rather than called because that
+        // `const fn` is private to its module and this test may not widen its
+        // visibility.
+        let owner_lifecycle = supervision_source_between(
+            "const fn daemon_owner_restart_lifecycle(",
+            "/// Returns the refusal that applies to one observed previous generation",
+        );
+        assert!(
+            owner_lifecycle
+                .contains("KernelServiceState::Draining | KernelServiceState::Stopped => {"),
+            "the daemon owner lifecycle no longer maps draining and stopped through ONE shared arm, so the collapse this assertion pins is gone"
+        );
+        assert!(
+            owner_lifecycle.contains("RestartOwnerLifecycle::PlannedShutdown"),
+            "the daemon owner lifecycle no longer names the planned-shutdown value"
+        );
+        for live in [
+            "KernelServiceState::Activating\n",
+            "| KernelServiceState::Ready\n",
+            "| KernelServiceState::Degraded => RestartOwnerLifecycle::Running",
+        ] {
+            assert!(
+                owner_lifecycle.contains(live),
+                "the daemon owner lifecycle no longer maps `{live}` to the running value"
+            );
+        }
+        // AND THE OWNER THAT DOES KEEP THEM APART, so the reading above is not
+        // read as a claim that the two are indistinguishable.
+        // `kernel_service_state_code` (health_view.rs:74) is the bounded code map
+        // behind `KernelActivationView.service_state`, and it gives `Draining` and
+        // `Stopped` two DIFFERENT codes (health_view.rs:83-84). That is the
+        // operator-visible distinction between the pair; the restart lifecycle
+        // above deliberately declines to make it. `health_view.rs` is another
+        // writer's file and is only READ here, at compile time, because
+        // `kernel_service_state_code` is module-private and its result is
+        // reachable only through a real `activation_operational_view` call on a
+        // live owner.
+        for (state, code) in [
+            ("KernelServiceState::Draining", "draining"),
+            ("KernelServiceState::Stopped", "stopped"),
+        ] {
+            assert!(
+                HEALTH_VIEW_SOURCE.contains(&format!("{state} => \"{code}\",")),
+                "the activation view no longer maps {state} to its own `{code}` code, so the operator-visible distinction between draining and stopped is gone"
+            );
+        }
+        let replacement = supervision_source_between(
+            "pub(crate) fn daemon_refuses_replacement(",
+            "/// Classifies one reconciled generation into the evidence the class rule reads.",
+        );
+        assert!(
+            replacement.contains(
+                "if daemon_owner_restart_lifecycle(owner_state) != RestartOwnerLifecycle::Running {"
+            ),
+            "the replacement refusal no longer gates on the mapped owner lifecycle"
+        );
+    }
+
+    /// AN EXACT REPLAY IS A READBACK (case 22): the already-recorded outcome is
+    /// returned from the owner, and no second transition success is claimed.
+    ///
+    /// `#[cfg(windows)]`, and NOT as a matter of convenience: what this test
+    /// measures IS the readback arm, and that arm is `#[cfg(windows)]`
+    /// (`daemon_runtime.rs:2189-2197`) and keyed on a supervision slot that does
+    /// not exist off Windows (`daemon_supervision.rs:458-459`). Off Windows
+    /// `mark_daemon_ready` has no readback arm at all — a second call on a
+    /// `Ready` record refuses with `readiness_unproven` instead — so there is no
+    /// readback here to prove, and the exactness tail reads the receipt
+    /// comparison at `daemon_runtime.rs:557` inside the same `#[cfg(windows)]` wait.
+    ///
+    /// Docs, condensed from the read fragments (line breaks reflowed; the
+    /// fragments' own `→` glyphs reproduced):
+    /// * I14.21: "Kernel queries `WriteReceipt` by idempotency key; if committed →
+    ///   reconcile ORS", and "Human/Doctor chooses evidence-backed
+    ///   reconciliation; no blind duplicate effect."
+    /// * I14.20: "Rollback is never a backward state transition."
+    /// * I1.8: "A digest, source-revision or mutation-plan mismatch returns
+    ///   `TRANSITION_DIGEST_MISMATCH`/conflict and never retries as the same
+    ///   decision."
+    ///
+    /// The causal property: `mark_daemon_ready` is idempotent only through its
+    /// readback arm, which is keyed on THREE owner slots (:2190-2192). The first
+    /// accepted report is the transition and is recorded once; the second call on
+    /// the same owner record returns the recorded outcome, changes nothing, and
+    /// claims nothing new. A mutation that made the replay a second application
+    /// — or that dropped any one of the three slots from the readback condition
+    /// — reddens here.
+    #[test]
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transition, the readback and the three per-slot cases are one measured order"
+    )]
+    fn an_exact_replay_returns_the_recorded_outcome_without_a_second_transition() {
+        let (_root, kernel) = daemon_case_kernel("replay-readback");
+        let receipt = daemon_case_receipt(1);
+        let contour = daemon_case_contour(1);
+        let foreign = daemon_case_receipt(2);
+        assert_ne!(
+            receipt, foreign,
+            "the two fixture receipts are the same record, so the exactness case measures nothing"
+        );
+
+        // THE TRANSITION. The owner records the authenticated ready report once,
+        // from a live `Running` daemon that still holds its exact receipt and its
+        // bound supervision contour.
+        {
+            let mut state = daemon_case_state(&kernel);
+            state.status = DaemonRuntimeStatus::Running;
+            state.receipt = Some(receipt.clone());
+            state.supervision = Some(contour.clone());
+        }
+        let (transition_logs, transition) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(transition.is_ok(), "{transition:?}");
+        assert_eq!(
+            daemon_case_daemon_events(&transition_logs),
+            vec!["kernel.daemon.ready_proven".to_owned()],
+            "the transition is not exactly one readiness record: {transition_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&transition_logs, "kernel.daemon.ready_proven"),
+            "success",
+            "{transition_logs}"
+        );
+        let Some(recorded_supervision) = ({
+            let state = daemon_case_state(&kernel);
+            assert_eq!(
+                state.status,
+                DaemonRuntimeStatus::Ready,
+                "the accepted transition did not record the owner status"
+            );
+            assert_eq!(
+                state.receipt.as_ref(),
+                Some(&receipt),
+                "the accepted transition did not keep the owner's own receipt"
+            );
+            state.supervision.clone()
+        }) else {
+            panic!("the accepted transition dropped the bound supervision contour")
+        };
+
+        // THE REPLAY. The same owner record, presented again. The owner returns
+        // the already-recorded outcome and claims no new transition.
+        let (replay_logs, replay) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+        assert!(
+            replay.is_ok(),
+            "the readback arm must return the recorded outcome: {replay:?}"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&replay_logs),
+            vec!["kernel.daemon.ready_reported".to_owned()],
+            "the replay is not exactly one owner report record: {replay_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&replay_logs, "kernel.daemon.ready_reported"),
+            "already_ready",
+            "{replay_logs}"
+        );
+        // THE REPLAY APPLIED NOTHING. Read back through the same mutex: this is
+        // what separates "the owner returned its recorded outcome" from "a second
+        // application happened to produce the same answer".
+        {
+            let state = daemon_case_state(&kernel);
+            assert_eq!(
+                state.status,
+                DaemonRuntimeStatus::Ready,
+                "the replay rewrote the recorded status"
+            );
+            assert_eq!(
+                state.receipt.as_ref(),
+                Some(&receipt),
+                "the replay rewrote the recorded receipt"
+            );
+            assert_eq!(
+                state.supervision.as_ref(),
+                Some(&recorded_supervision),
+                "the replay disturbed the recorded supervision contour"
+            );
+        }
+        assert!(
+            kernel.daemon_ready(),
+            "the recorded owner state is still ready"
+        );
+
+        // EXACTLY ONE SUCCESS CLAIM across the WHOLE captured surface of both
+        // calls, not a per-capture hand list. The mutation this breaks is a
+        // second `ready_proven` emission on the readback arm: the only such
+        // callsite in this file is :2215, reached only after the guard at :2204.
+        let whole = format!("{transition_logs}{replay_logs}");
+        assert_eq!(
+            daemon_case_events(&whole)
+                .iter()
+                .filter(|event| event.as_str() == "kernel.daemon.ready_proven")
+                .count(),
+            1,
+            "the replay claimed a second transition success: {whole}"
+        );
+        assert_eq!(
+            daemon_case_events(&replay_logs)
+                .iter()
+                .filter(|event| event.as_str() == "kernel.daemon.ready_proven")
+                .count(),
+            0,
+            "the replay recorded a readiness success: {replay_logs}"
+        );
+
+        // WHICH SLOTS THE READBACK READS, one at a time. Each case restores an owner
+        // record and removes exactly ONE of the three conditions at :2190-2192,
+        // so a readback condition dropped or widened in production reddens the
+        // case for that slot and not for the others. What the remaining two slots
+        // DO with the record differs — the refusal guard refuses one, and the
+        // promotion path treats the other as a fresh report — so each case pins
+        // its own real verdict rather than one invented outcome.
+        for (slot, recorded, expected_event, expected_outcome, expected_ok) in [
+            (
+                "the receipt slot",
+                (DaemonRuntimeStatus::Ready, None, Some(contour.clone())),
+                "kernel.daemon.ready_reported",
+                "readiness_unproven",
+                false,
+            ),
+            (
+                "the status slot",
+                (
+                    DaemonRuntimeStatus::Running,
+                    Some(receipt.clone()),
+                    Some(contour.clone()),
+                ),
+                "kernel.daemon.ready_proven",
+                "success",
+                true,
+            ),
+            (
+                "the supervision slot",
+                (DaemonRuntimeStatus::Ready, Some(receipt.clone()), None),
+                "kernel.daemon.ready_reported",
+                "supervision_unproven",
+                false,
+            ),
+        ] {
+            {
+                let mut state = daemon_case_state(&kernel);
+                state.status = recorded.0;
+                state.receipt = recorded.1;
+                state.supervision = recorded.2;
+            }
+            let (logs, outcome) = daemon_case_capture_with(|| kernel.mark_daemon_ready());
+            assert_eq!(
+                outcome.is_ok(),
+                expected_ok,
+                "{slot}: the arm reached the wrong result: {outcome:?}"
+            );
+            assert_eq!(
+                daemon_case_daemon_events(&logs),
+                vec![expected_event.to_owned()],
+                "{slot}: the whole daemon observation surface is not that one record: {logs}"
+            );
+            assert!(
+                !logs.contains("already_ready"),
+                "the readback no longer reads {slot}, so a replay with that slot absent is still a readback: {logs}"
+            );
+            assert_eq!(
+                daemon_case_outcome(&logs, expected_event),
+                expected_outcome,
+                "{slot}: the verdict changed: {logs}"
+            );
+            // And the record itself still names no readiness claim on the two
+            // refusal arms. The whole raw surface is scanned, so the absence is
+            // not read off a list this test wrote. The mutation each breaks is a
+            // `ready_proven` emission reached before the guard at :2204.
+            if !expected_ok {
+                assert!(
+                    !logs.contains("ready_proven"),
+                    "{slot}: a refused replay still claimed readiness: {logs}"
+                );
+            }
+        }
+
+        // EXACTNESS OF THE RECEIPT THE READBACK ANSWERS. The owner's wait binds
+        // readiness to the whole receipt record (:557), not to the mere presence
+        // of one, so a request naming a different launched receipt is refused
+        // instead of reading the owner's readiness back.
+        let (bound_logs, bound) = daemon_case_await(
+            &kernel,
+            DaemonRuntimeStatus::Ready,
+            &receipt,
+            &receipt,
+            Duration::from_millis(1),
+        );
+        assert!(
+            bound.is_ok(),
+            "the exact recorded receipt must be read back: {bound:?}"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&bound_logs),
+            vec![
+                "kernel.daemon.await_requested".to_owned(),
+                "kernel.daemon.await_satisfied".to_owned(),
+            ],
+            "{bound_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&bound_logs, "kernel.daemon.await_satisfied"),
+            "success",
+            "{bound_logs}"
+        );
+        let (foreign_logs, foreign_outcome) = daemon_case_await(
+            &kernel,
+            DaemonRuntimeStatus::Ready,
+            &receipt,
+            &foreign,
+            Duration::from_millis(1),
+        );
+        assert!(
+            foreign_outcome.is_err(),
+            "a different launched receipt satisfied the readiness wait"
+        );
+        assert_eq!(
+            daemon_case_daemon_events(&foreign_logs),
+            vec![
+                "kernel.daemon.await_requested".to_owned(),
+                "kernel.daemon.await_rejected".to_owned(),
+            ],
+            "{foreign_logs}"
+        );
+        assert_eq!(
+            daemon_case_outcome(&foreign_logs, "kernel.daemon.await_rejected"),
+            "receipt_mismatch",
+            "{foreign_logs}"
+        );
+        // REGRESSION GUARD (absence), over the WHOLE captured surface of the
+        // refused readback. The mutation each breaks is a readiness claim derived
+        // from the mere presence of a receipt rather than from its exact value —
+        // the `receipt_mismatch` refusal at :583-589 exists precisely so an
+        // unanswered-for receipt cannot be reported as the owner's readiness. The
+        // positive role is the `await_requested`/`await_rejected` record the same
+        // capture is asserted to carry above.
+        assert!(
+            !foreign_logs.contains("await_satisfied") && !foreign_logs.contains("ready_proven"),
+            "a mismatched receipt was reported as a satisfied readback: {foreign_logs}"
+        );
+    }
+}
