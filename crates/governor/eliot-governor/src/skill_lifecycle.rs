@@ -417,7 +417,7 @@ fn action_str(action: eliot_skill::LifecycleAction) -> &'static str {
 /// Builds the `ApplyLifecyclePolicy` semantic-command parameters.
 ///
 /// Every term that distinguishes one promotion from another has to be in the
-/// canonical bytes. `I6.08`: reusing one idempotency key with different
+/// canonical bytes. `I6.8`: reusing one idempotency key with different
 /// canonical bytes is always `IDENTITY_CONFLICT`, so the gate's independent
 /// route count, shared-or-critical depth marker and reversibility travel here
 /// as first-class parameters rather than only as a count of proof refs. A gate
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn changed_gate_terms_under_one_operation_identity_conflict_instead_of_replaying() {
-        // `I6.08`: reusing one idempotency key with different canonical bytes
+        // `I6.8`: reusing one idempotency key with different canonical bytes
         // is always IDENTITY_CONFLICT. `independent_route_count` and
         // `is_shared_or_critical` are gate terms that do not change the
         // verifier, the approval or the evidence set, so before they entered
