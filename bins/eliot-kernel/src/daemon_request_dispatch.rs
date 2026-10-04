@@ -5233,6 +5233,16 @@ impl KernelComposition {
         lease_id: &str,
     ) -> Result<(), TransportError> {
         self.promote_agent_bridge_profile(None)?;
+        // Issue #88, acceptance "lease expiry ... remains visible in
+        // readiness/Governance Profile". Readiness already fails closed and the
+        // dependent effect admission is revoked above, but the Governance
+        // Profile's supervision axis was only ever withdrawn by a new activation
+        // contour (`control_plane.rs:429`), so an expired lease left it standing.
+        // Withdrawing it here keeps one expiry meaning across every surface, and
+        // only a new Host-observed Watchdog branch under a new contour can
+        // re-establish it.
+        self.revoke_supervision_evidence()
+            .map_err(|_| TransportError::SessionFenced)?;
         observe_daemon_request(
             "kernel.daemon.supervision_expired_effects_revoked",
             "success",
