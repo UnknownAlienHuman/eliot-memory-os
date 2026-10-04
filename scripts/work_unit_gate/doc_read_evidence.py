@@ -140,14 +140,34 @@ BLOCK_END = "<!-- eliot-doc-read-evidence:v2:end -->"
 #   its callers already rely on.
 #
 #   MEASURED CEILING of that rule, so it is not read as broader than it is. It
-#   fires only when the value names one of the ten fixed whole-value literals or
-#   an angle slot, and only one content word is needed to defeat it: "placeholder
-#   fix", "the topic is tbd" and "see receipts for details about issue 2965" are
-#   all accepted today, while an evasion that names no listed literal is untouched
-#   ("n/a", "TODO: fix later", "see the diff"). Both are accepted residuals under
-#   the card's rule, which refuses a value whose ENTIRE informational content is
-#   an evasion plus filler; both are recorded rather than silently widened,
-#   because the trigger set is a contract decision this module does not own.
+#   fires only when the value names one of the eleven fixed whole-value literals
+#   or an angle slot, and one content word is still enough to defeat it:
+#   "placeholder fix", "the topic is tbd" and "see receipts for details about
+#   issue 2965" are accepted today, while an evasion that names no listed literal
+#   is untouched ("n/a", "TODO: fix later", "see the diff"). Those are accepted
+#   residuals under the rule, which refuses a value whose ENTIRE informational
+#   content is an evasion plus filler; they are recorded rather than silently
+#   widened, because widening the TRIGGER SET is a contract decision this module
+#   does not own.
+#
+#   TWO defects inside that rule were repaired rather than recorded, because
+#   neither is a trigger-set question - each was a case where the rule refused
+#   less than its own stated design allows. Both are pinned by executed
+#   assertions in `run_acceptance`, and both were falsified by re-running the
+#   suite with the pre-repair behaviour restored (exactly those assertions
+#   fail, nothing else):
+#
+#   1. CONJUNCTION INVERSION. "n/a" is a recorded accepted residual, and
+#      "see above" is a refused evasion, yet "n/a - see above" - strictly MORE
+#      evasive than either half - was accepted, because `_PROSE_WORD_RE`
+#      tokenizes "n/a" into the non-filler word "n". Acknowledged non-answers
+#      are now stripped from the residue, but only once an evasion or slot has
+#      already triggered, so "n/a" alone keeps its recorded acceptance.
+#   2. ARM ASYMMETRY. The slot pattern carried an arbitrary 64-character bound,
+#      so an inline slot of 65+ characters was invisible to this arm while the
+#      machine arm - which tests only for "<" and ">" - refused the very same
+#      string. The bound is removed; a sweep asserts the two arms no longer
+#      disagree in the direction that lets an evasion through.
 _PLACEHOLDER_TOKENS = (
     "see receipt",
     "as listed above",
@@ -175,8 +195,33 @@ _WHOLE_SLOT_RE = re.compile(r"\A<[^<>]*>\Z")
 _EVASION_PROSE_RE = re.compile(
     "|".join(re.escape(token) for token in sorted(_WHOLE_VALUE_EVASIONS, key=len, reverse=True))
 )
-_SLOT_REFERENCE_RE = re.compile(r"<[^<>]{0,64}>")
+# A slot reference is an angle-bracketed run, at ANY length. The bound this
+# regex used to carry (``{0,64}``) made an inline slot of 65+ characters
+# invisible to the descriptive arm while the machine arm refused the very same
+# string, because :func:`_is_placeholder` tests only for the presence of "<"
+# and ">". That contradicts the one-validator/two-arms design stated above, so
+# the bound is removed rather than raised: an arbitrary length limit is not a
+# property of slots, and no legitimate descriptive value is refused for naming
+# one unless nothing but filler remains.
+_SLOT_REFERENCE_RE = re.compile(r"<[^<>]*>")
 _PROSE_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# Acknowledged non-answers: forms this module RECORDS as accepted residuals
+# (see the ``accepted-residual`` assertions in :func:`run_acceptance` and the
+# measured-scope note below) which nevertheless state no causal property of
+# their own.
+#
+# They are stripped from the residue ONLY when an evasion token or a slot
+# reference has already triggered the meaning test, which fixes a measured logic
+# inversion: ``_is_placeholder_prose("see receipt")`` refuses and
+# ``_is_placeholder_prose("n/a")`` accepts, yet ``"n/a - see above"`` - strictly
+# more evasive than either half - was accepted, because ``_PROSE_WORD_RE``
+# tokenizes "n/a" into the non-filler word "n". Stripping the acknowledged
+# non-answer instead lets the surviving half decide, so the conjunction refuses
+# while ``"n/a"`` on its own keeps the acceptance this module already records.
+_RESIDUAL_NON_CONTENT_RE = re.compile(
+    r"\bn\s*[./\s]\s*a\b|\bn\.\s*a\.?\b|\bna\b|\bnone\b|\bnull\b|\bnil\b",
+    re.IGNORECASE,
+)
 # Words that carry no subject matter of their own: function words, procedural
 # filler ("pending review", "for details") and pointer words that send the
 # reader to another artifact instead of stating the property. A value whose
@@ -370,6 +415,7 @@ def _is_evasion_plus_filler(text: str) -> bool:
         return False
     residue = _EVASION_PROSE_RE.sub(" ", core)
     residue = _SLOT_REFERENCE_RE.sub(" ", residue)
+    residue = _RESIDUAL_NON_CONTENT_RE.sub(" ", residue)
     words = _PROSE_WORD_RE.findall(residue)
     return not any(word not in _PROSE_FILLER_WORDS for word in words)
 
@@ -2378,6 +2424,17 @@ def _write_seed(root: Path) -> None:
         "max_required_bytes = 393216\n"
         "\n"
         "[[route]]\n"
+        'id = "seed-docs"\n'
+        'description = "Sanitized acceptance normative-prose route."\n'
+        'path_globs = ["docs/**"]\n'
+        'topic_keywords = ["normative prose obligation"]\n'
+        'required_handles = ["I0.1"]\n'
+        "optional_handles = []\n"
+        "required_files = []\n"
+        "optional_files = []\n"
+        "max_required_bytes = 393216\n"
+        "\n"
+        "[[route]]\n"
         'id = "seed-source"\n'
         'description = "Sanitized acceptance source route."\n'
         'path_globs = ["src/**"]\n'
@@ -2442,12 +2499,25 @@ def _git_seed(root: Path, *arguments: str) -> None:
     )
 
 
-def _build_acceptance_repo() -> tuple[Path, str, str, str]:
+def _build_acceptance_repo(variant: str = "multi-route") -> tuple[Path, str, str, str]:
     """Build the hermetic sanitized repository and its base/candidate revisions.
 
-    The candidate change is deliberately multi-route and deliberately includes a
-    modification, a DELETION, a RENAME and a GENERATED file, so every one of
-    them participates in the changed-path denominator.
+    The default candidate change is deliberately multi-route and deliberately
+    includes a modification, a DELETION, a RENAME and a GENERATED file, so every
+    one of them participates in the changed-path denominator.
+
+    Two further candidates exist because their acceptance clause cannot be
+    reached by mutating a body:
+
+    ``docs-only``
+        The candidate touches NOTHING but normative prose. Implementation item 8
+        and acceptance A9 forbid a blanket documentation-only exemption, so this
+        candidate must still route, still carry required handles, and still admit
+        a genuinely valid envelope.
+    ``local-evidence``
+        The candidate additionally commits ``.eliot/docs-read-bundle.md``.
+        Implementation item 14 requires local evidence to stay out of Git, and
+        ``.gitignore`` alone is advisory, so the merge boundary must refuse.
     """
     directory = tempfile.mkdtemp(prefix="eliot-doc-read-acceptance-")
     root = Path(directory)
@@ -2464,12 +2534,27 @@ def _build_acceptance_repo() -> tuple[Path, str, str, str]:
     _git_seed(root, "commit", "-m", "seed")
     base = _git(root, "rev-parse", "HEAD")
 
-    # The candidate: an added source module (route seed-source), a generated
-    # output (route seed-generated), a deleted tracked file, and a rename.
-    (root / "src" / "core" / "added.rs").write_text("pub fn added() {}\n", encoding="utf-8", newline="\n")
-    (root / "generated" / "schema.json").write_text('{"generated": true}\n', encoding="utf-8", newline="\n")
-    (root / "src" / "core" / "legacy.rs").unlink()
-    (root / "src" / "core" / "mod.rs").rename(root / "src" / "core" / "lib.rs")
+    if variant == "docs-only":
+        # Only normative prose changes. No source, no generated output, no
+        # deletion and no rename, so every denominator entry is a docs path.
+        (root / DOCS_ONLY_NOTE).parent.mkdir(parents=True, exist_ok=True)
+        (root / DOCS_ONLY_NOTE).write_text(
+            "Normative prose edited by the sanitized acceptance candidate.\n",
+            encoding="utf-8", newline="\n",
+        )
+    else:
+        # The candidate: an added source module (route seed-source), a generated
+        # output (route seed-generated), a deleted tracked file, and a rename.
+        (root / "src" / "core" / "added.rs").write_text("pub fn added() {}\n", encoding="utf-8", newline="\n")
+        (root / "generated" / "schema.json").write_text('{"generated": true}\n', encoding="utf-8", newline="\n")
+        (root / "src" / "core" / "legacy.rs").unlink()
+        (root / "src" / "core" / "mod.rs").rename(root / "src" / "core" / "lib.rs")
+        if variant == "local-evidence":
+            # `.gitignore` is advisory, so the merge boundary must catch this.
+            (root / ".eliot").mkdir(parents=True, exist_ok=True)
+            (root / ".eliot" / "docs-read-bundle.md").write_text(
+                "# local reading bundle\n", encoding="utf-8", newline="\n",
+            )
     _git_seed(root, "add", "-A")
     _git_seed(root, "commit", "-m", "candidate")
     candidate = _git(root, "rev-parse", "HEAD")
@@ -2944,6 +3029,11 @@ def _run_concurrent_acceptance(surprising: list[str]) -> tuple[Path, int]:
 
 ACCEPTANCE_TOPIC = "seed source and seed generated acceptance routing"
 
+# Acceptance A9 / implementation item 8: a normative-prose-only change must
+# still route. These name the docs-only candidate and its causal property.
+DOCS_ONLY_NOTE = "docs/architecture/A00-09-seed-note.md"
+DOCS_ONLY_TOPIC = "state the sanitized normative prose obligation"
+
 # An evasion that is deliberately NOT one of the fixed whole-value literals: an
 # evasion token plus filler. It must refuse.
 OFF_LITERAL_PLACEHOLDER_TOPIC = "see receipts for details"
@@ -2978,6 +3068,68 @@ _TOPIC_SCOPED_MUTATION_TOPICS = {
     "placeholder_discussing_topic": PLACEHOLDER_DISCUSSING_TOPIC,
 }
 
+def _run_candidate_variant_acceptance(
+    variant: str,
+    topic: str,
+    expect: EvidenceFailure | None,
+    require_routing: bool,
+    surprising: list[str],
+    variant_roots: list[Path],
+) -> int:
+    """Execute one acceptance clause that needs its own hermetic candidate.
+
+    A body mutation cannot reach either clause: acceptance A9 is about WHICH
+    PATHS the final candidate changed, and implementation item 14 is about what
+    the candidate TREE carries. Both are properties of the candidate, so each
+    builds its own sanitized repository, computes a genuinely valid envelope for
+    that candidate, and runs the one real entry point over it.
+    """
+    root, base, candidate, _ = _build_acceptance_repo(variant)
+    variant_roots.append(root)
+    body = _valid_envelope(root, base, candidate, topic)
+    label = f"candidate-{variant}"
+    try:
+        result = verify(root, base, candidate, body)
+    except EvidenceError as exc:
+        if expect is not None and exc.code is expect:
+            print(f"  {label}: FAIL-CLOSED {exc.code.value} (the named clause refuses)")
+            return 1
+        if expect is None:
+            surprising.append(f"{label}: got {exc.code.value}, want a PASS")
+            print(f"  {label}: UNEXPECTED-FAIL {exc.code.value} (want a PASS)")
+            return 0
+        surprising.append(f"{label}: got {exc.code.value}, want {expect.value}")
+        print(f"  {label}: WRONG-CODE {exc.code.value} != {expect.value}")
+        return 0
+    if expect is not None:
+        surprising.append(f"{label}: unexpectedly passed, want {expect.value}")
+        print(f"  {label}: UNEXPECTED-PASS (want {expect.value})")
+        return 0
+    # A docs-only change must still be routed: an exemption would show up as no
+    # matched route or an empty required set, so both are asserted, not assumed.
+    if require_routing:
+        if not result["matched_routes"]:
+            surprising.append(f"{label}: passed with no matched route (blanket docs exemption)")
+            print(f"  {label}: UNEXPECTED-PASS-WITHOUT-ROUTING matched_routes=[]")
+            return 0
+        if not result["required_items"]:
+            surprising.append(f"{label}: passed with no required item (blanket docs exemption)")
+            print(f"  {label}: UNEXPECTED-PASS-WITHOUT-REQUIRED required_items=0")
+            return 0
+        if not all(path.startswith("docs/") for path in result["changed_paths"]):
+            surprising.append(f"{label}: candidate changed a non-docs path: {result['changed_paths']}")
+            print(f"  {label}: WRONG-DENOMINATOR {result['changed_paths']}")
+            return 0
+    print(
+        f"  {label}: PASS routes={','.join(result['matched_routes'])} "
+        f"required={result['required_items']} paths={len(result['changed_paths'])} "
+        f"(normative prose is still routed)"
+        if require_routing
+        else f"  {label}: PASS"
+    )
+    return 1
+
+
 ACCEPTANCE_CASES: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
     ("empty", "pr_2963_empty.md", EvidenceFailure.EMPTY_DOCUMENTATION_EVIDENCE,
      "the exact #2963 free-text block plus its prose attestation cannot pass"),
@@ -2985,6 +3137,15 @@ ACCEPTANCE_CASES: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
      "duplicate/ambiguous marker blocks fail"),
     ("placeholder", "pr_placeholder_prose.md", EvidenceFailure.ROUTER_INPUT_MISMATCH,
      "placeholder prose standing in for the recorded causal property is rejected"),
+    # Acceptance A7 / implementation item 6, final clause: "prose outside the
+    # structured block attempting to override a failure". This body carries a
+    # well-formed envelope whose every field is a plausible non-placeholder value,
+    # and prose that explicitly claims to override any machine failure. The
+    # verdict must still come from the envelope's own field comparison, because
+    # :func:`_extract_envelope` slices strictly between the markers and never
+    # reads the trailing prose.
+    ("prose-override", "pr_prose_override.md", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+     "prose outside the block claiming to override a machine failure changes nothing"),
 )
 
 
@@ -2997,6 +3158,41 @@ def _apply_mutation(valid_body: str, mutation: str) -> str:
     if mutation == "fabricated_receipts":
         mutated["route_receipt_id"] = "sha256:" + "a1" * 32
         mutated["read_receipt_id"] = "sha256:" + "b2" * 32
+    elif mutation == "fabricated_read_receipt":
+        # Acceptance A2, second half: only the READ receipt is forged. The route
+        # receipt is compared first (see :func:`_compare_router_input`), so a
+        # mutation that moved both ids could never observe READ_RECEIPT_MISMATCH.
+        mutated["read_receipt_id"] = "sha256:" + "b2" * 32
+    elif mutation == "break_route_rules_digest":
+        # Acceptance A6, "changed route rules": the recorded route-rules digest
+        # must equal the one recomputed from the final candidate tree.
+        mutated["contract_inputs"]["route_rules_sha256"] = "b" * 64
+    elif mutation == "break_handle_index_digest":
+        # Acceptance A6, "handle index": the same obligation for the handle index.
+        mutated["contract_inputs"]["handle_index_sha256"] = "c" * 64
+    elif mutation == "duplicate_required_item":
+        # Acceptance A8, "represented once": a required item may appear once only.
+        mutated["required_items"] = list(mutated["required_items"]) + [mutated["required_items"][0]]
+    elif mutation == "duplicate_changed_path":
+        # Acceptance A8, "represented once", for the changed-path denominator.
+        mutated["changed_paths"] = list(mutated["changed_paths"]) + [mutated["changed_paths"][0]]
+    elif mutation == "duplicate_optional_expansion":
+        # Acceptance A8/A10: one claimed optional expansion per path.
+        mutated["optional_expansions"] = list(mutated["optional_expansions"]) + [mutated["optional_expansions"][0]]
+    elif mutation == "drop_generated_path":
+        # Acceptance A5: a GENERATED file participates in the denominator, so
+        # omitting exactly this one must fail and name it.
+        mutated["changed_paths"] = [p for p in mutated["changed_paths"] if p != "generated/schema.json"]
+    elif mutation == "drop_deleted_path":
+        # Acceptance A5: a DELETION participates too. _changed_paths uses
+        # --diff-filter=ACMRTUXBD, so the deleted path is in the denominator.
+        mutated["changed_paths"] = [p for p in mutated["changed_paths"] if p != "src/core/legacy.rs"]
+    elif mutation == "optional_none_with_omitted_required":
+        # Acceptance A10, second conjunct: `none` is valid only when no required
+        # item is omitted. Both halves are applied together, because neither
+        # half alone exercises the clause.
+        mutated["optional_expansions"] = "none"
+        mutated["required_items"] = mutated["required_items"][:-1]
     elif mutation == "stale_base":
         mutated["base_sha"] = "sha256:" + "0" * 64
     elif mutation == "stale_tree":
@@ -3134,8 +3330,42 @@ def run_acceptance(_live_root: Path) -> int:
              "not on literal membership"),
             ("placeholder-discussing-topic", "placeholder_discussing_topic", None,
              "legitimate prose that discusses placeholders is accepted and the envelope passes"),
+            # Acceptance A2: the read receipt has its own typed code, reachable
+            # only when the route receipt still reproduces.
+            ("read-receipt", "fabricated_read_receipt", EvidenceFailure.READ_RECEIPT_MISMATCH,
+             "a forged READ receipt id fails recomputation with its own typed code, not the route one"),
+            # Acceptance A6: the contract inputs are compared against the final
+            # candidate tree, so changed route rules or handle index fail closed.
+            ("route-rules-digest", "break_route_rules_digest", EvidenceFailure.STALE_SOURCE_TREE,
+             "a changed route-rules digest fails closed against the final candidate tree"),
+            ("handle-index-digest", "break_handle_index_digest", EvidenceFailure.STALE_SOURCE_TREE,
+             "a changed handle-index digest fails closed against the final candidate tree"),
+            # Acceptance A8: "every required item and exact current digest
+            # represented once".
+            ("duplicate-required-item", "duplicate_required_item",
+             EvidenceFailure.REQUIRED_ITEM_MISMATCH,
+             "a required item represented twice fails instead of counting once"),
+            ("duplicate-changed-path", "duplicate_changed_path",
+             EvidenceFailure.UNCOVERED_CHANGED_PATH,
+             "a changed path represented twice fails instead of counting once"),
+            ("duplicate-optional-expansion", "duplicate_optional_expansion",
+             EvidenceFailure.REQUIRED_ITEM_MISMATCH,
+             "one claimed optional expansion per path: a repeat fails"),
+            # Acceptance A5: participation is proved by a targeted negative, not
+            # only by the positive multi-route pass.
+            ("drop-generated-path", "drop_generated_path", EvidenceFailure.UNCOVERED_CHANGED_PATH,
+             "a GENERATED file participates in the denominator: omitting it fails and names it"),
+            ("drop-deleted-path", "drop_deleted_path", EvidenceFailure.UNCOVERED_CHANGED_PATH,
+             "a DELETION participates in the denominator: omitting it fails and names it"),
+            # Acceptance A10: `none` plus an omitted required item.
+            ("optional-none-omits-required", "optional_none_with_omitted_required",
+             EvidenceFailure.REQUIRED_ITEM_MISMATCH,
+             "optional 'none' is invalid once a required item is omitted"),
         )
         surprising: list[str] = []
+        # Acceptance A14: every PASS must report the honest proof ceiling. The
+        # count is kept separately because `total` is only summed after the loop.
+        proof_ceiling_checks = 0
         # The three committed free-text/body-parser samples are verified verbatim.
         for name, fixture, expect, note in ACCEPTANCE_CASES:
             try:
@@ -3154,6 +3384,18 @@ def run_acceptance(_live_root: Path) -> int:
             code, result = _verify_mutation(root, base, candidate, source_body, mutation)
             if expect is None:
                 if code is None and result is not None:
+                    # Acceptance A14: a PASS is reported with its honest proof
+                    # ceiling. Asserting it here makes the constant a checked
+                    # property of a passing run instead of a string that merely
+                    # happens to be emitted.
+                    if result.get("proof_ceiling") != PROOF_CEILING:
+                        surprising.append(
+                            f"{name}: proof_ceiling is {result.get('proof_ceiling')!r}, "
+                            f"want {PROOF_CEILING!r}"
+                        )
+                        print(f"  {name}: WRONG-PROOF-CEILING {result.get('proof_ceiling')!r}")
+                    else:
+                        proof_ceiling_checks += 1
                     print(
                         f"  {name}: PASS routes={','.join(result['matched_routes'])} "
                         f"required={result['required_items']} paths={len(result['changed_paths'])} "
@@ -3167,7 +3409,7 @@ def run_acceptance(_live_root: Path) -> int:
             else:
                 surprising.append(f"{name}: got {code}, want {expect.value}")
                 print(f"  {name}: WRONG-CODE {code} != {expect.value} ({note})")
-        total = len(ACCEPTANCE_CASES) + len(expectations)
+        total = len(ACCEPTANCE_CASES) + len(expectations) + proof_ceiling_checks
         # Issue #4634 concurrent-movement phase: the frozen-graph refusal plus
         # the bounded composition and its negative cases, all through the same
         # real verifier entry point.
@@ -3185,6 +3427,15 @@ def run_acceptance(_live_root: Path) -> int:
             ("TBD pending review", "Handle Vec<T> in the response conversion"),
             ("placeholder text pending review", "Implement typed fallback response"),
             ("the <topic> is recorded above", "Reject unresolved template placeholders"),
+            # Defect 1 repair, second pass (issue #2965 audit 5919739325): a value
+            # conjoining an individually-refused evasion with an acknowledged
+            # non-answer is MORE evasive than either half, so it must refuse.
+            ("n/a - see above", "none of the routes matched the recorded topic"),
+            ("n/a see receipt", "Handle the generated identifier in the response conversion"),
+            # Defect 1 repair: an angle slot is a slot at any length. The machine
+            # arm refuses the 70-character form (it tests only for "<" and ">"),
+            # so the descriptive arm must agree rather than be the weaker one.
+            ("see receipts <" + "z" * 70 + ">", "Reject duplicate reader members before normalization"),
         ):
             for value, want_refusal in ((refuse, True), (accept, False)):
                 got = _is_placeholder_prose(value)
@@ -3211,6 +3462,41 @@ def run_acceptance(_live_root: Path) -> int:
             else:
                 print(f"  accepted-residual({residual!r}): ACCEPTED as recorded")
                 total += 1
+        # The machine arm refuses any value containing an angle slot; the
+        # descriptive arm must never be the weaker of the two on the same
+        # string, or an evasion reaches a descriptive field that the machine arm
+        # would have refused. Swept over every evasion token and a range of slot
+        # lengths, because the defect this pins was a length bound.
+        asymmetric: list[str] = []
+        for token in _WHOLE_VALUE_EVASIONS:
+            for slot_body in ("a", "x" * 64, "y" * 65, "z" * 200, "topic", "path digest sha256"):
+                probe_value = f"{token} <{slot_body}> pending review"
+                if _is_placeholder(probe_value) and not _is_placeholder_prose(probe_value):
+                    asymmetric.append(probe_value)
+        if asymmetric:
+            surprising.append(
+                f"arm-agreement: machine arm refuses but descriptive arm accepts {len(asymmetric)} "
+                f"value(s), first {asymmetric[0]!r}"
+            )
+            print(f"  arm-agreement: ASYMMETRIC x{len(asymmetric)} first={asymmetric[0]!r}")
+        else:
+            print("  arm-agreement: the two arms agree on every swept slot-bearing evasion")
+            total += 1
+        # Acceptance A9 and implementation item 14 need their own CANDIDATE, so
+        # they are executed against separately built hermetic repositories rather
+        # than as body mutations.
+        variant_roots: list[Path] = []
+        try:
+            total += _run_candidate_variant_acceptance(
+                "docs-only", DOCS_ONLY_TOPIC, None, True, surprising, variant_roots,
+            )
+            total += _run_candidate_variant_acceptance(
+                "local-evidence", ACCEPTANCE_TOPIC,
+                EvidenceFailure.LOCAL_EVIDENCE_COMMITTED, None, surprising, variant_roots,
+            )
+        finally:
+            for variant_root in variant_roots:
+                shutil.rmtree(variant_root, ignore_errors=True)
         if surprising:
             print(f"DOC_READ_EVIDENCE_ACCEPTANCE: FAIL cases={total}: {'; '.join(surprising)}")
             return 1
