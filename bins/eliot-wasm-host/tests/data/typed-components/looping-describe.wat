@@ -11,9 +11,9 @@
 ;; limits").
 ;;
 ;; This component's `describe` has no exit. With the admitted
-;; `CancellationPolicy::EpochAndFuel`, `typed_fuel_budget`
-;; (:1390-1395, whose `Some` arm at :1392 is what installs the budget)
-;; meters the store, so the call ends in
+;; `CancellationPolicy::EpochAndFuel`, `typed_fuel_budget` (:1390-1395) yields
+;; `limits.max_fuel` from its `Some` arm at :1392 and `new_store` installs that
+;; budget with `store.set_fuel` at :1419-1422, so the call ends in
 ;; `wasmtime::Trap::OutOfFuel`, mapped by `map_call_error` (:1287-1303,
 ;; through `trap_termination`'s `Trap::OutOfFuel` arm at :1279) to
 ;; `EngineTermination::FuelExhausted` and reported as

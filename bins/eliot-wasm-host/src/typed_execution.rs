@@ -5646,6 +5646,441 @@ mod six_world_capsule_drive {
         assert_eq!(screened.scope_id.as_str(), SCOPE_ID);
     }
 
+    use super::check_cache_identity;
+    use eliot_wasm_runtime::component_contract::TYPED_ABI_REVISION;
+
+    /// The three DERIVED slots of one cache identity — engine configuration,
+    /// frozen ABI binding and admitted policy — re-derived here from the
+    /// documented composition and from nothing else.
+    ///
+    /// INDEPENDENCE, stated exactly. This function calls NONE of the five
+    /// production functions that build the cache identity, and that is the
+    /// whole point:
+    ///
+    ///   - not `TypedCacheIdentity::digest` (src/typed_execution.rs:606-616),
+    ///     the five-slot composition the enclosing `assert_eq!` is about;
+    ///   - not `typed_cache_identity` (:681-694), the binder that fills the
+    ///     struct's five fields;
+    ///   - not `typed_engine_configuration_digest` (:624-635);
+    ///   - not `typed_policy_digest` (:641-663);
+    ///   - not `typed_abi_digest` (:668-677).
+    ///
+    /// Each canonical descriptor below is re-written from what the production
+    /// doc comments state it binds — :581-588 for the identity as a whole,
+    /// :619-623 engine version/config/target, :637-640 the limit/policy
+    /// envelope and its allow-list, :665-667 world/package/revision/WIT — and
+    /// hashed with the SAME primitive production uses
+    /// (`Sha256Digest::of_bytes`,
+    /// crates/modules/eliot-wasm-runtime/src/types.rs:89). Sharing the hash
+    /// primitive is deliberate and is not the sharing that would make this a
+    /// tautology: the claim under test is WHICH BYTES ARE COMPOSED, not
+    /// whether a hash function is available. If any of those five functions
+    /// were called here, both sides of the `assert_eq!` would be the same
+    /// value and the assertion could not fail.
+    ///
+    /// WHICH CONSTANT EACH SIDE READS. `wasmtime=` is the independent
+    /// `crate::contour::PINNED_WASMTIME_VERSION` (src/contour.rs:49) — the
+    /// package's own I14.19 baseline pin — NOT this file's `ENGINE_VERSION`
+    /// (:40), which is a second declaration of the same generation.
+    /// `max_wasm_stack=` is the provider's own
+    /// `crate::wasmtime_provider::PROVIDER_STACK_SIZE`
+    /// (`src/wasmtime_provider.rs:29`), the same constant the fresh engine is
+    /// actually configured with (:804), NOT this file's copy at :41.
+    /// `package=`, `wit=` and `abi_revision=` are the frozen identity owners:
+    /// `crate::typed_bindings::TYPED_PACKAGE_ID` (`src/typed_bindings.rs:24`),
+    /// `typed_wit_digest` (`src/typed_bindings.rs:193`) and
+    /// `eliot_wasm_runtime::component_contract::TYPED_ABI_REVISION`
+    /// (crates/modules/eliot-wasm-runtime/src/component_contract.rs:24). Each
+    /// is an identity the composition CLAIMS to bind, owned outside the
+    /// function under test.
+    ///
+    /// STATED LIMIT, not papered over: the memory- and table-COUNT ceilings
+    /// (`memories=`, `tables=`) have no second declaration anywhere in the
+    /// package, so this expected value reads the same two constants
+    /// production reads (:51, :54). Drift in those two numbers ALONE would not
+    /// fail this assertion. It does not touch the claim under test, which is
+    /// the five-slot composition and its binding, and the engine-executed leg
+    /// below is what the composition is compared against in production.
+    fn expected_cache_identity_slots(
+        world: TypedWorld,
+        limits: &InvocationLimits,
+    ) -> (Sha256Digest, Sha256Digest, Sha256Digest) {
+        // `consume_fuel=` re-derived from the admitted cancellation policy
+        // directly, matching `typed_fuel_budget`'s own two-arm match
+        // (:1390-1395) without calling it.
+        let engine = Sha256Digest::of_bytes(
+            format!(
+                "typed-engine/v1;wasmtime={version};target={os}/{arch};component_model=true;consume_fuel={consume};epoch_interruption=true;max_wasm_stack={stack};memories={memories};tables={tables};memory_bytes={memory};table_elements={table_elements};instances={instances}",
+                version = PINNED_WASMTIME_VERSION,
+                os = std::env::consts::OS,
+                arch = std::env::consts::ARCH,
+                consume = matches!(
+                    limits.epoch.cancellation,
+                    eliot_wasm_runtime::CancellationPolicy::EpochAndFuel
+                ),
+                stack = crate::wasmtime_provider::PROVIDER_STACK_SIZE,
+                memories = super::MAX_TYPED_MEMORIES,
+                tables = super::MAX_TYPED_TABLES,
+                memory = limits.max_memory_bytes,
+                table_elements = limits.max_table_elements,
+                instances = limits.max_instances,
+            )
+            .as_bytes(),
+        );
+
+        // Every scalar ceiling plus the allow-listed artifact digests, which
+        // `artifact_access.allowed_digests` keeps in sorted order
+        // (crates/modules/eliot-wasm-runtime/src/types.rs:244, a `BTreeSet`),
+        // so this iteration is the same deterministic one production performs.
+        let mut policy_descriptor = format!(
+            "typed-policy/v1;max_input_bytes={};max_output_bytes={};max_host_calls={};max_fuel={};max_memory_bytes={};max_table_elements={};max_instances={};max_stack_bytes={};wall_deadline_ms={};epoch_deadline_ticks={};epoch_cancellation={:?};artifact_max_reads={};artifact_max_bytes={}",
+            limits.max_input_bytes,
+            limits.max_output_bytes,
+            limits.max_host_calls,
+            limits.max_fuel,
+            limits.max_memory_bytes,
+            limits.max_table_elements,
+            limits.max_instances,
+            limits.max_stack_bytes,
+            limits.wall_deadline_ms,
+            limits.epoch.deadline_ticks,
+            limits.epoch.cancellation,
+            limits.artifact_access.max_reads,
+            limits.artifact_access.max_bytes,
+        );
+        for digest in &limits.artifact_access.allowed_digests {
+            policy_descriptor.push(';');
+            policy_descriptor.push_str(digest.as_str());
+        }
+        let policy = Sha256Digest::of_bytes(policy_descriptor.as_bytes());
+
+        let abi = Sha256Digest::of_bytes(
+            format!(
+                "typed-abi/v1;world={};package={};abi_revision={};wit={}",
+                world.world_name(),
+                TYPED_PACKAGE_ID,
+                TYPED_ABI_REVISION,
+                typed_wit_digest().as_str(),
+            )
+            .as_bytes(),
+        );
+        (engine, abi, policy)
+    }
+
+    /// The WHOLE documented cache identity, re-derived: artifact digest, exact
+    /// artifact length, and the three derived slots above, folded into the
+    /// labelled five-slot form at :607-615. Calls
+    /// [`expected_cache_identity_slots`] and the hash primitive, and no
+    /// production identity function at all.
+    fn expected_cache_identity(
+        world: TypedWorld,
+        artifact_digest: &Sha256Digest,
+        artifact_bytes: u64,
+        limits: &InvocationLimits,
+    ) -> Sha256Digest {
+        let (engine, abi, policy) = expected_cache_identity_slots(world, limits);
+        Sha256Digest::of_bytes(
+            format!(
+                "758-typed-cache-identity|{artifact}|{bytes}|{engine}|{abi}|{policy}",
+                artifact = artifact_digest.as_str(),
+                bytes = artifact_bytes,
+                engine = engine.as_str(),
+                abi = abi.as_str(),
+                policy = policy.as_str(),
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// #758 marker 22's EXECUTED half: what the cache identity IS, not only
+    /// that each input changes it. The marker stays in the acceptance file
+    /// `tests/typed_execution.rs` (where five `assert_ne!` legs and five
+    /// source-text assertions cover case 22); this is the half only in-crate
+    /// code can run, for the same reachability reason as the marker-17 and
+    /// marker-16 helpers above: `check_cache_identity`, the private
+    /// `TypedCacheIdentity`, and the generated per-world request records both
+    /// domain entries require are all reachable only from this crate.
+    ///
+    /// The differential legs in the acceptance file cannot distinguish a
+    /// CORRECT composition from any other function of the same five inputs
+    /// that also changes — one that omits a slot, reorders two, or binds the
+    /// wrong value passes all five of them. This helper closes that by
+    /// comparing the production value against a value computed independently,
+    /// whole, with `assert_eq!`.
+    fn assert_cache_identity_is_the_documented_composition() {
+        assert_cache_identity_over_every_frozen_world();
+        assert_cache_identity_artifact_slot_through_the_real_engine();
+        assert_cache_identity_abi_world_slot_at_the_gate();
+    }
+
+    /// Leg one and the two negative controls that make this more than a
+    /// differential: for EVERY frozen world, over its own checked-in real
+    /// component, the identity production's own revalidation gate builds is
+    /// equal to the value re-derived here from the documented composition, and
+    /// two compositions production COULD have produced are rejected.
+    fn assert_cache_identity_over_every_frozen_world() {
+        // Leg one: for EVERY frozen world, over its own checked-in real
+        // component, the identity production's own revalidation gate builds is
+        // equal to the value re-derived from the documented composition.
+        //
+        // The production side is `check_cache_identity` (:707-727), not a
+        // hand-built struct: it is the gate the domain lane executes at :2097
+        // before any engine exists, and it re-hashes the presented buffer
+        // independently of preflight (:713) and refuses a buffer outside the
+        // admitted allow-list (:719). So the value compared here is the value
+        // the receipt binds at :2135.
+        for world in TypedWorld::all() {
+            let artifact = load_fixture(world);
+            let preflight = must(preflight_bytes(&artifact));
+            let limits = default_experimental_limits(preflight.digest.clone());
+            let identity = must(
+                check_cache_identity(world, &artifact, &preflight.digest, &limits)
+                    .map_err(|error| error.to_string()),
+            );
+            assert_eq!(
+                identity.digest(),
+                expected_cache_identity(world, &preflight.digest, preflight.byte_len, &limits),
+                "#758/22 {} cache identity is not the documented composition",
+                world.world_name(),
+            );
+            // The two artifact slots are the ones production takes from the
+            // presented buffer itself, so they are compared on their own too:
+            // the digest re-hashed at :713-714 and the length measured at :724.
+            assert_eq!(identity.artifact, preflight.digest);
+            assert_eq!(identity.artifact_bytes, preflight.byte_len);
+        }
+
+        // The comparison above can tell a correct composition from a wrong one,
+        // which the five `assert_ne!` legs in the acceptance file cannot. Both
+        // controls below are values those production helpers COULD have
+        // produced — same inputs, same hash primitive, one slot omitted or two
+        // swapped — and this composition rejects both.
+        let control_world = TypedWorld::ContextAdmission;
+        let control_artifact = load_fixture(control_world);
+        let control_preflight = must(preflight_bytes(&control_artifact));
+        let control_limits = default_experimental_limits(control_preflight.digest.clone());
+        let control_identity = must(
+            check_cache_identity(
+                control_world,
+                &control_artifact,
+                &control_preflight.digest,
+                &control_limits,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        let (control_engine, control_abi, control_policy) =
+            expected_cache_identity_slots(control_world, &control_limits);
+        // Control A: the ABI and policy slots SWAPPED.
+        let swapped = Sha256Digest::of_bytes(
+            format!(
+                "758-typed-cache-identity|{}|{}|{}|{}|{}",
+                control_preflight.digest.as_str(),
+                control_preflight.byte_len,
+                control_engine.as_str(),
+                control_policy.as_str(),
+                control_abi.as_str(),
+            )
+            .as_bytes(),
+        );
+        // Control B: the artifact-LENGTH slot OMITTED.
+        let omitted = Sha256Digest::of_bytes(
+            format!(
+                "758-typed-cache-identity|{}|{}|{}|{}",
+                control_preflight.digest.as_str(),
+                control_engine.as_str(),
+                control_abi.as_str(),
+                control_policy.as_str(),
+            )
+            .as_bytes(),
+        );
+        assert_ne!(control_identity.digest(), swapped);
+        assert_ne!(control_identity.digest(), omitted);
+    }
+
+    /// Leg two, kept as its own function so each leg's proof ceiling is legible
+    /// on its own rather than buried in one oversized body.
+    fn assert_cache_identity_artifact_slot_through_the_real_engine() {
+        // Leg two: the ARTIFACT slot, ISOLATED and executed through the REAL
+        // engine. One world, ONE admitted envelope admitting both measured
+        // digests, two different real checked-in components — so the world
+        // slot and the policy slot are byte-identical on both calls and the
+        // artifact pair is the only input that can differ. Both receipts come
+        // from a real Wasmtime instantiation of the buffer whose identity is
+        // being compared; nothing here re-hashes a string in the test to get
+        // the receipt.
+        let screen = TypedWorld::MemoryCurationScreen;
+        let honest = load_fixture(screen);
+        let altered = load_fixture_file("guest-typed-error");
+        let honest_preflight = must(preflight_bytes(&honest));
+        let altered_preflight = must(preflight_bytes(&altered));
+        // The artifact PAIR is what differs, and the digest half of that pair
+        // is what proves it: two different component buffers hash to two
+        // different digests. The length half is not separately asserted to
+        // differ, because nothing observed here can execute-verify that the
+        // two buffers also differ in LENGTH, and asserting it would be a claim
+        // this module cannot falsify on its own. The length slot is still bound
+        // and still proven below: each executed receipt is compared against an
+        // expected value carrying ITS OWN measured length, so a composition
+        // that dropped or mis-bound `artifact_bytes` fails both of those.
+        assert_ne!(honest_preflight.digest, altered_preflight.digest);
+        // `default_experimental_limits` allow-lists exactly one measured digest
+        // (:469); the second is added here so the POLICY slot is identical on
+        // both calls. No ceiling is widened, relaxed or invented, and
+        // `validate_limits` admits an allow-list that contains the presented
+        // digest (:495).
+        let mut shared_limits = default_experimental_limits(honest_preflight.digest.clone());
+        shared_limits
+            .artifact_access
+            .allowed_digests
+            .insert(altered_preflight.digest.clone());
+        let admitted = admitted_record();
+        let screen_request = world_request(screen, &admitted);
+
+        let honest_kit = world_kit(screen, &honest);
+        let honest_capsule = world_capsule(screen, &honest_kit, &shared_limits);
+        let altered_kit = world_kit(screen, &altered);
+        let altered_capsule = world_capsule(screen, &altered_kit, &shared_limits);
+
+        let (honest_receipt, _, _) = must(
+            execute_capsule_domain_experimental(
+                &honest_kit,
+                &honest_capsule,
+                &honest,
+                &shared_limits,
+                &screen_request,
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        let (altered_receipt, _, _) = must(
+            execute_capsule_domain_experimental(
+                &altered_kit,
+                &altered_capsule,
+                &altered,
+                &shared_limits,
+                &screen_request,
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        // Each executed receipt really did compile the buffer whose identity it
+        // binds, so the two identities below differ only in their artifact
+        // pair.
+        assert_eq!(honest_receipt.artifact_digest, honest_preflight.digest);
+        assert_eq!(altered_receipt.artifact_digest, altered_preflight.digest);
+        assert_ne!(
+            honest_receipt.cache_identity,
+            altered_receipt.cache_identity
+        );
+        // ... and each is equal to its OWN independently re-derived value, so
+        // this leg is not a differential pair alone.
+        assert_eq!(
+            honest_receipt.cache_identity,
+            expected_cache_identity(
+                screen,
+                &honest_preflight.digest,
+                honest_preflight.byte_len,
+                &shared_limits,
+            )
+        );
+        assert_eq!(
+            altered_receipt.cache_identity,
+            expected_cache_identity(
+                screen,
+                &altered_preflight.digest,
+                altered_preflight.byte_len,
+                &shared_limits,
+            )
+        );
+    }
+
+    /// Leg three, the ABI/world slot isolated at the production gate. It is not
+    /// reachable through the real engine for one buffer under two worlds, and
+    /// that limit is stated rather than papered over.
+    fn assert_cache_identity_abi_world_slot_at_the_gate() {
+        // Leg three: the ABI/WORLD slot, ISOLATED at the production
+        // revalidation gate. One artifact buffer and one admitted envelope,
+        // two worlds, so the world is the only input that changes. This
+        // reaches the same production call the engine lane executes at :2097.
+        //
+        // REACHABILITY, stated: this leg CANNOT be executed through the real
+        // engine, and is not faked as if it could. Each checked-in fixture
+        // exports exactly one world's interface, so driving one buffer under
+        // two worlds is denied by `preflight_component_type`'s signature and
+        // export checks (:2102) before any receipt exists. The isolated world
+        // leg is therefore the production gate itself, plus the corroborating
+        // engine leg below.
+        let shared_artifact = load_fixture(TypedWorld::ContextAdmission);
+        let shared_preflight = must(preflight_bytes(&shared_artifact));
+        let shared_world_limits = default_experimental_limits(shared_preflight.digest.clone());
+        let admission_identity = must(
+            check_cache_identity(
+                TypedWorld::ContextAdmission,
+                &shared_artifact,
+                &shared_preflight.digest,
+                &shared_world_limits,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        let cycle_identity = must(
+            check_cache_identity(
+                TypedWorld::DreamerCycle,
+                &shared_artifact,
+                &shared_preflight.digest,
+                &shared_world_limits,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        assert_eq!(admission_identity.artifact, cycle_identity.artifact);
+        assert_eq!(
+            admission_identity.artifact_bytes,
+            cycle_identity.artifact_bytes
+        );
+        assert_ne!(admission_identity.digest(), cycle_identity.digest());
+        // Which slot separates them, from the independent re-derivation: the
+        // engine and policy slots are identical and only the ABI slot moves.
+        let (admission_engine, admission_abi, admission_policy) =
+            expected_cache_identity_slots(TypedWorld::ContextAdmission, &shared_world_limits);
+        let (cycle_engine, cycle_abi, cycle_policy) =
+            expected_cache_identity_slots(TypedWorld::DreamerCycle, &shared_world_limits);
+        assert_eq!(admission_engine, cycle_engine);
+        assert_eq!(admission_policy, cycle_policy);
+        assert_ne!(admission_abi, cycle_abi);
+
+        // Corroborating WORLD leg executed through the REAL engine for a second
+        // frozen world. It is NOT isolated — the two honest fixtures are
+        // different components, so their artifact slots differ too — and it is
+        // offered only as the executed counterpart of the isolated leg above.
+        let cycle_world = TypedWorld::DreamerCycle;
+        let cycle_artifact = load_fixture(cycle_world);
+        let cycle_preflight = must(preflight_bytes(&cycle_artifact));
+        let cycle_limits = default_experimental_limits(cycle_preflight.digest.clone());
+        let cycle_kit = world_kit(cycle_world, &cycle_artifact);
+        let cycle_capsule = world_capsule(cycle_world, &cycle_kit, &cycle_limits);
+        let (cycle_receipt, _, _) = must(
+            execute_capsule_domain_experimental(
+                &cycle_kit,
+                &cycle_capsule,
+                &cycle_artifact,
+                &cycle_limits,
+                &world_request(cycle_world, &admitted),
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        assert_eq!(cycle_receipt.world, cycle_world.world_name());
+        assert_ne!(cycle_receipt.cache_identity, honest_receipt.cache_identity);
+        assert_eq!(
+            cycle_receipt.cache_identity,
+            expected_cache_identity(
+                cycle_world,
+                &cycle_preflight.digest,
+                cycle_preflight.byte_len,
+                &cycle_limits,
+            )
+        );
+    }
+
     // No `WORK_UNIT_CASE` marker here on purpose: case 3 of #758 is marked once,
     // in the acceptance file `tests/typed_execution.rs`, so the declared
     // denominator stays exactly 1..26 with one marker per case. This in-crate
@@ -5703,6 +6138,18 @@ mod six_world_capsule_drive {
         // `tests/typed_execution.rs`; no `WORK_UNIT_CASE` marker is added here.
         assert_foreign_result_operation_id_is_denied_by_the_echo_gate();
         assert_foreign_result_scope_id_is_denied_by_the_echo_gate();
+        // #758 marker 22's composition half, in this same real-engine test for
+        // the same reachability reason as the calls above: the cache identity's
+        // revalidation gate and the private `TypedCacheIdentity` are reachable
+        // only in-crate. The one marker for case 22, and its five executed
+        // `assert_ne!` legs, stay in `tests/typed_execution.rs`; what runs here
+        // is the one thing those legs cannot do — the identity is compared to a
+        // value re-derived from the documented composition WITHOUT calling
+        // `digest`, `typed_cache_identity`, `typed_engine_configuration_digest`,
+        // `typed_policy_digest` or `typed_abi_digest`, so a composition that
+        // omitted a slot, swapped two or bound the wrong value fails here.
+        // No `WORK_UNIT_CASE` marker is added by this leg.
+        assert_cache_identity_is_the_documented_composition();
     }
 
     /// Real engine, real CHECKED-IN input: `instantiation-start-loop.wat` is a

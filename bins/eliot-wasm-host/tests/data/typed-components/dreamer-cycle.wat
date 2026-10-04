@@ -5,8 +5,10 @@
 ;; domain function `step`.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `step` result tuple, 0x1000 echo scratch, 0x1400 the bump
-;; region the host `realloc` hands out while lowering the request.
+;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo
+;; scratch blocks -- `operation-id` at 0x1000 and `state.fence-epoch` at 0x1200,
+;; each copy capped at 512 bytes -- and 0x1400 the bump region the host
+;; `realloc` hands out while lowering the request.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)

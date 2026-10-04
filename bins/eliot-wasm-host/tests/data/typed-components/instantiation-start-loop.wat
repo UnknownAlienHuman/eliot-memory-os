@@ -160,9 +160,12 @@
     ;; fuel budget, store resource ceilings and epoch deadline as `describe`
     ;; (`typed_fuel_budget`, :1390-1395; `new_store`, :1397-1426;
     ;; `EpochDriver::spawn`, :1508-1539). It touches no memory and calls nothing, so only
-    ;; fuel exhaustion or the epoch deadline can stop it. `describe` and `step`
-    ;; below are the untouched honest `dreamer-cycle` bodies: they are never
-    ;; reached, which is the point.
+    ;; fuel exhaustion or the epoch deadline can stop it. The two exports below
+    ;; are never reached, which is the point, and each names its whole
+    ;; difference from `dreamer-cycle.wat`: `step` is that fixture's `step`
+    ;; unchanged, and `describe` differs from it in exactly one respect -- the
+    ;; descriptor retptr base is 0x0c00 here instead of 0x600 there, with the
+    ;; same eleven-word record written at 3072..3116 instead of 1536..1580.
     (func $init (local $spin i64)
       (loop $forever
         (local.set $spin (i64.add (local.get $spin) (i64.const 1)))
@@ -187,12 +190,16 @@
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
     ;; the frozen ABI revision, lowered in WIT field order into guest memory.
     ;;
-    ;; This body is the honest `dreamer-cycle` one and is dead code: `(start
-    ;; $init)` above never returns, so instantiation never completes and this
-    ;; export is never called. The store and the single returned pointer are
-    ;; still written here, because the obligation this file proves is that
-    ;; component INITIALIZATION is terminated by the fuel/epoch policy, and
-    ;; `$init` -- not this body -- is what runs. Nothing below weakens or
+    ;; This body carries the honest `dreamer-cycle` descriptor VALUES and is
+    ;; dead code: `(start $init)` above never returns, so instantiation never
+    ;; completes and this export is never called. It is not byte-identical to
+    ;; `dreamer-cycle.wat`'s `describe`: that one returns 1536 (0x600) and
+    ;; writes the eleven-word record at 1536..1580, this one returns 3072
+    ;; (0x0c00) and writes the same eleven values at 3072..3116. The store and
+    ;; the single returned
+    ;; pointer are still written here, because the obligation this file proves
+    ;; is that component INITIALIZATION is terminated by the fuel/epoch policy,
+    ;; and `$init` -- not this body -- is what runs. Nothing below weakens or
     ;; shortens the start loop.
     ;;
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five

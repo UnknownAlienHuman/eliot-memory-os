@@ -11,14 +11,17 @@
 ;; `TypedExecutionError::LimitDenied("typed-string")`, staged at
 ;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
 ;;
-;; This component is an honest `dreamer-cycle` fixture except for the hostile
-;; lifted length: `describe` reports the true frozen descriptor, the domain
-;; result echoes the admitted `operation-id` and `fence-epoch` and claims the
-;; lowest proof ceiling, every list leaf is left empty, and only
+;; This component is an honest `dreamer-cycle` fixture except for two things.
+;; The hostile lifted length: `describe` reports the true frozen descriptor, the
+;; domain result echoes the admitted `operation-id` and `fence-epoch` and claims
+;; the lowest proof ceiling, every list leaf is left empty, and only
 ;; `state.state-digest` carries 4097 bytes -- exactly one byte past the host's
-;; per-string ceiling. Every earlier check therefore passes (in
-;; `check_cycle_result` the only prior charge is the two-byte echoed
-;; `operation-id`) and the string ceiling is provably the denial.
+;; per-string ceiling. And where the `describe` retarea sits: base 0x0c00 here,
+;; its eleven core words ending 0x0c2b, against `dreamer-cycle.wat`'s 0x0600 --
+;; the same eleven values, so nothing about the reported descriptor changes.
+;; Every earlier check therefore passes (in `check_cycle_result` the only prior
+;; charge is the two-byte echoed `operation-id`) and the string ceiling is
+;; provably the denial.
 ;;
 ;; Memory map (all within the single 1-page core memory, `1 1`):
 ;;   0x0000-0x03ff  reserved, never written

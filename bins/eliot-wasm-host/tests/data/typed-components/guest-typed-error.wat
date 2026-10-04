@@ -23,8 +23,11 @@
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings, 0x0600 the
 ;; `describe` retarea, 0x0800 the lowered `screen` result tuple, 0x0900 the one
-;; error-detail byte the guest writes, 0x1400 the bump region the host
-;; `realloc` hands out while lowering the request.
+;; error-detail byte -- carried by this file's extra
+;; `(data (i32.const 2304) "x")` segment, not stored by any instruction; the
+;; `screen` body writes only that byte's pointer/length pair into the retarea --
+;; and 0x1400 the bump region the host `realloc` hands out while lowering the
+;; request.
 ;;
 ;; Canonical-ABI layout of the returned retarea (base = the pointer this core
 ;; function returns, 0x800; the host requires `base % align32 == 0`, 0x800 is
@@ -36,7 +39,8 @@
 ;; `screen-error`'s own discriminant:
 ;;   0x000 result discriminant            1 = err          <- the typed-Err arm
 ;;   0x008 screen-error discriminant      1 = "cancelled-screen"
-;;   0x00c screen-cancelled.human-detail  (ptr, len) -> 0x900, 1
+;;   0x00c screen-cancelled.human-detail  POINTER_PAIR spanning 0x00c..0x013:
+;;                                    ptr = 0x900 at 0x00c, len = 1 at 0x010
 ;; The ok arm's `screen-outcome` discriminant occupies the same byte 0x008 and is
 ;; selected only when the result discriminant at 0x000 is 0. The err payload
 ;; starts at result payload_offset32 = align_to(1, align 8) = 8; screen-error's
