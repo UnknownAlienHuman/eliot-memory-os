@@ -852,28 +852,24 @@ pub(super) fn run() -> Result<(), String> {
         launch_nonce: launch.launch_nonce.clone(),
     };
     // #2560 card MAKE: the existing exact-generation idempotent `report_ready`
-    // runs ONCE and constructs exactly ONE producer, so the owner identity this
-    // exchange is issued for is captured here — read BEFORE the exchange, so the
-    // key can only lag and never lead — and the heartbeat re-issues only when that
-    // identity MOVES. A withheld verdict establishes no key at all, so the first
-    // admissible pass still runs the one exchange.
-    let (supervision_progress, supervision_exchange_owner) = if startup_readiness
+    // runs ONCE and constructs exactly ONE producer. This pre-loop block is that
+    // one exchange, and it publishes a producer only when it SUCCEEDED — which is
+    // what `run_loop` uses to seed its exact-generation key, so the heartbeat
+    // never repeats an exchange that already ran. A withheld verdict publishes
+    // neither exchange nor producer, so no key is seeded and the first admissible
+    // pass still runs the one exchange.
+    let supervision_progress = if startup_readiness
         .core_readiness_prerequisites_satisfied()
         .is_satisfied()
     {
-        let exchange_owner = {
-            let observed = eliotd::startup_readiness::observe_core_owner_state(&composition);
-            (observed.generation, observed.authority_epoch)
-        };
         let (transport, ready) = supervision_ready_evidence(&kernel)?;
-        let producer = Some(construct_supervision_producer(
+        Some(construct_supervision_producer(
             &supervision_launch,
             transport,
             ready,
-        )?);
-        (producer, Some(exchange_owner))
+        )?)
     } else {
-        (None, None)
+        None
     };
     // The local-read poller below drives Skill pairs through the composition
     // inside its flight future: share it here so the future owns its handle.
@@ -977,7 +973,6 @@ pub(super) fn run() -> Result<(), String> {
         Arc::clone(&composition),
         supervision_progress,
         supervision_launch,
-        supervision_exchange_owner,
         capability_model_restricted,
         startup_readiness,
         startup_maintenance_observations,
@@ -1691,12 +1686,6 @@ async fn run_loop(
     // the heartbeat's recovery of the same generation build byte-identical
     // `SupervisionProducerDeps` through one function.
     supervision_launch: SupervisionLaunchIdentity,
-    // #2560: the `(generation, authority_epoch)` the pre-loop `daemon_ready`
-    // exchange was issued for, or `None` when a withheld pre-loop verdict
-    // published no exchange. It seeds this loop's exact-generation key so the
-    // heartbeat does not repeat an exchange that already succeeded, and it is
-    // only ever replaced on a SUCCESSFUL exchange for a different identity.
-    supervision_exchange_owner: Option<(u64, u64)>,
     // The retained startup capability-model partition, reused verbatim by every
     // later readiness evaluation and republication.
     capability_model_restricted: bool,
@@ -1724,6 +1713,15 @@ async fn run_loop(
         let guard = composition.lock().await;
         eliotd::startup_readiness::observe_core_owner_state(&guard)
     };
+    // #2560: seed this loop's exact-generation key. The pre-loop block publishes a
+    // producer ONLY when its `daemon_ready` exchange succeeded, so a retained
+    // producer is itself the proof that exchange already ran, and the identity to
+    // record is the one observed here through the same accessor. A withheld
+    // pre-loop verdict published neither exchange nor producer, so it seeds no
+    // key and the first admissible pass still runs the one exchange.
+    let supervision_exchange_owner = supervision_progress
+        .as_ref()
+        .map(|_| (observed_owner.generation, observed_owner.authority_epoch));
     let readiness_record = Rc::new(RefCell::new(LoopReadinessRecord {
         observed_owner: Some(observed_owner),
         published_report: startup_readiness.borrow().report(),
