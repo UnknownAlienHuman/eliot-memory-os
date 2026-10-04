@@ -9,12 +9,25 @@
 //! inputs threaded per call. There is no static provider percentage anywhere
 //! in this type: the struct has no provider field by construction.
 //!
+//! Actual routes are selected from current capability evidence, observed task
+//! outcomes ([`RouteOutcomeEvidence`]), quotas, machine capacity, privacy and
+//! independence. An outcome profile is a derived empirical profile (I3.4): it
+//! can only keep a route whose own equal-stack samples failed out of the
+//! selection, it never admits a route, widens an envelope, or authorizes an
+//! action, a sparse or stale profile carries no signal at all, and every
+//! consulted profile is recorded in the receipt so aggregated success cannot
+//! hide the counts it was derived from.
+//!
 //! Pure and deterministic: no threads, no store, no provider execution, no
 //! credential handling. The planner returns a candidate receipt plus explicit
 //! dispositions; it persists nothing itself. A required-but-unstaffed audit
 //! class yields an escalate disposition, policy-declared non-executing
 //! Dreamer classes yield defer dispositions, and a missing writer is a typed
 //! [`StaffingPolicyError::NoWriterRoute`] rather than a silent substitution.
+//! An independent audit is staffed only when the frozen request materializes a
+//! distinct audit lane: a receipt lane no compiled lane and no attempt could
+//! ever run would read as satisfied review while nothing reviews anything, so
+//! the unstaffable class is escalated explicitly instead.
 //! A caller cannot widen the selected policy through supplied constraints:
 //! the constraints budget must sit within the policy per-job budget and a
 //! local-only privacy ceiling closes external lanes fail-closed. Provider
@@ -34,21 +47,26 @@
 //! [`enforce_plan_receipt`] is the matching check on the compiled coordinator
 //! candidate: a lane route the receipt did not authorize — including a
 //! same-family or paid substitute for an unavailable independent audit — is
-//! refused instead of dispatched.
+//! refused instead of dispatched, and every receipted route must actually be run
+//! by exactly one compiled lane.
 //!
 //! A route is placed in a class only where the route owner, recipe, role, and
 //! launch all name that exact class. Human preset/cost intent and route-owner
 //! class/privacy evidence are explicit request inputs, preserved in the
 //! canonical plan receipt, and never reconstructed from recipe shape, route
-//! identity, or a local default.
+//! identity, or a local default. [`route_outcome_evidence`] reads the
+//! Governor's own retained outcome profiles for exactly that reason: the
+//! behaviour identity those profiles are keyed under is owner-issued, and this
+//! policy derives no behaviour fingerprint from a route fingerprint.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use eliot_agent_api::{BudgetEnvelope, RouteFingerprint};
+use eliot_agent_api::{BudgetEnvelope, LowercaseSha256, RouteFingerprint};
 use eliot_agent_coordinator::{
     CoordinatorConfig, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
     StaffingPlanRequest,
 };
+use eliot_governor::{RouteBehaviorFingerprint, RouteOutcomeProfileIndex};
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -65,6 +83,15 @@ pub const ROUTE_CLASS_DREAMER_CURATION: &str = "dreamer_curation";
 pub const ROUTE_CLASS_DREAMER_ORIENTATION: &str = "dreamer_orientation";
 pub const ROUTE_CLASS_RESEARCH_SYNTHESIS: &str = "research_synthesis";
 pub const ROUTE_CLASS_SUBJECTIVE_EVALUATION: &str = "subjective_evaluation";
+
+/// Reason recorded on an independent-audit class the frozen request cannot run.
+///
+/// I3.6 makes independent review a real second lane, and the coordinator
+/// compiles exactly one candidate lane per request lane, so a request that binds
+/// the audit class only to the writer's own lane can never dispatch a reviewer.
+/// The receipt says so and escalates; it never staffs an entry that reads as
+/// satisfied review while nothing reviews anything.
+pub const UNAUDITABLE_REVIEW_REASON: &str = "independent audit cannot be staffed: the frozen request admits no lane that runs the audit apart from the writer's own lane; escalating instead of recording a lane nothing would dispatch";
 
 /// Independence requirements for review staffing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -143,6 +170,104 @@ pub struct RouteEligibility {
     pub privacy_admits: bool,
 }
 
+/// Minimum observed sample count before an outcome profile may move a route.
+///
+/// I3.4 keeps routing on policy defaults and controlled pilots "before enough
+/// equal-stack evidence exists", and the profile index is keyed by the complete
+/// effective route key, so the samples behind one profile are equal-stack by
+/// construction. Below this count the profile is too sparse to move anything
+/// and carries no signal: it is recorded in the receipt and otherwise ignored.
+pub const MIN_ROUTE_OUTCOME_SAMPLES: u32 = 3;
+
+/// One route's derived empirical outcome profile as this policy consumes it
+/// (I3.4 "Route outcome profile").
+///
+/// A profile, never a capability and never a proof by itself. It is carried as
+/// named sample counts plus the evidence that produced them rather than as an
+/// aggregate score, because a number without its counts would let aggregated
+/// success hide a minority failure. The only decision it can drive is negative:
+/// a route whose own observed samples for this task class produced nothing
+/// verified while at least one sample failed or stayed unknown is kept out of
+/// the selection when another eligible route exists. It can never admit a
+/// route, promote one over another, widen an envelope, or authorize an action.
+///
+/// `stale` marks a profile whose own declared stale dependencies (fingerprint,
+/// evaluator, task distribution, or behavior-affecting harness) moved. A stale
+/// profile carries no signal: it is neither read as success nor as failure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteOutcomeEvidence {
+    /// Samples whose output was verified complete.
+    pub verified_complete: u32,
+    /// Samples that finished with a partial result.
+    pub partial: u32,
+    /// Samples that failed.
+    pub failed: u32,
+    /// Samples whose outcome was never established. A real count, not an
+    /// absence: an unreconciled sample must stay visible.
+    pub unknown: u32,
+    /// Whether the profile's declared stale dependencies moved.
+    pub stale: bool,
+    /// Evidence references backing the profile. Must be non-empty: a profile
+    /// with no evidence proves nothing and is refused rather than consumed.
+    pub evidence_refs: Vec<String>,
+}
+
+impl RouteOutcomeEvidence {
+    /// Total observed samples behind this profile.
+    fn samples(&self) -> u32 {
+        self.verified_complete
+            .saturating_add(self.partial)
+            .saturating_add(self.failed)
+            .saturating_add(self.unknown)
+    }
+
+    /// Whether this profile keeps its route out of the selection.
+    ///
+    /// Negative-only by construction: success never promotes a route (so
+    /// aggregated success cannot authorize anything) and a profile that observed
+    /// at least one verified-complete sample never hides that route's minority
+    /// failures. Only a route whose own equal-stack samples produced nothing
+    /// verified while at least one sample failed or stayed unknown is skipped.
+    fn blocks_selection(&self) -> bool {
+        if self.stale || self.samples() < MIN_ROUTE_OUTCOME_SAMPLES || self.verified_complete > 0 {
+            return false;
+        }
+        self.failed > 0 || self.unknown > 0
+    }
+}
+
+/// One consulted outcome profile, bound to the exact route it was observed on.
+///
+/// Recorded for every candidate route the plan considered, not only the staffed
+/// ones, so the receipt shows which empirical input the selection stood on — and
+/// shows the ones that were refused.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteOutcomeRecord {
+    pub route: RouteFingerprint,
+    pub profile: RouteOutcomeEvidence,
+}
+
+/// Owner-issued binding from one coordinator route to the behaviour identity its
+/// outcome profiles are recorded under, plus whether that binding is current.
+///
+/// The profile index is keyed by the complete effective route key over the
+/// Governor's `RouteBehaviorFingerprint`, a behaviour identity with facets the
+/// coordinator's `RouteFingerprint` does not carry (adapter and runtime
+/// versions, protocol and transport kinds, account mode, execution identity,
+/// user-broker class, retention/network/session/workspace policy, tool-call id
+/// and role ordering, reasoning/continuation/compaction). This policy therefore
+/// never derives a behaviour fingerprint from a route fingerprint and never
+/// mints one: the route owner supplies the fingerprint and its currentness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOutcomeBinding {
+    pub fingerprint: RouteBehaviorFingerprint,
+    /// Whether the binding's declared stale dependencies moved. A stale binding
+    /// contributes no signal rather than an assumed outcome.
+    pub stale: bool,
+}
+
 /// One candidate route plus the orthogonal eligibility dimensions the policy
 /// checks before any ranking.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -161,6 +286,10 @@ pub struct RouteCandidate {
     /// Capability evidence handle for this candidate. Must be non-blank so
     /// the receipt binds real evidence inputs.
     pub evidence_ref: String,
+    /// This route's derived empirical outcome profile, when the owner retained
+    /// one. `None` means no profile was retained for the exact effective route,
+    /// which leaves the candidate on policy-default order.
+    pub outcome: Option<RouteOutcomeEvidence>,
 }
 
 /// Budget/privacy constraints the receipt binds.
@@ -217,6 +346,12 @@ pub struct StaffingPlanReceipt {
     /// Exact owner-supplied capability-class and privacy evidence for every
     /// route considered by the live coordinator bridge.
     pub route_policy_evidence: Vec<RoutePolicyEvidence>,
+    /// Every derived outcome profile the selection consulted, bound to the exact
+    /// route it was observed on. Empty when no owner profile was retained: an
+    /// absent profile is recorded as absent and never replaced by an assumed
+    /// success, and a profile that kept a route out of the selection stays
+    /// visible here next to the counts it was derived from.
+    pub route_outcome_evidence: Vec<RouteOutcomeRecord>,
     /// Exact Human-selected per-job cost ceiling. `budget` below records the
     /// effective plan ask; this preserves the intent the plan was checked
     /// against.
@@ -524,6 +659,9 @@ pub fn plan_staffing(
     for lane in &lanes {
         evidence_refs.extend(lane.evidence_refs.iter().cloned());
     }
+    for record in consulted_outcome_profiles(evidence)? {
+        evidence_refs.extend(record.profile.evidence_refs.iter().cloned());
+    }
     evidence_refs.sort();
     evidence_refs.dedup();
 
@@ -536,6 +674,7 @@ pub fn plan_staffing(
         // eligibility booleans. The live coordinator bridge fills this with
         // exact route-owner evidence before sealing the receipt.
         route_policy_evidence: Vec::new(),
+        route_outcome_evidence: consulted_outcome_profiles(evidence)?,
         policy_budget: policy.per_job_budget.clone(),
         budget: constraints.budget.clone(),
         privacy_ceiling: constraints.privacy_ceiling,
@@ -544,6 +683,41 @@ pub fn plan_staffing(
     };
     seal_receipt_digest(&mut receipt)?;
     Ok(receipt)
+}
+
+/// Every owner outcome profile the selection consulted, one record per exact
+/// route, ordered by the route's canonical digest so the receipt is
+/// deterministic for equivalent admitted inputs.
+///
+/// A candidate route retained in several classes appears once. Routes with no
+/// retained profile contribute nothing: an absent profile is never fabricated
+/// into an assumed success.
+fn consulted_outcome_profiles(
+    evidence: &[RouteClassEvidence],
+) -> Result<Vec<RouteOutcomeRecord>, StaffingPolicyError> {
+    let mut by_digest: BTreeMap<String, RouteOutcomeRecord> = BTreeMap::new();
+    for record in evidence {
+        for candidate in &record.candidates {
+            let Some(profile) = candidate.outcome.clone() else {
+                continue;
+            };
+            if profile.evidence_refs.is_empty() {
+                return Err(StaffingPolicyError::Contract(
+                    "route outcome profile carries no evidence reference".to_owned(),
+                ));
+            }
+            for reference in &profile.evidence_refs {
+                validate_text(reference, "outcome evidence_ref")?;
+            }
+            by_digest
+                .entry(route_digest(&candidate.route)?)
+                .or_insert(RouteOutcomeRecord {
+                    route: candidate.route.clone(),
+                    profile,
+                });
+        }
+    }
+    Ok(by_digest.into_values().collect())
 }
 
 fn seal_receipt_digest(receipt: &mut StaffingPlanReceipt) -> Result<(), StaffingPolicyError> {
@@ -632,22 +806,44 @@ fn select_writer(
             "local-only privacy ceiling closes external lanes; no writer staffed".to_owned(),
         ));
     }
+    let mut outcome_refused = false;
     for class in &policy.worker_route_classes {
         if let Some(record) = evidence.iter().find(|item| &item.route_class == class) {
             for candidate in &record.candidates {
-                if eligible_candidate(candidate) {
-                    candidate.route.validate().map_err(|error| {
-                        StaffingPolicyError::Contract(format!("writer route: {error}"))
-                    })?;
-                    return Ok(StaffedLane {
-                        role: "writer".to_owned(),
-                        route_class: class.clone(),
-                        route: candidate.route.clone(),
-                        evidence_refs: vec![candidate.evidence_ref.clone()],
-                    });
+                if !eligible_candidate(candidate) {
+                    continue;
                 }
+                // Observed outcomes are consulted only after hard eligibility:
+                // a route whose own equal-stack samples produced nothing
+                // verified while at least one failed or stayed unknown is kept
+                // out of the selection, and the refusal is remembered so a plan
+                // with no alternative reports the outcome reason instead of the
+                // generic "no eligible route".
+                if candidate
+                    .outcome
+                    .as_ref()
+                    .is_some_and(RouteOutcomeEvidence::blocks_selection)
+                {
+                    outcome_refused = true;
+                    continue;
+                }
+                candidate.route.validate().map_err(|error| {
+                    StaffingPolicyError::Contract(format!("writer route: {error}"))
+                })?;
+                return Ok(StaffedLane {
+                    role: "writer".to_owned(),
+                    route_class: class.clone(),
+                    route: candidate.route.clone(),
+                    evidence_refs: vec![candidate.evidence_ref.clone()],
+                });
             }
         }
+    }
+    if outcome_refused {
+        return Err(StaffingPolicyError::NoWriterRoute(
+            "every eligible writer route's observed outcome profile shows this task class failing; refusing to staff a route its own samples rejected"
+                .to_owned(),
+        ));
     }
     Err(StaffingPolicyError::NoWriterRoute(
         "no eligible writer route under current evidence, quota, capacity, and privacy".to_owned(),
@@ -668,6 +864,7 @@ fn select_independent_auditor(
     }
     let writer_family = writer_family(evidence, writer);
     let mut specific_reason: Option<String> = None;
+    let mut outcome_refused = false;
     for class in &policy.auditor_route_classes {
         let Some(record) = evidence.iter().find(|item| &item.route_class == class) else {
             continue;
@@ -676,6 +873,18 @@ fn select_independent_auditor(
         let mut saw_paid_fallback = false;
         for candidate in &record.candidates {
             if !eligible_candidate(candidate) {
+                continue;
+            }
+            // An outcome profile never admits an audit route and never promotes
+            // one; it only keeps a route out whose own samples rejected this
+            // task class. Aggregated success still cannot hide the counts,
+            // because every consulted profile is recorded in the receipt.
+            if candidate
+                .outcome
+                .as_ref()
+                .is_some_and(RouteOutcomeEvidence::blocks_selection)
+            {
+                outcome_refused = true;
                 continue;
             }
             if policy.independent_review_requirements.cross_family
@@ -708,6 +917,12 @@ fn select_independent_auditor(
             );
         }
     }
+    if outcome_refused && specific_reason.is_none() {
+        return Err(
+            "independent audit unavailable: every eligible audit route's observed outcome profile shows this task class failing; escalating instead of substituting"
+                .to_owned(),
+        );
+    }
     Err(specific_reason.unwrap_or_else(|| {
         "independent audit unavailable under current capability evidence; escalating instead of substituting"
             .to_owned()
@@ -731,6 +946,65 @@ fn evidence_refs_for(evidence: &[RouteClassEvidence], route_class: &str) -> Vec<
         .find(|item| item.route_class == route_class)
         .map(|item| item.evidence_refs.clone())
         .unwrap_or_default()
+}
+
+/// Reads one route's derived empirical outcome profile out of the Governor's
+/// retained profile index (I3.4 `RouteOutcomeProfileIndex`).
+///
+/// `bindings` maps the coordinator route's own effective route key to the
+/// owner-issued behaviour identity that route's profiles are recorded under, so
+/// this policy reads the exact effective route's samples and never a
+/// provider/model-identical sibling's. Three absences are distinguished and none
+/// of them becomes an assumed success:
+///
+/// * no binding for the route — the owner issued no behaviour identity, so no
+///   profile is consumed;
+/// * a binding marked stale — the binding's declared dependencies moved, so it
+///   contributes no signal;
+/// * a binding with no retained profile under that exact effective route key.
+///
+/// A retained profile is carried as its own named sample counts plus its
+/// evidence references. A profile with no evidence reference proves nothing and
+/// is refused rather than consumed.
+///
+/// # Errors
+///
+/// Returns [`StaffingPolicyError::Contract`] when the route's effective key or
+/// the behaviour identity's effective key cannot be computed, or when a
+/// retained profile carries no evidence reference. A route is never recorded
+/// under a placeholder key.
+pub fn route_outcome_evidence<S: std::hash::BuildHasher>(
+    profiles: &RouteOutcomeProfileIndex,
+    bindings: &HashMap<LowercaseSha256, RouteOutcomeBinding, S>,
+    route: &RouteFingerprint,
+) -> Result<Option<RouteOutcomeEvidence>, StaffingPolicyError> {
+    let route_key = crate::route_receipts::effective_route_key(route)
+        .map_err(|error| StaffingPolicyError::Contract(format!("outcome route key: {error}")))?;
+    let Some(binding) = bindings.get(&route_key) else {
+        return Ok(None);
+    };
+    if binding.stale {
+        return Ok(None);
+    }
+    let Some(profile) = profiles.lookup(&binding.fingerprint).map_err(|error| {
+        StaffingPolicyError::Contract(format!("outcome profile lookup: {error}"))
+    })?
+    else {
+        return Ok(None);
+    };
+    if profile.evidence_refs.is_empty() {
+        return Err(StaffingPolicyError::Contract(
+            "retained route outcome profile carries no evidence reference".to_owned(),
+        ));
+    }
+    Ok(Some(RouteOutcomeEvidence {
+        verified_complete: profile.outcome_counts.verified_complete,
+        partial: profile.outcome_counts.partial,
+        failed: profile.outcome_counts.failed,
+        unknown: profile.outcome_counts.unknown,
+        stale: false,
+        evidence_refs: profile.evidence_refs.clone(),
+    }))
 }
 
 /// Guards attempt continuation against silent provider switching.
@@ -859,6 +1133,12 @@ fn coordinator_recipe_policy(
 /// Route capability classes and privacy classes are supplied by the route
 /// owner. They must carry their own source references; task/role declarations
 /// alone cannot admit a route into a capability class or privacy scope.
+///
+/// A candidate's derived outcome profile is looked up separately through
+/// [`route_outcome_evidence`], because it needs the owner-issued behaviour
+/// identity its profile is keyed under. No outcome profile is derived or
+/// defaulted here: an absent profile leaves the candidate on policy-default
+/// order and is recorded as absent in the receipt.
 fn coordinator_route_candidate(
     config: &CoordinatorConfig,
     privacy_class: PrivacyClass,
@@ -893,6 +1173,7 @@ fn coordinator_route_candidate(
             privacy_admits: candidate.privacy_classes.contains(&privacy_class),
         },
         evidence_ref,
+        outcome: None,
     })
 }
 
@@ -936,16 +1217,74 @@ fn coordinator_lane_class_binding(
         .collect()
 }
 
+/// The I3.6 capability classes one request lane's own candidates bind, across
+/// every candidate the lane carries.
+///
+/// Same intersection as [`coordinator_lane_class_binding`], applied once per
+/// lane instead of once per candidate, so a lane can be classified as a writer
+/// lane or an independent-audit lane without re-deriving its bindings.
+fn coordinator_lane_bound_classes(
+    request: &StaffingPlanRequest,
+    lane: &StaffingLaneRequest,
+) -> BTreeSet<String> {
+    lane.route_candidates
+        .iter()
+        .flat_map(|candidate| coordinator_lane_class_binding(request, lane, candidate))
+        .collect()
+}
+
+/// Identity of one request lane inside its frozen plan.
+fn coordinator_lane_key(lane: &StaffingLaneRequest) -> (String, String) {
+    (
+        lane.work_unit_id.as_str().to_owned(),
+        lane.role_id.as_str().to_owned(),
+    )
+}
+
+/// Request lanes that can actually run an independent audit on their own.
+///
+/// The coordinator compiles exactly one candidate lane per request lane, and the
+/// fabric authorizes attempt `n` of an admission on the receipt's `n`th staffed
+/// route. An audit class bound only to a lane that also staffs the writer would
+/// therefore staff a receipt lane that no compiled lane and no attempt can ever
+/// run — a trailing entry that reads as satisfied independent review while
+/// nothing reviews anything. An audit lane is a request lane that binds an
+/// auditor class and binds no worker class, so the writer role and the audit
+/// role are always two different lanes.
+fn coordinator_audit_lane_keys(
+    request: &StaffingPlanRequest,
+    policy: &ModelRolePolicy,
+) -> BTreeSet<(String, String)> {
+    request
+        .lanes
+        .iter()
+        .filter(|lane| {
+            let bound = coordinator_lane_bound_classes(request, lane);
+            bound
+                .iter()
+                .any(|class| policy.auditor_route_classes.contains(class))
+                && !bound
+                    .iter()
+                    .any(|class| policy.worker_route_classes.contains(class))
+        })
+        .map(coordinator_lane_key)
+        .collect()
+}
+
 /// The live request's route candidates as capability evidence per I3.6 class.
 ///
 /// A route is placed in a class only where the route owner, recipe, role, and
 /// launch all name that exact class. The same complete lane pool is never
-/// copied into every worker, auditor, and Dreamer class.
+/// copied into every worker, auditor, and Dreamer class. An auditor class draws
+/// only from a lane that can run the audit on its own, so an audit class with no
+/// such lane ends up empty and is escalated by the receipt rather than staffed as
+/// a lane nothing would run.
 fn coordinator_route_evidence(
     config: &CoordinatorConfig,
     request: &StaffingPlanRequest,
     policy: &ModelRolePolicy,
 ) -> Result<Vec<RouteClassEvidence>, StaffingPolicyError> {
+    let audit_lanes = coordinator_audit_lane_keys(request, policy);
     let mut classes: Vec<String> = policy.worker_route_classes.clone();
     classes.extend(policy.auditor_route_classes.iter().cloned());
     classes.extend(policy.dreamer_route_classes.iter().cloned());
@@ -954,10 +1293,14 @@ fn coordinator_route_evidence(
 
     let mut placed: BTreeMap<String, Vec<RouteCandidate>> = BTreeMap::new();
     for lane in &request.lanes {
+        let audit_capable = audit_lanes.contains(&coordinator_lane_key(lane));
         for candidate in &lane.route_candidates {
             let mapped = coordinator_route_candidate(config, request.privacy_class, candidate)?;
             let binding = coordinator_lane_class_binding(request, lane, candidate);
             for class in binding {
+                if policy.auditor_route_classes.contains(&class) && !audit_capable {
+                    continue;
+                }
                 let candidates = placed.entry(class.clone()).or_default();
                 if !candidates.iter().any(|seen| seen.route == mapped.route) {
                     candidates.push(mapped.clone());
@@ -1105,13 +1448,18 @@ fn coordinator_constraints(
 /// ranking, and the returned [`StaffingPlanReceipt`] becomes the single
 /// authority on which routes this task class may use. The receipt identifies
 /// the selected route classes, the selected routes, the budget/privacy
-/// constraints it was computed under, and the evidence inputs used.
+/// constraints it was computed under, the outcome profiles it consulted, and
+/// the evidence inputs used.
 ///
 /// Route-class eligibility comes from the request's own declarations
 /// ([`coordinator_lane_class_binding`]), so an unavailable class yields the
 /// explicit typed disposition I3.6 requires rather than a candidate borrowed
 /// from a neighbouring class. The Human intent and route-owner evidence are
 /// bound into the returned receipt.
+///
+/// Every lane the receipt staffs is a lane the coordinator will compile and the
+/// fabric will run: an auditor class with no audit lane of its own is escalated
+/// by name instead of being staffed as a receipt entry nothing could dispatch.
 ///
 /// # Errors
 ///
@@ -1125,6 +1473,7 @@ pub fn plan_coordinator_staffing(
     request: &StaffingPlanRequest,
 ) -> Result<StaffingPlanReceipt, StaffingPolicyError> {
     let (policy, review_requested) = coordinator_recipe_policy(request)?;
+    let audit_lane_available = !coordinator_audit_lane_keys(request, &policy).is_empty();
     let evidence = coordinator_route_evidence(config, request, &policy)?;
     let constraints = coordinator_constraints(request)?;
     let mut receipt = plan_staffing(
@@ -1134,34 +1483,64 @@ pub fn plan_coordinator_staffing(
         &evidence,
         &constraints,
     )?;
+    if !audit_lane_available {
+        record_unauditable_review(&mut receipt, &policy);
+    }
     receipt.route_policy_evidence = coordinator_route_policy_evidence(request)?;
     seal_receipt_digest(&mut receipt)?;
     Ok(receipt)
+}
+
+/// Names the exact reason an independent-audit class could not be staffed.
+///
+/// The planner's own escalate reason for the class is replaced, not appended to,
+/// so the receipt carries one disposition per unavailable class and states the
+/// cause this bridge actually established: the frozen request admits no lane that
+/// can run the audit apart from the writer's own lane.
+fn record_unauditable_review(receipt: &mut StaffingPlanReceipt, policy: &ModelRolePolicy) {
+    for class in &policy.auditor_route_classes {
+        let Some(item) = receipt
+            .unavailable
+            .iter_mut()
+            .find(|item| &item.route_class == class)
+        else {
+            continue;
+        };
+        item.disposition = UnavailableDispositionKind::Escalate;
+        UNAUDITABLE_REVIEW_REASON.clone_into(&mut item.reason);
+    }
 }
 
 /// Enforces one staffing plan receipt against the compiled coordinator
 /// candidate.
 ///
 /// The receipt is the only source of authorized routes for the plan, so this
-/// is the structural form of "no silent substitution". Each planned lane is
-/// bound positionally to the receipt lane that staffed the same role, which is
-/// what stops a writer route from being reused as its own review lane: the
-/// audit position accepts only the cross-family, unpaid route the policy
-/// actually staffed, so a same-family or paid stand-in — or the writer's own
-/// route in the audit position — is refused rather than dispatched, and the
-/// receipt's explicit [`UnavailableClassDisposition`] for that class stays the
-/// record of why it is unavailable. The plan's privacy class must equal the
-/// receipt's ceiling; lane budgets may not exceed the receipt's effective plan
-/// budget, and a plan may staff fewer routes than the receipt only by leaving the
-/// remaining receipted class unstaffed, never by adding one.
+/// is the structural form of "no silent substitution". Each compiled lane is
+/// bound to the receipt lane that staffed the same *route*, never to a
+/// position: the coordinator sorts its lanes by priority, work unit, role and
+/// route key, so a positional comparison would compare a writer against an
+/// auditor whenever priorities differ. Binding by route identity is also what
+/// stops a writer route from being reused as its own review lane: a lane that
+/// selected a route no receipt lane staffed is refused, and a lane can claim a
+/// receipted route only once, so the audit route cannot be run twice or run in
+/// the writer's place.
+///
+/// Coverage is checked in both directions, which is the point. A compiled lane
+/// running an unstaffed route is refused, and a receipted route no compiled lane
+/// runs is refused too — a receipt lane that no lane and no attempt would ever
+/// dispatch is a trailing entry that would read as satisfied independent review
+/// while nothing reviews anything. The plan's privacy class must equal the
+/// receipt's ceiling and lane budgets may not exceed the receipt's effective plan
+/// budget.
 ///
 /// The receipt's integrity is re-bound here through [`verify_receipt_digest`],
 /// so a receipt that did not survive its persistence boundary fails closed.
 ///
 /// # Errors
 ///
-/// Returns the receipt or contract rejection describing the first planned lane
-/// the receipt does not authorize.
+/// Returns the receipt or contract rejection describing the first compiled lane
+/// the receipt does not authorize, the receipted route no compiled lane runs, or
+/// the repeated claim of one receipted route.
 pub fn enforce_plan_receipt(
     receipt: &StaffingPlanReceipt,
     candidate: &StaffingPlanCandidate,
@@ -1172,20 +1551,32 @@ pub fn enforce_plan_receipt(
             "planned privacy class does not match the staffing plan ceiling".to_owned(),
         ));
     }
-    if candidate.lanes.len() > receipt.lanes.len() {
-        return Err(StaffingPolicyError::Contract(format!(
-            "plan staffs {} routes above the {} the staffing plan receipt authorized",
-            candidate.lanes.len(),
-            receipt.lanes.len()
-        )));
-    }
-    for (planned, staffed) in candidate.lanes.iter().zip(receipt.lanes.iter()) {
+    let mut claimed = vec![false; receipt.lanes.len()];
+    for planned in &candidate.lanes {
         let Some(selected) = planned.routing.selected.as_ref() else {
             return Err(StaffingPolicyError::Contract(
                 "planned lane selected no route; the staffing plan receipt authorizes no substitution"
                     .to_owned(),
             ));
         };
+        let Some(position) = receipt
+            .lanes
+            .iter()
+            .position(|staffed| &staffed.route == selected)
+        else {
+            return Err(StaffingPolicyError::Contract(format!(
+                "planned lane selected a route the staffing plan receipt did not staff; the receipt authorizes {} staffed route(s) and this one is not among them",
+                receipt.lanes.len()
+            )));
+        };
+        let staffed = &receipt.lanes[position];
+        if claimed[position] {
+            return Err(StaffingPolicyError::Contract(format!(
+                "the staffing plan receipt authorizes one {} route per lane; two compiled lanes claimed it",
+                staffed.role
+            )));
+        }
+        claimed[position] = true;
         let Some(route_evidence) = receipt
             .route_policy_evidence
             .iter()
@@ -1196,12 +1587,6 @@ pub fn enforce_plan_receipt(
                     .to_owned(),
             ));
         };
-        if selected != &staffed.route {
-            return Err(StaffingPolicyError::Contract(format!(
-                "planned lane selected a route other than the {} route the staffing plan receipt authorized",
-                staffed.role
-            )));
-        }
         if !route_evidence.route_classes.contains(&staffed.route_class) {
             return Err(StaffingPolicyError::Contract(
                 "staffed route class is not present in the route owner's capability evidence"
@@ -1219,6 +1604,16 @@ pub fn enforce_plan_receipt(
         planned.budget.is_within(&receipt.budget).map_err(|error| {
             StaffingPolicyError::Contract(format!("planned lane budget: {error}"))
         })?;
+    }
+    if let Some(staffed) = claimed
+        .iter()
+        .position(|claimed| !claimed)
+        .map(|position| &receipt.lanes[position])
+    {
+        return Err(StaffingPolicyError::Contract(format!(
+            "the staffing plan receipt staffed a {} route for {} that this plan does not run; a receipted independent review lane is never dropped",
+            staffed.role, staffed.route_class
+        )));
     }
     Ok(())
 }

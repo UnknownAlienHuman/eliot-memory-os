@@ -226,11 +226,19 @@ impl AsyncIoOutcome {
     /// Requests cancellation of a pending operation. Only `Pending` moves;
     /// an already-observed completion stays complete (there is nothing to
     /// cancel), and anything else fails closed to `Unresolved`.
+    ///
+    /// `SynchronousComplete` belongs to the "nothing to cancel" arm together
+    /// with `ObservedComplete`. Both are terminal-for-ownership states that
+    /// never went outstanding — `terminal_storage_release` proves the kernel
+    /// owns no storage for either — so there is no request left to cancel and
+    /// collapsing one into `Unresolved` would discard a state the release
+    /// proof still accepts, downgrading a proven terminal result to
+    /// fail-closed retention.
     #[must_use]
     pub fn request_cancel(self) -> Self {
         match self {
             Self::Pending => Self::CancelRequested,
-            Self::ObservedComplete => Self::ObservedComplete,
+            Self::SynchronousComplete | Self::ObservedComplete => self,
             _ => Self::Unresolved,
         }
     }
@@ -2294,6 +2302,14 @@ pub struct SuspendedJobChild {
     observer: JobProcessObserver,
 }
 
+/// Maximum UTF-16 code units (excluding the terminating NUL) accepted in a
+/// named Job Object name.
+///
+/// `SuspendedJobChild::spawn_named` creates the object and
+/// `RecoverableJobObject::open` reopens it, so both ends of the same name
+/// share this bound: a name one end accepts must be reopenable by the other.
+const MAX_JOB_NAME_UTF16_UNITS: usize = 240;
+
 /// A named Job Object reopened during startup/runtime reconciliation.
 pub struct RecoverableJobObject {
     job: OwnedHandle,
@@ -2303,10 +2319,24 @@ pub struct RecoverableJobObject {
 impl RecoverableJobObject {
     /// Reopens an existing named Job Object with query and terminate rights.
     ///
+    /// The name is bounded by exactly the grammar `spawn_named` accepts, so a
+    /// name this end could never create is refused here too instead of being
+    /// handed to `OpenJobObjectW`. `nul_terminated_wide` alone does not catch
+    /// this: an empty `&str` encodes to an empty wide buffer plus the
+    /// terminating NUL, which passes its embedded-NUL and length checks and
+    /// then reaches the kernel as an empty object name.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the name is invalid, absent, or inaccessible.
+    /// Returns `InvalidInput` when the name is empty or past the bound, and an
+    /// error when the name is absent or inaccessible.
     pub fn open(name: &str) -> io::Result<Self> {
+        if name.is_empty() || name.encode_utf16().count() > MAX_JOB_NAME_UTF16_UNITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Job Object name must contain 1..=240 UTF-16 code units",
+            ));
+        }
         let wide = nul_terminated_wide(OsStr::new(name))?;
         // SAFETY: the name is NUL-terminated and remains live for the call.
         let job = unsafe {
@@ -2408,7 +2438,7 @@ impl SuspendedJobChild {
     /// Returns an error for invalid command or Job Object material, name
     /// collision, or any spawn, assignment, or resume failure.
     pub fn spawn_named(command: &std::process::Command, job_name: &str) -> io::Result<Self> {
-        if job_name.is_empty() || job_name.encode_utf16().count() > 240 {
+        if job_name.is_empty() || job_name.encode_utf16().count() > MAX_JOB_NAME_UTF16_UNITS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Job Object name must contain 1..=240 UTF-16 code units",

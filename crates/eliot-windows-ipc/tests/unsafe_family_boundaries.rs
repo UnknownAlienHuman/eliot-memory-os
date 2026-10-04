@@ -121,6 +121,14 @@ fn source_text(relative: &str) -> String {
 /// carries `inputs`, `expectation`, `impl`, `caller`, `family` and `binding_state`).
 /// An unscoped `find` always hit the `expected_set` entry first, so every assertion
 /// about `inputs`/`expectation`/`impl` read an object that does not contain them.
+///
+/// The depth walk MUST skip JSON string values. The `full_match_justification`
+/// prose quotes Rust source, so entries carry unbalanced braces INSIDE strings
+/// (`#[cfg(test)]`, `mod tests`, `{ expected }`). Counting those as structure made
+/// the depth walk run past the entry's real `}` and never return to zero, so cases
+/// 12, 24 and 26 were reported as "not closed" even though every one of them is a
+/// well-formed object. The scan below tracks string state and backslash escapes,
+/// so only structural braces move the depth.
 fn fixture_case(case: u32) -> String {
     let fixture = fixture_text();
     let cases_start = fixture
@@ -136,8 +144,21 @@ fn fixture_case(case: u32) -> String {
         .rfind('{')
         .unwrap_or_else(|| panic!("case {case} has no enclosing object"));
     let mut depth = 0_i32;
+    let mut inside_string = false;
+    let mut escaped = false;
     for (offset, character) in cases[open..].char_indices() {
+        if inside_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                inside_string = false;
+            }
+            continue;
+        }
         match character {
+            '"' => inside_string = true,
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -965,9 +986,28 @@ fn suspended_process_guard_cleans_up_on_early_return_before_assignment() {
         name_guard < first_read,
         "the job-name bound must be checked before the command is read at all, got {name_guard} then {first_read}"
     );
+    // The bound is read through the SHARED constant, not a literal. Both ends of
+    // the same name -- `spawn_named`, which creates it, and
+    // `RecoverableJobObject::open`, which reopens it -- must accept exactly the
+    // same grammar, so the assertion follows the constant to its one
+    // declaration rather than pinning a second copy of "240" in this test. A
+    // literal here would pass even if one end silently diverged.
     assert!(
-        spawn.contains("job_name.encode_utf16().count() > 240"),
-        "the job-name bound must reject anything past 240 UTF-16 code units"
+        spawn.contains("job_name.encode_utf16().count() > MAX_JOB_NAME_UTF16_UNITS"),
+        "the job-name bound must be checked against the shared MAX_JOB_NAME_UTF16_UNITS constant"
+    );
+    assert!(
+        library.contains("const MAX_JOB_NAME_UTF16_UNITS: usize = 240;"),
+        "the shared job-name bound must be the recorded 240 UTF-16 code units"
+    );
+    // The same bound is enforced on the REOPEN path, so a name `spawn_named`
+    // could never create is refused before any OpenJobObjectW.
+    let reopen = w1b_block(&library, "impl RecoverableJobObject {");
+    assert!(
+        reopen
+            .contains("name.is_empty() || name.encode_utf16().count() > MAX_JOB_NAME_UTF16_UNITS"),
+        "the reopen must enforce the same bound as the spawn, or a name this crate never creates \
+         still reaches OpenJobObjectW"
     );
     // The same grammar is independently enforced where this file can reach it:
     // an empty name has no NUL-terminated wide form, so the reopen refuses it
@@ -1495,6 +1535,14 @@ fn oplock_drain_timeout_takes_the_same_fail_closed_leak_path() {
     // times out) always resolves deterministically and leaves the directory
     // removable, proving the drain verdict — not any timeout value — decided
     // the release.
+    //
+    // The seam is PROCESS-GLOBAL, so this case must hold `fault_boundary_run`
+    // across its own `acquire` exactly as the arming cases do. Without it the
+    // LateCompletion arm left armed by case 21 (which holds the lock only for
+    // its own body) reaches this `acquire` and fails it with the injected
+    // error, so a case that asserts nothing about injection was decided by
+    // whichever armed test happened to run concurrently.
+    let _serialized = fault_boundary_run();
     let directory = ok(unique_probe_directory("oplock-drain-timeout"));
     let guard = ok(DirectoryOplockGuard::acquire(&directory));
     assert_eq!(guard.async_outcome(), AsyncIoOutcome::Pending);
@@ -2087,6 +2135,25 @@ fn w1b_block(source: &str, anchor: &str) -> String {
     panic!("unbalanced source block for anchor: {anchor}");
 }
 
+/// Drops the `//` comment tail of every line, so a source assertion can test
+/// what the CODE says rather than what a comment says ABOUT the code.
+///
+/// The loop this serves documents its own invariant by naming the function it
+/// refuses to call, so any `contains` over the raw block matches the
+/// explanation. Block comments (`/* */`) are not stripped: this crate's
+/// `src/lib.rs` uses `//` throughout, and leaving `/* */` intact keeps this
+/// helper from pretending to be a full Rust lexer.
+fn w1b_strip_line_comments(block: &str) -> String {
+    block
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The contiguous `//` comment lines immediately above `anchor`, which is
 /// where an operation-specific SAFETY witness has to live.
 fn w1b_comment_witness(source: &str, anchor: &str) -> String {
@@ -2513,8 +2580,15 @@ fn case28_child_drop_joins_observer_before_the_port_handle_drops() {
         w1b_block(&source, "impl Drop for JobProcessObserver {").contains("self.shutdown();"),
         "Drop must always shut the observer down"
     );
+    // Assert on the CALL, not on the bare token. The loop's own comment names
+    // `open_process_identity` precisely to explain why it is not called there
+    // ("resolving inline would leave shutdown's join unbounded"), so a
+    // substring test over the whole block matched the explanation and failed a
+    // loop that never resolves anything. Stripping `//` comments first makes
+    // the assertion mean what it says: no identity resolution on this thread.
     assert!(
-        !w1b_block(&source, "fn job_process_observer_loop(").contains("open_process_identity"),
+        !w1b_strip_line_comments(&w1b_block(&source, "fn job_process_observer_loop("))
+            .contains("open_process_identity"),
         "the observer thread must not resolve identities inline, or the join is unbounded"
     );
     let child_drop = w1b_block(&source, "impl Drop for SuspendedJobChild {");
@@ -3147,11 +3221,22 @@ fn case35_job_enumeration_regrowth_stays_bounded_under_churn() {
     // no seam to build the `&std::process::Command` that spawn takes. The live
     // enumeration execution stays with the in-crate `#[cfg(test)] mod tests` in
     // `src/lib.rs`.
+    // `Empty` is REFUSED by the shared classifier, and stays refused: it is the
+    // EOF-shaped outcome, deliberately distinct from success-with-data, so a
+    // site that accepts an empty transfer maps it itself. This is exactly what
+    // production does -- `job_process_ids` matches `TransferOutcome::Empty =>
+    // 0` rather than going through `complete_units` -- so asserting `Ok(0)`
+    // here would demand a contract the enum explicitly does not offer and would
+    // make an empty job unrepresentable.
     let empty = TransferOutcome::Empty;
     assert_eq!(
-        ok(empty.complete_units()),
-        0,
-        "an empty job must stay consumable as zero IDs, never as a failure"
+        w1b_error_kind(empty.complete_units()),
+        io::ErrorKind::InvalidData,
+        "an empty transfer must fail closed in the shared classifier, never read as a consumable count"
+    );
+    assert!(
+        empty.retry_capacity().is_err(),
+        "an empty transfer is not partial, so it must never size a regrown buffer"
     );
     let inside = TransferOutcome::Complete { units: 1 };
     assert_eq!(
