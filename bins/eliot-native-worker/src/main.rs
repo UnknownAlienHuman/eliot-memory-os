@@ -381,28 +381,35 @@ impl<L: AdmittedLifecycle> AdmittedLifecycle for RecordedLifecycle<'_, L> {
         &mut self,
         registration: &NativeWorkerRegistration,
     ) -> Result<serde_json::Value, NativeWorkerError> {
-        self.observe(self.inner.submit_registration(registration))
+        // The inner receipt is bound to a local first: nesting the delegate call
+        // inside `self.observe(..)` would borrow `*self` mutably twice in one
+        // expression and would not compile.
+        let receipt = self.inner.submit_registration(registration);
+        self.observe(receipt)
     }
 
     fn submit_claim(
         &mut self,
         admission: &ClaimAdmissionRequest,
     ) -> Result<serde_json::Value, NativeWorkerError> {
-        self.observe(self.inner.submit_claim(admission))
+        let receipt = self.inner.submit_claim(admission);
+        self.observe(receipt)
     }
 
     fn submit_reconcile(
         &mut self,
         submission: &ReconcileSubmission,
     ) -> Result<serde_json::Value, NativeWorkerError> {
-        self.observe(self.inner.submit_reconcile(submission))
+        let receipt = self.inner.submit_reconcile(submission);
+        self.observe(receipt)
     }
 
     fn submit_readiness(
         &mut self,
         submission: &ReadinessSubmission,
     ) -> Result<serde_json::Value, NativeWorkerError> {
-        self.observe(self.inner.submit_readiness(submission))
+        let receipt = self.inner.submit_readiness(submission);
+        self.observe(receipt)
     }
 }
 
