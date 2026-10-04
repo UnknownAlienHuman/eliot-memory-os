@@ -89,7 +89,7 @@
 //! a guard on release), while the fresh-write gate before the canonical apply
 //! consults the apply stage alone ([`RestoreEffectExposure::apply_stage`]) because
 //! the carrier stage is never answered from the apply's evidence: it is decided
-//! by its own exact readback, and there are exactly three such sites —
+//! by its own exact readback, and there are exactly four such call sites —
 //! [`SurrealStoreAdapter::resolve_carrier_stage`] immediately before the
 //! publication it governs, the same bounded readback on the publication's own
 //! success/duplicate arm after the provider answered, and its refusal arm when the
@@ -1557,13 +1557,16 @@ impl RestoreAttemptGuard {
             // publication and issues a second carrier transaction. A slot on
             // which nothing was ever submitted answers it too, and the original
             // pair-only test was already right about that one: no stage is
-            // unproven, the apply stage was never entered, and there is nothing a
-            // later invocation could learn from it that a fresh invocation would
-            // not re-derive. Retaining it would spend a slot of a bounded map on
+            // unproven, the apply stage was never entered, and the only thing
+            // such an entry carries that a fresh invocation would not re-derive
+            // is a first failure recorded by an earlier incarnation, which this
+            // release discards with the entry. Retaining it would spend a
+            // slot of a bounded map on
             // an identity that wrote nothing and would let the ceiling be reached
             // by the cheapest possible schedule — acquire and drop, once per
             // slot — which is a worse failure mode than the one this conjunct
-            // exists to close. So a slot is retained exactly when a
+            // exists to close. A recorded outcome also retains every state, so
+            // with no outcome recorded a slot is retained exactly when a
             // reconciliation is open, or when the apply stage has not reached
             // `DurableResultVerified` and something was actually submitted.
             ledger.attempts.remove(&self.key);
@@ -4685,13 +4688,13 @@ impl SurrealStoreAdapter {
                     // missing row observed while the old transaction may still be
                     // running is insufficient". A late commit of the previous
                     // publication therefore cannot produce a duplicate effect:
-                    // the carrier rows are create-only under the unique
-                    // `(namespace, key)` index, so a commit that lands after this
-                    // readback makes this very transaction answer
-                    // `IdentityConflict`, and the duplicate arm of
+                    // a commit that lands after this readback makes this very
+                    // transaction answer `IdentityConflict` on its own create-only
+                    // key, and the duplicate arm of
                     // [`publish_archive_member_carriers`] resolves that by the
-                    // same bounded exact readback — `Verified`, the carrier stage
-                    // raised, and the apply continued exactly once. The
+                    // same bounded exact readback - `Verified`, the carrier stage
+                    // raised, and the apply continued exactly once, under a retry
+                    // that carries the same state fence. The
                     // authorisation is bounded to the carrier stage: the apply
                     // stage keeps its own gate above and is never reopened here.
                     publish_archive_member_carriers(
