@@ -7,18 +7,20 @@ use eliot_engine::{
 };
 use eliot_store::{BlobStore, CanonicalStore, ControlWal};
 use eliot_types::{
-    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterResult, AdapterResultStatus,
-    AdapterState, AgentHostId, BlackboardItemKind, BlobStoreConfig, CapabilityManifest,
-    ControlWalConfig, GovernorConfig, MailboxMessageKind, ModuleAuthorityProfile, ModuleCapability,
-    OperationPhase, OperationReconciliationState, ProviderDeclaredBudget, ProviderDispatchState,
-    ProviderRoutePolicy, TaintClass,
+    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterError, AdapterResult,
+    AdapterResultStatus, AdapterState, AgentHostId, BlackboardItemKind, BlobStoreConfig,
+    CapabilityManifest, ControlWalConfig, GovernorConfig, MailboxMessageKind,
+    ModuleAuthorityProfile, ModuleCapability, OperationPhase, OperationReconciliationState,
+    ProviderDeclaredBudget, ProviderDispatchState, ProviderRoutePolicy, TaintClass,
 };
+use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 use tokio::time::{Duration, sleep};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -56,11 +58,7 @@ impl Adapter for FlakyExternalAdapter {
         context: AdapterExecutionContext,
     ) -> BoxAdapterFuture<'_, AdapterResult> {
         if context.generation == 1 {
-            Box::pin(async {
-                Err(EngineError::RuntimeSupervision(
-                    "injected pre-dispatch transport failure".to_owned(),
-                ))
-            })
+            Box::pin(async move { Ok(injected_transport_failure(&request)) })
         } else {
             self.echo.execute(request, context)
         }
@@ -152,6 +150,80 @@ fn external_test_request(adapter_id: &str, timeout_ms: u64) -> eliot_types::Adap
     );
     request.input = serde_json::json!({"provider_route_policy": route_policy});
     request
+}
+
+/// The pre-dispatch transport failure the flaky external adapter reports for
+/// `generation == 1`; the supervisor maps an adapter `Err` to `Failed`, which
+/// the circuit breaker no longer counts.
+fn injected_transport_failure(request: &eliot_types::AdapterRequest) -> AdapterResult {
+    let status = AdapterResultStatus::TransportFailure;
+    let message = "injected pre-dispatch transport failure";
+    AdapterResult {
+        result_id: format!("adapter-result:{}", request.request_id),
+        request_id: request.request_id.clone(),
+        adapter_id: request.adapter_id.clone(),
+        status,
+        output: json!({ "status": status, "message": message }),
+        output_blob: None,
+        observations: Vec::new(),
+        error: Some(AdapterError {
+            code: "transport_failure".to_owned(),
+            message: message.to_owned(),
+            retryable: false,
+        }),
+        duration_ms: 0,
+        trace_id: request.context.trace_id.clone(),
+        created_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// Holds its supervisor permit for ~150 ms, far shorter than the declared
+/// `timeout_ms` queue-wait bound, so a second request must queue instead of
+/// being refused as saturated.
+struct QueuedHoldingAdapter {
+    manifest: CapabilityManifest,
+    echo: TestEchoAdapter,
+}
+
+impl QueuedHoldingAdapter {
+    fn new() -> Self {
+        let mut manifest = external_test_manifest("queued-adapter", 5_000);
+        manifest.adapter_class = AdapterClass::InternalTest;
+        Self {
+            manifest,
+            echo: TestEchoAdapter::new(),
+        }
+    }
+}
+
+impl Adapter for QueuedHoldingAdapter {
+    fn id(&self) -> &str {
+        &self.manifest.adapter_id
+    }
+
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    fn health(&self) -> BoxAdapterFuture<'_, eliot_types::AdapterHealth> {
+        self.echo.health()
+    }
+
+    fn execute(
+        &self,
+        request: eliot_types::AdapterRequest,
+        context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
+        let echo = &self.echo;
+        Box::pin(async move {
+            sleep(Duration::from_millis(150)).await;
+            echo.execute(request, context).await
+        })
+    }
+
+    fn shutdown(&self) -> BoxAdapterFuture<'_, ()> {
+        self.echo.shutdown()
+    }
 }
 
 #[test]
@@ -337,7 +409,7 @@ async fn adapter_supervisor_circuit_breaker_opens() -> TestResult {
                 None,
             )
             .await?;
-        assert_eq!(result.status, AdapterResultStatus::Failed);
+        assert_eq!(result.status, AdapterResultStatus::TransportFailure);
     }
 
     let health = supervisor.health_probe("test-failing").await;
@@ -366,7 +438,7 @@ async fn adapter_supervisor_hydrates_durable_open_circuit() -> TestResult {
                 None,
             )
             .await?;
-        assert_eq!(result.status, AdapterResultStatus::Failed);
+        assert_eq!(result.status, AdapterResultStatus::TransportFailure);
     }
     drop(first);
 
@@ -402,7 +474,7 @@ async fn adapter_supervisor_does_not_redispatch_before_provider_dispatch() -> Te
     let operation_id = format!("adapter:flaky-external:{}", request.request_id);
 
     let result = supervisor.execute("flaky-external", request, None).await?;
-    assert_eq!(result.status, AdapterResultStatus::Failed);
+    assert_eq!(result.status, AdapterResultStatus::TransportFailure);
     let checkpoint = runtime
         .get_checkpoint(operation_id.clone())
         .await?
@@ -527,6 +599,76 @@ async fn adapter_supervisor_half_open_probe() -> TestResult {
     let health = supervisor.half_open_probe("test-failing").await;
     assert_eq!(health.state, AdapterState::Healthy);
     assert!(!health.circuit_open);
+    Ok(())
+}
+
+#[tokio::test]
+async fn adapter_supervisor_queues_a_request_over_its_own_concurrency_limit() -> TestResult {
+    let mut registry = AdapterRegistry::new();
+    registry.register(QueuedHoldingAdapter::new())?;
+    let supervisor = Arc::new(AdapterSupervisor::new(registry));
+
+    // The holder must keep running while the queued request waits, so it is
+    // spawned onto the runtime: a merely pinned local future would stop being
+    // polled once `select!` chose its other branch and would hold the permit
+    // forever, which is a stalled probe rather than a saturated adapter.
+    let mut holder = tokio::spawn({
+        let supervisor = Arc::clone(&supervisor);
+        async move {
+            supervisor
+                .execute(
+                    "queued-adapter",
+                    test_request("queued-adapter", AdapterCapability::ExecuteTest),
+                    None,
+                )
+                .await
+        }
+    });
+    if let Ok(joined) = tokio::time::timeout(Duration::from_millis(20), &mut holder).await {
+        return Err(format!(
+            "queued adapter released its single permit before the queueing probe: {joined:?}"
+        )
+        .into());
+    }
+
+    let queued = supervisor
+        .execute(
+            "queued-adapter",
+            test_request("queued-adapter", AdapterCapability::ExecuteTest),
+            None,
+        )
+        .await?;
+    assert_ne!(
+        queued.status,
+        AdapterResultStatus::Unavailable,
+        "the second request must queue behind the adapter's own permit, not be refused: {queued:?}"
+    );
+    assert_ne!(
+        queued.error.as_ref().map(|error| error.code.as_str()),
+        Some("busy")
+    );
+    assert_eq!(queued.status, AdapterResultStatus::Succeeded);
+    assert_eq!(holder.await??.status, AdapterResultStatus::Succeeded);
+    Ok(())
+}
+
+#[tokio::test]
+async fn adapter_supervisor_records_semantic_no_results_without_opening_the_circuit() -> TestResult
+{
+    let supervisor = AdapterSupervisor::builtin()?;
+
+    let result = supervisor
+        .execute(
+            "test-no-results",
+            test_request("test-no-results", AdapterCapability::ExecuteTest),
+            None,
+        )
+        .await?;
+    assert_eq!(result.status, AdapterResultStatus::NoResults);
+
+    let health = supervisor.health_probe("test-no-results").await;
+    assert!(!health.circuit_open);
+    assert_eq!(health.consecutive_failures, 0);
     Ok(())
 }
 

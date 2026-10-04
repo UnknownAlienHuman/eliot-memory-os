@@ -32,6 +32,13 @@ LET $resolved = $claims.map(|$claim| {
     statement: $claim.statement,
     status: $claim.status,
     memory_revision: $claim.memory_revision,
+    // `visibility`, `lifecycle_state` and `failed_verification` are QUERY-INTERNAL
+    // discriminators: the bucket filters below consume them. They must not be
+    // projected into a returned row, because `ClaimSummary` is a closed
+    // `deny_unknown_fields` DTO (eliot-types/src/memory.rs) declaring exactly the
+    // four fields above. Leaking them made every `current_state` decode fail
+    // closed with `unknown field failed_verification`, which is what stopped
+    // `ContextCompiler::read_context` from assembling any L3 packet at all.
     visibility: $claim.visibility,
     lifecycle_state: $lifecycle_state,
     failed_verification: <string> $claim.claim_id IN $failed_claim_ids,
@@ -54,11 +61,46 @@ LET $contested = $resolved[WHERE (failed_verification = true OR status = 'contes
 LET $forbidden = $resolved[WHERE status IN ['rejected', 'stale', 'superseded']
   OR lifecycle_state IN ['stale', 'superseded', 'deleted']
   OR visibility = 'private'];
-LET $verified_page = array::slice($verified, 0, 50);
-LET $supported_page = array::slice($supported, 0, 50);
-LET $weak_page = array::slice($weak, 0, 50);
-LET $contested_page = array::slice($contested, 0, 50);
-LET $forbidden_page = array::slice($forbidden, 0, 50);
+LET $verified_page = array::slice($verified, 0, 50).map(|$claim| {
+  RETURN {
+    claim_id: $claim.claim_id,
+    statement: $claim.statement,
+    status: $claim.status,
+    memory_revision: $claim.memory_revision,
+  };
+});
+LET $supported_page = array::slice($supported, 0, 50).map(|$claim| {
+  RETURN {
+    claim_id: $claim.claim_id,
+    statement: $claim.statement,
+    status: $claim.status,
+    memory_revision: $claim.memory_revision,
+  };
+});
+LET $weak_page = array::slice($weak, 0, 50).map(|$claim| {
+  RETURN {
+    claim_id: $claim.claim_id,
+    statement: $claim.statement,
+    status: $claim.status,
+    memory_revision: $claim.memory_revision,
+  };
+});
+LET $contested_page = array::slice($contested, 0, 50).map(|$claim| {
+  RETURN {
+    claim_id: $claim.claim_id,
+    statement: $claim.statement,
+    status: $claim.status,
+    memory_revision: $claim.memory_revision,
+  };
+});
+LET $forbidden_page = array::slice($forbidden, 0, 50).map(|$claim| {
+  RETURN {
+    claim_id: $claim.claim_id,
+    statement: $claim.statement,
+    status: $claim.status,
+    memory_revision: $claim.memory_revision,
+  };
+});
 LET $returned = array::len($verified_page)
   + array::len($supported_page)
   + array::len($weak_page)

@@ -18,8 +18,10 @@
 //! deserializer unparsed. A `serde_json::Value` intermediate collapses a
 //! repeated object member before the decoder ever sees it, so it could not
 //! prove case 5; every decoder call in this file therefore receives the stored
-//! string itself. NO `Value` EVER REACHES A DECODER in this file, and that is the
-//! whole claim. The `Value` uses are exactly two kinds, both of them AFTER the fact:
+//! string itself. NO `Value` REACHES A DECODER in this file EXCEPT the single
+//! site named below, and that site exists to EXECUTE the production ingress
+//! residual rather than to make a refusal look proven. The `Value` uses are
+//! exactly three kinds:
 //!
 //! - WITNESSES that parse a document which was ALREADY decoded from its own raw
 //!   text, purely to compare one decoded field against the fixture's own stored
@@ -27,11 +29,19 @@
 //!   `collapsed`/`repeats` pair; and
 //! - RE-ENCODINGS of an already-decoded value, compared as bytes: case 9's legacy
 //!   round trip and case 15's completeness-variant round trip each decode
-//!   `serde_json::to_string(..)` of a value they already hold.
+//!   `serde_json::to_string(..)` of a value they already hold; and
+//! - EXACTLY ONE `Value` INTO A DECODER, in case 5 (b): the collapsed-route
+//!   measurement `serde_json::from_value::<CompilePacketToolInput>(witness(&text))`,
+//!   which reproduces what the production MCP ingress actually does to a repeated
+//!   member. That call is the MEASUREMENT of a recorded, un-repaired defect
+//!   (`known_non_clean` row `c5_production_ingress_collapses_duplicates`) and is
+//!   not a claim that this route refuses anything.
 //!
 //! No fixture is normalized, re-serialized or pre-processed before a decoder sees
 //! it. Where this file parses a stored document at all, that parse is a
-//! comparison and never an input to a decoder.
+//! comparison, never an input to a decoder, and never a substitute for one - with
+//! the single case-5 (b) exception, which feeds the COLLAPSED form to a decoder on
+//! purpose and says so at the call site.
 //!
 //! Requirements the fixture container (`serde_t04_agent_mcp.json`, another
 //! writer's file) must satisfy for this file's assertions to be exact:
@@ -66,6 +76,20 @@
 //!     Every fixture whose name carries neither suffix is asserted to be ACCEPTED, and
 //!     the acceptances say so in their own names (`..._accepted`, `..._observed`,
 //!     `..._canonical`, `..._default`);
+//! - ONE suffix names a ROUTE instead of an outcome, and it is neither of the two
+//!   above:
+//!   - `..._collapsed_route` - a document whose outcome DEPENDS ON WHICH DECODE PATH
+//!     REACHES THE DECODER, and which this file therefore asserts BOTH ways on the
+//!     same stored bytes. There is exactly one:
+//!     `c5_area_ambiguous_task_id_in_compile_packet_tool_input_collapsed_route` is
+//!     REFUSED through `decode` (`serde_json::from_str`, no intermediate document) and
+//!     ACCEPTED through `serde_json::from_value` of the same bytes, because the
+//!     production MCP ingress supplies the second and not the first. Case 5 states
+//!     both outcomes, proves which stated value survives the second one, and records
+//!     the acceptance as the un-repaired known non-clean row
+//!     `c5_production_ingress_collapses_duplicates`. The name says ROUTE rather than
+//!     `..._refuse` because a `_refuse` name would have claimed production refuses
+//!     the document, which is the one thing case 5 proves it does not do;
 //! - `c16_ProviderRoutePolicyBinding_canonical` is the canonical policy's own
 //!   binding: the same `policy_id` and the same `policy_hash_blake3`.
 //!
@@ -183,6 +207,21 @@
 //! `known_non_clean` array, asserted there as the non-clean behaviour the source
 //! declares in case 12, and handed off to their named owner. No assertion in this
 //! file reports either path as clean.
+//!
+//! A THIRD recorded path, and the one this file can EXECUTE rather than merely
+//! describe, is `CompilePacketToolInput`'s duplicate-member refusal on the
+//! PRODUCTION MCP ingress. `crates/eliot-app/src/mcp_stdio.rs::handle_line` builds a
+//! `serde_json::Value` from the authenticated line
+//! (`crates/eliot-app/src/mcp_stdio.rs:2134`) and the one production decode site,
+//! `crates/eliot-app/src/mcp_stdio/task_handlers.rs:188`, reaches the decoder through
+//! `serde_json::from_value`
+//! (`crates/eliot-app/src/mcp_stdio/input_validation.rs:34`), so a repeated member is
+//! already collapsed - last wins - before any typed decoder runs, and the visitor's
+//! seven `duplicate_field` guards are UNREACHABLE there. The lossy stage is
+//! `eliot-app` code, outside issue #933's four-file production scope, so the row
+//! `c5_production_ingress_collapses_duplicates` is retained as unresolved and case 5
+//! proves the collapse on both routes. NOTHING in this file asserts that production
+//! refuses a duplicate member.
 //!
 //! `AdapterError.code` is a FREE REASON STRING
 //! (`crates/eliot-types/src/adapter.rs:174`), not a closed enum. Case 14 asserts
@@ -514,7 +553,7 @@ const TYPE_HOME_CASE: [(&str, &str); 54] = [
     ),
 ];
 
-/// The three `known_non_clean` identifiers the container must carry. Case 12 asserts
+/// The four `known_non_clean` identifiers the container must carry. Case 12 asserts
 /// every row exists, is complete, and is the recorded handoff for a path this lane
 /// must NOT repair.
 ///
@@ -527,10 +566,28 @@ const TYPE_HOME_CASE: [(&str, &str); 54] = [
 /// `eliot-app` / `eliot-engine` CALLERS. The first two rows are this lane's own
 /// named-owner handoff for `ObserveInput.hint`'s `alias = "kind"` and
 /// `ObserveInput.schema_version`'s helper default.
-const KNOWN_NON_CLEAN_IDS: [&str; 3] = [
+///
+/// The FOURTH row, `c5_production_ingress_collapses_duplicates`, is the case-5
+/// ingress residual. `CompilePacketToolInput`'s seven `duplicate_field` guards are
+/// reachable only from a raw `MapAccess`, and the production MCP ingress supplies
+/// none: `crates/eliot-app/src/mcp_stdio.rs::handle_line` parses the authenticated
+/// line with `serde_json::from_str` into a `serde_json::Value`
+/// (`crates/eliot-app/src/mcp_stdio.rs:2134`) and the single production decode site,
+/// `crates/eliot-app/src/mcp_stdio/task_handlers.rs:188`, reaches the decoder through
+/// `serde_json::from_value` (`crates/eliot-app/src/mcp_stdio/input_validation.rs:34`).
+/// No `preserve_order` feature is enabled anywhere in the workspace, so those objects
+/// are `BTreeMap`s: the second occurrence of a repeated member overwrites the first
+/// at INGRESS, before any typed decoder runs, and each key is then yielded exactly
+/// once. A document repeating an identity member with two DIFFERENT values is
+/// therefore ACCEPTED on that route and the LAST value is used. The lossy stage is
+/// `eliot-app` code, outside issue #933's four-file production scope, so the row is
+/// retained as unresolved and case 5 EXECUTES the collapse instead of asserting that
+/// the refusal is production-proven.
+const KNOWN_NON_CLEAN_IDS: [&str; 4] = [
     "c12_observe_hint_alias",
     "c12_observe_schema_version_default",
     "no_t04_decoder_enforces_schema_version",
+    "c5_production_ingress_collapses_duplicates",
 ];
 
 /// The member key each unknown-field refusal fixture injects, paired with that
@@ -1206,6 +1263,50 @@ fn resolve_repeated_member(document: &str) -> Option<String> {
     }
 }
 
+/// The RAW JSON VALUE TEXT that follows the `ordinal`-th (1-based) occurrence of
+/// `"<key>"` in `document`, taken from the stored bytes and returned unparsed.
+///
+/// WHY THIS EXISTS BESIDE `repeats` AND `resolve_repeated_member`, both of which
+/// this file already had: `repeats` returns a COUNT and `resolve_repeated_member`
+/// returns a NAME, and neither can say WHICH occurrence carried WHICH value. Case
+/// 5 (b) has to distinguish "the decoder kept the FIRST stated `task_id`" from
+/// "the decoder kept the SECOND stated `task_id`", and those two documents differ
+/// only in this fact - so the value has to be read from the text at a stated
+/// ordinal, not taken from whatever a parse happened to leave in the map.
+///
+/// The returned slice runs from just after the member's key to the next `,` or `}`,
+/// which is the exact span case 5's null-then-value loop already reads by hand. It is
+/// returned UNPARSED so the caller can compare the decoder's field against the stored
+/// token, and so a caller that expects a string says so at its own call site.
+fn nth_occurrence_value_text(document: &str, key: &str, ordinal: usize) -> String {
+    assert!(
+        ordinal >= 1,
+        "an occurrence ordinal is 1-based, got {ordinal}"
+    );
+    let token = format!("\"{key}\"");
+    let mut from = 0;
+    for _ in 1..ordinal {
+        let found = document[from..].find(token.as_str()).unwrap_or_else(|| {
+            panic!("`{key}` must occur at least {ordinal} times in the document")
+        });
+        from += found + token.len();
+    }
+    let start = document[from..]
+        .find(token.as_str())
+        .unwrap_or_else(|| panic!("`{key}` must occur at least {ordinal} times in the document"))
+        + from
+        + token.len();
+    document[start..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start()
+        .split([',', '}'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
 /// Assert that a fixture is ACCEPTED by the delivered decoder, and return the
 /// decoded value so the caller can compare its fields against the fixture text.
 fn assert_accepted<T>(fixture_name: &str) -> T
@@ -1824,7 +1925,7 @@ fn c5_duplicate_invocation_discriminator_identity_authority_keys_refused() {
     // raw-text facts are therefore something only the raw route could see: the text
     // carries the member twice, while a value parse of the SAME text yields one
     // occurrence and could never raise the refusal below.
-    let duplicates: [(&str, &str, &str); 14] = [
+    let duplicates: [(&str, &str, &str); 15] = [
         (
             "c5_AdapterRequest_duplicate_request_id_refuse",
             "request_id",
@@ -1881,6 +1982,18 @@ fn c5_duplicate_invocation_discriminator_identity_authority_keys_refused() {
             "request identity",
         ),
         (
+            // The AMBIGUOUS twin of the row above: every other member is
+            // byte-identical to `c5_area_repeated_task_id_in_compile_packet_tool_input_refuse`,
+            // and the two `task_id` occurrences carry DIFFERENT values, so this
+            // document says two different things about its own request identity and
+            // the route decides which one survives. That is what makes the
+            // collapsed-route measurement in (b) below discriminating: on the
+            // SAME-ORIENTED-value document the collapse would be invisible.
+            "c5_area_ambiguous_task_id_in_compile_packet_tool_input_collapsed_route",
+            "task_id",
+            "ambiguous request identity",
+        ),
+        (
             "c5_area_repeated_memory_mode_in_compile_packet_tool_input_refuse",
             "memory_mode",
             "wrapper memory-mode",
@@ -1931,8 +2044,14 @@ fn c5_duplicate_invocation_discriminator_identity_authority_keys_refused() {
         );
     }
 
-    // The eleven distinct decoders, named individually so each refusal is attributed
-    // to the type that raises it rather than to one shared helper. serde's derived
+    // The NINE distinct decoders, named individually so each refusal is attributed
+    // to the type that raises it rather than to one shared helper. Twelve refusals
+    // are asserted over those nine types here, and the count is not nine because two
+    // of them are asked about more than one repeated member: `CompilePacketToolInput`
+    // three times and `OperationAuthorityOpenRequest` twice. (This sentence said
+    // "eleven distinct decoders" and was wrong at every count - nine types, twelve
+    // assertions - so the number is now the measured one. See A14.8: an oracle's own
+    // description is part of what it has to be correct about.) serde's derived
     // struct decoder reports the repeat while it reads the raw map, before it can
     // keep either occurrence, and `CompilePacketToolInput`'s manual visitor carries
     // its own explicit `duplicate_field` guards (`crates/eliot-types/src/mcp_contract.rs:78-133`).
@@ -1995,6 +2114,141 @@ fn c5_duplicate_invocation_discriminator_identity_authority_keys_refused() {
         "c5_area_repeated_memory_mode_in_compile_packet_tool_input_refuse",
         "memory_mode",
         "duplicate field",
+    );
+
+    // =======================================================================
+    // THE PRODUCTION INGRESS RESIDUAL, EXECUTED ON BOTH ROUTES. The two
+    // assertions below are about ONE document,
+    // `c5_area_ambiguous_task_id_in_compile_packet_tool_input_collapsed_route`,
+    // which repeats its `task_id` - the compile-packet request identity - with two
+    // DIFFERENT values and is byte-identical to
+    // `c5_area_repeated_task_id_in_compile_packet_tool_input_refuse` in every other
+    // member. One route refuses it; the other, which is the route production
+    // actually uses, accepts it and keeps one of the two stated identities.
+    // =======================================================================
+    let collapsed_text =
+        raw("c5_area_ambiguous_task_id_in_compile_packet_tool_input_collapsed_route");
+
+    // (a) THE RAW ROUTE REFUSES. This is the same decoder and the same
+    // `duplicate_field` guard as the row above, reached through `decode` - which is
+    // `serde_json::from_str` with no intermediate document - so the guard IS live
+    // code and fires on exactly these bytes. `assert_named_refusal` adds the two
+    // preconditions that keep this from passing for the wrong reason: the text
+    // really carries `task_id`, and the refusal really is of the `duplicate field`
+    // kind and really names `task_id`.
+    assert_named_refusal::<CompilePacketToolInput>(
+        "c5_area_ambiguous_task_id_in_compile_packet_tool_input_collapsed_route",
+        TASK_ID_MEMBER,
+        "duplicate field",
+    );
+
+    // Both stated identities are read OUT OF THE STORED TEXT at a stated ordinal,
+    // not taken from a parsed map, so nothing here assumes which one wins. The
+    // document is only meaningful because the two differ: if they were equal, every
+    // assertion below would hold no matter what the route did with the repeat.
+    let first_stated: String = serde_json::from_str(&nth_occurrence_value_text(
+        &collapsed_text,
+        TASK_ID_MEMBER,
+        1,
+    ))
+    .unwrap_or_else(|error| {
+        panic!("the FIRST stated `{TASK_ID_MEMBER}` must be a JSON string: {error}")
+    });
+    let second_stated: String = serde_json::from_str(&nth_occurrence_value_text(
+        &collapsed_text,
+        TASK_ID_MEMBER,
+        2,
+    ))
+    .unwrap_or_else(|error| {
+        panic!("the SECOND stated `{TASK_ID_MEMBER}` must be a JSON string: {error}")
+    });
+    assert_ne!(
+        first_stated, second_stated,
+        "the collapsed-route fixture must state TWO DIFFERENT `{TASK_ID_MEMBER}` values, or \
+         nothing downstream of this line can tell a collapse from a no-op"
+    );
+
+    // (c) WHY (b) ASSERTS A SUCCESS - and this is the load-bearing sentence of the
+    // block, so it is stated before the assertion rather than after it.
+    //
+    // (b) below asserts that `serde_json::from_value::<CompilePacketToolInput>`
+    // SUCCEEDS on the collapsed document. It does not assert that as a PASS, a
+    // clean path, or a decoder that is doing the right thing. It asserts today's
+    // MEASURED behaviour of the ONE production MCP ingress route, which is a
+    // RECORDED, UN-REPAIRED DEFECT and the reason the container's
+    // `known_non_clean` array carries the row
+    // `c5_production_ingress_collapses_duplicates` (`KNOWN_NON_CLEAN_IDS`, fourth
+    // entry, asserted complete by case 12).
+    //
+    // The mechanism is upstream of this crate's four files, so #933 cannot repair
+    // it: `crates/eliot-app/src/mcp_stdio.rs::handle_line` parses the authenticated
+    // line with `serde_json::from_str` into a `serde_json::Value`
+    // (`crates/eliot-app/src/mcp_stdio.rs:2134`), and the single production decode
+    // site `crates/eliot-app/src/mcp_stdio/task_handlers.rs:188` hands that
+    // already-built document to
+    // `crates/eliot-app/src/mcp_stdio/input_validation.rs::decode_compile_packet_input`,
+    // which reaches the decoder through `serde_json::from_value`
+    // (`crates/eliot-app/src/mcp_stdio/input_validation.rs:34`). No `preserve_order`
+    // feature is enabled anywhere in the workspace, so that object is a `BTreeMap`
+    // and the second occurrence overwrites the first BEFORE any typed decoder runs;
+    // the key is then yielded exactly once and no guard can fire.
+    //
+    // THEREFORE A GREEN (a) MUST NEVER BE READ AS "PRODUCTION REFUSES DUPLICATES".
+    // (a) is a statement about the raw route only. The refusal is real and it is
+    // live code, and on the production route it is UNREACHABLE.
+    //
+    // And (b) is deliberately DISCRIMINATING in the other direction too: if the
+    // collapse were ever fixed - by refusing the repeated member on this route, or
+    // by carrying the raw bytes to the typed decoder - then (b) FAILS, because the
+    // decode would no longer succeed. That is the intended outcome. (b) pins
+    // today's measured behaviour of a route this issue cannot repair, so that the
+    // day it is repaired the assertion that was standing in for the repair fails
+    // loudly instead of being re-read as a pass.
+    let collapsed_route = serde_json::from_value::<CompilePacketToolInput>(witness(
+        &collapsed_text,
+    ))
+    .unwrap_or_else(|error| {
+        panic!(
+            "the collapsed production route ACCEPTS this document today, which is the recorded \
+             residual `c5_production_ingress_collapses_duplicates`; if this decode now fails, the \
+             ingress has been repaired and this assertion MUST be revisited, not deleted quietly: \
+             {error}"
+        )
+    });
+    // (b) The decoder kept the SECOND stated identity, not the first. Every side of
+    // this comparison comes from the stored bytes: `second_stated` from the second
+    // `"task_id"` in the raw text, `first_stated` from the first.
+    assert_eq!(
+        collapsed_route.request.task_id, second_stated,
+        "the collapsed route must yield the SECOND stated `{TASK_ID_MEMBER}`, the one the \
+         `BTreeMap` overwrote into place at ingress, got: {}",
+        collapsed_route.request.task_id
+    );
+    assert_ne!(
+        collapsed_route.request.task_id, first_stated,
+        "the collapsed route must NOT yield the FIRST stated `{TASK_ID_MEMBER}`; if it did, the \
+         collapse would be first-wins and the row's `observed` fact would be wrong"
+    );
+    // The collapse is also visible WITHOUT the typed decoder, which is what makes it
+    // an ingress fact and not a decoder choice: a `Value` parse of the same bytes
+    // already holds the second value, so the loss happened before any decode.
+    assert_eq!(
+        member(&collapsed_text, TASK_ID_MEMBER),
+        second_stated,
+        "a `Value` parse of the collapsed-route document must already hold the SECOND stated \
+         `{TASK_ID_MEMBER}`; if it held the first, the ingress overwrite is not what this row \
+         records"
+    );
+    // The acceptance is a WHOLE-DOCUMENT acceptance, not a partial salvage of the
+    // members the visitor understood: the same decode kept the document's own OTHER
+    // identity, `project_id`, so what was lost is the first stated `task_id` and
+    // nothing else. `ProjectId` is a `#[serde(transparent)]` `Uuid` newtype, so it is
+    // compared through its own `Display`, which is the text the document carries.
+    assert_eq!(
+        collapsed_route.request.project_id.to_string(),
+        member(&collapsed_text, "project_id"),
+        "the collapsed route accepts the whole document, so the repeated identity is the ONLY \
+         member whose stated value was lost"
     );
     // The audit's "duplicate null/value keys reject" item, on the required-nullable
     // members. These are the documents where one member appears TWICE - the first
@@ -3699,16 +3953,32 @@ fn c12_observe_alias_and_helper_default_are_recorded_non_clean_not_passes() {
     // that DOES exist - the alias in (b) and the helper default in (c) - is recorded
     // non-clean below and asserted as such.
     //
-    // (The interface recorded the three prose occurrences as `:277`, `:420` and `:465`;
-    // the search above finds them at `:274`, `:418` and `:465`. The two earlier lines
-    // differ by three and two lines. The measured positions are the ones cited here,
-    // because a citation that points at the wrong line is worse than a differing one.)
+    // (These three positions are re-measured against the file as it stands, and they
+    // are `274`, `418` and `465`. An earlier delivery of this file recorded them as
+    // `304`, `448` and `495` and explained the difference as drift; that explanation
+    // was wrong. The drift was caused by this issue's OWN record: a first attempt put
+    // the `c5_production_ingress_collapses_duplicates` comment block above
+    // `impl<'de> Deserialize<'de> for CompilePacketToolInput`, which shifted thirty
+    // lines and staled about thirty-five `mcp_contract.rs` citations in four files
+    // this issue does not own. The record now sits at the END of `mcp_contract.rs`
+    // for exactly that reason - zero lines above any declaration move - so these
+    // three coordinates are unchanged from `main` and the recorded-versus-measured
+    // delta is zero, not three and two.)
 
     // ============================== WORDS FIRST =============================
-    // The three paths exercised below are KNOWN NON-CLEAN. They are recorded here as
+    // The THREE paths exercised below are KNOWN NON-CLEAN. They are recorded here as
     // the behaviour the source declares and the assertions below are written to
     // check, and handed off to their named owner. They are NOT passes,
     // NOT clean paths, and this card repairs none of them.
+    //
+    // The container's `known_non_clean` array carries a FOURTH row, checked by (a)
+    // below like the other three, and it is deliberately NOT exercised in this case:
+    // `c5_production_ingress_collapses_duplicates` is the case-5 ingress residual
+    // (see its own prose above), its executable observation belongs to case 5, and
+    // repeating that measurement here would give two cases the same observable.
+    // What (a) below claims about all FOUR rows is exactly their existence and
+    // completeness - `path`, `property`, `observed`, `why_not_clean`, `owner`, all
+    // non-empty - and nothing more.
     //
     // 1. `ObserveInput.hint` carries `#[serde(default, alias = "kind")]`
     //    (`crates/eliot-types/src/mcp_contract.rs:420`). The CURRENT decoder
@@ -3721,7 +3991,7 @@ fn c12_observe_alias_and_helper_default_are_recorded_non_clean_not_passes() {
     //    `owner = "#692"`, `repair_child = "#933"`) with `eliot-app` coordinating.
     // 2. `ObserveInput.schema_version` carries the helper default
     //    `default = "default_observe_schema_version"` (`mcp_contract.rs:472-473`,
-    //    helper at `:476-478`),
+    //    helper at `:506-508`),
     //    so an OMITTED key is silently promoted to the current version. The version
     //    IS enforced later by `dispatch_observe`, outside this crate's file scope;
     //    making the key required would move the published `eliot.observe`
@@ -3737,7 +4007,11 @@ fn c12_observe_alias_and_helper_default_are_recorded_non_clean_not_passes() {
     // key is still refused, and (e) below asserts it.
     // =======================================================================
 
-    // (a) The container records both rows, complete, under the fixed identifiers.
+    // (a) The container records EVERY row of `KNOWN_NON_CLEAN_IDS` - all four of them -
+    // complete, under the fixed identifiers. The loop below iterates the CONSTANT, so
+    // this cannot be satisfied by a stale count: a fourth id that the container does
+    // not carry fails here, and the only fields it demands of that row are `path`,
+    // `property`, `observed`, `why_not_clean` and `owner`, each non-empty.
     let rows = corpus()
         .get("known_non_clean")
         .and_then(serde_json::Value::as_array)
@@ -4060,7 +4334,17 @@ fn c13_flat_packet_exceptions_are_exact_and_invalidate_on_use_change() {
     // (c) The visitor's duplicate-member check, which a derived `flatten` decoder
     // could not perform: the raw map is read key by key and a repeat is refused
     // BEFORE any insertion (`mcp_contract.rs:86-133`), so "first occurrence wins" is
-    // impossible on this boundary.
+    // impossible on THIS boundary.
+    //
+    // "ON THIS BOUNDARY" IS A REAL LIMIT AND NOT A REWORDING. This check needs a raw
+    // `MapAccess`, and the production MCP ingress does not supply one: it hands the
+    // decoder an already-built `serde_json::Value` through `from_value`, in which a
+    // repeated key is already gone. Case 5 EXECUTES that collapse on the
+    // `c5_area_ambiguous_task_id_in_compile_packet_tool_input_collapsed_route`
+    // document and records it as the known non-clean row
+    // `c5_production_ingress_collapses_duplicates`; the lossy stage is `eliot-app`
+    // code and is outside issue #933's scope, so nothing here asserts that this
+    // refusal is reachable in production.
     let duplicate_text = raw("c13_CompilePacketToolInput_duplicate_key_refuse");
     assert!(
         repeats(&duplicate_text, "project_id") >= 2,
@@ -4163,11 +4447,33 @@ fn c14_bounded_malformed_inputs_are_panic_free_and_code_is_a_free_reason_string(
     // present, so this refusal is not a missing-field failure wearing the same
     // document - it is the unknown-member arm.
     let nul_text = raw("c14_area_embedded_nul_escape_text");
-    assert!(
-        nul_text.contains(&format!("\"{NUL_MEMBER}\"")),
-        "the fixture must really carry a member whose NAME embeds a NUL"
-    );
     let nul_witness = witness(&nul_text);
+    // THE RAW TEXT AND THE PARSED NAME ARE TWO DIFFERENT THINGS, and this pair of
+    // assertions was previously ONE assertion that demanded the impossible of the
+    // wrong one. A JSON document cannot contain a raw NUL byte inside a string at
+    // all - U+0000 is a control character and RFC 8259 requires it to be escaped -
+    // so the stored fixture spells the member name `c14_embedded_nul` + the six
+    // characters `\u0000` + `_member`, and the member name embeds a REAL NUL only
+    // AFTER that text is parsed. The old line compared the raw text against a
+    // string built from a real NUL, so it demanded a byte no legal fixture can
+    // carry and was RED on `main` before this delivery. Both halves are now stated
+    // where each is actually true, and together they are STRONGER than the one line
+    // they replace: the escape is proved present in the stored bytes, the real NUL
+    // is proved present in the PARSED member name, and the refusal below still has
+    // to name that same NUL-bearing name.
+    assert!(
+        nul_text.contains(r#""c14_embedded_nul\u0000_member""#),
+        "the fixture must really carry a member whose NAME spells an escaped NUL, got: {nul_text}"
+    );
+    let nul_object = nul_witness
+        .as_object()
+        .expect("the NUL fixture must be a JSON object");
+    assert!(
+        nul_object.contains_key(NUL_MEMBER),
+        "the PARSED member name must embed a real NUL, which is what the stored text's \
+         `\\u0000` escape decodes to; got members: {:?}",
+        nul_object.keys().collect::<Vec<_>>()
+    );
     for declared in ["code", "message", "retryable"] {
         assert!(
             nul_witness.get(declared).is_some(),
@@ -4816,12 +5122,21 @@ fn c16_routing_schema_and_visibility_are_unchanged_by_this_lane() {
     // visibility code. It adds no second parser framework and no `Value`
     // pre-processing stage: the only decode entry point this file uses is
     // `serde_json::from_str` over the stored raw text, and every `Value` in this
-    // file is a post-decode witness. Every name it imports was already reachable
+    // file is a post-decode witness - with the ONE declared exception of case 5
+    // (b), `serde_json::from_value::<CompilePacketToolInput>(witness(&text))`, which
+    // feeds the COLLAPSED document to the decoder ON PURPOSE to execute the recorded
+    // production-ingress residual `c5_production_ingress_collapses_duplicates`. That
+    // call is a measurement, not a substitute for the raw route, and it adds no
+    // normalization stage: the same stored bytes are decoded both ways in the same
+    // test. Every name it imports was already reachable
     // through the `eliot_types` boundary, except the two the header declares: the
     // legacy module path for `CognitiveProviderRuntimeContract`, and
     // `CompilePacketToolInputVisitor`, which stays private and is asserted only
     // through the decoder that constructs it. The card's own non-goals - repairing
     // `ObserveInput.hint`'s `alias = "kind"`, repairing `schema_version`'s helper
     // default, and treating `AdapterError.code` as a closed enum - are untouched and
-    // are recorded in cases 12 and 14 instead.
+    // are recorded in cases 12 and 14 instead. The fourth recorded known-non-clean
+    // row, `c5_production_ingress_collapses_duplicates`, is likewise NOT repaired
+    // here: its lossy stage is `eliot-app` code, outside issue #933's four-file
+    // scope, and it is executed and recorded in case 5 instead.
 }

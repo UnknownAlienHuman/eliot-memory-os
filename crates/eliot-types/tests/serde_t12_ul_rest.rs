@@ -3534,8 +3534,8 @@ fn c14_bounded_adversarial_input_is_panic_free_and_deterministic() {
     // it lands in exactly one of them.
     assert_eq!(
         StrictJsonErrorKind::Malformed.as_str(),
-        "strict json: malformed or trailing JSON document",
-        "src/strict_json.rs:60 must keep the malformed-class wording verbatim"
+        "strict json: malformed or trailing json document",
+        "src/strict_json.rs:60 must keep the malformed-class wording verbatim, and every byte of it must stay lowercase/space/colon so the redaction property asserted by strict_json.rs's own leak test holds"
     );
     assert_eq!(
         StrictJsonErrorKind::DuplicateKey.as_str(),
