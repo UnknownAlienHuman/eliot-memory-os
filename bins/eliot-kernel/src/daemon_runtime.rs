@@ -4238,7 +4238,126 @@ mod daemon_lifecycle_observation_tests {
         let Some(end) = line[at..].find('"') else {
             panic!("the captured outcome for {event} is unterminated: {line}");
         };
-        line[at..at + end].to_owned()
+        let outcome = line[at..at + end].to_owned();
+        let Some((_, fields)) = line.split_once("daemon runtime observation") else {
+            panic!("the captured line for {event} has no production message: {line}");
+        };
+        assert_eq!(
+            fields,
+            format!(" event=\"{event}\" outcome=\"{outcome}\""),
+            "daemon diagnostic fields changed for {event}"
+        );
+        outcome
+    }
+
+    fn daemon_case_launch_descriptor() -> EliotdLaunchDescriptor {
+        let handle = |value: &str| {
+            eliot_platform::PlatformHandle::new(value)
+                .unwrap_or_else(|_| panic!("the fixture value is an accepted platform handle"))
+        };
+        let config_path = "C:/contour-config-canary/daemon.json";
+        let config_digest = "a".repeat(64);
+        let executable_digest = "b".repeat(64);
+        let nonce = handle("eliotd:0123456789abcdef0123456789abcdef");
+        let arguments = [
+            "--config-descriptor",
+            config_path,
+            "--config-descriptor-sha256",
+            config_digest.as_str(),
+            "--launch-nonce",
+            nonce.as_str(),
+            "--executable-sha256",
+            executable_digest.as_str(),
+        ]
+        .into_iter()
+        .map(handle)
+        .collect();
+        EliotdLaunchDescriptor {
+            wire_id: "eliot.kernel.eliotd-launch".to_owned(),
+            wire_version: EliotdLaunchDescriptor::CONTRACT_VERSION,
+            executable: handle("C:/contour-executable-canary/eliotd.exe"),
+            executable_sha256: executable_digest,
+            arguments,
+            working_directory: handle("C:/contour-working-directory-canary"),
+            config_descriptor: handle(config_path),
+            config_descriptor_sha256: config_digest,
+            protected_snapshot_digest: "c".repeat(64),
+            launch_nonce: nonce,
+            authority_epoch: eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new(
+                    "550e8400-e29b-41d4-a716-446655440000",
+                )
+                .expect("fixture epoch lineage"),
+                std::num::NonZeroU64::new(3).expect("fixture epoch sequence"),
+            )
+            .expect("fixture authority epoch"),
+            generation: eliot_contracts::ResourceGeneration::new(7)
+                .expect("fixture resource generation"),
+            restart_policy: None,
+            job_object_limits: None,
+            health_readiness_contract_ref: None,
+            descriptor_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap_or_else(|_| panic!("the fixture descriptor digest is computed"))
+    }
+
+    #[test]
+    fn daemon_launch_emits_exact_contour_presence_and_absence() {
+        let (absent_root, absent_kernel) = daemon_case_kernel("contour-absent");
+        let (absent_logs, absent) =
+            daemon_case_capture_with(|| absent_kernel.daemon_launch().cloned());
+        assert_eq!(absent, None, "the empty composition has no launch contour");
+        assert_eq!(
+            daemon_case_daemon_events(&absent_logs),
+            vec!["kernel.daemon.contour_observed".to_owned()]
+        );
+        assert_eq!(
+            daemon_case_outcome(&absent_logs, "kernel.daemon.contour_observed"),
+            "absent"
+        );
+        drop(absent_kernel);
+        drop(absent_root);
+
+        let present_root = daemon_case_root("contour-present");
+        let descriptor = daemon_case_launch_descriptor();
+        assert!(descriptor.validate().is_ok(), "fixture contour is valid");
+        let config = KernelConfig::new(present_root.path())
+            .with_kernel_artifact_sha256("d".repeat(64))
+            .with_daemon_launch(descriptor.clone());
+        let present_kernel = KernelComposition::new(config)
+            .unwrap_or_else(|_| panic!("the approved contour composes"));
+        let (present_logs, present) =
+            daemon_case_capture_with(|| present_kernel.daemon_launch().cloned());
+        assert_eq!(present, Some(descriptor), "the getter returns its retained contour");
+        assert_eq!(
+            daemon_case_daemon_events(&present_logs),
+            vec!["kernel.daemon.contour_observed".to_owned()]
+        );
+        assert_eq!(
+            daemon_case_outcome(&present_logs, "kernel.daemon.contour_observed"),
+            "present"
+        );
+        let config_digest_canary = "a".repeat(64);
+        let executable_digest_canary = "b".repeat(64);
+        let protected_snapshot_canary = "c".repeat(64);
+        for private_value in [
+            "contour-config-canary",
+            "contour-executable-canary",
+            "contour-working-directory-canary",
+            "eliotd:0123456789abcdef0123456789abcdef",
+            config_digest_canary.as_str(),
+            executable_digest_canary.as_str(),
+            protected_snapshot_canary.as_str(),
+        ] {
+            assert!(
+                !present_logs.contains(private_value),
+                "launch contour material leaked to diagnostics: {private_value}"
+            );
+        }
+
+        drop(present_kernel);
+        drop(present_root);
     }
 
     /// Drives the REAL `KernelComposition::await_daemon_ready` over the recorded
@@ -4891,6 +5010,11 @@ mod daemon_lifecycle_observation_tests {
                 ],
                 "the rendezvous surface for the {} arm is not the request then its own verdict: {logs}",
                 daemon_case_state_label(status),
+            );
+            assert_eq!(
+                daemon_case_outcome(&logs, "kernel.daemon.await_requested"),
+                "attempt",
+                "the rendezvous request record changed: {logs}"
             );
             assert_eq!(
                 daemon_case_outcome(&logs, expected_event),

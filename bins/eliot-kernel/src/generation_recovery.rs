@@ -284,6 +284,82 @@ impl OrsGenerationCoordinator {
         outcome
     }
 
+    /// Applies the accepted restore-journal retention policy to every stream
+    /// this store has durably accepted, as an independently authorized startup
+    /// reconciliation (I14.22 names startup reconciliation a legitimate
+    /// maintenance trigger).
+    ///
+    /// The streams are enumerated from the journal's own durable index, never
+    /// from a caller-supplied name, so this pass cannot reclaim a stream that
+    /// was never bound and cannot skip one that was. It reaches
+    /// [`RedbRecoveryStore::apply_restore_journal_retention`], which owns the
+    /// bounded pass, the policy and the per-stream
+    /// [`eliot_ors::RestoreJournalRetentionReport`]. This gateway adds no
+    /// retention rule of its own, so a maintenance outcome can never be folded
+    /// into an append receipt: the two dispositions stay distinct because each
+    /// still runs in its own write transaction on its own terms.
+    ///
+    /// One stream refusing retention does not skip the rest: every stream is
+    /// offered the policy, because an unrelated reclamation must not be denied
+    /// by a neighbour's refusal. No refusal is swallowed either. The first
+    /// refusal is returned verbatim in the error, with the count of streams
+    /// that refused, so the caller retains the owner's own bounded reason.
+    pub(crate) fn recover_restore_journal_retention(&self) -> Result<(), String> {
+        observe_recovery(
+            "kernel.recovery.restore_journal_retention_requested",
+            "attempt",
+        );
+        let outcome = (|| {
+            let streams = self
+                .ors
+                .list_restore_journal_streams()
+                .map_err(|error| error.to_string())?;
+            if streams.is_empty() {
+                observe_recovery("kernel.recovery.restore_journal_retention_absent", "empty");
+                return Ok(());
+            }
+            let total = streams.len();
+            let mut refused = 0_usize;
+            let mut first_refusal: Option<(String, String)> = None;
+            for stream in &streams {
+                match self.ors.apply_restore_journal_retention(stream) {
+                    Ok(report) => observe_recovery(
+                        "kernel.recovery.restore_journal_retention_pass",
+                        if report.record.removed_members > 0 {
+                            "success"
+                        } else {
+                            "empty"
+                        },
+                    ),
+                    Err(error) => {
+                        refused += 1;
+                        if first_refusal.is_none() {
+                            first_refusal = Some((stream.clone(), error.to_string()));
+                        }
+                    }
+                }
+            }
+            if let Some((stream, reason)) = first_refusal {
+                return Err(format!(
+                    "{refused} of {total} restore-journal stream(s) refused the accepted \
+                     retention policy; first refusal on {stream}: {reason}"
+                ));
+            }
+            observe_recovery(
+                "kernel.recovery.restore_journal_retention_reconciled",
+                "success",
+            );
+            Ok(())
+        })();
+        if outcome.is_err() {
+            observe_recovery(
+                "kernel.recovery.restore_journal_retention_failed",
+                "rejected",
+            );
+        }
+        outcome
+    }
+
     pub(crate) fn recover(
         &self,
         generations: &mut GenerationRouter,
@@ -564,6 +640,11 @@ mod generation_recovery_diagnostics_tests {
     use super::*;
     use crate::{KernelComposition, KernelConfig, unix_ms};
     use eliot_contracts::AuthorityEpoch;
+    use eliot_ors::{
+        JournalPredecessor, RestoreJournalAppendReceipt, RestoreJournalOperation,
+        RestoreJournalResult, RestoreJournalStreamBinding,
+    };
+    use sha2::Digest;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -606,6 +687,34 @@ mod generation_recovery_diagnostics_tests {
             tracing::subscriber::with_default(subscriber, run);
         }
         String::from_utf8_lossy(&sink.bytes.lock().expect("capture lock")).into_owned()
+    }
+
+    /// Asserts the actual observation field set and order from the installed
+    /// tracing formatter. Matching the complete suffix after the production
+    /// message makes an added diagnostic field fail this proof as well as a
+    /// changed event, outcome, correlation id, or emission order.
+    fn assert_recovery_observations(
+        text: &str,
+        expected: &[(&str, &str, Option<&str>)],
+    ) {
+        let actual: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                line.split_once("generation recovery observation")
+                    .map(|(_, fields)| fields.to_owned())
+            })
+            .collect();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|(event, outcome, cutover_id)| {
+                let mut fields = format!(" event=\"{event}\" outcome=\"{outcome}\"");
+                if let Some(cutover_id) = cutover_id {
+                    fields.push_str(&format!(" cutover_id=\"{cutover_id}\""));
+                }
+                fields
+            })
+            .collect();
+        assert_eq!(actual, expected, "recovery observation fields/order changed");
     }
 
     #[test]
@@ -717,9 +826,9 @@ mod generation_recovery_diagnostics_tests {
         let text = capture(|| {
             update_handshake_policy(&mut policy, &router).expect("policy update");
         });
-        assert!(
-            text.contains("kernel.recovery.handshake_projected"),
-            "missing diagnostics marker kernel.recovery.handshake_projected"
+        assert_recovery_observations(
+            &text,
+            &[("kernel.recovery.handshake_projected", "success", None)],
         );
         assert!(
             !text.contains("artifact-canary-string"),
@@ -762,9 +871,9 @@ mod generation_recovery_diagnostics_tests {
         let text = capture(|| {
             update_handshake_policy(&mut policy, &empty).expect("absent policy update");
         });
-        assert!(
-            text.contains("kernel.recovery.handshake_absent"),
-            "missing diagnostics marker kernel.recovery.handshake_absent"
+        assert_recovery_observations(
+            &text,
+            &[("kernel.recovery.handshake_absent", "absent", None)],
         );
         assert_eq!(policy, before);
 
@@ -848,13 +957,6 @@ mod generation_recovery_diagnostics_tests {
         .expect("direct child epoch")
     }
 
-    /// Byte offset of one observation name inside the WHOLE captured sink
-    /// surface, so phase order is asserted against the real emitted sequence.
-    fn observed_at(text: &str, marker: &str) -> usize {
-        text.find(marker)
-            .unwrap_or_else(|| panic!("missing diagnostics marker {marker}"))
-    }
-
     fn recovery_store_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "eliot-kernel-recovery-903-{tag}-{}-{}.redb",
@@ -907,7 +1009,11 @@ mod generation_recovery_diagnostics_tests {
     /// A refused publish reports NO phase: not one flag is set, and the ladder
     /// emits only `persist_failed`. Both halves are asserted together so the
     /// flag surface and the emitted surface cannot drift apart.
-    fn assert_no_persist_phase_reported(published: &PersistAndPublishResult, text: &str) {
+    fn assert_no_persist_phase_reported(
+        published: &PersistAndPublishResult,
+        text: &str,
+        cutover_id: &str,
+    ) {
         let observations = &published.observations;
         assert!(
             !observations.cutover_staged,
@@ -925,11 +1031,81 @@ mod generation_recovery_diagnostics_tests {
             observations.handshake_policy.is_none(),
             "a refused publish reported a handshake projection"
         );
-        assert!(text.contains("kernel.recovery.persist_failed"));
-        assert!(!text.contains("kernel.recovery.cutover_staged"));
-        assert!(!text.contains("kernel.recovery.cutover_committed"));
-        assert!(!text.contains("kernel.recovery.cutover_applied"));
-        assert!(!text.contains("kernel.recovery.persist_completed"));
+        assert_recovery_observations(
+            text,
+            &[(
+                "kernel.recovery.persist_requested",
+                "attempt",
+                Some(cutover_id),
+            ), ("kernel.recovery.persist_failed", "rejected", Some(cutover_id))],
+        );
+    }
+
+    /// Runs the real I1.12 handshake admission against the current runtime
+    /// compatibility projection, then serializes exactly its accepted result
+    /// through ORS's public evidence constructor. The normative receipt uses
+    /// the same expected-tag verifier input as `frame_dispatch`'s live
+    /// `runtime_compatibility_evidence` path; no accepted verdict or refusal is
+    /// hand-authored.
+    fn accepted_compatibility_for_recovery(
+        generation: eliot_contracts::ResourceGeneration,
+        candidate_epoch: &eliot_contracts::EpochId,
+        durable: &DurableCompatibilityState,
+    ) -> eliot_ors::CompatibilityEvidence {
+        let protocol_range = durable.protocol_range();
+        let canonical_format_range = durable.canonical_format_range();
+        let architecture_digest = durable.architecture_source_digest();
+        let normative_receipt = eliot_kernel_core::NormativePairReceipt::new(
+            architecture_digest,
+            eliot_kernel_core::expected_seal_tag(architecture_digest),
+        )
+        .expect("current normative pair receipt shape");
+        let candidate = eliot_kernel_core::CompatibilityEnvelope::new(
+            protocol_range,
+            durable.contract_set_digest().to_owned(),
+            canonical_format_range,
+            architecture_digest,
+            normative_receipt,
+            generation,
+            candidate_epoch.clone(),
+            durable.required_capabilities().to_vec(),
+            Vec::new(),
+            durable.migration_class(),
+        )
+        .expect("current runtime compatibility envelope");
+        let accepted = eliot_kernel_core::admit_handshake(&candidate, durable)
+            .expect("the current runtime handshake is compatible");
+        let migration_class = match accepted.migration_class() {
+            StateMigrationClass::NoMigration => "NO_MIGRATION",
+            StateMigrationClass::Additive => "ADDITIVE",
+            StateMigrationClass::BoundedDrain => "BOUNDED_DRAIN",
+            StateMigrationClass::BreakingRebase => "BREAKING_REBASE",
+        };
+
+        eliot_ors::CompatibilityEvidence::new(
+            accepted.envelope_version(),
+            protocol_range.min(),
+            protocol_range.max(),
+            accepted.contract_set_digest().to_owned(),
+            canonical_format_range.min(),
+            canonical_format_range.max(),
+            accepted.architecture_source_digest().to_owned(),
+            accepted.seal_tag().to_owned(),
+            accepted.module_generation().value(),
+            accepted
+                .authority_epoch()
+                .lineage_id
+                .as_str()
+                .to_owned(),
+            accepted.authority_epoch().sequence.get(),
+            candidate.required_capabilities().to_vec(),
+            candidate.optional_capabilities().to_vec(),
+            migration_class,
+            Some(accepted.protocol_version()),
+            Some(accepted.canonical_format_version()),
+            None,
+        )
+        .expect("accepted runtime verdict satisfies the ORS evidence shape")
     }
 
     /// The live service epoch and handshake policy as a REFUSED publish must
@@ -1099,22 +1275,24 @@ mod generation_recovery_diagnostics_tests {
         )
         .expect("cutover decision");
 
-        let mut published = None;
-        let text = capture(|| {
-            let outcome = coordinator.persist_and_publish(
-                &decision,
-                &mut generations,
-                &mut service,
-                &mut policy,
-            );
-            // Exactly the emission the cutover gateway owner performs after it
-            // releases the generation/service/policy guards.
-            outcome
-                .observations
-                .emit(outcome.result.is_ok(), decision.cutover_id());
-            published = Some(outcome);
-        });
-        let published = published.expect("persist_and_publish outcome");
+        let published = coordinator.persist_and_publish(
+            &decision,
+            &mut generations,
+            &mut service,
+            &mut policy,
+        );
+        let succeeded = published.result.is_ok();
+        let observations = published.observations;
+        // Match the production gateway boundary: release the live guards
+        // before the deferred observation records are emitted.
+        drop(policy);
+        drop(service);
+        let text = capture(|| observations.emit(succeeded, decision.cutover_id()));
+        let mut service = kernel.service.lock().expect("service lock after emission");
+        let mut policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("policy lock after emission");
 
         assert!(
             published.result.is_ok(),
@@ -1147,36 +1325,40 @@ mod generation_recovery_diagnostics_tests {
             ),
             "the handshake projection phase was not reached"
         );
-        // What these four comparisons establish, exactly: `emit` is a flat `if`
-        // ladder whose sequence is a compile-time constant of
-        // `PersistAndPublishObservations::emit`, so the offsets read the ladder's
-        // own vocabulary order. They prove every one of those phases was ENABLED
-        // and rendered in that fixed order.
-        //
-        // What they do NOT establish: any order of the real work inside
-        // `persist_and_publish_inner`. Production emits no marker at the work
-        // site, so no byte offset in this surface can observe whether
-        // `stage_generation_cutover` ran before
-        // `service.synchronize_authority_epoch`. The order-sensitive half of
-        // that claim is proven elsewhere, by
-        // `stage_failure_never_reports_a_staged_phase_or_moves_the_live_fence`,
-        // which observes the same ordering through the durable store and the
-        // live service epoch and policy fence.
-        assert!(
-            observed_at(&text, "kernel.recovery.persist_requested")
-                < observed_at(&text, "kernel.recovery.cutover_staged")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutover_staged")
-                < observed_at(&text, "kernel.recovery.cutover_committed")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutover_committed")
-                < observed_at(&text, "kernel.recovery.cutover_applied")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutover_applied")
-                < observed_at(&text, "kernel.recovery.persist_completed")
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.persist_requested",
+                    "attempt",
+                    Some("cutover-903-persist"),
+                ),
+                (
+                    "kernel.recovery.cutover_staged",
+                    "success",
+                    Some("cutover-903-persist"),
+                ),
+                (
+                    "kernel.recovery.cutover_committed",
+                    "success",
+                    Some("cutover-903-persist"),
+                ),
+                (
+                    "kernel.recovery.handshake_projected",
+                    "success",
+                    Some("cutover-903-persist"),
+                ),
+                (
+                    "kernel.recovery.cutover_applied",
+                    "success",
+                    Some("cutover-903-persist"),
+                ),
+                (
+                    "kernel.recovery.persist_completed",
+                    "success",
+                    Some("cutover-903-persist"),
+                ),
+            ],
         );
 
         // T10: the durable ORS row, read back through the store's own public
@@ -1265,25 +1447,27 @@ mod generation_recovery_diagnostics_tests {
         )
         .expect("refused cutover decision");
         let rows_before_refusal = rows.len();
-        let mut rejection = None;
-        let refused_text = capture(|| {
-            let outcome = coordinator.persist_and_publish(
-                &refused,
-                &mut generations,
-                &mut service,
-                &mut policy,
-            );
-            outcome
-                .observations
-                .emit(outcome.result.is_ok(), refused.cutover_id());
-            rejection = Some(outcome);
-        });
-        let rejection = rejection.expect("refused publish outcome");
+        let rejection = coordinator.persist_and_publish(
+            &refused,
+            &mut generations,
+            &mut service,
+            &mut policy,
+        );
+        let succeeded = rejection.result.is_ok();
+        let observations = rejection.observations;
+        drop(policy);
+        drop(service);
+        let refused_text = capture(|| observations.emit(succeeded, refused.cutover_id()));
+        let mut service = kernel.service.lock().expect("service lock after refusal");
+        let mut policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("policy lock after refusal");
         assert!(
             rejection.result.is_err(),
             "a cutover for an unowned route scope was published"
         );
-        assert_no_persist_phase_reported(&rejection, &refused_text);
+        assert_no_persist_phase_reported(&rejection, &refused_text, refused.cutover_id());
 
         let rows_after_refusal = store
             .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
@@ -1349,13 +1533,139 @@ mod generation_recovery_diagnostics_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn persist_without_daemon_route_emits_cutover_scoped_handshake_absence() {
+        let path = recovery_store_path("persist-no-daemon");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("open ORS"));
+        let root = recovery_root("persist-no-daemon");
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let mut service = kernel.service.lock().expect("service lock");
+        let mut policy = kernel.front_door_policy.lock().expect("policy lock");
+
+        let base = service.authority_epoch();
+        let staged_epoch = direct_child_epoch(&base);
+        let applied_epoch = direct_child_epoch(&staged_epoch);
+        let first_generation = eliot_contracts::ResourceGeneration::new(1).expect("generation");
+        let second_generation = eliot_contracts::ResourceGeneration::new(2).expect("generation");
+        let work = RouteScope::new("work-903-no-daemon").expect("work scope");
+        let base_record = RuntimeGenerationCutoverRecord {
+            cutover_id: "cutover-903-no-daemon-base".to_owned(),
+            route_scope: work.as_str().to_owned(),
+            old_generation: None,
+            new_generation: first_generation,
+            old_epoch: base.clone(),
+            new_epoch: staged_epoch.clone(),
+            state: GenerationCutoverState::Armed,
+        };
+        store
+            .stage_generation_cutover(base_record.clone())
+            .expect("stage base cutover");
+        store
+            .commit_generation_cutover_state(base_record)
+            .expect("commit base cutover");
+
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+        let mut generations = GenerationRouter::at_epoch(staged_epoch.clone());
+        generations
+            .register(
+                GenerationRoute::new(work.clone(), first_generation, staged_epoch.clone())
+                    .expect("work generation route"),
+            )
+            .expect("register work route");
+        let decision = CutoverDecision::new(
+            "cutover-903-no-daemon",
+            work.clone(),
+            Some(first_generation),
+            second_generation,
+            staged_epoch,
+            applied_epoch.clone(),
+            GenerationCutoverState::Committed,
+        )
+        .expect("cutover decision");
+        let policy_before = policy.clone();
+
+        let published = coordinator.persist_and_publish(
+            &decision,
+            &mut generations,
+            &mut service,
+            &mut policy,
+        );
+        assert!(published.result.is_ok(), "valid work cutover was refused");
+        let observations = published.observations;
+        drop(policy);
+        drop(service);
+        let text = capture(|| observations.emit(true, decision.cutover_id()));
+
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.persist_requested",
+                    "attempt",
+                    Some("cutover-903-no-daemon"),
+                ),
+                (
+                    "kernel.recovery.cutover_staged",
+                    "success",
+                    Some("cutover-903-no-daemon"),
+                ),
+                (
+                    "kernel.recovery.cutover_committed",
+                    "success",
+                    Some("cutover-903-no-daemon"),
+                ),
+                (
+                    "kernel.recovery.handshake_absent",
+                    "absent",
+                    Some("cutover-903-no-daemon"),
+                ),
+                (
+                    "kernel.recovery.cutover_applied",
+                    "success",
+                    Some("cutover-903-no-daemon"),
+                ),
+                (
+                    "kernel.recovery.persist_completed",
+                    "success",
+                    Some("cutover-903-no-daemon"),
+                ),
+            ],
+        );
+        assert!(!text.contains("work-903-no-daemon"));
+        assert!(!text.contains("authority_epoch"));
+        assert!(
+            generations
+                .route(&RouteScope::new("daemon").expect("daemon scope"))
+                .is_err(),
+            "the fixture has no daemon route to project"
+        );
+        assert_eq!(generations.epoch(), &applied_epoch);
+        let service = kernel.service.lock().expect("service after emission");
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("policy after emission");
+        assert_eq!(service.authority_epoch(), applied_epoch);
+        assert_eq!(*policy, policy_before, "absent projection changed the policy");
+
+        drop(policy);
+        drop(service);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        drop(coordinator);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
     /// F-LOG-KERNEL-4 (#903 slice B): the phase record is production-set, and
     /// the durable stage write is the FIRST thing the owner does.
     ///
-    /// The persist test above compares byte offsets in a surface whose order is
-    /// fixed by `PersistAndPublishObservations::emit` itself, so it cannot
-    /// observe the order of the real work. This leg can: it makes the durable
-    /// stage write fail and then reads the consequences.
+    /// The persist test above asserts the complete emitted record sequence,
+    /// whose order is fixed by `PersistAndPublishObservations::emit` itself, so
+    /// it cannot observe the order of the real work. This leg can: it makes the
+    /// durable stage write fail and then reads the consequences.
     ///
     /// The failure is genuine and reached through the owner's own public seam.
     /// `RedbRecoveryStore::stage_generation_cutover` keys its `Applying`
@@ -1417,26 +1727,28 @@ mod generation_recovery_diagnostics_tests {
         .expect("cutover decision");
 
         let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
-        let mut published = None;
-        let text = capture(|| {
-            let outcome = coordinator.persist_and_publish(
-                &decision,
-                &mut generations,
-                &mut service,
-                &mut policy,
-            );
-            outcome
-                .observations
-                .emit(outcome.result.is_ok(), decision.cutover_id());
-            published = Some(outcome);
-        });
-        let published = published.expect("persist_and_publish outcome");
+        let published = coordinator.persist_and_publish(
+            &decision,
+            &mut generations,
+            &mut service,
+            &mut policy,
+        );
+        let succeeded = published.result.is_ok();
+        let observations = published.observations;
+        drop(policy);
+        drop(service);
+        let text = capture(|| observations.emit(succeeded, decision.cutover_id()));
+        let mut service = kernel.service.lock().expect("service lock after emission");
+        let mut policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("policy lock after emission");
 
         assert!(
             published.result.is_err(),
             "a colliding durable stage write was accepted"
         );
-        assert_no_persist_phase_reported(&published, &text);
+        assert_no_persist_phase_reported(&published, &text, decision.cutover_id());
 
         // The refused stage write left no COMMITTED evidence under its own
         // identity.
@@ -1479,6 +1791,53 @@ mod generation_recovery_diagnostics_tests {
         drop(service);
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
+        drop(coordinator);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn absent_cutover_ownership_table_emits_exact_empty_observation_without_routes() {
+        let path = recovery_store_path("ownership-absent");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("open ORS"));
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+
+        let mut recovered = None;
+        let text = capture(|| {
+            recovered = Some(coordinator.recover_cutover_ownership());
+        });
+        assert!(
+            matches!(recovered.expect("ownership recovery result"), Ok(())),
+            "a legacy store with no ownership table remains compatible"
+        );
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.cutover_ownership_requested",
+                    "attempt",
+                    None,
+                ),
+                (
+                    "kernel.recovery.cutover_ownership_absent",
+                    "empty",
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(
+            coordinator.cutover_routes.admit(
+                "unrecorded-route-scope",
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+                AuthorityEpoch::new(1).expect("epoch"),
+                "unrecorded-operation",
+            ),
+            eliot_ors::CutoverAdmission::RejectStale,
+            "an absent owner table restored no route admission"
+        );
+        assert!(!text.contains("ors_cutover_ownership_v1"));
+
         drop(coordinator);
         drop(store);
         let _ = std::fs::remove_file(path);
@@ -1601,16 +1960,26 @@ mod generation_recovery_diagnostics_tests {
                 .recover_cutover_ownership()
                 .expect("restore committed cutover ownership");
         });
-        assert!(
-            observed_at(&text, "kernel.recovery.cutover_ownership_requested")
-                < observed_at(&text, "kernel.recovery.cutover_ownership_reconciled")
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.cutover_ownership_requested",
+                    "attempt",
+                    None,
+                ),
+                (
+                    "kernel.recovery.cutover_ownership_reconciled",
+                    "success",
+                    None,
+                ),
+                (
+                    "kernel.recovery.cutover_ownership_restored",
+                    "success",
+                    None,
+                ),
+            ],
         );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutover_ownership_reconciled")
-                < observed_at(&text, "kernel.recovery.cutover_ownership_restored")
-        );
-        assert!(!text.contains("kernel.recovery.cutover_ownership_absent"));
-        assert!(!text.contains("kernel.recovery.cutover_ownership_failed"));
 
         // Durable readback through the same store handle, before any verdict.
         let committed = store
@@ -1894,21 +2263,15 @@ mod generation_recovery_diagnostics_tests {
                 .recover(&mut generations, &mut service, &mut policy)
                 .expect("empty recovery");
         });
-        assert!(
-            observed_at(&text, "kernel.recovery.recover_requested")
-                < observed_at(&text, "kernel.recovery.cutovers_reconciled")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_reconciled")
-                < observed_at(&text, "kernel.recovery.cutovers_loaded")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_loaded")
-                < observed_at(&text, "kernel.recovery.load_empty")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.load_empty")
-                < observed_at(&text, "kernel.recovery.recover_completed")
+        assert_recovery_observations(
+            &text,
+            &[
+                ("kernel.recovery.recover_requested", "attempt", None),
+                ("kernel.recovery.cutovers_reconciled", "success", None),
+                ("kernel.recovery.cutovers_loaded", "success", None),
+                ("kernel.recovery.load_empty", "empty", None),
+                ("kernel.recovery.recover_completed", "success", None),
+            ],
         );
         assert!(
             !text.contains("kernel.recovery.cutovers_validated"),
@@ -1940,17 +2303,15 @@ mod generation_recovery_diagnostics_tests {
                 .recover(&mut generations, &mut service, &mut policy)
                 .expect("staged-only recovery");
         });
-        assert!(
-            observed_at(&text, "kernel.recovery.recover_requested")
-                < observed_at(&text, "kernel.recovery.cutovers_reconciled")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_reconciled")
-                < observed_at(&text, "kernel.recovery.cutovers_loaded")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_loaded")
-                < observed_at(&text, "kernel.recovery.load_empty")
+        assert_recovery_observations(
+            &text,
+            &[
+                ("kernel.recovery.recover_requested", "attempt", None),
+                ("kernel.recovery.cutovers_reconciled", "success", None),
+                ("kernel.recovery.cutovers_loaded", "success", None),
+                ("kernel.recovery.load_empty", "empty", None),
+                ("kernel.recovery.recover_completed", "success", None),
+            ],
         );
         assert!(
             !text.contains("kernel.recovery.cutovers_validated"),
@@ -2011,21 +2372,15 @@ mod generation_recovery_diagnostics_tests {
                 "a route with no recorded rollback verdict was restored"
             );
         });
-        assert!(
-            observed_at(&text, "kernel.recovery.recover_requested")
-                < observed_at(&text, "kernel.recovery.cutovers_reconciled")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_reconciled")
-                < observed_at(&text, "kernel.recovery.cutovers_loaded")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_loaded")
-                < observed_at(&text, "kernel.recovery.cutovers_validated")
-        );
-        assert!(
-            observed_at(&text, "kernel.recovery.cutovers_validated")
-                < observed_at(&text, "kernel.recovery.recover_failed")
+        assert_recovery_observations(
+            &text,
+            &[
+                ("kernel.recovery.recover_requested", "attempt", None),
+                ("kernel.recovery.cutovers_reconciled", "success", None),
+                ("kernel.recovery.cutovers_loaded", "success", None),
+                ("kernel.recovery.cutovers_validated", "success", None),
+                ("kernel.recovery.recover_failed", "rejected", None),
+            ],
         );
         assert!(
             !text.contains("kernel.recovery.routes_applied"),
@@ -2054,10 +2409,20 @@ mod generation_recovery_diagnostics_tests {
                 )
             })
             .collect();
-        let _ = capture(|| {
+        let replay_text = capture(|| {
             let outcome = coordinator.recover(&mut generations, &mut service, &mut policy);
             assert!(outcome.is_err(), "a replayed recovery changed the verdict");
         });
+        assert_recovery_observations(
+            &replay_text,
+            &[
+                ("kernel.recovery.recover_requested", "attempt", None),
+                ("kernel.recovery.cutovers_reconciled", "success", None),
+                ("kernel.recovery.cutovers_loaded", "success", None),
+                ("kernel.recovery.cutovers_validated", "success", None),
+                ("kernel.recovery.recover_failed", "rejected", None),
+            ],
+        );
         let replayed_commit = store
             .commit_generation_cutover_state(committed_record)
             .expect("replay the committed cutover");
@@ -2126,6 +2491,237 @@ mod generation_recovery_diagnostics_tests {
         let _ = std::fs::remove_dir_all(root);
         drop(coordinator);
         drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A committed route can be restored only with the exact typed verdict
+    /// produced by I1.12 admission and retained by the public ORS artifact
+    /// registry. This executes the successful rollback gate and the real
+    /// `routes_applied` observation instead of treating a missing verdict as
+    /// the only reachable recovery outcome.
+    #[test]
+    fn valid_recorded_verdict_restores_route_and_emits_exact_applied_phase() {
+        let path = recovery_store_path("routes-applied");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("open ORS"));
+
+        let root = recovery_root("routes-applied");
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let mut service = kernel.service.lock().expect("service lock");
+        let mut policy = kernel.front_door_policy.lock().expect("policy lock");
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+
+        let base = service.authority_epoch();
+        let target = direct_child_epoch(&base);
+        let generation = eliot_contracts::ResourceGeneration::new(7).expect("generation");
+        let durable = current_durable_compatibility_state(&service)
+            .expect("current runtime compatibility projection");
+        let compatibility =
+            accepted_compatibility_for_recovery(generation, &target, &durable);
+        compatibility
+            .require()
+            .expect("the owner-accepted compatibility verdict is admissible");
+
+        let artifact_hash = "c".repeat(64);
+        let artifact = eliot_ors::VersionedArtifact::new(
+            "daemon",
+            generation.value(),
+            artifact_hash.clone(),
+            eliot_ors::VersionedArtifact::canonical_path(
+                "daemon",
+                generation.value(),
+                &artifact_hash,
+            ),
+        )
+        .expect("canonical generation-addressed artifact");
+        let mut registry = eliot_ors::VersionedArtifactRegistry::new();
+        registry
+            .install_candidate(artifact, compatibility.clone())
+            .expect("install owner-accepted candidate");
+        registry
+            .activate("daemon", generation.value(), &artifact_hash)
+            .expect("activate candidate with its recorded verdict");
+        store
+            .commit_versioned_artifact_registry(&registry)
+            .expect("persist the real versioned-artifact registry");
+        let registry_readback = store
+            .load_versioned_artifact_registry(eliot_ors::MAX_RECOVERY_PAGE)
+            .expect("read back the real versioned-artifact registry");
+        assert_eq!(
+            registry_readback.compatibility("daemon", generation.value()),
+            Some(&compatibility),
+            "the rollback gate did not read the persisted owner verdict"
+        );
+
+        let record = RuntimeGenerationCutoverRecord {
+            cutover_id: "cutover-903-routes-applied".to_owned(),
+            route_scope: "daemon".to_owned(),
+            old_generation: None,
+            new_generation: generation,
+            old_epoch: base.clone(),
+            new_epoch: target.clone(),
+            state: GenerationCutoverState::Armed,
+        };
+        store
+            .stage_generation_cutover(record.clone())
+            .expect("stage real daemon cutover");
+        store
+            .commit_generation_cutover_state(record)
+            .expect("commit real daemon cutover");
+
+        let mut generations = GenerationRouter::at_epoch(base.clone());
+        let text = capture(|| {
+            coordinator
+                .recover(&mut generations, &mut service, &mut policy)
+                .expect("restore admitted committed route");
+        });
+        assert_recovery_observations(
+            &text,
+            &[
+                ("kernel.recovery.recover_requested", "attempt", None),
+                ("kernel.recovery.cutovers_reconciled", "success", None),
+                ("kernel.recovery.cutovers_loaded", "success", None),
+                ("kernel.recovery.cutovers_validated", "success", None),
+                ("kernel.recovery.handshake_projected", "success", None),
+                ("kernel.recovery.routes_applied", "success", None),
+                ("kernel.recovery.recover_completed", "success", None),
+            ],
+        );
+        let daemon = RouteScope::new("daemon").expect("daemon scope");
+        assert_eq!(generations.epoch(), &target);
+        assert_eq!(
+            generations
+                .route(&daemon)
+                .expect("restored daemon route")
+                .active_generation(),
+            generation
+        );
+        assert_eq!(service.authority_epoch(), target);
+        assert_eq!(policy.module_generation.generation, generation);
+        assert_eq!(
+            policy.module_generation.state_fence.authority_epoch,
+            target
+        );
+        assert_eq!(
+            policy.module_generation.state_fence.resource_generation,
+            policy.module_generation.generation,
+            "recovery did not preserve the projected policy generation fence"
+        );
+        assert!(
+            !text.contains(&artifact_hash),
+            "artifact identity leaked into recovery diagnostics"
+        );
+        assert!(
+            !text.contains("authority_epoch"),
+            "authority epoch leaked into recovery diagnostics"
+        );
+
+        drop(policy);
+        drop(service);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+        drop(coordinator);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A finite malformed row in ORS's actual ownership table reaches the
+    /// production reconciliation read and is reported as a rejected owner
+    /// observation. The corrupt bytes stay durable and no route becomes
+    /// admissible.
+    #[test]
+    fn corrupt_cutover_ownership_row_emits_exact_rejected_observation() {
+        let path = recovery_store_path("corrupt-ownership");
+        let _ = std::fs::remove_file(&path);
+        drop(RedbRecoveryStore::open(&path).expect("initialize ORS tables"));
+
+        // This schema is the private ORS CUTOVER_OWNERSHIP definition in
+        // `eliot-ors/src/store.rs`; write one malformed payload before opening
+        // the production recovery owner.
+        let database = redb::Database::create(&path).expect("open initialized ORS database");
+        let write = database.begin_write().expect("begin corrupt fixture write");
+        {
+            let mut table = write
+                .open_table(redb::TableDefinition::<&str, &str>::new(
+                    "ors_cutover_ownership_v1",
+                ))
+                .expect("open ORS cutover-ownership table");
+            table
+                .insert("cutover-903-corrupt-row", "not-json")
+                .expect("insert finite corrupt row");
+        }
+        write.commit().expect("commit corrupt fixture row");
+        drop(database);
+
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("reopen ORS owner"));
+        let typed = store
+            .reconcile_staged_cutover_ownership(eliot_ors::MAX_RECOVERY_PAGE);
+        assert!(
+            matches!(
+                typed,
+                Err(OrsError::IntegrityProblem {
+                    record_type: "cutover_ownership",
+                    ..
+                })
+            ),
+            "the owner did not classify its corrupt typed row as an integrity failure"
+        );
+
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+        let text = capture(|| {
+            assert!(
+                coordinator.recover_cutover_ownership().is_err(),
+                "malformed ownership bytes were accepted"
+            );
+        });
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.cutover_ownership_requested",
+                    "attempt",
+                    None,
+                ),
+                (
+                    "kernel.recovery.cutover_ownership_failed",
+                    "rejected",
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(
+            coordinator.cutover_routes.admit(
+                "corrupt-route-scope-hash",
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+                AuthorityEpoch::new(1).expect("epoch"),
+                "new-operation",
+            ),
+            eliot_ors::CutoverAdmission::RejectStale,
+            "failed ownership restoration populated the live route snapshot"
+        );
+
+        drop(coordinator);
+        drop(store);
+        let database = redb::Database::create(&path).expect("reopen corrupt fixture database");
+        let read = database.begin_read().expect("read corrupt fixture");
+        let table = read
+            .open_table(redb::TableDefinition::<&str, &str>::new(
+                "ors_cutover_ownership_v1",
+            ))
+            .expect("reopen cutover-ownership table");
+        assert_eq!(
+            table
+                .get("cutover-903-corrupt-row")
+                .expect("read corrupt row")
+                .expect("corrupt row remains present")
+                .value(),
+            "not-json",
+            "failed reconciliation rewrote the malformed owner row"
+        );
+        drop(table);
+        drop(read);
+        drop(database);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2253,5 +2849,476 @@ mod generation_recovery_diagnostics_tests {
         drop(coordinator);
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_journal_retention_empty_owner_emits_requested_then_absent() {
+        let path = recovery_store_path("retention-empty");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("open ORS"));
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+        assert!(store
+            .list_restore_journal_streams()
+            .expect("read empty owner index")
+            .is_empty());
+
+        let mut outcome = None;
+        let text = capture(|| {
+            outcome = Some(coordinator.recover_restore_journal_retention());
+        });
+        assert_eq!(outcome, Some(Ok(())), "empty owner was not a successful no-op");
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.restore_journal_retention_requested",
+                    "attempt",
+                    None,
+                ),
+                (
+                    "kernel.recovery.restore_journal_retention_absent",
+                    "empty",
+                    None,
+                ),
+            ],
+        );
+        assert!(store
+            .list_restore_journal_streams()
+            .expect("re-read empty owner index")
+            .is_empty());
+        assert!(!text.contains("retention-custody-canary"));
+
+        drop(coordinator);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_journal_retention_reclaims_resolved_prefix_and_reconciles() {
+        let path = recovery_store_path("retention-owner-admitted");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("open ORS"));
+        let (epoch, state_fence) = retention_test_epoch_and_fence();
+        let resolved_stream = "retention-custody-canary-a-resolved";
+        let unresolved_stream = "retention-custody-canary-z-unresolved";
+        let resolved_transaction = "retention-custody-canary-resolved-transaction";
+        let unresolved_transaction = "retention-custody-canary-unresolved-transaction";
+        bind_retention_test_stream(
+            &store,
+            resolved_stream,
+            resolved_transaction,
+            &state_fence,
+        );
+        bind_retention_test_stream(
+            &store,
+            unresolved_stream,
+            unresolved_transaction,
+            &state_fence,
+        );
+
+        let first_operation = retention_test_operation(
+            resolved_transaction,
+            "resolved-phase-0",
+            &state_fence,
+            None,
+        );
+        let first_intent = append_retention_test_intent(
+            &store,
+            resolved_stream,
+            &first_operation,
+            &epoch,
+            &state_fence,
+            "retention-custody-canary-first-payload",
+        );
+        append_retention_test_result(
+            &store,
+            resolved_stream,
+            &first_operation,
+            first_intent.sequence,
+            &epoch,
+            &state_fence,
+            "retention-custody-canary-first-receipt",
+        );
+
+        let second_operation = retention_test_operation(
+            resolved_transaction,
+            "resolved-phase-1",
+            &state_fence,
+            Some(JournalPredecessor {
+                sequence: first_intent.sequence,
+                digest: first_intent.record_digest.clone(),
+            }),
+        );
+        let second_intent = append_retention_test_intent(
+            &store,
+            resolved_stream,
+            &second_operation,
+            &epoch,
+            &state_fence,
+            "retention-custody-canary-second-payload",
+        );
+        append_retention_test_result(
+            &store,
+            resolved_stream,
+            &second_operation,
+            second_intent.sequence,
+            &epoch,
+            &state_fence,
+            "retention-custody-canary-second-receipt",
+        );
+        let unresolved_operation = retention_test_operation(
+            unresolved_transaction,
+            "unresolved-phase",
+            &state_fence,
+            None,
+        );
+        let unresolved_intent = append_retention_test_intent(
+            &store,
+            unresolved_stream,
+            &unresolved_operation,
+            &epoch,
+            &state_fence,
+            "retention-custody-canary-unresolved-payload",
+        );
+
+        let expected_streams = vec![resolved_stream.to_owned(), unresolved_stream.to_owned()];
+        assert_eq!(
+            store
+                .list_restore_journal_streams()
+                .expect("owner-admitted stream index"),
+            expected_streams
+        );
+        let resolved_head_before = store
+            .restore_journal_durable_head(resolved_stream)
+            .expect("read resolved head before retention");
+        let unresolved_head_before = store
+            .restore_journal_durable_head(unresolved_stream)
+            .expect("read unresolved head before retention");
+        assert_eq!(resolved_head_before, Some(JournalPredecessor {
+            sequence: second_intent.sequence,
+            digest: second_intent.record_digest.clone(),
+        }));
+        assert_eq!(unresolved_head_before, Some(JournalPredecessor {
+            sequence: unresolved_intent.sequence,
+            digest: unresolved_intent.record_digest.clone(),
+        }));
+
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+        let mut outcome = None;
+        let text = capture(|| {
+            outcome = Some(coordinator.recover_restore_journal_retention());
+        });
+        assert_eq!(outcome, Some(Ok(())), "accepted owner retention was refused");
+        assert_recovery_observations(
+            &text,
+            &[
+                (
+                    "kernel.recovery.restore_journal_retention_requested",
+                    "attempt",
+                    None,
+                ),
+                (
+                    "kernel.recovery.restore_journal_retention_pass",
+                    "success",
+                    None,
+                ),
+                (
+                    "kernel.recovery.restore_journal_retention_pass",
+                    "empty",
+                    None,
+                ),
+                (
+                    "kernel.recovery.restore_journal_retention_reconciled",
+                    "success",
+                    None,
+                ),
+            ],
+        );
+        for canary in [
+            "retention-custody-canary",
+            "resolved-transaction",
+            "unresolved-transaction",
+            "first-payload",
+            "second-payload",
+            "unresolved-payload",
+            "first-receipt",
+            "second-receipt",
+        ] {
+            assert!(!text.contains(canary), "diagnostic leaked {canary}");
+        }
+
+        let (retained_resolved, history_fence) = store
+            .load_restore_journal_readback(resolved_stream, 8)
+            .expect("read retained resolved history");
+        assert_eq!(retained_resolved.len(), 1);
+        assert_eq!(
+            retained_resolved[0].operation.phase_operation,
+            "resolved-phase-1"
+        );
+        assert_eq!(
+            history_fence,
+            Some(JournalPredecessor {
+                sequence: first_intent.sequence,
+                digest: first_intent.record_digest.clone(),
+            }),
+            "only the oldest resolved owner member should be retired"
+        );
+        assert_eq!(
+            store
+                .load_restore_journal_result(resolved_stream, "resolved-phase-1")
+                .expect("read retained resolved result"),
+            Some(RestoreJournalResult {
+                transaction_id: resolved_transaction.to_owned(),
+                phase_operation: "resolved-phase-1".to_owned(),
+                intent_sequence: second_intent.sequence,
+                receipt_sha256: retention_test_result_digest(
+                    &second_operation,
+                    resolved_stream,
+                    &epoch,
+                    &state_fence,
+                    "retention-custody-canary-second-receipt",
+                ),
+                receipt: retention_test_result_payload(
+                    &second_operation,
+                    resolved_stream,
+                    &epoch,
+                    &state_fence,
+                    "retention-custody-canary-second-receipt",
+                ),
+            })
+        );
+        let (retained_unresolved, unresolved_fence) = store
+            .load_restore_journal_readback(unresolved_stream, 8)
+            .expect("read recovery-needed owner history");
+        assert_eq!(retained_unresolved.len(), 1);
+        assert_eq!(
+            retained_unresolved[0].operation.phase_operation,
+            "unresolved-phase"
+        );
+        assert_eq!(unresolved_fence, None);
+        assert_eq!(
+            store
+                .load_restore_journal_result(unresolved_stream, "unresolved-phase")
+                .expect("prove unresolved member has no result"),
+            None
+        );
+        assert_eq!(
+            store
+                .restore_journal_durable_head(resolved_stream)
+                .expect("read resolved head after retention"),
+            resolved_head_before,
+            "retention changed the durable head"
+        );
+        assert_eq!(
+            store
+                .restore_journal_durable_head(unresolved_stream)
+                .expect("read unresolved head after retention"),
+            unresolved_head_before,
+            "retention changed an unresolved stream head"
+        );
+        assert_eq!(
+            store
+                .list_restore_journal_streams()
+                .expect("re-read owner-admitted stream index"),
+            expected_streams
+        );
+
+        drop(coordinator);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn retention_test_epoch_and_fence() -> (eliot_ors::EpochLineage, eliot_ors::StateFenceSnapshot) {
+        let lineage_id = eliot_ors::OpaqueLabel::new("retention-test-lineage")
+            .expect("test lineage label");
+        let epoch = eliot_ors::EpochLineage {
+            current: eliot_ors::EpochIdentity {
+                lineage_id: lineage_id.clone(),
+                epoch: 1,
+            },
+            predecessor: None,
+        };
+        let state_fence = eliot_ors::StateFenceSnapshot::capture(
+            &serde_json::json!({
+                "authority_epoch": {
+                    "lineage_id": lineage_id.as_str(),
+                    "sequence": 1
+                },
+                "resource_generation": 1
+            }),
+            1,
+        )
+        .expect("capture exact test fence");
+        (epoch, state_fence)
+    }
+
+    fn bind_retention_test_stream(
+        store: &RedbRecoveryStore,
+        stream: &str,
+        transaction_id: &str,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+    ) {
+        store
+            .bind_restore_journal_stream(
+                stream,
+                &RestoreJournalStreamBinding {
+                    transaction_id: transaction_id.to_owned(),
+                    source_archive_id: "retention-custody-canary-source".to_owned(),
+                    archive_class: eliot_ors::RestoreJournalArchiveClass::FullRecovery,
+                    destination_ref: "retention-custody-canary-destination".to_owned(),
+                    writer_id: "retention-custody-canary-writer".to_owned(),
+                    writer_fence_digest: state_fence.sha256.clone(),
+                },
+            )
+            .expect("owner-admit restore journal stream");
+    }
+
+    fn retention_test_operation(
+        transaction_id: &str,
+        phase_operation: &str,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+        expected_predecessor: Option<JournalPredecessor>,
+    ) -> RestoreJournalOperation {
+        RestoreJournalOperation {
+            transaction_id: transaction_id.to_owned(),
+            source_archive_id: "retention-custody-canary-source".to_owned(),
+            archive_class: eliot_ors::RestoreJournalArchiveClass::FullRecovery,
+            destination_ref: "retention-custody-canary-destination".to_owned(),
+            writer_id: "retention-custody-canary-writer".to_owned(),
+            writer_fence_digest: state_fence.sha256.clone(),
+            record_schema: eliot_ors::RESTORE_JOURNAL_RECORD_SCHEMA.to_owned(),
+            phase_operation: phase_operation.to_owned(),
+            request_digest: "1f".repeat(32),
+            body_digest: "2e".repeat(32),
+            expected_predecessor,
+            payload_handle: format!("retention-custody-canary-handle-{phase_operation}"),
+        }
+    }
+
+    fn retention_test_envelope(
+        operation: &RestoreJournalOperation,
+        stream: &str,
+        epoch: &eliot_ors::EpochLineage,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+        payload: &str,
+    ) -> String {
+        let envelope = eliot_ors::RecoveryPayloadEnvelope::encrypted(
+            eliot_ors::RecoveryEnvelopeContext {
+                operation_or_checkpoint_id: eliot_ors::OpaqueLabel::new(
+                    operation.identity(stream).expect("owner operation identity"),
+                )
+                .expect("test operation identity label"),
+                privacy_and_visibility_class: eliot_ors::RecoveryAccessClass {
+                    privacy: eliot_ors::PrivacyClass::Private,
+                    visibility: eliot_ors::VisibilityClass::new(
+                        "retention-test-owner-only",
+                    )
+                    .expect("test visibility label"),
+                    instruction_taint: eliot_ors::InstructionTaint::DataOnly,
+                },
+                authority_epoch: epoch.clone(),
+                state_fence: state_fence.clone(),
+                created_at_ms: 10,
+                known_at_ms: 11,
+                expires_at_ms: None,
+            },
+            eliot_platform::SecretReference::new(
+                "retention-custody-canary-provider",
+                "retention-custody-canary-key",
+            )
+            .expect("test secret reference"),
+            payload.as_bytes().to_vec(),
+        )
+        .expect("construct valid versioned owner envelope");
+        serde_json::to_string(&envelope).expect("serialize owner envelope")
+    }
+
+    fn retention_test_digest(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    fn append_retention_test_intent(
+        store: &RedbRecoveryStore,
+        stream: &str,
+        operation: &RestoreJournalOperation,
+        epoch: &eliot_ors::EpochLineage,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+        payload_marker: &str,
+    ) -> RestoreJournalAppendReceipt {
+        let payload = retention_test_envelope(
+            operation,
+            stream,
+            epoch,
+            state_fence,
+            payload_marker,
+        );
+        let payload_sha256 = retention_test_digest(payload.as_bytes());
+        let receipt = store
+            .append_restore_journal_intent(stream, operation, &payload_sha256, &payload)
+            .expect("append owner-admitted restore intent");
+        store
+            .verify_restore_journal_receipt(stream, &receipt)
+            .expect("verify owner-issued intent receipt");
+        receipt
+    }
+
+    fn retention_test_result_payload(
+        operation: &RestoreJournalOperation,
+        stream: &str,
+        epoch: &eliot_ors::EpochLineage,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+        receipt_marker: &str,
+    ) -> String {
+        retention_test_envelope(operation, stream, epoch, state_fence, receipt_marker)
+    }
+
+    fn retention_test_result_digest(
+        operation: &RestoreJournalOperation,
+        stream: &str,
+        epoch: &eliot_ors::EpochLineage,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+        receipt_marker: &str,
+    ) -> String {
+        retention_test_digest(
+            retention_test_result_payload(
+                operation,
+                stream,
+                epoch,
+                state_fence,
+                receipt_marker,
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn append_retention_test_result(
+        store: &RedbRecoveryStore,
+        stream: &str,
+        operation: &RestoreJournalOperation,
+        intent_sequence: u64,
+        epoch: &eliot_ors::EpochLineage,
+        state_fence: &eliot_ors::StateFenceSnapshot,
+        receipt_marker: &str,
+    ) {
+        let receipt = retention_test_result_payload(
+            operation,
+            stream,
+            epoch,
+            state_fence,
+            receipt_marker,
+        );
+        let result = RestoreJournalResult {
+            transaction_id: operation.transaction_id.clone(),
+            phase_operation: operation.phase_operation.clone(),
+            intent_sequence,
+            receipt_sha256: retention_test_digest(receipt.as_bytes()),
+            receipt,
+        };
+        let owner_receipt = store
+            .append_restore_journal_result(stream, &result)
+            .expect("append owner-admitted restore result");
+        store
+            .verify_restore_journal_receipt(stream, &owner_receipt)
+            .expect("verify owner-issued result receipt");
     }
 }
