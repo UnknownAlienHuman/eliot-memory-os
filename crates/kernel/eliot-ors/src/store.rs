@@ -105,15 +105,16 @@ use crate::{
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
-    UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
-    UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
-    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
-    VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
-    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
-    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor,
-    WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor,
-    WriteReservationRecoveryPage, WriterReservationToken, is_replay_terminal_phase,
-    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    UnknownCommitOutcome, UnknownCommitRecord, UnknownCommitRecoveryCursor,
+    UnknownCommitRecoveryPage, UserBrokerFence, UserBrokerHeartbeat, UserBrokerRegistration,
+    UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot, UserBrokerResourceSelection,
+    UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry, VersionedArtifactRegistry,
+    WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors,
+    WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
+    WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry,
+    WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor, WriteReservationRecoveryPage,
+    WriterReservationToken, is_replay_terminal_phase, parse_replay_stream_id,
+    require_replay_claim_binding, signed_supervision_lease_from_verified,
     signed_terminal_supervision_lease_from_verified,
 };
 
@@ -3591,6 +3592,25 @@ const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_f
 /// cannot look like versioned-artifact movement and refuse an unrelated
 /// continuation.
 const VERSIONED_ARTIFACT_FAMILY_REVISION: &str = "versioned_artifact_family_revision";
+/// Durable monotone revision of the open unknown-commit family (issue #2763).
+///
+/// The exact counterpart of [`PROCESS_STREAM_RECOVERY_FAMILY_REVISION`] for
+/// `ors_unknown_commit_recovery_v1`, with the same three properties: it is
+/// advanced inside the same write transaction as every durable stage and every
+/// durable resolution of that family, so any movement of the open set moves
+/// this counter; a bounded reader compares it against the revision it froze and
+/// refuses to answer from a page served under a revision the family has left;
+/// and an absent key is revision `0`, the legacy state of a store written before
+/// this counter existed, which is an answer rather than an unknown one.
+///
+/// It is a SEPARATE key from the recovery-inventory counters on purpose. The
+/// unknown-commit family is not a [`RecoveryInventorySource`] member, so adding
+/// one would have changed `RecoveryInventorySnapshot`'s digest preimage, forced a
+/// `RECOVERY_INVENTORY_REVISION_SCHEMA` migration for every store already opened
+/// at version `1`, and reached `store/recovery_projection.rs` outside this
+/// slice. A separate key also means a reservation or inbox write cannot look
+/// like unknown-commit movement and refuse an unrelated pause admission.
+const UNKNOWN_COMMIT_RECOVERY_REVISION: &str = "unknown_commit_recovery_revision";
 
 struct ClosureRowPlan {
     key: String,
@@ -6218,6 +6238,10 @@ impl RedbRecoveryStore {
                     .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;
                 drop(table);
+                // #2763: the family revision advances in the SAME transaction as
+                // the row that made the open set larger, so a bounded pause
+                // reader can never see the new record under the old revision.
+                Self::advance_unknown_commit_recovery_revision(&write)?;
                 write.commit().map_err(storage)?;
                 return Ok(None);
             };
@@ -6317,6 +6341,11 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
             next
         };
+        // #2763: resolving RETIRES a row by rewriting it as terminal evidence
+        // rather than deleting it, so it moves the open set exactly like a
+        // stage does. The revision advances in the same transaction, after the
+        // family table borrow has ended.
+        Self::advance_unknown_commit_recovery_revision(&write)?;
         write.commit().map_err(storage)?;
         Ok(Some(resolved))
     }
@@ -31475,6 +31504,146 @@ impl RedbRecoveryStore {
         )
         .map_err(storage)?;
         Ok(next)
+    }
+
+    /// Reads the durable monotone revision of the open unknown-commit family
+    /// (issue #2763).
+    ///
+    /// The single owner of the counter: [`Self::stage_unknown_commit`] and
+    /// [`Self::resolve_unknown_commit`] advance it, and every bounded pause
+    /// reader observes it. A store written before the counter existed reads as
+    /// revision `0`, which is a real frozen value and not an error.
+    pub fn unknown_commit_recovery_revision(&self) -> Result<u64, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::unknown_commit_recovery_revision_in(&read)
+    }
+
+    /// Reads the unknown-commit family revision out of an open transaction.
+    ///
+    /// One reader serves both the writing transaction and the answering read, so
+    /// a revision is never produced by two rules that could disagree. An absent
+    /// counter is revision `0`; a counter that is not an unsigned integer is an
+    /// integrity failure rather than a number to guess at.
+    fn unknown_commit_recovery_revision_in(read: &redb::ReadTransaction) -> Result<u64, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let revision = meta
+            .get(UNKNOWN_COMMIT_RECOVERY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        Ok(revision)
+    }
+
+    /// Advances the unknown-commit family revision in the caller's open write
+    /// transaction (issue #2763).
+    ///
+    /// Called only when a family row was actually inserted or advanced, in the
+    /// same transaction as that write: an exact re-presentation that changed
+    /// nothing must not look like movement to an in-progress bounded reader.
+    /// Because the counter is monotone and transaction-bound, resolving a row -
+    /// which rewrites it as terminal evidence rather than deleting it - moves it
+    /// exactly like any other change.
+    fn advance_unknown_commit_recovery_revision(
+        write: &redb::WriteTransaction,
+    ) -> Result<u64, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(UNKNOWN_COMMIT_RECOVERY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        let next = prior
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: "unknown-commit recovery revision counter exhausted".to_owned(),
+            })?;
+        meta.insert(UNKNOWN_COMMIT_RECOVERY_REVISION, next.to_string().as_str())
+            .map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Serves one bounded page of the open unknown-commit family under the
+    /// cursor's frozen owner-issued revision (issue #2763).
+    ///
+    /// This is the bounded replacement for an unbounded full-table enumeration
+    /// on a per-mutation admission path. It reads at most `cursor.limit` keys
+    /// plus one over-read that decides coverage, so the work is bounded by the
+    /// page ceiling rather than by the size of the family. `complete` is true
+    /// only when the over-read proved there was no further key, never from a row
+    /// count.
+    ///
+    /// The revision is re-read inside the same read transaction that serves the
+    /// page. A family that moved under the cursor is refused rather than
+    /// answered from a torn read, because a pause published after the cursor was
+    /// frozen is exactly the record this admission must not miss.
+    pub fn scan_unknown_commit_recovery_page(
+        &self,
+        cursor: &UnknownCommitRecoveryCursor,
+    ) -> Result<UnknownCommitRecoveryPage, OrsError> {
+        cursor.validate()?;
+        let source_revision = cursor.source_revision();
+        let read = self.database.begin_read().map_err(storage)?;
+        let observed = Self::unknown_commit_recovery_revision_in(&read)?;
+        if observed != source_revision {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_recovery",
+                reason: format!(
+                    "the unknown-commit family moved from revision {source_revision} to \
+                     {observed} while a bounded pause page was being served"
+                ),
+            });
+        }
+        let table = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let rows = match cursor.after.as_ref() {
+            Some(after) => table
+                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                .map_err(storage)?,
+            None => table.range::<&str>(..).map_err(storage)?,
+        };
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OpaqueLabel> = None;
+        let mut continues = false;
+        for (offset, entry) in rows.take(limit + 1).enumerate() {
+            if offset == limit {
+                continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
+            let record: UnknownCommitRecord = decode(value.value())?;
+            record.validate()?;
+            last_key = Some(OpaqueLabel::new(key.value().to_owned())?);
+            if record.is_open() {
+                records.push(record);
+            }
+        }
+        let next_cursor = if continues {
+            Some(
+                cursor.continue_after(last_key.ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_recovery",
+                    reason: "continuing page has no exclusive continuation".to_owned(),
+                })?),
+            )
+        } else {
+            None
+        };
+        Ok(UnknownCommitRecoveryPage {
+            source_revision,
+            records,
+            next_cursor,
+            complete: !continues,
+        })
     }
 
     /// Reads the durable monotone revision of the versioned-artifact family
