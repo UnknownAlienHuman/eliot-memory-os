@@ -3484,6 +3484,43 @@ fn check_cancellation(
     Err(StoreError::Unavailable)
 }
 
+/// Reports whether a purge disposition that publishes no carrier row must still
+/// refuse this operation, because the carrier stage of its slot is still owed.
+///
+/// `scope_disposition` is what [`decide_purge`] decided from the *current*
+/// purge-ledger readback, and that readback happens on every invocation, so one
+/// operation identity can reach the canonical apply under a disposition that is
+/// not [`MemberDisposition::Restored`] even though an earlier incarnation of the
+/// same slot left the carrier publication unproven. `Restored` answers `false`
+/// here, because that disposition reaches
+/// [`SurrealStoreAdapter::resolve_carrier_stage`], which decides the carrier
+/// stage by bounded exact carrier readback and, on an absent row, authorises the
+/// same-identity carrier retry the card names.
+///
+/// Every other disposition publishes no carrier row and therefore reads none
+/// back, so nothing on that path can discharge the stage: the standing obligation
+/// has no evidence either way, and the only writer that can discharge it is an
+/// invocation whose own exact readback proves the rows. This is the card clause
+/// "carrier unknown -> block only until carrier reconciliation", and the refusal
+/// it produces is the one [`publish_archive_member_carriers`] already returns for
+/// exactly this state — its `CarrierVerification::NotApplied` arm answers
+/// `unknown_outcome(batch.operation.operation_id.as_str())` — and the one
+/// [`check_cancellation`] returns while either stage owes a reconciliation.
+/// Inherited uncertainty is never reset by an invocation that has not written.
+///
+/// The block is bounded and preserves every other decision: the purge reading,
+/// the disposition mapping and the commit below are untouched, nothing is
+/// published and nothing is written, and the same identity proceeds the moment
+/// its carrier stage is answered — by a cleared ledger, by competent carrier
+/// evidence [`SurrealStoreAdapter::reconcile_operation`] feeds the slot, or by
+/// the carrier readback a `Restored` disposition already performs.
+fn purge_disposition_blocks_on_unproven_carrier(
+    scope_disposition: MemberDisposition,
+    exposure: RestoreEffectExposure,
+) -> bool {
+    scope_disposition != MemberDisposition::Restored && exposure.carrier_stage().is_unproven()
+}
+
 /// Verifies the expected-state identity: every expected head must carry the
 /// request's state fence, so a batch cannot bind heads from another fence.
 ///
@@ -4709,6 +4746,26 @@ impl SurrealStoreAdapter {
                 }
             }
         } else {
+            // A disposition that publishes no carrier row also reads none back,
+            // so nothing below this branch can discharge an inherited carrier
+            // stage, and the canonical apply below would commit while that
+            // obligation is still open — a schedule the create-only carrier key
+            // and the destination's bookkeeping rows can never settle, because
+            // the ledger that suppressed the member scope can keep the carrier
+            // unprovable for as long as it stays suppressed. The disposition is
+            // re-read on every invocation, so it can differ between two of them
+            // for one identity; the slot's carrier stage cannot. This branch
+            // therefore asks the carrier stage the question the publication
+            // branch answers by readback, and refuses with that branch's own
+            // typed outcome when the answer is "unproven": the card clause
+            // "carrier unknown -> block only until carrier reconciliation", and
+            // the DONE clause "inherited uncertainty is never reset by an
+            // invocation that has not written". A carrier stage that is proved,
+            // or that was never submitted, is untouched here — only the unproven
+            // case waits, and it waits without writing anything.
+            if purge_disposition_blocks_on_unproven_carrier(scope_disposition, *exposure) {
+                return Err(unknown_outcome(batch.operation.operation_id.as_str()));
+            }
             Vec::new()
         };
         let resolved = resolve_archive_members(transport, &self.config, batch).await?;
@@ -5443,9 +5500,13 @@ fn apply_bindings(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
     use crate::config::{PINNED_SURREALDB_MAJOR, SchemaGeneration};
-    use eliot_contracts::ResourceGeneration;
-    use eliot_store_api::{CONTRACT_VERSION, DestinationClass, OperationId as TestOperationId};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_store_api::{
+        BlobResidency, CONTRACT_VERSION, DestinationClass, OperationId as TestOperationId,
+    };
     use secrecy::SecretString;
 
     const TEST_HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -6700,7 +6761,7 @@ mod tests {
     // Second, the slot converges and leaves the map in the same process once
     // competent provider evidence arrives, so a restart is never needed.
     //
-    // Measured site of the gate this case pins: `apply_canonical_batch` at :4587,
+    // Measured site of the gate this case pins: `apply_canonical_batch` at :4590,
     // `if exposure.apply_stage().is_unproven() { return
     // Err(unknown_outcome(...)) }` — the only predicate that closes the fresh-write
     // branch, reached after the exact record read at `read_record` and before the
@@ -6893,10 +6954,10 @@ mod tests {
     // Measured sites: the bound is checked in `RestoreAttemptGuard::acquire` at
     // :1465 (`retained.is_none() && ledger.attempts.len() >=
     // MAX_RESTORE_TRACKED_ATTEMPTS`), which `restore_canonical_batch` reaches at
-    // :4096 before `apply_canonical_batch` — and therefore before both provider
-    // writes at :2886 (carrier publication) and :4880 (canonical apply). The
+    // :4099 before `apply_canonical_batch` — and therefore before both provider
+    // writes at :2889 (carrier publication) and :4883 (canonical apply). The
     // exposure gate the refusal must never be confused with is the per-stage
-    // `apply_stage()` decision at :4587, which runs strictly later and only over
+    // `apply_stage()` decision at :4590, which runs strictly later and only over
     // an already-acquired slot.
     #[test]
     fn ceiling_refusal_is_fail_closed_and_leaves_the_projection_intact() {
@@ -7006,8 +7067,15 @@ mod tests {
     //
     // The schedule this pins is the one the card's DONE clause names: a successful
     // carrier publication, a drop before the canonical apply, and a next exact
-    // request that then reaches the carrier readback instead of publishing a
-    // second time. The state that leaves the drop is
+    // request that publishes no second time. Precisely: the retained carrier
+    // stage is answered by `resolve_carrier_stage`'s `DurableResultVerified`
+    // early return, which rests on the dropped incarnation's own exact carrier
+    // readback; the carrier rows this invocation then uses are read back from
+    // the destination by `resolve_archive_members`, which re-proves payload
+    // digest and length. So the rows are read back in that invocation, but not
+    // by the carrier-stage verdict — this case pins the accessors that verdict
+    // consults, and says so rather than claiming more. The state that leaves
+    // the drop is
     // {carrier: DurableResultVerified, apply: NoWriteSubmitted}, which no other
     // case reaches: the eviction case covers {WMS, DRV}, {DRV, DRV} and
     // {DRV, DRV} plus a recorded outcome, and the drop case seeds only an
@@ -7023,13 +7091,13 @@ mod tests {
     // Measured sites: the eviction predicate is the `if` at :1537, and the
     // republication decision is the `exposure.carrier_stage() ==
     // RestoreEffectState::DurableResultVerified` early return of
-    // `SurrealStoreAdapter::resolve_carrier_stage` at :4448, which is reached
-    // before the `!exposure.carrier_stage().is_unproven()` guard at :4451 that
+    // `SurrealStoreAdapter::resolve_carrier_stage` at :4451, which is reached
+    // before the `!exposure.carrier_stage().is_unproven()` guard at :4454 that
     // answers `Ok(None)` and hands the caller a second carrier-publication
     // transaction. That function is `async` over a live provider transport, so
     // this case drives the accessors it consults — `carrier_stage` and
     // `is_unproven` — over the retained exposure, the way case 2666/13 pins the
-    // apply-stage gate `apply_canonical_batch` consults at :4587.
+    // apply-stage gate `apply_canonical_batch` consults at :4590.
     #[test]
     fn drop_before_the_canonical_apply_retains_the_proved_carrier_publication() {
         let _serial = ledger_serial();
@@ -7121,9 +7189,12 @@ mod tests {
         assert_eq!(
             exact.exposure.carrier_stage(),
             RestoreEffectState::DurableResultVerified,
-            "reacquisition must inherit the retained carrier publication, so \
-             resolve_carrier_stage answers Ok(Some) at its :4448 early return and \
-             never reaches the Ok(None) that would authorise a second publication"
+            "reacquisition must inherit the retained carrier publication, so the \
+             inherited carrier stage answers `DurableResultVerified` at \
+             resolve_carrier_stage's :4451 early return rather than the :4454 \
+             `Ok(None)` that would authorise a second publication. This asserts \
+             the inherited STATE that verdict reads; the verdict itself is async \
+             over a live transport and is not executed here"
         );
         assert_eq!(
             exact.exposure.apply_stage(),
@@ -7136,21 +7207,12 @@ mod tests {
              obligation"
         );
 
-        // The contrast that makes the branch decision legible: the same accessors
-        // over an exposure that inherited nothing answer the republication guard
-        // instead, because `NoWriteSubmitted` is not unproven.
-        let inherited_nothing = RestoreEffectExposure::new(RestoreStageExposure::NONE);
-        assert_eq!(
-            inherited_nothing.carrier_stage(),
-            RestoreEffectState::NoWriteSubmitted,
-            "a slot that retained nothing hands the republication branch its answer, \
-             which is how the measured defect spent a second carrier transaction"
-        );
-        assert!(
-            !inherited_nothing.carrier_stage().is_unproven(),
-            "NoWriteSubmitted is proven in the narrow sense and unproven in the one \
-             that matters: it never reached the wire"
-        );
+        // The contrast that makes the branch decision legible is asserted below over a
+        // slot that really went through `release`. An earlier version of this case also
+        // asserted the same contrast over a freshly constructed
+        // `RestoreEffectExposure::new(RestoreStageExposure::NONE)`; that was removed as
+        // vacuous, because folding constants over `NONE` holds under every mutation of the
+        // code under test and therefore proved nothing.
 
         // This invocation wrote nothing and is dropped too, so its own exposure
         // is `NoWriteSubmitted` on both stages while the slot's are strictly
@@ -7252,5 +7314,788 @@ mod tests {
             lines.sort();
             lines
         })
+    }
+
+    /// Canonical lineage of the fixture fence below. An `EpochLineageId` is a
+    /// canonical UUID text by contract, so this is the shape the type demands and
+    /// not a stand-in for any digest the carrier code computes.
+    const CARRIER_FIXTURE_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// The durable fence the carrier rows are registered under.
+    ///
+    /// The fence is bound into each published *row*, never into the carrier
+    /// document, so its value is inert for the identity and content comparisons
+    /// these cases pin — exactly as it is for a fixture that opens no connection.
+    fn carrier_fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(CARRIER_FIXTURE_LINEAGE).expect("canonical lineage fixture"),
+                NonZeroU64::new(1).expect("non-zero fixture epoch sequence"),
+            )
+            .expect("valid fixture epoch"),
+            ResourceGeneration::genesis(),
+        )
+    }
+
+    /// The canonical logical payload one retained member carries.
+    fn carrier_payload_text(member_id: &str) -> String {
+        format!(r#"{{"body":"{member_id}","revision":7}}"#)
+    }
+
+    /// One admitted batch member with real residency metadata.
+    ///
+    /// `content_digest` is the *archive* commitment the capture recorded for the
+    /// member, not a checksum of the payload that travels beside it, so it comes
+    /// from this module's fixture digests and never from `sha256_hex` over the
+    /// payload. Members are told apart by `member_id`; the second and later
+    /// members of a batch take the other fixture digest, so two members of one
+    /// batch never claim one commitment.
+    fn carrier_member(member_id: &str, payload: &str, content_digest: &str) -> SnapshotMember {
+        SnapshotMember {
+            member_id: member_id.to_owned(),
+            member_type: SnapshotMemberType::Record,
+            content_digest: content_digest.to_owned(),
+            residency: BlobResidency {
+                domain: BlobResidencyDomain::InlineCanonical,
+                residency_digest: TEST_HASH_B.to_owned(),
+                byte_count: u64::try_from(payload.len())
+                    .expect("a fixture payload length always fits in u64"),
+            },
+            reference_digest: None,
+        }
+    }
+
+    /// The retained reference for one member, with the owner's attested digest and
+    /// declared length computed over the payload bytes it actually holds —
+    /// `carrier_for` re-proves both, so a fixture constant standing in for either
+    /// would be refused typed instead of publishing a carrier.
+    fn retained_carrier_member(member_id: &str, payload: &str) -> RetainedArchiveMember {
+        RetainedArchiveMember {
+            member_id: member_id.to_owned(),
+            class: RestoreRecordClass::WriteReceipt.token().to_owned(),
+            record_id: format!("receipt-{member_id}"),
+            payload_digest: sha256_hex(payload.as_bytes()),
+            byte_count: u64::try_from(payload.len())
+                .expect("a fixture payload length always fits in u64"),
+            payload: payload.to_owned(),
+        }
+    }
+
+    /// An owner-scoped batch that actually carries members and the retained
+    /// payloads behind them.
+    ///
+    /// This is `scoped_batch` with the one thing it leaves empty filled in: a real
+    /// member denominator and one retained reference per importable member. Every
+    /// other field stays inert, so the carrier published from it is produced by
+    /// `carrier_for` out of admitted values and never by a hand-written literal.
+    fn carrier_batch(
+        destination_id: &str,
+        operation_id: &str,
+        member_ids: &[&str],
+    ) -> CanonicalRestoreBatch {
+        let mut batch = scoped_batch(destination_id, operation_id);
+        for (index, member_id) in member_ids.iter().enumerate() {
+            let payload = carrier_payload_text(member_id);
+            let content_digest = if index % 2 == 0 {
+                TEST_HASH_A
+            } else {
+                TEST_HASH_B
+            };
+            batch
+                .members
+                .push(carrier_member(member_id, &payload, content_digest));
+            batch
+                .retained_members
+                .push(retained_carrier_member(member_id, &payload));
+        }
+        batch.member_count = batch.members.len() as u64;
+        batch
+    }
+
+    /// Applies one field mutation to the carrier a producer built, so each
+    /// mutation below names the single fact it changes and nothing else.
+    fn with_carrier_field(
+        intended: &ArchiveMemberCarrier,
+        mutate: impl FnOnce(&mut ArchiveMemberCarrier),
+    ) -> ArchiveMemberCarrier {
+        let mut mutated = intended.clone();
+        mutate(&mut mutated);
+        mutated
+    }
+
+    /// One single-fact divergence per clause of `carrier_answers_for`, in the
+    /// order the comparator states them. Held here rather than in the case body
+    /// so the case reads as the ten assertions it makes; the array length is
+    /// itself asserted by the case, so dropping a fact still fails it.
+    fn carrier_identity_fact_mutations(
+        intended: &ArchiveMemberCarrier,
+    ) -> [(&'static str, ArchiveMemberCarrier); 10] {
+        [
+            (
+                "operation_id",
+                with_carrier_field(intended, |carrier| {
+                    carrier.operation_id = "op-carrier-identity-foreign".to_owned();
+                }),
+            ),
+            (
+                "source_store_id",
+                with_carrier_field(intended, |carrier| {
+                    carrier.source_store_id = "source-store-foreign".to_owned();
+                }),
+            ),
+            (
+                "source_installation_id",
+                with_carrier_field(intended, |carrier| {
+                    carrier.source_installation_id = "source-installation-foreign".to_owned();
+                }),
+            ),
+            (
+                "source_schema_generation",
+                with_carrier_field(intended, |carrier| {
+                    carrier.source_schema_generation = "2.0.1".to_owned();
+                }),
+            ),
+            (
+                "archive_member_digest",
+                with_carrier_field(intended, |carrier| {
+                    carrier.archive_member_digest = TEST_HASH_A.to_owned();
+                }),
+            ),
+            (
+                "member_id",
+                with_carrier_field(intended, |carrier| {
+                    carrier.member_id = "member-1-foreign".to_owned();
+                }),
+            ),
+            (
+                "member_type",
+                with_carrier_field(intended, |carrier| {
+                    carrier.member_type = SnapshotMemberType::Blob;
+                }),
+            ),
+            (
+                "residency_domain",
+                with_carrier_field(intended, |carrier| {
+                    carrier.residency_domain =
+                        residency_label(BlobResidencyDomain::ContentBlob).to_owned();
+                }),
+            ),
+            (
+                "content_digest",
+                with_carrier_field(intended, |carrier| {
+                    carrier.content_digest = TEST_HASH_B.to_owned();
+                }),
+            ),
+            (
+                "byte_count",
+                with_carrier_field(intended, |carrier| {
+                    carrier.byte_count += 1;
+                }),
+            ),
+        ]
+    }
+
+    // WORK_UNIT_CASE: 2666/17 — the readback's identity half decides on all ten facts.
+    //
+    // The card's MAKE clause fixes the carrier stage verified "only on full
+    // identity+content match", and the identity half of that match is
+    // `carrier_answers_for` (:3113-3128), the comparator `read_archive_member`
+    // applies before it hands a row to the readback at all. Every one of the
+    // sixteen existing `2666/N` cases builds a structurally empty batch, so not
+    // one carrier was ever constructed and no clause of that conjunction was ever
+    // exercised. This case builds the carrier through the only lawful producer —
+    // `carrier_for` (:2984), reached through `intended_archive_member_carriers`
+    // (:2751) — and then mutates each of the ten identity facts exactly once.
+    //
+    // Measured sites: the ten facts are the ten clauses of `carrier_answers_for`;
+    // the values they are compared against are the ones `carrier_for` builds at
+    // :3021-3036.
+    //
+    // The single mutation that would kill this case is any one of the ten clauses
+    // being dropped or compared against the carrier's own value instead of the
+    // batch's: `carrier.byte_count == carrier.byte_count`, for instance, leaves
+    // every assertion here but the `byte_count` one passing.
+    #[test]
+    fn the_carrier_identity_comparator_decides_on_every_one_of_its_ten_facts() {
+        let batch = carrier_batch(
+            "dest-carrier-identity",
+            "op-carrier-identity",
+            &["member-1"],
+        );
+        let published = intended_archive_member_carriers(&batch, &carrier_fence())
+            .expect("an importable member with a retained payload publishes exactly one row");
+        assert_eq!(
+            published.len(),
+            1,
+            "one importable member publishes one carrier row; an empty set would make \
+             every assertion below vacuous"
+        );
+        let entry = &published[0];
+        let member = &entry.member;
+        assert_eq!(
+            member.member_id, entry.carrier.member_id,
+            "the published row travels beside the member it answers for"
+        );
+        assert!(
+            carrier_answers_for(&entry.carrier, &batch, member),
+            "the carrier the producer builds must answer for its own member, or every \
+             negative fact below would be satisfied by a fixture that is wrong from \
+             the start"
+        );
+
+        let intended = entry.carrier.clone();
+        let mutations = carrier_identity_fact_mutations(&intended);
+        assert_eq!(
+            mutations.len(),
+            10,
+            "the comparator states ten independent facts; this case holds one mutation \
+             for each of them so no fact can be dropped silently"
+        );
+        for (fact, divergent) in &mutations {
+            assert_ne!(
+                *divergent, intended,
+                "the `{fact}` mutation must actually change the carrier, otherwise it \
+                 asserts nothing"
+            );
+            assert!(
+                !carrier_answers_for(divergent, &batch, member),
+                "identity fact `{fact}` alone must make the comparator refuse: a row that \
+                 disagrees with the admitted batch or its member is an identity \
+                 conflict, never a payload accepted because it looked plausible"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 2666/18 — the readback's content half is the whole-value
+    // comparison, and the identity comparator cannot stand in for it.
+    //
+    // The production expression pinned here is `if existing != entry.carrier`
+    // (:2838) inside `verify_archive_member_carriers`: `entry` is one
+    // `PublishedCarrier` of the intended set and `existing` is what
+    // `read_archive_member` returned for that member, so the equality that turns a
+    // publication into a verified one is `PartialEq` over the whole
+    // `ArchiveMemberCarrier` — payload, payload digest, class and destination
+    // address included. `carrier_answers_for` deliberately says nothing about any
+    // of those four, which this case demonstrates rather than assumes: each
+    // content mutation below still passes the identity comparator and still fails
+    // the whole-value one.
+    //
+    // Measured sites: `existing != entry.carrier` at :2838; the four fields only it
+    // covers are the ones `carrier_for` sets at :3031-3035.
+    //
+    // The single mutation that would kill this case is narrowing that comparison
+    // to the identity facts — comparing `carrier_answers_for(existing, ..)`
+    // instead of the whole value — which makes every content assertion below fail
+    // on its `carrier_answers_for` clause.
+    #[test]
+    fn the_readback_whole_value_comparison_rejects_a_content_the_identity_comparator_accepts() {
+        let batch = carrier_batch("dest-carrier-content", "op-carrier-content", &["member-1"]);
+        let published = intended_archive_member_carriers(&batch, &carrier_fence())
+            .expect("an importable member with a retained payload publishes exactly one row");
+        assert_eq!(
+            published.len(),
+            1,
+            "the content comparison needs a real intended row to diverge from"
+        );
+        let entry = &published[0];
+        let intended = &entry.carrier;
+        assert!(
+            carrier_answers_for(intended, &batch, &entry.member),
+            "the producer's carrier answers for its own member before content is compared"
+        );
+
+        let divergences: [(&'static str, ArchiveMemberCarrier); 4] = [
+            (
+                "payload",
+                with_carrier_field(intended, |carrier| {
+                    carrier.payload = serde_json::json!({"body": "forged", "revision": 7});
+                }),
+            ),
+            (
+                "payload_digest",
+                with_carrier_field(intended, |carrier| {
+                    carrier.payload_digest = TEST_HASH_A.to_owned();
+                }),
+            ),
+            (
+                "class",
+                with_carrier_field(intended, |carrier| {
+                    carrier.class = RestoreRecordClass::CanonicalEvent;
+                }),
+            ),
+            (
+                "record_id",
+                with_carrier_field(intended, |carrier| {
+                    carrier.record_id = "receipt-member-1-foreign".to_owned();
+                }),
+            ),
+        ];
+        assert_eq!(
+            divergences.len(),
+            4,
+            "the whole-value comparison is pinned over exactly the four content fields \
+             the identity comparator never reads"
+        );
+        for (content_fact, existing) in &divergences {
+            assert_ne!(
+                *existing, *intended,
+                "a carrier whose `{content_fact}` differs must not compare equal to the \
+                 intended row: `existing != entry.carrier` at :2838 is the only thing \
+                 that turns this row into an identity conflict instead of a verified \
+                 publication"
+            );
+            assert!(
+                carrier_answers_for(existing, &batch, &entry.member),
+                "`{content_fact}` is not an identity fact: the comparator must still \
+                 accept this row, which is exactly why the content half needs the \
+                 whole-value comparison and can never be left to `carrier_answers_for`"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 2666/19 — the basis the readback verifies is complete, and a
+    // divergence in a later row does not escape behind an earlier row's agreement.
+    //
+    // What this case does NOT claim, and why: `verify_archive_member_carriers`
+    // (:2827) is `async` over a live `&RpcTransport`, so its loop's *ordering*
+    // property — that it returns at the first absent or divergent row and never
+    // reads the rows after it, and that `CarrierVerification::Verified` is
+    // reachable only when every row agreed — cannot be observed without calling
+    // it, and no pure seam encodes it. Restating the loop here would be a mock of
+    // the function under proof, so it is not done. What IS observable on the pure
+    // seams is pinned here: the intended set holds a row for every importable
+    // member, so a set that is short is never a set that verifies; an importable
+    // member with no retained payload is refused typed instead of published as a
+    // short set; a reference edge is never published at all; and the comparison
+    // the loop applies per row is a whole-value one that a divergence in a later
+    // row does not survive by matching an earlier one.
+    //
+    // Measured sites: the membership of the intended set and its two exclusions are
+    // `intended_archive_member_carriers` (:2756-2788); the per-row comparison is
+    // `existing != entry.carrier` (:2838), the same expression case 2666/18 pins.
+    //
+    // The single mutation that would kill this case is building the intended set
+    // from the batch's declared count instead of from its admitted members — or
+    // continuing past an importable member that retains nothing — which makes the
+    // published-row assertions below fail.
+    #[test]
+    fn the_readback_basis_covers_every_importable_member_and_a_later_divergence_still_diverges() {
+        let batch = carrier_batch(
+            "dest-carrier-basis",
+            "op-carrier-basis",
+            &["member-1", "member-2"],
+        );
+        let published = intended_archive_member_carriers(&batch, &carrier_fence())
+            .expect("both members retain a payload, so both rows are published");
+        assert_eq!(
+            published.len(),
+            2,
+            "the set the readback verifies must hold a row per importable member; a set \
+             that silently omitted one would let a short publication read as verified"
+        );
+        assert_eq!(
+            (
+                published[0].member.member_id.as_str(),
+                published[1].member.member_id.as_str()
+            ),
+            ("member-1", "member-2"),
+            "rows keep admitted order, so the loop's per-row comparison reaches both \
+             members of this batch"
+        );
+        for entry in &published {
+            assert!(
+                carrier_answers_for(&entry.carrier, &batch, &entry.member),
+                "every published row must answer for the member it travels beside"
+            );
+        }
+
+        // The earlier row agrees exactly while the later one carries other content:
+        // `existing != entry.carrier` is false for the first row and true for the
+        // second, so agreeing on one row can never stand in for the whole set.
+        let first_row_intended =
+            carrier_for(&batch, &published[0].member, &batch.retained_members[0])
+                .expect("the first member's own retained payload publishes a carrier");
+        assert_eq!(
+            first_row_intended, published[0].carrier,
+            "the earlier row equals exactly what its own member publishes, so the later \
+             row's divergence below is not an artifact of a mispaired set"
+        );
+        let divergent_second = with_carrier_field(&published[1].carrier, |carrier| {
+            carrier.payload = serde_json::json!({"body": "member-2", "revision": 8});
+        });
+        assert_ne!(
+            divergent_second, published[1].carrier,
+            "a later row whose payload differs is not equal to its intended row even \
+             though every earlier row agrees: the readback compares each row, not the \
+             set as a whole"
+        );
+
+        // An importable member that retains nothing is refused typed, so the set can
+        // never be quietly short instead of absent.
+        let mut without_retained = carrier_batch(
+            "dest-carrier-basis-missing",
+            "op-carrier-basis-missing",
+            &["member-1"],
+        );
+        without_retained.retained_members.clear();
+        assert!(
+            matches!(
+                intended_archive_member_carriers(&without_retained, &carrier_fence()),
+                Err(StoreError::InvalidField { .. })
+            ),
+            "an importable member with no retained payload must be refused before any \
+             write, never published as a set that omits its row"
+        );
+
+        // A reference edge names a canonical object; it is not a payload of its own,
+        // so it contributes no row and no member of the set to verify.
+        let mut with_reference_edge = carrier_batch(
+            "dest-carrier-basis-edge",
+            "op-carrier-basis-edge",
+            &["member-1"],
+        );
+        let edge_payload = carrier_payload_text("member-edge");
+        with_reference_edge.members.push(SnapshotMember {
+            member_id: "member-edge".to_owned(),
+            member_type: SnapshotMemberType::Reference,
+            content_digest: TEST_HASH_B.to_owned(),
+            residency: BlobResidency {
+                domain: BlobResidencyDomain::InlineCanonical,
+                residency_digest: TEST_HASH_B.to_owned(),
+                byte_count: u64::try_from(edge_payload.len())
+                    .expect("a fixture payload length always fits in u64"),
+            },
+            reference_digest: Some(TEST_HASH_A.to_owned()),
+        });
+        with_reference_edge.member_count = with_reference_edge.members.len() as u64;
+        let with_edge = intended_archive_member_carriers(&with_reference_edge, &carrier_fence())
+            .expect("a reference edge carries no payload and is skipped, not refused");
+        assert_eq!(
+            with_edge.len(),
+            1,
+            "a reference edge is never published, so the verified set is exactly the \
+             importable members"
+        );
+        assert_eq!(
+            with_edge[0].member.member_id, "member-1",
+            "the published row is the importable member's own"
+        );
+    }
+
+    /// This file's own text, read at compile time, for the one assertion that
+    /// cannot be executed without a live provider.
+    ///
+    /// The repository proves that kind of structural claim the same way elsewhere
+    /// (`bins/eliot-kernel/tests/backup_restore.rs` reads its own coordinator
+    /// source), and the alternative — restating the branch here — would be a mock
+    /// of the function under proof rather than a case.
+    const RESTORE_SOURCE: &str = include_str!("backup_restore.rs");
+
+    /// One current purge-ledger entry over this batch's own archive member
+    /// digest, in the state the case names.
+    ///
+    /// The subject is the batch's own digest, so the entry is exactly the
+    /// member-scope obligation `read_purge_ledger` returns for this batch, and
+    /// the three domain labels come from [`RestoreDomains::derive`] over the same
+    /// destination rather than from text invented here. `PurgeLedgerEntry::validate`
+    /// is run by the case, so a fixture that the destination could never have
+    /// recorded fails instead of deciding a disposition.
+    fn member_scope_purge_entry(
+        batch: &CanonicalRestoreBatch,
+        state: PurgeLedgerState,
+    ) -> PurgeLedgerEntry {
+        let domains =
+            RestoreDomains::derive(&batch.destination, "dest-carrier-suppressed-identity");
+        PurgeLedgerEntry {
+            subject: batch.archive_member_digest.clone(),
+            state,
+            purge_policy_revision: batch.purge_policy_revision,
+            residency_domain: domains.residency,
+            privacy_domain: domains.privacy,
+            retention_domain: domains.retention,
+        }
+    }
+
+    // WORK_UNIT_CASE: 2666/20 - a suppressed disposition no longer carries an
+    // inherited unproven carrier stage past the carrier stage.
+    //
+    // The defect this pins: the carrier decision was reachable only on the
+    // `Restored` branch, while `decide_purge` re-reads the CURRENT purge ledger on
+    // every invocation, so one operation identity could reach the canonical apply
+    // under `Suppressed`/`Unresolved` with a carrier stage an earlier incarnation
+    // had left unproven. Nothing on that path publishes or reads a carrier row, so
+    // the obligation could never be discharged, and `release` (:1538
+    // `!merged.any_unproven()`) can never evict a slot that still carries one: the
+    // identity stays occupied for as long as the ledger keeps the member scope out
+    // of the destination.
+    //
+    // What this case executes: the real guard lifecycle that produces the inherited
+    // exposure (`RestoreAttemptGuard::acquire` / `Drop` -> `release`), the real
+    // `decide_purge` over a real, validated ledger entry, the real decision
+    // `apply_canonical_batch` consults, the real refusal value, and the real
+    // retention predicate. What it does NOT cover: `apply_canonical_batch` is
+    // `async` over a live `&RpcTransport` obtained from `restore_transport(self)`
+    // (:4560), so the branch itself — that this refusal is *returned* rather than
+    // the commit proceeding, and the provider calls that would follow it — cannot
+    // be observed here at all; and the three-arm
+    // `PurgeDecision -> MemberDisposition` mapping (:4694-4697) is asserted only
+    // through `decide_purge`'s own verdicts, because it is written inline in the
+    // function under proof. The one claim that is therefore made on the source text
+    // is the branch wiring itself, asserted below over this file's own bytes: the
+    // non-`Restored` arm must consult the decision and must refuse before it
+    // publishes its empty set, and the decision must be built from the carrier
+    // stage with `Restored` exempt. That is the single mutation this case kills.
+    //
+    // Measured sites: the branch at :4766-4769 inside the `let published = if
+    // scope_disposition == MemberDisposition::Restored` arm; the decision at
+    // :3517; the refusal it shares with the carrier publication's `NotApplied` arm
+    // (:2945) and with `check_cancellation` (:3479); the apply-stage gate at
+    // :4627 that does NOT answer this schedule; the retention predicate at :1538.
+    /// An earlier incarnation handed the carrier publication to the provider and never
+    /// learned what became of it. The pre-poll mark and the drop are the production
+    /// marks; nothing here is a hand-built exposure.
+    fn abandoned_carrier_publication(batch: &CanonicalRestoreBatch, config: &SurrealAdapterConfig) {
+        let mut abandoned = acquire_guard(batch, config);
+        abandoned
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CarrierPublication);
+        drop(abandoned);
+        let Some(retained) = slot_for(batch, config) else {
+            panic!("an abandoned carrier publication must keep its slot")
+        };
+        assert_eq!(
+            retained.effect_state.carrier,
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "the abandoned incarnation left the carrier stage unproven, which is the \
+             inherited uncertainty this case is about"
+        );
+        assert_eq!(
+            retained.effect_state.apply,
+            RestoreEffectState::NoWriteSubmitted,
+            "only the carrier stage was submitted, so the apply stage owes nothing yet"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_disposition_blocks_on_an_inherited_unproven_carrier_stage() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-carrier-suppressed", "install-carrier-suppressed");
+        let batch = scoped_batch("dest-carrier-suppressed", "op-carrier-suppressed");
+        forget_slot(&batch, &config);
+        let operation_id = batch.operation.operation_id.as_str();
+
+        // An earlier incarnation handed the carrier publication to the provider
+        // and never learned what became of it.
+        abandoned_carrier_publication(&batch, &config);
+
+        // The later incarnation of the same identity. Reacquisition hands it the
+        // retained stage and nothing else.
+        let exact = acquire_guard(&batch, &config);
+        assert_eq!(
+            exact.exposure.carrier_stage(),
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "the later incarnation inherits the unproven carrier stage, so the \
+             disposition it now reads is the only thing that can decide whether the \
+             operation still owes a carrier reconciliation"
+        );
+        assert_eq!(
+            exact.exposure.apply_stage(),
+            RestoreEffectState::NoWriteSubmitted,
+            "this incarnation submitted no apply, so the apply-stage gate at :4627 \
+             does not answer this schedule at all"
+        );
+        assert!(
+            !exact.exposure.apply_stage().is_unproven(),
+            "the apply stage is not unproven here, which is exactly why the \
+             per-stage apply gate cannot close this hole and the carrier stage must"
+        );
+
+        // The disposition, decided by the production `decide_purge` over an entry
+        // the destination could actually have recorded.
+        let purged = member_scope_purge_entry(&batch, PurgeLedgerState::Purged);
+        let requested = member_scope_purge_entry(&batch, PurgeLedgerState::Requested);
+        purged
+            .validate()
+            .expect("a member-scope entry over this batch's own digest is recordable");
+        requested
+            .validate()
+            .expect("a requested obligation is recordable too, and is not complete");
+        assert!(
+            matches!(decide_purge(Some(&purged), None), PurgeDecision::Suppressed),
+            "a durably complete obligation over the member scope suppresses it"
+        );
+        assert!(
+            matches!(
+                decide_purge(Some(&requested), None),
+                PurgeDecision::Unresolved
+            ),
+            "a recorded but incomplete obligation leaves the scope unresolved"
+        );
+        assert!(
+            matches!(decide_purge(None, None), PurgeDecision::Clear),
+            "no recorded obligation is the only reading that reaches the carrier \
+             publication branch, and the contrast is what makes the two suppressed \
+             verdicts above legible"
+        );
+
+        // The decision the branch consults, over that inherited exposure.
+        for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
+            assert!(
+                purge_disposition_blocks_on_unproven_carrier(suppressed, exact.exposure),
+                "{suppressed:?} publishes no carrier row and reads none back, so an \
+                 inherited unproven carrier stage must wait for carrier \
+                 reconciliation instead of riding into the canonical apply"
+            );
+        }
+        assert!(
+            !purge_disposition_blocks_on_unproven_carrier(
+                MemberDisposition::Restored,
+                exact.exposure
+            ),
+            "the Restored branch reaches resolve_carrier_stage and answers the stage \
+             by exact readback, so it must never be blocked here: that would close \
+             the same-identity carrier retry the card clause requires"
+        );
+
+        // The contrast: nothing about the purge decision itself is blocked.
+        suppressed_disposition_waves_through_an_answered_carrier_stage();
+
+        // The refusal is the typed unknown outcome the carrier path already
+        // returns for an unproven publication, naming this operation.
+        assert_carrier_refusal_is_the_typed_unknown(operation_id);
+
+        // The blocked invocation wrote nothing, so the obligation it inherited must
+        // survive it untouched and keep the slot retained.
+        drop(exact);
+        let Some(after) = slot_for(&batch, &config) else {
+            panic!("the blocked invocation must release only its local running owner")
+        };
+        assert_eq!(
+            after.effect_state.carrier,
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "inherited uncertainty is never reset by an invocation that has not \
+             written: the carrier stage is exactly what it was"
+        );
+        assert_eq!(
+            after.effect_state.apply,
+            RestoreEffectState::NoWriteSubmitted,
+            "the refused invocation submitted no canonical apply"
+        );
+        assert!(
+            after.effect_state.any_unproven(),
+            "the open obligation is what keeps the slot retained, so the identity \
+             waits for carrier reconciliation and is never silently evicted"
+        );
+        forget_slot(&batch, &config);
+
+        suppressed_branch_consults_the_carrier_decision();
+    }
+
+    /// A slot that never submitted a carrier write proceeds, and a slot whose carrier
+    /// stage was proved proceeds: the gate answers inherited uncertainty only, and
+    /// never the purge decision itself.
+    fn suppressed_disposition_waves_through_an_answered_carrier_stage() {
+        let fresh = RestoreEffectExposure::new(RestoreStageExposure::NONE);
+        assert!(
+            !purge_disposition_blocks_on_unproven_carrier(MemberDisposition::Suppressed, fresh),
+            "a suppressed batch whose slot never submitted a carrier write is \
+             unchanged by this gate; the gate answers inherited uncertainty only"
+        );
+        let mut proved = RestoreEffectExposure::new(RestoreStageExposure {
+            carrier: RestoreEffectState::WriteMayHaveBeenSubmitted,
+            apply: RestoreEffectState::NoWriteSubmitted,
+        });
+        proved.note_carrier_verified();
+        assert!(
+            !purge_disposition_blocks_on_unproven_carrier(MemberDisposition::Suppressed, proved),
+            "an exact carrier readback discharges the stage, so the same identity \
+             proceeds under a suppressed disposition without waiting"
+        );
+    }
+
+    /// The refusal the suppressed branch answers with is the typed unknown outcome the
+    /// carrier path already returns for an unproven publication, naming this
+    /// operation — not a retryable refusal and not a receipt failure.
+    fn assert_carrier_refusal_is_the_typed_unknown(operation_id: &str) {
+        let refusal = unknown_outcome(operation_id);
+        assert!(
+            matches!(
+                &refusal,
+                StoreError::UnknownOutcome { operation_id: reported }
+                    if reported.as_str() == operation_id
+            ),
+            "the block must answer with the typed unknown outcome over this operation \
+             identity, so it reconciles by identity instead of reporting success"
+        );
+        assert_ne!(
+            refusal,
+            StoreError::Unavailable,
+            "a clean retryable refusal would understate an unknown external effect"
+        );
+        assert_ne!(
+            refusal,
+            StoreError::MissingReceiptEnvelope,
+            "the refusal is not a receipt-envelope failure: nothing is missing, the \
+             outcome is unknown"
+        );
+    }
+
+    /// The branch wiring, asserted over this file's own bytes because
+    /// `apply_canonical_batch` is `async` over a live `&RpcTransport` and cannot be
+    /// executed here. This is the weakest kind of proof in this file and is
+    /// labelled as such: it pins that the non-`Restored` arm consults the decision
+    /// and refuses before it returns its empty set, and it would NOT survive a
+    /// mutation that keeps those bytes while moving the guard into a branch that is
+    /// never taken. The behavioural half of the case is the decision's own truth
+    /// table and the retention assertions, which do execute.
+    fn suppressed_branch_consults_the_carrier_decision() {
+        let (after_start, _) = RESTORE_SOURCE
+            .split_once("let published = if scope_disposition == MemberDisposition::Restored {")
+            .expect(
+                "apply_canonical_batch decides the carrier stage from the purge \
+                 disposition it read this invocation",
+            );
+        let (region, _) = after_start
+            .split_once("let resolved = resolve_archive_members(")
+            .expect(
+                "that decision is one region, and the member resolution that \
+                 follows it is where the empty published set is consumed",
+            );
+        let guard = region
+            .find("purge_disposition_blocks_on_unproven_carrier(")
+            .expect(
+                "the disposition that publishes no carrier row must consult the \
+                 carrier stage before it returns an empty published set",
+            );
+        let empty_set = region
+            .find("Vec::new()")
+            .expect("the non-Restored arm still returns an empty published set");
+        assert!(
+            guard < empty_set,
+            "the carrier-stage block must precede the empty published set, otherwise \
+             the operation returns from the arm having decided nothing"
+        );
+        assert!(
+            region[guard..empty_set].contains("return Err(unknown_outcome("),
+            "the block must answer with the typed unknown outcome the carrier path \
+             already returns, not with a silent empty set"
+        );
+        let (after_signature, _) = RESTORE_SOURCE
+            .split_once("fn purge_disposition_blocks_on_unproven_carrier(")
+            .expect("the branch consults one named decision, defined in this file");
+        let (decision, _) = after_signature
+            .split_once("\n}\n")
+            .expect("that decision is a single closed function");
+        for fact in [
+            "MemberDisposition::Restored",
+            "carrier_stage()",
+            "is_unproven()",
+        ] {
+            assert!(
+                decision.contains(fact),
+                "the decision must be built from `{fact}`; a version that answers \
+                 without it would block or wave through every disposition alike"
+            );
+        }
     }
 }
