@@ -256,6 +256,10 @@ pub struct ReleaseSurfaceDriftReport {
     pub manifest_mutated: bool,
     /// Observation instant used for expiry comparison, in Unix seconds.
     pub observed_at_unix_seconds: i64,
+    /// How far this comparison reached. OFFLINE_INSPECTION means the compared
+    /// bytes came from a caller-named path, so the findings describe those
+    /// bytes and not the active installation.
+    pub verification_scope: ReleaseSurfaceVerificationScope,
 }
 
 impl ReleaseSurfaceDriftReport {
@@ -770,6 +774,29 @@ pub enum ReleaseSurfaceError {
     /// The published bytes did not read back identically.
     #[error("release surface manifest readback differs from the published bytes: {0}")]
     ManifestReadback(String),
+    /// The destination is not the installed generation-relative manifest path.
+    ///
+    /// The manifest is an installed release invariant, not a sidecar: an
+    /// arbitrary destination would produce bytes the installation owner never
+    /// retains, and the accepted manifest could not be the one the active
+    /// installation is verified against.
+    #[error("release surface destination is not the installed manifest path: {0}")]
+    DestinationNotInstalled(String),
+}
+
+/// Generation-relative path of the installed release-surface manifest.
+///
+/// One fixed location under the release install root, so the installation owner,
+/// the active generation and Doctor all resolve the same file instead of each
+/// caller naming its own destination.
+pub const INSTALLED_MANIFEST_RELATIVE_PATH: &str = "release-surface.json";
+
+/// The exact installed manifest path for one generation under its install root.
+#[must_use]
+pub fn installed_manifest_path(install_root: &Path, generation: &PlatformHandle) -> PathBuf {
+    install_root
+        .join(generation.as_str())
+        .join(INSTALLED_MANIFEST_RELATIVE_PATH)
 }
 
 fn require_absolute(path: &Path, field: &'static str) -> Result<(), ReleaseSurfaceError> {
@@ -2560,8 +2587,20 @@ pub fn observed_unix_seconds() -> Result<i64, ReleaseSurfaceError> {
 pub fn generate_release_surface_manifest(
     input: &ReleaseSurfaceGenerateInput,
 ) -> Result<(ReleaseSurfaceManifest, Vec<u8>), ReleaseSurfaceError> {
+    // The destination is decided by the release owner, not by the caller, and
+    // is checked before any release work: the manifest must land at the one
+    // installed generation-relative path the installation owner and Doctor both
+    // resolve. An arbitrary output would publish bytes no installation retains.
+    let installed = installed_manifest_path(&input.release_install_root, &input.generation);
+    if input.output != installed {
+        return Err(ReleaseSurfaceError::DestinationNotInstalled(format!(
+            "requested {} but the installed manifest for this release is {}",
+            input.output.display(),
+            installed.display()
+        )));
+    }
     let manifest = build_manifest(input)?;
-    let bytes = publish_manifest(&manifest, &input.output)?;
+    let bytes = publish_manifest(&manifest, &installed)?;
     Ok((manifest, bytes))
 }
 
@@ -2759,6 +2798,7 @@ fn build_drift_report(
     manifest_path: &Path,
     observation: &ManifestByteObservation<'_>,
     observed_at_unix_seconds: i64,
+    verification_scope: ReleaseSurfaceVerificationScope,
 ) -> ReleaseSurfaceDriftReport {
     let mut counts = ReleaseSurfaceVerdictCounts::default();
     for finding in &findings {
@@ -2800,6 +2840,7 @@ fn build_drift_report(
         },
         manifest_mutated: false,
         observed_at_unix_seconds,
+        verification_scope,
     }
 }
 
@@ -2808,11 +2849,52 @@ fn build_drift_report(
 /// The comparison is read-only: it reads the manifest before and after the
 /// comparison, records both digests, and never regenerates, repairs, or
 /// re-signs the accepted bytes.
+/// How far a comparison reached.
+///
+/// The comparison itself is identical in both arms; only the claim it is
+/// allowed to make differs. A caller-supplied file is an OFFLINE inspection of
+/// those bytes, never a statement about the active installation: the
+/// installation/Host owner, not the diagnostic caller, owns which manifest is
+/// the accepted one for the active generation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReleaseSurfaceVerificationScope {
+    /// The manifest path is the retained installed path for the active
+    /// generation, so the report may be read as active-installation evidence.
+    ActiveInstallation,
+    /// The caller named an arbitrary file. Findings describe those bytes only.
+    OfflineInspection,
+}
+
+/// Compare one accepted manifest against the observed installation.
+///
+/// The comparison is read-only: it reads the manifest before and after the
+/// comparison, records both digests, and never regenerates, repairs, or
+/// re-signs the accepted bytes.
+///
+/// `install_root`/`generation` name the retained installed path for the active
+/// generation. When `manifest_path` is that path the report may be read as
+/// active-installation evidence; when it is any other absolute path the
+/// comparison still runs in full but the report records
+/// [`ReleaseSurfaceVerificationScope::OfflineInspection`], so a caller cannot
+/// point Doctor at arbitrary bytes and call the result an installation verdict.
 pub fn verify_release_surface(
     manifest_path: &Path,
+    install_root: Option<&Path>,
+    generation: Option<&PlatformHandle>,
     observed_at_unix_seconds: i64,
 ) -> Result<ReleaseSurfaceDriftReport, ReleaseSurfaceError> {
     require_absolute(manifest_path, "manifest")?;
+    let scope = match (install_root, generation) {
+        (Some(root), Some(generation)) => {
+            if manifest_path == installed_manifest_path(root, generation) {
+                ReleaseSurfaceVerificationScope::ActiveInstallation
+            } else {
+                ReleaseSurfaceVerificationScope::OfflineInspection
+            }
+        }
+        _ => ReleaseSurfaceVerificationScope::OfflineInspection,
+    };
     let before = read_bounded(manifest_path, "manifest", MAX_MANIFEST_BYTES)?;
     let manifest: ReleaseSurfaceManifest = serde_json::from_slice(&before)
         .map_err(|error| ReleaseSurfaceError::Serialization(error.to_string()))?;
@@ -2842,6 +2924,7 @@ pub fn verify_release_surface(
         manifest_path,
         &observation,
         observed_at_unix_seconds,
+        scope,
     ))
 }
 
@@ -2851,5 +2934,140 @@ impl DriftCollector {
             (left.section.as_str(), &left.field).cmp(&(right.section.as_str(), &right.field))
         });
         self.findings
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "the installed-surface tests drive the real generator and comparator, and a fixture that cannot build is a test failure"
+)]
+mod installed_surface_tests {
+    use super::{
+        INSTALLED_MANIFEST_RELATIVE_PATH, ReleaseSurfaceError, ReleaseSurfaceGenerateInput,
+        ReleaseSurfaceVerificationScope, generate_release_surface_manifest,
+        installed_manifest_path, verify_release_surface,
+    };
+    use eliot_installation::{InstallationProfile, PlatformHandle};
+
+    fn generation() -> PlatformHandle {
+        PlatformHandle::new("generation-1857").expect("generation handle")
+    }
+
+    fn input(output: std::path::PathBuf) -> ReleaseSurfaceGenerateInput {
+        ReleaseSurfaceGenerateInput {
+            repo_root: std::path::PathBuf::from(r"C:\repo"),
+            release_bundle: std::path::PathBuf::from(r"C:\bundle"),
+            phase_a_bundle: std::path::PathBuf::from(r"C:\phase-a"),
+            phase_a_install_root: std::path::PathBuf::from(r"C:\phase-a-root"),
+            release_install_root: std::path::PathBuf::from(r"C:\install-root"),
+            generation: generation(),
+            installation: PlatformHandle::new("installation-1857").expect("installation handle"),
+            lineage_id: PlatformHandle::new("lineage-1857").expect("lineage handle"),
+            sequence: 1,
+            transaction_id: PlatformHandle::new("transaction-1857").expect("transaction handle"),
+            profile: InstallationProfile::SystemService,
+            recovery_command: PlatformHandle::new("recover").expect("recovery handle"),
+            expires_at_unix_seconds: 0,
+            generated_schemas: Vec::new(),
+            generated_plugins: Vec::new(),
+            generated_skills: Vec::new(),
+            generated_hooks: Vec::new(),
+            generated_prompts: Vec::new(),
+            capability_cell_registries: Vec::new(),
+            product_proof_receipts: Vec::new(),
+            migration_evidence_snapshots: Vec::new(),
+            supersedes: None,
+            prior_generation: None,
+            output,
+        }
+    }
+
+    #[test]
+    fn the_installed_manifest_path_is_one_fixed_generation_relative_location() {
+        let root = std::path::Path::new(r"C:\install-root");
+        let installed = installed_manifest_path(root, &generation());
+        assert_eq!(
+            installed,
+            root.join("generation-1857")
+                .join(INSTALLED_MANIFEST_RELATIVE_PATH),
+            "the installed path is the fixed generation-relative member"
+        );
+        assert_eq!(
+            installed_manifest_path(root, &PlatformHandle::new("other").expect("handle")),
+            root.join("other").join(INSTALLED_MANIFEST_RELATIVE_PATH),
+            "each generation resolves its own installed member under the same root"
+        );
+    }
+
+    #[test]
+    fn a_destination_outside_the_installed_path_is_refused_before_any_release_work() {
+        // The paths below do not exist, so a caller error is the only thing that
+        // can decide this call: the destination check runs before the release
+        // bundle is read at all.
+        let err = generate_release_surface_manifest(&input(std::path::PathBuf::from(
+            r"C:\somewhere-else\manifest.json",
+        )))
+        .expect_err("an arbitrary destination must be refused");
+        assert!(
+            matches!(err, ReleaseSurfaceError::DestinationNotInstalled(_)),
+            "an arbitrary destination is refused as not installed, got {err:?}"
+        );
+        // Non-vacuity: the installed destination gets past this check and fails
+        // later, on a bundle that does not exist.
+        let later = generate_release_surface_manifest(&input(installed_manifest_path(
+            std::path::Path::new(r"C:\install-root"),
+            &generation(),
+        )))
+        .expect_err("the installed destination proceeds past the destination check");
+        assert!(
+            !matches!(later, ReleaseSurfaceError::DestinationNotInstalled(_)),
+            "the installed destination is accepted by this gate, got {later:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_retained_installed_path_may_claim_active_installation_verification() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bytes = b"{}\n";
+        let installed = installed_manifest_path(temp.path(), &generation());
+        std::fs::create_dir_all(installed.parent().expect("parent"))
+            .expect("create generation root");
+        std::fs::write(&installed, bytes).expect("write manifest");
+        let elsewhere = temp.path().join("caller-named.json");
+        std::fs::write(&elsewhere, bytes).expect("write manifest");
+
+        let active = verify_release_surface(&installed, Some(temp.path()), Some(&generation()), 0)
+            .expect("the retained installed path compares");
+        assert_eq!(
+            active.verification_scope,
+            ReleaseSurfaceVerificationScope::ActiveInstallation,
+            "the retained installed path for the active generation is active evidence"
+        );
+
+        let offline = verify_release_surface(&elsewhere, Some(temp.path()), Some(&generation()), 0)
+            .expect("a caller-named path still compares");
+        assert_eq!(
+            offline.verification_scope,
+            ReleaseSurfaceVerificationScope::OfflineInspection,
+            "a caller-named path is an offline inspection even when the active generation is named"
+        );
+
+        let no_owner =
+            verify_release_surface(&installed, None, None, 0).expect("comparison without an owner");
+        assert_eq!(
+            no_owner.verification_scope,
+            ReleaseSurfaceVerificationScope::OfflineInspection,
+            "without the install root and generation the caller cannot claim active verification"
+        );
+
+        // Non-vacuity: the comparison itself is identical in every arm - only the
+        // recorded claim differs - so a match is never downgraded to a refusal.
+        assert_eq!(
+            active.sections_present.len(),
+            offline.sections_present.len(),
+            "the offline arm performs the same comparison"
+        );
+        assert!(!active.manifest_mutated && !offline.manifest_mutated);
     }
 }
