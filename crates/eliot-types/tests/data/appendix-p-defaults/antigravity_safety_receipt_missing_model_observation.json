@@ -1,0 +1,15 @@
+{
+  "typed_argv": [
+    "agy",
+    "--json"
+  ],
+  "prompt_hash_blake3": "prompt-sha",
+  "shell_false": true,
+  "stdin_devnull": true,
+  "process_group_kill_on_timeout": true,
+  "timeout_ms": 1000,
+  "max_output_bytes": 1024,
+  "effective_cwd": "C:/repo",
+  "env_fixed_vars": [],
+  "env_dropped_names": []
+}

@@ -1,0 +1,9 @@
+{
+  "harness_fingerprint": "harness-sha",
+  "evaluator_fingerprint": "evaluator-sha",
+  "environment_fingerprint": "environment-sha",
+  "actual_route": "provider",
+  "requested_route": "provider",
+  "acceptance_relation": "greater_or_equal",
+  "oracle_owner": "crates/eliot-app"
+}

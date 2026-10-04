@@ -1,0 +1,12 @@
+{
+  "text_or_structured_payload": {
+    "text": "the observer saw a red test"
+  },
+  "hint": "auto",
+  "task_id": null,
+  "affected_resources": [],
+  "source_handles": [],
+  "expected_reuse_note": null,
+  "write_id": null,
+  "schema_version": "eliot.observe-v0"
+}

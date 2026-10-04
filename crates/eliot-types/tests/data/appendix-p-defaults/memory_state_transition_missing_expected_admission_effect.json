@@ -1,0 +1,20 @@
+{
+  "transition_id": "transition-1",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "target_ref": "memory-1",
+  "from_state": "active",
+  "to_state": "suppressed",
+  "operator": "suppress",
+  "reason": "stale",
+  "policy_ref": "policy-1",
+  "evidence_refs": [
+    "evidence-1"
+  ],
+  "precondition_refs": [],
+  "reactivation_condition": null,
+  "reversible": true,
+  "approval_ref": null,
+  "performed_by": "principal-1",
+  "created_at": "2026-09-07T12:00:00Z",
+  "write_receipt": null
+}

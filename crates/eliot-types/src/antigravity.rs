@@ -167,7 +167,7 @@ pub enum AntigravityProviderState {
     BlockedByPolicy,
     Incompatible,
 }
-
+/// W4: `enabled_for_read_only_smoke`/`enabled_for_worktree_candidate_smoke` trial-accept a closed control variant; no named boundary; not corrected by #708; inventory: `NOT_SAFE`/`needs-repair`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AntigravityEnablementState {
@@ -185,7 +185,7 @@ pub enum AntigravityEnablementState {
     BlockedByPolicy,
     FailedLiveSmoke,
 }
-
+/// W4: `read_only_smoke_only`/`worktree_candidate_smoke_only` trial-accept a closed control variant; no named boundary; not corrected by #708; inventory: `NOT_SAFE`/`needs-repair`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AntigravityEnablementScope {
@@ -245,7 +245,7 @@ pub struct AntigravityAuthCheck {
     #[serde(with = "time::serde::rfc3339")]
     pub checked_at: OffsetDateTime,
 }
-
+/// W4: `read_only_audit`/`worktree_candidate_no_apply` trial-accept a closed control variant; no named boundary; not corrected by #708; inventory: `NOT_SAFE`/`needs-repair`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AntigravityLiveSmokeMode {
@@ -565,7 +565,7 @@ pub enum AntigravityOutputMode {
     Text,
     Json,
 }
-
+/// W4: `controller_repo_read_only`/`worktree_for_candidate_implementation` trial-accept a closed control variant; no named boundary; not corrected by #708; inventory: `NOT_SAFE`/`needs-repair`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AntigravityWorkdirPolicy {

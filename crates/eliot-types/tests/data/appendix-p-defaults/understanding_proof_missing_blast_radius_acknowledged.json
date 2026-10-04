@@ -1,0 +1,30 @@
+{
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "goal": "remove the silent default",
+  "code_task": true,
+  "current_truth_refs": [],
+  "evidence_refs": [],
+  "codecortex_report_refs": [],
+  "files_to_change": [
+    "crates/eliot-types/src/lifecycle.rs"
+  ],
+  "files_to_inspect": [
+    "crates/eliot-types/src/memory.rs"
+  ],
+  "causal_bridge": "the default manufactures the claim",
+  "causal_bridge_from_goal_to_code": "goal -> decoder -> wire",
+  "invariants": [],
+  "negative_memory_checked": true,
+  "unknowns": [],
+  "planned_action": "require explicit presence",
+  "expected_verifiers": [
+    "cargo test"
+  ],
+  "skill_refs": [],
+  "skill_application_rationales": [],
+  "skill_anti_scope_acknowledgements": [],
+  "skill_required_inputs": [],
+  "skill_verifier_plan_refs": [],
+  "risk_level": "low"
+}

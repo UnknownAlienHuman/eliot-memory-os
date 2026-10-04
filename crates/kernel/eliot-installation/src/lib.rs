@@ -214,8 +214,9 @@ pub use canary_removal::{
     CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalAction, CanaryRemovalBuildBinding,
     CanaryRemovalEffect, CanaryRemovalEffectBound, CanaryRemovalEffectDisposition,
     CanaryRemovalEffectProgress, CanaryRemovalEffectState, CanaryRemovalNextAction,
-    CanaryRemovalOperation, CanaryRemovalPlan, CanaryRemovalPostcondition, CanaryRemovalQuiesce,
-    CanaryRemovalResource, CanaryRemovalResourceOrigin, CanaryRemovalStage, CanaryRemovalStatus,
+    CanaryRemovalOperation, CanaryRemovalPlan, CanaryRemovalPlanEnvelope,
+    CanaryRemovalPostcondition, CanaryRemovalQuiesce, CanaryRemovalResource,
+    CanaryRemovalResourceOrigin, CanaryRemovalStage, CanaryRemovalStatus,
     canary_removal_operation_id,
 };
 pub use credential_provision::{
@@ -6576,7 +6577,10 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 let marker = match receipt_result {
                     Ok(marker) => marker,
                     Err(error) => {
-                        let pending = port_pending(root_execution_error::<()>(error));
+                        let pending = match port_pending(root_execution_error::<()>(error)) {
+                            Ok(pending) => pending,
+                            Err(rejection) => return PortOutcome::Error(rejection),
+                        };
                         return PortOutcome::Partial {
                             value: InstallationEffectExecution {
                                 evidence: Vec::new(),
@@ -8308,7 +8312,14 @@ fn map_root_create_attempt(
             disposition: InstallerRootCreateDisposition::Created,
             error,
         }) => {
-            let pending = port_pending(root_execution_error::<()>(error));
+            let pending = match port_pending(root_execution_error::<()>(error)) {
+                Ok(pending) => pending,
+                Err(rejection) => {
+                    return Err(Box::new(PortOutcome::<InstallationEffectExecution>::Error(
+                        rejection,
+                    )));
+                }
+            };
             Err(Box::new(PortOutcome::Partial {
                 value: InstallationEffectExecution {
                     evidence: Vec::new(),
@@ -8822,7 +8833,11 @@ where
                     match self.port.fresh_service_registration_nonce(&provisional) {
                         PortOutcome::Known(nonce) => nonce,
                         other => {
-                            return self.persist_unknown(transaction, index, port_pending(other));
+                            return self.persist_unknown(
+                                transaction,
+                                index,
+                                port_pending(other).map_err(|error| platform_error(&error))?,
+                            );
                         }
                     }
                 }
@@ -8932,7 +8947,13 @@ where
         {
             let disposition = match self.port.provision_ownership_secret(&request) {
                 PortOutcome::Known(disposition) => disposition,
-                other => return self.persist_unknown(transaction, index, port_pending(other)),
+                other => {
+                    return self.persist_unknown(
+                        transaction,
+                        index,
+                        port_pending(other).map_err(|error| platform_error(&error))?,
+                    );
+                }
             };
             if disposition != InstallationSecretProvisionDisposition::Created {
                 return self.persist_unknown(
@@ -8962,7 +8983,13 @@ where
         let observation = match state {
             InstallationEffectProgressState::Pending => match self.port.inspect(&request) {
                 PortOutcome::Known(observation) => observation,
-                other => return self.persist_unknown(transaction, index, port_pending(other)),
+                other => {
+                    return self.persist_unknown(
+                        transaction,
+                        index,
+                        port_pending(other).map_err(|error| platform_error(&error))?,
+                    );
+                }
             },
             InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
                 if request.intent_digest()? != intent_digest {
@@ -8975,7 +9002,13 @@ where
                 }
                 match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
-                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                    other => {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            port_pending(other).map_err(|error| platform_error(&error))?,
+                        );
+                    }
                 }
             }
             _ => unreachable!(),
@@ -9307,7 +9340,7 @@ where
                                 return self.persist_unknown(
                                     transaction,
                                     index,
-                                    port_pending(other),
+                                    port_pending(other).map_err(|error| platform_error(&error))?,
                                 );
                             }
                         };
@@ -9317,7 +9350,7 @@ where
                                 return self.persist_unknown(
                                     transaction,
                                     index,
-                                    port_pending(other),
+                                    port_pending(other).map_err(|error| platform_error(&error))?,
                                 );
                             }
                         };
@@ -9358,6 +9391,7 @@ where
                                 self.port.discard_prepared_user_mode_authority(&value);
                                 return Err(InstallationError::IncompleteObservation(
                                     port_pending(PortOutcome::Partial { value, missing })
+                                        .map_err(|error| platform_error(&error))?
                                         .as_str()
                                         .to_owned(),
                                 ));
@@ -9429,7 +9463,11 @@ where
                     let disposition = match self.port.provision_ownership_secret(&request) {
                         PortOutcome::Known(disposition) => disposition,
                         other => {
-                            return self.persist_unknown(transaction, index, port_pending(other));
+                            return self.persist_unknown(
+                                transaction,
+                                index,
+                                port_pending(other).map_err(|error| platform_error(&error))?,
+                            );
                         }
                     };
                     if disposition != InstallationSecretProvisionDisposition::Created {
@@ -9597,7 +9635,13 @@ where
                         // it never republishes the Host overlay blindly.
                         return Ok(InstallationStepOutcome::Rejected);
                     }
-                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                    other => {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            port_pending(other).map_err(|error| platform_error(&error))?,
+                        );
+                    }
                 };
                 let is_start_apply = matches!(
                     transaction.installer_effects[index],
@@ -9913,7 +9957,13 @@ where
                 }
                 let reconciled = match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
-                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                    other => {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            port_pending(other).map_err(|error| platform_error(&error))?,
+                        );
+                    }
                 };
                 reconciled.validate_for_effect(&transaction.installer_effects[index])?;
                 match reconciled {
@@ -10313,7 +10363,12 @@ where
                     observed.validate()?;
                     observed
                 }
-                other => return self.persist_quarantined(transaction, port_pending(other)),
+                other => {
+                    return self.persist_quarantined(
+                        transaction,
+                        port_pending(other).map_err(|error| platform_error(&error))?,
+                    );
+                }
             };
             match observed {
                 InstallationEffectObservation::Absent { evidence, .. } => {
@@ -10400,13 +10455,17 @@ where
                         }) => {}
                         PortOutcome::Unknown(reason) if credential_effect => {
                             return Ok(InstallationStepOutcome::RollbackRequired {
-                                pending_refs: vec![port_pending(PortOutcome::<()>::Unknown(
-                                    reason,
-                                ))],
+                                pending_refs: vec![
+                                    port_pending(PortOutcome::<()>::Unknown(reason))
+                                        .map_err(|error| platform_error(&error))?,
+                                ],
                             });
                         }
                         other => {
-                            return self.persist_quarantined(transaction, port_pending(other));
+                            return self.persist_quarantined(
+                                transaction,
+                                port_pending(other).map_err(|error| platform_error(&error))?,
+                            );
                         }
                     }
                     if matches!(
@@ -10441,7 +10500,12 @@ where
                             reconciled.validate()?;
                             reconciled
                         }
-                        other => return self.persist_quarantined(transaction, port_pending(other)),
+                        other => {
+                            return self.persist_quarantined(
+                                transaction,
+                                port_pending(other).map_err(|error| platform_error(&error))?,
+                            );
+                        }
                     };
                     match reconciled {
                         InstallationEffectObservation::Absent { evidence, .. } => {
@@ -10507,7 +10571,9 @@ where
                 PortOutcome::Known(absent) => absent,
                 other => {
                     return Ok(InstallationStepOutcome::RollbackRequired {
-                        pending_refs: vec![port_pending(other)],
+                        pending_refs: vec![
+                            port_pending(other).map_err(|error| platform_error(&error))?,
+                        ],
                     });
                 }
             };
@@ -10516,7 +10582,9 @@ where
                     PortOutcome::Known(()) => {}
                     other => {
                         return Ok(InstallationStepOutcome::RollbackRequired {
-                            pending_refs: vec![port_pending(other)],
+                            pending_refs: vec![
+                                port_pending(other).map_err(|error| platform_error(&error))?,
+                            ],
                         });
                     }
                 }
@@ -10524,7 +10592,9 @@ where
                     PortOutcome::Known(true) => {}
                     other => {
                         return Ok(InstallationStepOutcome::RollbackRequired {
-                            pending_refs: vec![port_pending(other)],
+                            pending_refs: vec![
+                                port_pending(other).map_err(|error| platform_error(&error))?,
+                            ],
                         });
                     }
                 }
@@ -10994,7 +11064,9 @@ where
                         transaction.effect_progress[watchdog_index]
                             .effect_id
                             .as_str(),
-                        port_pending(other).as_str(),
+                        port_pending(other)
+                            .map_err(|error| platform_error(&error))?
+                            .as_str(),
                     )));
                 }
             };
@@ -11114,7 +11186,9 @@ where
                     return Err(InstallationError::IncompleteObservation(format!(
                         "service start reconciliation stays unknown for effect {}: {}",
                         transaction.effect_progress[*index].effect_id.as_str(),
-                        port_pending(other).as_str(),
+                        port_pending(other)
+                            .map_err(|error| platform_error(&error))?
+                            .as_str(),
                     )));
                 }
             };
@@ -12158,7 +12232,19 @@ fn service_registration_unknown_provider_error(
     }
 }
 
-fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
+/// Projects one non-`Known` port outcome into its bounded pending reference.
+///
+/// A recognised typed reference is returned unchanged, and every other outcome
+/// is composed from the exact outcome it carries, so the published reference
+/// names the same cause the port reported. Composition is refused only where the
+/// platform contract cannot admit the text at all, which a caller-supplied
+/// [`PortError`] field can cause by carrying a blank value or a control
+/// character. That refusal is a typed [`PortError`] the caller converts into its
+/// own typed error instead of a substituted value: the composed handle feeds the
+/// durable `Unknown` and quarantined dispositions, so this boundary must never
+/// abort the process that was about to record that evidence, and it must never
+/// mint a different identity for a cause it could not represent exactly.
+fn port_pending<T>(outcome: PortOutcome<T>) -> Result<PlatformHandle, PortError> {
     let value = match outcome {
         PortOutcome::Known(_) => "unknown:unexpected-known".to_owned(),
         PortOutcome::Unknown(reason) => format!("unknown:{reason:?}"),
@@ -12175,13 +12261,13 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
                 || is_typed_credential_unknown_reference(reference.as_str())
                 || is_typed_phase_b_unknown_reference(reference.as_str())
             {
-                return reference;
+                return Ok(reference);
             }
             REDACTED_PROVIDER_REFERENCE_PENDING.to_owned()
         }
         PortOutcome::Error(error) => format!("error:{error}"),
     };
-    PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    PlatformHandle::new(value)
 }
 
 fn is_typed_package_staging_reference(value: &str) -> bool {
