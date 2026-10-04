@@ -1,53 +1,62 @@
-;; ELIOT typed NEGATIVE fixture for case 13 of #758: "infinite loop fuel
-;; exhaustion, including descriptor/initialization" -- the INITIALIZATION half.
+;; ELIOT typed NEGATIVE fixture for item 9 and P6.2 of #758: "artifact/raw-
+;; input/item/string/list bounds before unbounded allocation" -- the
+;; host-lifting STRING half, sibling of `host-lifting-list.wat`.
 ;;
-;; `looping-describe.wat` covers the descriptor half. This fixture covers the
-;; other half the issue names: the component's own initialization is untrusted
-;; execution too (issue #758 P6.2: "The descriptor call and component
-;; initialization are untrusted execution and must receive the same applicable
-;; limits, not only the later domain call").
+;; A guest that can make the HOST allocate and measure is a host-lifting
+;; exhaustion risk, so every string leaf is bounded as it is read, before it is
+;; folded into the call's output budget. `check_cycle_result`
+;; (typed_execution.rs:3605-3632) charges `state.state-digest` with
+;; `TypedBound::text` (:828-836), which refuses a lifted string longer than
+;; `MAX_TYPED_STRING_BYTES` (4096, :46) with
+;; `TypedExecutionError::LimitDenied("typed-string")`, staged at
+;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
 ;;
-;; The core module declares a `(start ...)` function whose loop has no exit.
-;; `describe_dreamer_cycle` (typed_execution.rs:1792-1825) runs
-;; `DreamerCycle::instantiate` inside `run_guarded`, so the admitted fuel
-;; budget (`typed_fuel_budget`, :1390-1395), the store resource ceilings
-;; (`new_store`, :1397-1426) and the epoch deadline (`EpochDriver::spawn`,
-;; :1508-1539) all apply to it exactly as they apply to the later `describe`
-;; call. The engine therefore genuinely terminates this instantiation: with
-;; `EpochAndFuel` it is `wasmtime::Trap::OutOfFuel`
-;; (wasmtime-environ-47.0.4 `trap_encoding.rs`:145, "all fuel consumed by
-;; WebAssembly"), and with `EpochInterruption` it is `Trap::Interrupt`
-;; (same file :141, "interrupt").
+;; This component is an honest `dreamer-cycle` fixture except for the hostile
+;; lifted length: `describe` reports the true frozen descriptor, the domain
+;; result echoes the admitted `operation-id` and `fence-epoch` and claims the
+;; lowest proof ceiling, every list leaf is left empty, and only
+;; `state.state-digest` carries 4097 bytes -- exactly one byte past the host's
+;; per-string ceiling. Every earlier check therefore passes (in
+;; `check_cycle_result` the only prior charge is the two-byte echoed
+;; `operation-id`) and the string ceiling is provably the denial.
 ;;
-;; WHAT THE HOST REPORTS: the typed fuel/epoch cause this case requires.
-;; `describe_dreamer_cycle` routes the instantiate failure through
-;; `map_instantiate_error` (:1305-1338, applied at :1801-1806), which
-;; classifies in this order:
-;; `store.data().limit_hit` first (:1309-1311), then
-;; `is_instance_limit_error` (:1315-1317, which needs "instance" plus
-;; "limit"/"maximum" -- wasmtime_provider.rs:767-770), then the shared
-;; `trap_termination` classifier
-;; (:1326-1328), and only then the substring fallbacks for "import"
-;; (:1330-1331), "export"/"missing"/"type" (:1332-1335). Component initialization is
-;; untrusted execution too and runs inside the same guarded envelope as the
-;; descriptor call, so an instantiation the engine terminates with a real trap
-;; carries the owner-typed cause read from the real engine trap code, never
-;; from message text: `trap_termination` (:1276-1285) maps
-;; `Trap::OutOfFuel` to `EngineTermination::FuelExhausted` (:1279) and
-;; `Trap::Interrupt` to `EngineTermination::EpochDeadline` (:1280).
+;; Memory map (all within the single 1-page core memory, `1 1`):
+;;   0x0000-0x03ff  reserved, never written
+;;   0x0400-0x0477  descriptor strings (data segments at 0x400/0x40d/0x420/
+;;                  0x433/0x438)
+;;   0x0800-0x0878  the lowered `step` result tuple (retptr base 0x800; the
+;;                  `state` record at 0x820, so `state-digest` at 0x82c/0x830
+;;                  and `fence-epoch` at 0x844/0x848)
+;;   0x0c00-0x0c2b  the `describe` retptr record (eleven core words)
+;;   0x1000         `operation-id` echo scratch
+;;   0x1200         `state.fence-epoch` echo scratch
+;;   0x2000-0x3001  the hostile 4097-byte `state.state-digest` region
+;;                  (8192 .. 8192 + 4097 = 12289). No byte is stored here:
+;;                  exactly as the sibling `host-lifting-list.wat` builds its
+;;                  300-element leaf, the region is the ZEROED high part of
+;;                  this one-page memory, and every NUL byte is valid UTF-8 in
+;;                  a lifted `string`, so the host really does lift 4097 bytes.
+;;   0x3040-0x3051  this fixture's own label, immediately above the hostile
+;;                  region so a memory dump identifies it
+;;   0xb000         the `realloc` bump region the host calls while lowering the
+;;                  request; starts at 45056, far above every other region
 ;;
-;; So this fixture denies with `Engine("FuelExhausted")` under the default
-;; `EpochAndFuel` policy and `Engine("EpochDeadline")` under
-;; `CancellationPolicy::EpochInterruption`, both staged `TypedStage::Instantiate`
-;; by the `staged` wrapper at :1800-1806. The untyped
-;; `Engine("instantiate:component-error")` (:1336) is now only the fallback
-;; for an engine error that is not a trap at all. This is the same classifier
-;; `map_call_error` (:1287-1303) applies to the later `describe`/domain leg, so
-;; both untrusted-execution legs carry the same typed cause.
-;;
-;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo scratch
-;; blocks, 0x1400 the bump region the host `realloc` hands out while lowering the request.
+;; Canonical-ABI offsets derived for wasmtime 47.0.4 /
+;; wasmtime-environ-47.0.4 (CARGO_HOME registry), the same derivation the
+;; sibling fixtures record:
+;;   result<cycle-outcome, cycle-error> retptr base 0x800 (2048)
+;;     discriminant at +0 (CanonicalAbiInfo::variant_static,
+;;     wasmtime-environ-47.0.4/src/component/types.rs:841; payload at
+;;     payload_offset32 = align_to(1, align32) = 8, types.rs:950) -> 2056
+;;   cycle-outcome "stepped" payload at 2056 + 8 = 2064 (types.rs:950)
+;;   cycle-step-result.state at record offset 16 (operation-id string 8 bytes
+;;     at 0; from-phase/to-phase/disposition one-byte enums at 8/9/10, so
+;;     align_to(11, 8) = 16; CanonicalAbiInfo::next_field32, types.rs:756)
+;;     -> 2080
+;;   dreamer-state.state-digest at record offset 12 (u32 `schema-version` 0,
+;;     enum `phase` 4, u32 `revision` 8, then CanonicalAbiInfo::next_field32
+;;     types.rs:756) -> 2080 + 12 = 2092 (ptr), 2096 (len, POINTER_PAIR 8
+;;     bytes, types.rs:707)
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -153,22 +162,7 @@
   (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
-    ;; Component initialization that never returns. A core-module start function
-    ;; is ordinary untrusted guest execution that runs inside
-    ;; `DreamerCycle::instantiate`, i.e. inside the one guarded envelope of
-    ;; `run_guarded` (typed_execution.rs:1561-1593) and therefore under the same
-    ;; fuel budget, store resource ceilings and epoch deadline as `describe`
-    ;; (`typed_fuel_budget`, :1390-1395; `new_store`, :1397-1426;
-    ;; `EpochDriver::spawn`, :1508-1539). It touches no memory and calls nothing, so only
-    ;; fuel exhaustion or the epoch deadline can stop it. `describe` and `step`
-    ;; below are the untouched honest `dreamer-cycle` bodies: they are never
-    ;; reached, which is the point.
-    (func $init (local $spin i64)
-      (loop $forever
-        (local.set $spin (i64.add (local.get $spin) (i64.const 1)))
-        (br $forever)))
-    (start $init)
-    (global $bump (mut i32) (i32.const 5120))
+    (global $bump (mut i32) (i32.const 45056))
     (func $copy (param $dst i32) (param $src i32) (param $len i32)
       (local $i i32)
       (block $done
@@ -187,14 +181,6 @@
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
     ;; the frozen ABI revision, lowered in WIT field order into guest memory.
     ;;
-    ;; This body is the honest `dreamer-cycle` one and is dead code: `(start
-    ;; $init)` above never returns, so instantiation never completes and this
-    ;; export is never called. The store and the single returned pointer are
-    ;; still written here, because the obligation this file proves is that
-    ;; component INITIALIZATION is terminated by the fuel/epoch policy, and
-    ;; `$init` -- not this body -- is what runs. Nothing below weakens or
-    ;; shortens the start loop.
-    ;;
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
@@ -203,10 +189,9 @@
     ;; and push exactly one pointer for `Abi::Lift`, and
     ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
-    ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
-    ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
-    ;; `realloc` bump region. `$init` writes nothing at all, so it collides
-    ;; with nothing. 0x0c00 is clear of all of the above.
+    ;; 0x0c00 is clear of the descriptor strings, of the 0x800 result tuple, of
+    ;; the 0x1000/0x1200 echo scratch and of the 0x2000 hostile string region,
+    ;; and inside the single exported page.
     (func (export "describe") (result i32)
       (i32.store (i32.const 3072) (i32.const 1024))
       (i32.store (i32.const 3076) (i32.const 13))
@@ -246,6 +231,24 @@
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
       (i32.store (i32.const 2116) (i32.const 4608))
       (i32.store (i32.const 2120) (local.get $n))
+      ;; Hostile lifted length, and nothing else: `state.state-digest` is the
+      ;; FIRST charged string leaf that this world's echo checks do not pin to
+      ;; an admitted value, so it is the first charge that can fail for this
+      ;; fixture. Its 4097 bytes are the zeroed high part of this single-page
+      ;; core memory (8192 .. 8192 + 4097 = 12289, inside the 1-page memory,
+      ;; clear of the descriptor strings, the result tuple, the `describe`
+      ;; retptr and both echo scratch blocks, and well below the 45056 `realloc`
+      ;; bump region, so nothing this call lowers can overlap it). Every NUL
+      ;; byte is valid UTF-8 in a lifted `string`, so the host really lifts all
+      ;; 4097 bytes and the denial is its own per-string ceiling -- not a fuel,
+      ;; memory or list-item exhaustion: the string is exactly one byte above
+      ;; `MAX_TYPED_STRING_BYTES` (4096) and every list leaf of this result is
+      ;; left empty.
+      ;; canonical-ABI: `state.state-digest` is dreamer-state record offset 12
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 12 = 2092 (ptr) and 2096 (len).
+      (i32.store (i32.const 2092) (i32.const 8192))
+      (i32.store (i32.const 2096) (i32.const 4097))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")
@@ -253,6 +256,10 @@
     (data (i32.const 1056) "eliot-dreamer-cycle")
     (data (i32.const 1075) "0.1.0")
     (data (i32.const 1080) "6e878cbb40e2060fd2d570345a1b0105920a0398b3c70e2c4e1f9b7eb291a0e6")
+    ;; This fixture's own label, immediately above the hostile 0x2000 region
+    ;; (it ends at 12289 = 0x3001) and far below the 0xb000 `realloc` bump, so
+    ;; a memory dump of the page identifies which fixture refused.
+    (data (i32.const 12352) "758/9-typed-string")
   )
   (core instance $guest (instantiate $guest))
   (alias core export $guest "memory" (core memory $memory))

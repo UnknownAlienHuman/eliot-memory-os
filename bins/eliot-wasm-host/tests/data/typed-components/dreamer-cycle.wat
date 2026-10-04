@@ -109,7 +109,7 @@
     (case "internal" $cycle_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome $cycle_error))))
+  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 5120))
@@ -129,20 +129,32 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, flattened in WIT field order.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 13)
-      (i32.const 1037)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1056)
-      (i32.const 19)
-      (i32.const 1075)
-      (i32.const 5)
-      (i32.const 1080)
-      (i32.const 64)
-    )
+    ;; the frozen ABI revision, in WIT field order. A lifted export flattens
+    ;; its result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the
+    ;; core function returns ONE pointer into exported linear memory
+    ;; (wasmparser-0.256.0 src/validator/component_types.rs:35, :129 and
+    ;; :1279-1292, enforced at src/validator/component.rs:1343 and :1365).
+    ;; Retptr base 0x600: past the last descriptor byte at 0x478 and below
+    ;; the 0x800 result tuple, so it collides with nothing in this memory.
+    (func (export "describe") (result i32)
+      ;; world-name
+      (i32.store (i32.const 1536) (i32.const 1024))
+      (i32.store (i32.const 1540) (i32.const 13))
+      ;; package-id
+      (i32.store (i32.const 1544) (i32.const 1037))
+      (i32.store (i32.const 1548) (i32.const 19))
+      ;; abi-revision
+      (i32.store (i32.const 1552) (i32.const 1))
+      ;; native-contract
+      (i32.store (i32.const 1556) (i32.const 1056))
+      (i32.store (i32.const 1560) (i32.const 19))
+      ;; native-revision
+      (i32.store (i32.const 1564) (i32.const 1075))
+      (i32.store (i32.const 1568) (i32.const 5))
+      ;; abi-digest
+      (i32.store (i32.const 1572) (i32.const 1080))
+      (i32.store (i32.const 1576) (i32.const 64))
+      (i32.const 1536))
     ;; `step`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
     ;; identity field is copied back out of the request, so the host echo
@@ -159,12 +171,29 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo "state.fence-epoch" back out of the lowered request.
+      ;; Canonical-ABI derivation, pinned to wasmtime 47.0.4 /
+      ;; wasmtime-environ-47.0.4 (CARGO_HOME registry):
+      ;;   result<cycle-outcome, cycle-error> retptr base 0x800 (2048);
+      ;;     discriminant at +0 (CanonicalAbiInfo::variant_static,
+      ;;     wasmtime-environ-47.0.4/src/component/types.rs:841; payload at
+      ;;     payload_offset32 = align_to(1, align32) = 8, types.rs:950) -> 2056
+      ;;   cycle-outcome "stepped" payload at 2056 + 8 = 2064 (types.rs:950)
+      ;;   cycle-step-result.state at record offset 16 (operation-id string
+      ;;     8 bytes at 0; from-phase/to-phase/disposition one-byte enums at
+      ;;     8/9/10, so align_to(11, 8) = 16; CanonicalAbiInfo::next_field32,
+      ;;     types.rs:756) -> 2080
+      ;;   dreamer-state.fence-epoch at record offset 36 (u32 0, enum 4,
+      ;;     u32 8, state-digest 12, pending 20, observed 28 -> align_to(36,4)=36)
+      ;;     -> 2080 + 36 = 2116 (ptr), 2120 (len, POINTER_PAIR 8 bytes,
+      ;;     types.rs:707)
+      ;; Writing 2124/2128 would place the pair in the pad before
+      ;; fence-generation and inside fence-generation itself.
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2124) (i32.const 4608))
-      (i32.store (i32.const 2128) (local.get $n))
+      (i32.store (i32.const 2116) (i32.const 4608))
+      (i32.store (i32.const 2120) (local.get $n))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")
