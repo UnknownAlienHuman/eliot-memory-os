@@ -30,5 +30,179 @@
     "requested_route": "runtime artifact/effect observation",
     "acceptance_relation": "required criterion matches a measurement result",
     "oracle_owner": "eliot_engine::eval::EvalMeasurementService"
-  }
+  },
+
+  "skill_lifecycle_record_accept": {
+    "record_id": "slr-00000000-0000-7000-8000-000000000001",
+    "skill_ref": "01920000-0000-7000-8000-0000000000a1",
+    "state": "active",
+    "uses": 12,
+    "successes": 9,
+    "failures": 3,
+    "context_cost": 4096,
+    "last_verified": "2026-10-04T09:00:00Z",
+    "where_applies": [
+      {
+        "rule_id": "rule-apply-1",
+        "description": "single-file refactors",
+        "positive_examples": ["rename one symbol"],
+        "negative_examples": ["cross-crate API change"],
+        "required_evidence_refs": ["evr-1"]
+      }
+    ],
+    "where_not_apply": [],
+    "promotion_evidence": ["evr-1", "evr-2"],
+    "source_case_refs": ["case-1"],
+    "source_pattern_refs": ["pattern-1"],
+    "mechanism_refs": ["mech-1"],
+    "local_check_refs": ["check-1"],
+    "transfer_evidence_refs": ["transfer-1"],
+    "holdout_evidence_refs": ["holdout-1"],
+    "negative_transfer_refs": [],
+    "promotion_outcome": null,
+    "rollback_ref": null,
+    "demotion_reason": null,
+    "archive_or_restore_receipt": null,
+    "created_at": "2026-10-01T09:00:00Z"
+  },
+
+  "skill_lifecycle_record_legacy_defaults": {
+    "record_id": "slr-00000000-0000-7000-8000-000000000002",
+    "skill_ref": "01920000-0000-7000-8000-0000000000a2",
+    "state": "candidate",
+    "uses": 0,
+    "successes": 0,
+    "failures": 0,
+    "context_cost": null,
+    "last_verified": null,
+    "where_applies": [],
+    "where_not_apply": [],
+    "promotion_evidence": [],
+    "demotion_reason": null,
+    "archive_or_restore_receipt": null,
+    "created_at": "2026-10-01T09:00:00Z"
+  },
+
+  "metric_sample_accept": {
+    "sample_id": "ms-1",
+    "metric_id": "metric-latency",
+    "value": 12.5,
+    "labels": [{ "name": "route", "value": "eval", "redacted": false }],
+    "trace_id": null,
+    "source_ref": "src-1",
+    "observed_at": "2026-10-04T09:30:00Z"
+  },
+
+  "metric_series_zero_samples_accept": {
+    "series_id": "series-1",
+    "metric_id": "metric-latency",
+    "labels_hash": "sha256:0f1e",
+    "samples": [],
+    "rollups": []
+  },
+
+  "eval_case_result_accept": {
+    "result_id": "ecr-1",
+    "eval_case_id": "01920000-0000-7000-8000-0000000000c1",
+    "family": "understand",
+    "status": "passed",
+    "measurements": [
+      {
+        "measurement_id": "m-1",
+        "passed": true,
+        "observed": "one symbol renamed",
+        "evidence_refs": ["evr-1"]
+      }
+    ],
+    "produced_refs": ["ref-1"],
+    "errors": [],
+    "duration_ms": 41,
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+    }
+  },
+
+  "eval_case_result_legacy_defaults": {
+    "result_id": "ecr-2",
+    "eval_case_id": "01920000-0000-7000-8000-0000000000c2",
+    "family": "understand",
+    "status": "passed",
+    "measurements": [],
+    "produced_refs": [],
+    "errors": [],
+    "duration_ms": 7,
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService"
+    }
+  },
+
+  "eval_baseline_accept": {
+    "baseline_id": "baseline-1",
+    "suite_id": "suite-1",
+    "eval_run_id": "01920000-0000-7000-8000-0000000000b1",
+    "git_commit": "198d7b269",
+    "manifest_ref": "manifest-1",
+    "family_scores": [
+      { "family": "understand", "passed": 3, "failed": 0, "blocked": 0, "total": 3, "score_percent": 100 }
+    ],
+    "overall_status": "pass",
+    "approved_at": "2026-10-03T12:00:00Z",
+    "approved_by": "owner-1",
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+    }
+  },
+
+  "raw_skill_record_duplicate_identity_key": "{\"record_id\":\"slr-dup\",\"record_id\":\"slr-dup-2\",\"skill_ref\":\"01920000-0000-7000-8000-0000000000a1\",\"state\":\"active\",\"uses\":1,\"successes\":1,\"failures\":0,\"context_cost\":null,\"last_verified\":null,\"where_applies\":[],\"where_not_apply\":[],\"promotion_evidence\":[],\"demotion_reason\":null,\"archive_or_restore_receipt\":null,\"created_at\":\"2026-10-01T09:00:00Z\"}",
+
+  "raw_skill_record_duplicate_nested_key": "{\"record_id\":\"slr-dup-nested\",\"skill_ref\":\"01920000-0000-7000-8000-0000000000a1\",\"state\":\"active\",\"uses\":1,\"successes\":1,\"failures\":0,\"context_cost\":null,\"last_verified\":null,\"where_applies\":[{\"rule_id\":\"r1\",\"rule_id\":\"r2\",\"description\":\"d\",\"positive_examples\":[],\"negative_examples\":[],\"required_evidence_refs\":[]}],\"where_not_apply\":[],\"promotion_evidence\":[],\"demotion_reason\":null,\"archive_or_restore_receipt\":null,\"created_at\":\"2026-10-01T09:00:00Z\"}",
+
+  "raw_metric_sample_duplicate_metric_key": "{\"sample_id\":\"ms-dup\",\"metric_id\":\"metric-a\",\"metric_id\":\"metric-b\",\"value\":1.0,\"labels\":[],\"trace_id\":null,\"source_ref\":null,\"observed_at\":\"2026-10-04T09:30:00Z\"}",
+
+  "raw_eval_case_result_duplicate_nested_fingerprint_key": "{\"result_id\":\"ecr-dup\",\"eval_case_id\":\"01920000-0000-7000-8000-0000000000c1\",\"family\":\"understand\",\"status\":\"passed\",\"measurements\":[],\"produced_refs\":[],\"errors\":[],\"duration_ms\":1,\"integrity_fingerprints\":{\"oracle_owner\":\"a\",\"oracle_owner\":\"b\",\"harness_fingerprint\":\"h\",\"evaluator_fingerprint\":\"e\",\"environment_fingerprint\":\"env\",\"actual_route\":\"ar\",\"requested_route\":\"rr\",\"acceptance_relation\":\"rel\"}}",
+
+  "raw_malformed_bounded": [
+    "",
+    "{",
+    "null",
+    "[]",
+    "\"a string\"",
+    "123",
+    "{\"record_id\":}",
+    "{\"record_id\":\"a\",\"record_id\":\"a\"}",
+    "{\"skill_ref\":\"not-a-uuid\"}",
+    "{\"state\":\"ACTIVE\"}",
+    "{\"family\":\"Understand\"}",
+    "{\"observed_at\":\"not-rfc3339\"}",
+    "{\"labels\":[{\"name\":\"a\"}]}",
+    "{\"samples\":[{\"value\":\"NaN-ish\"}]}",
+    "{\"integrity_fingerprints\":[]}",
+    "{\"integrity_fingerprints\":null,\"extra\":1}",
+    "{\"overall_status\":\"passed\"}",
+    "{\"score_percent\":101}",
+    "{\"value\":1e400}",
+    "{\"uses\":-1}"
+  ]
 }
