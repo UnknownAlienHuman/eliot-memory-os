@@ -89,9 +89,10 @@
 //! a guard on release), while the fresh-write gate before the canonical apply
 //! consults the apply stage alone ([`RestoreEffectExposure::apply_stage`]) because
 //! the carrier stage is never answered from the apply's evidence: it is decided
-//! by its own exact readback, either in
+//! by its own exact readback, and there are exactly three such sites —
 //! [`SurrealStoreAdapter::resolve_carrier_stage`] immediately before the
-//! publication it governs, or on that publication's own refusal arm when the
+//! publication it governs, the same bounded readback on the publication's own
+//! success/duplicate arm after the provider answered, and its refusal arm when the
 //! write was handed to the transport and did not answer. Relaxing any one of them
 //! therefore cannot silently relax another. A dropped future releases only its own
 //! incarnation while an effect that may already have been submitted stays an
@@ -1186,8 +1187,12 @@ impl RestoreAttemptState {
 /// one scalar over the operation, so a slot retained for an unproven carrier stage
 /// does not assert anything about the apply stage and vice versa — and a retry
 /// always reaches the provider's durable reconciliation readback first. The two
-/// stage-wise questions stay distinct here too: retention is decided per stage by
-/// [`RestoreStageExposure::any_unproven`], and so is the cancellation answer — it
+/// stage-wise questions stay distinct here too: retention is decided per stage,
+/// keeping a slot while [`RestoreStageExposure::any_unproven`] answers true, and
+/// also while its canonical apply stage has not reached
+/// [`RestoreEffectState::DurableResultVerified`] beside a submitted carrier
+/// stage; the cancellation answer is
+/// per stage too, as it
 /// answers the typed unknown outcome while *either* stage still owes a
 /// reconciliation, because a carrier publication is an external effect in its own
 /// right and a verified apply says nothing about it.
@@ -1378,11 +1383,18 @@ fn attempt_slot_key_from_components(
 /// provider, and one stage's verified result can never clear the other stage's
 /// uncertainty. There is no single "highest exposure" this guard hands back: the
 /// accessors [`RestoreEffectExposure::carrier_stage`] and
-/// [`RestoreEffectExposure::apply_stage`] each report one stage, and only
-/// [`RestoreStageExposure::any_unproven`] — used on release, per stage — decides
-/// whether the slot may be evicted. A guard release therefore keeps a slot whose
-/// *carrier* stage is still unproven even when its apply stage is fully verified,
-/// which is what lets the later carrier readback still find that obligation.
+/// [`RestoreEffectExposure::apply_stage`] each report one stage, and a release
+/// asks the merged pair two different per-stage questions of them.
+/// [`RestoreStageExposure::any_unproven`] decides whether a stage still owes an
+/// exact reconciliation, so a release keeps a slot whose *carrier* stage is
+/// unproven even when its apply stage is fully verified, which is what lets the
+/// later carrier readback still find that obligation; and the canonical apply
+/// stage decides whether this operation still owes a write, so a release also
+/// keeps a slot whose apply stage is [`RestoreEffectState::NoWriteSubmitted`]
+/// beside any stage that was submitted. That stage owes a write nobody has
+/// performed yet and it is not unproven, so the pair-only question would collect
+/// the evidence of a carrier publication that was already proved — unless
+/// nothing was ever submitted, which is the one state that owes nothing.
 struct RestoreAttemptGuard {
     /// Owner-scoped slot key, derived once so release never formats anything.
     key: String,
@@ -1522,10 +1534,38 @@ impl RestoreAttemptGuard {
             .exposure
             .state()
             .merged(ledger.attempts[&self.key].effect_state);
-        if outcome.is_none() && !merged.any_unproven() {
-            // Nothing is owed any more: every provider-write stage's exact
-            // durable result is known, so the bounded evidence leaves the map
-            // instead of accumulating in it.
+        if outcome.is_none()
+            && !merged.any_unproven()
+            && (merged.apply == RestoreEffectState::DurableResultVerified
+                || matches!(
+                    (merged.carrier, merged.apply),
+                    (
+                        RestoreEffectState::NoWriteSubmitted,
+                        RestoreEffectState::NoWriteSubmitted
+                    )
+                ))
+        {
+            // Nothing is owed any more, so the bounded evidence leaves the map
+            // instead of accumulating in it. Two states reach that answer, and
+            // both are asked per stage rather than over the pair. A proven apply
+            // answers it because "no stage is unproven" is a different question:
+            // `NoWriteSubmitted` is not unproven, so an apply that has not
+            // started at all reads as answered there, and a slot whose carrier
+            // publication is proved while its apply is still owed must survive
+            // this release. Collected as if it owed nothing, the next exact
+            // invocation of the same identity finds no evidence of that
+            // publication and issues a second carrier transaction. A slot on
+            // which nothing was ever submitted answers it too, and the original
+            // pair-only test was already right about that one: no stage is
+            // unproven, the apply stage was never entered, and there is nothing a
+            // later invocation could learn from it that a fresh invocation would
+            // not re-derive. Retaining it would spend a slot of a bounded map on
+            // an identity that wrote nothing and would let the ceiling be reached
+            // by the cheapest possible schedule — acquire and drop, once per
+            // slot — which is a worse failure mode than the one this conjunct
+            // exists to close. So a slot is retained exactly when a
+            // reconciliation is open, or when the apply stage has not reached
+            // `DurableResultVerified` and something was actually submitted.
             ledger.attempts.remove(&self.key);
             return Ok(());
         }
@@ -2682,8 +2722,13 @@ enum CarrierVerification {
     /// Every published row was found and equals the intended carrier exactly.
     Verified,
     /// At least one published row was absent. Publication is one create-only
-    /// transaction over the whole bounded set, so a row this operation created
-    /// being absent proves that transaction did not commit.
+    /// transaction over the whole bounded set, so an absent row is the only
+    /// evidence this readback can obtain about that transaction. Absence is not
+    /// by itself proof of non-commit: the issue records that "a missing row
+    /// observed while the old transaction may still be running is insufficient",
+    /// so what this variant authorises is the bounded readback, never an
+    /// independent claim that nothing committed. See
+    /// [`verify_archive_member_carriers`] for the per-call evidence.
     NotApplied,
 }
 
@@ -2764,10 +2809,18 @@ fn intended_archive_member_carriers(
 /// exclusive per batch — an absent row at position *i* is reported as
 /// `NotApplied` even when a divergent row sits later at *j > i*, and a divergent
 /// row at *i* is reported as a conflict even when an absent row sits later — and
-/// whichever verdict a batch gets, the stage is not marked verified. For one
-/// create-only transaction, `NotApplied` is the only condition under which a
-/// same-identity retry is lawful: a row this operation created being absent is
-/// what proves that publication did not commit.
+/// whichever verdict a batch gets, the stage is not marked verified.
+///
+/// `NotApplied` reports the one thing this bounded readback actually observed: no
+/// row of the create-only publication is durably present at this operation
+/// identity right now. It is deliberately *not* phrased as proof that the
+/// transaction did not commit, because the issue is explicit that "a missing row
+/// observed while the old transaction may still be running is insufficient"
+/// (issue #2666, implementation item 4). What an absence authorises is bounded by
+/// the card clause quoted at the republication site in
+/// [`SurrealStoreAdapter::apply_canonical_batch`]; what it never authorises is a
+/// blind second effect of the other stage, and a divergent row is never read as an
+/// absence.
 async fn verify_archive_member_carriers(
     transport: &RpcTransport,
     config: &SurrealAdapterConfig,
@@ -3397,8 +3450,11 @@ fn check_cumulative_bytes(cumulative: u64, added: u64) -> Result<(), StoreError>
 /// The retained slot is a separate property and not a substitute for this answer:
 /// [`RestoreAttemptGuard::release`] merges this incarnation's per-stage exposure
 /// into the slot and evicts it only when
-/// [`RestoreStageExposure::any_unproven`] is false, so an unproven carrier stage
-/// keeps the slot retained rather than letting the evidence be collected, and
+/// [`RestoreStageExposure::any_unproven`] is false *and* either the canonical
+/// apply stage has reached [`RestoreEffectState::DurableResultVerified`] or
+/// nothing was ever submitted, so an unproven carrier stage, and an apply nobody
+/// has performed yet beside a submitted carrier stage, keep the slot retained
+/// rather than letting the evidence be collected, and
 /// [`SurrealStoreAdapter::resolve_carrier_stage`] later performs the bounded exact
 /// per-row carrier readback before any new provider write. That is why the carrier
 /// obligation is not *lost*; it is not why it may be reported as absent here.
@@ -4369,11 +4425,15 @@ impl SurrealStoreAdapter {
     ///   proved — *is* reconciled right here, by the same bounded exact readback
     ///   the publication itself uses. Full identity and content agreement for
     ///   every row proves the stage and returns `Some` of the set, so the
-    ///   publication is skipped entirely; a row this operation created being
-    ///   absent proves the create-only transaction did not commit, which is the
-    ///   only condition under which a same-identity carrier retry is lawful, and
-    ///   that verdict returns `None`, so the caller reaches the publication and
-    ///   republishes under that same identity.
+    ///   publication is skipped entirely; a divergent row is an error and never
+    ///   reaches the publication at all; and an absent row yields `None`, so the
+    ///   caller reaches the publication and republishes under that same identity.
+    ///   That last verdict is the absence case the issue calls insufficient on its
+    ///   own ("a missing row observed while the old transaction may still be
+    ///   running is insufficient"), so what it authorises here is exactly the card
+    ///   clause quoted at the republication site in
+    ///   [`Self::apply_canonical_batch`] — a same-identity carrier retry, nothing
+    ///   more, and never a blind second effect of the apply stage.
     async fn resolve_carrier_stage(
         &self,
         transport: &RpcTransport,
@@ -4608,14 +4668,32 @@ impl SurrealStoreAdapter {
             // The carrier stage is decided before the publication it governs,
             // never after it. A proven stage continues on this same operation
             // identity and republishes nothing; an unproven-but-not-submitted
-            // stage, and an unknown stage the readback below proved did not
-            // commit, both publish under that same identity.
+            // stage, and a stage whose exact readback above found no durable row,
+            // both publish under that same identity.
             match self
                 .resolve_carrier_stage(transport, batch, &ctx.state_fence, exposure)
                 .await?
             {
                 Some(proven) => proven,
                 None => {
+                    // GAP 5 of issue #2666 is settled by the card's own MAKE
+                    // clause, quoted verbatim from
+                    // ROOT-continuation/workstreams/swarm/cards/2666.md:
+                    // "carrier unproven → allow a same-identity carrier retry".
+                    // The clause — not the absent row alone — is what authorises
+                    // this republication, because the issue is explicit that "a
+                    // missing row observed while the old transaction may still be
+                    // running is insufficient". A late commit of the previous
+                    // publication therefore cannot produce a duplicate effect:
+                    // the carrier rows are create-only under the unique
+                    // `(namespace, key)` index, so a commit that lands after this
+                    // readback makes this very transaction answer
+                    // `IdentityConflict`, and the duplicate arm of
+                    // [`publish_archive_member_carriers`] resolves that by the
+                    // same bounded exact readback — `Verified`, the carrier stage
+                    // raised, and the apply continued exactly once. The
+                    // authorisation is bounded to the carrier stage: the apply
+                    // stage keeps its own gate above and is never reopened here.
                     publish_archive_member_carriers(
                         transport,
                         &self.config,
@@ -6607,5 +6685,569 @@ mod tests {
         );
         drop(resumed);
         forget_slot(&batch, &config);
+    }
+
+    // WORK_UNIT_CASE: 2666/13 — retained unproven apply reaches the owner readback, then converges
+    //
+    // Third sentence of audit comment 5934351574: "repeated cancellations не
+    // должны навсегда занимать operation solely из-за abandoned local
+    // exposure." This case answers the two halves of that sentence. First, the
+    // retained slot gates the fresh-write branch only and is never a substitute
+    // for the exact durable record read, and it never manufactures a receipt.
+    // Second, the slot converges and leaves the map in the same process once
+    // competent provider evidence arrives, so a restart is never needed.
+    //
+    // Measured site of the gate this case pins: `apply_canonical_batch` at :4587,
+    // `if exposure.apply_stage().is_unproven() { return
+    // Err(unknown_outcome(...)) }` — the only predicate that closes the fresh-write
+    // branch, reached after the exact record read at `read_record` and before the
+    // carrier publication and the canonical-apply write.
+    #[test]
+    fn retained_unproven_apply_reaches_the_owner_readback_and_then_converges() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-owner-readback", "install-owner-readback");
+        retained_unproven_apply_answers_the_typed_unknown(&config);
+        competent_evidence_converges_the_slot_in_process(&config);
+    }
+
+    /// Half of case 13: after an abandoned in-flight apply, the next exact
+    /// invocation of the same identity reacquires the slot, inherits the unproven
+    /// apply stage, and therefore answers with the typed unknown outcome at the
+    /// fresh-write gate instead of a fresh write or a fabricated receipt. A retry
+    /// of that retry does not erase what it inherited.
+    fn retained_unproven_apply_answers_the_typed_unknown(config: &SurrealAdapterConfig) {
+        let batch = scoped_batch("dest-owner-readback", "op-owner-readback");
+        forget_slot(&batch, config);
+        let operation_id = batch.operation.operation_id.as_str();
+
+        // The abandoned in-flight apply: the pre-poll mark is raised and the
+        // pending future is then dropped without an explicit completion.
+        let mut abandoned = acquire_guard(&batch, config);
+        abandoned
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CanonicalApply);
+        drop(abandoned);
+        assert!(
+            slot_for(&batch, config).is_some(),
+            "an abandoned apply that may have been submitted must keep its slot"
+        );
+
+        // The subsequent exact invocation. Reacquisition grants local ownership
+        // and nothing else: the predicate it must answer is the one
+        // `apply_canonical_batch` consults on the apply stage before the
+        // canonical-apply write, so an unproven inherited stage closes that
+        // branch and hands the decision to the exact durable record read.
+        let exact = acquire_guard(&batch, config);
+        assert!(
+            exact.exposure.apply_stage().is_unproven(),
+            "reacquisition must inherit the unproven apply stage, so the fresh-write \
+             branch stays closed and the exact durable record read decides"
+        );
+        assert_eq!(
+            exact.exposure.carrier_stage(),
+            RestoreEffectState::NoWriteSubmitted,
+            "the apply stage's uncertainty says nothing about the carrier stage"
+        );
+        assert_eq!(
+            unknown_outcome(operation_id),
+            StoreError::MissingReceiptEnvelope,
+            "the answer at that gate is the typed unknown outcome, never a receipt"
+        );
+        assert!(
+            cached_receipt(&batch.operation).is_none(),
+            "no receipt may be fabricated for an operation the provider never confirmed"
+        );
+        assert!(
+            with_shared_ledger(|ledger| ledger.readback(&batch.operation)).is_none(),
+            "the durable-receipt cache must hold nothing for an unconfirmed operation"
+        );
+
+        // The obligation survives this invocation too: an exact retry that is
+        // itself cancelled must not erase the uncertainty it inherited.
+        drop(exact);
+        let observed = restore_attempt_state(&batch, config);
+        let Ok(Some(observed)) = observed else {
+            panic!("the bounded reader must still observe the retained slot")
+        };
+        assert_eq!(
+            observed.effect_state.apply,
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "a cancelled retry must not reset the uncertainty it inherited"
+        );
+        assert!(observed.effect_state.any_unproven());
+        assert!(observed.original_failure().is_none());
+        forget_slot(&batch, config);
+    }
+
+    /// Half of case 13: competent provider evidence — the exact durable record
+    /// read back under this operation identity, the only input `reconcile_operation`
+    /// feeds the slot — discharges the stage, the fresh-write gate opens, and a
+    /// clean completion evicts the bounded evidence so the identity is no longer
+    /// occupied by its own local bookkeeping.
+    fn competent_evidence_converges_the_slot_in_process(config: &SurrealAdapterConfig) {
+        let batch = scoped_batch("dest-owner-converge", "op-owner-converge");
+        forget_slot(&batch, config);
+        let operation_id = batch.operation.operation_id.as_str();
+        let (active_store, active_installation) = active_store_identity(config);
+        let key = attempt_slot_key(
+            &active_store,
+            &active_installation,
+            &batch.destination,
+            &batch.operation,
+        );
+
+        let mut abandoned = acquire_guard(&batch, config);
+        abandoned
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CanonicalApply);
+        abandoned.exposure.note_carrier_verified();
+        drop(abandoned);
+
+        assert!(
+            project_provider_apply_state(
+                &key,
+                operation_id,
+                RestoreEffectState::DurableResultVerified,
+            )
+            .is_ok(),
+            "an exact durable record read under this identity must refresh the slot"
+        );
+
+        let resolved = acquire_guard(&batch, config);
+        assert_eq!(
+            resolved.exposure.apply_stage(),
+            RestoreEffectState::DurableResultVerified,
+            "competent provider evidence must be able to discharge the retained apply"
+        );
+        assert!(
+            !resolved.exposure.state().any_unproven(),
+            "a verified apply beside a verified carrier leaves the identity owing nothing"
+        );
+        assert!(
+            resolved.complete(None).is_ok(),
+            "a fully proven slot must release cleanly"
+        );
+        assert!(
+            slot_for(&batch, config).is_none(),
+            "a settled identity must not stay occupied by its own local evidence"
+        );
+        forget_slot(&batch, config);
+    }
+
+    // WORK_UNIT_CASE: 2666/14 — each cancellation releases the running claim, consuming one slot
+    #[test]
+    fn repeated_cancellations_of_one_identity_never_pile_up_running_flags() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-repeat-cancel", "install-repeat-cancel");
+        let batch = scoped_batch("dest-repeat-cancel", "op-repeat-cancel");
+        forget_slot(&batch, &config);
+        let baseline = with_shared_ledger(|ledger| ledger.attempts.len());
+
+        for cycle in 0..5usize {
+            let mut cancelled = match RestoreAttemptGuard::acquire(&batch, &config) {
+                Ok(guard) => guard,
+                Err(error) => panic!(
+                    "cycle {cycle}: a released identity must stay re-acquirable, never \
+                     permanently consumed by its own abandoned in-flight flag: {error:?}"
+                ),
+            };
+            cancelled
+                .exposure
+                .note_write_may_be_submitted(RestoreWriteStage::CanonicalApply);
+            drop(cancelled);
+
+            let slot = slot_for(&batch, &config);
+            let Some(slot) = slot else {
+                panic!("cycle {cycle}: an abandoned apply must keep its slot")
+            };
+            assert!(
+                !slot.running,
+                "cycle {cycle}: dropping a pending future must clear the local running \
+                 claim, which is the only thing the destructor may clear"
+            );
+            assert_eq!(
+                slot.effect_state.apply,
+                RestoreEffectState::WriteMayHaveBeenSubmitted,
+                "cycle {cycle}: repeated cancellation must not decay the retained obligation"
+            );
+            assert!(
+                slot.first_failure.is_none(),
+                "cycle {cycle}: a cancellation is an abandoned obligation, not a failure"
+            );
+            assert_eq!(
+                with_shared_ledger(|ledger| ledger.attempts.len()),
+                baseline + 1,
+                "cycle {cycle}: five cancellations of one identity must consume exactly one \
+                 bounded slot, so an operation is occupied by its exposure rather than by \
+                 the number of attempts"
+            );
+        }
+        forget_slot(&batch, &config);
+    }
+
+    // WORK_UNIT_CASE: 2666/15 — a ceiling refusal is fail-closed and leaves the projection intact
+    //
+    // Measured sites: the bound is checked in `RestoreAttemptGuard::acquire` at
+    // :1465 (`retained.is_none() && ledger.attempts.len() >=
+    // MAX_RESTORE_TRACKED_ATTEMPTS`), which `restore_canonical_batch` reaches at
+    // :4096 before `apply_canonical_batch` — and therefore before both provider
+    // writes at :2886 (carrier publication) and :4880 (canonical apply). The
+    // exposure gate the refusal must never be confused with is the per-stage
+    // `apply_stage()` decision at :4587, which runs strictly later and only over
+    // an already-acquired slot.
+    #[test]
+    fn ceiling_refusal_is_fail_closed_and_leaves_the_projection_intact() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-ceiling-intact", "install-ceiling-intact");
+        let held = seed_held_reconcilable_identity(&config);
+        let _filler = insert_ceiling_filler_slots();
+        let before = attempt_map_lines();
+        ceiling_refusal_is_inert(&config, &before);
+        held_identity_stays_reconcilable_at_the_ceiling(&config, &held);
+    }
+
+    /// Seeds the one identity whose slot must survive the ceiling refusal: an
+    /// unproven apply obligation beside a recorded first failure.
+    fn seed_held_reconcilable_identity(config: &SurrealAdapterConfig) -> CanonicalRestoreBatch {
+        let held = scoped_batch("dest-held-reconcilable", "op-held-reconcilable");
+        forget_slot(&held, config);
+        let mut seeding = acquire_guard(&held, config);
+        seeding
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CanonicalApply);
+        seeding.exposure.note_carrier_verified();
+        assert!(
+            seeding.complete(Some(&StoreError::FenceMismatch)).is_ok(),
+            "the seeding incarnation must release the slot it owns"
+        );
+        held
+    }
+
+    /// Half of case 15: at the ceiling a fresh identity is refused by the
+    /// unchanged bound, and the refusal is inert — it happens before any write, so
+    /// it may not insert a slot, evict one, or rewrite the exposure or the failure
+    /// of any slot already there. The ceiling value is pinned against the batch
+    /// member ceiling it reuses, so widening it to hide a leak fails here.
+    fn ceiling_refusal_is_inert(config: &SurrealAdapterConfig, before: &[String]) {
+        assert_eq!(
+            before.len(),
+            MAX_RESTORE_BATCH_MEMBERS,
+            "the fixture must reach MAX_RESTORE_TRACKED_ATTEMPTS, which is still the \
+             unchanged batch member ceiling"
+        );
+        let fresh = scoped_batch("dest-ceiling-intact-new", "op-ceiling-intact-new");
+        forget_slot(&fresh, config);
+        assert_eq!(
+            RestoreAttemptGuard::acquire(&fresh, config).err(),
+            Some(StoreError::PayloadTooLarge),
+            "a fresh slot arriving at the ceiling must be refused by the bound"
+        );
+        assert_eq!(
+            attempt_map_lines(),
+            *before,
+            "a ceiling refusal must be inert: it may not insert, evict or rewrite a slot"
+        );
+        assert!(
+            slot_for(&fresh, config).is_none(),
+            "the refused identity must own no slot at all"
+        );
+        forget_slot(&fresh, config);
+    }
+
+    /// Half of case 15: the refusal is fail-closed and non-corrupting, so the held
+    /// identity is still readable, still carries its exact obligation and its
+    /// original failure, and is still reusable at the ceiling rather than refused
+    /// together with the fresh one — and releasing it still retains the slot.
+    fn held_identity_stays_reconcilable_at_the_ceiling(
+        config: &SurrealAdapterConfig,
+        held: &CanonicalRestoreBatch,
+    ) {
+        let observed = restore_attempt_state(held, config);
+        let Ok(Some(observed)) = observed else {
+            panic!("the held identity must survive the refusal")
+        };
+        assert_eq!(
+            observed.effect_state.apply,
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "the refusal must not lower a retained obligation"
+        );
+        assert_eq!(
+            observed.original_failure(),
+            Some(StoreError::FenceMismatch),
+            "the refusal must not drop or overwrite a retained first failure"
+        );
+        let reused = acquire_guard(held, config);
+        assert_eq!(
+            reused.exposure.apply_stage(),
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "a held identity must stay reconcilable at the ceiling"
+        );
+        assert_eq!(
+            reused.exposure.carrier_stage(),
+            RestoreEffectState::DurableResultVerified
+        );
+        assert!(reused.complete(None).is_ok());
+        let retained = slot_for(held, config);
+        let Some(retained) = retained else {
+            panic!("an unproven obligation must never be evicted to free a slot")
+        };
+        assert!(!retained.running);
+        assert_eq!(
+            retained.effect_state.apply,
+            RestoreEffectState::WriteMayHaveBeenSubmitted
+        );
+        forget_slot(held, config);
+    }
+
+    // WORK_UNIT_CASE: 2666/16 — a drop before the canonical apply retains the proved carriers
+    //
+    // The schedule this pins is the one the card's DONE clause names: a successful
+    // carrier publication, a drop before the canonical apply, and a next exact
+    // request that then reaches the carrier readback instead of publishing a
+    // second time. The state that leaves the drop is
+    // {carrier: DurableResultVerified, apply: NoWriteSubmitted}, which no other
+    // case reaches: the eviction case covers {WMS, DRV}, {DRV, DRV} and
+    // {DRV, DRV} plus a recorded outcome, and the drop case seeds only an
+    // unproven apply beside an untouched carrier.
+    //
+    // The single mutation killed here is the eviction predicate in
+    // `RestoreAttemptGuard::release`: reverting it to
+    // `outcome.is_none() && !merged.any_unproven()` fails this case, because
+    // `DurableResultVerified` and `NoWriteSubmitted` are both proven states, so
+    // that predicate collects the slot and every retained-carrier assertion
+    // below fails with it.
+    //
+    // Measured sites: the eviction predicate is the `if` at :1537, and the
+    // republication decision is the `exposure.carrier_stage() ==
+    // RestoreEffectState::DurableResultVerified` early return of
+    // `SurrealStoreAdapter::resolve_carrier_stage` at :4448, which is reached
+    // before the `!exposure.carrier_stage().is_unproven()` guard at :4451 that
+    // answers `Ok(None)` and hands the caller a second carrier-publication
+    // transaction. That function is `async` over a live provider transport, so
+    // this case drives the accessors it consults — `carrier_stage` and
+    // `is_unproven` — over the retained exposure, the way case 2666/13 pins the
+    // apply-stage gate `apply_canonical_batch` consults at :4587.
+    #[test]
+    fn drop_before_the_canonical_apply_retains_the_proved_carrier_publication() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-drop-before-apply", "install-drop-before-apply");
+        let batch = scoped_batch("dest-drop-before-apply", "op-drop-before-apply");
+        forget_slot(&batch, &config);
+        let baseline = with_shared_ledger(|ledger| ledger.attempts.len());
+
+        drop_before_the_apply_keeps_the_proved_carriers(&batch, &config, baseline);
+        the_next_exact_invocation_inherits_them(&batch, &config, baseline);
+        the_recorded_and_completed_arms_are_unchanged(&batch, &config, baseline);
+        forget_slot(&batch, &config);
+    }
+
+    /// Half of case 16: the carrier transaction reaches a successful provider
+    /// response, the bounded exact readback of every carrier row of this
+    /// operation fixes the stage, and the pending future is then dropped before
+    /// the canonical apply write. The slot survives that drop, with the two
+    /// stages no longer "unproven" and the apply stage still owing its write —
+    /// the one pair the eviction predicate has to keep.
+    fn drop_before_the_apply_keeps_the_proved_carriers(
+        batch: &CanonicalRestoreBatch,
+        config: &SurrealAdapterConfig,
+        baseline: usize,
+    ) {
+        // The marks are the production ones: `execute_restore_write` raises
+        // `note_write_may_be_submitted` on the last synchronous line before the
+        // transport poll and `note_response_observed` on the answer, and only the
+        // bounded exact readback raises `note_carrier_verified`.
+        let mut publisher = acquire_guard(batch, config);
+        publisher
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CarrierPublication);
+        publisher
+            .exposure
+            .note_response_observed(RestoreWriteStage::CarrierPublication);
+        publisher.exposure.note_carrier_verified();
+        drop(publisher);
+
+        let Some(retained) = slot_for(batch, config) else {
+            panic!(
+                "a drop between a proved carrier publication and the canonical apply must \
+                 keep its slot: the next exact invocation inherits the carrier evidence \
+                 from here and nowhere else"
+            )
+        };
+        assert!(
+            !retained.running,
+            "a drop releases the local running owner and nothing else"
+        );
+        assert_eq!(
+            retained.effect_state.carrier,
+            RestoreEffectState::DurableResultVerified,
+            "the exact carrier readback is retained evidence, not a stage to perform again"
+        );
+        assert_eq!(
+            retained.effect_state.apply,
+            RestoreEffectState::NoWriteSubmitted,
+            "the canonical apply was never entered, so that stage still owes its write"
+        );
+        assert!(
+            !retained.effect_state.any_unproven(),
+            "both stages read as proven here, which is exactly why the release predicate \
+             must ask the apply stage itself and not only the pair"
+        );
+        assert!(
+            retained.first_failure.is_none(),
+            "a drop records uncertainty, not a failure"
+        );
+        assert_eq!(
+            with_shared_ledger(|ledger| ledger.attempts.len()),
+            baseline + 1,
+            "the retained slot is visible in the bounded map as one occupied slot"
+        );
+    }
+
+    /// Half of case 16: the next exact invocation of the same operation identity
+    /// reacquires that slot, so the carrier stage it consults is the retained
+    /// one — which is what answers `resolve_carrier_stage` before the
+    /// republication guard. Dropping that resumed invocation merges an untouched
+    /// exposure into strictly higher retained stages, so the merge — never an
+    /// overwrite — is pinned on the same state.
+    fn the_next_exact_invocation_inherits_them(
+        batch: &CanonicalRestoreBatch,
+        config: &SurrealAdapterConfig,
+        baseline: usize,
+    ) {
+        let exact = acquire_guard(batch, config);
+        assert_eq!(
+            exact.exposure.carrier_stage(),
+            RestoreEffectState::DurableResultVerified,
+            "reacquisition must inherit the retained carrier publication, so \
+             resolve_carrier_stage answers Ok(Some) at its :4448 early return and \
+             never reaches the Ok(None) that would authorise a second publication"
+        );
+        assert_eq!(
+            exact.exposure.apply_stage(),
+            RestoreEffectState::NoWriteSubmitted,
+            "the apply of this invocation is still the one owed"
+        );
+        assert!(
+            !exact.exposure.carrier_stage().is_unproven(),
+            "the retained stage is a proved result, so it is not an open readback \
+             obligation"
+        );
+
+        // The contrast that makes the branch decision legible: the same accessors
+        // over an exposure that inherited nothing answer the republication guard
+        // instead, because `NoWriteSubmitted` is not unproven.
+        let inherited_nothing = RestoreEffectExposure::new(RestoreStageExposure::NONE);
+        assert_eq!(
+            inherited_nothing.carrier_stage(),
+            RestoreEffectState::NoWriteSubmitted,
+            "a slot that retained nothing hands the republication branch its answer, \
+             which is how the measured defect spent a second carrier transaction"
+        );
+        assert!(
+            !inherited_nothing.carrier_stage().is_unproven(),
+            "NoWriteSubmitted is proven in the narrow sense and unproven in the one \
+             that matters: it never reached the wire"
+        );
+
+        // This invocation wrote nothing and is dropped too, so its own exposure
+        // is `NoWriteSubmitted` on both stages while the slot's are strictly
+        // higher. A mutation of the merge in `release` into a plain assignment of
+        // this invocation's own state would answer `NoWriteSubmitted` for the
+        // carrier here and hand the next invocation a second publication.
+        drop(exact);
+        let after_merge = slot_for(batch, config);
+        let Some(after_merge) = after_merge else {
+            panic!("the merged release must keep the slot it merged into")
+        };
+        assert_eq!(
+            after_merge.effect_state.carrier,
+            RestoreEffectState::DurableResultVerified,
+            "a drop merges the retained maximum per stage, never overwrites it"
+        );
+        assert_eq!(
+            after_merge.effect_state.apply,
+            RestoreEffectState::NoWriteSubmitted,
+            "the inherited apply stage survives a later, less informed observation"
+        );
+        assert_eq!(
+            with_shared_ledger(|ledger| ledger.attempts.len()),
+            baseline + 1,
+            "repeated cancellations of this identity consume exactly one bounded slot"
+        );
+    }
+
+    /// Half of case 16: on the retained {carrier: `DurableResultVerified`, apply:
+    /// `NoWriteSubmitted`} slot the typed-error arm and the completed arm behave
+    /// exactly as they do today — a recorded outcome keeps the slot whatever its
+    /// stages are, and only an apply that reached its own exact durable result
+    /// lets a clean completion collect it.
+    fn the_recorded_and_completed_arms_are_unchanged(
+        batch: &CanonicalRestoreBatch,
+        config: &SurrealAdapterConfig,
+        baseline: usize,
+    ) {
+        let refused = acquire_guard(batch, config);
+        assert!(
+            refused.complete(Some(&StoreError::FenceMismatch)).is_ok(),
+            "a recorded outcome must release the slot this incarnation owns"
+        );
+        let Some(after_error) = slot_for(batch, config) else {
+            panic!("a recorded outcome must keep its slot")
+        };
+        assert!(
+            !after_error.running,
+            "an explicit completion releases the local running owner"
+        );
+        assert!(
+            after_error.first_failure.is_some(),
+            "a recorded outcome keeps the slot, so the first failure survives"
+        );
+        assert_eq!(
+            after_error.effect_state.carrier,
+            RestoreEffectState::DurableResultVerified,
+            "the retained carrier stage is untouched by an unrelated refusal"
+        );
+
+        let mut settled = acquire_guard(batch, config);
+        settled.exposure.note_apply_verified();
+        assert!(
+            settled.complete(None).is_ok(),
+            "a fully proven slot must release cleanly"
+        );
+        assert!(
+            slot_for(batch, config).is_none(),
+            "with the apply stage itself proved and no recorded outcome, the bounded \
+             evidence still leaves the map"
+        );
+        assert_eq!(
+            with_shared_ledger(|ledger| ledger.attempts.len()),
+            baseline,
+            "the converged identity occupies no bounded slot afterwards"
+        );
+    }
+
+    /// Projects the shared attempt map into one sorted line per slot, naming every
+    /// fact a ceiling refusal must leave untouched. Sorting keeps the comparison
+    /// independent of hash iteration order.
+    fn attempt_map_lines() -> Vec<String> {
+        with_shared_ledger(|ledger| {
+            let mut lines: Vec<String> = ledger
+                .attempts
+                .iter()
+                .map(|(key, attempt)| {
+                    format!(
+                        "{key}|{}|{}|{}|{:?}|{:?}|{:?}",
+                        attempt.phase,
+                        attempt.incarnation,
+                        attempt.running,
+                        attempt.effect_state.carrier,
+                        attempt.effect_state.apply,
+                        attempt.first_failure,
+                    )
+                })
+                .collect();
+            lines.sort();
+            lines
+        })
     }
 }
