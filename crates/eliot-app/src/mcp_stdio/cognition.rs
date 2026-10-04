@@ -315,7 +315,54 @@ pub(super) fn cognitive_tool_observation_subject(run_id: &str, call_number: u8) 
     format!("{run_id}:call:{call_number}")
 }
 
-pub(super) async fn cognitive_record_by_revision<T: serde::de::DeserializeOwned>(
+/// Refuses a decoded cognitive-run record that does not declare the one
+/// supported per-contract `schema_version`.
+///
+/// Issue #935, criterion `MAKE-CGR-VALIDATION-AT-GENERIC-DECODER`: version
+/// selection has to hold at the decoding boundary itself, not only at the call
+/// sites that happen to read a status, capability, receipt or verifier fact.
+/// `cognitive_record_by_revision` is the single generic decode boundary for
+/// cognitive-run canonical records, so `deny_unknown_fields` alone is not enough:
+/// a foreign layout that still fits the current fields would otherwise be handed
+/// back as current data.
+///
+/// The admitted set is closed on purpose. Only the cognitive-run records that
+/// carry `COGNITIVE_RUN_SCHEMA_VERSION` have a supported version at this
+/// boundary; any other decoded type is refused by name instead of being returned
+/// unchecked.
+pub(super) fn require_cognitive_record_schema_version<T: std::any::Any>(
+    record: &CanonicalRecord<T>,
+) -> Result<()> {
+    let body: &dyn std::any::Any = &record.receipt_body;
+    if let Some(attempt) = body.downcast_ref::<CognitiveRunAttempt>() {
+        attempt.validate_schema_version()?;
+    } else if let Some(terminal) = body.downcast_ref::<CognitiveRunTerminal>() {
+        terminal.validate_schema_version()?;
+    } else if let Some(observation) = body.downcast_ref::<CognitiveToolObservation>() {
+        observation.validate_schema_version()?;
+    } else if let Some(evidence) = body.downcast_ref::<CognitiveRawVerifierEvidence>() {
+        evidence.validate_schema_version()?;
+    } else if let Some(contract) = body.downcast_ref::<CognitiveRunContract>() {
+        // The sealed contract declares the same per-contract constant and already
+        // has owners that compare this exact field (`same_seal_request` and the
+        // sealed `contract_sha256`). The boundary repeats that same constant
+        // comparison instead of crediting a foreign version.
+        if contract.schema_version != COGNITIVE_RUN_SCHEMA_VERSION {
+            anyhow::bail!(
+                "CognitiveRunContract declares unsupported cognitive-run schema_version `{}`; supported version is `{COGNITIVE_RUN_SCHEMA_VERSION}`",
+                contract.schema_version
+            );
+        }
+    } else {
+        anyhow::bail!(
+            "canonical cognitive record type `{}` declares no supported cognitive-run schema_version at this decode boundary",
+            std::any::type_name::<T>()
+        );
+    }
+    Ok(())
+}
+
+pub(super) async fn cognitive_record_by_revision<T: serde::de::DeserializeOwned + std::any::Any>(
     state: &McpState,
     project_id: ProjectId,
     task_id: TaskId,
@@ -325,11 +372,20 @@ pub(super) async fn cognitive_record_by_revision<T: serde::de::DeserializeOwned>
 ) -> Result<Option<CanonicalRecord<T>>> {
     let key = cognitive_revision_key(run_id, revision);
     let write_id = deterministic_canonical_write_id(project_id, Some(task_id), kind, &key);
-    state
+    let record = state
         .store
         .canonical_record_by_write_id(project_id, Some(task_id), &[kind.as_str()], write_id)
         .await
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    // Schema-version gate (issue #935): the decoded record is refused here, at
+    // the decode boundary, before any caller can read a status, capability,
+    // execution seal, shared gate, receipt chain or verifier fact from it. This
+    // covers every caller of this helper, including the ones that cannot validate
+    // the record themselves.
+    if let Some(record) = record.as_ref() {
+        require_cognitive_record_schema_version(record)?;
+    }
+    Ok(record)
 }
 
 pub(super) async fn cognitive_run_seal(

@@ -169,6 +169,249 @@ fn cognitive_seal_rejects_source_commit_and_policy_drift() -> Result<()> {
     validate_cognitive_source_binding(&input)
 }
 
+/// Issue #935, `MAKE-CGR-VALIDATION-AT-GENERIC-DECODER`: the four
+/// schema-bearing cognitive-run records as they arrive at the generic canonical
+/// decode boundary of `cognitive_record_by_revision`.
+fn version_gate_execution() -> CognitiveExecutionSeal {
+    CognitiveExecutionSeal {
+        executable_sha256: "11".repeat(32),
+        provider_executable_sha256: "22".repeat(32),
+        argv_sha256: "33".repeat(32),
+        environment_sha256: "44".repeat(32),
+        cwd_sha256: "55".repeat(32),
+        bundle_sha256: "66".repeat(32),
+        prompt_sha256: "77".repeat(32),
+    }
+}
+
+fn version_gate_receipt() -> WriteReceiptRef {
+    WriteReceiptRef {
+        receipt_id: ReceiptId::new_v7(),
+        write_id: WriteId::from_uuid(uuid::Uuid::from_u128(0x935)),
+    }
+}
+
+fn version_gate_attempt(schema_version: &str) -> CognitiveRunAttempt {
+    CognitiveRunAttempt {
+        schema_version: schema_version.to_owned(),
+        run_id: "version-gate-run".to_owned(),
+        call_id: "PC-01-target-opencode-treatment".to_owned(),
+        call_number: 1,
+        run_revision: 1,
+        expected_previous_revision: 0,
+        contract_receipt: version_gate_receipt(),
+        invocation_id: uuid::Uuid::now_v7().to_string(),
+        candidate_write_id: None,
+        provider_calls_consumed: 1,
+        hard_provider_call_cap: 18,
+        status: CognitiveRunCallStatus::Attempting,
+        execution: version_gate_execution(),
+        capability: None,
+        shared_gate: None,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+fn version_gate_terminal(schema_version: &str) -> CognitiveRunTerminal {
+    CognitiveRunTerminal {
+        schema_version: schema_version.to_owned(),
+        run_id: "version-gate-run".to_owned(),
+        call_id: "PC-01-target-opencode-treatment".to_owned(),
+        call_number: 1,
+        run_revision: 2,
+        expected_previous_revision: 1,
+        attempt_receipt: version_gate_receipt(),
+        status: CognitiveRunCallStatus::Succeeded,
+        execution: version_gate_execution(),
+        process_sha256: Some("88".repeat(32)),
+        stdout_sha256: Some("99".repeat(32)),
+        stderr_sha256: Some("aa".repeat(32)),
+        provider_output_sha256: Some("bb".repeat(32)),
+        candidate_write_id: None,
+        candidate_receipt: None,
+        host_observation: None,
+        tool_observation_receipts: vec![version_gate_receipt()],
+        raw_verifier_receipts: vec![version_gate_receipt()],
+        reason: "version gate fixture".to_owned(),
+        no_redispatch: true,
+        finished_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+fn version_gate_tool_observation(schema_version: &str) -> CognitiveToolObservation {
+    CognitiveToolObservation {
+        schema_version: schema_version.to_owned(),
+        run_id: "version-gate-run".to_owned(),
+        call_subject_ref: "version-gate-run:call:1".to_owned(),
+        observation_id: uuid::Uuid::now_v7().to_string(),
+        call_id: "PC-01-target-opencode-treatment".to_owned(),
+        call_number: 1,
+        project_id: ProjectId::new_v7(),
+        task_id: TaskId::new_v7(),
+        session_id: SessionId::new_v7(),
+        host: AgentHostId::OpenCode,
+        attempt_receipt: version_gate_receipt(),
+        tool_name: "eliot_cognitive_job_fetch".to_owned(),
+        outcome: "succeeded".to_owned(),
+        sealed_truth_revision: "version-gate-revision".to_owned(),
+        observed_memory_revision: Some(7),
+        arguments_sha256: "cc".repeat(32),
+        result_sha256: "dd".repeat(32),
+        requested_handles: Vec::new(),
+        returned_handles: Vec::new(),
+        observed_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+fn version_gate_raw_evidence(schema_version: &str) -> CognitiveRawVerifierEvidence {
+    CognitiveRawVerifierEvidence {
+        schema_version: schema_version.to_owned(),
+        run_id: "version-gate-run".to_owned(),
+        call_id: "PC-01-target-opencode-treatment".to_owned(),
+        call_number: 1,
+        project_id: ProjectId::new_v7(),
+        task_id: TaskId::new_v7(),
+        attempt_receipt: version_gate_receipt(),
+        execution: version_gate_execution(),
+        process_sha256: Some("88".repeat(32)),
+        stdout_sha256: Some("99".repeat(32)),
+        stderr_sha256: Some("aa".repeat(32)),
+        provider_output_sha256: Some("bb".repeat(32)),
+        host_observation: None,
+        tool_observation_receipts: vec![version_gate_receipt()],
+        verifier_version: "version-gate-v1".to_owned(),
+        checks_sha256: "ee".repeat(32),
+        passed: true,
+        verified_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+fn version_gate_record<T>(
+    receipt_kind: CanonicalReceiptKind,
+    receipt_body: T,
+) -> CanonicalRecord<T> {
+    let write_id = WriteId::from_uuid(uuid::Uuid::from_u128(0x935));
+    CanonicalRecord {
+        record_id: write_id.to_string(),
+        receipt_kind: receipt_kind.as_str().to_owned(),
+        project_id: ProjectId::new_v7(),
+        task_id: Some(TaskId::new_v7()),
+        subject_ref: "version-gate-run".to_owned(),
+        receipt_body,
+        canonical_receipt: WriteReceiptRef {
+            receipt_id: ReceiptId::new_v7(),
+            write_id,
+        },
+        memory_revision: Some(MemoryRevision::new(3)),
+        project_sequence: None,
+    }
+}
+
+/// Drives one schema-bearing cognitive-run record through the generic canonical
+/// decode boundary at the supported version and at versions it must refuse.
+fn assert_record_version_gate<T, F>(record_name: &str, kind: CanonicalReceiptKind, build: F)
+where
+    T: Clone
+        + std::fmt::Debug
+        + PartialEq
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::any::Any,
+    F: Fn(&str) -> T,
+{
+    // The concrete counterexample: a canonical, otherwise shape-valid record
+    // whose declared version is not the supported per-contract constant.
+    let refused = version_gate_record(kind, build("eliot-cognitive-run-v999"));
+    let error = require_cognitive_record_schema_version(&refused)
+        .expect_err("an unsupported cognitive-run version must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("unsupported cognitive-run schema_version")
+            && message.contains("eliot-cognitive-run-v999")
+            && message.contains(COGNITIVE_RUN_SCHEMA_VERSION),
+        "{record_name} refusal must name the offending and the supported version: {message}"
+    );
+
+    // A misselected but well-formed older layout is refused too: the supported
+    // set is exactly one version, with no legacy alias.
+    let misselected = version_gate_record(kind, build("eliot-cognitive-run-v1"));
+    assert!(
+        require_cognitive_record_schema_version(&misselected).is_err(),
+        "{record_name} must refuse a well-formed but misselected version"
+    );
+
+    let empty = version_gate_record(kind, build(""));
+    assert!(
+        require_cognitive_record_schema_version(&empty).is_err(),
+        "{record_name} must refuse an empty declared version"
+    );
+
+    let accepted = version_gate_record(kind, build(COGNITIVE_RUN_SCHEMA_VERSION));
+    let before = accepted.receipt_body.clone();
+    require_cognitive_record_schema_version(&accepted)
+        .unwrap_or_else(|error| panic!("{record_name} must admit the supported version: {error}"));
+    // The gate is read-only for valid stored data.
+    assert_eq!(
+        accepted.receipt_body, before,
+        "{record_name} admission must not alter the decoded body"
+    );
+    // The admitted record still encodes and decodes byte-identically, so no
+    // stored digest or list order changes.
+    let owner_bytes = serde_json::to_string(&accepted.receipt_body)
+        .unwrap_or_else(|error| panic!("{record_name} body serializes: {error}"));
+    let round_trip: T = serde_json::from_str(&owner_bytes)
+        .unwrap_or_else(|error| panic!("{record_name} body decodes: {error}"));
+    assert_eq!(round_trip, accepted.receipt_body);
+    assert_eq!(
+        serde_json::to_string(&round_trip).expect("round-trip serializes"),
+        owner_bytes,
+        "{record_name} admitted bytes must stay byte-identical"
+    );
+    assert_eq!(
+        sha256_json(&round_trip).expect("body digest"),
+        sha256_json(&accepted.receipt_body).expect("owner body digest"),
+        "{record_name} admitted digest must stay byte-identical"
+    );
+}
+
+#[test]
+fn cognitive_decode_boundary_refuses_unsupported_and_misselected_versions() {
+    assert_record_version_gate(
+        "CognitiveRunAttempt",
+        CanonicalReceiptKind::CognitiveRunAttempt,
+        version_gate_attempt,
+    );
+    assert_record_version_gate(
+        "CognitiveRunTerminal",
+        CanonicalReceiptKind::CognitiveRunTerminal,
+        version_gate_terminal,
+    );
+    assert_record_version_gate(
+        "CognitiveToolObservation",
+        CanonicalReceiptKind::CognitiveToolObservation,
+        version_gate_tool_observation,
+    );
+    assert_record_version_gate(
+        "CognitiveRawVerifierEvidence",
+        CanonicalReceiptKind::CognitiveRawVerifier,
+        version_gate_raw_evidence,
+    );
+}
+
+#[test]
+fn cognitive_decode_boundary_refuses_a_record_type_without_a_supported_version() {
+    let record = version_gate_record(
+        CanonicalReceiptKind::CognitiveRunAttempt,
+        json!({"schema_version": COGNITIVE_RUN_SCHEMA_VERSION}),
+    );
+    let error =
+        require_cognitive_record_schema_version(&record).expect_err("untyped body must be refused");
+    assert!(
+        error.to_string().contains("serde_json::value::Value"),
+        "the refusal must name the unadmitted type: {error}"
+    );
+}
+
 #[test]
 fn cognitive_roles_fail_closed_even_when_hidden_tool_names_are_called_directly() {
     assert!(tool_definitions_for_profile(McpAccessProfile::CognitiveControl).is_empty());
