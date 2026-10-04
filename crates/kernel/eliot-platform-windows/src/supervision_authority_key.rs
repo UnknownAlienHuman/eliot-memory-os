@@ -1498,6 +1498,19 @@ fn portable_dev_key_path(
     Ok(path)
 }
 
+/// One supervision contour path with its separators normalized to `\`.
+///
+/// [`crate::windows_paths_equal`] compares spellings case-insensitively but
+/// treats `/` and `\` as different characters. The disposable key contract
+/// names its repository-local contour with forward slashes, so the path built
+/// by `join(relative_path)` and the same path built component-wise describe
+/// one object while differing only in separator spelling. Normalizing the
+/// separator keeps the contour guard an exact check instead of one that can
+/// never hold on Windows.
+fn normalized_contour_path(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+}
+
 fn open_portable_dev_parent(
     root: &UserOwnedRootLease,
     key_path: &Path,
@@ -1511,7 +1524,10 @@ fn open_portable_dev_parent(
             .file_name()
             .ok_or(SupervisionAuthorityKeyError::InvalidBinding)?,
     );
-    if !crate::windows_paths_equal(key_path, &expected_key_path) {
+    if !crate::windows_paths_equal(
+        &normalized_contour_path(key_path),
+        &normalized_contour_path(&expected_key_path),
+    ) {
         return Err(SupervisionAuthorityKeyError::InvalidBinding);
     }
     crate::reject_reparse_chain(key_path, false).map_err(map_user_owned_path_error)?;
