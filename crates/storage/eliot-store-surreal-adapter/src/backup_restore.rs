@@ -6169,6 +6169,144 @@ mod tests {
         SlotCleanup { keys }
     }
 
+    // WORK_UNIT_CASE: 2666/AUD13-schedule — the exact drop-after-carrier-publication,
+    // before-canonical-apply schedule, driven through the real guard lifecycle and
+    // the real branch predicates. This is the case that used to be a production
+    // dead-end: the first attempt published its carriers and answered, then the
+    // future was dropped; the retry inherited `ResponseObserved` on the carrier
+    // stage with `NoWriteSubmitted` on apply, so the apply gate stayed open while
+    // the carrier obligation was still owed. Nothing here reaches a live provider;
+    // the schedule is expressed over the same release path production uses, so the
+    // convergence claim rests on the branch decisions rather than on a fixture.
+    #[test]
+    fn drop_after_carrier_publication_before_canonical_apply_converges() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-drop-schedule", "install-drop-schedule");
+        let batch = scoped_batch("dest-drop-schedule", "op-drop-schedule");
+
+        // --- incarnation 1: carriers published and answered, then dropped ---
+        //
+        // The first guard records exactly what the two provider-write stages
+        // observed before the future is abandoned: the carrier stage reached
+        // `ResponseObserved` (the provider answered the publication) and the
+        // apply stage never left `NoWriteSubmitted`, because the drop happened
+        // before `RESTORE_OPERATION_APPLY` was ever handed to the transport.
+        forget_slot(&batch, &config);
+        let mut first = acquire_guard(&batch, &config);
+        first
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CarrierPublication);
+        first
+            .exposure
+            .note_response_observed(RestoreWriteStage::CarrierPublication);
+        drop(first);
+
+        let after_drop = slot_for(&batch, &config).expect("the dropped slot is retained");
+        assert!(
+            !after_drop.running,
+            "Drop must release this incarnation's local running claim"
+        );
+        assert_eq!(
+            after_drop.effect_state.carrier,
+            RestoreEffectState::ResponseObserved,
+            "the abandoned carrier write is retained as an owed reconciliation"
+        );
+        assert_eq!(
+            after_drop.effect_state.apply,
+            RestoreEffectState::NoWriteSubmitted,
+            "the canonical apply was never entered by the dropped incarnation"
+        );
+
+        // --- incarnation 2: the exact retry decisions, in production order ---
+        //
+        // The slot is NOT forgotten here: that is the whole point of the schedule.
+        // The retry acquires the SAME owner-scoped slot, so `acquire` reuses it
+        // (Work item 6) and the new guard inherits the abandoned carrier stage
+        // beside its own fresh one. A `forget_slot` here would delete the very
+        // obligation this case exists to follow, and the test would silently pass
+        // on a fresh slot instead.
+        let mut retry = acquire_guard(&batch, &config);
+        let inherited = retry.exposure;
+
+        // Step 1 — the apply gate at `apply_canonical_batch` reads the MERGED
+        // apply stage. `NoWriteSubmitted` is not unproven, so the retry is NOT
+        // refused here as a permanent local UNKNOWN. This is the first half of the
+        // convergence: an absent final record plus "apply never entered" leaves
+        // the apply stage exactly where it was.
+        assert!(
+            !inherited.apply_stage().is_unproven(),
+            "a canonical apply that was never entered must not block the retry"
+        );
+
+        // Step 2 — the carrier decision runs at `resolve_carrier_stage` and is
+        // asked BEFORE any provider read. The inherited stage owes a readback, so
+        // the function does not take the republication shortcut.
+        assert!(
+            carrier_stage_requires_readback(inherited),
+            "an inherited carrier ResponseObserved stage owes an exact readback"
+        );
+
+        // Step 3 — that bounded exact readback returns the rows this operation
+        // published, so the carrier stage is discharged and the publication is
+        // SKIPPED entirely: the retry performs no second carrier mutation.
+        // Step 3 — that bounded exact readback returns the rows this operation
+        // published, so the carrier stage is discharged and the publication is
+        // SKIPPED entirely: the retry performs no second carrier mutation.
+        //
+        // The notes are applied to the GUARD's own exposure, not to a local copy,
+        // because `complete` releases the guard's exposure and nothing else. A
+        // local copy would let this case pass its own assertions while the
+        // released slot still carried the abandoned carrier uncertainty.
+        retry.exposure.note_carrier_verified();
+        let settled = retry.exposure;
+        assert_eq!(
+            settled.carrier_stage(),
+            RestoreEffectState::DurableResultVerified
+        );
+        assert_eq!(
+            settled.apply_stage(),
+            RestoreEffectState::NoWriteSubmitted,
+            "carrier settlement is evidence about the carrier stage alone"
+        );
+
+        // Step 4 — with the carrier stage proved and the apply stage still owed a
+        // write nobody has performed, the pair is not "anything unproven", so the
+        // cancellation gate at `check_cancellation` no longer reports the
+        // abandoned carrier exposure as a standing unknown.
+        assert!(
+            !retry.exposure.state().any_unproven(),
+            "after exact carrier settlement the pair owes only the pending apply"
+        );
+
+        // Step 5 — the retry then performs the canonical apply exactly once and
+        // discharges it from its own durable record, which is the only evidence
+        // that settles that stage.
+        retry
+            .exposure
+            .note_write_may_be_submitted(RestoreWriteStage::CanonicalApply);
+        retry.exposure.note_apply_verified();
+        assert_eq!(
+            retry.exposure.apply_stage(),
+            RestoreEffectState::DurableResultVerified
+        );
+        assert!(
+            !retry.exposure.state().any_unproven(),
+            "both stages settled: the slot owes nothing and may be evicted"
+        );
+
+        // The retry's own release therefore evicts rather than retains, which is
+        // the observable end of "repeated cancellations cannot permanently consume
+        // every slot solely through abandoned exposure".
+        assert!(
+            retry.complete(None).is_ok(),
+            "a retry that settles both stages must release cleanly"
+        );
+        assert!(
+            slot_for(&batch, &config).is_none(),
+            "a fully settled slot is evicted, so the identity is not consumed"
+        );
+    }
+
     // WORK_UNIT_CASE: 2666/1 — component-wise merge, never a derived lexicographic max.
     #[test]
     fn stage_merge_keeps_both_maxima_instead_of_absorbing_the_apply_uncertainty() {
