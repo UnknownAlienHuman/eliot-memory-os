@@ -312,9 +312,7 @@ enum ActivationStage {
     /// The Kernel returned a valid ticket and the resolve-wait step is
     /// outstanding. `ticket_id` is the ORIGINAL claimed identity, retained
     /// verbatim; there is no result digest because none exists.
-    ClaimedWaiting {
-        ticket_id: String,
-    },
+    ClaimedWaiting { ticket_id: String },
     /// Semantic resolution produced a result and the submit step is
     /// outstanding. Both identities are real and are carried verbatim.
     ResolvedSubmitting(RetainedActivationIdentity),
@@ -1045,10 +1043,7 @@ pub(super) fn run() -> Result<(), String> {
         // activation whose terminal disposition the daemon cannot prove - while
         // the message names the ticket and states that no result digest exists,
         // so the record cannot be read as a submit that happened.
-        (
-            Ok(RunLoopExit::ShutdownActivationClaimedUnknown { ticket_id, detail }),
-            Ok(()),
-        ) => {
+        (Ok(RunLoopExit::ShutdownActivationClaimedUnknown { ticket_id, detail }), Ok(())) => {
             shutdown_activation_unknown = true;
             Err(report_terminal_failure(
                 &kernel,
