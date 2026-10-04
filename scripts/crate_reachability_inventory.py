@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol
 
 SCHEMA: Final = "eliot.crate-reachability-inventory.v1"
-TOOL_VERSION: Final = "0.2.0"
+TOOL_VERSION: Final = "0.2.1"
 OUTPUT_ROOT: Final = ".eliot"
 
 # Issue #1720 extends the #1133 inventory with a checked CrateExtractionDecision
@@ -299,6 +299,17 @@ class SourceFileEvidence:
     # absent from ``identifiers`` is referenced by documentation or a string only and
     # is therefore not a source-level construction of the capability.
     raw_identifiers: tuple[str, ...] = ()
+    # Code identifiers inside a test-only attributed item. Kept separately so a
+    # `#[cfg(test)]` or `#[test]` construction in src remains visible as test
+    # evidence without entering the production identifier set.
+    test_identifiers: tuple[str, ...] = ()
+    # Original-coordinate, comment/literal-masked code view after test-only items
+    # are removed. Internal admission checks use it to bind a named consumer to
+    # a production source reference; it is never serialized as source content.
+    production_source: str = dataclasses.field(default="", repr=False, compare=False)
+    # Code view of the test-only attributed items in production files, or the full
+    # code view for files whose declared source scope is test/example/bench.
+    test_source: str = dataclasses.field(default="", repr=False, compare=False)
 
     def to_json(self) -> dict[str, Any]:
         """Project evidence for the report.
@@ -316,6 +327,7 @@ class SourceFileEvidence:
             "public_items": self.public_items,
             "test_attributes": self.test_attributes,
             "identifiers": list(self.identifiers),
+            "test_identifiers": list(self.test_identifiers),
         }
 
 
@@ -327,22 +339,67 @@ TEXT_INDICATORS: Final[tuple[tuple[str, str], ...]] = (
     ("skeleton", "SKELETON_LANGUAGE"),
     ("contract-only", "CONTRACT_ONLY_LANGUAGE"),
     ("not yet implemented", "NOT_IMPLEMENTED_LANGUAGE"),
+    ("no-op", "NO_OP_ADAPTER_LANGUAGE"),
+    ("no_op", "NO_OP_ADAPTER_LANGUAGE"),
+    ("unavailable", "UNAVAILABLE_ADAPTER_LANGUAGE"),
 )
 
 CODE_INDICATORS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
-    (re.compile(r"\btodo\s*!\s*\("), "TODO_MACRO"),
-    (re.compile(r"\bunimplemented\s*!\s*\("), "UNIMPLEMENTED_MACRO"),
+    (re.compile(r"\btodo\s*!\s*[({\[]"), "TODO_MACRO"),
+    (re.compile(r"\bunimplemented\s*!\s*[({\[]"), "UNIMPLEMENTED_MACRO"),
+    (re.compile(r"\bpanic\s*!\s*[({\[]"), "PANIC_MACRO"),
+    (re.compile(r"\bcompile_error\s*!\s*[({\[]"), "COMPILE_ERROR_MACRO"),
     (re.compile(r"\b(?:std\s*::\s*process\s*::\s*)?Command\s*::\s*new\s*\("), "DIRECT_PROCESS_COMMAND"),
     (re.compile(r"\bunsafe\b"), "UNSAFE_CODE"),
     (re.compile(r"#!?\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]"), "DEAD_CODE_ALLOW"),
     (re.compile(r"\bserde_json\s*::\s*Value\b"), "GENERIC_JSON_VALUE"),
     (re.compile(r"\boperation\s*:\s*String\b"), "GENERIC_STRING_OPERATION"),
     (re.compile(r"\bprocess\s*::\s*exit\s*\(\s*78\s*\)"), "EXPLICIT_ADMISSION_EXIT"),
+    (
+        re.compile(r"\bprocess\s*::\s*exit\s*\(\s*(?!78\s*\))[^)]*\)"),
+        "PROCESS_EXIT",
+    ),
+    (re.compile(r"\bno[_-]?op\b", re.IGNORECASE), "NO_OP_MARKER"),
+    (re.compile(r"\b(?:unavailable|unsupported)\b", re.IGNORECASE), "UNAVAILABLE_OR_UNSUPPORTED_MARKER"),
+    (
+        re.compile(
+            r"\buse\b[^;]*\b(?:process|std\s*::\s*process|core\s*::\s*process|"
+            r"tokio\s*::\s*process)\b[^;]*;",
+            re.IGNORECASE,
+        ),
+        "PROCESS_IMPORT",
+    ),
+    (
+        re.compile(
+            r"\buse\b[^;]*(?:\b(?:net|network|std\s*::\s*net|core\s*::\s*net|"
+            r"tokio\s*::\s*net|async_std\s*::\s*net)\b|"
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:net|network)\w*\b)[^;]*;",
+            re.IGNORECASE,
+        ),
+        "NETWORK_IMPORT",
+    ),
+    (
+        re.compile(
+            r"\buse\b[^;]*(?:\b(?:fs|filesystem|std\s*::\s*fs|core\s*::\s*fs|"
+            r"tokio\s*::\s*fs|async_std\s*::\s*fs)\b|"
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:fs|filesystem)\w*\b)[^;]*;",
+            re.IGNORECASE,
+        ),
+        "FILESYSTEM_IMPORT",
+    ),
+    (
+        re.compile(
+            r"\buse\b[^;]*(?:\bstore\b|\bprovider\b|"
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:store|provider)\w*\b)[^;]*;",
+            re.IGNORECASE,
+        ),
+        "STORE_OR_PROVIDER_IMPORT",
+    ),
 )
 
 PUBLIC_ITEM_RE: Final = re.compile(
     r"\bpub(?:\s*\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+)*"
-    r"(?:struct|enum|trait|fn|type|const|static|mod)\b"
+    r"(?:struct|enum|trait|fn|type|const|static|mod|use)\b"
 )
 TEST_ATTRIBUTE_RE: Final = re.compile(r"#\s*\[\s*(?:tokio\s*::\s*)?test(?:\s*\([^]]*\))?\s*\]")
 IDENTIFIER_RE: Final = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
@@ -351,6 +408,26 @@ _CHAR_PATTERN: Final = re.compile(
     r"^(?:b)?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]{1,6}\}|\\[\\'\"0ntre]|[^\\'\n\r])'"
 )
 _LIFETIME_PATTERN: Final = re.compile(r"^'[a-zA-Z_][a-zA-Z0-9_]*")
+_ATTRIBUTE_START_RE: Final = re.compile(r"#!?\s*\[")
+_CFG_TEST_ATTRIBUTE_RE: Final = re.compile(r"#!?\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+_TEST_ITEM_ATTRIBUTE_RE: Final = re.compile(
+    r"#!?\s*\[\s*(?:tokio\s*::\s*)?test(?:\s*\([^]]*\))?\s*\]"
+)
+_PLATFORM_CFG_ATTRIBUTE_RE: Final = re.compile(
+    r"#!?\s*\[\s*cfg\s*\([^]]*\b"
+    r"(?:target_os|target_arch|target_env|target_family|target_vendor|windows|unix)\b"
+    r"[^]]*\)\s*\]"
+)
+_NEGATED_PLATFORM_CFG_RE: Final = re.compile(
+    r"\bnot\s*\(\s*(?:target_os|target_arch|target_env|target_family|target_vendor|windows|unix)\b",
+    re.IGNORECASE,
+)
+_FAIL_CLOSED_PLATFORM_RE: Final = re.compile(
+    r"\b(?:compile_error|panic|todo|unimplemented)\s*!\s*[({\[]|"
+    r"\bprocess\s*::\s*exit\s*\(|"
+    r"\b(?:unavailable|unsupported|not[_-]?supported|not[_-]?available)\b.*\bErr\s*\(",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _sha256(data: bytes) -> str:
@@ -683,62 +760,91 @@ def _tracked_manifests(root: Path, runner: Runner) -> tuple[str, ...]:
     return unique
 
 
-def _remove_created_lockfile(lock_path: Path, *, existed_before: bool) -> None:
-    """Delete a Cargo.lock created as a side effect of unlocked metadata.
-
-    `cargo metadata` without `--locked` resolves and writes the adjacent
-    lockfile. The inventory is read-only evidence (A12): a lockfile that did
-    not exist before the call must not survive it. A pre-existing lockfile,
-    symlink, or directory is never touched.
-    """
-    if existed_before:
-        return
-    if lock_path.is_symlink() or not lock_path.is_file():
-        return
-    try:
-        lock_path.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise InventoryError(
-            "LOCKFILE_CLEANUP_FAILED",
-            f"cannot remove cargo-created lockfile: {lock_path}",
-        ) from exc
-
-
 def _metadata(root: Path, runner: Runner, manifest: str | None = None) -> MetadataGraph:
-    manifest_dir = (root / manifest).parent if manifest is not None else root
-    lock_path = manifest_dir / "Cargo.lock"
-    lockfile_exists = lock_path.exists()
-    argv: list[str] = ["cargo", "metadata"]
-    if lockfile_exists:
-        argv.append("--locked")
-    argv.extend(("--offline", "--all-features", "--format-version", "1"))
+    argv: list[str] = [
+        "cargo",
+        "metadata",
+        "--locked",
+        "--offline",
+        "--all-features",
+        "--format-version",
+        "1",
+    ]
     if manifest is not None:
         argv.extend(("--manifest-path", manifest))
-    try:
-        raw = runner.run(root, tuple(argv))
-    finally:
-        _remove_created_lockfile(lock_path, existed_before=lockfile_exists)
+    raw = runner.run(root, tuple(argv))
     value = _json_object(raw, source="cargo metadata")
     packages = value.get("packages")
     members = value.get("workspace_members")
-    defaults = value.get("workspace_default_members", [])
+    defaults = value.get("workspace_default_members")
     workspace_root = value.get("workspace_root")
-    if not isinstance(packages, list) or not isinstance(members, list) or not isinstance(defaults, list):
+    if (
+        not isinstance(packages, list)
+        or any(not isinstance(item, dict) for item in packages)
+        or not isinstance(members, list)
+        or any(not isinstance(item, str) or not item for item in members)
+        or not isinstance(defaults, list)
+        or any(not isinstance(item, str) or not item for item in defaults)
+    ):
         raise InventoryError("MALFORMED_METADATA", "cargo metadata package/member arrays are missing")
-    if not isinstance(workspace_root, str):
+    if len(set(members)) != len(members) or len(set(defaults)) != len(defaults):
+        raise InventoryError("MALFORMED_METADATA", "workspace member identities contain duplicates")
+    if not isinstance(workspace_root, str) or not workspace_root.strip():
         raise InventoryError("MALFORMED_METADATA", "cargo metadata workspace_root is missing")
+    workspace_root_path = Path(workspace_root)
+    if not workspace_root_path.is_absolute():
+        raise InventoryError("MALFORMED_METADATA", "cargo metadata workspace_root is not absolute")
+    workspace_root_path = _inside(root, workspace_root_path)
+    if manifest is None:
+        if workspace_root_path != root:
+            raise InventoryError("MALFORMED_METADATA", "root metadata workspace_root does not match repository root")
+    else:
+        selected_manifest = _inside(root, root / manifest)
+        selected_directory = selected_manifest.parent
+        if workspace_root_path != root:
+            try:
+                selected_directory.relative_to(workspace_root_path)
+            except ValueError as exc:
+                raise InventoryError(
+                    "MALFORMED_METADATA",
+                    "standalone metadata workspace_root does not contain the selected manifest",
+                ) from exc
+            workspace_manifest = _inside(root, workspace_root_path / "Cargo.toml")
+            workspace_document = _read_toml(root, workspace_manifest)
+            if not isinstance(workspace_document.get("workspace"), dict):
+                raise InventoryError(
+                    "MALFORMED_METADATA",
+                    "standalone metadata workspace_root has no workspace manifest",
+                )
+    package_ids: set[str] = set()
+    for package in packages:
+        package_id = package.get("id")
+        manifest_path = package.get("manifest_path")
+        if (
+            not isinstance(package_id, str)
+            or not package_id.strip()
+            or not isinstance(manifest_path, str)
+            or not manifest_path.strip()
+        ):
+            raise InventoryError("MALFORMED_METADATA", "cargo metadata package identity is incomplete")
+        if package_id in package_ids:
+            raise InventoryError("DUPLICATE_PACKAGE_KEY", f"duplicate metadata package id: {package_id}")
+        package_ids.add(package_id)
+    if not set(members).issubset(package_ids) or not set(defaults).issubset(set(members)):
+        raise InventoryError("MALFORMED_METADATA", "workspace member identities do not match package identities")
+    resolve = value.get("resolve")
+    if not isinstance(resolve, dict):
+        raise InventoryError("MALFORMED_METADATA", "cargo metadata resolve graph is missing or unresolved")
     graph_manifest = manifest or "Cargo.toml"
     return MetadataGraph(
         graph_id=_sha256(_canonical_bytes({"manifest": graph_manifest, "workspace_root": workspace_root})),
         manifest_path=graph_manifest.replace("\\", "/"),
         workspace_root=workspace_root,
-        workspace_members=tuple(str(item) for item in members),
-        workspace_default_members=tuple(str(item) for item in defaults),
-        packages=tuple(item for item in packages if isinstance(item, dict)),
-        resolve=value.get("resolve") if isinstance(value.get("resolve"), dict) else None,
-        locked=lockfile_exists,
+        workspace_members=tuple(members),
+        workspace_default_members=tuple(defaults),
+        packages=tuple(packages),
+        resolve=resolve,
+        locked=True,
     )
 
 
@@ -870,7 +976,12 @@ def _manifest_paths_from_graph(root: Path, graph: MetadataGraph) -> dict[str, Ma
     for package in graph.packages:
         manifest_path = package.get("manifest_path")
         package_id = package.get("id")
-        if not isinstance(manifest_path, str) or not isinstance(package_id, str):
+        if (
+            not isinstance(manifest_path, str)
+            or not manifest_path.strip()
+            or not isinstance(package_id, str)
+            or not package_id.strip()
+        ):
             raise InventoryError("MALFORMED_METADATA", "package id/manifest_path is missing")
         path = Path(manifest_path)
         try:
@@ -912,39 +1023,91 @@ def _package_key(graph: MetadataGraph, package_id: str) -> str:
 
 def _dependency_edges(graph: MetadataGraph) -> list[dict[str, Any]]:
     if graph.resolve is None:
-        return []
+        raise InventoryError("MALFORMED_METADATA", "metadata dependency graph is unresolved")
     nodes = graph.resolve.get("nodes")
     if not isinstance(nodes, list):
         raise InventoryError("MALFORMED_METADATA", "resolve.nodes is missing")
     edges: list[dict[str, Any]] = []
+    node_ids: set[str] = set()
+    dependency_ids: set[str] = set()
     for node in nodes:
-        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+        if (
+            not isinstance(node, dict)
+            or not isinstance(node.get("id"), str)
+            or not node.get("id", "").strip()
+        ):
             raise InventoryError("MALFORMED_METADATA", "resolve node id is missing")
         source_id = node["id"]
-        deps = node.get("deps", [])
+        if source_id in node_ids:
+            raise InventoryError("MALFORMED_METADATA", f"duplicate resolve node id: {source_id}")
+        node_ids.add(source_id)
+        deps = node.get("deps")
         if not isinstance(deps, list):
             raise InventoryError("MALFORMED_METADATA", "resolve node deps is malformed")
         for dep in deps:
-            if not isinstance(dep, dict) or not isinstance(dep.get("pkg"), str):
+            if (
+                not isinstance(dep, dict)
+                or not isinstance(dep.get("pkg"), str)
+                or not dep.get("pkg", "").strip()
+            ):
                 raise InventoryError("MALFORMED_METADATA", "resolve dependency package is missing")
-            dep_kinds = dep.get("dep_kinds", [])
+            dependency_ids.add(dep["pkg"])
+            dep_kinds = dep.get("dep_kinds")
             if not isinstance(dep_kinds, list) or not dep_kinds:
-                dep_kinds = [{"kind": None, "target": None}]
+                raise InventoryError("MALFORMED_METADATA", "resolve dependency kinds are missing")
             for dep_kind in dep_kinds:
                 if not isinstance(dep_kind, dict):
                     raise InventoryError("MALFORMED_METADATA", "dependency kind is malformed")
-                kind = dep_kind.get("kind") or "normal"
+                kind = dep_kind.get("kind")
+                if kind is None:
+                    kind = "normal"
+                elif not isinstance(kind, str) or not kind:
+                    raise InventoryError("MALFORMED_METADATA", "dependency kind name is malformed")
+                if kind not in {"normal", "build", "dev"}:
+                    raise InventoryError("MALFORMED_METADATA", f"unsupported dependency kind: {kind!r}")
                 target = dep_kind.get("target")
+                if target is not None and (
+                    not isinstance(target, str) or not target.strip()
+                ):
+                    raise InventoryError("MALFORMED_METADATA", "dependency target predicate is malformed")
+                dependency_name = dep.get("name")
+                if (
+                    not isinstance(dependency_name, str)
+                    or not dependency_name.strip()
+                    or len(dependency_name) > 256
+                ):
+                    raise InventoryError("MALFORMED_METADATA", "resolve dependency name is missing")
                 edges.append(
                     {
                         "graph_id": graph.graph_id,
                         "from_package": _package_key(graph, source_id),
                         "to_package": _package_key(graph, dep["pkg"]),
-                        "dependency_name": _bounded_text(dep.get("name", ""), 256),
-                        "kind": str(kind),
-                        "target": str(target) if target is not None else None,
+                        "dependency_name": dependency_name,
+                        "kind": kind,
+                        "target": target,
                     }
                 )
+    package_ids: set[str] = set()
+    for package in graph.packages:
+        if (
+            not isinstance(package, dict)
+            or not isinstance(package.get("id"), str)
+            or not package.get("id", "").strip()
+        ):
+            raise InventoryError("MALFORMED_METADATA", "metadata package id is missing")
+        package_id = package["id"]
+        if package_id in package_ids:
+            raise InventoryError("DUPLICATE_PACKAGE_KEY", f"duplicate metadata package id: {package_id}")
+        package_ids.add(package_id)
+    if not set(graph.workspace_members).issubset(package_ids) or not set(
+        graph.workspace_default_members
+    ).issubset(set(graph.workspace_members)):
+        raise InventoryError("MALFORMED_METADATA", "workspace member identities do not match package identities")
+    if node_ids != package_ids or not dependency_ids.issubset(package_ids):
+        raise InventoryError(
+            "MALFORMED_METADATA",
+            "resolve graph identities do not match metadata package identities",
+        )
     return sorted(
         edges,
         key=lambda item: (
@@ -970,6 +1133,203 @@ def _source_scope(manifest_dir: Path, path: Path) -> SourceScope:
     if relative.startswith("src/"):
         return SourceScope.PRODUCTION
     return SourceScope.UNKNOWN
+
+
+_IMPORT_ITEM_RE: Final = re.compile(
+    r"\b(?:(?:pub(?:\s*\([^)]*\))?)\s+)?use\s+(?P<use_tree>[^;]+);"
+    r"|\bextern\s+crate\s+(?P<extern_crate>[A-Za-z_]\w*)"
+    r"(?:\s+as\s+(?P<extern_alias>[A-Za-z_]\w*))?\s*;",
+    re.DOTALL,
+)
+_DIRECT_PATH_ROOT_RE: Final = re.compile(r"\b([A-Za-z_]\w*)\s*::\s*[A-Za-z_]\w*")
+
+
+def _split_use_tree(tree: str) -> tuple[str, str] | None:
+    opening = tree.find("{")
+    if opening < 0:
+        return None
+    depth = 0
+    for index in range(opening, len(tree)):
+        if tree[index] == "{":
+            depth += 1
+        elif tree[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return tree[:opening].strip(), tree[opening + 1 : index]
+    return None
+
+
+def _split_use_tree_items(value: str) -> tuple[str, ...]:
+    items: list[str] = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(value):
+        if char == "{":
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append(value[start:index].strip())
+            start = index + 1
+    tail = value[start:].strip()
+    if tail:
+        items.append(tail)
+    return tuple(items)
+
+
+def _use_tree_aliases(tree: str) -> tuple[tuple[str, str], ...]:
+    """Return bounded `(import-root, local-name)` pairs from one Rust use tree."""
+    tree = tree.strip()
+    grouped = _split_use_tree(tree)
+    if grouped is not None:
+        prefix, items = grouped
+        return tuple(
+            pair
+            for item in _split_use_tree_items(items)
+            for pair in _use_tree_aliases(prefix + item)
+        )
+    path, separator, alias = tree.rpartition(" as ")
+    if not separator:
+        path = tree
+        alias = ""
+    path = path.strip().lstrip(":")
+    root_match = re.match(r"([A-Za-z_]\w*)", path)
+    if root_match is None:
+        return ()
+    root = root_match.group(1)
+    if alias:
+        local_name = alias.strip()
+    else:
+        segments = [part.strip() for part in path.split("::") if part.strip()]
+        local_name = segments[-1] if segments else ""
+        if local_name == "self" and len(segments) > 1:
+            local_name = segments[-2]
+    if not re.fullmatch(r"[A-Za-z_]\w*", local_name) or local_name == "_":
+        return ()
+    return ((root, local_name),)
+
+
+def _imports_and_code(source: str) -> tuple[dict[str, set[str]], str]:
+    aliases_by_root: dict[str, set[str]] = defaultdict(set)
+    chars = list(source)
+    for match in _IMPORT_ITEM_RE.finditer(source):
+        if match.group("extern_crate"):
+            root = match.group("extern_crate")
+            alias = match.group("extern_alias") or root
+            aliases_by_root[root].add(alias)
+        else:
+            for root, alias in _use_tree_aliases(match.group("use_tree")):
+                aliases_by_root[root].add(alias)
+        for index in range(match.start(), match.end()):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+    return aliases_by_root, "".join(chars)
+
+
+def _function_parameter_bindings(code: str) -> set[str]:
+    """Return simple binding names from bounded function parameter lists."""
+    bindings: set[str] = set()
+    for function in re.finditer(r"\bfn\s+[A-Za-z_]\w*", code):
+        angle_depth = 0
+        opening = None
+        for index in range(function.end(), len(code)):
+            char = code[index]
+            if char == "<" and not (index > 0 and code[index - 1] == "-"):
+                angle_depth += 1
+            elif char == ">" and angle_depth:
+                angle_depth -= 1
+            elif char == "(" and angle_depth == 0:
+                opening = index
+                break
+            elif char in "{;":
+                break
+        if opening is None:
+            continue
+
+        round_depth = square_depth = brace_depth = angle_depth = 0
+        segments: list[str] = []
+        segment_start = opening + 1
+        closing = None
+        for index in range(opening + 1, len(code)):
+            char = code[index]
+            if char == "(":
+                round_depth += 1
+            elif char == ")":
+                if round_depth:
+                    round_depth -= 1
+                elif not (square_depth or brace_depth or angle_depth):
+                    segments.append(code[segment_start:index])
+                    closing = index
+                    break
+            elif char == "[":
+                square_depth += 1
+            elif char == "]" and square_depth:
+                square_depth -= 1
+            elif char == "{":
+                brace_depth += 1
+            elif char == "}" and brace_depth:
+                brace_depth -= 1
+            elif char == "<" and not (index > 0 and code[index - 1] == "-"):
+                angle_depth += 1
+            elif char == ">" and angle_depth:
+                angle_depth -= 1
+            elif char == "," and not (round_depth or square_depth or brace_depth or angle_depth):
+                segments.append(code[segment_start:index])
+                segment_start = index + 1
+        if closing is None:
+            continue
+
+        for segment in segments:
+            pattern = segment.split(":", 1)[0].strip()
+            match = re.fullmatch(
+                r"(?:&\s*(?:'[A-Za-z_]\w*\s*)?(?:mut\s+)?)?"
+                r"(?:(?:mut|ref)\s+)*(?P<name>self|[A-Za-z_]\w*)",
+                pattern,
+            )
+            if match is not None:
+                bindings.add(match.group("name"))
+    return bindings
+
+
+def _dependency_references_from_code(
+    code: str,
+    aliases_by_root: Mapping[str, set[str]],
+) -> set[str]:
+    references = set(_DIRECT_PATH_ROOT_RE.findall(code))
+    identifiers = set(IDENTIFIER_RE.findall(code))
+    parameter_bindings = _function_parameter_bindings(code)
+    type_module_shadows = {
+        match.group(1)
+        for match in re.finditer(
+            r"\b(?:struct|enum|union|trait|type|mod)\s+([A-Za-z_]\w*)\b", code
+        )
+    }
+    value_shadows = {
+        name
+        for match in _LOCAL_VALUE_SHADOW_RE.finditer(code)
+        for name in match.groups()
+        if name is not None
+    }
+    references.difference_update(type_module_shadows)
+    identifiers.difference_update(type_module_shadows | value_shadows | parameter_bindings)
+    alias_to_roots: dict[str, set[str]] = defaultdict(set)
+    for root, aliases in aliases_by_root.items():
+        for alias in aliases:
+            alias_to_roots[alias].add(root)
+    for root in tuple(references):
+        matches = alias_to_roots.get(root, set())
+        if matches:
+            references.remove(root)
+            if len(matches) == 1:
+                references.update(matches)
+    for alias, roots in alias_to_roots.items():
+        if alias in identifiers and len(roots) == 1:
+            references.update(roots)
+    return references
+
+
+def _source_dependency_references(source: str) -> set[str]:
+    return _scoped_source_dependency_references(source)
 
 
 def _mask_rust(text: str) -> str:
@@ -1054,8 +1414,251 @@ def _mask_rust(text: str) -> str:
     return "".join(chars)
 
 
+def _rust_attribute_end(masked: str, start: int) -> int | None:
+    """Return the end of one bracket-balanced Rust attribute, if bounded."""
+    match = _ATTRIBUTE_START_RE.match(masked, start)
+    if match is None:
+        return None
+    bracket = masked.find("[", start, match.end())
+    if bracket < 0:
+        return None
+    depth = 0
+    for index in range(bracket, len(masked)):
+        if masked[index] == "[":
+            depth += 1
+        elif masked[index] == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _rust_item_end(masked: str, start: int) -> int | None:
+    """Find a bounded item body or semicolon without treating nested syntax as one.
+
+    This deliberately handles only lexical delimiter structure needed to bound an
+    attributed item. It is not a Rust parser: ambiguous or unclosed headers return
+    ``None`` so test-only code can fail closed instead of leaking into production.
+    """
+    round_depth = 0
+    square_depth = 0
+    angle_depth = 0
+    brace_depth = 0
+    index = start
+    while index < len(masked):
+        char = masked[index]
+        if char == "(":
+            round_depth += 1
+        elif char == ")" and round_depth:
+            round_depth -= 1
+        elif char == "[":
+            square_depth += 1
+        elif char == "]" and square_depth:
+            square_depth -= 1
+        elif char == "<" and not (index > 0 and masked[index - 1] == "-"):
+            angle_depth += 1
+        elif char == ">" and angle_depth:
+            angle_depth -= 1
+        elif char == "{":
+            if not (round_depth or square_depth or angle_depth or brace_depth):
+                depth = 1
+                probe = index + 1
+                while probe < len(masked) and depth:
+                    if masked[probe] == "{":
+                        depth += 1
+                    elif masked[probe] == "}":
+                        depth -= 1
+                    probe += 1
+                return probe if depth == 0 else None
+            brace_depth += 1
+        elif char == "}" and brace_depth:
+            brace_depth -= 1
+        elif char == ";" and not (round_depth or square_depth or angle_depth or brace_depth):
+            return index + 1
+        elif char == "}" and not (round_depth or square_depth or angle_depth or brace_depth):
+            return None
+        index += 1
+    return None
+
+
+def _attributed_item_contexts(
+    masked: str,
+) -> tuple[list[tuple[int, int, str]], list[tuple[int, int, int, int]], tuple[str, ...]]:
+    """Find bounded test/platform-attributed items and retain test code separately.
+
+    Each context row is ``(attribute_start, item_end, disposition)``. Test-item
+    rows are ``(attribute_start, item_start, item_end, test_start)``; the final
+    field is retained for a uniform tuple shape and is currently the item start.
+    Attribute chains are parsed only when they directly govern a lexically bounded
+    item. Unknown ordinary attributes remain unknown; an unbounded ``cfg(test)``
+    item is an error so its constructor cannot contaminate production evidence.
+    """
+    contexts: list[tuple[int, int, str]] = []
+    test_items: list[tuple[int, int, int, int]] = []
+    test_identifiers: set[str] = set()
+    processed_attributes: set[int] = set()
+
+    for candidate in _ATTRIBUTE_START_RE.finditer(masked):
+        if candidate.start() in processed_attributes:
+            continue
+        attribute_start = candidate.start()
+        cursor = attribute_start
+        attributes: list[tuple[int, int, str]] = []
+        while True:
+            while cursor < len(masked) and masked[cursor].isspace():
+                cursor += 1
+            attribute_end = _rust_attribute_end(masked, cursor)
+            if attribute_end is None:
+                break
+            attributes.append((cursor, attribute_end, masked[cursor:attribute_end]))
+            processed_attributes.add(cursor)
+            cursor = attribute_end
+        if not attributes:
+            continue
+        while cursor < len(masked) and masked[cursor].isspace():
+            cursor += 1
+        item_start = cursor
+        cfg_test = any(_CFG_TEST_ATTRIBUTE_RE.fullmatch(raw) for _, _, raw in attributes)
+        test_item = any(_TEST_ITEM_ATTRIBUTE_RE.fullmatch(raw) for _, _, raw in attributes)
+        platform_guard = any(_PLATFORM_CFG_ATTRIBUTE_RE.fullmatch(raw) for _, _, raw in attributes)
+        if not (cfg_test or test_item or platform_guard):
+            continue
+
+        # Inner cfg(test) gates the complete source module rather than a following
+        # item. Bound it to the innermost declared module, or the file when this is
+        # the file-level inner attribute.
+        if cfg_test and any(raw.startswith("#!") for _, _, raw in attributes):
+            module_ranges = _inline_module_ranges(masked, _brace_pairs(masked))
+            scope_start, scope_end = _innermost_module_range(
+                attribute_start, len(masked), module_ranges
+            )
+            contexts.append((attribute_start, scope_end, "TEST_SCOPE"))
+            test_items.append((attribute_start, scope_start, scope_end, scope_start))
+            test_identifiers.update(IDENTIFIER_RE.findall(masked[scope_start:scope_end]))
+            continue
+
+        item_end = _rust_item_end(masked, item_start)
+        if item_end is None:
+            if cfg_test:
+                raise InventoryError(
+                    "MALFORMED_RUST_SOURCE",
+                    "unbounded #[cfg(test)] item: its source extent cannot be determined",
+                )
+            continue
+
+        if cfg_test or test_item:
+            contexts.append((attribute_start, item_end, "TEST_SCOPE"))
+            test_items.append((attribute_start, item_start, item_end, item_start))
+            test_identifiers.update(IDENTIFIER_RE.findall(masked[item_start:item_end]))
+        elif platform_guard and any(
+            _NEGATED_PLATFORM_CFG_RE.search(raw) for _, _, raw in attributes
+        ) and _FAIL_CLOSED_PLATFORM_RE.search(masked[item_start:item_end]):
+            contexts.append((attribute_start, item_end, "DELIBERATE_UNSUPPORTED_PLATFORM_GUARD"))
+
+    return contexts, test_items, tuple(sorted(test_identifiers))
+
+
+def _blank_cf_test_bodies(
+    masked: str,
+    test_items: Sequence[tuple[int, int, int, int]] | None = None,
+) -> str:
+    """Blank test-only attributed items while preserving line and column positions.
+
+    When no pre-parsed item spans are supplied, the same syntax-bounded item reader
+    used by finding classification computes them. An unbounded cfg(test) item raises
+    instead of leaking test-only identifiers into production consumers.
+    """
+    if test_items is None:
+        _, test_items, _ = _attributed_item_contexts(masked)
+    chars = list(masked)
+    for attribute_start, _, item_end, _ in test_items:
+        for index in range(attribute_start, item_end):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+    return "".join(chars)
+
+
+def _test_code_view(
+    masked: str,
+    test_items: Sequence[tuple[int, int, int, int]],
+) -> str:
+    """Keep only the code spans for test-only attributed items."""
+    selected = ["\n" if char == "\n" else "\r" if char == "\r" else " " for char in masked]
+    for _, item_start, item_end, _ in test_items:
+        selected[item_start:item_end] = masked[item_start:item_end]
+    # Module-scope imports are not constructions on their own, but they are
+    # needed to resolve the aliases a test-only item actually uses.
+    for match in _IMPORT_ITEM_RE.finditer(masked):
+        selected[match.start() : match.end()] = masked[match.start() : match.end()]
+    return "".join(selected)
+
+
+def _in_non_code(masked: str, text: str, index: int, length: int) -> bool:
+    """Whether an exact match span intersects a masked comment or literal body."""
+    return masked[index : index + length] != text[index : index + length]
+
+
+def _contextual_disposition(
+    scope: str,
+    text: str,
+    masked: str,
+    index: int,
+    length: int,
+    contexts: Sequence[tuple[int, int, str]],
+) -> tuple[str, str | None]:
+    """Classify marker context as evidence; every finding remains a reviewer lead."""
+    if _in_non_code(masked, text, index, length):
+        return "NON_CODE_MENTION", "DOCUMENTATION_OR_LITERAL_MENTION"
+    if scope in {SourceScope.TEST.value, SourceScope.EXAMPLE.value, SourceScope.BENCH.value}:
+        return "TEST_SCOPE", "TEST_FIXTURE_OR_NON_PRODUCTION_SCOPE"
+    covering = [disposition for start, end, disposition in contexts if start <= index < end]
+    if "TEST_SCOPE" in covering:
+        return "TEST_SCOPE", "TEST_FIXTURE_OR_NON_PRODUCTION_SCOPE"
+    if "DELIBERATE_UNSUPPORTED_PLATFORM_GUARD" in covering:
+        return "DELIBERATE_UNSUPPORTED_PLATFORM_GUARD", "UNSUPPORTED_PLATFORM_GUARD"
+    return "REVIEW_REQUIRED", None
+
+
 def _line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
+
+
+def _casefold_with_original_offsets(text: str) -> tuple[str, tuple[int, ...]]:
+    """Build a casefolded view whose positions map back to original code points."""
+    folded: list[str] = []
+    original_offsets: list[int] = []
+    for index, char in enumerate(text):
+        value = char.casefold()
+        folded.append(value)
+        original_offsets.extend([index] * len(value))
+    return "".join(folded), tuple(original_offsets)
+
+
+def _casefold_matches(
+    folded: str,
+    original_offsets: Sequence[int],
+    token: str,
+) -> Iterable[tuple[int, int]]:
+    """Yield exact original spans for a casefolded token, including expansions."""
+    needle = token.casefold()
+    start = 0
+    while needle:
+        match_start = folded.find(needle, start)
+        if match_start < 0:
+            return
+        folded_end = match_start + len(needle)
+        yield original_offsets[match_start], original_offsets[folded_end - 1] + 1
+        start = folded_end
+
+
+def _finding_location(text: str, start: int, end: int) -> dict[str, Any]:
+    line_start = text.rfind("\n", 0, start) + 1
+    return {
+        "line": _line_number(text, start),
+        "column": start - line_start + 1,
+        "byte_offset": len(text[:start].encode("utf-8")),
+        "span": text[start:end],
+    }
 
 
 def _line_excerpt(text: str, line: int) -> str:
@@ -1080,13 +1683,69 @@ def _nearest_instructions(root: Path, manifest_dir: Path) -> str | None:
             return None
 
 
-def _owner_issues(root: Path, manifest_dir: Path) -> tuple[int, ...]:
+def _instruction_evidence(
+    root: Path,
+    manifest_dir: Path,
+) -> tuple[str | None, str | None, tuple[int, ...]]:
+    """Bind nearest instructions, their bytes, and parsed references together."""
     instructions = _nearest_instructions(root, manifest_dir)
     if instructions is None:
-        return ()
+        return None, None, ()
     raw = _read_bytes(root, root / instructions, max_bytes=BOUNDS.max_source_file_bytes)
     text = raw.decode("utf-8", errors="replace")
-    return tuple(sorted({int(value) for value in re.findall(r"(?:issues/|#)(\d{1,7})", text)}))
+    issue_refs = tuple(sorted({int(value) for value in re.findall(r"(?:issues/|#)(\d{1,7})", text)}))
+    return instructions, _sha256(raw), issue_refs
+
+
+_I28_METADATA_FIELDS: Final[tuple[str, ...]] = (
+    "layer",
+    "purpose",
+    "source_maintenance_owner",
+    "functional_cell_refs",
+    "independent_proof_profile",
+    "contract_refs",
+    "component_contract_ref",
+)
+_EFFECT_ADAPTER_LEAD_CATEGORIES: Final = frozenset(
+    {
+        "PROCESS_IMPORT",
+        "DIRECT_PROCESS_COMMAND",
+        "NETWORK_IMPORT",
+        "FILESYSTEM_IMPORT",
+        "STORE_OR_PROVIDER_IMPORT",
+    }
+)
+_FAIL_CLOSED_LEAD_CATEGORIES: Final = frozenset(
+    {
+        "TODO_MACRO",
+        "UNIMPLEMENTED_MACRO",
+        "PANIC_MACRO",
+        "COMPILE_ERROR_MACRO",
+        "EXPLICIT_ADMISSION_EXIT",
+        "PROCESS_EXIT",
+        "NO_OP_MARKER",
+        "UNAVAILABLE_OR_UNSUPPORTED_MARKER",
+        "SKELETON_LANGUAGE",
+        "CONTRACT_ONLY_LANGUAGE",
+        "NOT_IMPLEMENTED_LANGUAGE",
+    }
+)
+
+
+def _eliot_metadata(package: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = package.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return {}
+    eliot = metadata.get("eliot")
+    return eliot if isinstance(eliot, Mapping) else {}
+
+
+def _capability_binding(
+    package: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy only declared I2.8 metadata; missing values remain absent."""
+    eliot = _eliot_metadata(package)
+    return {field: eliot[field] for field in _I28_METADATA_FIELDS if field in eliot}
 
 
 def _scan_sources(
@@ -1126,10 +1785,17 @@ def _scan_sources(
             raise InventoryError("INVALID_RUST_ENCODING", f"Rust source is not UTF-8: {_relative(root, path)}") from exc
         try:
             masked = _mask_rust(text)
+            contexts, test_items, test_identifiers = _attributed_item_contexts(masked)
+            production_masked = _blank_cf_test_bodies(masked, test_items)
         except InventoryError as exc:
             raise InventoryError(exc.code, f"{_relative(root, path)}: {exc.detail}") from exc
         scope = _source_scope(manifest_dir, path)
-        identifiers = tuple(sorted(set(IDENTIFIER_RE.findall(masked))))
+        test_source = (
+            masked
+            if scope in {SourceScope.TEST, SourceScope.EXAMPLE, SourceScope.BENCH}
+            else _test_code_view(masked, test_items)
+        )
+        identifiers = tuple(sorted(set(IDENTIFIER_RE.findall(production_masked))))
         evidence.append(
             SourceFileEvidence(
                 package_key=package_key,
@@ -1138,49 +1804,54 @@ def _scan_sources(
                 scope=scope.value,
                 sha256=_sha256(raw),
                 nonblank_loc=sum(1 for line in text.splitlines() if line.strip()),
-                public_items=len(PUBLIC_ITEM_RE.findall(masked)),
+                public_items=len(PUBLIC_ITEM_RE.findall(production_masked)),
                 test_attributes=len(TEST_ATTRIBUTE_RE.findall(masked)),
                 identifiers=identifiers,
                 raw_identifiers=tuple(sorted(set(IDENTIFIER_RE.findall(text)))),
+                test_identifiers=test_identifiers,
+                production_source=production_masked,
+                test_source=test_source,
             )
         )
+        lowered, original_offsets = _casefold_with_original_offsets(text)
         for token, category in TEXT_INDICATORS:
-            start = 0
-            lowered = text.casefold()
-            needle = token.casefold()
-            while True:
-                index = lowered.find(needle, start)
-                if index < 0:
-                    break
-                line = _line_number(text, index)
+            for index, end in _casefold_matches(lowered, original_offsets, token):
+                location = _finding_location(text, index, end)
+                disposition, contextual_class = _contextual_disposition(
+                    scope.value, text, masked, index, end - index, contexts
+                )
                 findings.append(
                     {
                         "package_key": package_key,
                         "path": _relative(root, path),
-                        "line": line,
+                        **location,
                         "scope": scope.value,
                         "category": category,
                         "token": token,
-                        "excerpt": _line_excerpt(text, line),
+                        "excerpt": _line_excerpt(text, location["line"]),
                         "source_sha256": _sha256(raw),
-                        "contextual_disposition": "REVIEW_REQUIRED",
+                        "contextual_disposition": disposition,
+                        "contextual_class": contextual_class,
                     }
                 )
-                start = index + len(needle)
         for pattern, category in CODE_INDICATORS:
             for match in pattern.finditer(masked):
-                line = _line_number(masked, match.start())
+                location = _finding_location(text, match.start(), match.end())
+                disposition, contextual_class = _contextual_disposition(
+                    scope.value, text, masked, match.start(), match.end() - match.start(), contexts
+                )
                 findings.append(
                     {
                         "package_key": package_key,
                         "path": _relative(root, path),
-                        "line": line,
+                        **location,
                         "scope": scope.value,
                         "category": category,
                         "token": _bounded_text(match.group(0), 128),
-                        "excerpt": _line_excerpt(text, line),
+                        "excerpt": _line_excerpt(text, location["line"]),
                         "source_sha256": _sha256(raw),
-                        "contextual_disposition": "REVIEW_REQUIRED",
+                        "contextual_disposition": disposition,
+                        "contextual_class": contextual_class,
                     }
                 )
         if len(findings) > BOUNDS.max_findings:
@@ -1249,7 +1920,8 @@ def _package_rows(
         reverse_edges[edge["to_package"]].append(edge)
         forward_edges[edge["from_package"]].append(edge)
 
-    token_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    production_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    non_production_consumers: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
     doc_only_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     source_by_package: dict[str, list[SourceFileEvidence]] = defaultdict(list)
     findings_by_package: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1264,14 +1936,58 @@ def _package_rows(
         findings_by_package[key].extend(package_findings)
         for file in evidence:
             code_only = set(file.identifiers)
+            test_only = set(file.test_identifiers)
             # Documentation/string-only references are tracked separately and must
             # never be promoted to a production construction of the capability.
-            for identifier in set(file.raw_identifiers) - code_only:
+            for identifier in set(file.raw_identifiers) - code_only - test_only:
                 doc_only_consumers[identifier].add((key, file.scope))
-            if file.scope not in {SourceScope.PRODUCTION.value, SourceScope.BUILD.value}:
-                continue
-            for identifier in code_only:
-                token_consumers[identifier].add((key, file.scope))
+            if file.scope == SourceScope.PRODUCTION.value:
+                production_refs = _source_dependency_references(file.production_source)
+                for edge in forward_edges.get(key, []):
+                    if edge["kind"] != "normal":
+                        continue
+                    alias = str(edge["dependency_name"]).replace("-", "_")
+                    if alias in production_refs:
+                        target = package_by_key.get(edge["to_package"])
+                        if target is not None:
+                            identifier = str(target.get("name", "")).replace("-", "_")
+                            production_consumers[identifier].add((key, file.scope))
+                test_refs = _source_dependency_references(file.test_source)
+                for edge in forward_edges.get(key, []):
+                    if edge["kind"] not in {"normal", "dev"}:
+                        continue
+                    alias = str(edge["dependency_name"]).replace("-", "_")
+                    if alias in test_refs:
+                        target = package_by_key.get(edge["to_package"])
+                        if target is not None:
+                            identifier = str(target.get("name", "")).replace("-", "_")
+                            non_production_consumers[identifier].add((key, file.scope, "CFG_TEST"))
+            elif file.scope == SourceScope.BUILD.value:
+                build_refs = _source_dependency_references(file.production_source)
+                for edge in forward_edges.get(key, []):
+                    if edge["kind"] != "build":
+                        continue
+                    alias = str(edge["dependency_name"]).replace("-", "_")
+                    if alias in build_refs:
+                        target = package_by_key.get(edge["to_package"])
+                        if target is not None:
+                            identifier = str(target.get("name", "")).replace("-", "_")
+                            production_consumers[identifier].add((key, file.scope))
+            elif file.scope in {
+                SourceScope.TEST.value,
+                SourceScope.EXAMPLE.value,
+                SourceScope.BENCH.value,
+            }:
+                test_refs = _source_dependency_references(file.test_source)
+                for edge in forward_edges.get(key, []):
+                    if edge["kind"] not in {"normal", "dev"}:
+                        continue
+                    alias = str(edge["dependency_name"]).replace("-", "_")
+                    if alias in test_refs:
+                        target = package_by_key.get(edge["to_package"])
+                        if target is not None:
+                            identifier = str(target.get("name", "")).replace("-", "_")
+                            non_production_consumers[identifier].add((key, file.scope, file.scope))
 
     for key, package in sorted(package_by_key.items()):
         graph = graph_by_key[key]
@@ -1279,8 +1995,9 @@ def _package_rows(
         package_name = str(package.get("name", ""))
         crate_identifier = package_name.replace("-", "_")
         source_consumers: list[dict[str, str]] = []
+        test_only_source_consumers: list[dict[str, str]] = []
         documentation_only_consumers: list[dict[str, str]] = []
-        for consumer_key, scope in sorted(token_consumers.get(crate_identifier, set())):
+        for consumer_key, scope in sorted(production_consumers.get(crate_identifier, set())):
             if consumer_key == key:
                 continue
             source_consumers.append({"package_key": consumer_key, "scope": scope})
@@ -1288,6 +2005,20 @@ def _package_rows(
                 raise InventoryError(
                     "SOURCE_CONSUMER_LIMIT",
                     f"source consumer count exceeds {BOUNDS.max_source_consumers_per_package}: {package_name}",
+                )
+        for consumer_key, scope, context in sorted(
+            non_production_consumers.get(crate_identifier, set())
+        ):
+            if consumer_key == key:
+                continue
+            test_only_source_consumers.append(
+                {"package_key": consumer_key, "scope": scope, "context": context}
+            )
+            if len(test_only_source_consumers) > BOUNDS.max_source_consumers_per_package:
+                raise InventoryError(
+                    "SOURCE_CONSUMER_LIMIT",
+                    f"non-production source consumer count exceeds "
+                    f"{BOUNDS.max_source_consumers_per_package}: {package_name}",
                 )
         for consumer_key, scope in sorted(doc_only_consumers.get(crate_identifier, set())):
             if consumer_key == key:
@@ -1297,23 +2028,48 @@ def _package_rows(
             reverse_edges.get(key, []),
             key=lambda item: (item["from_package"], item["kind"], item["target"] or ""),
         )
-        targets_raw = package.get("targets", [])
-        if not isinstance(targets_raw, list):
+        files = source_by_package.get(key, [])
+        targets_raw = package.get("targets")
+        if not isinstance(targets_raw, list) or not targets_raw:
             raise InventoryError("MALFORMED_METADATA", f"targets are malformed: {package_name}")
         targets: list[dict[str, Any]] = []
+        target_identities: set[tuple[str, tuple[str, ...], str]] = set()
+        scanned_source_paths = {file.path for file in files}
         has_binary = False
         for target in targets_raw:
             if not isinstance(target, dict):
                 raise InventoryError("MALFORMED_METADATA", f"target is malformed: {package_name}")
             kinds = target.get("kind", [])
             crate_types = target.get("crate_types", [])
-            if not isinstance(kinds, list) or not isinstance(crate_types, list):
+            target_name = target.get("name")
+            if (
+                not isinstance(target_name, str)
+                or not target_name.strip()
+                or len(target_name) > 256
+                or not isinstance(kinds, list)
+                or not kinds
+                or any(not isinstance(item, str) or not item for item in kinds)
+                or not isinstance(crate_types, list)
+                or any(not isinstance(item, str) or not item for item in crate_types)
+            ):
                 raise InventoryError("MALFORMED_METADATA", f"target kind is malformed: {package_name}")
             has_binary = has_binary or "bin" in kinds
+            required_features = target.get("required-features", [])
+            if (
+                not isinstance(required_features, list)
+                or any(not isinstance(item, str) or not item for item in required_features)
+            ):
+                raise InventoryError("MALFORMED_METADATA", f"target features are malformed: {package_name}")
+            for flag in ("doctest", "test", "bench"):
+                if flag in target and not isinstance(target[flag], bool):
+                    raise InventoryError("MALFORMED_METADATA", f"target {flag} flag is malformed: {package_name}")
+            edition = target.get("edition")
+            if not isinstance(edition, str) or not edition:
+                raise InventoryError("MALFORMED_METADATA", f"target edition is malformed: {package_name}")
             src_path = target.get("src_path")
             target_context = (
                 f"package {package_name!r} ({package.get('id')!r}), "
-                f"target {target.get('name')!r} (kind={kinds!r})"
+                f"target {target_name!r} (kind={kinds!r})"
             )
             if (
                 not isinstance(src_path, str)
@@ -1331,17 +2087,26 @@ def _package_rows(
                     exc.code,
                     f"{target_context}: invalid src_path {src_path!r}: {exc.detail}",
                 ) from exc
+            target_identity = (target_name, tuple(sorted(kinds)), relative_src)
+            if target_identity in target_identities:
+                raise InventoryError("MALFORMED_METADATA", f"duplicate target identity: {target_context}")
+            target_identities.add(target_identity)
+            if relative_src not in scanned_source_paths:
+                raise InventoryError(
+                    "MALFORMED_METADATA",
+                    f"{target_context}: target source is not present in bounded source evidence",
+                )
             targets.append(
                 {
-                    "name": _bounded_text(target.get("name", ""), 256),
+                    "name": target_name,
                     "kind": tuple(sorted(str(item) for item in kinds)),
                     "crate_types": tuple(sorted(str(item) for item in crate_types)),
-                    "edition": _bounded_text(target.get("edition", ""), 32),
+                    "edition": _bounded_text(edition, 32),
                     "src_path": relative_src,
-                    "required_features": tuple(sorted(str(item) for item in target.get("required-features", []) or [])),
-                    "doctest": bool(target.get("doctest", False)),
-                    "test": bool(target.get("test", False)),
-                    "bench": bool(target.get("bench", False)),
+                    "required_features": tuple(sorted(required_features)),
+                    "doctest": target.get("doctest", False),
+                    "test": target.get("test", False),
+                    "bench": target.get("bench", False),
                 }
             )
         dependency_kinds = {edge["kind"] for edge in rev}
@@ -1350,24 +2115,70 @@ def _package_rows(
         normal_consumers = [edge for edge in rev if edge["kind"] == "normal"]
         build_consumers = [edge for edge in rev if edge["kind"] == "build"]
         dev_consumers = [edge for edge in rev if edge["kind"] == "dev"]
+        production_consumer_keys = {
+            edge["from_package"] for edge in normal_consumers
+        } | {item["package_key"] for item in source_prod_consumers}
+        test_only_consumer_keys = {
+            edge["from_package"] for edge in dev_consumers
+        } | {item["package_key"] for item in test_only_source_consumers}
         if has_binary:
             reachability = Reachability.BINARY_ENTRYPOINT
         elif normal_consumers or source_prod_consumers:
             reachability = Reachability.PRODUCTION_CONSUMER
         elif build_consumers or source_build_consumers:
             reachability = Reachability.BUILD_ONLY
-        elif dev_consumers:
+        elif dev_consumers or test_only_source_consumers:
             reachability = Reachability.TEST_ONLY
         elif package.get("links") or ((package.get("metadata") or {}).get("eliot") or {}).get("dynamic_registration"):
             reachability = Reachability.UNRESOLVED_DYNAMIC
         else:
             reachability = Reachability.NO_CONSUMER
 
-        files = source_by_package.get(key, [])
         package_findings = findings_by_package.get(key, [])
         manifest_dir = (root / manifest).parent
-        instructions = _nearest_instructions(root, manifest_dir)
-        owner_issues = _owner_issues(root, manifest_dir)
+        instructions, instructions_sha256, owner_issues = _instruction_evidence(root, manifest_dir)
+        capability_binding = _capability_binding(package)
+        source_owner = capability_binding.get("source_maintenance_owner")
+        effect_adapter_leads = [
+            {
+                field: finding[field]
+                for field in (
+                    "path",
+                    "line",
+                    "column",
+                    "byte_offset",
+                    "category",
+                    "span",
+                    "source_sha256",
+                    "contextual_disposition",
+                    "contextual_class",
+                )
+            }
+            for finding in package_findings
+            if finding["scope"] == SourceScope.PRODUCTION.value
+            and finding["category"] in _EFFECT_ADAPTER_LEAD_CATEGORIES
+            and finding["contextual_disposition"] == "REVIEW_REQUIRED"
+        ]
+        fail_closed_leads = [
+            {
+                field: finding[field]
+                for field in (
+                    "path",
+                    "line",
+                    "column",
+                    "byte_offset",
+                    "category",
+                    "span",
+                    "source_sha256",
+                    "contextual_disposition",
+                    "contextual_class",
+                )
+            }
+            for finding in package_findings
+            if finding["scope"] == SourceScope.PRODUCTION.value
+            and finding["category"] in _FAIL_CLOSED_LEAD_CATEGORIES
+            and finding["contextual_disposition"] == "REVIEW_REQUIRED"
+        ]
         row = {
             "package_key": key,
             "graph_id": graph.graph_id,
@@ -1386,11 +2197,42 @@ def _package_rows(
             ),
             "reverse_dependency_edges": rev,
             "source_consumers": source_consumers,
+            "test_only_source_consumers": test_only_source_consumers,
             "documentation_only_consumers": documentation_only_consumers,
+            "consumer_summary": {
+                "production_source_consumers": len(source_prod_consumers),
+                "build_source_consumers": len(source_build_consumers),
+                "test_or_example_source_consumers": len(test_only_source_consumers),
+                "documentation_only_consumers": len(documentation_only_consumers),
+                "normal_dependency_edges": len(normal_consumers),
+                "build_dependency_edges": len(build_consumers),
+                "dev_dependency_edges": len(dev_consumers),
+                "production_consumers": len(production_consumer_keys),
+                "test_only_consumers": len(test_only_consumer_keys),
+                "no_consumers": int(
+                    not (
+                        production_consumer_keys
+                        or test_only_consumer_keys
+                        or source_build_consumers
+                        or build_consumers
+                    )
+                ),
+            },
+            "production_gap_evidence": {
+                "production_source_consumer_count": len(source_prod_consumers),
+                "effect_adapter_surface_status": "UNKNOWN_FROM_THIS_INVENTORY",
+                "effect_adapter_indicator_findings": effect_adapter_leads,
+                "production_fail_closed_findings": fail_closed_leads,
+                "source_maintenance_owner_status": (
+                    "DECLARED_OWNER"
+                    if isinstance(source_owner, str) and source_owner.strip()
+                    else "UNRESOLVED_OWNER"
+                ),
+            },
             "capability_construction": (
-                # The crate identifier appearing as a *code* identifier is the only
-                # signal that the public capability is constructed/called. A bare
-                # dependency edge never reaches this state.
+                # A source reference resolved through an incoming package's declared
+                # Cargo alias is the construction signal. A bare dependency edge
+                # never reaches this state.
                 "PRODUCTION_CONSTRUCTED"
                 if source_prod_consumers
                 else (
@@ -1398,7 +2240,7 @@ def _package_rows(
                     if source_build_consumers
                     else (
                         "TEST_ONLY"
-                        if any(item["scope"] == SourceScope.TEST.value for item in source_consumers)
+                        if test_only_source_consumers
                         else (
                             "DOCUMENTATION_ONLY"
                             if documentation_only_consumers
@@ -1429,11 +2271,14 @@ def _package_rows(
                 )
             ),
             "nearest_instructions": instructions,
+            "nearest_instructions_sha256": instructions_sha256,
             "owner_issue_refs_from_instructions": owner_issues,
+            "capability_binding": capability_binding,
             "support_axes": {
-                "contract_maturity": "UNKNOWN_FROM_THIS_INVENTORY",
-                "implementation_support": "SOURCE_SHAPE_OBSERVED_ONLY",
-                "evidence_execution_status": "NOT_EXECUTED_BY_THIS_INVENTORY",
+                "contract_maturity": "SKELETON",
+                "implementation_support": "CURRENT_UNVERIFIED" if files else "TARGET",
+                "evidence_execution_status": "NOT_EXECUTED",
+                "production_reachability": reachability.value,
                 "runtime_support": "UNKNOWN_FROM_THIS_INVENTORY",
                 "product_support": "UNKNOWN_FROM_THIS_INVENTORY",
             },
@@ -1462,7 +2307,15 @@ def _package_rows(
         sorted(rows, key=lambda item: (item["manifest_path"], item["package_id"], item["graph_id"])),
         manifest_rows,
         sorted(source_files, key=lambda item: (item.package_key, item.scope, item.path)),
-        sorted(findings, key=lambda item: (item["package_key"], item["path"], item["line"], item["category"])),
+        sorted(
+            findings,
+            key=lambda item: (
+                item["package_key"],
+                item["path"],
+                item["byte_offset"],
+                item["category"],
+            ),
+        ),
     )
 
 
@@ -1667,6 +2520,14 @@ def classify_unreachable_packages(
                 # evaluation date, never against a wall clock.
                 pass
 
+        owner_issue_refs = list(row.get("owner_issue_refs_from_instructions") or [])
+        decision_owner = (record.owner or record.review_owner) if record is not None else None
+        owner_status = (
+            "DECLARED_OWNER"
+            if isinstance(decision_owner, str) and decision_owner.strip()
+            else "UNRESOLVED_OWNER"
+        )
+
         if record is not None:
             classification = {
                 "package": name,
@@ -1678,6 +2539,8 @@ def classify_unreachable_packages(
                 "admitted": not defects,
                 "defects": sorted(set(defects)),
                 "record": record.to_json(),
+                "instruction_issue_refs": owner_issue_refs,
+                "owner_status": owner_status,
             }
         else:
             classification = {
@@ -1690,6 +2553,8 @@ def classify_unreachable_packages(
                 "admitted": False,
                 "defects": sorted(set(defects)),
                 "record": None,
+                "instruction_issue_refs": owner_issue_refs,
+                "owner_status": owner_status,
             }
         classifications.append(classification)
         if classification["defects"]:
@@ -1700,6 +2565,8 @@ def classify_unreachable_packages(
                     "reachability": classification["reachability"],
                     "capability_construction": classification["capability_construction"],
                     "classification": classification["classification"],
+                    "instruction_issue_refs": classification["instruction_issue_refs"],
+                    "owner_status": classification["owner_status"],
                     "defects": classification["defects"],
                 }
             )
@@ -1728,6 +2595,9 @@ def reconciliation_map(inventory: Mapping[str, Any]) -> list[dict[str, Any]]:
     extraction = inventory.get("extraction_classification") or {}
     admission = inventory.get("capability_admission") or {}
     by_package = {item.get("package"): item for item in extraction.get("classifications", [])}
+    admission_by_package = {
+        item.get("package"): item for item in admission.get("classifications", [])
+    }
     items: list[dict[str, Any]] = []
     for defect in extraction.get("admission_defects", []):
         name = str(defect.get("package"))
@@ -1749,6 +2619,8 @@ def reconciliation_map(inventory: Mapping[str, Any]) -> list[dict[str, Any]]:
     for defect in admission.get("admission_defects", []):
         name = str(defect.get("package"))
         record = defect.get("record") or {}
+        if not record and defect.get("admission_wave") is not None:
+            record = (admission_by_package.get(name) or {}).get("record") or {}
         owner = (
             record.get("evidence_status_and_review_owner") or ISSUE_1720_OWNER
         )
@@ -1865,12 +2737,221 @@ def _defines_function(root: Path, relative: str, symbol: str) -> bool:
     path = _inside(root, root / relative)
     if path.is_symlink() or not path.is_file():
         return False
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return re.search(rf"\bfn\s+{re.escape(symbol)}\s*\(", text) is not None
+    raw = _read_bytes(root, path, max_bytes=BOUNDS.max_source_file_bytes)
+    try:
+        masked = _mask_rust(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return False
+    return _function_source_span(masked, symbol) is not None
 
 
 def _declared_symbols(value: str) -> list[tuple[str, str]]:
     return [(match.group("path"), match.group("symbol")) for match in SYMBOL_REF_RE.finditer(value)]
+
+
+def _function_source_span(source: str, symbol: str) -> tuple[int, int] | None:
+    pattern = re.compile(rf"\bfn\s+{re.escape(symbol)}\b")
+    spans: list[tuple[int, int]] = []
+    for match in pattern.finditer(source):
+        end = _rust_item_end(source, match.start())
+        if end is not None and "{" in source[match.start() : end]:
+            spans.append((match.start(), end))
+    return spans[0] if len(spans) == 1 else None
+
+
+def _brace_pairs(source: str) -> dict[int, int]:
+    stack: list[int] = []
+    pairs: dict[int, int] = {}
+    for index, char in enumerate(source):
+        if char == "{":
+            stack.append(index)
+        elif char == "}" and stack:
+            pairs[stack.pop()] = index
+    return pairs
+
+
+def _inline_module_ranges(source: str, brace_pairs: Mapping[int, int]) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    for match in re.finditer(r"\bmod\s+[A-Za-z_]\w*\s*\{", source):
+        opening = source.rfind("{", match.start(), match.end())
+        closing = brace_pairs.get(opening)
+        if closing is not None:
+            ranges.append((opening + 1, closing))
+    return tuple(ranges)
+
+
+def _innermost_module_range(
+    index: int,
+    source_length: int,
+    module_ranges: Sequence[tuple[int, int]],
+) -> tuple[int, int]:
+    containing = [span for span in module_ranges if span[0] <= index < span[1]]
+    return min(containing, key=lambda span: span[1] - span[0]) if containing else (0, source_length)
+
+
+def _function_body_open(source: str, start: int, end: int) -> int | None:
+    round_depth = square_depth = angle_depth = 0
+    for index in range(start, end):
+        char = source[index]
+        if char == "(":
+            round_depth += 1
+        elif char == ")" and round_depth:
+            round_depth -= 1
+        elif char == "[":
+            square_depth += 1
+        elif char == "]" and square_depth:
+            square_depth -= 1
+        elif char == "<" and not (index > 0 and source[index - 1] == "-"):
+            angle_depth += 1
+        elif char == ">" and angle_depth:
+            angle_depth -= 1
+        elif char == "{" and not (round_depth or square_depth or angle_depth):
+            return index
+    return None
+
+
+def _module_import_source(source: str, function_span: tuple[int, int]) -> str:
+    """Keep imports in the selected function's module or directly in its body."""
+    function_start, function_end = function_span
+    brace_pairs = _brace_pairs(source)
+    module_ranges = _inline_module_ranges(source, brace_pairs)
+    module_pairs = {(start - 1, end) for start, end in module_ranges}
+    target_module = _innermost_module_range(function_start, len(source), module_ranges)
+    body_open = _function_body_open(source, function_start, function_end)
+    body_close = brace_pairs.get(body_open) if body_open is not None else None
+    selected = ["\n" if char == "\n" else "\r" if char == "\r" else " " for char in source]
+    for match in _IMPORT_ITEM_RE.finditer(source):
+        enclosing = [
+            (opening, closing)
+            for opening, closing in brace_pairs.items()
+            if opening < match.start() < closing
+        ]
+        if function_start <= match.start() < function_end:
+            # A function-local use is included only at the direct body scope.
+            if body_open is None or body_close is None or (body_open, body_close) not in enclosing:
+                continue
+            if any(
+                pair not in module_pairs
+                and pair != (body_open, body_close)
+                and not (pair[0] < function_start and function_end <= pair[1])
+                for pair in enclosing
+            ):
+                continue
+        else:
+            if _innermost_module_range(match.start(), len(source), module_ranges) != target_module:
+                continue
+            if any(pair not in module_pairs for pair in enclosing):
+                continue
+        selected[match.start() : match.end()] = source[match.start() : match.end()]
+    return "".join(selected)
+
+
+def _module_scope_parts(source: str) -> tuple[tuple[str, str], ...]:
+    """Return `(module imports, module code)` without sibling-module leakage."""
+    brace_pairs = _brace_pairs(source)
+    module_ranges = _inline_module_ranges(source, brace_pairs)
+    module_pairs = {(start - 1, end) for start, end in module_ranges}
+    scopes = ((0, len(source)), *module_ranges)
+    parts: list[tuple[str, str]] = []
+    for scope in scopes:
+        imports = ["\n" if char == "\n" else "\r" if char == "\r" else " " for char in source]
+        code = list(source)
+        if scope != (0, len(source)):
+            for index in range(0, scope[0]):
+                if code[index] not in "\r\n":
+                    code[index] = " "
+            for index in range(scope[1], len(source)):
+                if code[index] not in "\r\n":
+                    code[index] = " "
+        for nested in module_ranges:
+            if nested == scope or not (scope[0] <= nested[0] and nested[1] <= scope[1]):
+                continue
+            opening, closing = nested[0] - 1, nested[1]
+            for index in range(opening, closing + 1):
+                if code[index] not in "\r\n":
+                    code[index] = " "
+        for match in _IMPORT_ITEM_RE.finditer(source):
+            enclosing = [
+                (opening, closing)
+                for opening, closing in brace_pairs.items()
+                if opening < match.start() < closing
+            ]
+            in_scope = (
+                _innermost_module_range(match.start(), len(source), module_ranges) == scope
+                and all(pair in module_pairs for pair in enclosing)
+            )
+            if in_scope:
+                imports[match.start() : match.end()] = source[match.start() : match.end()]
+            for index in range(match.start(), match.end()):
+                if code[index] not in "\r\n":
+                    code[index] = " "
+        for function_match in re.finditer(r"\bfn\s+[A-Za-z_]\w*\b", source):
+            function_end = _rust_item_end(source, function_match.start())
+            if function_end is None:
+                continue
+            for index in range(function_match.start(), function_end):
+                if code[index] not in "\r\n":
+                    code[index] = " "
+        parts.append(("".join(imports), "".join(code)))
+    return tuple(parts)
+
+
+def _function_reference_source(source: str) -> str:
+    """Keep one function's code without attributing nested item bodies to it."""
+    chars = list(source)
+    for match in re.finditer(r"\bfn\s+[A-Za-z_]\w*\b", source):
+        if match.start() == 0:
+            continue
+        end = _rust_item_end(source, match.start())
+        if end is None:
+            continue
+        # The nested item still binds its name in the parent's value namespace.
+        # Keep that declaration head, but no parameters or body references.
+        for index in range(match.end(), end):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+        chars[match.end()] = ";"
+    return "".join(chars)
+
+
+def _scoped_source_dependency_references(source: str) -> set[str]:
+    references: set[str] = set()
+    for import_source, code_source in _module_scope_parts(source):
+        aliases_by_root, _ = _imports_and_code(import_source)
+        references.update(_dependency_references_from_code(code_source, aliases_by_root))
+    for match in re.finditer(r"\bfn\s+([A-Za-z_]\w*)\b", source):
+        end = _rust_item_end(source, match.start())
+        if end is None:
+            continue
+        span = (match.start(), end)
+        function_source = _function_reference_source(source[span[0] : span[1]])
+        module_imports = _module_import_source(source, span)
+        aliases_by_root, _ = _imports_and_code(module_imports)
+        _, function_code = _imports_and_code(function_source)
+        references.update(_dependency_references_from_code(function_code, aliases_by_root))
+    return references
+
+
+_LOCAL_VALUE_SHADOW_RE: Final = re.compile(
+    r"\bfn\s+([A-Za-z_]\w*)\b|\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\b"
+)
+
+
+def _source_uses_dependency(
+    source: str,
+    symbol: str,
+    dependency_aliases: Iterable[str],
+) -> bool:
+    """Require a named production function to use the declared supplier alias."""
+    span = _function_source_span(source, symbol)
+    if span is None:
+        return False
+    function_source = _function_reference_source(source[span[0] : span[1]])
+    module_imports = _module_import_source(source, span)
+    aliases_by_root, _ = _imports_and_code(module_imports)
+    _, function_code = _imports_and_code(function_source)
+    references = _dependency_references_from_code(function_code, aliases_by_root)
+    return bool(references & set(dependency_aliases))
 
 
 def _future_date(value: str, as_of: date) -> date | None:
@@ -1909,7 +2990,15 @@ def check_admission_decisions(
         if item.get("workspace_member")
     }
     owner_of_path = {item.path: item.package_name for item in source_files}
+    source_by_path = {item.path: item for item in source_files}
     name_by_key = {str(item["package_key"]): str(item["name"]) for item in packages}
+    package_keys_by_name: dict[str, set[str]] = defaultdict(set)
+    package_rows_by_name: dict[str, Mapping[str, Any]] = {}
+    for item in packages:
+        package_name = str(item["name"])
+        package_keys_by_name[package_name].add(str(item["package_key"]))
+        if item.get("workspace_member"):
+            package_rows_by_name[package_name] = item
     edges_by_package = {
         str(item["name"]): {
             name_by_key[str(edge["to_package"])]
@@ -1960,10 +3049,27 @@ def check_admission_decisions(
             consumers = _declared_symbols(record.first_real_consumer_or_time_bounded_migration_facade)
             if consumers:
                 for consumer_path, consumer_symbol in consumers:
+                    consumer_name = owner_of_path.get(consumer_path, "")
+                    consumer_row = package_rows_by_name.get(consumer_name)
+                    consumer_source = source_by_path.get(consumer_path)
+                    supplier_keys = package_keys_by_name.get(package, set())
+                    normal_aliases = {
+                        str(edge["dependency_name"]).replace("-", "_")
+                        for edge in (consumer_row or {}).get("dependency_edges", [])
+                        if edge.get("kind") == "normal"
+                        and str(edge.get("to_package")) in supplier_keys
+                    }
                     if (
                         not _defines_function(root, consumer_path, consumer_symbol)
-                        or owner_of_path.get(consumer_path) == package
-                        or package not in edges_by_package.get(owner_of_path.get(consumer_path, ""), set())
+                        or consumer_name == package
+                        or consumer_source is None
+                        or consumer_source.scope != SourceScope.PRODUCTION.value
+                        or not normal_aliases
+                        or not _source_uses_dependency(
+                            consumer_source.production_source,
+                            consumer_symbol,
+                            normal_aliases,
+                        )
                     ):
                         defects.append(AdmissionDefect.ADMISSION_CONSUMER_ABSENT.value)
                 consumer = ", ".join(f"{path}::{symbol}" for path, symbol in consumers)
