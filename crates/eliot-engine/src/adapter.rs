@@ -27,8 +27,14 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant, sleep};
 
 mod adapter_registry;
+mod process_adapter;
 
 pub use adapter_registry::{AdapterRegistry, TestNoResultsAdapter};
+pub use process_adapter::{
+    BoxProcessDispatchFuture, PROCESS_ADAPTER_ID, ProcessAdapter, ProcessAdapterConfig,
+    ProcessAdapterRequest, ProcessDispatchError, ProcessDispatchOutcome, ProcessDispatchPort,
+    ProcessDispatchRequest, ProcessExecutionReceipt, process_receipt_summary,
+};
 
 pub type BoxAdapterFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;

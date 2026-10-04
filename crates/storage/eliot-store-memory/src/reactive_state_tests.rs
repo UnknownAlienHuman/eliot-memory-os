@@ -90,7 +90,15 @@ fn transition_with(
         ordering_scopes: vec![OrderingScopeId::new("reactive-state").expect("ordering")],
         transition_class: TransitionClass::ReactiveState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        // The build's OWN admission contract set identity, not a placeholder. The
+        // store-api `PreparedTransition::validate` (crates/storage/eliot-store-api
+        // src/lib.rs, the `admission_contract_set_digest` arm) refuses any
+        // transition whose field is not this receiving build's
+        // `supported_admission_contract_set_digest()`, with `ManifestMismatch`.
+        // A hardcoded literal is therefore never admissible and every assertion
+        // past admission would be unreachable.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contract set digest"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
