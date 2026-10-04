@@ -1232,7 +1232,7 @@ mod pool_behavior_tests {
         let mut probed = h
             .transport()
             .query_admin(
-                "proof.987.admin_dispatch",
+                "read.schema_generation",
                 "RETURN $value;",
                 Map::from_iter([("value".into(), Value::String("admin-lane".into()))]),
             )

@@ -77,6 +77,7 @@ impl<U: SkillLifecycleApi> SkillLifecyclePort for BridgeSkillForwarder<U> {
                     request.evidence_refs().to_vec(),
                     request.dependency_versions().to_vec(),
                     request.scope().clone(),
+                    request.policy_revision().to_owned(),
                 )
                 .await
         })
@@ -163,6 +164,7 @@ mod tests {
             _evidence_refs: Vec<String>,
             _dependencies: Vec<DependencyVersion>,
             _scope: SkillScope,
+            _policy_revision: String,
         ) -> Result<SkillCandidate, SkillError> {
             Err(SkillError::NotFound)
         }

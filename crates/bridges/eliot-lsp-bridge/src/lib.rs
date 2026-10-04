@@ -17,11 +17,11 @@
 //! crate offers no conversion of observations into pass/fail verdicts.
 //! Rename output is an unapplied [`RenameCandidate`] (also named
 //! [`EditCandidate`] for the I10.10 "rename/edits as candidates" row); the
-//! bridge never writes to source files. No CodeCortex-private execution path
-//! exists: observations, candidates, and receipts are `#[non_exhaustive]`,
-//! so downstream crates cannot forge them with struct literals and must
-//! obtain them from the bridge constructors; all launches go through
-//! [`LspBridge`] and the shared
+//! bridge never writes to source files. Received results pass through
+//! [`NormalizedResult::adopt_received`] under the invocation owner's retained
+//! output; the adopted view exposes immutable borrows. Deserialization also
+//! refuses an applied rename and fields outside the closed result shape.
+//! Analyzer launches go through [`LspBridge`] and the shared
 //! [`ProcessExecutor`](eliot_process::ProcessExecutor) contract.
 
 #![forbid(unsafe_code)]
@@ -377,6 +377,7 @@ impl LspCommand {
 
 /// Normalized definition location (SCIP coordinates are zero-based).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Definition {
     /// Exact SCIP symbol string.
     pub symbol: String,
@@ -390,6 +391,7 @@ pub struct Definition {
 
 /// Normalized reference location (SCIP coordinates are zero-based).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Reference {
     /// Exact SCIP symbol string.
     pub symbol: String,
@@ -403,6 +405,7 @@ pub struct Reference {
 
 /// Normalized symbol-table entry projected from a SCIP index.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolInfo {
     /// Exact SCIP symbol string.
     pub symbol: String,
@@ -434,12 +437,11 @@ pub enum DiagnosticSeverity {
 /// model facts and must not be converted into verification verdicts; this
 /// crate provides no such conversion.
 ///
-/// The struct is `#[non_exhaustive]` so only the bridge parsers
-/// ([`parse_diagnostics_output`], [`finalize_diagnostics`]) can mint
-/// observations. Downstream crates — including `CodeCortex` — cannot forge
-/// them with struct literals and must consume bridge results as evidence.
-/// There is no CodeCortex-private diagnostics execution path.
+/// Received observations require [`NormalizedResult::adopt_received`] before
+/// use. The closed wire shape and the invocation receipt bound by that owner
+/// boundary preserve the observation's meaning across deserialization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct DiagnosticObservation {
     /// File path as reported by the analyzer.
@@ -470,6 +472,7 @@ impl DiagnosticObservation {
 
 /// One anchor-only text edit of a rename candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TextEdit {
     /// Repository-relative document path.
     pub path: String,
@@ -490,10 +493,10 @@ pub struct TextEdit {
 ///
 /// The bridge never writes to source files; `applied` is always `false`.
 ///
-/// The struct is `#[non_exhaustive]` so only the bridge constructors
-/// ([`rename_candidate`], [`finalize_scip`]) can mint candidates.
-/// Downstream crates cannot forge them with struct literals.
+/// Deserialization validates the same unapplied-anchor invariant as adoption.
+/// Public-field mutations must pass the owner adoption boundary again.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ReceivedRenameCandidate")]
 #[non_exhaustive]
 pub struct RenameCandidate {
     /// Exact SCIP symbol string the candidate renames.
@@ -506,6 +509,30 @@ pub struct RenameCandidate {
     pub applied: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedRenameCandidate {
+    symbol: String,
+    new_name: String,
+    edits: Vec<TextEdit>,
+    applied: bool,
+}
+
+impl TryFrom<ReceivedRenameCandidate> for RenameCandidate {
+    type Error = BridgeError;
+
+    fn try_from(received: ReceivedRenameCandidate) -> Result<Self, Self::Error> {
+        let candidate = Self {
+            symbol: received.symbol,
+            new_name: received.new_name,
+            edits: received.edits,
+            applied: received.applied,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+}
+
 /// Explicit edit-candidate name for the I10.10 "rename/edits as candidates"
 /// row.
 ///
@@ -514,6 +541,32 @@ pub struct RenameCandidate {
 pub type EditCandidate = RenameCandidate;
 
 impl RenameCandidate {
+    /// Validates an unapplied candidate against the bridge's anchor-only shape.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        if self.applied {
+            return Err(BridgeError::InvalidResult {
+                detail: "a bridge rename candidate cannot claim applied edits",
+            });
+        }
+        checked_text(&self.symbol, "symbol")?;
+        checked_identifier(&self.new_name)?;
+        if self.edits.len() > MAX_NORMALIZED_RECORDS {
+            return Err(BridgeError::TooManyRecords);
+        }
+        for edit in &self.edits {
+            checked_text(&edit.path, "edit.path")?;
+            if edit.line != edit.end_line
+                || edit.column != edit.end_column
+                || edit.replacement != self.new_name
+            {
+                return Err(BridgeError::InvalidResult {
+                    detail: "rename edits must remain anchors for the declared replacement",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Reports that this candidate was not applied to any file.
     #[must_use]
     pub const fn is_unapplied(&self) -> bool {
@@ -529,7 +582,7 @@ impl RenameCandidate {
 
 /// Freshness of a normalized result relative to its tool invocation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum Freshness {
     /// The tool completed and its full output was normalized.
     Current,
@@ -542,7 +595,7 @@ pub enum Freshness {
 
 /// Declared coverage scope of a normalized result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum Coverage {
     /// The analyzer scanned the whole workspace root.
     Workspace {
@@ -565,7 +618,7 @@ pub enum Coverage {
 
 /// Failure disposition carried by every observation receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum FailureDisposition {
     /// The tool completed and its output normalized cleanly.
     Success,
@@ -587,11 +640,12 @@ pub enum FailureDisposition {
 
 /// Observation receipt attached to every normalized result.
 ///
-/// The struct is `#[non_exhaustive]` so receipts are assembled only via
-/// [`ObservationReceipt::assemble`], which derives freshness and the success
-/// dispositions deterministically from run evidence instead of accepting
-/// caller-invented values.
+/// A received receipt is compared with the invocation owner's retained receipt
+/// by [`NormalizedResult::adopt_received`]. Assembly derives run completion
+/// and truncation; exact source-content freshness still requires source-owner
+/// evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ObservationReceipt {
     /// Exact analyzer executable as invoked.
@@ -669,7 +723,7 @@ impl ObservationReceipt {
 /// Normalized bridge result. Diagnostics appear only as observations;
 /// rename output appears only as an unapplied candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum NormalizedResult {
     /// Definition locations for one symbol.
     Definitions {
@@ -715,7 +769,109 @@ pub enum NormalizedResult {
     },
 }
 
+/// Received result checked against its operation and retained invocation receipt.
+///
+/// Inspection borrows the result, so its public wire fields cannot be mutated
+/// after adoption. This binding does not establish source-content identity or
+/// executable supply-chain admission that the retained receipt does not carry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdoptedResult {
+    result: NormalizedResult,
+}
+
+impl AdoptedResult {
+    /// Borrows the validated normalized result.
+    #[must_use]
+    pub const fn result(&self) -> &NormalizedResult {
+        &self.result
+    }
+
+    /// Borrows the invocation-bound observation receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> &ObservationReceipt {
+        self.result.receipt()
+    }
+}
+
 impl NormalizedResult {
+    /// Adopts received bytes under the invocation owner's original binding.
+    ///
+    /// `expected_result` must be that owner's retained normalized invocation
+    /// output. Its receipt and payload are both compared; a receipt copied onto
+    /// altered items cannot authorize those items. Receipt binding alone cannot
+    /// prove that decoded coordinates came from the retained analyzer output.
+    pub fn adopt_received(
+        self,
+        operation: &SemanticOperation,
+        expected_result: &Self,
+    ) -> Result<AdoptedResult, BridgeError> {
+        if self.receipt() != expected_result.receipt() {
+            return Err(BridgeError::InvalidResult {
+                detail: "received result does not match the retained invocation receipt",
+            });
+        }
+        let bound = match (&self, operation, &self.receipt().coverage) {
+            (
+                Self::Definitions { items, .. },
+                SemanticOperation::Definitions { symbol },
+                Coverage::SingleSymbol { symbol: covered },
+            ) => {
+                items.len() <= MAX_NORMALIZED_RECORDS
+                    && symbol == covered
+                    && items.iter().all(|item| item.symbol == *symbol)
+            }
+            (
+                Self::References { items, .. },
+                SemanticOperation::References { symbol },
+                Coverage::SingleSymbol { symbol: covered },
+            ) => {
+                items.len() <= MAX_NORMALIZED_RECORDS
+                    && symbol == covered
+                    && items.iter().all(|item| item.symbol == *symbol)
+            }
+            (
+                Self::Symbols { items, .. },
+                SemanticOperation::Symbols { path_scope },
+                Coverage::SymbolSubset {
+                    path_scope: covered,
+                },
+            ) => items.len() <= MAX_NORMALIZED_RECORDS && path_scope == covered,
+            (
+                Self::Diagnostics { observations, .. },
+                SemanticOperation::Diagnostics,
+                Coverage::Workspace { .. },
+            ) => observations.len() <= MAX_NORMALIZED_RECORDS,
+            (
+                Self::Rename { candidate, .. },
+                SemanticOperation::Rename { symbol, new_name },
+                Coverage::SingleSymbol { symbol: covered },
+            ) => {
+                candidate.validate()?;
+                candidate.symbol == *symbol && candidate.new_name == *new_name && symbol == covered
+            }
+            (Self::Version { .. }, SemanticOperation::ProbeVersion, Coverage::ProbeOnly) => true,
+            _ => false,
+        };
+        if !bound {
+            return Err(BridgeError::InvalidResult {
+                detail: "received result does not match the requested operation and coverage",
+            });
+        }
+        if self.receipt().disposition != FailureDisposition::Success
+            && self.receipt().freshness == Freshness::Current
+        {
+            return Err(BridgeError::InvalidResult {
+                detail: "a failed observation cannot claim current freshness",
+            });
+        }
+        if self != *expected_result {
+            return Err(BridgeError::InvalidResult {
+                detail: "received items do not match the retained normalized invocation output",
+            });
+        }
+        Ok(AdoptedResult { result: self })
+    }
+
     /// Returns the observation receipt attached to this result.
     #[must_use]
     pub const fn receipt(&self) -> &ObservationReceipt {
@@ -2311,6 +2467,12 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
 /// observation receipt disposition while parsing stays total.
 #[derive(Debug, Error)]
 pub enum BridgeError {
+    /// Received normalized data failed its retained invocation binding.
+    #[error("invalid received analyzer result: {detail}")]
+    InvalidResult {
+        /// Closed reason for the adoption refusal.
+        detail: &'static str,
+    },
     /// Analyzer configuration failed validation.
     #[error("invalid analyzer configuration: {0}")]
     InvalidConfig(String),

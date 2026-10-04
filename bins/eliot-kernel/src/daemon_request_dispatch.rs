@@ -163,7 +163,7 @@ const PROCESS_STREAM_RECOVERY_UNREADABLE_KIND: &str = "unreadable";
 /// transition-specific activation receipt. It is never an `activate_grant`
 /// overload, and the dispatcher never reads transition fields out of an
 /// untyped map.
-pub(crate) const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
+pub(crate) use eliot_authority::ACTIVATE_ROOT_TRANSITION_OPERATION;
 
 /// Typed receipt kind answered by the root-transition activation arm.
 pub(crate) const ROOT_TRANSITION_RECEIPT_KIND: &str = "authority_root_transition_receipt";
@@ -894,7 +894,7 @@ struct GrantRevocationOperation {
 /// it carries the complete typed root-transition operation — operation
 /// identity, idempotency key, both grant identities AND their immutable
 /// commitments, both authority roots, the graph snapshot and its
-/// predecessor/expected-next revisions, policy revision, deadline, effect
+/// predecessor/expected-next/admission revisions, policy revision, deadline, effect
 /// ceiling, semantic decision reference, canonical request digest, the
 /// presented authority binding, and the presented principal/session/scope
 /// subject. The dispatcher decodes it closed, rechecks binding and subject
@@ -917,6 +917,7 @@ struct RootTransitionActivationOperation {
     graph_snapshot_id: String,
     predecessor_graph_revision: u64,
     expected_next_graph_revision: u64,
+    admitted_at_revision: u64,
     policy_revision: String,
     deadline_unix_ms: u64,
     effect_ceiling: eliot_receipts::EffectClass,
@@ -4978,7 +4979,7 @@ impl KernelComposition {
                     graph_snapshot_id: operation.graph_snapshot_id,
                     predecessor_graph_revision: operation.predecessor_graph_revision,
                     expected_next_graph_revision: operation.expected_next_graph_revision,
-                    admitted_at_revision: operation.expected_next_graph_revision,
+                    admitted_at_revision: operation.admitted_at_revision,
                     policy_revision: operation.policy_revision,
                     deadline_unix_ms: operation.deadline_unix_ms,
                     effect_ceiling: operation.effect_ceiling,
@@ -4986,8 +4987,9 @@ impl KernelComposition {
                     binding: operation.binding,
                 };
                 // The presented canonical request digest must be the one this
-                // exact operation produces: a recomputed digest is authority
-                // readback over the presented bytes, not caller assertion.
+                // exact operation produces. Recomputing the digest checks
+                // canonical request integrity only; authority still requires
+                // the semantic owner decision and Kernel/ORS evidence.
                 let request = eliot_authority::RootTransitionActivationRequest::new(
                     record,
                     operation.subject,

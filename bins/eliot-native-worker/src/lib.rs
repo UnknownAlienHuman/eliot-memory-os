@@ -779,6 +779,49 @@ fn truncate_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+/// How a governed drive refused (issue #1911, A10.1 steps 7-8 and A10.8).
+///
+/// The two arms are different facts and must not be flattened into one error:
+/// a refusal before admission observed nothing and owns no action, while a
+/// failure after admission already admitted every drive action and may already
+/// have completed some of them. Discarding the admitted actions on the second
+/// arm is what used to lose the observations and the finish state of a partial
+/// drive, so they travel with the error instead.
+#[derive(Debug)]
+pub enum GovernedDriveFailure {
+    /// Refused at or before envelope admission: no lifecycle submit ran, so no
+    /// operation was attempted and no action exists to report.
+    RefusedBeforeDrive(NativeWorkerError),
+    /// Admission succeeded and the drive started. The already-admitted actions
+    /// are retained so the caller can report the operations whose own
+    /// observations it holds and finish honestly.
+    PartialDrive {
+        /// Every admitted [`GOVERNED_DRIVE_OPS`] action, in drive order.
+        actions: Vec<governed_action::ValidatedAction>,
+        /// The failure the drive reported.
+        error: NativeWorkerError,
+    },
+}
+
+impl GovernedDriveFailure {
+    /// The drive error itself, without the retained admission.
+    #[must_use]
+    pub fn error(&self) -> &NativeWorkerError {
+        match self {
+            Self::RefusedBeforeDrive(error) | Self::PartialDrive { error, .. } => error,
+        }
+    }
+
+    /// The admitted actions a partial drive still owns, empty before admission.
+    #[must_use]
+    pub fn retained_actions(&self) -> &[governed_action::ValidatedAction] {
+        match self {
+            Self::RefusedBeforeDrive(_) => &[],
+            Self::PartialDrive { actions, .. } => actions,
+        }
+    }
+}
+
 /// Drives one admitted generation behind the governed gate (issue #1911).
 ///
 /// Pins the explicit job envelope first (issue #1912): principal/session,
@@ -800,7 +843,7 @@ pub async fn drive_governed_material<E, A, R, C, L>(
         Vec<governed_action::ValidatedAction>,
         eliot_native_worker_core::WorkerReady,
     ),
-    NativeWorkerError,
+    GovernedDriveFailure,
 >
 where
     E: ProcessExecutor,
@@ -813,25 +856,33 @@ where
     // bind every envelope dimension before the governed gate admits any
     // driven operation. A disagreement refuses with zero submits and zero
     // starts, ahead of the envelope negatives below.
-    require_job_envelope(material)?;
-    let fence = serde_json::to_value(&material.hello.state_fence).map_err(|_| {
-        NativeWorkerError::KernelAdmissionRequired(
-            "admitted fence is not projectable to the governed gate".to_owned(),
-        )
-    })?;
-    let epoch = serde_json::to_value(&material.hello.authority_epoch).map_err(|_| {
-        NativeWorkerError::KernelAdmissionRequired(
-            "admitted epoch is not projectable to the governed gate".to_owned(),
-        )
-    })?;
+    require_job_envelope(material).map_err(GovernedDriveFailure::RefusedBeforeDrive)?;
+    let fence = serde_json::to_value(&material.hello.state_fence)
+        .map_err(|_| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "admitted fence is not projectable to the governed gate".to_owned(),
+            )
+        })
+        .map_err(GovernedDriveFailure::RefusedBeforeDrive)?;
+    let epoch = serde_json::to_value(&material.hello.authority_epoch)
+        .map_err(|_| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "admitted epoch is not projectable to the governed gate".to_owned(),
+            )
+        })
+        .map_err(GovernedDriveFailure::RefusedBeforeDrive)?;
     let actions = admit_product_envelopes(
         &GOVERNED_DRIVE_OPS,
         &material.action_envelopes,
         &material.admission.claim().work_scope_id,
         &fence,
         &epoch,
-    )?;
-    let ready = drive_admitted_claimed(
+    )
+    .map_err(GovernedDriveFailure::RefusedBeforeDrive)?;
+    // Past this line the run owns externally effective operations, so a failure
+    // returns the admitted actions with it instead of dropping them: the
+    // caller still has to decide what was observed and how the run finishes.
+    match drive_admitted_claimed(
         lifecycle,
         worker,
         material.admission.registration(),
@@ -841,8 +892,11 @@ where
         &material.reconcile,
         &material.readiness,
     )
-    .await?;
-    Ok((actions, ready))
+    .await
+    {
+        Ok(ready) => Ok((actions, ready)),
+        Err(error) => Err(GovernedDriveFailure::PartialDrive { actions, error }),
+    }
 }
 
 /// Admitted factory-resolution seam (T9-07, issue #874; supersedes PR #1125).

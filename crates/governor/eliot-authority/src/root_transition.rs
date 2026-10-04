@@ -57,6 +57,11 @@ use crate::{AuthorityError, SnapshotId, validate_digest, validate_text};
 /// P-07 operation kind under one operation identity.
 pub const ROOT_TRANSITION_OPERATION_KIND: &str = "authority.root_transition.activate";
 
+/// Authenticated daemon-to-Kernel operation name for root-transition
+/// activation. Both transport endpoints and the closed gateway use this
+/// spelling; it is distinct from the canonical digest's operation kind.
+pub const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
+
 /// Closed schema identity of the transition activation receipt.
 pub const ROOT_TRANSITION_RECEIPT_SCHEMA: &str = "eliot.authority.root-transition-activation";
 
