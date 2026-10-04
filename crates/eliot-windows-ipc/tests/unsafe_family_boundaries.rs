@@ -157,6 +157,48 @@ fn credential_boundary_valid_minimal_ids() {
     ok(validate_credential_id("a"));
     ok(validate_credential_id("abc123"));
     ok(validate_credential_id("wipc-789-probe"));
+
+    // The three ids this case drives must be the registry row's OWN inputs,
+    // read through the same scoped `cases` lookup the later cases use, so the
+    // case cannot certify a fixture of its own making.
+    let row = fixture_case(1);
+    for minimal in ["a", "abc123", "wipc-789-probe"] {
+        assert!(
+            row.contains(&format!("\"{minimal}\"")),
+            "fixture case 1 must list the minimal credential id {minimal} this case drives"
+        );
+    }
+
+    // Behaviour is bound to the PRODUCTION grammar, read from
+    // `crates/eliot-windows-ipc/src/lib.rs` lines 3444-3487: the
+    // `MAX_CREDENTIAL_ID_BYTES` bound declared at line 3448 and the
+    // `pub fn validate_credential_id` entry point this test imports at line 27,
+    // whose body opens at line 3469. A minimal id is accepted exactly because
+    // that production body keeps the empty-exclusion and the ASCII
+    // alphanumeric / `-` `_` `.` `/` predicate; a locally restated grammar
+    // could not prove either clause.
+    let library = source_text("crates/eliot-windows-ipc/src/lib.rs");
+    let grammar = w1b_block(
+        &library,
+        "pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {",
+    );
+    assert!(
+        grammar.contains("!credential_id.is_empty()")
+            && grammar.contains("!credential_id.starts_with('/')")
+            && grammar.contains("!credential_id.ends_with('/')"),
+        "the production validate_credential_id body must reject the empty id and both '/'-edge forms"
+    );
+    assert!(
+        grammar.contains(
+            "character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')"
+        ),
+        "the production validate_credential_id body must hold the ASCII alphanumeric plus - _ . / predicate"
+    );
+    assert_eq!(
+        w1b_count(&library, "pub fn validate_credential_id("),
+        1,
+        "exactly one exported validate_credential_id may exist, or this case's Ok would prove a fiction"
+    );
 }
 
 // WORK_UNIT_CASE: 789/2
@@ -164,6 +206,62 @@ fn credential_boundary_valid_minimal_ids() {
 fn credential_boundary_valid_nested_ids() {
     ok(validate_credential_id("operator-cursor/isolated-abc"));
     ok(validate_credential_id("a-b_c.d/e-f_g.h/i"));
+
+    // The two ids this case drives must be the registry row's OWN inputs, read
+    // through the same scoped `cases` lookup the later cases use, so the case
+    // cannot certify a fixture of its own making.
+    let row = fixture_case(2);
+    for nested in ["operator-cursor/isolated-abc", "a-b_c.d/e-f_g.h/i"] {
+        assert!(
+            row.contains(&format!("\"{nested}\"")),
+            "fixture case 2 must list the namespaced credential id {nested} this case drives"
+        );
+    }
+
+    // Behaviour is bound to the PRODUCTION grammar, read from
+    // `crates/eliot-windows-ipc/src/lib.rs` lines 3460-3487: the
+    // `pub fn validate_credential_id` entry point this test imports at line 27,
+    // whose body opens at line 3469. A namespaced id is accepted exactly because
+    // that production body splits on `/` and demands nonempty segments, so the
+    // `'/'` separator is legal INSIDE the id while no segment may be empty or
+    // `"."`/`".."`. A locally restated rule could not prove that clause.
+    let library = source_text("crates/eliot-windows-ipc/src/lib.rs");
+    let grammar = w1b_block(
+        &library,
+        "pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {",
+    );
+    assert!(
+        grammar.contains(".split('/')")
+            && grammar.contains("segment != \".\" && segment != \"..\""),
+        "the production validate_credential_id body must split on '/' and refuse empty, \".\" and \"..\" segments"
+    );
+    assert_eq!(
+        w1b_count(&library, "pub fn validate_credential_id("),
+        1,
+        "exactly one exported validate_credential_id may exist, or this case's Ok would prove a fiction"
+    );
+
+    // The nested segment the case accepts must also be accepted by the one
+    // production entry point that turns an id into the wide `WinCred` target,
+    // `fn credential_target` at `crates/eliot-windows-ipc/src/lib.rs` line 3489
+    // (body 3489-3503). That is the only production consumer of this grammar in
+    // the crate, and it delegates to `validate_credential_id` before the
+    // `EliotGovernor/` prefix is applied, so the nested form is validated by the
+    // same production bytes this case just read.
+    let target = w1b_block(
+        &library,
+        "fn credential_target(credential_id: &str) -> io::Result<Vec<u16>> {",
+    );
+    assert!(
+        target.contains("validate_credential_id(credential_id)?;")
+            && target.contains("format!(\"EliotGovernor/{credential_id}\")"),
+        "the production credential_target must validate the id before namespacing it under EliotGovernor/"
+    );
+    assert_eq!(
+        w1b_count(&library, "validate_credential_id(credential_id)?"),
+        1,
+        "exactly one production caller may revalidate the credential id before the FFI target is formed"
+    );
 }
 
 // WORK_UNIT_CASE: 789/3
@@ -297,6 +395,7 @@ fn credential_boundary_real_absent_and_blob_bounds_without_mutation() {
 
 // WORK_UNIT_CASE: 789/12
 #[test]
+#[allow(clippy::too_many_lines)]
 fn credential_boundary_fixture_binds_sites_and_deferred_families() {
     let fixture = fixture_text();
     for required in [
@@ -327,22 +426,175 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
             "fixture must list deferred family {deferred}"
         );
     }
-    for case in 1..=12 {
+    // The registry binds every declared case 1..42, not just the first wave.
+    // This loop used to stop at 12, which left cases 28..42 bound by nothing;
+    // case 42 now carries the structural denominator assertions that prove it.
+    for case in 1..=42 {
         let marker = format!("\"case\": {case}");
         assert!(
             fixture.contains(marker.as_str()),
             "fixture must bind case {case}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // CASE IDENTITY BINDING. The loop above only proved that a `\"case\": {n}`
+    // STRING exists somewhere in the fixture; it never checked that the
+    // `source_test` each row names is a real `#[test] fn` in this very file, and
+    // it never checked the row's own `title_mismatch` boolean against anything
+    // but itself. That let a row self-certify `title_mismatch: false` while its
+    // `source_test` pointed at an unrelated test -- precisely the
+    // "self-declaration is not evidence" failure. Below, every row is
+    // cross-checked against the REAL test file, and the boolean is required to
+    // agree with what that cross-check found, so the flag can no longer lie.
+    //
+    // Three independent facts are asserted per row, read from the PARSED
+    // registry (never from a substring of the fixture text):
+    //   1. `source_test`, when present, must be the literal `fn <name>(` of a
+    //      real function defined in this file. A renamed, deleted or invented
+    //      test fails here.
+    //   2. A row with NO `source_test` may not claim `title_mismatch: false`,
+    //      and a row that declares `title_mismatch: true` must carry a non-empty
+    //      `title_mismatch_reason`. The flag therefore cannot be flipped to
+    //      false to make an unbound row look clean.
+    //   3. The exact sets are pinned at the end: `rebound` is the set of rows
+    //      with no binding at all, and `mismatched` is the set of rows that must
+    //      carry `title_mismatch: true`. Adding, removing or quietly re-binding
+    //      any row changes one of these and fails the case.
+    let registry = ok(serde_json::from_str::<serde_json::Value>(&fixture));
+    let Some(registry_cases) = registry.get("cases").and_then(serde_json::Value::as_array) else {
+        panic!("fixture must carry a top-level `cases` array");
+    };
+    assert_eq!(
+        registry_cases.len(),
+        42,
+        "CASE IDENTITY (registry length): the registry `cases` array holds {} entries, expected exactly 42",
+        registry_cases.len()
+    );
+    // The real test-file source, read through the same package-relative helper
+    // the later cases use, so this assertion reads the file on disk rather than
+    // trusting the fixture's own claim about it.
+    let suite_source = w1b_read_package_file("tests/unsafe_family_boundaries.rs");
+    let mut rebound: Vec<u64> = Vec::new();
+    for entry in registry_cases {
+        let id = entry
+            .get("case")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("every registry `cases` entry needs an integer `case` id"));
+        let source_test = entry
+            .get("source_test")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let declared_mismatch = entry
+            .get("title_mismatch")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| panic!("case {id} must carry a boolean `title_mismatch`"));
+        if let Some(name) = source_test.as_deref() {
+            // Fact 1: the named test really is a `fn` in this file.
+            let signature = format!("fn {name}(");
+            assert!(
+                suite_source.contains(&signature),
+                "CASE IDENTITY (source_test exists): case {id} names source_test `{name}`, but no `fn {name}(` is defined in unsafe_family_boundaries.rs"
+            );
+            // Fact 2: the flag is an honest verdict about the binding.
+            // `false` is a clean, full match and carries
+            // `title_mismatch_reason: null`; `true` is a partial or
+            // inapplicable binding and MUST say why. Either way the flag is
+            // constrained by a fact read from the real file, so it cannot
+            // simply assert a match.
+            if declared_mismatch {
+                let reason = entry
+                    .get("title_mismatch_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    !reason.trim().is_empty(),
+                    "CASE IDENTITY (reason recorded): case {id} declares title_mismatch=true over the real test `{name}`, so it must carry a non-empty `title_mismatch_reason`"
+                );
+            }
+        } else {
+            // An unbound row may not claim a match.
+            assert!(
+                declared_mismatch,
+                "CASE IDENTITY (flag consistency): case {id} has no source_test at all, so it may NOT self-certify title_mismatch=false"
+            );
+            // Fact 3: an unresolved binding must say why.
+            let reason = entry
+                .get("title_mismatch_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                !reason.trim().is_empty(),
+                "CASE IDENTITY (reason recorded): case {id} has no source_test and title_mismatch=true, so it must carry a non-empty `title_mismatch_reason`"
+            );
+            rebound.push(id);
+        }
+    }
+    rebound.sort_unstable();
+    // The unresolved set is asserted explicitly so a future writer cannot quietly
+    // shrink it by deleting a `title_mismatch_reason`, and cannot grow it
+    // without this exact list changing.
+    assert_eq!(
+        rebound,
+        vec![2, 5, 6],
+        "CASE IDENTITY (unresolved set): these cases have no source_test at all and must keep title_mismatch=true with a recorded reason; got {rebound:?}"
+    );
+    // The complete, exact verdict every row must now carry. This is the flag's
+    // whole meaning: cases 1, 10 and 12 are clean full matches over a real,
+    // re-pointed binding; cases 3, 4, 7, 8, 9 and 11 name a real test that only
+    // PARTIALLY (or, for 11, transfer-but-not-duplication) proves the title and
+    // say so; cases 2, 5 and 6 name no test because none proves their title.
+    let mut verdicts: Vec<(u64, bool)> = registry_cases
+        .iter()
+        .map(|entry| {
+            (
+                entry
+                    .get("case")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| {
+                        panic!("every registry `cases` entry needs an integer `case` id")
+                    }),
+                entry
+                    .get("title_mismatch")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| {
+                        panic!("every registry `cases` entry needs a `title_mismatch`")
+                    }),
+            )
+        })
+        .collect();
+    verdicts.sort_unstable();
+    let mismatched: Vec<u64> = verdicts
+        .iter()
+        .filter(|(_, mismatch)| *mismatch)
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        mismatched,
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 11],
+        "CASE IDENTITY (flag honesty): exactly these cases may carry title_mismatch=true; every other case must resolve to a full match over a real, verified source_test. got {mismatched:?}"
+    );
+    assert_eq!(
+        verdicts.len(),
+        42,
+        "CASE IDENTITY (verdict denominator): the verdict table must cover exactly 42 rows, got {}",
+        verdicts.len()
+    );
 }
 
 // WORK_UNIT_CASE inventory 789/13..42 (wave 2, issue #789 implementation
-// lane): declaration-only. Each marker below names its wired bounding
-// implementation plus production caller; EXECUTION stays TEST-PHASE (no
-// #[test] here per the owner NO TESTS order). The fixture `cases` array
-// carries the matching DATA rows. Discovery rule: a marker line counts as
-// DECLARED; only a marker immediately above #[test] counts as EXECUTED
-// (cases 1..12 above).
+// lane) — HISTORY. When this block was first written the owner's NO TESTS
+// order held execution back to the test phase, so cases 13..42 were
+// declaration-only here: each marker named its wired bounding implementation
+// plus production caller, carried no `#[test]`, and only cases 1..12 above
+// were EXECUTED. That is no longer true. Every one of cases 13..42 is now
+// anchored as a bare `// WORK_UNIT_CASE: 789/<n>` line immediately above its OWN
+// `#[test]`, so the whole file is EXECUTED, 42/42, matching the shape the
+// "Cases 28..42 (wave 2 execution lane)" block further down also states. The
+// old status/impl/caller tail text is gone from the file. Discovery rule,
+// unchanged and now uniform: a marker line counts as DECLARED, and because
+// every marker sits directly above its own `#[test]`, all 42 also count as
+// EXECUTED.
 
 // 13. concurrent close/use race;
 // WORK_UNIT_CASE: 789/13
@@ -2882,6 +3134,7 @@ fn case41_package_checks_span_both_feature_sets_and_supported_fixtures() {
 // families.
 // WORK_UNIT_CASE: 789/42
 #[test]
+#[allow(clippy::too_many_lines)]
 fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     let manifest = w1b_manifest_text();
     // The manifest keeps the ADR-0014 exception, and keeps it narrow.
@@ -2945,4 +3198,100 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             "the case denominator must stay at 42, missing {denominator}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // The STRUCTURAL denominator. The substring checks above are satisfied by the
+    // very file they police and would still pass on a registry that also carries
+    // a case 43, so they cannot carry W7 on their own. Below, the registry is
+    // PARSED and this suite's OWN source text is counted, on four independent
+    // axes: the length of `cases`, the exact id set 1..=42, the number of
+    // anchored `// WORK_UNIT_CASE: 789/<n>` markers here, and equality of the
+    // marker id set with the registry id set. A dropped, invented or duplicated
+    // case, or a marker deleted from or added to this file, now fails.
+    //
+    // Axis 1 and 2 read the registry. `serde_json` is a dependency of this
+    // package (Cargo.toml: `serde_json.workspace = true`), so the real JSON is
+    // parsed rather than substring-matched. The JSON parse is a precondition:
+    // an unparseable registry cannot satisfy any of these axes.
+    let registry = ok(serde_json::from_str::<serde_json::Value>(&fixture));
+    let Some(registry_cases) = registry.get("cases").and_then(serde_json::Value::as_array) else {
+        panic!("fixture must carry a top-level `cases` array");
+    };
+    let registry_len = registry_cases.len();
+    assert_eq!(
+        registry_len, 42,
+        "W7 DENOMINATOR (registry length): the registry `cases` array holds {registry_len} entries, expected exactly 42"
+    );
+    // Axis 2: the id set is exactly 1..=42. `dedup` makes a duplicate
+    // disappear, so the equal-length comparison below also proves there is
+    // none; every axis message names the measured numbers either way.
+    let mut registry_ids: Vec<u64> = registry_cases
+        .iter()
+        .map(|entry| {
+            entry
+                .get("case")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    panic!("every registry `cases` entry needs an integer `case` id")
+                })
+        })
+        .collect();
+    registry_ids.sort_unstable();
+    let mut deduped = registry_ids.clone();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        42,
+        "W7 DENOMINATOR (registry id set): the registry carries {} distinct ids, expected exactly 42 distinct ids covering 1..=42",
+        deduped.len()
+    );
+    let expected_ids: Vec<u64> = (1_u64..=42).collect();
+    assert_eq!(
+        registry_ids, expected_ids,
+        "W7 DENOMINATOR (registry id set): the sorted registry ids are {registry_ids:?}, expected exactly 1..=42 (no gap, no duplicate, no extra)"
+    );
+
+    // Axis 3 and 4 read THIS source file through the same mechanism `w1b_count`
+    // uses for its sixteen source-content checks: `w1b_read_package_file`
+    // resolves a package-relative path from `CARGO_MANIFEST_DIR`. `w1b_count`
+    // itself counts a literal needle with `str::matches`, so it cannot count a
+    // regex-shaped marker line; the same underlying source-text access is used
+    // instead, which is the only part of `w1b_count` that matters here.
+    let suite_source = w1b_read_package_file("tests/unsafe_family_boundaries.rs");
+    let mut suite_marker_ids: Vec<u64> = suite_source
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let rest = trimmed.strip_prefix("//")?.trim_start();
+            rest.strip_prefix("WORK_UNIT_CASE:")?
+                .trim()
+                .strip_prefix("789/")?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .collect();
+    let suite_marker_count = suite_marker_ids.len();
+    assert_eq!(
+        suite_marker_count, 42,
+        "W7 DENOMINATOR (source marker count): this suite source holds {suite_marker_count} anchored `// WORK_UNIT_CASE: 789/<n>` markers, expected exactly 42"
+    );
+    // `dedup` on the source side too, so a duplicated marker is caught by name
+    // rather than hiding behind the equal-length comparison.
+    suite_marker_ids.sort_unstable();
+    let mut marker_ids_deduped = suite_marker_ids.clone();
+    marker_ids_deduped.dedup();
+    assert_eq!(
+        marker_ids_deduped.len(),
+        42,
+        "W7 DENOMINATOR (source marker ids): this suite source holds {} distinct marker ids, expected exactly 42",
+        marker_ids_deduped.len()
+    );
+    // Axis 4: the two id sets are equal in BOTH directions, so a case present
+    // in the registry but unmarked here, or marked here but absent from the
+    // registry, each fail with the full offending id in the message.
+    assert_eq!(
+        suite_marker_ids, registry_ids,
+        "W7 DENOMINATOR (registry/marker agreement): the sorted marker ids in this source are {suite_marker_ids:?} but the sorted registry `cases` ids are {registry_ids:?}; they must be identical"
+    );
 }
