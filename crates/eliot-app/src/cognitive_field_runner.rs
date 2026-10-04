@@ -12282,4 +12282,252 @@ mod tests {
         fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn provider_import_rejects_duplicate_reader_member_before_normalization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-cognitive-provider-import-duplicate-{}",
+            Uuid::new_v4()
+        ));
+        let report_root = root.join("report");
+        let private_root = root.join("private");
+        fs::create_dir_all(&report_root)?;
+        fs::create_dir_all(private_root.join("oracles"))?;
+        fs::create_dir_all(private_root.join("prompts"))?;
+        fs::create_dir_all(private_root.join("outputs"))?;
+        let report_root = fs::canonicalize(report_root)?;
+        let private_root = fs::canonicalize(private_root)?;
+        let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let suite_bytes = fs::read(suite_root.join("tests/cognitive/field-v2/suite.json"))?;
+        let suite: CognitiveFieldSuite = serde_json::from_slice(&suite_bytes)?;
+        let case = suite
+            .cases
+            .iter()
+            .find(|case| case.case_id == "U01")
+            .ok_or("find U01")?;
+        let contract = CognitiveFieldRunContract {
+            schema_version: COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION.to_owned(),
+            run_id: "provider-import-duplicate".to_owned(),
+            suite_sha256: sha256_bytes(&suite_bytes),
+            source_commit: super::git_commit(suite_root)?,
+            primary_repository: suite_root.to_string_lossy().into_owned(),
+            second_repository: "C:/second".to_owned(),
+            second_repository_commit: "b".repeat(40),
+            output_root: super::canonical_path(&report_root),
+            private_root_sha256: sha256_bytes(super::canonical_path(&private_root).as_bytes()),
+            hard_provider_call_cap: suite.hard_provider_call_cap,
+            contract_hash: "contract".to_owned(),
+            sealed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        write_new_or_same_json(&report_root.join("suite.json"), &suite)?;
+        write_new_or_same_json(&report_root.join("contract.json"), &contract)?;
+
+        let mut oracle = generated_oracle(case, 0, &contract, &suite_bytes);
+        CognitiveFieldGradingService::seal_oracle(&mut oracle)?;
+        write_new_or_same_json(&private_root.join("oracles/U01.json"), &oracle)?;
+        let project_id = eliot_types::ProjectId::new_v7();
+        let task_id = eliot_types::TaskId::new_v7();
+        let mut deterministic = CognitiveDeterministicReport {
+            schema_version: COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION.to_owned(),
+            case_id: case.case_id.clone(),
+            project_id,
+            task_id,
+            source_commit: contract.source_commit.clone(),
+            verifier_refs: case.deterministic_verifier_refs.clone(),
+            hard_gate_evidence: suite
+                .shared_hard_gates
+                .iter()
+                .copied()
+                .map(|gate| CognitiveHardGateEvidence {
+                    gate,
+                    passed: true,
+                    evidence_refs: vec!["test:provider-import-duplicate".to_owned()],
+                    explanation: "test hard gate passed".to_owned(),
+                })
+                .collect(),
+            controller_provider_calls: 0,
+            truth_revision_before: "revision:1".to_owned(),
+            truth_revision_after_observability: "revision:1".to_owned(),
+            report_hash: String::new(),
+            passed: true,
+        };
+        CognitiveFieldGradingService::seal_deterministic_report(&mut deterministic)?;
+        let evidence_root = report_root.join("evidence/U01/treatment");
+        write_new_or_same_json(&evidence_root.join("deterministic.json"), &deterministic)?;
+
+        let executable = private_root.join("claude.exe");
+        let prompt = private_root.join("prompts/reader-01.txt");
+        fs::write(&executable, b"provider executable fixture")?;
+        fs::write(&prompt, b"isolated reader prompt without oracle")?;
+        let model = "claude-opus-5";
+        let execution = CognitiveFieldExecutionKey {
+            case_id: "U01".to_owned(),
+            memory_condition: CognitiveMemoryCondition::Treatment,
+        };
+        let (_, canonical_schema_sha256, provider_schema_sha256) =
+            provider_test_prompt(CognitiveFieldRole::UnderstandingReader, "reader-01")?;
+        let (expected_provider_executable_sha256, runtime_contract_ref, runtime_contract_sha256) =
+            provider_test_runtime(&private_root, AgentHostId::Claude, "reader-01", &executable)?;
+        let call = CognitiveFieldProviderCallPlan {
+            call_number: 1,
+            call_id: "reader-01".to_owned(),
+            role: CognitiveFieldRole::UnderstandingReader,
+            host: AgentHostId::Claude,
+            requested_model: model.to_owned(),
+            expected_provider_executable_sha256,
+            prompt_ref: "prompts/reader-01.txt".to_owned(),
+            prompt_sha256: sha256_bytes(&fs::read(&prompt)?),
+            canonical_schema_sha256,
+            provider_schema_sha256,
+            provider_smoke: false,
+            counts_against_cap: true,
+            executions: vec![execution.clone()],
+            runtime_contract_ref,
+            runtime_contract_sha256: runtime_contract_sha256.clone(),
+            adapter_id: String::new(),
+            adapter_version: String::new(),
+            execution_request_ref: String::new(),
+            execution_request_sha256: String::new(),
+        };
+        let mut provider_plan = CognitiveFieldProviderPlan {
+            schema_version: COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION.to_owned(),
+            run_id: contract.run_id.clone(),
+            contract_hash: contract.contract_hash.clone(),
+            calls: vec![call.clone()],
+            planned_provider_calls: 1,
+            planned_smoke_calls: 0,
+            planned_reused_roles: 0,
+            role_evidence_plan_hash: None,
+            seal_attempt_id: None,
+            seal_generation: 0,
+            authority_activation_ref: None,
+            runtime_manifest_sha256: None,
+            artifact_manifest_sha256: None,
+            plan_hash: String::new(),
+            sealed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        provider_plan.plan_hash =
+            CognitiveFieldGradingService::hash_json(&provider_plan_without_hash(&provider_plan))?;
+        write_new_or_same_json(&report_root.join("provider-plan.json"), &provider_plan)?;
+
+        let mut reader = minimal_cognitive_understanding_answer();
+        reader.case_id = "U01".to_owned();
+        reader.project_id = project_id;
+        reader.task_id = task_id;
+        reader.memory_condition = CognitiveMemoryCondition::Treatment;
+        // #2985: the same admitted reader document, prefixed with one repeated
+        // top-level `case_id` member. The bytes stay well under
+        // `READER_PROVIDER_OUTPUT_MAX_BYTES`, stay valid UTF-8, and stay valid
+        // JSON for every ordinary decoder, so the duplicate member is the only
+        // property that can reject them.
+        let reader_object = serde_json::to_string(&reader)?
+            .strip_prefix('{')
+            .and_then(|document| document.strip_suffix('}'))
+            .ok_or("reader document is not a JSON object")?
+            .to_owned();
+        let duplicate_output = format!(
+            "{{\"case_id\":{},{reader_object}}}",
+            serde_json::to_string(&reader.case_id)?
+        );
+        let reader_path = private_root.join("outputs/reader.json");
+        fs::write(&reader_path, duplicate_output.as_bytes())?;
+        let raw_stdout = private_root.join("raw.stdout.json");
+        let raw_stderr = private_root.join("raw.stderr.log");
+        fs::write(
+            &raw_stdout,
+            format!(
+                "{{\"model\":\"{model}\",\"session\":\"session-1\",\"receipt\":\"provider-receipt-1\"}}"
+            ),
+        )?;
+        fs::write(&raw_stderr, b"")?;
+        let receipt = CognitiveFieldProviderEvidenceReceipt {
+            schema_version: COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            run_id: contract.run_id.clone(),
+            contract_hash: contract.contract_hash.clone(),
+            provider_plan_hash: provider_plan.plan_hash.clone(),
+            source_commit: contract.source_commit.clone(),
+            call_id: call.call_id.clone(),
+            role: call.role,
+            host: call.host,
+            requested_model: model.to_owned(),
+            resolved_model: model.to_owned(),
+            provider_session_id: "session-1".to_owned(),
+            provider_receipt_ref: "provider-receipt-1".to_owned(),
+            provider_executable: executable.to_string_lossy().into_owned(),
+            provider_executable_sha256: call.expected_provider_executable_sha256,
+            prompt_path: prompt.to_string_lossy().into_owned(),
+            prompt_sha256: call.prompt_sha256,
+            raw_stdout_path: raw_stdout.to_string_lossy().into_owned(),
+            raw_stdout_sha256: sha256_bytes(&fs::read(&raw_stdout)?),
+            raw_stderr_path: raw_stderr.to_string_lossy().into_owned(),
+            raw_stderr_sha256: sha256_bytes(&fs::read(&raw_stderr)?),
+            outputs: vec![CognitiveFieldProviderOutputReceipt {
+                execution,
+                output_path: reader_path.to_string_lossy().into_owned(),
+                output_sha256: sha256_bytes(&fs::read(&reader_path)?),
+            }],
+            provider_calls: 1,
+            exit_code: 0,
+            elapsed_ms: 12,
+            timed_out: false,
+            unknown_outcome: false,
+            controller_substitution: false,
+            oracle_exposed: false,
+            worker_transcript_exposed: false,
+            read_only: true,
+            runtime_contract_sha256,
+            observed_mcp_server_names: Vec::new(),
+            observed_mcp_tool_names: Vec::new(),
+        };
+        // The sealed output digest must bind the exact rejected bytes, so the
+        // refusal below can only come from the duplicate member itself.
+        assert_eq!(
+            receipt.outputs[0].output_sha256,
+            sha256_bytes(&fs::read(&reader_path)?)
+        );
+        assert_eq!(
+            duplicate_output.matches("\"case_id\"").count(),
+            2,
+            "fixture payload must repeat exactly one member name"
+        );
+        assert!(
+            serde_json::from_slice::<Value>(duplicate_output.as_bytes()).is_ok(),
+            "serde_json must collapse this document, otherwise the duplicate member is not \
+             the only property that can reject it"
+        );
+        let receipt_path = private_root.join("receipt.json");
+        write_new_or_same_json(&receipt_path, &receipt)?;
+
+        let Err(refusal) = record_provider(&report_root, &private_root, &receipt_path) else {
+            return Err("record_provider admitted a duplicate reader member".into());
+        };
+        let refusal_text = refusal.to_string();
+        assert_eq!(
+            refusal_text,
+            "Reader output failed strict JSON decode: strict json: duplicate object member"
+        );
+        assert_eq!(
+            refusal.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![refusal_text.clone()],
+            "the refusal must name one bounded cause and no reader payload byte"
+        );
+        assert!(!refusal_text.contains("case_id"));
+        assert!(!refusal_text.contains(&duplicate_output));
+        assert!(!evidence_root.join("reader.json").exists());
+        assert!(!evidence_root.join("reader-binding.json").exists());
+        assert!(!evidence_root.join("provider-reader.json").exists());
+        assert!(
+            !report_root
+                .join("provider-invocations/reader-01.json")
+                .exists()
+        );
+        assert!(evidence_root.join("deterministic.json").is_file());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }
