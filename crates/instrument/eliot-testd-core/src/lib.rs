@@ -2029,6 +2029,25 @@ impl TestdOwnerSubmitRequest {
 }
 
 /// Typed directive for a productive TestD owner-submit refusal.
+///
+/// The refusal reason is the canonical I7.20 reason code
+/// `TASK_SELECTION_REQUIRED`, never a TestD-private spelling:
+/// `owner_submit_v2_wire_round_trips_both_outcomes_and_pins_the_directive_token`
+/// pins the serialized bytes and resolves them through the generated I7.20
+/// registry, so this crate cannot drift from
+/// `docs/generated/reason-codes.md` silently.
+///
+/// # Single-definition status (issue #1789 W1.4)
+///
+/// `eliot_workscope::MaterialReadinessDirective` is the one owner of the four
+/// typed readiness directives, and this enum re-declares exactly one of them
+/// because `eliot-testd-core` does not depend on `eliot-workscope`. Collapsing
+/// the pair is a shape-preserving alias: the `TASK_SELECTION_REQUIRED` bytes
+/// and every `TestdOwnerSubmitDirective::TaskSelectionRequired` construction
+/// and comparison site survive it unchanged. It needs one
+/// `eliot-workscope.workspace = true` line in this package manifest to become
+/// expressible, which is outside this source file, so the duplicate stays and
+/// the pinning test above is what keeps it honest in the meantime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TestdOwnerSubmitDirective {
@@ -6026,6 +6045,98 @@ mod tests {
             .expect("issue contour grant");
         grant.contour_root = "C:\\caller-widened-contour".to_owned();
         assert!(grant.validate_integrity().is_err());
+    }
+
+    /// Issue #1789 W1.4, wire closure. The tagged submit-v2 response keeps both
+    /// outcomes byte-stable under `TESTD_OWNER_SUBMIT_WIRE_VERSION = 2`, and a
+    /// refusal carries the exact I7.20 catalogue token rather than any
+    /// TestD-local spelling.
+    ///
+    /// The byte assertions are the oracle. A serde round trip alone would still
+    /// pass after the directive token, the outcome tag or the field set changed,
+    /// so the serialized bytes are compared literally and the token is then
+    /// resolved through the generated reason-code registry, which is the single
+    /// canonical projection of the I7.20 catalogue.
+    #[test]
+    fn owner_submit_v2_wire_round_trips_both_outcomes_and_pins_the_directive_token() {
+        const REQUEST_DIGEST: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const OPERATION_ID: &str = "operation-owner-submit-1";
+
+        let admitted = TestdOwnerSubmitResponse::Admitted {
+            wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_SUBMIT_WIRE_VERSION,
+            request_digest: REQUEST_DIGEST.to_owned(),
+            job_id: "job-owner-submit-1".to_owned(),
+            operation_id: OPERATION_ID.to_owned(),
+            authority_epoch: test_epoch(11),
+            generation: 1,
+            payload_digest: "b".repeat(64),
+        };
+        let denied = TestdOwnerSubmitResponse::Denied {
+            wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_SUBMIT_WIRE_VERSION,
+            request_digest: REQUEST_DIGEST.to_owned(),
+            operation_id: OPERATION_ID.to_owned(),
+            directive: TestdOwnerSubmitDirective::TaskSelectionRequired,
+        };
+        admitted
+            .validate()
+            .expect("an admitted submit-v2 response validates");
+        denied
+            .validate()
+            .expect("a denied submit-v2 response validates");
+
+        // Submit owns its own wire revision; the other TestD owner routes stay
+        // at v1, so a widened revision here would silently break them.
+        assert_eq!(TESTD_OWNER_SUBMIT_WIRE_VERSION, 2);
+        assert_ne!(TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_OWNER_WIRE_VERSION);
+
+        let admitted_bytes = serde_json::to_string(&admitted).expect("serialize admission");
+        let denied_bytes = serde_json::to_string(&denied).expect("serialize denial");
+
+        // The tagged shape: `outcome` first, then the declared fields in order.
+        assert!(
+            admitted_bytes.starts_with(concat!(
+                r#"{"outcome":"ADMITTED","wire_id":"eliot.kernel.testd-owner-submit","#,
+                r#""wire_version":2,"request_digest":""#,
+            )),
+            "unexpected admitted bytes: {admitted_bytes}"
+        );
+        assert_eq!(
+            denied_bytes,
+            concat!(
+                r#"{"outcome":"DENIED","wire_id":"eliot.kernel.testd-owner-submit","#,
+                r#""wire_version":2,"request_digest":""#,
+                r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+                r#""operation_id":"operation-owner-submit-1","#,
+                r#""directive":"TASK_SELECTION_REQUIRED"}"#,
+            )
+        );
+
+        // Both outcomes survive one exact byte round trip through the tagged
+        // wire, so the pins above are wire pins, not in-memory identities.
+        assert_eq!(
+            serde_json::from_str::<TestdOwnerSubmitResponse>(&admitted_bytes)
+                .expect("decode admission"),
+            admitted
+        );
+        assert_eq!(
+            serde_json::from_str::<TestdOwnerSubmitResponse>(&denied_bytes).expect("decode denial"),
+            denied
+        );
+
+        // The refusal token is the canonical catalogue code itself, at the exact
+        // SCREAMING_SNAKE_CASE spelling `docs/generated/reason-codes.md` records.
+        assert_eq!(
+            serde_json::to_string(&TestdOwnerSubmitDirective::TaskSelectionRequired)
+                .expect("serialize directive"),
+            r#""TASK_SELECTION_REQUIRED""#
+        );
+        let catalogue = eliot_protocol::agent_reason_code("TASK_SELECTION_REQUIRED")
+            .expect("the I7.20 catalogue owns TASK_SELECTION_REQUIRED");
+        assert_eq!(catalogue.code, "TASK_SELECTION_REQUIRED");
+        assert_eq!(catalogue.group, "request/identity");
     }
 
     #[test]
