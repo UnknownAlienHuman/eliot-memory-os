@@ -20,10 +20,11 @@
 //! `path.rs:line`. A case whose premises only compare two values this file built
 //! would be a formatter test, not a proof, so none is written that way.
 //!
-//! `tests/data/kernel_generation_control_diagnostics.json` freezes the six-file
-//! denominator, the complete `kernel.*` event inventory of those six modules and
-//! one boundary row per case. Case 1 re-measures both lists from source and
-//! compares them two ways, so the map cannot be satisfied by a fabricated list.
+//! `tests/data/kernel_generation_control_diagnostics.json` freezes two separate
+//! denominators: exactly 30 `WORK_UNIT_CASE` boundaries and every static
+//! `kernel.*` event-literal emission site in the six issue-owned modules. Case 1
+//! re-measures both from current source and binds each emitter site to an actual
+//! declared test handle or a source-backed blocker.
 //!
 //! Not proven here, by the card's own DEFER clause and by the module ownership
 //! below: live Windows kernel-owner and daemon-launch execution, live cutover or
@@ -31,22 +32,13 @@
 //! omission arms, the `pub(crate)` runtime-identity and ORS-recovery slices, and
 //! Control Reserve Product behaviour.
 //!
-//! MEASURED COVERAGE GAP, disclosed here because the map above is an inventory
-//! map and not yet a completeness map. An emitter inventory was derived from the
-//! six modules independently of this file: `events_by_file` reproduces exactly
-//! (13/10/9/21/14/10 = 77 distinct `kernel.*` literals), but the 30 rows cover
-//! five of the six modules - `runtime_identity.rs` has no row - and 34 of the 77
-//! events are read by no case. Two uncovered emitters sit in `control_plane.rs`,
-//! a module the map does cover, and they are named here so the gap is not
-//! silent: `kernel.control.runtime_lease_tick` (from `observe_runtime_lease_tick`)
-//! and `kernel.control.resume_identity_gap_observed` (from
-//! `observe_resume_identity_gap`). One row per `WORK_UNIT_CASE` is the card's
-//! 30-row contract, so widening the map is a scope decision for root, not one to
-//! invent here.
+//! The case denominator and emitter-site denominator are intentionally distinct:
+//! several literal sites share an event name, and inline private tests provide
+//! valid execution coverage where the integration surface is private or gated.
 
 // -------------------- capture seam (single, shared) --------------------
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -475,8 +467,8 @@ fn strip_line_comments(source: &str) -> String {
 /// it is written, and `control_plane.rs:2159` `verify_probe_watchdog_branch`
 /// only returns `TransportError::SessionFenced`.
 ///
-/// Measured over the six card modules this rule yields 77 distinct production
-/// literals (13/10/9/21/14/10); the old first-attribute rule yielded 73,
+/// Measured over the six card modules this rule yields 82 distinct production
+/// literals (13/10/9/26/14/10); the old first-attribute rule yielded 78,
 /// because it lost exactly the four named above in `generation_control.rs`.
 fn production_source(path: &Path) -> String {
     let source = std::fs::read_to_string(path).unwrap_or_else(|error| {
@@ -568,6 +560,262 @@ fn kernel_event_literals(path: &Path) -> BTreeSet<String> {
         cursor = literal_start + end + 1;
     }
     found
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct EventLiteralSite {
+    file: String,
+    function: String,
+    event: String,
+    source_line: usize,
+    occurrence: usize,
+    terminal_emitter: String,
+    role: String,
+    outcome: Option<String>,
+}
+
+/// Name of the smallest production call expression enclosing this literal.
+/// Event literals passed to an observer identify that terminal helper; a
+/// literal inside `bound_field` belongs to the containing tracing emitter.
+fn enclosing_call_name(source: &str, literal_start: usize, literal_end: usize) -> Option<String> {
+    for (open, _) in source[..literal_start].rmatch_indices('(') {
+        let Some(call) = balanced_delimited(source, open) else {
+            continue;
+        };
+        if open + call.len() <= literal_end {
+            continue;
+        }
+        let mut name_end = open;
+        while name_end > 0 && source.as_bytes()[name_end - 1].is_ascii_whitespace() {
+            name_end -= 1;
+        }
+        let mut name_start = name_end;
+        while name_start > 0 {
+            let byte = source.as_bytes()[name_start - 1];
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                name_start -= 1;
+            } else {
+                break;
+            }
+        }
+        if name_start == name_end {
+            continue;
+        }
+        return Some(source[name_start..name_end].to_owned());
+    }
+    None
+}
+
+fn second_string_argument(source: &str, literal_end: usize) -> Option<String> {
+    let mut cursor = literal_end;
+    while source
+        .as_bytes()
+        .get(cursor)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        cursor += 1;
+    }
+    if source.as_bytes().get(cursor) != Some(&b',') {
+        return None;
+    }
+    cursor += 1;
+    while source
+        .as_bytes()
+        .get(cursor)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        cursor += 1;
+    }
+    if source.as_bytes().get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let tail = &source[cursor..];
+    let end = tail.find('"')?;
+    Some(tail[..end].to_owned())
+}
+
+/// Static production event-literal callsites, in source order. This is a
+/// callsite denominator, so repeated literals in separate outcome arms remain
+/// separate rows even though `events_by_file` is a distinct-name set.
+fn kernel_event_literal_sites(path: &Path, relative: &str) -> Vec<EventLiteralSite> {
+    let source = strip_line_comments(&production_source(path));
+    let mut sites = Vec::new();
+    let mut occurrences: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let needle = "\"kernel.";
+    let mut cursor = 0usize;
+    while let Some(found) = source[cursor..].find(needle) {
+        let literal_start = cursor + found + 1;
+        let Some(end) = source[literal_start..].find('"') else {
+            break;
+        };
+        let event = &source[literal_start..literal_start + end];
+        cursor = literal_start + end + 1;
+        if !is_event_literal(event) {
+            continue;
+        }
+        let prefix = &source[..literal_start - 1];
+        let mut function_name: Option<String> = None;
+        let mut declaration_cursor = 0usize;
+        while let Some(at) = prefix[declaration_cursor..].find("fn ") {
+            let start = declaration_cursor + at + 3;
+            declaration_cursor = start;
+            let tail = &prefix[start..];
+            let length = tail
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(tail.len());
+            if length > 0 {
+                function_name = Some(tail[..length].to_owned());
+            }
+        }
+        let function = function_name.unwrap_or_else(|| {
+            panic!("event literal {event} has no containing function in {relative}")
+        });
+        let literal_end = literal_start + end;
+        let call = enclosing_call_name(&source, literal_start - 1, literal_end + 1)
+            .unwrap_or_else(|| panic!("event literal {event} has no enclosing call in {relative}"));
+        let terminal_emitter = if call == "bound_field" {
+            function.clone()
+        } else {
+            call.clone()
+        };
+        let role = if terminal_emitter == function {
+            "terminal_emitter"
+        } else {
+            "propagated_caller"
+        };
+        let outcome = if call.starts_with("observe_") {
+            second_string_argument(&source, literal_end + 1)
+        } else {
+            None
+        };
+        let key = (function.clone(), event.to_owned());
+        let occurrence = occurrences.entry(key).or_default();
+        *occurrence += 1;
+        sites.push(EventLiteralSite {
+            file: relative.to_owned(),
+            function,
+            event: event.to_owned(),
+            source_line: source[..literal_start].matches('\n').count() + 1,
+            occurrence: *occurrence,
+            terminal_emitter,
+            role: role.to_owned(),
+            outcome,
+        });
+    }
+    sites
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NonliteralPropagationSite {
+    file: String,
+    function: String,
+    source_line: usize,
+    call: String,
+    span: String,
+    terminal_emitter: String,
+}
+
+/// Production callers whose event is emitted by a fixed helper or by the
+/// diagnostics facade rather than by a "kernel.…" literal at the callsite.
+/// Kept separate from the literal-site rows so helper propagation is not
+/// counted as another literal emitter.
+fn nonliteral_propagation_sites(path: &Path, relative: &str) -> Vec<NonliteralPropagationSite> {
+    let source = strip_line_comments(&production_source(path));
+    let mut sites = Vec::new();
+    let calls = [
+        (
+            "observe_terminal_error_in_context",
+            "kernel.terminal_error",
+            "kernel_diagnostics::observe_terminal_error_in_context",
+        ),
+        (
+            "observe_terminal_error",
+            "kernel.terminal_error",
+            "kernel_diagnostics::observe_terminal_error",
+        ),
+        (
+            "observe_runtime_lease_tick",
+            "kernel.control.runtime_lease_tick",
+            "observe_runtime_lease_tick",
+        ),
+        (
+            "observe_resume_identity_gap",
+            "kernel.control.resume_identity_gap_observed",
+            "observe_resume_identity_gap",
+        ),
+        (
+            "observe_control_capacity",
+            "kernel.control.capacity_observed",
+            "observe_control_capacity",
+        ),
+    ];
+    for (call, span, terminal_emitter) in calls {
+        let mut cursor = 0usize;
+        while let Some(found) = source[cursor..].find(call) {
+            let at = cursor + found;
+            cursor = at + call.len();
+            let before = at
+                .checked_sub(1)
+                .and_then(|index| source.as_bytes().get(index));
+            let after = source.as_bytes().get(at + call.len());
+            if before.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                || after.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                continue;
+            }
+            let mut open = at + call.len();
+            while source
+                .as_bytes()
+                .get(open)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                open += 1;
+            }
+            if source.as_bytes().get(open) != Some(&b'(') {
+                continue;
+            }
+            let mut prefix = at;
+            while prefix > 0 && source.as_bytes()[prefix - 1].is_ascii_whitespace() {
+                prefix -= 1;
+            }
+            if source[..prefix].ends_with("fn") {
+                continue;
+            }
+            let mut function: Option<String> = None;
+            let mut declaration_cursor = 0usize;
+            while let Some(found) = source[..at][declaration_cursor..].find("fn ") {
+                let start = declaration_cursor + found + 3;
+                declaration_cursor = start;
+                let tail = &source[start..at];
+                let length = tail
+                    .find(|character: char| {
+                        !(character.is_ascii_alphanumeric() || character == '_')
+                    })
+                    .unwrap_or(tail.len());
+                if length > 0 {
+                    function = Some(tail[..length].to_owned());
+                }
+            }
+            let function = function.unwrap_or_else(|| {
+                panic!("propagation call {call} has no containing function in {relative}")
+            });
+            sites.push(NonliteralPropagationSite {
+                file: relative.to_owned(),
+                function,
+                source_line: source[..at].matches('\n').count() + 1,
+                call: call.to_owned(),
+                span: span.to_owned(),
+                terminal_emitter: terminal_emitter.to_owned(),
+            });
+        }
+    }
+    sites.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.source_line.cmp(&right.source_line))
+    });
+    sites
 }
 
 fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -970,6 +1218,154 @@ fn test_attribute_count(source: &str) -> usize {
         .count()
 }
 
+/// Returns an actually declared test body and its containing scope, named by a
+/// fully qualified fixture handle. Handles are `path.rs::module::test_fn` for
+/// private inline tests or `path.rs::test_fn` for this integration-test file.
+/// A plain non-empty name is not evidence: the module and real test declaration
+/// must exist.
+fn declared_test(handle: &str) -> Option<(String, String)> {
+    let mut parts = handle.split("::");
+    let relative = parts.next()?;
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() || rest.len() > 2 {
+        return None;
+    }
+    let path = manifest_dir().join(
+        relative
+            .strip_prefix("bins/eliot-kernel/")
+            .unwrap_or(relative),
+    );
+    let raw = std::fs::read_to_string(path).ok()?;
+    let source = strip_line_comments(&raw);
+    let test_name = *rest.last()?;
+    let scope = if rest.len() == 2 {
+        let module_name = rest[0];
+        let marker = format!("mod {module_name}");
+        let module_at = source.find(&marker)?;
+        let open = module_at + source[module_at..].find('{')?;
+        balanced_delimited(&source, open)?
+    } else {
+        source.as_str()
+    };
+    let lines: Vec<&str> = scope.lines().collect();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    let mut line_start = 0usize;
+    for line in &lines {
+        line_starts.push(line_start);
+        line_start += line.len() + 1;
+    }
+    let mut index = 0usize;
+    while index < lines.len() {
+        let attribute = lines[index].trim();
+        if attribute != "#[test]" && !attribute.starts_with("#[tokio::test") {
+            index += 1;
+            continue;
+        }
+        let mut declaration_line = index + 1;
+        while let Some(line) = lines.get(declaration_line) {
+            if line.trim().is_empty() {
+                declaration_line += 1;
+                continue;
+            }
+            if !line.trim_start().starts_with("#[") {
+                break;
+            }
+            // Skip the complete attribute, including multiline `allow` and
+            // `cfg` lists. Line-prefix skipping stopped at continuation lines
+            // such as `reason = ...`, which hid otherwise real test handles.
+            let open = line_starts[declaration_line] + line.find('[')?;
+            let attribute = balanced_delimited(scope, open)?;
+            let attribute_end = open + attribute.len();
+            while declaration_line < lines.len() && line_starts[declaration_line] < attribute_end {
+                declaration_line += 1;
+            }
+        }
+        let Some(declaration) = lines.get(declaration_line).and_then(|line| {
+            line.trim()
+                .strip_prefix("fn ")
+                .or_else(|| line.trim().strip_prefix("async fn "))
+        }) else {
+            index = declaration_line.saturating_add(1);
+            continue;
+        };
+        let declared_name = declaration
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .map_or(declaration, |end| &declaration[..end]);
+        if declared_name != test_name {
+            index = declaration_line + 1;
+            continue;
+        }
+        let declaration_start = line_starts[declaration_line];
+        let body_open = scope[declaration_start..]
+            .find('{')
+            .map(|offset| declaration_start + offset)?;
+        let body = balanced_delimited(scope, body_open)?;
+        return Some((body.to_owned(), scope.to_owned()));
+    }
+    None
+}
+
+/// Returns the body of a declared helper function in the test's own scope.
+/// This binds an async or table-driven test to the concrete assertions it calls
+/// without accepting a helper name that is only mentioned in fixture prose.
+fn declared_helper_body<'a>(scope: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("fn {name}");
+    let mut cursor = 0usize;
+    while let Some(found) = scope[cursor..].find(&needle) {
+        let declaration = cursor + found;
+        let before = declaration
+            .checked_sub(1)
+            .and_then(|at| scope.as_bytes().get(at));
+        let after = scope.as_bytes().get(declaration + needle.len());
+        if before.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || after.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            cursor = declaration + needle.len();
+            continue;
+        }
+        let open = declaration + scope[declaration..].find('{')?;
+        return balanced_delimited(scope, open);
+    }
+    None
+}
+
+/// True only when `token` is an operand of a real assertion macro or a
+/// declared `assert_*` helper call in executable test source. Merely placing an
+/// event name and outcome somewhere in a test body is not assertion evidence.
+fn assertion_binds(scope: &str, source: &str, token: &str) -> bool {
+    for (at, _) in source.match_indices("assert") {
+        let before = at
+            .checked_sub(1)
+            .and_then(|index| source.as_bytes().get(index));
+        if before.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+            continue;
+        }
+        let Some(open_offset) = source[at..].find('(') else {
+            continue;
+        };
+        if open_offset > 32 {
+            continue;
+        }
+        let open = at + open_offset;
+        let Some(call) = balanced_delimited(source, open) else {
+            continue;
+        };
+        if !token_present(call, token) {
+            continue;
+        }
+        let name = source[at..open].trim().trim_end_matches('!').trim();
+        if name == "assert" || name.starts_with("assert_eq") || name.starts_with("assert_ne") {
+            return true;
+        }
+        if name.starts_with("assert_")
+            && declared_helper_body(scope, name).is_some_and(|body| body.contains("assert"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 // -------------------- result probes (cases 29, 30) --------------------
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1148,11 +1544,414 @@ fn six_file_boundary_denominator_is_complete() {
         "the files writing through the #903 observation helpers must be exactly the six card modules, in both directions"
     );
     // ---------------------------------------------------------------------
-    // THIRD DENOMINATOR: the TEST denominator. The two above measure which
-    // production FILES and which helper CALLSITES belong to #903. This one
-    // measures which CASES the thirty frozen boundary rows are bound to, and
-    // every part of it is measured from source read at run time rather than
-    // from the fixture's own word.
+    // SECOND DENOMINATOR: static production literal callsites. `events_by_file`
+    // above intentionally counts distinct event names; this table counts each
+    // source occurrence independently, including repeated outcome arms. A
+    // row must preserve its source line, containing function, event phase and
+    // occurrence ordinal. Every mapped handle is resolved to an actual
+    // `#[test]` declaration whose body carries that exact event literal; a
+    // missing executable owner path is represented by an issue-owned blocker,
+    // never by a placeholder name.
+    let emitter_rows = fx["emitter_sites"]
+        .as_array()
+        .expect("fixture must pin the source-measured emitter_sites array");
+    let frozen_emitter_count = fx["emitter_site_count"]
+        .as_u64()
+        .expect("fixture must pin emitter_site_count");
+    let mut measured_sites = Vec::new();
+    for relative in &expected {
+        let path = manifest_dir().join(
+            relative
+                .strip_prefix("bins/eliot-kernel/")
+                .unwrap_or(relative),
+        );
+        measured_sites.extend(kernel_event_literal_sites(&path, relative));
+    }
+    assert_eq!(
+        measured_sites.len() as u64,
+        frozen_emitter_count,
+        "the independently measured production emitter denominator changed"
+    );
+    assert_eq!(
+        emitter_rows.len(),
+        measured_sites.len(),
+        "emitter_sites must carry one row per static production event-literal callsite, independently of the 30 case boundaries"
+    );
+    for (row, measured) in emitter_rows.iter().zip(&measured_sites) {
+        let event = row["event"].as_str().unwrap_or("");
+        let function = row["function"].as_str().unwrap_or("");
+        let phase = row["phase"].as_str().unwrap_or("");
+        assert_eq!(row["file"].as_str(), Some(measured.file.as_str()));
+        assert_eq!(function, measured.function);
+        assert_eq!(event, measured.event);
+        assert_eq!(
+            row["source_line"].as_u64(),
+            Some(measured.source_line as u64)
+        );
+        assert_eq!(row["occurrence"].as_u64(), Some(measured.occurrence as u64));
+        assert_eq!(
+            row["terminal_emitter"].as_str(),
+            Some(measured.terminal_emitter.as_str())
+        );
+        assert_eq!(row["role"].as_str(), Some(measured.role.as_str()));
+        assert_eq!(row["outcome"].as_str(), measured.outcome.as_deref());
+        assert_eq!(
+            phase,
+            measured.event.rsplit('.').next().unwrap_or(""),
+            "the phase must be the event's production outcome suffix"
+        );
+        assert!(
+            row["owner_evidence"]
+                .as_str()
+                .is_some_and(|evidence| !evidence.trim().is_empty()),
+            "{}:{} {} must state the owner evidence for this emitted phase",
+            measured.file,
+            measured.source_line,
+            measured.event
+        );
+        assert!(
+            matches!(
+                row["coverage_status"].as_str(),
+                Some("covered" | "blocked" | "excluded")
+            ),
+            "{}:{} {} must declare covered, blocked, or excluded status",
+            measured.file,
+            measured.source_line,
+            measured.event
+        );
+        assert!(
+            matches!(
+                row["role"].as_str(),
+                Some("terminal_emitter" | "propagated_caller")
+            ),
+            "{}:{} {} has an invalid terminal-emitter/propagated-caller role",
+            measured.file,
+            measured.source_line,
+            measured.event
+        );
+        if row["coverage_status"] == "blocked" {
+            assert!(row["test"].is_null());
+            assert!(row["proof_kind"].is_null());
+            let blocker = row
+                .get("blocker")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} {} must name its blocker",
+                        measured.file, measured.source_line, measured.event
+                    )
+                });
+            assert!(
+                blocker
+                    .get("blocked_by_issue")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|issue| issue > 0)
+            );
+            assert!(
+                blocker
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.trim().is_empty())
+            );
+            continue;
+        }
+        if row["coverage_status"] == "excluded" {
+            assert_eq!(row["proof_kind"].as_str(), Some("ExclusionProof"));
+            let basis = row
+                .get("exclusion")
+                .and_then(Value::as_object)
+                .and_then(|exclusion| exclusion.get("basis"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            assert!(
+                !basis.trim().is_empty(),
+                "an exclusion needs exact source evidence"
+            );
+            if let Some(handle) = row["test"].as_str() {
+                let (body, scope) = declared_test(handle).unwrap_or_else(|| {
+                    panic!(
+                        "excluded site {} names a missing test {handle}",
+                        measured.event
+                    )
+                });
+                let mut assertion_source = body.clone();
+                if let Some(helper_name) = row["assertion_helper"].as_str() {
+                    let helper = declared_helper_body(&scope, helper_name).unwrap_or_else(|| {
+                        panic!("test {handle} names missing helper {helper_name}")
+                    });
+                    assertion_source.push_str(helper);
+                }
+                assert!(
+                    token_present(&assertion_source, event)
+                        && (assertion_source.contains("!record.contains")
+                            || assertion_source.contains("assert_absent")),
+                    "excluded site {} must be explicitly absent on its declared test surface",
+                    measured.event
+                );
+            } else {
+                assert!(
+                    basis.contains("::") && basis.contains("lifecycle.rs"),
+                    "an exclusion without a runtime test must cite the exact owner source proof"
+                );
+            }
+            continue;
+        }
+        match row["test"].as_str() {
+            Some(handle) => {
+                assert!(
+                    row.get("blocker").is_none() || row["blocker"].is_null(),
+                    "{}:{} {} cannot claim both a test and a blocker",
+                    measured.file,
+                    measured.source_line,
+                    measured.event
+                );
+                let (body, scope) = declared_test(handle).unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} {} names {handle}, but it is not an actually declared #[test]",
+                        measured.file, measured.source_line, measured.event
+                    )
+                });
+                let mut assertion_source = body.clone();
+                if let Some(helper_name) = row["assertion_helper"].as_str() {
+                    assert!(
+                        token_present(&body, helper_name),
+                        "test {handle} does not execute its declared assertion helper {helper_name}"
+                    );
+                    let helper = declared_helper_body(&scope, helper_name).unwrap_or_else(|| {
+                        panic!("test {handle} names missing helper {helper_name}")
+                    });
+                    assertion_source.push_str(helper);
+                }
+                assert!(
+                    token_present(&assertion_source, event),
+                    "test {handle} does not bind the exact event literal {}:{} {} in executable source",
+                    measured.file,
+                    measured.source_line,
+                    measured.event
+                );
+                assert!(
+                    assertion_binds(&scope, &assertion_source, event),
+                    "test {handle} mentions {} but does not assert it for {}:{}",
+                    measured.event,
+                    measured.file,
+                    measured.source_line
+                );
+                if let Some(outcome) = measured.outcome.as_deref() {
+                    assert!(
+                        token_present(&assertion_source, outcome),
+                        "test {handle} does not bind the emitted outcome {outcome} for {}:{} {}",
+                        measured.file,
+                        measured.source_line,
+                        measured.event
+                    );
+                    assert!(
+                        assertion_binds(&scope, &assertion_source, outcome),
+                        "test {handle} mentions outcome {outcome} but does not assert it for {}:{} {}",
+                        measured.file,
+                        measured.source_line,
+                        measured.event
+                    );
+                }
+                if let Some(expected_outcomes) = row["expected_outcomes"].as_array() {
+                    assert!(
+                        !expected_outcomes.is_empty(),
+                        "{}:{} {} cannot freeze an empty expected_outcomes list",
+                        measured.file,
+                        measured.source_line,
+                        measured.event
+                    );
+                    for expected_outcome in expected_outcomes {
+                        let value = expected_outcome
+                            .as_str()
+                            .expect("expected_outcomes values must be strings");
+                        assert!(
+                            token_present(&assertion_source, value),
+                            "test {handle} does not assert expected outcome {value} for {}:{} {}",
+                            measured.file,
+                            measured.source_line,
+                            measured.event
+                        );
+                        assert!(
+                            assertion_binds(&scope, &assertion_source, value),
+                            "test {handle} mentions expected outcome {value} but does not assert it for {}:{} {}",
+                            measured.file,
+                            measured.source_line,
+                            measured.event
+                        );
+                    }
+                }
+                if let Some(expected_fields) = row["expected_fields"].as_array() {
+                    for expected_field in expected_fields {
+                        let value = expected_field
+                            .as_str()
+                            .expect("expected_fields values must be strings");
+                        assert!(
+                            token_present(&assertion_source, value),
+                            "test {handle} does not assert expected field {value} for {}:{} {}",
+                            measured.file,
+                            measured.source_line,
+                            measured.event
+                        );
+                        assert!(
+                            assertion_binds(&scope, &assertion_source, value),
+                            "test {handle} mentions expected field {value} but does not assert it for {}:{} {}",
+                            measured.file,
+                            measured.source_line,
+                            measured.event
+                        );
+                    }
+                }
+                if let Some(expected_values) = row["expected_values"].as_object() {
+                    for (field, value) in expected_values {
+                        assert!(
+                            token_present(&assertion_source, field)
+                                && token_present(&assertion_source, &value.to_string()),
+                            "test {handle} does not assert expected value {field}={value} for {}:{} {}",
+                            measured.file,
+                            measured.source_line,
+                            measured.event
+                        );
+                        assert!(
+                            assertion_binds(&scope, &assertion_source, field)
+                                && assertion_binds(&scope, &assertion_source, &value.to_string()),
+                            "test {handle} mentions expected value {field}={value} but does not assert its operands for {}:{} {}",
+                            measured.file,
+                            measured.source_line,
+                            measured.event
+                        );
+                    }
+                }
+                assert!(matches!(
+                    row["proof_kind"].as_str(),
+                    Some("EdgeProof" | "UnitProof")
+                ));
+            }
+            None => {
+                panic!(
+                    "{}:{} {} is marked covered/excluded without a real test handle",
+                    measured.file, measured.source_line, measured.event
+                );
+            }
+        }
+    }
+    // ---------------------------------------------------------------------
+    // SEPARATE PROPAGATION DENOMINATOR: these nonliteral helper edges remain
+    // distinct from static event-literal callsites. Measure every production
+    // call in the six owned modules and bind each frozen row to its exact
+    // function, source line, helper, span, terminal emitter, and actual test or
+    // named upstream blocker.
+    let propagation_rows = fx["propagations"]
+        .as_array()
+        .expect("fixture must pin nonliteral production propagation edges");
+    let frozen_propagation_count = fx["propagation_count"]
+        .as_u64()
+        .expect("fixture must pin propagation_count");
+    let mut measured_propagations = Vec::new();
+    for relative in &expected {
+        let path = manifest_dir().join(
+            relative
+                .strip_prefix("bins/eliot-kernel/")
+                .unwrap_or(relative),
+        );
+        measured_propagations.extend(nonliteral_propagation_sites(&path, relative));
+    }
+    assert_eq!(
+        measured_propagations.len() as u64,
+        frozen_propagation_count,
+        "the independently measured nonliteral production propagation denominator changed"
+    );
+    assert_eq!(
+        propagation_rows.len(),
+        measured_propagations.len(),
+        "propagations must carry one row per measured nonliteral production edge, separately from emitter_sites"
+    );
+    for (row, measured) in propagation_rows.iter().zip(&measured_propagations) {
+        assert_eq!(row["file"].as_str(), Some(measured.file.as_str()));
+        assert_eq!(row["function"].as_str(), Some(measured.function.as_str()));
+        assert_eq!(
+            row["source_line"].as_u64(),
+            Some(measured.source_line as u64)
+        );
+        assert_eq!(row["call"].as_str(), Some(measured.call.as_str()));
+        assert_eq!(row["span"].as_str(), Some(measured.span.as_str()));
+        assert_eq!(
+            row["terminal_emitter"].as_str(),
+            Some(measured.terminal_emitter.as_str())
+        );
+        assert_eq!(row["role"].as_str(), Some("propagated_caller"));
+        assert!(
+            row["owner_evidence"]
+                .as_str()
+                .is_some_and(|evidence| !evidence.trim().is_empty()),
+            "{}:{} {} must state the concrete owner value propagated",
+            measured.file,
+            measured.source_line,
+            measured.call
+        );
+        match row["coverage_status"].as_str() {
+            Some("blocked") => {
+                assert!(row["test"].is_null());
+                assert!(row["proof_kind"].is_null());
+                let blocker = row
+                    .get("blocker")
+                    .and_then(Value::as_object)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}:{} {} must name its owner blocker",
+                            measured.file, measured.source_line, measured.call
+                        )
+                    });
+                assert!(
+                    blocker
+                        .get("blocked_by_issue")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|issue| issue > 0)
+                );
+                assert!(
+                    blocker
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| !reason.trim().is_empty())
+                );
+            }
+            Some("covered") => {
+                assert!(row.get("blocker").is_none() || row["blocker"].is_null());
+                assert!(matches!(
+                    row["proof_kind"].as_str(),
+                    Some("EdgeProof" | "UnitProof")
+                ));
+                let handle = row["test"].as_str().unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} {} is covered without a test handle",
+                        measured.file, measured.source_line, measured.call
+                    )
+                });
+                let (body, scope) = declared_test(handle).unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} {} names {handle}, but no real #[test] declaration exists",
+                        measured.file, measured.source_line, measured.call
+                    )
+                });
+                assert!(
+                    body.contains("assert"),
+                    "test {handle} does not execute an assertion for propagated owner edge {}:{} {}",
+                    measured.file,
+                    measured.source_line,
+                    measured.call
+                );
+                let _ = scope;
+            }
+            status => panic!(
+                "{}:{} {} has invalid propagation coverage status {status:?}",
+                measured.file, measured.source_line, measured.call
+            ),
+        }
+    }
+    // ---------------------------------------------------------------------
+    // THIRD DENOMINATOR: the case/test denominator. The production emitter
+    // sites above remain distinct from the exactly thirty `WORK_UNIT_CASE`
+    // rows. This denominator binds each frozen boundary row to the case that
+    // reads it, and every part is measured from source at run time.
     //
     // MEASURED HERE, four ways:
     //   (a) PAIRING. This file must carry exactly thirty
@@ -1197,39 +1996,11 @@ fn six_file_boundary_denominator_is_complete() {
     //       neither. The listed lines are compared to the measured ones in BOTH
     //       directions, so an invented line and an unlisted real one both fail.
     //
-    // NOT FULLY MEASURED, and disclosed here rather than asserted away: (c) does
-    // not hold for every row. Rows 10, 16, 19 and 29 name a span their OWN case
-    // never reads. Case 10 asserts the authority-epoch tuples and the refusal's
-    // request/failure pair, not the handshake record it names; case 16 asserts
-    // the control lane's own health records and terminal absences, not the
-    // transition failure it names; case 19 asserts liveness/readiness
-    // separation, not the readiness report it names; case 29 asserts sink
-    // non-interference, not the service-state record it names. All four spans
-    // are real in production and every one of them IS read by other cases, so
-    // the map is not false about the owner; it is false about WHICH case reads
-    // it. The residue is pinned by exact identity below, so repairing one of the
-    // four, or letting a fifth appear, fails here until the map and the case
-    // agree. That is deliberate: this is a tripwire on disclosed debt, not a
-    // standing exemption.
-    //
-    // WHAT WOULD CLOSE (c) COMPLETELY is fixture data this map does not carry:
-    // per row, the set of literals the named case is expected to assert on. A
-    // `span` names ONE production literal, while a case such as case 29 asserts
-    // a whole driven sequence of them, so "this span" cannot be the unit of
-    // expected needles without inventing a per-row list. Inventing that list
-    // here would fabricate evidence, so it is not invented; (c) is therefore
-    // honestly bounded at "the named case carries this literal in its code",
-    // which is weaker than "the named case asserts this literal against a
-    // capture" and is reported as such.
-    //
     // (d) IS A CROSS-CHECK, and its two directions are both real: `emitter` is
     // falsified by a function whose body carries neither the span nor an
     // argument call for it, and `propagated` is falsified by a function whose
-    // body carries the span. Neither direction is a restatement of the other,
-    // and neither is a claim about `owner_evidence`, whose prose is verified by
-    // reading and NOT by this file: only its presence is asserted here, because
-    // no mechanical check can decide whether a durable ORS row really is the
-    // evidence a stage turns on.
+    // body carries the span. The separate emitter-site rows above additionally
+    // bind every event literal to a real test declaration or a named blocker.
     let source = self_source();
     let marked = marked_cases(&source);
     assert_eq!(
@@ -1260,7 +2031,6 @@ fn six_file_boundary_denominator_is_complete() {
         "the fixture must freeze exactly one boundary row per marked case, in both directions"
     );
     let bodies = top_level_fn_bodies(&strip_line_comments(&source));
-    let mut unbound: Vec<u64> = Vec::new();
     for (row, (case, name, _)) in rows.iter().zip(&marked) {
         assert!(
             row["span"]
@@ -1377,17 +2147,36 @@ fn six_file_boundary_denominator_is_complete() {
             .iter()
             .find_map(|(candidate, body)| (candidate == name).then_some(body.as_str()))
             .unwrap_or_default();
-        if !case_reads_span(span, body, &fx) {
-            unbound.push(*case);
+        assert!(
+            case_reads_span(span, body, &fx),
+            "boundary row for case {case} names span {span}, but that case's executable body never reads it"
+        );
+        if *case == 15 {
+            assert_eq!(
+                row["proof_kind"].as_str(),
+                Some("UnitProof"),
+                "the reserve terminal-code mapper is only unit-proven for a supplied typed variant"
+            );
+            let proof_handle = row["proof_handle"]
+                .as_str()
+                .expect("case 15 must name its typed-variant mapper proof");
+            let (proof_body, proof_scope) = declared_test(proof_handle).unwrap_or_else(|| {
+                panic!("case 15 names {proof_handle}, but no real mapper #[test] exists")
+            });
+            for token in ["ControlReserveExhausted", "CONTROL_RESERVE_EXHAUSTED"] {
+                assert!(
+                    assertion_binds(&proof_scope, &proof_body, token),
+                    "case 15 UnitProof must assert the exact supplied variant/code pair {token}"
+                );
+            }
+            assert!(
+                row["proof_limit"]
+                    .as_str()
+                    .is_some_and(|limit| limit.contains("no real reserve-owner refusal")),
+                "case 15 must disclose that this mapper proof is not an upstream reserve edge"
+            );
         }
     }
-    assert_eq!(
-        unbound,
-        vec![10, 16, 19, 29],
-        "the disclosed span-binding residue changed: either a row stopped naming a span its own \
-         case reads, or a fifth row now does. Repair the map or the case and restate this list; \
-         the four rows are the ones whose span their named case provably never reads"
-    );
     // Drive one real callsite so the frozen emitter names exist in a capture.
     let (kernel, _guard) = test_kernel();
     let (text, snapshot) = capture_with(|| kernel.generation_route_snapshot());
@@ -1441,7 +2230,7 @@ fn candidate_identity_is_not_validated_identity() {
     assert_absent(&candidate_text, &[staged]);
     // The candidate never reached the ORS staging owner at all: production sets
     // `observations.cutover_staged` only after `stage_generation_cutover`
-    // returned Ok (`generation_recovery.rs:451`). Its own refusal is the gateway
+    // returned Ok (`generation_recovery.rs:527`). Its own refusal is the gateway
     // fence `apply_generation_cutover_inner` records in `generation_poison`
     // (`generation_control.rs:922`) and returns as `KernelServiceError::Platform`,
     // which `generation_cutover_terminal_code` maps to `CUTOVER_PLATFORM`; it is
@@ -1533,8 +2322,8 @@ fn invalid_or_foreign_generation_identity_stays_typed() {
 // I14.20:265 (truncated at the semicolon, which continues with the
 // unresolved-scopes clause): "`COMMITTED` is the ORS linearization point";
 // I14.20:27 ORS operation machine: "STAGED → ASSIGNED → APPLYING → RESOLVED".
-// Pins `generation_recovery.rs:451` (staged only after the ORS write returned)
-// against `:456`-`:459` (committed only after the ORS returned a `Committed`
+// Pins `generation_recovery.rs:527` (staged only after the ORS write returned)
+// against `:532`-`:535` (committed only after the ORS returned a `Committed`
 // snapshot), and `:147`-`:153` (applied and completed are separate phases).
 #[test]
 fn staged_generation_is_not_committed_generation() {
@@ -1576,7 +2365,7 @@ fn staged_generation_is_not_committed_generation() {
 // WORK_UNIT_CASE: 903/5
 // I14.20:248 module generation: "STAGED → STARTING | RETIRED | QUARANTINED" — a
 // staged generation is never the active route.
-// Pins `generation_recovery.rs:471` (`*generations = candidate` is reached only
+// Pins `generation_recovery.rs:547` (`*generations = candidate` is reached only
 // on `Ok`) together with `generation_control.rs:705`-`:729` (the owner's live
 // projection reads the router, not the staged record).
 #[test]
@@ -1727,7 +2516,7 @@ fn drain_requested_is_not_drained() {
 // activation/staging receipt to the same `admission_decision_digest`."
 // Pins `classify_generation_cutover_live_endpoint` (`generation_control.rs:587`,
 // only a `Committed` decision is classified) and the ORS commit gate
-// (`generation_recovery.rs:456`), which is the only place a cutover becomes
+// (`generation_recovery.rs:532`), which is the only place a cutover becomes
 // authority.
 #[test]
 fn cutover_requires_the_owners_committed_receipt() {
@@ -1856,7 +2645,7 @@ fn old_generation_cannot_be_current_after_cutover() {
 // I14.20:265: "Rollback is never a backward state transition. It is a new cutover
 // with a newer Authority Epoch"; I1.8:34: "Session exists only while transport
 // identity and semantic Session refer to the same State Fence/epoch."
-// Pins the exact-tuple epoch bridge at `generation_recovery.rs:464`-`:467`
+// Pins the exact-tuple epoch bridge at `generation_recovery.rs:540`-`:543`
 // (`synchronize_authority_epoch(decision.new_epoch())`) by proving the refused
 // cutover advanced NEITHER the router epoch NOR the live service epoch, and by
 // proving production's own same-authority comparison still holds afterwards
@@ -1907,6 +2696,19 @@ fn old_and_new_authority_epochs_are_both_preserved() {
             "kernel.generation.cutover_failed",
         ],
     );
+    assert_eq!(
+        outcome_marker_after(
+            &text,
+            index_of(&text, "kernel.generation.cutover_requested")
+        ),
+        "attempt",
+        "the stale committed decision is recorded as a cutover attempt"
+    );
+    assert_eq!(
+        outcome_marker_after(&text, index_of(&text, "kernel.generation.cutover_failed")),
+        "rejected",
+        "the stale committed decision is recorded as the owner's typed refusal"
+    );
     assert_absent(&text, &["550e8400-e29b-41d4-a716", "epoch="]);
 }
 
@@ -1940,6 +2742,19 @@ fn old_and_new_fences_are_both_preserved() {
             "kernel.generation.service_fence_requested",
             "kernel.generation.service_fenced",
         ],
+    );
+    assert_eq!(
+        outcome_marker_after(
+            &text,
+            index_of(&text, "kernel.generation.service_fence_requested")
+        ),
+        "attempt",
+        "the service fence owner records its request before applying the fence"
+    );
+    assert_eq!(
+        outcome_marker_after(&text, index_of(&text, "kernel.generation.service_fenced")),
+        "success",
+        "the service fence success record requires the owner's fence_generation result"
     );
     assert_causal_order(
         &text,
@@ -2273,6 +3088,15 @@ fn reserve_degradation_is_not_total_kernel_failure() {
     let fx = fixture();
     let refused = fixture_str(&fx, "/control/probe_ready_terminal");
     let (kernel, _guard) = test_kernel();
+    let route_before = kernel
+        .generation_route_snapshot()
+        .expect("baseline generation route snapshot");
+    let scope = daemon_scope();
+    let daemon_route_before = route_before
+        .route(&scope)
+        .expect("baseline daemon route")
+        .clone();
+    let epoch_before = route_before.epoch().clone();
     let (text, outcome) = capture_with(|| kernel.apply_control(KernelControlCommand::ProbeReady));
     assert!(
         matches!(outcome, Err(KernelServiceError::ReadinessNotProven)),
@@ -2281,6 +3105,49 @@ fn reserve_degradation_is_not_total_kernel_failure() {
     assert!(
         text.contains(&refused),
         "the refusal keeps its own stable code"
+    );
+    assert_present(
+        &text,
+        &[
+            "kernel.control.transition_requested",
+            "kernel.control.transition_failed",
+        ],
+    );
+    assert_eq!(
+        outcome_marker_after(
+            &text,
+            index_of(&text, "kernel.control.transition_requested")
+        ),
+        "attempt",
+        "the service records the requested command before applying it"
+    );
+    assert_eq!(
+        outcome_marker_after(&text, index_of(&text, "kernel.control.transition_failed")),
+        "rejected",
+        "the service records the typed transition refusal as rejected"
+    );
+    assert_eq!(
+        occurrences(&text, "kernel.terminal_error"),
+        1,
+        "the refused control transition owns exactly one terminal record"
+    );
+    assert_eq!(
+        occurrences(&text, "kernel.control.transition_requested"),
+        1,
+        "the refused control transition owns one request record"
+    );
+    assert_eq!(
+        occurrences(&text, "kernel.control.transition_failed"),
+        1,
+        "the refused control transition owns one failure record"
+    );
+    assert_causal_order(
+        &text,
+        &[
+            "kernel.control.transition_requested",
+            "kernel.control.transition_failed",
+            "kernel.terminal_error",
+        ],
     );
     // A degraded control lane is not a whole-Kernel failure: the service state
     // and the generation gateway keep answering, and no core/platform code is
@@ -2300,6 +3167,19 @@ fn reserve_degradation_is_not_total_kernel_failure() {
     let (route_text, route) = capture_with(|| kernel.generation_route_snapshot());
     assert!(route.is_ok(), "the generation gateway keeps serving");
     assert_present(&route_text, &["kernel.generation.snapshot_committed"]);
+    let route_after = route.expect("generation route after refused control request");
+    assert_eq!(
+        route_after
+            .route(&scope)
+            .expect("daemon route after refused control request"),
+        &daemon_route_before,
+        "a refused control transition must leave the full daemon route unchanged"
+    );
+    assert_eq!(
+        route_after.epoch(),
+        &epoch_before,
+        "a refused control transition must leave the router epoch unchanged"
+    );
     for total_failure in ["CONTROL_CORE", "CONTROL_PLATFORM", "SNAPSHOT_PLATFORM"] {
         assert_absent(&text, &[total_failure]);
     }
@@ -2445,6 +3325,13 @@ fn daemon_liveness_is_not_semantic_readiness() {
     // records its projection (`health_view.rs:244`/`:253`/`:267`).
     assert_present(&state_text, &["kernel.health.service_state_observed"]);
     assert_present(&view_text, &["kernel.activation.view_projected"]);
+    let (report_text, report) = capture_with(|| kernel.mark_daemon_ready());
+    assert!(
+        matches!(report, Err(KernelServiceError::ReadinessNotProven)),
+        "a liveness read without a receipt cannot be promoted to readiness, got {report:?}"
+    );
+    assert_present(&report_text, &["kernel.daemon.ready_reported"]);
+    assert_absent(&report_text, &["kernel.daemon.ready_proven"]);
     // DISCLOSED, not repaired: the `liveness_text` absence below is vacuous BY
     // CONSTRUCTION. `daemon_ready()` is a pure predicate (`daemon_runtime.rs:510`)
     // that deliberately emits NO record, so that capture is legitimately EMPTY and
@@ -2469,12 +3356,12 @@ fn daemon_liveness_is_not_semantic_readiness() {
 // committed → reconcile ORS; if known rollback → retry under same identity; if
 // unknown → pause Ordering Scope".
 // Pins the five distinct recovery phase records production emits from five
-// distinct sites: `generation_recovery.rs:293` (`recover_requested`), `:313`
-// (`cutovers_reconciled`), `:318` (`cutovers_loaded`), `:320` (`load_empty`) and
-// `:296` (`recover_completed`), driven through the real composition build that
+// distinct sites: `generation_recovery.rs:369` (`recover_requested`), `:389`
+// (`cutovers_reconciled`), `:394` (`cutovers_loaded`), `:396` (`load_empty`) and
+// `:372` (`recover_completed`), driven through the real composition build that
 // calls `recover` at `composition_bootstrap.rs:1922`. Unreachable slice:
-// `cutovers_validated` (`generation_recovery.rs:341`) and `routes_applied`
-// (`:397`) need a non-empty ORS cutover set, which the composition does not
+// `cutovers_validated` (`generation_recovery.rs:417`) and `routes_applied`
+// (`:473`) need a non-empty ORS cutover set, which the composition does not
 // expose; that slice belongs to `generation_recovery_diagnostics_tests`.
 #[test]
 fn recovery_phases_stay_distinct() {
@@ -2856,7 +3743,29 @@ fn component_degradation_is_not_whole_kernel_failure() {
         route.is_ok(),
         "a degraded component must not fence the gateway"
     );
-    assert_present(&route_text, &["kernel.generation.snapshot_committed"]);
+    assert_present(
+        &route_text,
+        &[
+            "kernel.generation.snapshot_requested",
+            "kernel.generation.snapshot_committed",
+        ],
+    );
+    assert_eq!(
+        outcome_marker_after(
+            &route_text,
+            index_of(&route_text, "kernel.generation.snapshot_requested")
+        ),
+        "attempt",
+        "the route owner records a requested snapshot before serving it"
+    );
+    assert_eq!(
+        outcome_marker_after(
+            &route_text,
+            index_of(&route_text, "kernel.generation.snapshot_committed")
+        ),
+        "success",
+        "the route owner records the committed result it returned"
+    );
     // Each total-failure token is scanned on the capture whose OWN read is the
     // only thing that could have written it, and each of those captures is
     // proved non-empty by the record its own read emitted, so neither absence is
@@ -2919,6 +3828,12 @@ fn one_operation_yields_exactly_one_designated_terminal() {
     // be empty. It is a distinct fact from the terminal count and the stable
     // code above, so it is kept rather than folded into them.
     assert_present(&text, &["kernel.generation.snapshot_requested"]);
+    assert_present(&text, &["kernel.generation.snapshot_failed"]);
+    assert_eq!(
+        outcome_marker_after(&text, index_of(&text, "kernel.generation.snapshot_failed")),
+        "rejected",
+        "a fenced route read records its typed owner refusal as rejected"
+    );
     // The read's terminal is bound to the read's own phases: no cutover or
     // recovery record of any kind is emitted under it.
     for foreign in [
@@ -3122,6 +4037,7 @@ fn sink_failure_drop_and_disable_preserve_calls_and_results() {
         healthy_text.contains(capacity_event),
         "the healthy capture must carry the records"
     );
+    assert_present(&healthy_text, &["kernel.health.service_state_observed"]);
     // PER-ARM SINK PREMISES, MEASURED (the healthy arm's positive above is the
     // idiom). Without these two, the failing and discarding arms would assert
     // nothing about their sinks: swapping either helper for `capture_with`

@@ -3,7 +3,7 @@
   "issue": 903,
   "facade_issue": 895,
   "target": "eliot_kernel::diagnostics",
-  "note": "Freezes the six-file generation/control/recovery/health/identity boundary inventory exercised by tests/kernel_generation_control_diagnostics.rs. `files` is the complete denominator of production modules this issue owns. `events_by_file` is the complete set of `kernel.*` event literals each of those modules emits, measured from source with the same rule case 1 re-measures: each module's production prefix, cut at the first `#[cfg(test)]`- or `#[cfg(all(test, ...))]`-gated test MODULE and never at a `#[cfg(test)]`-gated helper function defined above one. A new, renamed, moved or deleted emitter therefore breaks the map in both directions. `boundaries` freezes one row per WORK_UNIT_CASE 903/1..30. Every row names a real production `function` and a `role` that says which it is: `emitter` means the span is written inside that function's own body, or — when the row also carries `argument_call_sites` — that the span is passed to that function as an argument at exactly those lines of the row's own file; `propagated` means that function neither writes the record itself nor receives it as an argument, and is only on the production call path that produces it. Both directions of that cross-check are asserted by case 1, so `emitter` cannot be claimed for a function that writes nothing and `propagated` cannot be claimed for one that writes the span itself. A method's `function` may be written with the type that owns it, but case 1 resolves it on the segment after the last `::`, so a row that qualifies a free function with a type it does not belong to fails. `argument_call_sites` is present only on the rows that need it, and is compared to the measured call sites in both directions, so an invented line and an unlisted real one both fail. Every row also names the `stage` it belongs to, the exact `span` (a `kernel.*` event literal, a stable terminal code, or a typed `KernelServiceError` field written as `HandshakeMismatch:<field>`, each half of a composite matched as a complete token; no row uses any other shape), the `owner_evidence` for that stage (the durable ORS row, live fence, coordinator disposition or owner receipt the stage actually turns on, read from production values and never invented; its prose is verified by reading, and case 1 asserts only that it is present and non-empty), the `test` that asserts on that span, and, where the row is an absence or noninterference claim, what must not appear. `events_by_file` is a per-module inventory and NOT a whole-tree claim: production modules outside these six emit `kernel.*` records for their own axes through their own observation helpers or raw `tracing` calls, and no row of this map asserts otherwise. The map deliberately does NOT claim: live Windows kernel-owner or daemon-launch execution (the card's DEFER), live cutover or reserve recovery from real owner evidence, the `#[cfg(test)]`-gated source-string guards inside those modules' inline test modules, the `pub(super)` health snapshot omission arms, the `pub(crate)` runtime-identity and ORS-recovery slices, or Control Reserve Product behaviour. Those remain named blockers owned by the modules' own inline test modules and by the deferral clause, not by this fixture. COVERAGE, MEASURED 2026-10-04 against an emitter inventory derived independently from the six modules BEFORE this fixture was read: events_by_file is exactly reproducible (13/10/9/21/14/10 = 77 distinct kernel.* literals), but the 30 boundaries rows cover 5 of the 6 modules - runtime_identity.rs has no row at all - and 34 of the 77 events are read by no case. Two of those uncovered emitters sit in control_plane.rs, a module the map DOES cover, and until this sentence they appeared in neither this note nor the driver's disclosure: kernel.control.runtime_lease_tick (control_plane.rs:1632, emitted by observe_runtime_lease_tick) and kernel.control.resume_identity_gap_observed (control_plane.rs:2149, emitted by observe_resume_identity_gap). Both are named here so the gap is disclosed rather than undisclosed. One row per WORK_UNIT_CASE is the card's 30-row contract, so widening the map is a scope decision and is escalated, not invented.",
+  "note": "Issue #903 freezes two independent denominators: exactly 30 WORK_UNIT_CASE integration boundaries, and 108 source-measured static production event-literal callsites across its six owned modules (82 distinct event names). It separately freezes 11 nonliteral production propagation edges; these do not increase the emitter-site denominator. Each emitter row carries exact source file/function/line/occurrence/event/phase, terminal helper, owner evidence, and either a real declared inline/integration execution test (EdgeProof or narrow UnitProof), an evidence-backed ExclusionProof, or an explicit blocker naming its upstream owner. Case 1 remeasures the production callsites independently and validates every row against source, while retaining exactly 30 substantive case markers. Frozen 2026-10-04.",
   "terminal_event": "kernel.terminal_error",
   "files": [
     "bins/eliot-kernel/src/control_plane.rs",
@@ -73,6 +73,11 @@
       "kernel.recovery.recover_completed",
       "kernel.recovery.recover_failed",
       "kernel.recovery.recover_requested",
+      "kernel.recovery.restore_journal_retention_absent",
+      "kernel.recovery.restore_journal_retention_failed",
+      "kernel.recovery.restore_journal_retention_pass",
+      "kernel.recovery.restore_journal_retention_reconciled",
+      "kernel.recovery.restore_journal_retention_requested",
       "kernel.recovery.routes_applied"
     ],
     "bins/eliot-kernel/src/health_view.rs": [
@@ -200,12 +205,12 @@
     },
     {
       "case": 10,
-      "file": "bins/eliot-kernel/src/generation_recovery.rs",
-      "function": "OrsGenerationCoordinator::persist_and_publish_inner",
-      "role": "propagated",
-      "stage": "epoch_bridge",
-      "span": "kernel.recovery.handshake_projected",
-      "owner_evidence": "the HandshakePolicyObservation returned by update_handshake_policy_without_observation over the candidate router and policy.config_snapshot's artifact_digest and protected_snapshot_digest; Projected is reachable only after synchronize_authority_epoch(decision.new_epoch()) returned Ok",
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::apply_generation_cutover",
+      "role": "emitter",
+      "stage": "stale_committed_cutover_refusal",
+      "span": "kernel.generation.cutover_failed",
+      "owner_evidence": "The stale committed decision is compared against the canonical live route; the owner returns the typed refusal and preserves the current route/fence.",
       "test": "old_and_new_authority_epochs_are_both_preserved"
     },
     {
@@ -256,8 +261,11 @@
       "role": "emitter",
       "stage": "reserve_terminal",
       "span": "CONTROL_RESERVE_EXHAUSTED",
-      "owner_evidence": "the KernelServiceError::ControlReserveExhausted variant alone; the mapper chooses the stable code from the variant and reads no payload, so this code belongs to the closed vocabulary whether or not a reserve can be exhausted on this surface",
-      "test": "reserve_lifecycle_vocabulary_stays_distinct"
+      "owner_evidence": "control_transition_terminal_code maps the supplied ControlReserveExhausted variant to CONTROL_RESERVE_EXHAUSTED. The inline mapper test constructs that variant, so the exact mapping is a UnitProof; it does not prove real reserve exhaustion traverses apply_control_with_terminal.",
+      "test": "reserve_lifecycle_vocabulary_stays_distinct",
+      "proof_kind": "UnitProof",
+      "proof_handle": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::control_diagnostics_terminal_codes_are_stable",
+      "proof_limit": "Direct typed-variant mapper assertion only; no real reserve-owner refusal is driven through KernelComposition::apply_control_with_terminal and no terminal event is claimed."
     },
     {
       "case": 16,
@@ -465,5 +473,2182 @@
     "transition_requested": "kernel.control.transition_requested",
     "transition_failed": "kernel.control.transition_failed",
     "probe_ready_terminal": "CONTROL_READINESS_NOT_PROVEN"
-  }
+  },
+  "emitter_site_count": 108,
+  "emitter_sites": [
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "observe_control_capacity",
+      "event": "kernel.control.capacity_observed",
+      "phase": "capacity_observed",
+      "source_line": 118,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_capacity",
+      "role": "terminal_emitter",
+      "outcome": null,
+      "owner_evidence": "The count is the unchanged usize returned by self.runtime.available_capacity(ProtectedControl); this read acquires no slot.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::control_capacity_observation_never_acquires_the_protected_reserve",
+      "assertion_helper": "assert_capacity_records"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_with_terminal",
+      "event": "kernel.control.transition_requested",
+      "phase": "transition_requested",
+      "source_line": 189,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_in_context",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Emitted immediately before apply_control_inner; attempt is a submitted command, not admission.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/tests/kernel_generation_control_diagnostics.rs::reserve_degradation_is_not_total_kernel_failure",
+      "expected_outcomes": [
+        "attempt"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_with_terminal",
+      "event": "kernel.control.transition_committed",
+      "phase": "transition_committed",
+      "source_line": 193,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_in_context",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Only the Ok(state) arm from the KernelService transition owner emits success and returns that same state.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::degraded_kernel_keeps_protected_control_open_and_is_not_a_total_failure",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_with_terminal",
+      "event": "kernel.control.transition_failed",
+      "phase": "transition_failed",
+      "source_line": 200,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_in_context",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Only the Err(KernelServiceError) arm emits rejected; its typed variant selects the one terminal code when this wrapper owns it.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::one_failed_transition_emits_exactly_one_designated_terminal",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request",
+      "event": "kernel.control.request_received",
+      "phase": "request_received",
+      "source_line": 267,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_in_context",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Emitted after context construction from the submitted request; request identity is attached only when request.validate() succeeds.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::control_request_is_recorded_and_denied_without_becoming_a_reserve_admission",
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "assertion_helper": "assert_request_denied_not_admitted"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request",
+      "event": "kernel.control.request_admitted",
+      "phase": "request_admitted",
+      "source_line": 273,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_in_context",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Only Ok(response) from apply_control_request_inner reaches success, after request, handle-proven peer, candidate and command owner gates.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "success"
+      ],
+      "blocker": {
+        "blocked_by_issue": 293,
+        "reason": "The admitted response needs a handle-proven peer and current request identity; existing executions stop at the unproven-peer owner gate."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request",
+      "event": "kernel.control.request_denied",
+      "phase": "request_denied",
+      "source_line": 277,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control_in_context",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Only an actual inner TransportError/KernelServiceError reaches rejected; TerminalOwned suppresses a duplicate terminal.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::control_request_is_recorded_and_denied_without_becoming_a_reserve_admission",
+      "expected_outcomes": [
+        "rejected"
+      ],
+      "assertion_helper": "assert_request_denied_not_admitted"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request_inner",
+      "event": "kernel.control.drain_disposition_observed",
+      "phase": "drain_disposition_observed",
+      "source_line": 518,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Copies disposition_code from coordinator.on_activate_request(presented_activation_generation); old authority is fenced only when that returned disposition requires it.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 15,
+        "reason": "No executable test drives an authenticated activation request through the real drain-wake owner disposition."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "revalidate_activation_resume_identities",
+      "event": "kernel.control.resume_identity_checked",
+      "phase": "resume_identity_checked",
+      "source_line": 1128,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Attempt precedes current/presented owner snapshots; success requires valid ResumeRevalidation, forward-family checks and an empty stale gap_families set.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "blocker": {
+        "blocked_by_issue": 293,
+        "reason": "No executable activation-resume request reaches this owner gate with the current identity proof."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "revalidate_activation_resume_identities",
+      "event": "kernel.control.resume_identity_checked",
+      "phase": "resume_identity_checked",
+      "source_line": 1173,
+      "occurrence": 2,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Attempt precedes current/presented owner snapshots; success requires valid ResumeRevalidation, forward-family checks and an empty stale gap_families set.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "success"
+      ],
+      "blocker": {
+        "blocked_by_issue": 293,
+        "reason": "No executable activation-resume request reaches this owner gate with the current identity proof."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "request_shutdown",
+      "event": "kernel.control.drain_request_failed",
+      "phase": "drain_request_failed",
+      "source_line": 1563,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": "unavailable",
+      "owner_evidence": "The coordinator is unavailable or its durable request_shutdown() returns Err; both actual owner failures return false before requesting runtime shutdown.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::unreadable_shutdown_state_is_reported_without_closing_runtime",
+      "expected_outcomes": [
+        "unavailable"
+      ],
+      "assertion_helper": "assert_bounded_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "request_shutdown",
+      "event": "kernel.control.drain_request_failed",
+      "phase": "drain_request_failed",
+      "source_line": 1567,
+      "occurrence": 2,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": "unavailable",
+      "owner_evidence": "The coordinator is unavailable or its durable request_shutdown() returns Err; both actual owner failures return false before requesting runtime shutdown.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::shutdown_state_replace_failure_is_reported_without_closing_runtime",
+      "expected_outcomes": [
+        "unavailable"
+      ],
+      "assertion_helper": "assert_bounded_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "request_shutdown",
+      "event": "kernel.control.drain_requested_observed",
+      "phase": "drain_requested_observed",
+      "source_line": 1572,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Follows durable coordinator.request_shutdown() success; outcome is copied from the owner activation_operational_view().drain_disposition.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::drain_requested_is_not_drained"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "observe_runtime_lease_tick",
+      "event": "kernel.control.runtime_lease_tick",
+      "phase": "runtime_lease_tick",
+      "source_line": 1632,
+      "occurrence": 1,
+      "terminal_emitter": "observe_runtime_lease_tick",
+      "role": "terminal_emitter",
+      "outcome": null,
+      "owner_evidence": "Projects typed RuntimeLeaseTickOutcome counts from the ORS lease owner; emits iff renewed, expired or superseded is nonzero and never logs lease identity.",
+      "coverage_status": "covered",
+      "proof_kind": "UnitProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::runtime_lease_tick_observation_uses_owner_expiry_count_without_changing_record",
+      "expected_fields": [
+        "event",
+        "expired",
+        "message",
+        "renewed",
+        "superseded"
+      ],
+      "expected_values": {
+        "expired": 1,
+        "renewed": 0,
+        "superseded": 0
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "observe_resume_identity_gap",
+      "event": "kernel.control.resume_identity_gap_observed",
+      "phase": "resume_identity_gap_observed",
+      "source_line": 2149,
+      "occurrence": 1,
+      "terminal_emitter": "observe_control",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Walks stale ResumeIdentityFamily values in the actual contract verdict-vector order; shape error uses the closed family set because no verdict vector exists.",
+      "coverage_status": "covered",
+      "proof_kind": "UnitProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::resume_identity_gap_observation_uses_contract_verdict_order_and_preserves_result",
+      "expected_fields": [
+        "event",
+        "message",
+        "outcome"
+      ],
+      "expected_outcomes": [
+        "boot",
+        "pid"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "daemon_launch",
+      "event": "kernel.daemon.contour_observed",
+      "phase": "contour_observed",
+      "source_line": 486,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Reads self.daemon_launch.as_ref() and records only the owner Option descriptor presence bit; descriptor fields are not observed.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::daemon_launch_emits_exact_contour_presence_and_absence"
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "await_daemon_ready",
+      "event": "kernel.daemon.await_requested",
+      "phase": "await_requested",
+      "source_line": 549,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "await_daemon_ready takes the caller-supplied ProcessStartReceipt and compares it with daemon_runtime.receipt; this fixture seeds the same typed receipt into the owner before invoking the rendezvous, so it proves the wait input but not an OS process launch.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_manifest_restart_admission_tests::the_daemon_lifecycle_states_stay_distinct_and_liveness_is_never_promoted",
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "assertion_helper": "daemon_case_outcome"
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "await_daemon_ready",
+      "event": "kernel.daemon.await_satisfied",
+      "phase": "await_satisfied",
+      "source_line": 595,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires daemon_runtime.receipt == launched receipt and the owner status DaemonRuntimeStatus::Ready.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::the_daemon_lifecycle_states_stay_distinct_and_liveness_is_never_promoted",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "await_daemon_ready",
+      "event": "kernel.daemon.await_rejected",
+      "phase": "await_rejected",
+      "source_line": 604,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "The exact receipt/status owner check selects mismatch, not-launched, degraded-before-ready or failed-before-ready; Running waits, and deadline expiry alone selects timeout.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::the_daemon_lifecycle_states_stay_distinct_and_liveness_is_never_promoted"
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "await_daemon_ready",
+      "event": "kernel.daemon.await_rejected",
+      "phase": "await_rejected",
+      "source_line": 613,
+      "occurrence": 2,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": "timeout",
+      "owner_evidence": "The exact receipt/status owner check selects mismatch, not-launched, degraded-before-ready or failed-before-ready; Running waits, and deadline expiry alone selects timeout.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::the_daemon_lifecycle_states_stay_distinct_and_liveness_is_never_promoted",
+      "expected_outcomes": [
+        "timeout"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "require_recorded_launch_identity",
+      "event": "kernel.daemon.restart_refused",
+      "phase": "restart_refused",
+      "source_line": 1604,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "The full observed KernelLaunchBinding fails the sealed manifest owner comparison; the refusal row must persist before this typed refusal returns.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 15,
+        "reason": "No executable owner test reaches this concrete daemon restart refusal with a canonical process/supervision receipt."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "launch_eliotd_for_activation_under_manifest",
+      "event": "kernel.daemon.restart_refused",
+      "phase": "restart_refused",
+      "source_line": 1748,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Only DaemonRestartManifestAdmission::Refused from the sealed active descriptor/manifest gate records refusal; Admitted reaches the launch primitive.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable owner test reaches this concrete daemon restart refusal with a canonical process/supervision receipt."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_in_context",
+      "event": "kernel.daemon.recovery_requested",
+      "phase": "recovery_requested",
+      "source_line": 1791,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Emitted before recover_eliotd_inner inspects the prior receipt, process disposition, restart class, manifest binding and readiness.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable canonical process/supervision recovery run reaches this production recovery phase."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_in_context",
+      "event": "kernel.daemon.recovery_committed",
+      "phase": "recovery_committed",
+      "source_line": 1800,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires recover_eliotd_inner to return an actual replacement ProcessStartReceipt.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "success"
+      ],
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable canonical process/supervision recovery run reaches this production recovery phase."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_in_context",
+      "event": "kernel.daemon.recovery_failed",
+      "phase": "recovery_failed",
+      "source_line": 1808,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Requires recover_eliotd_inner to return KernelBuildError; its owner code is emitted once unless a child already owns the terminal.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "rejected"
+      ],
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable canonical process/supervision recovery run reaches this production recovery phase."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_inner",
+      "event": "kernel.daemon.restart_refused",
+      "phase": "restart_refused",
+      "source_line": 1959,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Comes from actual prior-process disposition, admitted restart class, sealed manifest binding, or front-door generation/fence check; no replacement is installed on refusal.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable owner test reaches this concrete daemon restart refusal with a canonical process/supervision receipt."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_inner",
+      "event": "kernel.daemon.restart_refused",
+      "phase": "restart_refused",
+      "source_line": 1987,
+      "occurrence": 2,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Comes from actual prior-process disposition, admitted restart class, sealed manifest binding, or front-door generation/fence check; no replacement is installed on refusal.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable owner test reaches this concrete daemon restart refusal with a canonical process/supervision receipt."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_inner",
+      "event": "kernel.daemon.restart_refused",
+      "phase": "restart_refused",
+      "source_line": 2014,
+      "occurrence": 3,
+      "terminal_emitter": "observe_daemon_runtime_in_context",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "Comes from actual prior-process disposition, admitted restart class, sealed manifest binding, or front-door generation/fence check; no replacement is installed on refusal.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "No executable owner test reaches this concrete daemon restart refusal with a canonical process/supervision receipt."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "mark_daemon_ready",
+      "event": "kernel.daemon.ready_reported",
+      "phase": "ready_reported",
+      "source_line": 2195,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime",
+      "role": "propagated_caller",
+      "outcome": "already_ready",
+      "owner_evidence": "already_ready requires owner receipt Some and status Ready; on Windows the additional condition is only that the supervision slot is Some, not a separate live supervision proof.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::an_exact_replay_returns_the_recorded_outcome_without_a_second_transition",
+      "expected_outcomes": [
+        "already_ready"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "mark_daemon_ready",
+      "event": "kernel.daemon.ready_reported",
+      "phase": "ready_reported",
+      "source_line": 2201,
+      "occurrence": 2,
+      "terminal_emitter": "observe_daemon_runtime",
+      "role": "propagated_caller",
+      "outcome": "supervision_unproven",
+      "owner_evidence": "On Windows, supervision_unproven is selected when the owner supervision slot is None; the test proves this slot predicate, not a live process-supervision receipt.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::an_exact_replay_returns_the_recorded_outcome_without_a_second_transition",
+      "expected_outcomes": [
+        "supervision_unproven"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "mark_daemon_ready",
+      "event": "kernel.daemon.ready_reported",
+      "phase": "ready_reported",
+      "source_line": 2206,
+      "occurrence": 3,
+      "terminal_emitter": "observe_daemon_runtime",
+      "role": "propagated_caller",
+      "outcome": "readiness_unproven",
+      "owner_evidence": "This mapped test exercises the missing-receipt disjunct: the daemon owner has no ProcessStartReceipt, so mark_daemon_ready returns ReadinessNotProven and records readiness_unproven. Production also uses this outcome when status is not Running, but that second disjunct is not claimed by this test.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::an_exact_replay_returns_the_recorded_outcome_without_a_second_transition",
+      "expected_outcomes": [
+        "readiness_unproven"
+      ],
+      "assertion_helper": "daemon_case_outcome"
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "mark_daemon_ready",
+      "event": "kernel.daemon.ready_proven",
+      "phase": "ready_proven",
+      "source_line": 2215,
+      "occurrence": 1,
+      "terminal_emitter": "observe_daemon_runtime",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "The owner receipt is present and status is Running; on Windows production additionally checks only supervision.is_some() before it changes status to Ready and emits success.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/daemon_runtime.rs::daemon_lifecycle_observation_tests::an_exact_replay_returns_the_recorded_outcome_without_a_second_transition",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "rollback_refusal_outcome",
+      "event": "kernel.generation.cutover_requested",
+      "phase": "cutover_requested",
+      "source_line": 543,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "After the typed rollback owner returns GenerationFenced, records attempt with cutover_id copied from that exact validated GenerationCutoverRequest.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::refused_cutover_frame_emits_one_cutover_terminal",
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "rollback_refusal_outcome",
+      "event": "kernel.generation.cutover_failed",
+      "phase": "cutover_failed",
+      "source_line": 548,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Only the same request’s GenerationFenced result emits rejected; its mapper selects the terminal and the reply has no cutover receipt.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::refused_cutover_frame_emits_one_cutover_terminal",
+      "expected_outcomes": [
+        "rejected"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "emit_for_cutover",
+      "event": "kernel.generation.service_fence_requested",
+      "phase": "service_fence_requested",
+      "source_line": 631,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Records attempt for the same validated cutover_id immediately before publishing the actual service fence result; reason text is excluded.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::generation_diagnostics_codes_are_stable_and_fence_observation_is_canary_free",
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "emit_for_cutover",
+      "event": "kernel.generation.service_fenced",
+      "phase": "service_fenced",
+      "source_line": 636,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "ServiceFenceObservation.succeeded is set only from service.fence_generation(reason) returning Ok; the row correlates only the validated cutover_id.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::generation_diagnostics_codes_are_stable_and_fence_observation_is_canary_free",
+      "expected_outcomes": [
+        "success"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "emit_for_cutover",
+      "event": "kernel.generation.service_fence_rejected",
+      "phase": "service_fence_rejected",
+      "source_line": 639,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Err from fence_generation is source-excluded: lifecycle.rs:561-573 only transitions seven states and each edge is legal (:113-133); :2302-2305 delegates, while generation_control.rs:663-671 recovers poison with into_inner.",
+      "coverage_status": "excluded",
+      "proof_kind": "ExclusionProof",
+      "test": null,
+      "exclusion": {
+        "basis": "crates/kernel/eliot-kernel-service/src/lifecycle.rs:561-573 guards transition(Failed) to Reconciling|ShadowNoAuthority|HandoffPrepared|Activating|Ready|Degraded|Draining; each guarded edge is legal in KernelServiceState::transition_to at :113-133. KernelService::transition delegates at :2302-2305. Poison recovery uses PoisonError::into_inner at bins/eliot-kernel/src/generation_control.rs:663-671. Thus the current service owner states cannot make fence_generation return Err; the rejected observation is an evidence-backed unreachable arm."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "generation_route_snapshot",
+      "event": "kernel.generation.snapshot_requested",
+      "phase": "snapshot_requested",
+      "source_line": 765,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Emitted before checking generation_poison and cloning the canonical live GenerationRouter; attempt is not a route projection.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/tests/kernel_generation_control_diagnostics.rs::component_degradation_is_not_whole_kernel_failure",
+      "expected_outcomes": [
+        "attempt"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "generation_route_snapshot",
+      "event": "kernel.generation.snapshot_committed",
+      "phase": "snapshot_committed",
+      "source_line": 768,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Only a successful clone from the canonical GenerationRouter owner reaches the returned projection and success event.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/tests/kernel_generation_control_diagnostics.rs::component_degradation_is_not_whole_kernel_failure",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "generation_route_snapshot",
+      "event": "kernel.generation.snapshot_failed",
+      "phase": "snapshot_failed",
+      "source_line": 772,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Only a poison-fence or live generation-router lock KernelServiceError reaches rejected; that same typed error selects one SNAPSHOT terminal.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/tests/kernel_generation_control_diagnostics.rs::one_operation_yields_exactly_one_designated_terminal",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "apply_generation_cutover",
+      "event": "kernel.generation.cutover_requested",
+      "phase": "cutover_requested",
+      "source_line": 818,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Precedes live router/service endpoint classification and ORS persist-and-publish; cutover_id is read from the supplied CutoverDecision.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::committed_cutover_publishes_candidate_and_retires_old_generation",
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "apply_generation_cutover",
+      "event": "kernel.generation.cutover_committed",
+      "phase": "cutover_committed",
+      "source_line": 825,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Only GenerationCutoverApplyDisposition::Applied emits success after the durable Committed record and owner route/policy cutover; Readback is not a second commit.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::committed_cutover_publishes_candidate_and_retires_old_generation",
+      "expected_outcomes": [
+        "success"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "apply_generation_cutover",
+      "event": "kernel.generation.cutover_failed",
+      "phase": "cutover_failed",
+      "source_line": 836,
+      "occurrence": 1,
+      "terminal_emitter": "observe_generation_cutover",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Only the typed error returned by apply_generation_cutover_inner emits rejected and selects its single terminal; Applied is a disjoint arm.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::refused_cutover_stays_typed_and_publishes_no_route_change",
+      "expected_outcomes": [
+        "rejected"
+      ],
+      "assertion_helper": "assert_cutover_observation"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.handshake_projected",
+      "phase": "handshake_projected",
+      "source_line": 90,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "HandshakePolicyObservation::Projected follows update_handshake_policy using the actual candidate/recovered GenerationRouter; the policy is projected from that owner route.",
+      "coverage_status": "covered",
+      "proof_kind": "UnitProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_handshake_observation_preserves_policy_projection",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.handshake_absent",
+      "phase": "handshake_absent",
+      "source_line": 92,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "absent",
+      "owner_evidence": "HandshakePolicyObservation::Absent means update_handshake_policy has no admitted route to project; it remains distinct from a successful empty policy.",
+      "coverage_status": "covered",
+      "proof_kind": "UnitProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_handshake_observation_preserves_policy_projection",
+      "expected_outcomes": [
+        "absent"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit_for_cutover",
+      "event": "kernel.recovery.handshake_projected",
+      "phase": "handshake_projected",
+      "source_line": 102,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "The candidate HandshakePolicyObservation::Projected follows owner policy update and carries only the same validated cutover_id for correlation.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_and_publish_stages_commits_then_applies_one_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit_for_cutover",
+      "event": "kernel.recovery.handshake_absent",
+      "phase": "handshake_absent",
+      "source_line": 108,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "absent",
+      "owner_evidence": "The candidate HandshakePolicyObservation::Absent means no admitted policy route exists; the row carries only the validated cutover_id.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_without_daemon_route_emits_cutover_scoped_handshake_absence",
+      "expected_outcomes": [
+        "absent"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.persist_requested",
+      "phase": "persist_requested",
+      "source_line": 137,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "PersistAndPublishObservations emits after persist_and_publish_inner and starts the phase sequence with its validated operation identity.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_and_publish_stages_commits_then_applies_one_cutover",
+      "expected_outcomes": [
+        "attempt"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.cutover_staged",
+      "phase": "cutover_staged",
+      "source_line": 139,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "The flag is set only after ORS stage_generation_cutover returns Ok with state Armed; failed staging cannot emit it.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_and_publish_stages_commits_then_applies_one_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.cutover_committed",
+      "phase": "cutover_committed",
+      "source_line": 142,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "The flag is set only after the ORS owner reads the cutover back in Committed state; an Armed candidate cannot set it.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_and_publish_stages_commits_then_applies_one_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.cutover_applied",
+      "phase": "cutover_applied",
+      "source_line": 148,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "The flag is set only after committed ORS evidence and the router, service epoch, and handshake policy owners reach the candidate.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_and_publish_stages_commits_then_applies_one_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.persist_completed",
+      "phase": "persist_completed",
+      "source_line": 151,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Emitted only when persist_and_publish_inner returns Ok; recorded flags are the phases actually reached by this cutover.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::persist_and_publish_stages_commits_then_applies_one_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "emit",
+      "event": "kernel.recovery.persist_failed",
+      "phase": "persist_failed",
+      "source_line": 153,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery_cutover",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Emitted only when persist_and_publish_inner returns Err; phase flags preserve which owner steps completed before refusal.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::stage_failure_never_reports_a_staged_phase_or_moves_the_live_fence",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_cutover_ownership",
+      "event": "kernel.recovery.cutover_ownership_requested",
+      "phase": "cutover_ownership_requested",
+      "source_line": 258,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Precedes reconciliation/readback of the ORS cutover-ownership table; the durable schema row, not request data, is the owner input.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::absent_cutover_ownership_table_emits_exact_empty_observation_without_routes",
+      "expected_outcomes": [
+        "attempt"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_cutover_ownership",
+      "event": "kernel.recovery.cutover_ownership_absent",
+      "phase": "cutover_ownership_absent",
+      "source_line": 265,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "empty",
+      "owner_evidence": "Only is_absent_cutover_ownership_table’s typed absent-table result emits empty; every other ORS reconcile error remains failure.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::absent_cutover_ownership_table_emits_exact_empty_observation_without_routes",
+      "expected_outcomes": [
+        "empty"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_cutover_ownership",
+      "event": "kernel.recovery.cutover_ownership_reconciled",
+      "phase": "cutover_ownership_reconciled",
+      "source_line": 270,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires ORS reconcile_staged_cutover_ownership(MAX_RECOVERY_PAGE) to return Ok for the current durable ownership table.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::committed_cutover_restore_never_reactivates_an_old_generation",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_cutover_ownership",
+      "event": "kernel.recovery.cutover_ownership_restored",
+      "phase": "cutover_ownership_restored",
+      "source_line": 278,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires ORS latest_committed_cutover_ownership read, CutoverRouteSnapshot rebuild, then swap_committed of that persisted projection.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::committed_cutover_restore_never_reactivates_an_old_generation",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_cutover_ownership",
+      "event": "kernel.recovery.cutover_ownership_failed",
+      "phase": "cutover_ownership_failed",
+      "source_line": 282,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Emitted for actual ORS reconciliation/readback or typed ownership snapshot rebuild Err; diagnostics do not rewrite the source row.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::corrupt_cutover_ownership_row_emits_exact_rejected_observation",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_restore_journal_retention",
+      "event": "kernel.recovery.restore_journal_retention_requested",
+      "phase": "restore_journal_retention_requested",
+      "source_line": 309,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Startup OrsGenerationCoordinator retention reconciliation begins before reading the canonical ORS restore-journal stream index; this attempt record claims no enumeration or retention result.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::restore_journal_retention_empty_owner_emits_requested_then_absent",
+      "expected_outcomes": [
+        "attempt"
+      ],
+      "assertion_helper": "assert_recovery_observations"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_restore_journal_retention",
+      "event": "kernel.recovery.restore_journal_retention_absent",
+      "phase": "restore_journal_retention_absent",
+      "source_line": 318,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "empty",
+      "owner_evidence": "The canonical RedbRecoveryStore list_restore_journal_streams() read returns an empty durable stream index; that actual owner result short-circuits retention as empty.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::restore_journal_retention_empty_owner_emits_requested_then_absent",
+      "expected_outcomes": [
+        "empty"
+      ],
+      "assertion_helper": "assert_recovery_observations"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_restore_journal_retention",
+      "event": "kernel.recovery.restore_journal_retention_pass",
+      "phase": "restore_journal_retention_pass",
+      "source_line": 327,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "For each canonical owner-listed stream, apply_restore_journal_retention(stream) returns a RestoreJournalRetentionReport; its record.removed_members > 0 selects success, otherwise empty. The event carries no stream identity.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::restore_journal_retention_reclaims_resolved_prefix_and_reconciles",
+      "expected_outcomes": [
+        "success",
+        "empty"
+      ],
+      "assertion_helper": "assert_recovery_observations"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_restore_journal_retention",
+      "event": "kernel.recovery.restore_journal_retention_reconciled",
+      "phase": "restore_journal_retention_reconciled",
+      "source_line": 349,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Every stream in the canonical ORS index completed apply_restore_journal_retention without a refusal; the coordinator emits reconciled/success only after all per-stream owner reports return Ok.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::restore_journal_retention_reclaims_resolved_prefix_and_reconciles",
+      "expected_outcomes": [
+        "success"
+      ],
+      "assertion_helper": "assert_recovery_observations"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_restore_journal_retention",
+      "event": "kernel.recovery.restore_journal_retention_failed",
+      "phase": "restore_journal_retention_failed",
+      "source_line": 356,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "A canonical stream-index read error or one or more per-stream apply_restore_journal_retention errors makes the coordinator return Err after examining the indexed streams; this terminal observation carries only rejected, not a stream name or storage reason.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 957,
+        "reason": "The selected ORS owner validates restore-journal schema/table family during initialization (store.rs:29824; restore_journal.rs:327-375), and read/list/apply validate the complete owner state (restore_journal.rs:1599-1601, 1563-1577, 1611-1617). A malformed family/row is refused before this coordinator runs; no accepted post-open owner failure driver exists in the fixture. The gateway is #2653; the missing executable storage-failure seam is owned by ORS issue #957."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover",
+      "event": "kernel.recovery.recover_requested",
+      "phase": "recover_requested",
+      "source_line": 369,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Precedes recover_inner reconciliation/read of durable ORS generation cutovers for the live GenerationRouter, KernelService and ServerHandshakePolicy.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_phases_stay_distinct_and_never_resolve_a_staged_cutover",
+      "expected_outcomes": [
+        "attempt"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover",
+      "event": "kernel.recovery.recover_completed",
+      "phase": "recover_completed",
+      "source_line": 372,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires recover_inner Ok after durable rows reconcile and the owned route/service/policy state is consistent.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_phases_stay_distinct_and_never_resolve_a_staged_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover",
+      "event": "kernel.recovery.recover_failed",
+      "phase": "recover_failed",
+      "source_line": 374,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Requires recover_inner Err from the actual ORS, rollback admission, service-epoch, route, or policy owner path.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_phases_stay_distinct_and_never_resolve_a_staged_cutover",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_inner",
+      "event": "kernel.recovery.cutovers_reconciled",
+      "phase": "cutovers_reconciled",
+      "source_line": 389,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires ORS reconcile_staged_generation_cutovers(MAX_RECOVERY_PAGE) to complete successfully on the durable cutover table.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_phases_stay_distinct_and_never_resolve_a_staged_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_inner",
+      "event": "kernel.recovery.cutovers_loaded",
+      "phase": "cutovers_loaded",
+      "source_line": 394,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires ORS latest_generation_cutovers(MAX_RECOVERY_PAGE) to return the durable cutover snapshot vector.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_phases_stay_distinct_and_never_resolve_a_staged_cutover",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_inner",
+      "event": "kernel.recovery.load_empty",
+      "phase": "load_empty",
+      "source_line": 396,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "empty",
+      "owner_evidence": "The successfully loaded durable ORS snapshot vector is empty; recovery returns without inventing an active route.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::recovery_phases_stay_distinct_and_never_resolve_a_staged_cutover",
+      "expected_outcomes": [
+        "empty"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_inner",
+      "event": "kernel.recovery.cutovers_validated",
+      "phase": "cutovers_validated",
+      "source_line": 417,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Reached after loaded records are Committed and the latest durable authority epoch is selected; invalid history returns before this phase.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::valid_recorded_verdict_restores_route_and_emits_exact_applied_phase",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "recover_inner",
+      "event": "kernel.recovery.routes_applied",
+      "phase": "routes_applied",
+      "source_line": 473,
+      "occurrence": 1,
+      "terminal_emitter": "observe_recovery",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires every current-epoch committed row to pass admit_generation_rollback on durable compatibility evidence, routes to register, policy to update, and recovered router to replace the owner.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_recovery.rs::generation_recovery_diagnostics_tests::valid_recorded_verdict_restores_route_and_emits_exact_applied_phase",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_health_response",
+      "event": "kernel.health.response_projected",
+      "phase": "response_projected",
+      "source_line": 108,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "known",
+      "owner_evidence": "Serializes borrowed typed StoreHealth as fixed status=known/value.kind=health/value/recovery=null; projection leaves the health owner value unchanged.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::health_response_projects_the_typed_store_value_and_records_known",
+      "expected_outcomes": [
+        "known"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_snapshot",
+      "event": "kernel.health.snapshot_omitted",
+      "phase": "snapshot_omitted",
+      "source_line": 121,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "The front_door_policy owner lock is poisoned; daemon_snapshot returns typed SessionFenced and records the closed fenced omission.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::unreadable_front_door_policy_records_fenced_snapshot_omission",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_snapshot",
+      "event": "kernel.health.snapshot_omitted",
+      "phase": "snapshot_omitted",
+      "source_line": 139,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "missing_artifact",
+      "owner_evidence": "The owner config snapshot has no artifact digest; snapshot omits it rather than deriving a value.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::daemon_snapshot_names_every_omitted_health_input_apart_from_a_healthy_reading",
+      "expected_outcomes": [
+        "missing_artifact"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_snapshot",
+      "event": "kernel.health.snapshot_omitted",
+      "phase": "snapshot_omitted",
+      "source_line": 144,
+      "occurrence": 3,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "invalid_protected",
+      "owner_evidence": "The protected digest string from front_door_policy is checked as exactly 64 lowercase hexadecimal characters; a shape/case mismatch records invalid_protected and the value is omitted.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::daemon_snapshot_names_every_omitted_health_input_apart_from_a_healthy_reading",
+      "expected_outcomes": [
+        "invalid_protected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_snapshot",
+      "event": "kernel.health.snapshot_omitted",
+      "phase": "snapshot_omitted",
+      "source_line": 148,
+      "occurrence": 4,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "missing_protected",
+      "owner_evidence": "The owner has no protected digest; absence is fenced only when an admitted daemon_launch requires it.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::daemon_snapshot_names_every_omitted_health_input_apart_from_a_healthy_reading",
+      "expected_outcomes": [
+        "missing_protected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_snapshot",
+      "event": "kernel.health.snapshot_projected",
+      "phase": "snapshot_projected",
+      "source_line": 164,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Projects artifact/protected digests and StateFence from the live front_door_policy owner; does not derive a digest or create launch admission.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::daemon_snapshot_projects_the_exact_assembled_health_inputs",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_health",
+      "event": "kernel.health.store_unavailable",
+      "phase": "store_unavailable",
+      "source_line": 175,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "A poisoned canonical_store_gateway mutex returns Platform(\"store gateway lock poisoned\") and fenced; no gateway method runs.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::unreadable_store_gateway_records_fenced_typed_health_refusal",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_health",
+      "event": "kernel.health.store_absent",
+      "phase": "store_absent",
+      "source_line": 181,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "unknown",
+      "owner_evidence": "The canonical_store_gateway option is None, so daemon_health returns ReadinessNotProven/unknown.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::absent_store_component_projects_a_typed_refusal_and_no_health_value",
+      "expected_outcomes": [
+        "unknown"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_health",
+      "event": "kernel.health.store_reported",
+      "phase": "store_reported",
+      "source_line": 186,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Requires health().await to return an actual typed StoreHealth from an admitted canonical gateway; live connection is owned by connect_canonical_store (#1681).",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "success"
+      ],
+      "blocker": {
+        "blocked_by_issue": 1681,
+        "reason": "The production branch requires an admitted canonical Store gateway and typed Store owner response."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_health",
+      "event": "kernel.health.store_unavailable",
+      "phase": "store_unavailable",
+      "source_line": 190,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "unknown",
+      "owner_evidence": "The admitted canonical Store gateway health().await returns Result<StoreHealth,String>; Err(String) is wrapped as KernelServiceError::Platform and maps to store_unavailable/unknown. Admitted Store setup is owned by connect_canonical_store (#1681).",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "unknown"
+      ],
+      "blocker": {
+        "blocked_by_issue": 1681,
+        "reason": "The production branch requires an admitted canonical Store gateway and typed Store owner response."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_health",
+      "event": "kernel.health.store_absent",
+      "phase": "store_absent",
+      "source_line": 200,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "unknown",
+      "owner_evidence": "The composition owner has no Store component, so daemon_health returns ReadinessNotProven/unknown without projecting health.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::absent_store_component_projects_a_typed_refusal_and_no_health_value",
+      "expected_outcomes": [
+        "unknown"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "service_state",
+      "event": "kernel.health.service_state_omitted",
+      "phase": "service_state_omitted",
+      "source_line": 207,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "A poisoned self.service KernelService mutex returns Platform(\"service lock poisoned\") and fenced; no lifecycle state is substituted.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::unreadable_lifecycle_input_projects_the_bounded_total_disposition",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "service_state",
+      "event": "kernel.health.service_state_observed",
+      "phase": "service_state_observed",
+      "source_line": 214,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "The readable self.service owner mutex returns its actual KernelServiceState and closed state code; observed/success belongs only to that successful read.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::unreadable_drain_disposition_owner_also_collapses_to_the_bounded_total_disposition",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "activation_operational_view",
+      "event": "kernel.activation.view_projected",
+      "phase": "view_projected",
+      "source_line": 244,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "The service-state owner mutex is poisoned, so activation_operational_view receives the bounded fenced service state and projects KernelActivationView::FENCED.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::unreadable_lifecycle_input_projects_the_bounded_total_disposition",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "activation_operational_view",
+      "event": "kernel.activation.view_projected",
+      "phase": "view_projected",
+      "source_line": 253,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "The drain coordinator cannot return its owner disposition, so activation_operational_view projects KernelActivationView::FENCED rather than reusing stale drain state.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::unreadable_drain_disposition_owner_also_collapses_to_the_bounded_total_disposition",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "activation_operational_view",
+      "event": "kernel.activation.view_projected",
+      "phase": "view_projected",
+      "source_line": 267,
+      "occurrence": 3,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "The event outcome is exactly the returned view.lease_state; the full view separately projects live service state, idle lease census, front-door generation/fence and coordinator drain disposition.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::activation_operational_view_records_its_own_projection_event_with_the_returned_lease_state"
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "blob_capability_projection",
+      "event": "kernel.health.blob_projected",
+      "phase": "blob_projected",
+      "source_line": 279,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "absent",
+      "owner_evidence": "Maps actual blob_probe_status port variants None/ManifestValidated/Ready/Degraded to absent/standby/ready/degraded; daemon liveness does not supply capability state.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::blob_capability_projection_names_the_omitted_and_unstarted_states_from_the_port",
+      "expected_outcomes": [
+        "absent"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "blob_capability_projection",
+      "event": "kernel.health.blob_projected",
+      "phase": "blob_projected",
+      "source_line": 287,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "standby",
+      "owner_evidence": "Maps actual blob_probe_status port variants None/ManifestValidated/Ready/Degraded to absent/standby/ready/degraded; daemon liveness does not supply capability state.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::blob_capability_projection_names_the_omitted_and_unstarted_states_from_the_port",
+      "expected_outcomes": [
+        "standby"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "blob_capability_projection",
+      "event": "kernel.health.blob_projected",
+      "phase": "blob_projected",
+      "source_line": 295,
+      "occurrence": 3,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "ready",
+      "owner_evidence": "Maps actual blob_probe_status port variants None/ManifestValidated/Ready/Degraded to absent/standby/ready/degraded; daemon liveness does not supply capability state.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::blob_capability_projection_names_the_probed_and_degraded_states_only_from_the_port",
+      "expected_outcomes": [
+        "ready"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "blob_capability_projection",
+      "event": "kernel.health.blob_projected",
+      "phase": "blob_projected",
+      "source_line": 303,
+      "occurrence": 4,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "degraded",
+      "owner_evidence": "Maps actual blob_probe_status port variants None/ManifestValidated/Ready/Degraded to absent/standby/ready/degraded; daemon liveness does not supply capability state.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::blob_capability_projection_names_the_probed_and_degraded_states_only_from_the_port",
+      "expected_outcomes": [
+        "degraded"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_route_metrics_projection",
+      "event": "kernel.health.route_metrics_projected",
+      "phase": "route_metrics_projected",
+      "source_line": 328,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "A poisoned host_request_connection_index mutex returns the owner’s fixed unknown/fenced metrics result.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::route_metrics_projection_records_its_own_event_on_both_production_call_sites",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "daemon_route_metrics_projection",
+      "event": "kernel.health.route_metrics_projected",
+      "phase": "route_metrics_projected",
+      "source_line": 424,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": null,
+      "owner_evidence": "The projection uses live connection-index gauges and audit-chain reads; the event follows their actual bounded result.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::route_metrics_projection_records_its_own_event_on_both_production_call_sites"
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "diagnostic_brief_projection",
+      "event": "kernel.health.diagnostic_brief_projected",
+      "phase": "diagnostic_brief_projected",
+      "source_line": 446,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Reads retained_diagnostic_brief only while its StateFence and current audit head match; missing/invalidated means unknown. A genuine current-brief producer remains owned by #1844.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "expected_outcomes": [
+        "success"
+      ],
+      "blocker": {
+        "blocked_by_issue": 1844,
+        "reason": "A successful brief requires a retained current-fence brief produced from a real audit trigger."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "diagnostic_brief_projection",
+      "event": "kernel.health.diagnostic_brief_projected",
+      "phase": "diagnostic_brief_projected",
+      "source_line": 449,
+      "occurrence": 2,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "unknown",
+      "owner_evidence": "Reads retained_diagnostic_brief only while its StateFence and current audit head match; missing/invalidated means unknown. A genuine current-brief producer remains owned by #1844.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::missing_diagnostic_brief_projects_unknown_and_records_unknown",
+      "expected_outcomes": [
+        "unknown"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "recovery_view_response",
+      "event": "kernel.health.recovery_view_projected",
+      "phase": "recovery_view_projected",
+      "source_line": 462,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "known",
+      "owner_evidence": "Projects the borrowed RecoveryView through its fixed build, generation, ORS and incident fields; no semantic recovery is derived.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::recovery_view_response_projects_only_its_four_fields_and_records_known",
+      "expected_outcomes": [
+        "known"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "deferred_semantic_recovery",
+      "event": "kernel.health.semantic_recovery_deferred",
+      "phase": "semantic_recovery_deferred",
+      "source_line": 475,
+      "occurrence": 1,
+      "terminal_emitter": "observe_health",
+      "role": "propagated_caller",
+      "outcome": "known",
+      "owner_evidence": "Consumes KernelAvailability; Unavailable returns the fixed RecoveryDeferral and known observation without running recovery.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/health_view.rs::health_view_diagnostics_tests::semantic_recovery_deferral_records_the_composition_owned_unavailability",
+      "expected_outcomes": [
+        "known"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "observed_session_principal_binding",
+      "event": "kernel.identity.session_binding_failed",
+      "phase": "session_binding_failed",
+      "source_line": 59,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "fenced",
+      "owner_evidence": "current_process_named_pipe_expectation() returns an OS-port error; the caller receives typed KernelBuildError::Principal and no binding candidate is supplied.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::session_binding_offers_the_inert_candidate_and_never_an_admission_verdict",
+      "expected_outcomes": [
+        "fenced"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "observed_session_principal_binding",
+      "event": "kernel.identity.session_binding_observed",
+      "phase": "session_binding_observed",
+      "source_line": 63,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "current_process_named_pipe_expectation() returns the OS port’s expected SID/session candidate; observation is candidate binding, not admission.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::session_binding_offers_the_inert_candidate_and_never_an_admission_verdict",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "eliotd_launch_attempt_identity",
+      "event": "kernel.identity.launch_attempt_failed",
+      "phase": "launch_attempt_failed",
+      "source_line": 100,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "Only serde_json serialization of fixed AttemptBinding can fail; its fields are EpochId,u64,&str,u32,u64,&str. EpochId serializes lineage_id: EpochLineageId (transparent String), then sequence: NonZeroU64, so current types serialize infallibly.",
+      "coverage_status": "excluded",
+      "proof_kind": "ExclusionProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::launch_attempt_identity_projects_the_exact_digest_and_never_a_refusal",
+      "exclusion": {
+        "basis": "AttemptBinding fields are EpochId, u64, &str, u32, u64, &str; EpochId serializes lineage_id: EpochLineageId (transparent String) then sequence: NonZeroU64, so all fields serialize infallibly to serde_json. The declared success test hashes exact ordered bytes (golden digest 891ca56b6cf5...ffd6a2d) and asserts kernel.identity.launch_attempt_failed absent; no artificial failure seam is added."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "eliotd_launch_attempt_identity",
+      "event": "kernel.identity.launch_attempt_derived",
+      "phase": "launch_attempt_derived",
+      "source_line": 104,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Builds AttemptBinding from cloned EpochId, generation.value(), launch_nonce.as_str(), PID, start time and image path; hashes exact ordered serde_json bytes without mutating the input.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::launch_attempt_identity_projects_the_exact_digest_and_never_a_refusal",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "eliotd_operation_id",
+      "event": "kernel.identity.operation_rejected",
+      "phase": "operation_rejected",
+      "source_line": 114,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "The input operation-id text must pass the first 16-byte length/character-prefix check; failure returns the typed Service refusal before OperationId construction.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::operation_identity_refusals_stay_typed_for_invalid_and_foreign_candidates",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "eliotd_operation_id",
+      "event": "kernel.identity.operation_derived",
+      "phase": "operation_derived",
+      "source_line": 121,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "After the first 16-byte prefix gate, OperationId::new accepts the supplied opaque identifier syntax and the function returns the derived operation id; this is identity projection, not admission.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::operation_identity_refusals_stay_typed_for_invalid_and_foreign_candidates",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "eliotd_operation_id",
+      "event": "kernel.identity.operation_rejected",
+      "phase": "operation_rejected",
+      "source_line": 125,
+      "occurrence": 2,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "OperationId::new rejects the exact supplied opaque identifier syntax with a typed Service error; this path checks syntax only and makes no foreign-owner/admission decision.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::operation_identity_refusals_stay_typed_for_invalid_and_foreign_candidates",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "fresh_eliotd_launch_descriptor",
+      "event": "kernel.identity.launch_refresh_requested",
+      "phase": "launch_refresh_requested",
+      "source_line": 136,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "attempt",
+      "owner_evidence": "Begins refresh by validating and cloning the retained EliotdLaunchDescriptor; owner input remains available and unchanged.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::launch_descriptor_refresh_records_requested_then_refreshed_and_preserves_input",
+      "expected_outcomes": [
+        "attempt"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "fresh_eliotd_launch_descriptor",
+      "event": "kernel.identity.launch_descriptor_refreshed",
+      "phase": "launch_descriptor_refreshed",
+      "source_line": 139,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Only the validated clone gets argv nonce slot 5 replaced and descriptor digest recomputed; the retained descriptor is unchanged.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::launch_descriptor_refresh_records_requested_then_refreshed_and_preserves_input",
+      "expected_outcomes": [
+        "success"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "fresh_eliotd_launch_descriptor",
+      "event": "kernel.identity.launch_refresh_failed",
+      "phase": "launch_refresh_failed",
+      "source_line": 141,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "rejected",
+      "owner_evidence": "The retained descriptor’s validate() returns the typed Service refusal; no refreshed descriptor is returned.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::invalid_launch_descriptor_refresh_keeps_the_typed_refusal_and_event_order",
+      "expected_outcomes": [
+        "rejected"
+      ]
+    },
+    {
+      "file": "bins/eliot-kernel/src/runtime_identity.rs",
+      "function": "stable_owner_principal_digest",
+      "event": "kernel.identity.owner_digest_derived",
+      "phase": "owner_digest_derived",
+      "source_line": 191,
+      "occurrence": 1,
+      "terminal_emitter": "observe_identity",
+      "role": "propagated_caller",
+      "outcome": "success",
+      "owner_evidence": "Hashes stable SID bytes, module id bytes, canonical EpochId lineage bytes, epoch sequence little-endian, then Generation little-endian; returns only the digest.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/runtime_identity.rs::runtime_identity_diagnostics_tests::each_identity_boundary_emits_one_observation_and_no_terminal_claim",
+      "expected_outcomes": [
+        "success"
+      ],
+      "assertion_helper": "assert_single_observation"
+    }
+  ],
+  "propagation_count": 11,
+  "propagations": [
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_with_terminal",
+      "source_line": 202,
+      "call": "observe_terminal_error_in_context",
+      "span": "kernel.terminal_error",
+      "terminal_emitter": "kernel_diagnostics::observe_terminal_error_in_context",
+      "role": "propagated_caller",
+      "owner_evidence": "Passes the actual KernelServiceError from apply_control_inner to control_transition_terminal_code and the shared terminal emitter; nested calls set emit_terminal=false to preserve one terminal owner.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::one_failed_transition_emits_exactly_one_designated_terminal"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request",
+      "source_line": 292,
+      "call": "observe_terminal_error_in_context",
+      "span": "kernel.terminal_error",
+      "terminal_emitter": "kernel_diagnostics::observe_terminal_error_in_context",
+      "role": "propagated_caller",
+      "owner_evidence": "Passes the actual TransportError or preserved KernelServiceError code to the shared terminal emitter only when emit_terminal=true; TerminalOwned retains the nested operation’s terminal.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::control_request_is_recorded_and_denied_without_becoming_a_reserve_admission",
+      "assertion_helper": "assert_request_denied_not_admitted"
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request_inner",
+      "source_line": 749,
+      "call": "observe_runtime_lease_tick",
+      "span": "kernel.control.runtime_lease_tick",
+      "terminal_emitter": "observe_runtime_lease_tick",
+      "role": "propagated_caller",
+      "owner_evidence": "Passes RuntimeLeaseTickOutcome produced by the ORS owner’s due lease rows to the tick observer, which publishes only unchanged renewed/expired/superseded counts and skips all-zero outcomes.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1751,
+        "reason": "The caller edge requires the real authenticated probe path to produce a nonzero RuntimeLeaseTickOutcome from canonical ORS lease rows; helper projection coverage alone does not execute this caller."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "apply_control_request_inner",
+      "source_line": 905,
+      "call": "observe_runtime_lease_tick",
+      "span": "kernel.control.runtime_lease_tick",
+      "terminal_emitter": "observe_runtime_lease_tick",
+      "role": "propagated_caller",
+      "owner_evidence": "Passes the ORS-produced RuntimeLeaseTickOutcome to the same observer; this callsite preserves typed owner counts and emits no lease identity.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1751,
+        "reason": "The caller edge requires the real authenticated probe path to produce a nonzero RuntimeLeaseTickOutcome from canonical ORS lease rows; helper projection coverage alone does not execute this caller."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "revalidate_activation_resume_identities",
+      "source_line": 1137,
+      "call": "observe_resume_identity_gap",
+      "span": "kernel.control.resume_identity_gap_observed",
+      "terminal_emitter": "observe_resume_identity_gap",
+      "role": "propagated_caller",
+      "owner_evidence": "Malformed revalidation shape has no verdict vector; the caller passes None plus the closed ResumeIdentityFamily set, then returns SessionFenced.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 293,
+        "reason": "The caller edge requires a real authenticated activation request, handle-proven process/pipe identity and live policy/lease snapshots; the helper UnitProof does not execute this owner gate."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "revalidate_activation_resume_identities",
+      "source_line": 1183,
+      "call": "observe_resume_identity_gap",
+      "span": "kernel.control.resume_identity_gap_observed",
+      "terminal_emitter": "observe_resume_identity_gap",
+      "role": "propagated_caller",
+      "owner_evidence": "A valid ResumeRevalidation passes its actual ordered verdicts and computed stale-family subset; an empty subset returns success, otherwise the caller returns SessionFenced.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 293,
+        "reason": "The caller edge requires a real authenticated activation request, handle-proven process/pipe identity and live policy/lease snapshots; the helper UnitProof does not execute this owner gate."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "control_capacity",
+      "source_line": 1551,
+      "call": "observe_control_capacity",
+      "span": "kernel.control.capacity_observed",
+      "terminal_emitter": "observe_control_capacity",
+      "role": "propagated_caller",
+      "owner_evidence": "Returns the same usize from self.runtime.available_capacity(ProtectedControl) that it passes to observe_control_capacity; this read does not acquire capacity.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/control_plane.rs::control_plane_diagnostics_tests::control_capacity_observation_never_acquires_the_protected_reserve"
+    },
+    {
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "recover_eliotd_in_context",
+      "source_line": 1814,
+      "call": "observe_terminal_error_in_context",
+      "span": "kernel.terminal_error",
+      "terminal_emitter": "kernel_diagnostics::observe_terminal_error_in_context",
+      "role": "propagated_caller",
+      "owner_evidence": "Maps the actual KernelBuildError from recover_eliotd_inner and calls the shared terminal emitter only if child recovery has not already claimed terminal ownership.",
+      "coverage_status": "blocked",
+      "proof_kind": null,
+      "test": null,
+      "blocker": {
+        "blocked_by_issue": 1682,
+        "reason": "The emitter/helper is covered separately, but no executable integration test reaches this measured caller edge with canonical owner input."
+      }
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "rollback_refusal_outcome",
+      "source_line": 552,
+      "call": "observe_terminal_error",
+      "span": "kernel.terminal_error",
+      "terminal_emitter": "kernel_diagnostics::observe_terminal_error",
+      "role": "propagated_caller",
+      "owner_evidence": "Receives this request’s actual GenerationFenced refusal and passes its mapped terminal code once; all other typed errors propagate without this terminal projection.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::refused_cutover_frame_emits_one_cutover_terminal",
+      "assertion_helper": "assert_terminal_record"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "generation_route_snapshot",
+      "source_line": 773,
+      "call": "observe_terminal_error",
+      "span": "kernel.terminal_error",
+      "terminal_emitter": "kernel_diagnostics::observe_terminal_error",
+      "role": "propagated_caller",
+      "owner_evidence": "Forwards the poison/router-lock KernelServiceError from generation_route_snapshot_inner through the snapshot terminal mapper to the shared terminal emitter.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::failed_route_read_emits_one_snapshot_terminal",
+      "assertion_helper": "assert_terminal_record"
+    },
+    {
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "apply_generation_cutover",
+      "source_line": 840,
+      "call": "observe_terminal_error",
+      "span": "kernel.terminal_error",
+      "terminal_emitter": "kernel_diagnostics::observe_terminal_error",
+      "role": "propagated_caller",
+      "owner_evidence": "Forwards the actual typed error from apply_generation_cutover_inner through the cutover terminal mapper; Applied and Readback are disjoint nonterminal arms.",
+      "coverage_status": "covered",
+      "proof_kind": "EdgeProof",
+      "test": "bins/eliot-kernel/src/generation_control.rs::tests::refused_cutover_stays_typed_and_publishes_no_route_change",
+      "assertion_helper": "assert_terminal_record"
+    }
+  ]
 }
