@@ -36,7 +36,10 @@
     fails closed with a usage error. -McpOnly and -RunIgnored encode implicit
     selection/exclusion and are likewise rejected. Fixed recipes derive from
     accepted inventory identities plus the committed toolchain inside the
-    IntegrationHarness.Core/Model modules. -HarnessProbe, -EvidenceLogPath,
+    IntegrationHarness.Core/Model modules. There is NO -HarnessProbe knob: the
+    public Run surface exposes no fault-injection or result-synthesis parameter,
+    so no caller can request a Passed or AssertionFailed disposition that is not
+    backed by a real executed-test receipt. -EvidenceLogPath,
     -ResultArtifactPath, and -InjectFailureAfterSecretSetup are execution knobs
     valid only with -Run. -PlanOutputPath is valid only with -WhatIf and must
     descend from the admitted run root. -EvidenceLogPath/-ResultArtifactPath must
@@ -50,7 +53,7 @@
         [-TimeoutSeconds <n>]  -> returns the finite plan object (never $null)
       Invoke-HarnessRun -SelectedTestId <ids>|-SelectAllRows [-InventoryPath <file>]
         [-RunId <id>] [-CandidateRoot <path>] [-TimeoutSeconds <n>]
-        [-HarnessProbe <name>] [-InjectFailureAfterSecretSetup]
+        [-InjectFailureAfterSecretSetup]
         [-EvidenceLogPath <path>] [-ResultArtifactPath <path>]
         -> returns the run result object, or throws on any failure. A result that
            reports zero executed tests is NOT success even without a throw.
@@ -87,8 +90,6 @@ param(
     [switch]$RunIgnored,
     [ValidateRange(1, 7200)]
     [int]$TestTimeoutSeconds = 3600,
-    [ValidateSet('none', 'success', 'failure', 'retained_handle')]
-    [string]$HarnessProbe = 'none',
     [switch]$InjectFailureAfterSecretSetup,
     [string]$EvidenceLogPath,
     [string]$ResultArtifactPath,
@@ -505,13 +506,13 @@ if (($activeProfile -eq 'Run' -or $activeProfile -eq 'WhatIf') -and -not $hasSel
 }
 
 # ---------------------------------------------------------------------------
-# 4. Profile-gated knobs. Execution probes/artifacts belong to -Run; plan
+# 4. Profile-gated knobs. Execution artifacts belong to -Run; plan
 #    output belongs to -WhatIf; -ValidateConfiguration takes none of them.
+#    There is deliberately no probe knob here: -HarnessProbe was removed
+#    entirely (issue #907 D1) because it synthesized Passed/AssertionFailed
+#    dispositions with no contained execution behind them.
 # ---------------------------------------------------------------------------
 if ($activeProfile -ne 'Run') {
-    if ($HarnessProbe -ne 'none') {
-        Write-HarnessUsageError ("-HarnessProbe is an execution probe and is valid only with -Run, not -{0}. Nothing launches." -f $activeProfile)
-    }
     if ($InjectFailureAfterSecretSetup) {
         Write-HarnessUsageError ("-InjectFailureAfterSecretSetup is an execution failure-injection knob and is valid only with -Run, not -{0}. Nothing launches." -f $activeProfile)
     }
@@ -707,7 +708,6 @@ if ($activeProfile -eq 'Run') {
     $seamArgs['Provider'] = New-HarnessRunProviderTable -BaseTemp $candidateRoot `
         -RunState $providerRunState -Entropy $providerEntropy -PortReservation $providerPortReservation `
         -NamespaceReservation $providerNamespaceReservation
-    if ($HarnessProbe -ne 'none') { $seamArgs['HarnessProbe'] = $HarnessProbe }
     if ($InjectFailureAfterSecretSetup) { $seamArgs['InjectFailureAfterSecretSetup'] = $true }
     if ($null -ne $resolvedEvidenceLogPath) { $seamArgs['EvidenceLogPath'] = $resolvedEvidenceLogPath }
     if ($null -ne $resolvedResultArtifactPath) { $seamArgs['ResultArtifactPath'] = $resolvedResultArtifactPath }

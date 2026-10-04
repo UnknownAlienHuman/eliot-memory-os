@@ -181,6 +181,16 @@ enum RunLoopExit {
         result_sha256: String,
         detail: String,
     },
+    /// #2559 D1: a ticket the Kernel has CLAIMED is awaiting resolution or its
+    /// terminal disposition is unresolved. This is deliberately a separate
+    /// variant from `ShutdownActivationUnknown`: at this stage no
+    /// `AgentActivationResolutionResult` exists, so there is no honest
+    /// `result_sha256` to carry, and reporting clean shutdown here would drop a
+    /// Kernel-owned ticket from daemon shutdown evidence.
+    ShutdownActivationClaimedUnknown {
+        ticket_id: String,
+        detail: String,
+    },
 }
 
 /// Typed dispatch failure so the shutdown drain can distinguish an ambiguous
@@ -281,9 +291,36 @@ struct ActivationResolvedTicket {
     owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
+/// Which stage one activation flight has actually reached.
+///
+/// #2559 D1. The flight used to carry `Option<RetainedActivationIdentity>`,
+/// which cannot express "a ticket is claimed and waiting" because that stage
+/// has a ticket identity and NO result digest yet. `None` therefore meant two
+/// different things - "no activation at all" and "claimed, result-less" - and
+/// the drain read both as clean shutdown, so a claimed ticket could be dropped
+/// from daemon shutdown evidence while the Kernel still owned it.
+///
+/// The stage is set the moment the transition is known, outside the opaque
+/// future, and it is NEVER advanced by a timeout: a digest only ever comes from
+/// a real `AgentActivationResolutionResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivationStage {
+    /// The claim request is outstanding. No ticket identity exists yet, so
+    /// there is nothing to retain and nothing to reconcile: this stage is
+    /// genuinely equivalent to "no activation work owned".
+    Claiming,
+    /// The Kernel returned a valid ticket and the resolve-wait step is
+    /// outstanding. `ticket_id` is the ORIGINAL claimed identity, retained
+    /// verbatim; there is no result digest because none exists.
+    ClaimedWaiting { ticket_id: String },
+    /// Semantic resolution produced a result and the submit step is
+    /// outstanding. Both identities are real and are carried verbatim.
+    ResolvedSubmitting(RetainedActivationIdentity),
+}
+
 struct ActivationFlightState {
     future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>>,
-    retained: Option<RetainedActivationIdentity>,
+    stage: ActivationStage,
 }
 
 /// Sole owner of activation state in `run_loop`. `Idle` means no activation
@@ -356,9 +393,16 @@ fn install_activation_resolve(
     flight: &mut ActivationFlight,
     ticket: AgentActivationResolutionTicket,
 ) {
+    // #2559 D1: the ticket identity is retained HERE, where the claim has
+    // settled and the ticket is in hand - not inside the opaque future, which
+    // is what made a claimed ticket indistinguishable from no activation when
+    // the drain budget expired. `ticket_id` is cloned from the caller's own
+    // ticket; nothing is recomputed and no digest is invented, because at this
+    // stage no `AgentActivationResolutionResult` exists yet.
+    let ticket_id = ticket.ticket_id.clone();
     *flight = ActivationFlight::InFlight(ActivationFlightState {
         future: start_activation_resolve(Arc::clone(kernel), Arc::clone(composition), ticket),
-        retained: None,
+        stage: ActivationStage::ClaimedWaiting { ticket_id },
     });
 }
 
@@ -993,6 +1037,21 @@ pub(super) fn run() -> Result<(), String> {
     let mut shutdown_activation_unknown = false;
     let final_result = match (loop_result, shutdown_result) {
         (Ok(RunLoopExit::Shutdown), Ok(())) => Ok(()),
+        // #2559 D1: a claimed-but-unresolved ticket is NOT a clean shutdown.
+        // It reuses the same non-clean `WithActivationUnknown` terminal outcome
+        // as the submit-unknown case because that is exactly what it is - an
+        // activation whose terminal disposition the daemon cannot prove - while
+        // the message names the ticket and states that no result digest exists,
+        // so the record cannot be read as a submit that happened.
+        (Ok(RunLoopExit::ShutdownActivationClaimedUnknown { ticket_id, detail }), Ok(())) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with a claimed activation ticket unresolved, ticket {ticket_id}, no result digest exists: {detail}"
+                ),
+            ))
+        }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
                 ticket_id,
@@ -1013,6 +1072,18 @@ pub(super) fn run() -> Result<(), String> {
         (Err(failure), Ok(())) => {
             shutdown_activation_unknown = failure.activation_unknown.is_some();
             Err(report_terminal_failure(&kernel, failure.message))
+        }
+        (
+            Ok(RunLoopExit::ShutdownActivationClaimedUnknown { ticket_id, detail }),
+            Err(shutdown_error),
+        ) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with a claimed activation ticket unresolved, ticket {ticket_id}, no result digest exists: {detail}; shutdown: {shutdown_error}"
+                ),
+            ))
         }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
@@ -1897,15 +1968,17 @@ async fn run_loop(
                     &mut solo_poll_last_refusal,
                     &mut fair_pull_recovery_flight,
                     &mut fair_pull_recovery_last_refusal,
+                    // #2559 D3: the campaign-packet flight keeps its own queue,
+                    // claim, compile and result legs, the Task Controller
+                    // flight keeps its own queue and attempt type, and Finish
+                    // keeps its own submit leg. All three now drain inside the
+                    // shared bounded budget instead of behind three further
+                    // fresh ones, so `exit` already accounts for all of them.
+                    &mut campaign_packet_flight,
+                    &mut task_controller_flight,
+                    &mut finish_flight,
                 )
                 .await?;
-                // #1862: the campaign-packet flight keeps its own queue, claim,
-                // compile and result legs, and the Task Controller flight keeps
-                // its own queue and attempt type. Both drain on their own
-                // bounded budgets after the shared flights settle.
-                drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
-                drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
-                drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -2375,7 +2448,12 @@ fn start_tick_work(
                 // Kernel-side `NotReady` supersede gate sees an authenticated
                 // observation instead of an implicit one.
                 future: start_activation_claim(kernel, composition),
-                retained: None,
+                // #2559 D1: the claim request is outstanding, so no ticket
+                // identity exists yet and `Claiming` is the honest stage. It is
+                // a distinct variant from the claimed/waiting stage rather than
+                // a shared "nothing retained" value, so the drain can tell them
+                // apart instead of inferring one from the other.
+                stage: ActivationStage::Claiming,
             });
         }
     }
@@ -4353,7 +4431,7 @@ fn start_activation_dispatch(
         });
     ActivationFlightState {
         future,
-        retained: Some(retained),
+        stage: ActivationStage::ResolvedSubmitting(retained),
     }
 }
 
@@ -4410,6 +4488,9 @@ async fn drain_flights_on_shutdown(
     solo_poll_last_refusal: &mut Option<String>,
     fair_pull_recovery_flight: &mut FairPullRecoveryFlight,
     fair_pull_recovery_last_refusal: &mut Option<String>,
+    campaign_packet_flight: &mut CampaignPacketFlight,
+    task_controller_flight: &mut TaskControllerFlight,
+    finish_flight: &mut FinishFlight,
 ) -> Result<RunLoopExit, RunLoopFailure> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -4439,6 +4520,13 @@ async fn drain_flights_on_shutdown(
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
             && matches!(fair_pull_recovery_flight, FairPullRecoveryFlight::Idle)
+            // #2559 D3: these three were previously drained AFTER this
+            // function returned, each under its own fresh
+            // `SHUTDOWN_ACTIVATION_DRAIN`. They are part of the same drain now,
+            // so an all-idle drain means all of them are idle.
+            && matches!(campaign_packet_flight, CampaignPacketFlight::Idle)
+            && matches!(task_controller_flight, TaskControllerFlight::Idle)
+            && matches!(finish_flight, FinishFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -4516,6 +4604,30 @@ async fn drain_flights_on_shutdown(
             }
             testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
+            }
+            // #2559 D3: these three settle inside the shared drain, so a
+            // campaign packet, a Task Controller attempt and a Finish submit
+            // are polled concurrently with every other flight under the ONE
+            // absolute deadline. Previously they were polled only after this
+            // loop returned, which let a dependency one of them needed make no
+            // progress while it waited, and which spent up to three further
+            // two-second budgets in sequence.
+            campaign_packet_completion =
+                next_campaign_packet_completion(campaign_packet_flight) => {
+                    settle_campaign_packet_completion(
+                        campaign_packet_completion,
+                        campaign_packet_flight,
+                    )?;
+                }
+            task_controller_completion =
+                next_task_controller_completion(task_controller_flight) => {
+                    settle_task_controller_completion(
+                        task_controller_completion,
+                        task_controller_flight,
+                    )?;
+                }
+            finish_completion = next_finish_completion(finish_flight) => {
+                settle_finish_completion(finish_completion, finish_flight)?;
             }
             watchdog_export_drain_completion =
                 next_watchdog_export_drain_completion(watchdog_export_drain_flight) => {
@@ -4617,6 +4729,20 @@ async fn drain_flights_on_shutdown(
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
                 *fair_pull_recovery_flight = FairPullRecoveryFlight::Idle;
+                // #2559 D3: the campaign-packet, Task Controller and Finish
+                // flights are dropped here, on the SAME single absolute
+                // deadline as every other flight, instead of behind three
+                // further `timeout(SHUTDOWN_ACTIVATION_DRAIN, ...)` calls that
+                // each granted a fresh budget after this loop had stopped
+                // polling them. The honest classification of a dropped
+                // campaign/Task-Controller/Finish step - claimed vs submitted vs
+                // committed-but-unacknowledged - is NOT invented here; these
+                // flight states still carry no retained operation identity, and
+                // that absence is defect 2 and defect 4 of this issue, not
+                // something this budget fix may paper over.
+                *campaign_packet_flight = CampaignPacketFlight::Idle;
+                *task_controller_flight = TaskControllerFlight::Idle;
+                *finish_flight = FinishFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
                 return Ok(exit);
@@ -4646,16 +4772,44 @@ fn discard_shutdown_heartbeat_completion(
 }
 
 /// Resolves the activation disposition when the shared shutdown budget ends.
-/// Only a dispatch flight owns a result identity; claim and resolve flights
-/// remain result-less and preserve the prior shutdown disposition.
+///
+/// #2559 D1. The disposition is now decided by the flight's real STAGE, not by
+/// whether a result digest happened to exist:
+///
+/// * `Claiming` - the claim request itself is outstanding, so no ticket
+///   identity exists and there is genuinely nothing owned. Preserves the prior
+///   disposition, which is the honest answer rather than a manufactured unknown.
+/// * `ClaimedWaiting` - the Kernel owns a claimed ticket whose terminal
+///   disposition is unresolved. This is NOT clean: the ticket is reported
+///   under its ORIGINAL identity with NO result digest, because inventing one
+///   would assert a submit that never happened.
+/// * `ResolvedSubmitting` - a real result exists and its submit is outstanding,
+///   so both identities are carried verbatim exactly as before.
+///
+/// The claimed/waiting case is deliberately a distinct exit rather than a reuse
+/// of `ShutdownActivationUnknown`, whose `result_sha256` field has no honest
+/// value to fill at that stage.
 fn activation_exit_after_drain_timeout(
     flight: &mut ActivationFlight,
     activation_exit: RunLoopExit,
 ) -> RunLoopExit {
     match std::mem::replace(flight, ActivationFlight::Idle) {
         ActivationFlight::Idle => activation_exit,
-        ActivationFlight::InFlight(state) => match state.retained {
-            Some(identity) => {
+        ActivationFlight::InFlight(state) => match state.stage {
+            ActivationStage::Claiming => activation_exit,
+            ActivationStage::ClaimedWaiting { ticket_id } => {
+                let _ = eliotd::diagnostics::emit_drain(
+                    eliotd::diagnostics::DrainOutcome::ActivationClaimedUnknown,
+                    &ticket_id,
+                    "",
+                );
+                RunLoopExit::ShutdownActivationClaimedUnknown {
+                    ticket_id,
+                    detail: "daemon shutdown drain timed out with a claimed activation ticket still awaiting resolution; original ticket identity retained with no result digest, the Kernel-owned ticket must expire or reconcile"
+                        .to_owned(),
+                }
+            }
+            ActivationStage::ResolvedSubmitting(identity) => {
                 let _ = eliotd::diagnostics::emit_drain(
                     eliotd::diagnostics::DrainOutcome::ActivationUnknown,
                     &identity.ticket_id,
@@ -4668,7 +4822,6 @@ fn activation_exit_after_drain_timeout(
                         .to_owned(),
                 }
             }
-            None => activation_exit,
         },
     }
 }
@@ -6449,19 +6602,6 @@ async fn submit_campaign_packet_result_idempotent(
     }
 }
 
-async fn drain_campaign_packet_on_shutdown(
-    flight: &mut CampaignPacketFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, CampaignPacketFlight::Idle);
-    let CampaignPacketFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(CampaignPacketCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
 /// Outcome of one production Task Controller poll step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskControllerPollOutcome {
@@ -6910,17 +7050,6 @@ async fn run_finish_poll(
     }
 }
 
-async fn drain_finish_on_shutdown(flight: &mut FinishFlight) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, FinishFlight::Idle);
-    let FinishFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(FinishCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
 async fn run_task_controller_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -6984,19 +7113,6 @@ async fn run_task_controller_poll(
                 "Kernel Task Controller result submit: {first_error}; retry: {second_error}"
             )),
         },
-    }
-}
-
-async fn drain_task_controller_on_shutdown(
-    flight: &mut TaskControllerFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, TaskControllerFlight::Idle);
-    let TaskControllerFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(TaskControllerCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 
@@ -9267,7 +9383,7 @@ mod tests {
         );
         let mut flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
-            retained: None,
+            stage: ActivationStage::Claiming,
         });
         assert_eq!(
             decide_activation_tick(&flight),
@@ -9327,7 +9443,7 @@ mod tests {
         };
         let mut flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
-            retained: Some(retained.clone()),
+            stage: ActivationStage::ResolvedSubmitting(retained.clone()),
         });
 
         let failure = settle_activation_dispatch_completion(
@@ -9350,7 +9466,7 @@ mod tests {
 
         let mut hard_flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
-            retained: Some(RetainedActivationIdentity {
+            stage: ActivationStage::ResolvedSubmitting(RetainedActivationIdentity {
                 ticket_id,
                 result_sha256,
             }),
@@ -9365,6 +9481,81 @@ mod tests {
 
         assert!(matches!(hard_flight, ActivationFlight::Idle));
         assert!(hard.activation_unknown.is_none());
+    }
+
+    /// #2559 D1: the claimed/waiting stage is what the old
+    /// `retained: Option<_>` could not express, so this is the regression the
+    /// audit's counterexample depends on. A ticket the Kernel has already
+    /// returned must NOT settle as clean shutdown, and the disposition must
+    /// name the ORIGINAL ticket identity while carrying NO result digest -
+    /// because no `AgentActivationResolutionResult` exists at that stage and
+    /// inventing one would assert a submit that never happened.
+    #[test]
+    fn a_claimed_waiting_ticket_is_not_clean_shutdown_and_invents_no_result_digest() {
+        let ticket_id = "ticket-claimed-waiting".to_owned();
+        let mut flight = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            stage: ActivationStage::ClaimedWaiting {
+                ticket_id: ticket_id.clone(),
+            },
+        });
+
+        let exit = activation_exit_after_drain_timeout(&mut flight, RunLoopExit::Shutdown);
+
+        match exit {
+            RunLoopExit::ShutdownActivationClaimedUnknown {
+                ticket_id: reported,
+                detail,
+            } => {
+                assert_eq!(reported, ticket_id, "original ticket identity, verbatim");
+                assert!(detail.contains("no result digest"));
+                // A claimed ticket must not be able to smuggle a result digest
+                // into the record at all.
+                assert!(!detail.contains("result sha"));
+            }
+            other => panic!("a claimed ticket must not settle as {other:?}"),
+        }
+        // The drain consumed the flight, so nothing is left claiming ownership.
+        assert!(matches!(flight, ActivationFlight::Idle));
+    }
+
+    /// #2559 D1: the other two stages keep their own honest answers. `Claiming`
+    /// owns no ticket, so it preserves the prior disposition; `ResolvedSubmitting`
+    /// carries both real identities exactly as before. Without this, the D1 fix
+    /// could pass while accidentally making the claim stage non-clean or
+    /// dropping a real result digest.
+    #[test]
+    fn claiming_and_submitting_stages_keep_their_own_dispositions() {
+        let mut claiming = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            stage: ActivationStage::Claiming,
+        });
+        assert!(matches!(
+            activation_exit_after_drain_timeout(&mut claiming, RunLoopExit::Shutdown),
+            RunLoopExit::Shutdown
+        ));
+
+        let result_sha256 = "e".repeat(64);
+        let mut submitting = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            stage: ActivationStage::ResolvedSubmitting(RetainedActivationIdentity {
+                ticket_id: "ticket-submitting".to_owned(),
+                result_sha256: result_sha256.clone(),
+            }),
+        });
+        match activation_exit_after_drain_timeout(&mut submitting, RunLoopExit::Shutdown) {
+            RunLoopExit::ShutdownActivationUnknown {
+                ticket_id,
+                result_sha256: reported,
+                ..
+            } => {
+                assert_eq!(ticket_id, "ticket-submitting");
+                assert_eq!(reported, result_sha256, "real digest retained verbatim");
+            }
+            other => {
+                panic!("a submitting flight must keep its unknown disposition, got {other:?}")
+            }
+        }
     }
 
     #[test]

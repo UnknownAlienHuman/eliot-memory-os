@@ -361,6 +361,13 @@ impl DaemonMetricRecorder {
     /// A drain that retains an unknown activation is an orphan detection; an
     /// idle drain observed no orphan and records nothing.
     ///
+    /// #2559 D1: a Kernel-claimed ticket whose terminal disposition is
+    /// unresolved is the SAME class of observation - work the daemon cannot
+    /// account for - so it records `OrphanDetected` too. It is deliberately not
+    /// folded into `Idle`: before this variant existed, a claimed ticket
+    /// awaiting resolution recorded nothing at all, which is how an unaccounted
+    /// activation could pass for a clean drain.
+    ///
     /// # Errors
     ///
     /// Returns [`DaemonMetricRecordRefusal`] when the sample is refused.
@@ -369,7 +376,7 @@ impl DaemonMetricRecorder {
         outcome: DrainOutcome,
     ) -> Result<(), DaemonMetricRecordRefusal> {
         match outcome {
-            DrainOutcome::ActivationUnknown => {
+            DrainOutcome::ActivationUnknown | DrainOutcome::ActivationClaimedUnknown => {
                 let subject = self.subject(
                     ModuleIdentity::InternalRust,
                     WorkClass::Swarm,

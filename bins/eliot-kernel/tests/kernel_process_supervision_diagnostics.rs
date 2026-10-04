@@ -44,36 +44,68 @@ use eliot_runtime_contracts::{HealthVector, ModuleGeneration, ModuleGenerationSt
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// The exact six source files this leaf owns, in the fixture's spelling.
+/// The EXACT FIVE source files this leaf owns, in the fixture's spelling.
 ///
-/// `process_execution_client.rs` is the sixth and was added by the same
-/// instrumentation commit that created the five process/daemon/supervision
-/// modules (80659466e, "fix: Instrument Kernel process execution and
-/// supervision boundaries (#901)"). It carries one production
-/// `observe_process_in_context` callsite at :106, emitting
-/// `kernel.process.request_rejected` with outcome `path_proof` on the arm where
-/// `retain_process_path_proof` fails, and the fixture now names it in `files`
-/// and carries its boundary row (covering case 4). The fixture's earlier
-/// 116-against-117 count was measured entirely inside the other five files, so
-/// that understated denominator is corrected here rather than excused.
-const OWNED_FILES: [&str; 6] = [
+/// These are the five modules issue #901's exclusive mutable scope names, and
+/// nothing else is added here: the denominator is a statement about what this
+/// issue OWNS, so widening it to a sixth file the issue never listed would make
+/// the "exact" claim a restatement of whatever the fixture happens to say.
+///
+/// `bins/eliot-kernel/src/process_execution_client.rs` is the file that was
+/// wrongly folded in. It does carry one production `observe_process_in_context`
+/// callsite at `:106`, emitting `kernel.process.request_rejected` with outcome
+/// `path_proof`, and it still carries that callsite and its boundary row
+/// (covering case 4) - nothing was deleted to make this denominator come out at
+/// five. It is named in [`OUT_OF_SCOPE_INSTRUMENTED_FILES`] instead, and its row
+/// is still resolved against its real source by `assert_boundary_inventory`, so
+/// the boundary stays inventoried while the OWNED set stays exact.
+const OWNED_FILES: [&str; 5] = [
     "bins/eliot-kernel/src/process_execution.rs",
     "bins/eliot-kernel/src/daemon_process_launch.rs",
     "bins/eliot-kernel/src/daemon_live_receipt.rs",
     "bins/eliot-kernel/src/daemon_supervision.rs",
     "bins/eliot-kernel/src/supervision_lease_authority.rs",
-    "bins/eliot-kernel/src/process_execution_client.rs",
 ];
 
-/// The crate-relative owned paths this suite reads for case 30's diff.
+/// Every production file in this package that CALLS one of the six observers and
+/// is NOT one of the five this issue owns, as repository-relative paths.
 ///
-/// One entry per [`OWNED_FILES`] path, so the forbidden-vocabulary sweep
-/// covers EVERY path the denominator derivation covers: `process_execution.rs`
-/// was the sixth until `process_execution_client.rs` joined the denominator,
-/// and a sweep that still listed five paths would leave a second subscriber
-/// owner in that sixth file unobserved. `assert_sweep_covers_derivation` fails
-/// if the two lists ever drift apart, so the two cannot be maintained apart.
-const OWNED_PATHS: [&str; 6] = [
+/// This is a refusal, not an omission. The derivation in
+/// `derived_instrumented_files` walks the whole `src/` tree, so a sixth
+/// instrumented file cannot simply be left out of the fixture: it would turn
+/// `assert_denominator` red in the direction that says "an instrumented file is
+/// in neither named list". Naming it here is what keeps the owned denominator at
+/// exactly five AND keeps the sixth file's boundary accounted for, instead of
+/// trading a false "exact five" for an unowned boundary nobody looks at.
+///
+/// [`OWNED_FILES`] is the whole of what this issue owns; this list is the
+/// measurement of what it touches without owning. A file is in one or the other,
+/// never both, and `assert_denominator` enforces that.
+const OUT_OF_SCOPE_INSTRUMENTED_FILES: [&str; 1] =
+    ["bins/eliot-kernel/src/process_execution_client.rs"];
+
+/// The crate-relative owned paths this suite reads for case 30's sweep.
+///
+/// One entry per [`OWNED_FILES`] path. The sixth derived path is swept too,
+/// through [`SWEPT_PATHS`], because a sweep that stopped at the owned five would
+/// leave a second subscriber owner in that file unobserved.
+const OWNED_PATHS: [&str; 5] = [
+    "src/process_execution.rs",
+    "src/daemon_process_launch.rs",
+    "src/daemon_live_receipt.rs",
+    "src/daemon_supervision.rs",
+    "src/supervision_lease_authority.rs",
+];
+
+/// Every crate-relative path case 30 sweeps: the five owned modules PLUS the one
+/// out-of-scope instrumented file, which is why the sweep is not
+/// [`OWNED_PATHS`].
+///
+/// `assert_sweep_covers_derivation` fails if this list and the derived
+/// instrumented set ever differ, so the sweep cannot quietly stop covering a
+/// file the denominator counts. That correspondence is what lets case 30 read as
+/// a whole-surface sweep rather than a sweep of the owned subset.
+const SWEPT_PATHS: [&str; 6] = [
     "src/process_execution.rs",
     "src/daemon_process_launch.rs",
     "src/daemon_live_receipt.rs",
@@ -673,101 +705,75 @@ fn is_observer_declaration(source: &str, name_start: usize) -> bool {
 /// The half-open line range each COLUMN-ZERO test-gated `mod` capsule occupies
 /// in `lines`, so the exclusion is by MODULE EXTENT and never truncates a file.
 ///
-/// Both #901 capsules are declared that way, and a callsite inside one of them
-/// is a TEST callsite, not a production boundary: `process_execution.rs:4827`
-/// (`#[cfg(test)] mod process_execution_diagnostics_tests`, holding `:4923`,
-/// `:4924`, `:4925`) and `daemon_supervision.rs:802` (`#[cfg(all(test,
-/// windows))] mod daemon_supervision_diagnostics_tests`, holding `:918`,
-/// `:919`, `:924`, `:925`). Only an attribute that is followed by a `mod` item
-/// counts, so the `#[cfg(test)]` inside a function body at
-/// `process_execution.rs:4790` and the one named inside a doc comment at
-/// `daemon_process_launch.rs:788` do not shorten anyone's production region.
+/// A callsite inside one of them is a TEST callsite, not a production boundary:
+/// `process_execution.rs:4827` (`#[cfg(test)] mod
+/// process_execution_diagnostics_tests`) and `daemon_supervision.rs:802`
+/// (`#[cfg(all(test, windows))] mod daemon_supervision_diagnostics_tests`). Only
+/// an attribute that is followed by a `mod` item counts, so the `#[cfg(test)]`
+/// inside a function body at `process_execution.rs:4790` and the one named inside
+/// a doc comment at `daemon_process_launch.rs:788` do not shorten anyone's
+/// production region.
 ///
-/// The extent runs from the attribute to the line whose closing brace returns
-/// the depth to zero, which is measured rather than assumed, because the
-/// measured extents are NOT all trailing. `process_execution.rs` carries a
-/// SECOND capsule, `#[cfg(all(test, windows))]` at `:4948`, so the measured
-/// ranges there are `:4827`-`:4946` and `:4948`-`:5415` and production line
-/// `:4947` sits BETWEEN them - a derivation that truncated the file at its
-/// first capsule would leave everything below it invisible, so the derived map,
-/// the forwarder list and the total would all be unchanged by a production
-/// callsite appended after one, while the per-FILE walk, which has no cutoff,
-/// still counted the file as instrumented. Every line outside these ranges is
-/// production, wherever it sits.
+/// #901's five private-boundary capsules are INLINE in the owned modules
+/// themselves, which makes this reader the one that has to exclude them, and the
+/// extent is therefore found by ITEM BOUNDARY rather than by brace depth.
 ///
-/// KNOWN AND STATED LIMIT of this reader, so no caller over-claims it: only a
-/// COLUMN-ZERO `#[cfg(...)]` attribute immediately followed by a `mod` item is
-/// recognised. An indented in-function `#[cfg(test)] mod tests { ... }`, a
-/// capsule gated by a macro or by a `cfg_attr`, and a `mod` whose attribute is
-/// not adjacent to it are all read as PRODUCTION. Nothing in `src/` is shaped
-/// that way today - measured on this tree, the recognised capsules are
-/// `process_execution.rs:4827` and `:4948`, `daemon_supervision.rs:802`,
-/// `daemon_process_launch.rs:681`, `generation_control.rs:1324`,
-/// `generation_recovery.rs:556` and `runtime_identity.rs:195`, all column-zero
-/// and adjacent, while `generation_control.rs:647` is a `#[cfg(test)]` on a
-/// FUNCTION and correctly opens no extent - and the
-/// direction of a miss is conservative: an unrecognised capsule is counted as
-/// production callsites, which turns the per-(file, event) multiset red rather
-/// than silently accepting a missing row.
+/// WHY NOT BRACE DEPTH. Counting braces requires lexing string literals so a
+/// quoted brace cannot move the depth, and the simple form of that lex is not
+/// reliable here, because these files defeat it: `daemon_live_receipt.rs` carries
+/// a raw string (`r"C:\ProgramData\Eliot\HostState"`), a byte-string char literal
+/// (`&b'"'`) and doc comments quoting unbalanced braces, so a depth walk closes
+/// that module several hundred lines early and then excludes only part of it. An
+/// under-exclusion is the dangerous direction - it lets a test helper's name be
+/// read as a production observation surface - so the extent is measured from
+/// rustfmt's own guarantee instead: inside a `mod` body every item is indented,
+/// and every top-level item BEGINS at column zero.
+///
+/// The rule, then: a column-zero `#[cfg(` attribute naming `test` whose next line
+/// declares a `mod` opens an extent at that attribute; the extent closes at the
+/// next column-zero line that is neither blank, nor the module's own `mod` header,
+/// nor indented. `process_execution.rs` exercises the case that matters - it
+/// carries TWO capsules with a production line between them - and this rule closes
+/// the first at its own `}` and opens the second at its own attribute, so that
+/// production line is still production.
+///
+/// KNOWN AND STATED LIMIT, and its direction: a column-zero non-blank, non-`}`
+/// line INSIDE a gated module closes the extent early, and an indented
+/// `#[cfg(test)]` inside a module body is not recognised at all. Both fail toward
+/// reading MORE text as production, never toward hiding production text, which is
+/// the conservative direction for every caller here: an unexcluded capsule can
+/// only redden a reader, never quietly satisfy one.
 fn test_module_extents(lines: &[&str]) -> Vec<(usize, usize)> {
-    let mut extents = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let is_test_attribute = line.starts_with("#[cfg(") && line.contains("test");
-        let module_line = lines
+    let mut extents: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let gated = lines[index].starts_with("#[cfg(") && lines[index].contains("test");
+        let declares_module = lines
             .get(index + 1)
             .is_some_and(|next| next.trim_start().starts_with("mod "));
-        if !(is_test_attribute && module_line) {
+        if !(gated && declares_module) {
+            index += 1;
             continue;
         }
-        // A `mod name;` item has no body here, so only the attribute and the
-        // item line are excluded; otherwise the closing brace is found by
-        // depth, and a file whose capsule never closes runs to its last line.
-        let mut depth = 0i64;
+        // The `mod` header on the line after the attribute belongs to the extent,
+        // so the search for its end starts below it.
         let mut end = lines.len();
-        for (cursor, body_line) in lines.iter().enumerate().skip(index + 1) {
-            depth += brace_delta(body_line);
-            if depth <= 0 {
-                end = cursor + 1;
+        let mut cursor = index + 2;
+        while cursor < lines.len() {
+            let line = lines[cursor];
+            let starts_a_new_top_level_item = !line.trim().is_empty()
+                && !line.starts_with('}')
+                && !line.starts_with(char::is_whitespace);
+            if starts_a_new_top_level_item {
+                end = cursor;
                 break;
             }
+            cursor += 1;
         }
         extents.push((index, end));
+        index = end.max(index + 1);
     }
     extents
-}
-
-/// How many `{` minus `}` a single line opens, ignoring braces inside a `//`
-/// comment or a string literal so a documented or quoted brace cannot move the
-/// depth a test capsule's extent is measured by.
-fn brace_delta(line: &str) -> i64 {
-    let mut delta = 0i64;
-    let mut characters = line.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(character) = characters.next() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '/' => {
-                if characters.peek() == Some(&'/') {
-                    break;
-                }
-            }
-            '"' => in_string = true,
-            '{' => delta += 1,
-            '}' => delta -= 1,
-            _ => {}
-        }
-    }
-    delta
 }
 
 /// The parenthesised argument list of the callsite whose observer name ends at
@@ -1460,8 +1466,28 @@ fn derived_instrumented_files(package_prefix: &str) -> Vec<String> {
 /// state accessor, not an observation surface. So a name that continues with an
 /// identifier byte is not a name at all here.
 fn derived_observation_declarations(source: &str) -> BTreeSet<String> {
+    // Test-gated module bodies are EXCLUDED here, by the same brace-matched
+    // extent rule the subscriber check uses. The claim this reader backs is about
+    // the observation surfaces an owned module EXPOSES, and a `fn observe...`
+    // declared inside that module's own `#[cfg(test)]` capsule exposes nothing:
+    // it is a test helper, it is not reachable from production, and it is not a
+    // second observation surface. This exclusion is what makes the reading
+    // independent of where the private-boundary proof physically lives - a
+    // helper named `observe_live_receipt_callsites` inside the inlined #901
+    // capsule is the same helper whether it sits in `daemon_live_receipt.rs` or in
+    // a separate `src/tests/` file the walk skips, and this reader must not
+    // change its answer when the file moves.
+    let lines: Vec<&str> = source.lines().collect();
+    let extents = test_module_extents(&lines);
     let mut declared = BTreeSet::new();
     for (hit, _) in source.match_indices("fn observe") {
+        let line_index = source[..hit].matches('\n').count();
+        if extents
+            .iter()
+            .any(|(start, end)| line_index >= *start && line_index < *end)
+        {
+            continue;
+        }
         let name_start = hit + "fn ".len();
         if source[hit + "fn observe".len()..]
             .starts_with(|character: char| character.is_ascii_alphanumeric())
@@ -1587,12 +1613,14 @@ fn assert_observation_declarations(owned: &str, source: &str) {
     assert_eq!(
         derived_observation_declarations(source),
         expected,
-        "{owned} declares exactly the observation surfaces the six owned modules \
-         already carry, in BOTH directions: the visibility and the `async` \
-         modifier are not part of the key, so `pub(crate) fn observe_...` (the one \
-         legitimate spelling, process_execution.rs:73), `pub async fn observe_...` \
-         and `pub fn observe(` are all read as declarations and a second one is red \
-         here"
+        "{owned} declares exactly the observation surfaces the five owned modules \
+         already carry, in BOTH directions and reading PRODUCTION text only: the \
+         visibility and the `async` modifier are not part of the key, so \
+         `pub(crate) fn observe_...` (the one legitimate spelling, \
+         process_execution.rs:73), `pub async fn observe_...` and `pub fn observe(` \
+         are all read as declarations and a second one is red here. A `fn \
+         observe...` inside this module's own `#[cfg(test)]` capsule is excluded \
+         by brace-matched extent and is not a second observation surface"
     );
 }
 
@@ -2043,6 +2071,26 @@ fn fixture_owned_files(f: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The fixture's `out_of_scope_instrumented_files` array, read as owned strings.
+///
+/// This is the array that lets the OWNED denominator stay at exactly five while
+/// the sixth instrumented file stays accounted for, so it is read here rather
+/// than folded into `fixture_owned_files`: merging the two is the widening this
+/// case refuses.
+fn fixture_out_of_scope_files(f: &Value) -> Vec<String> {
+    f["out_of_scope_instrumented_files"]
+        .as_array()
+        .expect("fixture out_of_scope_instrumented_files array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("an out-of-scope file string")
+                .to_owned()
+        })
+        .collect()
+}
+
 /// Proves case 30's forbidden-vocabulary sweep covers exactly the paths the
 /// denominator derivation covers.
 ///
@@ -2053,34 +2101,42 @@ fn fixture_owned_files(f: &Value) -> Vec<String> {
 /// subscriber owner or a new public observation surface could be added in the
 /// unswept file with every assertion green.
 fn assert_sweep_covers_derivation() {
+    let crate_relative = |repository_relative: &str| {
+        let (_, module) = repository_relative.split_once("/src/").unwrap_or_else(|| {
+            panic!("swept file {repository_relative} names a module under this package's src/")
+        });
+        format!("src/{module}")
+    };
     let mut measured: BTreeSet<String> = OWNED_FILES
         .iter()
-        .map(|owned| {
-            let (_, module) = owned.split_once("/src/").unwrap_or_else(|| {
-                panic!("owned file {owned} names a module under this package's src/")
-            });
-            format!("src/{module}")
-        })
+        .chain(OUT_OF_SCOPE_INSTRUMENTED_FILES.iter())
+        .map(|file| crate_relative(file))
         .collect();
-    let swept: BTreeSet<&str> = OWNED_PATHS.iter().copied().collect();
+    let swept: BTreeSet<&str> = SWEPT_PATHS.iter().copied().collect();
     assert_eq!(
         swept.len(),
-        OWNED_PATHS.len(),
-        "the sweep names no owned path twice"
+        SWEPT_PATHS.len(),
+        "the sweep names no path twice"
     );
-    for owned in swept {
-        measured.remove(owned);
+    for path in swept {
+        measured.remove(path);
     }
     assert_eq!(
         measured,
         BTreeSet::new(),
         "case 30's forbidden-vocabulary sweep covers every path the derivation \
-         covers: an owned module missing from OWNED_PATHS is never swept"
+         covers: a file the denominator names but OWNED_PATHS/SWEPT_PATHS do not \
+         sweep is never read"
     );
-    let unswept: Vec<&str> = OWNED_PATHS
+    let unswept: Vec<&str> = SWEPT_PATHS
         .iter()
         .copied()
-        .filter(|path| !OWNED_FILES.iter().any(|owned| owned.ends_with(*path)))
+        .filter(|path| {
+            !OWNED_FILES
+                .iter()
+                .chain(OUT_OF_SCOPE_INSTRUMENTED_FILES.iter())
+                .any(|named| named.ends_with(path))
+        })
         .collect();
     assert_eq!(
         unswept,
@@ -2092,121 +2148,155 @@ fn assert_sweep_covers_derivation() {
 /// Proves the denominator of case 1 in BOTH directions against the DERIVED
 /// callsite set, and returns nothing.
 ///
-/// * the derived set must equal [`OWNED_FILES`] exactly - so a seventh
-///   instrumented module, a renamed module, a relocated module, or the loss of
-///   the client module's `observe_process_in_context` callsite at
+/// * the length of `files` must equal the length of [`OWNED_FILES`] and the two
+///   sets must match member for member, so the OWNED denominator is EXACTLY the
+///   five modules issue #901 names - a sixth file cannot be added to the fixture
+///   to make a derived set agree with it, which is the widening this case exists
+///   to refuse;
+/// * the length of `out_of_scope` must equal the length of
+///   [`OUT_OF_SCOPE_INSTRUMENTED_FILES`] exactly and the two must be disjoint
+///   from `files`, so an instrumented file outside this issue's scope is NAMED
+///   rather than absorbed into the owned set;
+/// * the derived set must equal the union of those two lists exactly - so a
+///   seventh instrumented module, a renamed module, a relocated module, or the
+///   loss of the client module's `observe_process_in_context` callsite at
 ///   `process_execution_client.rs:106` all turn this red;
-/// * every derived file absent from the fixture's `files` must be NOTHING - so
-///   a new instrumented file cannot slip in unremarked, and the fixture cannot
-///   understate the denominator by omitting an instrumented module;
-/// * every file in `files` must be in the derived set - so the fixture cannot
-///   keep naming a module that no longer calls any observer;
-/// * case 30's sweep covers every one of those paths, so the two lists cannot
-///   drift apart.
-///
-/// The fixture now carries the same six files the walk derives, so this
-/// comparison carries no allowance at all.
-fn assert_denominator(files: &[String], derived: &[String]) {
+/// * the two lists must differ in neither direction against the derived set, so
+///   neither a named file that stopped instrumenting nor an instrumented file in
+///   neither list can survive here.
+fn assert_denominator(files: &[String], out_of_scope: &[String], derived: &[String]) {
     assert_sweep_covers_derivation();
     assert_eq!(
         files.len(),
         OWNED_FILES.len(),
-        "the fixture names exactly the six owned modules"
+        "the fixture names exactly the five modules this issue owns, and no more: \
+         widening `files` is not how a disagreement with the derived set is settled"
     );
     for expected in OWNED_FILES {
         assert!(
             files.iter().any(|value| value == expected),
-            "fixture must list {expected}"
+            "fixture must list the owned file {expected}"
         );
     }
-    let mut measured: Vec<String> = OWNED_FILES.iter().map(|file| (*file).to_owned()).collect();
+    assert_eq!(
+        out_of_scope.len(),
+        OUT_OF_SCOPE_INSTRUMENTED_FILES.len(),
+        "the fixture names exactly the instrumented files this issue does NOT own"
+    );
+    for expected in OUT_OF_SCOPE_INSTRUMENTED_FILES {
+        assert!(
+            out_of_scope.iter().any(|value| value == expected),
+            "fixture must list {expected} as an out-of-scope instrumented file"
+        );
+    }
+    for file in files {
+        assert!(
+            !out_of_scope.contains(file),
+            "{file} is claimed as both owned and out of scope"
+        );
+    }
+    let mut measured: Vec<String> = OWNED_FILES
+        .iter()
+        .chain(OUT_OF_SCOPE_INSTRUMENTED_FILES.iter())
+        .map(|file| (*file).to_owned())
+        .collect();
     measured.sort();
     assert_eq!(
         derived, measured,
-        "the DERIVED instrumented-file set is exactly the measured list"
+        "the DERIVED instrumented-file set is exactly the owned five plus the \
+         named out-of-scope files"
     );
     let uncovered: Vec<&String> = derived
         .iter()
-        .filter(|file| !files.contains(*file))
+        .filter(|file| !files.contains(*file) && !out_of_scope.contains(*file))
         .collect();
     assert_eq!(
         uncovered,
         Vec::<&String>::new(),
-        "`files` omits no instrumented file: the derived set and the fixture's \
-         `files` array differ in neither direction"
+        "no derived instrumented file is unnamed: every one of them is either an \
+         owned file or a named out-of-scope file, so a boundary cannot go \
+         unaccounted for"
     );
-    for file in files {
-        assert!(
-            derived.contains(file),
-            "fixture file {file} has no observer callsite in the source tree"
-        );
-    }
+    let unowned: Vec<&String> = files
+        .iter()
+        .chain(out_of_scope.iter())
+        .filter(|file| !derived.contains(*file))
+        .collect();
+    assert_eq!(
+        unowned,
+        Vec::<&String>::new(),
+        "no named file has stopped instrumenting"
+    );
 }
 
-/// Proves the fixture's `inline_tests` field against the capsule registrations
-/// DERIVED from this crate's own root module, `src/lib.rs`.
+/// Proves the fixture's `inline_tests` field against the inline `#901`
+/// capsules DERIVED from the five owned modules' own sources.
 ///
 /// `inline_tests` is this delivery's record of which in-crate capsules carry the
-/// inline tests it registers, so a name in that array with no registration behind
-/// it would be a field asserting something no test performs - and, before this
-/// assertion existed, the field was both unasserted AND incomplete, naming three
-/// of the five capsules `src/lib.rs` actually registers.
+/// private-boundary proof, so a name in that array with no `mod` behind it would
+/// be a field asserting something no test performs.
 ///
-/// The five names are therefore NOT written here: they are read out of
-/// `src/lib.rs`, in source order, and compared in full, so this is red in both
-/// drift directions.
+/// The five names are therefore NOT written here: they are read out of the five
+/// owned module sources, in [`OWNED_FILES`] order, and compared in full, so this
+/// is red in both drift directions. That derivation replaced an earlier one that
+/// read the same five names out of `src/lib.rs`: this issue's exclusive mutable
+/// scope excludes `src/lib.rs`, so an earlier delivery that registered five
+/// `#[cfg(test)] #[path = "tests/process_supervision_*.rs"]` modules there was
+/// refused for widening the scope past the issue, the five separate files it
+/// registered are gone, and the proof is inline in the owned modules where the
+/// issue's own "directly relevant private inline tests in these five modules"
+/// clause puts it.
 ///
-/// The extraction is structural, not a substring sweep. `CAPSULE_PATH_PREFIX`
-/// selects this issue's capsule family out of every `#[cfg(test)] #[path = ...]
-/// mod ...;` registration the crate root declares, so `mod tests;` and
-/// `local_read_claim_tests` are outside it and can never be mistaken for one of
-/// these capsules. The attribute buffer is what makes the `#[cfg(test)]` half
-/// load-bearing: the test gate is read from an attribute that both BEGINS
-/// `#[cfg(` and names `test`, because the `#[path = "tests/..."]` attribute
-/// itself contains the word `tests` and would otherwise satisfy a bare
-/// containment check on its own. A path is paired with the `mod` line it
-/// actually precedes and names, and the buffer is cleared at each non-attribute,
-/// non-comment line, so an unpaired `#[path]` cannot drift onto a later module.
-fn assert_inline_tests(f: &Value) {
-    const CAPSULE_PATH_PREFIX: &str = "tests/process_supervision_";
-    let root =
-        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
-            .expect("crate root source");
+/// The extraction is structural. `INLINE_MODULE_PREFIX` selects this issue's
+/// capsule family out of every `mod` item the owned modules declare, so
+/// `process_execution_diagnostics_tests`, `new_effect_operation_authority_1884_tests`
+/// and `daemon_supervision_diagnostics_tests` - none of which is #901's - can
+/// never be mistaken for one of these. The attribute buffer is what makes the
+/// `#[cfg(test)]` half load-bearing: the `#[path = "tests/..."]` spelling is gone
+/// with the registrations, and a `#[cfg(windows)]` alone must not open an extent,
+/// so the gate is read from an attribute that both BEGINS `#[cfg(` and names
+/// `test`. A `mod` whose attribute is not adjacent to it, and a declaration
+/// inside a `#[cfg(test)]` module body, both open no extent. All five of this
+/// issue's capsules are `test`-gated, so the assertion can require the gate
+/// rather than tolerate its absence.
+fn assert_inline_tests(f: &Value, package_prefix: &str) {
+    const INLINE_MODULE_PREFIX: &str = "process_supervision_";
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut derived: Vec<String> = Vec::new();
-    let mut attributes: Vec<&str> = Vec::new();
-    for line in root.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            attributes.push(trimmed);
-            continue;
+    for owned in OWNED_FILES {
+        let module_relative = owned
+            .strip_prefix(&format!("{package_prefix}/"))
+            .expect("an owned file is inside this package");
+        let source = std::fs::read_to_string(manifest.join(module_relative))
+            .unwrap_or_else(|_| panic!("owned module {owned} must be readable"));
+        let mut attributes: Vec<&str> = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                attributes.push(trimmed);
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            let test_gated = attributes
+                .iter()
+                .any(|attribute| attribute.starts_with("#[cfg(") && attribute.contains("test"));
+            if test_gated
+                && let Some(signature) = trimmed.strip_prefix("mod ")
+                && let Some(name) = signature.strip_suffix('{').map(str::trim)
+                && name.starts_with(INLINE_MODULE_PREFIX)
+            {
+                derived.push(name.to_owned());
+            }
+            attributes.clear();
         }
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            continue;
-        }
-        let path = attributes
-            .iter()
-            .rev()
-            .find_map(|attribute| attribute.strip_prefix("#[path = \""))
-            .and_then(|value| value.strip_suffix("\"]"))
-            .map(str::to_owned);
-        let test_gated = attributes
-            .iter()
-            .any(|attribute| attribute.starts_with("#[cfg(") && attribute.contains("test"));
-        if test_gated
-            && let Some(path) = path.as_deref()
-            && let Some(stem) = path.strip_suffix(".rs")
-            && stem.starts_with(CAPSULE_PATH_PREFIX)
-            && let Some(signature) = trimmed.strip_prefix("mod ")
-            && let Some(name) = signature.strip_suffix(';')
-        {
-            derived.push(name.to_owned());
-        }
-        attributes.clear();
     }
-    assert!(
-        !derived.is_empty(),
-        "src/lib.rs registers no #[cfg(test)] #[path = \"{CAPSULE_PATH_PREFIX}*.rs\"] \
-         module, so the comparison below would be against nothing"
+    assert_eq!(
+        derived.len(),
+        OWNED_FILES.len(),
+        "each of the five owned modules carries exactly one inline #901 capsule, \
+         in OWNED_FILES order: {derived:?}"
     );
     let declared: Vec<String> = f["inline_tests"]
         .as_array()
@@ -2221,10 +2311,21 @@ fn assert_inline_tests(f: &Value) {
         .collect();
     assert_eq!(
         declared, derived,
-        "the fixture's `inline_tests` is exactly the capsule registrations DERIVED \
-         from src/lib.rs, in registration order: a capsule registered there and \
-         missing here is unrecorded, and a name here with no registration behind it \
-         asserts nothing"
+        "the fixture's `inline_tests` is exactly the inline capsules DERIVED from \
+         the five owned module sources, in owned-file order: a capsule inlined \
+         there and missing here is unrecorded, and a name here with no `mod` \
+         behind it asserts nothing"
+    );
+    // The registration this delivery REMOVED must stay removed. `src/lib.rs` is
+    // outside this issue's mutable scope, and a reader who cannot see the
+    // five `#[path]` registrations come back would have no other way to know.
+    let crate_root =
+        std::fs::read_to_string(manifest.join("src/lib.rs")).expect("crate root source");
+    assert!(
+        !crate_root.contains("process_supervision_"),
+        "src/lib.rs registers no #901 capsule: this issue's exclusive mutable \
+         scope excludes src/lib.rs, and the private-boundary proof is inline in \
+         the owned modules"
     );
 }
 
@@ -2274,21 +2375,28 @@ fn assert_case_owners(f: &Value, suite: &str) -> BTreeSet<u64> {
     declared
 }
 
-/// Reads the six owned modules' production sources once, keyed by the
-/// fixture's own repository-relative spelling of each path.
+/// Reads every file the DENOMINATOR names - the five owned modules plus the
+/// out-of-scope instrumented file - once, keyed by the fixture's own
+/// repository-relative spelling of each path.
+///
+/// The out-of-scope file is read here for the same reason its row is kept: a
+/// boundary row is only proved when the module it names really defines the
+/// function and really passes that event prefix, and that check must reach the
+/// sixth file's source rather than skip it because the file is not owned.
 fn owned_module_sources(package_prefix: &str) -> BTreeMap<&'static str, String> {
     OWNED_FILES
         .iter()
+        .chain(OUT_OF_SCOPE_INSTRUMENTED_FILES.iter())
         .map(|owned| {
             let manifest_relative = owned
                 .strip_prefix(&format!("{package_prefix}/"))
-                .expect("an owned file is inside this package");
+                .expect("a denominator file is inside this package");
             (
                 *owned,
                 std::fs::read_to_string(
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(manifest_relative),
                 )
-                .unwrap_or_else(|_| panic!("owned module {owned} must be readable")),
+                .unwrap_or_else(|_| panic!("denominator module {owned} must be readable")),
             )
         })
         .collect()
@@ -2300,9 +2408,11 @@ fn owned_module_sources(package_prefix: &str) -> BTreeMap<&'static str, String> 
 ///   RESOLVE rows: the per-CALLSITE `(file, event)` multiset derived from the
 ///   production tree and the nine cross-cutting rowless cases are what make
 ///   the inventory COMPLETE;
-/// * every row's `file` must be inside the fixture's denominator AND still in
-///   the DERIVED callsite set, so a row cannot name a module that stopped
-///   instrumenting;
+/// * every row's `file` must be inside the fixture's DENOMINATOR - the owned
+///   five plus the named out-of-scope file - AND still in the DERIVED callsite
+///   set, so a row cannot name a module that stopped instrumenting, and the
+///   out-of-scope file's row is resolved against its real source rather than
+///   skipped;
 /// * every row's `covering_case` must be a case number `case_owners` declares,
 ///   which is what makes the old `(1..=30).contains(&case)` range test
 ///   unnecessary - that predicate is true of every number that parses as
@@ -2364,20 +2474,25 @@ fn assert_boundary_inventory(
 // WORK_UNIT_CASE: 901/1
 // The denominator is DERIVED, not restated. `derived_instrumented_files` walks
 // this package's own `src/` tree and keeps every production file that CALLS one
-// of the six observer functions; that measured set is what the fixture's
-// `files` array is compared against, in BOTH directions. A seventh instrumented
-// module, or a renamed or relocated one, now changes the derived set and turns
-// this red instead of agreeing with a restated constant.
+// of the six observer functions; that measured set is what the fixture's `files`
+// array and its `out_of_scope_instrumented_files` array are compared against, in
+// BOTH directions. A seventh instrumented module, or a renamed or relocated one,
+// now changes the derived set and turns this red instead of agreeing with a
+// restated constant.
 //
-// The two sets are now IDENTICAL and the comparison carries NO allowance.
-// `bins/eliot-kernel/src/process_execution_client.rs` carries a production
+// THE OWNED DENOMINATOR IS EXACTLY FIVE, and that is the point this case exists
+// to hold. `files` is asserted member for member against `OWNED_FILES`, which is
+// the five modules issue #901's exclusive mutable scope names, so adding a sixth
+// file to the fixture to make the derived set agree is refused here rather than
+// accepted. `bins/eliot-kernel/src/process_execution_client.rs` is the file an
+// earlier revision folded in: it really does carry a production
 // `observe_process_in_context` callsite at :106 emitting
-// `kernel.process.request_rejected` with outcome `path_proof`, and the fixture
-// names that file in `files` and carries its boundary row (covering case 4).
-// An earlier revision of this fixture carried 116 rows against 117 counted
-// callsites because that count had been measured entirely inside the other five
-// files; the understated denominator is corrected in the fixture rather than
-// recorded as an exception here, so the difference asserted below is EMPTY.
+// `kernel.process.request_rejected` with outcome `path_proof`, and that callsite
+// and its boundary row (covering case 4) are both STILL HERE - the boundary was
+// not deleted to make the count come out. The file is named in the fixture's
+// `out_of_scope_instrumented_files` instead, and `assert_denominator` requires
+// the derived set to be exactly those two named lists, disjoint. So the sixth
+// file is accounted for in full and the owned set is still exact five.
 #[test]
 fn process_supervision_denominator_is_exact() {
     let f = fixture();
@@ -2396,16 +2511,21 @@ fn process_supervision_denominator_is_exact() {
 
     let derived = derived_instrumented_files(package_prefix);
     let files = fixture_owned_files(&f);
+    let out_of_scope = fixture_out_of_scope_files(&f);
     let declared = assert_case_owners(&f, suite);
-    assert_denominator(&files, &derived);
-    // The `inline_tests` half is derived from src/lib.rs for the same reason: the
-    // field names the capsules this delivery registers, so it is compared against
-    // the registrations themselves rather than against a list copied beside them.
-    assert_inline_tests(&f);
+    assert_denominator(&files, &out_of_scope, &derived);
+    // The `inline_tests` half is derived from the five owned module SOURCES for
+    // the same reason: the field names the capsules this delivery inlined, so it
+    // is compared against the inline `mod` items themselves rather than against a
+    // list copied beside them - and against `src/lib.rs` for the registrations
+    // that must stay removed.
+    assert_inline_tests(&f, package_prefix);
+    let mut denominator: Vec<String> = files.clone();
+    denominator.extend(out_of_scope.iter().cloned());
     let boundaries = f["boundaries"].as_array().expect("fixture boundaries");
     assert_boundary_inventory(
         boundaries,
-        &files,
+        &denominator,
         &derived,
         &declared,
         &owned_module_sources(package_prefix),
@@ -3634,17 +3754,26 @@ fn captured_causal_order_and_diagnostic_only_diff() {
     // extra owned file, "case 30 sweeps no path the derivation does not cover"
     // for an extra swept path - naming which lists differ.
     assert_sweep_covers_derivation();
-    for owned in OWNED_PATHS {
-        let src = std::fs::read_to_string(manifest_dir.join(owned))
-            .unwrap_or_else(|_| panic!("owned module {owned} must be readable"));
+    // The sweep covers the whole DERIVED denominator - the five owned modules
+    // plus the one out-of-scope instrumented file - because a sweep that stopped
+    // at the owned five would leave a second subscriber owner in that sixth file
+    // unobserved. The observation-surface check stays on the owned five, which is
+    // where OWNED_OBSERVATION_DECLARATIONS is defined.
+    for swept in SWEPT_PATHS {
+        let src = std::fs::read_to_string(manifest_dir.join(swept))
+            .unwrap_or_else(|_| panic!("swept module {swept} must be readable"));
         for needle in FORBIDDEN_IN_OWNED {
-            assert!(!src.contains(needle), "{owned} must not contain {needle}");
+            assert!(!src.contains(needle), "{swept} must not contain {needle}");
         }
         // A THREAD-LOCAL subscriber install, which the whole-file list above
         // cannot carry because the capsules' own `with_default(` calls are
         // legitimate, plus the exact observation-surface declaration set in any
         // visibility.
-        assert_no_production_subscriber(owned, &src);
+        assert_no_production_subscriber(swept, &src);
+    }
+    for owned in OWNED_PATHS {
+        let src = std::fs::read_to_string(manifest_dir.join(owned))
+            .unwrap_or_else(|_| panic!("owned module {owned} must be readable"));
         assert_observation_declarations(owned, &src);
     }
     // F-LOG-KERNEL-3 (#901 T30), the seventh-module gap: a module that installs
@@ -3661,7 +3790,7 @@ fn captured_causal_order_and_diagnostic_only_diff() {
     // already proves each of them individually and names the exact line.
     let outsiders: Vec<String> = derived_subscriber_installers()
         .into_iter()
-        .filter(|path| !OWNED_PATHS.contains(&path.as_str()))
+        .filter(|path| !SWEPT_PATHS.contains(&path.as_str()))
         .collect();
     assert_eq!(
         outsiders,

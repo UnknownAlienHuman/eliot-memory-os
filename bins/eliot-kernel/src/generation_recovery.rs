@@ -284,6 +284,82 @@ impl OrsGenerationCoordinator {
         outcome
     }
 
+    /// Applies the accepted restore-journal retention policy to every stream
+    /// this store has durably accepted, as an independently authorized startup
+    /// reconciliation (I14.22 names startup reconciliation a legitimate
+    /// maintenance trigger).
+    ///
+    /// The streams are enumerated from the journal's own durable index, never
+    /// from a caller-supplied name, so this pass cannot reclaim a stream that
+    /// was never bound and cannot skip one that was. It reaches
+    /// [`RedbRecoveryStore::apply_restore_journal_retention`], which owns the
+    /// bounded pass, the policy and the per-stream
+    /// [`eliot_ors::RestoreJournalRetentionReport`]. This gateway adds no
+    /// retention rule of its own, so a maintenance outcome can never be folded
+    /// into an append receipt: the two dispositions stay distinct because each
+    /// still runs in its own write transaction on its own terms.
+    ///
+    /// One stream refusing retention does not skip the rest: every stream is
+    /// offered the policy, because an unrelated reclamation must not be denied
+    /// by a neighbour's refusal. No refusal is swallowed either. The first
+    /// refusal is returned verbatim in the error, with the count of streams
+    /// that refused, so the caller retains the owner's own bounded reason.
+    pub(crate) fn recover_restore_journal_retention(&self) -> Result<(), String> {
+        observe_recovery(
+            "kernel.recovery.restore_journal_retention_requested",
+            "attempt",
+        );
+        let outcome = (|| {
+            let streams = self
+                .ors
+                .list_restore_journal_streams()
+                .map_err(|error| error.to_string())?;
+            if streams.is_empty() {
+                observe_recovery("kernel.recovery.restore_journal_retention_absent", "empty");
+                return Ok(());
+            }
+            let total = streams.len();
+            let mut refused = 0_usize;
+            let mut first_refusal: Option<(String, String)> = None;
+            for stream in &streams {
+                match self.ors.apply_restore_journal_retention(stream) {
+                    Ok(report) => observe_recovery(
+                        "kernel.recovery.restore_journal_retention_pass",
+                        if report.record.removed_members > 0 {
+                            "success"
+                        } else {
+                            "empty"
+                        },
+                    ),
+                    Err(error) => {
+                        refused += 1;
+                        if first_refusal.is_none() {
+                            first_refusal = Some((stream.clone(), error.to_string()));
+                        }
+                    }
+                }
+            }
+            if let Some((stream, reason)) = first_refusal {
+                return Err(format!(
+                    "{refused} of {total} restore-journal stream(s) refused the accepted \
+                     retention policy; first refusal on {stream}: {reason}"
+                ));
+            }
+            observe_recovery(
+                "kernel.recovery.restore_journal_retention_reconciled",
+                "success",
+            );
+            Ok(())
+        })();
+        if outcome.is_err() {
+            observe_recovery(
+                "kernel.recovery.restore_journal_retention_failed",
+                "rejected",
+            );
+        }
+        outcome
+    }
+
     pub(crate) fn recover(
         &self,
         generations: &mut GenerationRouter,
