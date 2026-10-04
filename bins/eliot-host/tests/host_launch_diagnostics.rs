@@ -105,7 +105,7 @@ const EXECUTED_SEAM_PROVES: &str =
     "the forwarding property and the slot rendering on a reachable, already-forwarding seam";
 
 /// Where the DELIVERED twins' own rendered records are proven instead. The eight
-/// `#978` twins are `pub(crate)`/`pub(super)` inside private modules, so no
+/// `#978` twins are private, `pub(crate)` or `pub(super)` inside a private module,
 /// integration target can call one and never could; each twin's rendered record
 /// is the inline owner case in its own file, mapped by the fixture key below.
 const EXECUTED_SEAM_TWIN_OWNER_MAP: &str = "inline_case_owners";
@@ -1673,7 +1673,7 @@ fn launch_01_eight_file_denominator() {
         }
     }
 
-    // #978 W2/AUD3: every delivered twin is `pub(crate)`/`pub(super)` inside a
+    // #978 W2/AUD3: every delivered twin is private, `pub(crate)` or `pub(super)` inside
     // private module, so this target cannot call one and never could. The
     // fixture therefore maps each twin to the INLINE OWNER CASE in its own file
     // that really does execute it, and this proves that mapping against real
@@ -2063,7 +2063,7 @@ fn launch_03_retained_identity_on_substitution() {
     // slot rendering on a REACHABLE, ALREADY-FORWARDING seam - which is exactly
     // what the fixture's `proves` field is required to say. It does NOT prove any
     // delivered twin's rendered record: all eight twins of this delivery are
-    // `pub(crate)`/`pub(super)` inside private modules, so an integration target
+    // private, `pub(crate)` or `pub(super)` inside a private module, so an integration
     // cannot call one and never could, and each twin's own rendered record is its
     // inline owner case in its own file, mapped by `inline_case_owners`. The twin
     // forwarding itself is proved below from real source bytes.
@@ -2345,16 +2345,26 @@ fn launch_03_retained_identity_on_substitution() {
         declared_count + excluded.len() as u64,
         "the delivered twins must be exactly the correlated entry points plus the declared exclusions: {expected_twins:?} against {excluded:?}"
     );
-    let mut expected_covered: Vec<String> = expected_twins
+    // The set difference is taken in the SAME SPELLING on both sides. `listed_twins`
+    // above is built without the `fn ` prefix because that is how `inline_case_owner_cases`
+    // keys its members, while `expected_twins` and the fixture's `excluded` entries
+    // both carry it - so comparing those directly compares 7 unprefixed strings
+    // against 9 prefixed ones and can never hold. The delivered twins this contour
+    // does NOT call are exactly the declared exclusions, so the comparison is
+    // "every twin, minus the exclusions" against the listed entry points.
+    let mut listed_with_prefix: Vec<String> = listed_twins
         .iter()
-        .cloned()
-        .chain(excluded.iter().cloned())
+        .map(|twin| twin.replacen(':', ":fn ", 1))
         .collect();
-    expected_covered.sort();
-    let mut listed_sorted = listed_twins.clone();
-    listed_sorted.sort();
+    listed_with_prefix.sort();
+    let mut expected_called: Vec<String> = expected_twins
+        .iter()
+        .filter(|twin| !excluded.contains(twin))
+        .cloned()
+        .collect();
+    expected_called.sort();
     assert_eq!(
-        listed_sorted, expected_covered,
+        listed_with_prefix, expected_called,
         "the declared exclusions must be exactly the delivered twins this contour does not call, no more and no fewer: listed {listed_twins:?} of {expected_twins:?}, excluded {excluded:?}"
     );
     // An exclusion is only honest while the twin it excuses really is pinned on
@@ -2897,7 +2907,7 @@ fn launch_06_store_before_kernel() {
     // the slot rendering on a REACHABLE, ALREADY-FORWARDING seam - which is
     // exactly what the fixture's `proves` field is required to say. It does NOT
     // prove any delivered twin's rendered record: all eight twins of this delivery
-    // are `pub(crate)`/`pub(super)` inside private modules, so an integration
+    // are private, `pub(crate)` or `pub(super)` inside a private module, so an integration
     // target cannot call one and never could, and each twin's own rendered record
     // is its inline owner case in its own file, mapped by `inline_case_owners`.
     // That is also why this seam is deliberately NOT one of
