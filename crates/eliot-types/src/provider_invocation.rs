@@ -697,25 +697,37 @@ pub struct ProviderRouteReadinessGate {
 // authority or status of its own, yet a policy that steers process lifetime
 // is read back out of it.
 //
-// 2. The decode site, re-measured: `crates/eliot-engine/src/adapter.rs:241-248`
-// — `request.input.get("provider_route_policy").cloned()`, a missing key
-// rejected as "external adapter request has no provider route policy", then
-// `serde_json::from_value::<ProviderRoutePolicy>(route_policy)?` at :248. It
-// runs only for `AdapterClass::ExternalCandidate` (:240). The general request
-// gate `validate_request` (`crates/eliot-engine/src/adapter.rs:1196-1221`)
-// checks adapter identity, capability membership, forbidden authority and
+// 2. The decode site, re-measured: `crates/eliot-engine/src/adapter.rs:262-270`
+// — `request.input.get("provider_route_policy").cloned()` at :263-266, a missing
+// key rejected as "external adapter request has no provider route policy" at
+// :267-269, then `serde_json::from_value::<ProviderRoutePolicy>(route_policy)?`
+// at :270. It runs only for `AdapterClass::ExternalCandidate`, which is the
+// `if` guard at :262. The general request gate `validate_request`
+// (`crates/eliot-engine/src/adapter.rs:1218-1243`) checks adapter identity,
+// capability membership, forbidden authority and
 // `serde_json::to_vec(&request.input)?.len()` against `max_payload_bytes`
-// (:1216) — it never inspects the structure of `input`, so :248 is the only
+// (:1239) — it never inspects the structure of `input`, so :270 is the only
 // thing standing between an opaque payload and a governing deadline.
 //
-// 3. What the consumer obtains. `crates/eliot-engine/src/adapter.rs:249-253`
-// takes `route_policy.timeout_profile()` — `&ProviderTimeoutProfile`, declared
-// at `provider_invocation.rs:398` — and reads
+// CORRECTION TO THE PREVIOUS TEXT OF THIS BLOCK, recorded rather than made
+// silently: the coordinates above and in point 3 were stated 22 lines low
+// (`:241-248`, `:248`, `:240`, `:1196-1221`, `:1216`, `:249-253`, `:257-259`,
+// `:263-272`, `:274-297`, `:255`, `:240-253`). Every one of them was wrong and
+// every one of them is now the measured line. The error is recorded because the
+// whole value of this block is that a reader can go and look, and a reader who
+// arrives 22 lines early finds a plausible-looking neighbouring statement
+// instead of a gap.
+//
+// 3. What the consumer obtains. `crates/eliot-engine/src/adapter.rs:271-275`
+// takes `route_policy.timeout_profile()` at :271 — `&ProviderTimeoutProfile`,
+// declared at `provider_invocation.rs:398` — and reads
 // `absolute_runtime_deadline_ms()` (:508), `cancellation_grace_ms()` (:513)
-// and `cleanup_grace_ms()` (:518), summing them into `timeout_ms`. That value
-// becomes the absolute `deadline` handed to `AdapterExecutionContext`
-// (:257-259, :263-272) and `deadline_at`, recorded as `phase_deadline_at` and
-// `absolute_deadline_at` on the runtime checkpoint (:274-297). It therefore
+// and `cleanup_grace_ms()` (:518) at :273/:274/:275, summing them into
+// `timeout_ms` (the sum closes at :278). That value becomes the absolute
+// `deadline` computed at `crates/eliot-engine/src/adapter.rs:279-281` and handed
+// to `AdapterExecutionContext` in the literal at :285-294 (its `deadline` field
+// at :289), and to `deadline_at` at :296-297, recorded as `phase_deadline_at` and
+// `absolute_deadline_at` on the runtime checkpoint at :318-319. It therefore
 // steers process lifetime and cleanup, not a label. `policy_id` and
 // `policy_hash_blake3` are NOT consulted by this consumer at all; the
 // identity members of the policy are carried but unread on this path.
@@ -777,14 +789,18 @@ pub struct ProviderRouteReadinessGate {
 //     `crates/eliot-engine/src/external_review.rs:679` (adapter_id
 //     `"test-echo"`, `input` a `json!` literal at :694-699 carrying no
 //     `provider_route_policy`, so that request takes the non-`ExternalCandidate`
-//     branch at `crates/eliot-engine/src/adapter.rs:255` and never reaches the
-//     decode) and at `crates/eliot-app/src/host_runtime/external_agent.rs:4752`
-//     inside a `#[cfg(test)]` module. Neither is a third route-policy ingress.
+//     branch at `crates/eliot-engine/src/adapter.rs:276-277` and never reaches the
+//     decode), at `crates/eliot-engine/src/adapter.rs:878-879`
+//     `pub fn test_request`, which is a `pub` constructor and NOT `#[cfg(test)]`
+//     - so it is a third build site and not a test-only one - and at
+//     `crates/eliot-app/src/host_runtime/external_agent.rs:4752`
+//     inside a `#[cfg(test)]` module. None of the three is a further
+//     route-policy ingress.
 //
 // 6. Owner and disposition: UNRESOLVED, and deliberately not repaired here. The
 // causal owner is whoever decides that a protected route policy may travel
-// inside an opaque adapter payload — that is the adapter request contract in
-// `crates/eliot-engine/src/adapter.rs:240-253` together with the
+// inside an opaque adapter payload — that is the adapter request contract at
+// `crates/eliot-engine/src/adapter.rs:262-278` together with the
 // opaque-payload-versus-envelope-field boundary declared at
 // `crates/eliot-types/src/adapter.rs:146-152`. The repair is outside this file
 // and outside #933's scope: #933 cannot add a new envelope member, mint a new
