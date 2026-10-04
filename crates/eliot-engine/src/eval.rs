@@ -198,6 +198,15 @@ pub struct CanonicalMetaExperimentInput {
     pub holdout_candidate: CanonicalReplayExecutionRecord,
     pub threshold: ReplayThresholdPolicyV1,
     pub attempted_fence: Option<MetaIsolationFence>,
+    /// Declared second route or Human disposition that lifts the replay-only
+    /// evaluation evidence above its own proof ceiling (issue #1922, I18.47).
+    ///
+    /// A canonical replay receipt is `REPLAY_ONLY` and `INCONCLUSIVE` by
+    /// construction, so without this the experiment is measured but never
+    /// promotable. This is the ONLY way the evaluation-integrity gate passes:
+    /// it names a second route or a Human disposition that the caller actually
+    /// holds. It never edits a receipt and never asserts measured validity.
+    pub evidence_corroboration: Option<eliot_types::MetaEvidenceCorroboration>,
 }
 
 #[derive(Clone, Debug)]
@@ -213,7 +222,7 @@ struct CanonicalMetaDerivedAssessment {
     attempted_fence_hash: String,
     isolation_reasons: Vec<String>,
     metric_evidence: Vec<CanonicalMetaMetricEvidence>,
-    gates: [bool; 4],
+    gates: [bool; 5],
     blocking_reasons: Vec<String>,
     eligible_for_promotion: bool,
     reproducibility_hash: String,
@@ -233,6 +242,15 @@ pub enum MetaExperimentGate {
     Holdout,
     PrimaryMetrics,
     CounterMetrics,
+    /// Load-bearing evaluation-integrity evidence for every replay run in the
+    /// experiment (issue #1922).
+    ///
+    /// Passes only when each run's sealed evaluation-integrity receipt is
+    /// present, intact, bound to that run and free of drift, AND carries the
+    /// corroboration a replay-only result needs before it may support a
+    /// promotion. I18.47: "replay or simulation calibrates an oracle but cannot
+    /// alone promote live Product Proof".
+    EvaluationIntegrity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,7 +357,7 @@ impl MetaHarnessService {
         Ok(MetaExperimentAssessment {
             record,
             eligible_for_promotion,
-            gate_results: meta_gate_results([
+            gate_results: legacy_meta_gate_results([
                 fixed_replay_passed,
                 holdout_passed,
                 primary_metrics_passed,
@@ -472,8 +490,20 @@ impl MetaPolicyExecutor {
         assessment: &CanonicalMetaExperimentAssessment,
         authorization: &MetaPolicyAuthorization,
     ) -> Result<(ExperimentalMetaPolicyCandidate, MetaPolicyExecutionReceipt), EngineError> {
+        // Issue #1922: eligibility alone is a caller-asserted boolean, so it is
+        // not sufficient on its own. The assessment must positively carry a
+        // PASSING evaluation-integrity gate, which only
+        // `derive_canonical_meta_assessment` can produce from the sealed
+        // receipts. An assessment that omits the gate (or reports it failed) is
+        // refused here, so replay-only INCONCLUSIVE evidence cannot be promoted
+        // by fabricating the eligibility flag.
+        let integrity_gate_passed = assessment
+            .gate_results
+            .iter()
+            .any(|result| result.gate == MetaExperimentGate::EvaluationIntegrity && result.passed);
         if candidate.state != ExperimentalMetaPolicyState::Experimental
             || !assessment.eligible_for_promotion
+            || !integrity_gate_passed
             || assessment.records.experiment.decision != MetaExperimentDecision::KeptExperimental
             || candidate.project_id
                 != assessment.records.experiment.project_id.ok_or_else(|| {
@@ -2996,12 +3026,26 @@ fn derive_canonical_meta_assessment(
             false,
         )?,
     ];
+    let evidence_dispositions = canonical_meta_evidence_dispositions(input);
+    // Corroboration is read only after every disposition proved intact and
+    // drift-free: a stale or foreign receipt can never be lifted by a second
+    // route, because the thing being corroborated no longer describes the
+    // current system. Only the replay-only ceiling may be lifted.
+    let corroboration = input
+        .evidence_corroboration
+        .as_ref()
+        .filter(|corroboration| corroboration.is_honest());
+    let evidence_supports_promotion = evidence_dispositions.iter().all(|disposition| {
+        disposition.validity == super::replay::ReplayEvidenceValidity::Current
+            && (disposition.measured_validity_claimed || corroboration.is_some())
+    });
     let gates = [
         fixed_candidate_score >= input.threshold.minimum_pass_basis_points,
         holdout_candidate_score >= input.threshold.minimum_pass_basis_points,
         aggregate_candidate >= input.threshold.minimum_pass_basis_points
             && aggregate_candidate >= aggregate_baseline,
         counter_regressions <= input.threshold.maximum_counter_regressions,
+        evidence_supports_promotion,
     ];
     let mut blocking_reasons = isolation_reasons.clone();
     for (passed, reason) in gates.into_iter().zip([
@@ -3009,9 +3053,28 @@ fn derive_canonical_meta_assessment(
         "holdout sealed replay missed the derived threshold",
         "sealed replay primary metric regressed",
         "sealed replay counter-regression bound failed",
+        "evaluation-integrity evidence does not support a load-bearing promotion",
     ]) {
         if !passed {
             blocking_reasons.push(reason.to_owned());
+        }
+    }
+    // Name the causal dimension per run rather than only the aggregate gate, so
+    // an operator sees WHICH invalidation dimension refused the promotion.
+    for (label, disposition) in [
+        ("fixed_baseline", &evidence_dispositions[0]),
+        ("fixed_candidate", &evidence_dispositions[1]),
+        ("holdout_baseline", &evidence_dispositions[2]),
+        ("holdout_candidate", &evidence_dispositions[3]),
+    ] {
+        for reason in &disposition.blocking_reasons {
+            blocking_reasons.push(format!("{label}: {reason}"));
+        }
+        if !disposition.measured_validity_claimed && corroboration.is_none() {
+            blocking_reasons.push(format!(
+                "{label}: {}",
+                super::replay::REPLAY_EVIDENCE_REPLAY_ONLY_UNCORROBORATED
+            ));
         }
     }
     let eligible_for_promotion = isolation_reasons.is_empty() && gates.into_iter().all(|gate| gate);
@@ -3034,6 +3097,19 @@ fn derive_canonical_meta_assessment(
         eligible_for_promotion,
         reproducibility_hash,
     })
+}
+
+/// Recomputes the current evaluation-integrity disposition of every replay run
+/// the experiment depends on, in fixed arm order.
+fn canonical_meta_evidence_dispositions(
+    input: &CanonicalMetaExperimentInput,
+) -> [super::replay::ReplayEvidenceDisposition; 4] {
+    [
+        super::replay::replay_evidence_disposition(&input.fixed_baseline),
+        super::replay::replay_evidence_disposition(&input.fixed_candidate),
+        super::replay::replay_evidence_disposition(&input.holdout_baseline),
+        super::replay::replay_evidence_disposition(&input.holdout_candidate),
+    ]
 }
 
 fn canonical_meta_isolation(
@@ -3493,7 +3569,29 @@ fn validate_meta_policy_authorization(
     Ok(())
 }
 
-fn meta_gate_results(results: [bool; 4]) -> Vec<MetaExperimentGateResult> {
+fn meta_gate_results(results: [bool; 5]) -> Vec<MetaExperimentGateResult> {
+    [
+        MetaExperimentGate::FixedReplay,
+        MetaExperimentGate::Holdout,
+        MetaExperimentGate::PrimaryMetrics,
+        MetaExperimentGate::CounterMetrics,
+        MetaExperimentGate::EvaluationIntegrity,
+    ]
+    .into_iter()
+    .zip(results)
+    .map(|(gate, passed)| MetaExperimentGateResult { gate, passed })
+    .collect()
+}
+
+/// Gate projection for the LEGACY `assess` route.
+///
+/// That route consumes bare `ReplayRun`s and carries no
+/// `CanonicalReplayExecutionRecord`, so it has no sealed evaluation-integrity
+/// receipt to evaluate and cannot report
+/// [`MetaExperimentGate::EvaluationIntegrity`]. Inventing a pass there would
+/// credit evidence that was never observed, so the gate is omitted instead of
+/// faked. Only the canonical route, which owns the receipt, gates on it.
+fn legacy_meta_gate_results(results: [bool; 4]) -> Vec<MetaExperimentGateResult> {
     [
         MetaExperimentGate::FixedReplay,
         MetaExperimentGate::Holdout,

@@ -119,36 +119,36 @@ use eliot_types::{
     MemoryInfluenceToolInput, MemoryInfluenceTrace, MemoryInfluenceTraceWriteResult,
     MemoryInspectorView, MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed,
     MemoryRevision, MemoryStateTransition, MemoryUtilitySourceRecord, MemoryWriteEnvelope,
-    MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence, MetaPolicyAuthorization,
-    MetaPolicyExecutionAction, MetricDefinition, MetricSample, MetricWindow,
-    MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
-    OBSERVABILITY_SCHEMA_VERSION, OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION,
-    OPERATOR_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteStatus, OperationJob, OperationJobState, OperationStatus, OperatorActionView,
-    OperatorCommand, OperatorCommandReceipt, OperatorControlRequest, OperatorFieldView,
-    OperatorProjectionFilter, OperatorProjectionKind, OperatorProjectionPage,
-    OperatorQueryOperation, OperatorQueryRequest, OperatorRecordView, OperatorRelationshipView,
-    OperatorSnapshot, PatchRequest, PatchRequestId, ProcedurePromotionOutcome,
-    ProfileVerificationRun, ProjectId, QualitySignal, ReactivationCondition, ReadConsistencyMode,
-    RecallL0Request, RecallL0Response, ReceiptId, ReplayCaseKind, ReplayInputSnapshot,
-    ReplaySetRole, ReplayThresholdPolicyV1, RuntimeMode, SealedReplaySetRecord, SemanticCommand,
-    SemanticCommandKind, ServiceHealthState, ServiceRuntimeStatus, SessionId, SkillCardV2,
-    SkillCurationAction, SkillCurationGateDecision, SkillCurationProposal, SkillCuratorRun,
-    SkillExecutionOutcome, SkillFailureMode, SkillId, SkillInputRequirement, SkillInputSource,
-    SkillLifecycleRecord, SkillLifecycleState, SkillOutputSpec, SkillScopeRule, SkillStep,
-    SkillToolRequirement, SleepCandidateArtifactKind, SleepConsolidationBundle, SleepTrigger,
-    SloDefinition, SloEvaluation, SourceSnapshotInput, TaintClass, TaskAcceptanceEvidenceKind,
-    TaskAcceptanceItem, TaskCognitionView, TaskContract, TaskContractInput, TaskContractStatus,
-    TaskContractWriteCommand, TaskId, TaskMeaningFrame, TelemetryRollup, TestInventory,
-    ToolObservationInput, ToolObservationRecordCommand, TraceTimelineView,
-    UnderstandingOutcomeRecord, UnderstandingProof, UnifiedDiff, VerificationId, VerificationPlan,
-    VerificationResult, VerificationRun, VerificationRunInput, VerificationVerdict,
-    VerifiedEpisodeProjection, VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind,
-    VerifierPlan, VerifierRequirement, VerifierRun, Visibility, WorkItem, WorkItemId,
-    WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason,
-    WorkLeaseId, WorkLeaseState, WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest,
-    WorktreeLeaseRequestId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef,
-    WriteStatus, operator_contract_hash,
+    MetaCandidateChangeClass, MetaEvidenceCorroboration, MetaExperimentDecision,
+    MetaIsolationFence, MetaPolicyAuthorization, MetaPolicyExecutionAction, MetricDefinition,
+    MetricSample, MetricWindow, MinorityPressureRecord, MinorityPressureStatus,
+    NegativeTransferHarm, OBSERVABILITY_SCHEMA_VERSION, OPERATOR_CONTRACT_MANIFEST,
+    OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteStatus, OperationJob, OperationJobState,
+    OperationStatus, OperatorActionView, OperatorCommand, OperatorCommandReceipt,
+    OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter, OperatorProjectionKind,
+    OperatorProjectionPage, OperatorQueryOperation, OperatorQueryRequest, OperatorRecordView,
+    OperatorRelationshipView, OperatorSnapshot, PatchRequest, PatchRequestId,
+    ProcedurePromotionOutcome, ProfileVerificationRun, ProjectId, QualitySignal,
+    ReactivationCondition, ReadConsistencyMode, RecallL0Request, RecallL0Response, ReceiptId,
+    ReplayCaseKind, ReplayInputSnapshot, ReplaySetRole, ReplayThresholdPolicyV1, RuntimeMode,
+    SealedReplaySetRecord, SemanticCommand, SemanticCommandKind, ServiceHealthState,
+    ServiceRuntimeStatus, SessionId, SkillCardV2, SkillCurationAction, SkillCurationGateDecision,
+    SkillCurationProposal, SkillCuratorRun, SkillExecutionOutcome, SkillFailureMode, SkillId,
+    SkillInputRequirement, SkillInputSource, SkillLifecycleRecord, SkillLifecycleState,
+    SkillOutputSpec, SkillScopeRule, SkillStep, SkillToolRequirement, SleepCandidateArtifactKind,
+    SleepConsolidationBundle, SleepTrigger, SloDefinition, SloEvaluation, SourceSnapshotInput,
+    TaintClass, TaskAcceptanceEvidenceKind, TaskAcceptanceItem, TaskCognitionView, TaskContract,
+    TaskContractInput, TaskContractStatus, TaskContractWriteCommand, TaskId, TaskMeaningFrame,
+    TelemetryRollup, TestInventory, ToolObservationInput, ToolObservationRecordCommand,
+    TraceTimelineView, UnderstandingOutcomeRecord, UnderstandingProof, UnifiedDiff, VerificationId,
+    VerificationPlan, VerificationResult, VerificationRun, VerificationRunInput,
+    VerificationVerdict, VerifiedEpisodeProjection, VerifierArtifactRef, VerifierArtifactScope,
+    VerifierCommandKind, VerifierPlan, VerifierRequirement, VerifierRun, Visibility, WorkItem,
+    WorkItemId, WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind,
+    WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLease, WorktreeLeaseId,
+    WorktreeLeaseRequest, WorktreeLeaseRequestId, WorktreeLeaseState, WriteId, WriteReceipt,
+    WriteReceiptRef, WriteStatus, operator_contract_hash,
 };
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -3363,6 +3363,14 @@ struct MetaExperimentToolInput {
     holdout_candidate_execution_id: String,
     #[serde(default)]
     attempted_fence: Option<MetaIsolationFence>,
+    /// Declared second route or Human disposition that lifts the replay-only
+    /// evaluation evidence above its own proof ceiling (issue #1922, I18.47).
+    ///
+    /// Absent by default: a canonical replay receipt is `REPLAY_ONLY` and
+    /// `INCONCLUSIVE` by construction, so without this the experiment is
+    /// measured, receipted and recorded but never promotable.
+    #[serde(default)]
+    evidence_corroboration: Option<MetaEvidenceCorroboration>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
