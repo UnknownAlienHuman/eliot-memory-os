@@ -507,6 +507,12 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
             // attribute run.
             let declaration = format!("fn {name}(");
             let suite_lines: Vec<&str> = suite_source.lines().collect();
+            // The code-only projection of this same source, taken ONCE here and
+            // reused by every `source_test` row in this loop, so the per-row
+            // body extraction is a line scan and not a fresh whole-file
+            // lexical scan.
+            let suite_code = w1b_code_only(&suite_source);
+            let suite_code_lines: Vec<&str> = suite_code.lines().collect();
             let declaration_index = suite_lines
                 .iter()
                 .position(|line| line.trim_start().starts_with(&declaration))
@@ -531,6 +537,32 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                 has_test_attribute,
                 "CASE IDENTITY (source_test is a test): case {id} names source_test `{name}`, but the `fn {name}(` declaration in unsafe_family_boundaries.rs carries no contiguous `#[test]` or `#[tokio::test]` attribute above it, so it is not a test function and proves no title"
             );
+            // Fact 1b: `#[test]` above a declaration proves the function is
+            // DISCOVERED, not that it PROVES anything. `#[test]
+            // fn credential_target_probe() { /* TODO */ }` carries the
+            // attribute, so Fact 1 passed it while the row certified itself over
+            // a body that asserts nothing. Case 12 imports no denominator axis
+            // of its own, so nothing downstream caught it.
+            //
+            // The named test's body is therefore held to the SAME anti-
+            // placeholder adequacy floor the denominator applies to the
+            // anchored markers: it must not be empty, must not be `assert!(true);`
+            // and must not reduce to `assert_eq!(X, X);`. The floor is the
+            // shared `w1b_adequacy_floor`, and the body is the shared
+            // `w1b_test_body` extractor, so this block never re-implements the
+            // rule -- it applies the one the suite already enforces elsewhere.
+            // Every real `#[test]` in this file clears it, because a body with
+            // no real call, macro or trait path named after `assert`, `panic`,
+            // `check`, `verify` or `should_panic` is not a test of anything.
+            let named_body = w1b_test_body(&suite_code_lines, &suite_lines, declaration_index + 1);
+            if let Some((problem, why)) = w1b_adequacy_floor(&named_body) {
+                panic!(
+                    "CASE IDENTITY (source_test is adequate): case {id} names source_test `{name}`, \
+                     whose body fails the shared anti-placeholder adequacy floor `{problem}`: {why}. \
+                     A `#[test]` attribute proves the function is discovered, not that it proves its \
+                     title, so an empty or placeholder body certifies nothing"
+                );
+            }
             // Fact 2: the flag is an honest verdict about the binding.
             // `false` is a clean, full match and MUST carry a non-empty
             // justification of why the binding is a full match -- the code
@@ -633,17 +665,41 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                     }
                 }
                 let bound_marker = marker_bound_to_test.unwrap_or_else(|| own_marker.clone());
-                // The marker bound to `source_test` must be either the row's
-                // OWN case's marker -- the ordinary, un-re-pointed row -- or a
-                // recorded re-pointing, in which case the row must state WHY in
-                // its recorded justification AND that justification must name
-                // this exact `source_test`. Cases 1, 3, 4, 7, 8, 9, 10, 11 and
-                // 12 are re-pointings today and each carries such a note.
-                // A marker belonging to NEITHER is the demonstrated false flag
-                // and is rejected; so is a re-pointed row whose recorded note no
-                // longer names the test it claims (the verifier's counterexample:
-                // case 10 re-pointed at case38's test while `registry_marker`
-                // stayed `789/10`).
+                // WHAT THE ROW CLAIMS IS COMPARED AGAINST WHAT IS ACTUALLY
+                // BOUND. The previous condition here was
+                //
+                //     bound_marker == own_marker || recorded_repoint
+                //
+                // which never mentioned `claimed_marker` at all: the value the
+                // row DECLARED was read, used only in the failure message, and
+                // then discarded. Worse, `recorded_repoint` was `true` for all
+                // 39 bound rows, because every `full_match_justification`
+                // names its own `source_test` -- so the `||` short-circuited
+                // and `bound_marker` was never consulted either. The assertion
+                // was vacuous in both directions, and setting
+                // `cases[9].registry_marker` to `"789/41"` passed. The comment
+                // above this block names that exact counterexample as the REASON
+                // the block was written, and the block did not fix it.
+                //
+                // The two facts being compared are independent, and both are
+                // real:
+                //
+                //   * `claimed_marker` -- what the row says it claims, i.e. the
+                //     literal `registry_marker` string in the fixture.
+                //   * `bound_marker` -- the anchored `// WORK_UNIT_CASE: 789/<n>`
+                //     that this very file binds, by the forward walk above, to
+                //     the `fn` the row names in `source_test`.
+                //
+                // `claimed_marker` must therefore be EITHER the row's own case
+                // marker -- the ordinary, un-re-pointed row -- OR the marker
+                // genuinely bound to the test it names. The second case is the
+                // nine rows that deliberately RE-POINT `source_test` at the test
+                // that really proves their title (cases 1, 3, 4, 7, 8, 9, 10, 11
+                // and 12); each still has to RECORD why, in `binding_note`,
+                // `title_mismatch_reason` or `full_match_justification`, AND that
+                // note has to name this exact `source_test`. So the claim is
+                // bounded, the `||` cannot be short-circuited by the note, and
+                // the note cannot excuse a marker that matches neither.
                 let names_this_test = |key: &str| {
                     entry
                         .get(key)
@@ -653,9 +709,17 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
                 let recorded_repoint = names_this_test("binding_note")
                     || names_this_test("title_mismatch_reason")
                     || names_this_test("full_match_justification");
+                let claims_own_marker = claimed_marker == own_marker;
+                let claims_bound_marker = claimed_marker == bound_marker;
                 assert!(
-                    bound_marker == own_marker || recorded_repoint,
-                    "CASE IDENTITY (registry marker agreement): case {id} claims registry_marker `{claimed_marker}` over source_test `{name}`, but the anchored marker actually bound to that test in unsafe_family_boundaries.rs is `{bound_marker}`, not its own case marker `{own_marker}`; a re-pointed row must record WHY in `binding_note`, `title_mismatch_reason` or `full_match_justification` AND that note must name source_test `{name}`, otherwise the row is not internally consistent about which case its test proves"
+                    claims_own_marker || (claims_bound_marker && recorded_repoint),
+                    "CASE IDENTITY (registry marker agreement): case {id} claims registry_marker \
+                     `{claimed_marker}` over source_test `{name}`, but the anchored marker actually \
+                     bound to that test in unsafe_family_boundaries.rs is `{bound_marker}`, not its \
+                     own case marker `{own_marker}`; a re-pointed row must record WHY in \
+                     `binding_note`, `title_mismatch_reason` or `full_match_justification` AND that \
+                     note must name source_test `{name}`, otherwise the row is not internally \
+                     consistent about which case its test proves"
                 );
             }
         } else {
@@ -2056,6 +2120,358 @@ fn w1b_line_run(source: &str, anchor: &str, count: usize) -> String {
         .unwrap_or_else(|| panic!("missing source anchor: {anchor}"));
     let end = index.saturating_add(count).min(lines.len());
     lines[index..end].join("\n")
+}
+
+/// Rewrites `source` with every NON-CODE character replaced by a space, so the
+/// returned text is character-for-character the same length and line count as
+/// the input but carries only real code tokens.
+///
+/// Line comments, nestable block comments, string literals (with their `\\`
+/// escapes, which continue across a newline), raw strings (`r"..."`, `r#"..."#`)
+/// and char literals are blanked. A `'` that opens a LIFETIME (`&'static`,
+/// `<'a>`) is not a char literal and is kept, while a `'{'` or `'}'` IS one and
+/// is blanked. That distinction is the whole point: this file quotes braces and
+/// assertion keywords inside string literals and inside prose comments, and a
+/// scan that reads those as code is satisfied by text that asserts nothing.
+///
+/// Newlines are preserved rather than blanked, so a caller may still split the
+/// result into lines and keep the line numbers of the input.
+// CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, RAW_STRING, CHAR_LITERAL.
+const CODE: usize = 0;
+const LINE_COMMENT: usize = 1;
+const BLOCK_COMMENT: usize = 2;
+const STRING: usize = 3;
+const RAW_STRING: usize = 4;
+const CHAR_LITERAL: usize = 5;
+#[allow(clippy::too_many_lines)]
+fn w1b_code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    for ch in &chars {
+        out.push(if *ch == '\n' { '\n' } else { ' ' });
+    }
+    let mut state = CODE;
+    let mut block_depth = 0_i64;
+    let mut raw_hashes = 0_usize;
+    let mut escaped = false;
+    let mut index = 0_usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        let next = chars.get(index + 1).copied();
+        match state {
+            CODE => {
+                if ch == '/' && next == Some('/') {
+                    state = LINE_COMMENT;
+                    index += 2;
+                    continue;
+                }
+                if ch == '/' && next == Some('*') {
+                    state = BLOCK_COMMENT;
+                    block_depth = 1;
+                    index += 2;
+                    continue;
+                }
+                // A `b` prefix may precede a byte string or a raw string, and
+                // either may be followed by any number of `#`. The lookahead must
+                // start where the prefix does, or a `b` identifier that merely
+                // happens to sit before a later quote would be misread as
+                // opening a literal.
+                let prefix_len = usize::from(ch == 'b') + usize::from(ch == 'B');
+                let quote = index + prefix_len;
+                let mut hashes = 0_usize;
+                while quote + hashes < chars.len() && chars[quote + hashes] == '#' {
+                    hashes += 1;
+                }
+                let quote_follows = chars.get(quote + hashes) == Some(&'"');
+                if quote_follows {
+                    state = if prefix_len == 0 { STRING } else { RAW_STRING };
+                    raw_hashes = hashes;
+                    escaped = false;
+                    index = quote + hashes + 1;
+                    continue;
+                }
+                if ch == '\'' {
+                    let mut cursor = index + 1;
+                    let lifetime_open = chars
+                        .get(cursor)
+                        .is_some_and(|after| after.is_alphanumeric() || *after == '_');
+                    if lifetime_open {
+                        while cursor < chars.len()
+                            && (chars[cursor].is_alphanumeric() || chars[cursor] == '_')
+                        {
+                            cursor += 1;
+                        }
+                        if chars.get(cursor) == Some(&'\'') {
+                            state = CHAR_LITERAL;
+                            escaped = false;
+                            index += 1;
+                            continue;
+                        }
+                        out[index] = ch;
+                        index += 1;
+                        continue;
+                    }
+                    state = CHAR_LITERAL;
+                    escaped = false;
+                    index += 1;
+                    continue;
+                }
+                out[index] = ch;
+                index += 1;
+            }
+            LINE_COMMENT => {
+                if ch == '\n' {
+                    state = CODE;
+                }
+                index += 1;
+            }
+            BLOCK_COMMENT => {
+                if ch == '/' && next == Some('*') {
+                    block_depth += 1;
+                    index += 2;
+                    continue;
+                }
+                if ch == '*' && next == Some('/') {
+                    block_depth -= 1;
+                    index += 2;
+                    if block_depth == 0 {
+                        state = CODE;
+                    }
+                    continue;
+                }
+                index += 1;
+            }
+            RAW_STRING => {
+                if ch == '"' {
+                    let mut closing = 0_usize;
+                    while closing < raw_hashes && chars.get(index + 1 + closing) == Some(&'#') {
+                        closing += 1;
+                    }
+                    if closing == raw_hashes {
+                        state = CODE;
+                        index += 1 + closing;
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+            STRING | CHAR_LITERAL => {
+                if escaped {
+                    escaped = false;
+                    index += 1;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    index += 1;
+                    continue;
+                }
+                if (state == STRING && ch == '"') || (state == CHAR_LITERAL && ch == '\'') {
+                    state = CODE;
+                }
+                index += 1;
+            }
+            _ => unreachable!("w1b_code_only tracks a closed state set"),
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The body of the test function whose `fn` declaration is at `declaration_line`,
+/// from that declaration line through its matching `}` INCLUSIVE.
+///
+/// The scan is a depth counter over REAL braces only -- it reads
+/// `w1b_code_only(source)` -- so a `{` or `}` inside a string literal, a char
+/// literal or a comment cannot move the depth. Starting at the declaration line
+/// is what makes the closing brace unambiguous: that line is the function's own
+/// opening brace, so depth returns to zero exactly at the brace that closes it,
+/// never later.
+///
+/// `code_lines` and `source_lines` are the line views of a source and of its
+/// `w1b_code_only` projection, taken ONCE by the caller because the projection
+/// is a whole-file scan; `declaration_line` is 1-based within both.
+///
+/// This is the single body extraction shared by the denominator floor below and
+/// the `source_test` adequacy check in case 12, so a body is delimited the same
+/// way wherever it is judged.
+fn w1b_test_body(code_lines: &[&str], source_lines: &[&str], declaration_line: usize) -> String {
+    let start = declaration_line.checked_sub(1).unwrap_or_else(|| {
+        panic!("w1b_test_body needs a 1-based line number, got {declaration_line}")
+    });
+    let mut depth = 0_i64;
+    let mut inside_body = false;
+    let mut body: Vec<&str> = Vec::new();
+    let mut offset = start;
+    while offset < source_lines.len() {
+        let Some(code_line) = code_lines.get(offset) else {
+            break;
+        };
+        let open_braces =
+            i64::try_from(code_line.matches('{').count()).expect("brace count fits in i64");
+        let close_braces =
+            i64::try_from(code_line.matches('}').count()).expect("brace count fits in i64");
+        if open_braces > 0 {
+            depth += open_braces;
+            inside_body = true;
+        }
+        if close_braces > 0 {
+            depth -= close_braces;
+        }
+        if inside_body {
+            body.push(source_lines[offset]);
+            if depth <= 0 {
+                break;
+            }
+        }
+        offset += 1;
+    }
+    assert!(
+        inside_body,
+        "w1b_test_body found no body for the fn declared on line {declaration_line}, \
+         which must name a `fn <name>(` line that opens a brace"
+    );
+    body.join("\n")
+}
+
+/// The anti-placeholder adequacy floor, applied to a test body extracted by
+/// [`w1b_test_body`]. Returns `None` when the body clears every arm, or the gate
+/// problem name with the reason when it does not.
+///
+/// The arms run in the gate's own order. `EMPTY_TEST_BODY` and
+/// `UNCONDITIONAL_TRUE` read the whole body. `TRIVIAL_SELF_EQUALITY` and
+/// `NO_CHECK_CONSTANT` read CODE ONLY -- `w1b_code_only(body)` -- because both
+/// are defeated by prose: this file quotes `assert_eq!(X, X);` and the keyword
+/// list in its own comments, and a body whose only "assertion" is the comment
+/// `// TODO: assert something real here`, or whose only `assert`-shaped text is
+/// an identifier like `checkpoint`, satisfies a raw substring scan without
+/// asserting anything.
+///
+/// `TRIVIAL_SELF_EQUALITY` therefore accepts an `assert_eq!` whose two operands
+/// are the SAME identifier, at any position, because it is exactly what the
+/// gate's own pattern detects. That stays STRICTER than a name-only rule in one
+/// direction only: it can report MORE defects, never fewer, so it can never let
+/// a placeholder raise the bound count.
+///
+/// `NO_CHECK_CONSTANT` accepts a keyword only as a real CALL, MACRO or TRAIT
+/// PATH: the token is `assert`/`panic`/`check`/`verify`/`should_panic` exactly,
+/// or that keyword plus a `_suffix`, and the next non-space code character is
+/// `!`, `(` or `::`. A local named `checkpoint` or `unverified` therefore does
+/// not satisfy the floor, while `assert!(...)`, `assert_eq!(...)`, `verify(x)`,
+/// `panic!(...)` and `should_panic()` all still do.
+#[allow(clippy::too_many_lines)]
+fn w1b_adequacy_floor(body: &str) -> Option<(&'static str, String)> {
+    // :405-411, the gate's own cleanup of the extracted body: trim, drop ONE
+    // leading `{` if present, drop ONE trailing `}` if present, trim again.
+    let mut inner = body.trim().to_owned();
+    if let Some(after_open) = inner.strip_prefix('{') {
+        inner = after_open.to_owned();
+    }
+    if let Some(before_close) = inner.strip_suffix('}') {
+        inner = before_close.to_owned();
+    }
+    let inner = inner.trim().to_owned();
+    if inner.is_empty() || inner == "return;" || inner == "return" {
+        // `EMPTY_TEST_BODY` -- empty or return-only Rust test body.
+        return Some((
+            "EMPTY_TEST_BODY",
+            "body is empty or return-only, which the gate's floor reads as a placeholder"
+                .to_owned(),
+        ));
+    }
+    // `UNCONDITIONAL_TRUE` -- `assert!(true);` as the entire body.
+    let literal_arms: [&str; 5] = ["assert!", "(", "true", ")", ";"];
+    let mut rest = inner.as_str();
+    let mut unconditional_true = true;
+    for literal in literal_arms {
+        let Some(after_literal) = rest.trim_start().strip_prefix(literal) else {
+            unconditional_true = false;
+            break;
+        };
+        rest = after_literal;
+    }
+    if unconditional_true && rest.is_empty() {
+        return Some((
+            "UNCONDITIONAL_TRUE",
+            format!("whole body is `{inner}`, the gate's unconditional-true placeholder"),
+        ));
+    }
+    // `TRIVIAL_SELF_EQUALITY` -- `assert_eq!(X, X);`, same identifier twice, read
+    // from CODE ONLY so a pattern quoted inside a comment is not a call.
+    let code_only = w1b_code_only(&inner);
+    let mut scan_from = 0_usize;
+    while let Some(found) = code_only[scan_from..].find("assert_eq!") {
+        let run_start = scan_from + found;
+        let tail = &code_only[run_start + "assert_eq!".len()..];
+        let open = tail.find('(');
+        let close = tail.find(')');
+        if let (Some(open), Some(close)) = (open, close)
+            && close > open
+        {
+            let call = &tail[open + 1..close];
+            let mut operands = call.split(',');
+            let first = operands.next().unwrap_or_default().trim();
+            let second = operands.next().unwrap_or_default().trim();
+            let is_identifier = |operand: &str| {
+                !operand.is_empty()
+                    && operand
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            };
+            if operands.next().is_none() && is_identifier(first) && first == second {
+                return Some((
+                    "TRIVIAL_SELF_EQUALITY",
+                    format!(
+                        "whole body is `{inner}`, the gate's trivial self-equality over the \
+                         identifier `{first}`"
+                    ),
+                ));
+            }
+        }
+        scan_from = run_start + 1;
+    }
+    // `NO_CHECK_CONSTANT` -- no checked result anywhere in the CODE of the body.
+    let keywords: [&str; 5] = ["assert", "panic", "check", "verify", "should_panic"];
+    let code_chars: Vec<char> = code_only.chars().collect();
+    let mut index = 0_usize;
+    let mut checked_result = false;
+    while index < code_chars.len() {
+        let ch = code_chars[index];
+        if ch.is_alphanumeric() || ch == '_' {
+            let mut end = index;
+            while end < code_chars.len()
+                && (code_chars[end].is_alphanumeric() || code_chars[end] == '_')
+            {
+                end += 1;
+            }
+            let token: String = code_chars[index..end].iter().collect();
+            let mut cursor = end;
+            while cursor < code_chars.len() && code_chars[cursor].is_whitespace() {
+                cursor += 1;
+            }
+            let next = code_chars.get(cursor).copied().unwrap_or('\0');
+            for keyword in keywords {
+                let is_keyword = token == keyword
+                    || (token.len() > keyword.len()
+                        && token.starts_with(keyword)
+                        && token.as_bytes()[keyword.len()] == b'_');
+                if is_keyword && matches!(next, '!' | '(' | ':') {
+                    checked_result = true;
+                }
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    if checked_result {
+        return None;
+    }
+    Some((
+        "NO_CHECK_CONSTANT",
+        "body holds none of `assert`, `panic`, `check`, `verify` or `should_panic` as a real call, \
+         macro or trait path, so the gate reads it as constant construction with no checked result"
+            .to_owned(),
+    ))
 }
 
 // 28. callback after owner destruction prevented;
@@ -3485,6 +3901,12 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     //         `DYNAMIC_IDENTITY`, `AMBIGUOUS_MARKER` and the AST-derived
     //         `proof_ceiling_downgrade`. Not applicable to a Rust source port.
     let suite_lines: Vec<&str> = suite_source.lines().collect();
+    // The code-only projection of this same source, taken ONCE here and reused
+    // by every `w1b_test_body` call below, so the per-marker body extraction is
+    // a line scan rather than a fresh whole-file lexical scan. It is the same
+    // text `w1b_adequacy_floor` re-derives per body for the keyword scan.
+    let suite_code = w1b_code_only(&suite_source);
+    let suite_code_lines: Vec<&str> = suite_code.lines().collect();
     let mut suite_marker_ids: Vec<u64> = Vec::with_capacity(42);
     let mut suite_marker_defects: Vec<String> = Vec::new();
     // Every bound `fn` name against the line of the marker that first bound it,
@@ -3608,156 +4030,38 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
             ));
             continue;
         }
-        // The ADEQUACY FLOOR (case_binding.py:386-424), ported literally. The
-        // gate's body extractor is a plain per-LINE brace counter, so a brace in
-        // a string or comment still moves the count; that is reproduced here
-        // rather than "fixed", because the floor must agree with the gate.
-        let mut body_text = String::new();
-        let mut brace_count = 0_i64;
-        let mut inside_body = false;
-        for body_line in &suite_lines[walk..] {
-            let open_braces = body_line.matches('{').count();
-            let close_braces = body_line.matches('}').count();
-            if open_braces > 0 {
-                brace_count += i64::try_from(open_braces).expect("brace count fits in i64");
-                inside_body = true;
-            }
-            if close_braces > 0 {
-                brace_count -= i64::try_from(close_braces).expect("brace count fits in i64");
-            }
-            if inside_body {
-                body_text.push_str(body_line);
-                body_text.push('\n');
-                if brace_count == 0 {
-                    break;
-                }
-            }
-        }
-        // :405-411, the gate's own cleanup of the extracted body: trim, drop ONE
-        // leading `{` if present, drop ONE trailing `}` if present, trim again.
-        let trimmed_body = body_text.trim();
-        let mut inner_stripped = trimmed_body.to_owned();
-        if let Some(after_open) = inner_stripped.strip_prefix('{') {
-            inner_stripped = after_open.to_owned();
-        }
-        if let Some(before_close) = inner_stripped.strip_suffix('}') {
-            inner_stripped = before_close.to_owned();
-        }
-        let inner_stripped = inner_stripped.trim().to_owned();
-        // :413-424, the gate's four adequacy arms, in its order. Each returns on
-        // the first arm that fires, exactly as the `elif` chain does there.
-        // The two regex arms are hand-ported rather than run through a regex
-        // engine, because this package's `Cargo.toml` declares no regex crate
-        // and this port must not add a dependency.
+        // The ADEQUACY FLOOR (case_binding.py:386-424), now applied through the
+        // two shared helpers rather than an inline copy.
         //
-        // Arm 2 (:416) is `assert!\s*\(\s*true\s*\)\s*;`: the five literals are
-        // in fixed order and no metacharacter may appear between them, so the
-        // port is "starts with `assert!`, then `(`, `true`, `)`, `;` in order,
-        // with whitespace allowed only at the four `\s*` gaps".
-        let literal_arms: [&str; 5] = ["assert!", "(", "true", ")", ";"];
-        let is_unconditional_true = || {
-            let mut rest = inner_stripped.as_str();
-            for literal in literal_arms {
-                match rest.trim_start().strip_prefix(literal) {
-                    Some(after_literal) => rest = after_literal,
-                    None => return false,
-                }
-            }
-            rest.is_empty()
-        };
-        // Arm 3 (:419) is
-        // `assert_eq!\s*\(\s*([A-Za-z0-9_]+)\s*,\s*\1\s*\)\s*;`, applied with
-        // `re.search`, so it may match ANYWHERE in the body. The port therefore
-        // scans for every `assert_eq!` occurrence left to right and, for each,
-        // takes the MACRO CALL that starts there: from its `(` to the `)` that
-        // closes it. The gate's pattern stops at `)` and then requires `;`, and
-        // it matches whatever `\1` captures, so this port requires the call to
-        // hold exactly two arguments and those two to be equal.
+        // D2: THE BODY EXTRACTION IS NOW BOUNDED BY THE FUNCTION. The old
+        // extractor started at `suite_lines[walk..]`, i.e. AFTER the
+        // `fn ... {` line, so the function's own opening brace was never
+        // counted, and it counted braces RAW, so a brace inside a string
+        // literal or a comment moved it too. This file carries a net +45
+        // unbalanced braces inside string literals and comments, so for 19 of
+        // the 42 markers the "body" never closed and ran from the test all the
+        // way to EOF -- marker 789/1 extracted 3,664 lines, the entire rest of
+        // the file. Every one of those bodies therefore spanned this floor's
+        // OWN keyword list, so `NO_CHECK_CONSTANT` was structurally incapable
+        // of firing for them and the marker was certified by the checker's own
+        // source text instead of by the test. `w1b_test_body` starts at the
+        // `fn` declaration line -- so the function's own `{` IS counted -- and
+        // counts only real braces, skipping string literals, char literals and
+        // comments. Depth returns to zero exactly at the brace that closes the
+        // function, so the body can no longer overrun it.
         //
-        // Why the whole call, and not the gate's prefix: the gate's raw body
-        // text for this file OVERRUNS the function, because its extractor
-        // counts `{`/`}` inside string literals and comments and this file
-        // quotes 44 of them unbalanced (every `w1b_block(&source, "... {")`
-        // source anchor is one). The gate's inner body therefore runs on past
-        // the closing brace into later cases. Judging the body the way the gate
-        // does would make this port read case 1's body as containing case 27's
-        // code, so the extraction is delimited by the CALL instead.
+        // D3: `w1b_adequacy_floor` reads the CODE-ONLY projection of the body
+        // for `TRIVIAL_SELF_EQUALITY` and `NO_CHECK_CONSTANT`, so a keyword
+        // quoted in prose or embedded in an identifier no longer satisfies the
+        // floor. The old raw `inner_stripped.contains(keyword)` scan accepted
+        // `let checkpoint = 1;` (contains `check`) and `let unverified = 2;`
+        // (contains `verify`) with zero assertions, and accepted a body that was
+        // only the comment `// TODO: assert something real here`.
         //
-        // That is STRICTER than the gate's prefix in exactly one respect: a
-        // body whose only `assert_eq!` is `assert_eq!(x, x, "note");` has an
-        // all-identifier `\1` for the gate, but three arguments here. The
-        // stricter direction only ever reports MORE defects, and it can never
-        // raise the bound count, so the denominator stays sound.
-        let trivial_self_equality = || {
-            let mut scan_from = 0_usize;
-            while let Some(found) = inner_stripped[scan_from..].find("assert_eq!") {
-                let run_start = scan_from + found;
-                let tail = &inner_stripped[run_start + "assert_eq!".len()..];
-                let open = tail.find('(');
-                let close = tail.find(')');
-                if let (Some(open), Some(close)) = (open, close)
-                    && close > open
-                {
-                    let call = &tail[open + 1..close];
-                    let mut operands = call.split(',');
-                    let first = operands.next().unwrap_or_default().trim();
-                    let second = operands.next().unwrap_or_default().trim();
-                    let is_identifier = |operand: &str| {
-                        !operand.is_empty()
-                            && operand
-                                .bytes()
-                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                    };
-                    if operands.next().is_none() && is_identifier(first) && first == second {
-                        return Some(first);
-                    }
-                }
-                scan_from = run_start + 1;
-            }
-            None
-        };
-        let adequacy: Option<(&str, String)> = if inner_stripped.is_empty()
-            || inner_stripped == "return;"
-            || inner_stripped == "return"
-        {
-            // `EMPTY_TEST_BODY` -- empty or return-only Rust test body.
-            Some((
-                "EMPTY_TEST_BODY",
-                "body is empty or return-only, which the gate's floor reads as a placeholder"
-                    .to_owned(),
-            ))
-        } else if is_unconditional_true() {
-            // `UNCONDITIONAL_TRUE` -- `assert!(true);` as the entire body.
-            Some((
-                "UNCONDITIONAL_TRUE",
-                format!(
-                    "whole body is `{inner_stripped}`, the gate's unconditional-true placeholder"
-                ),
-            ))
-        } else if let Some(identifier) = trivial_self_equality() {
-            // `TRIVIAL_SELF_EQUALITY` -- `assert_eq!(X, X);`, same identifier twice.
-            Some((
-                "TRIVIAL_SELF_EQUALITY",
-                format!(
-                    "whole body is `{inner_stripped}`, the gate's trivial self-equality over the \
-                     identifier `{identifier}`"
-                ),
-            ))
-        } else if !["assert", "panic", "check", "verify", "should_panic"]
-            .iter()
-            .any(|keyword| inner_stripped.contains(keyword))
-        {
-            // `NO_CHECK_CONSTANT` -- no checked result anywhere in the body.
-            Some((
-                "NO_CHECK_CONSTANT",
-                "body holds none of `assert`, `panic`, `check`, `verify` or `should_panic`, so the \
-                 gate reads it as constant construction with no checked result"
-                    .to_owned(),
-            ))
-        } else {
-            None
-        };
-        if let Some((problem, why)) = adequacy {
+        // The two helpers are shared with the `source_test` adequacy check in
+        // case 12, so the rule is written once.
+        let body_text = w1b_test_body(&suite_code_lines, &suite_lines, walk + 1);
+        if let Some((problem, why)) = w1b_adequacy_floor(&body_text) {
             suite_marker_defects.push(format!(
                 "line {marker_line}: ADEQUACY FLOOR FAILS `{problem}`, case {marker_id} binds \
                  `{bound_name}` whose {why}"
