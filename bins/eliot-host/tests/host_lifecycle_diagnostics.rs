@@ -1,13 +1,15 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! Starter probes for F-LOG-HOST-1 item 891 (Implements, not Closes).
+//! Starter probes and acceptance cases for F-LOG-HOST-1 item 891 (Implements,
+//! not Closes).
 //!
 //! Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
 //! `observe_entrypoint_with_detail`, `observe_terminal_error`); the Windows
 //! Event Log seam stays typed-Unavailable (`event_log_sink_status`), never
 //! implemented here (#984 still open).
 //!
-//! Exactly two probes:
+//! Exactly two retained starter probes (T-A, T-B) plus the 22 numbered
+//! acceptance cases (`// WORK_UNIT_CASE: 891/1`..`891/22`) declared below:
 //! - T-A stop/drain distinct (`Requested` -> `Draining` -> `StoppedClean` via
 //!   existing `HostComposition::stop` seams; three distinct records sharing
 //!   one `drain_generation` correlation, exactly one terminal on failure;
@@ -495,7 +497,7 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
 }
 
 // ---------------------------------------------------------------------------
-// #891 declared acceptance cases 1..5.
+// #891 declared acceptance cases 1..22.
 //
 // One `// WORK_UNIT_CASE: 891/<case>` test per declared case, appended after
 // the untouched T-A/T-B starter probes. Every case binds source -> discovery
@@ -510,6 +512,18 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
 // executed
 //   `capture_emit` over the frozen table vocabulary and a real public API
 //   round trip.
+// executed owner pass
+//   PRESENT in this target. Cases 1 and 22 execute the real owner operation
+//   `HostComposition::open` inside `capture_emit` and bind its OWNER-EMITTED
+//   records to the frozen table; cases 19, 20 and 21 execute the real
+//   production entry point `eliot_host::HostLaunchOptions::parse`. The
+//   remaining seventeen cases bind `executed` to the #889 facade itself, and
+//   for cases 15, 17 and 19 that facade is driven with a
+//   `HostRequestProjection` built from real parsed options rather than a
+//   frozen row spelling. Only the two owner rows and the three
+//   parse-entry-point rows are executed here; the emitting rows these cases
+//   never reach are never claimed to be executed. Cases 1 and 22 name the
+//   three named owner-pass risks at their own capture sites.
 //
 // No service start/stop side effect, no fake clock, no fake SCM port, no new
 // dependency, no diagnostic/control-flow change. The Windows Event Log seam
@@ -796,7 +810,13 @@ fn case_1_frozen_boundary_table_matches_fixture_and_propagated_exclusions() {
 
     // Executed: every emitting spelling survives the real bounded formatter
     // unchanged and reaches the real facade verbatim, so the parsed table is
-    // the vocabulary production actually emits.
+    // the vocabulary the real facade emits and delivers unchanged when handed a
+    // parsed row event.
+    // This capture calls the facade directly, so it still proves only the
+    // facade's own formatting and delivery for the frozen spellings. The
+    // OWNER-EMITTED spelling is now proved separately below by the
+    // `HostComposition::open` capture, which is a real production owner
+    // operation.
     for event in &emitting_events {
         assert_eq!(
             eliot_host::host_diagnostics::bound_detail(event).text(),
@@ -825,6 +845,47 @@ fn case_1_frozen_boundary_table_matches_fixture_and_propagated_exclusions() {
     assert!(
         emitted.contains(HOST_DIAGNOSTICS_TARGET),
         "the frozen vocabulary must travel through the #889 facade target"
+    );
+
+    // Owner pass risks, all three named: `lib.rs` runs a wiring self-check over
+    // a by-value backup-dispatch table before the observation and registers no
+    // process-global, `HostOwnerLease::acquire` is a real `Global\` named mutex,
+    // and the guarded region is entered unconditionally, so the captured
+    // evidence is identical on every machine whichever fallible step fails
+    // first.
+    let owner_emitted = capture_emit(|| {
+        let _ = eliot_host::HostComposition::open(
+            eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+                .expect("the established argv must admit"),
+        );
+    });
+    assert_eq!(
+        count_occurrences(&owner_emitted, "detail=\"host.open requested\""),
+        1,
+        "one failed owner operation must emit the open request row exactly once: {owner_emitted}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_emitted, "code=\"host-open-failed\""),
+        1,
+        "one failed owner operation must emit exactly one designated terminal: {owner_emitted}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_emitted, "detail=\"host.open admitted\""),
+        0,
+        "a failed owner operation must never emit the admitted row: {owner_emitted}"
+    );
+    let owner_requested = rows
+        .iter()
+        .find(|row| case1_field(row.as_slice(), "event") == "host.open requested")
+        .expect("the frozen table must carry the open request row the owner emitted");
+    let owner_requested_detail = case1_field(owner_requested, "event");
+    assert_eq!(
+        count_occurrences(
+            &owner_emitted,
+            &format!("detail=\"{owner_requested_detail}\"")
+        ),
+        1,
+        "the detail the OWNER emitted must be byte-identical to the frozen table spelling taken from `src/lib.rs`, which is what binds this row to the table rather than to a literal: {owner_emitted}"
     );
 }
 
@@ -6973,7 +7034,7 @@ fn case21_launch_argv() -> Vec<std::ffi::OsString> {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "case 22 proves all four allowed-diff properties from the real production call path: row ownership, the single terminal, the lifecycle vocabulary and the published surface"
+    reason = "case 22 proves all five allowed-diff properties from the executed HostComposition::open call path plus the parsed production call sites: row ownership, the single terminal, the lifecycle vocabulary and the published surface"
 )]
 fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     let lib = manifest_source("src/lib.rs");
@@ -7261,6 +7322,8 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
 
     // ---- no new visibility: nothing here is published, and cfg(test) is not a
     // publication channel ----
+    // This is the whole proof of `no_new_visibility` and nothing is executed for
+    // it: the property is provable only by declaration lines, never by execution.
     for published in [
         "pub fn host_lifecycle_",
         "pub struct HostLifecycleBoundary",
@@ -7304,7 +7367,15 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         "the published seam must resolve to an existing facade item, not a new one"
     );
 
-    // ---- executed pass: the real facade emits the table's rows verbatim ----
+    // ---- executed pass: the #889 facade's own formatting and delivery for the
+    // table's frozen row events and terminal codes ----
+    // Each row event is handed to `observe_entrypoint_with_detail` and each
+    // terminal code to `observe_terminal_error` directly, so this section proves
+    // the facade's own bounded formatting and delivery behaviour for those
+    // frozen spellings, not that a production call site emitted them.
+    // A real `HostComposition` owner operation IS now executed in this target
+    // further down through `HostComposition::open`, which emits the
+    // `open.requested` and `open.terminal` rows of the frozen table.
     for (row_name, stage_name) in [
         ("open.requested", "startup"),
         ("kernel-restart.requested", "scm_dispatch"),
@@ -7355,11 +7426,64 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         "no mutable global dedup cache may suppress a second emission: {repeated}"
     );
 
-    // ---- the fixture's declared diff is bound to the real call path ----
-    // Each allowed-diff property is proven above from `src/lib.rs` and the real
-    // facade, so here the object is only bound to that proof: its five names
-    // must be exactly the five properties this delivery proves, and each must
-    // stay a declared boolean rather than a free-text claim.
+    // Owner pass risks, all three named: `lib.rs` runs a wiring self-check over
+    // a by-value backup-dispatch table before the observation and registers no
+    // process-global, `HostOwnerLease::acquire` is a real `Global\` named mutex,
+    // and the guarded region is entered unconditionally, so the captured
+    // evidence is identical on every machine whichever fallible step fails
+    // first.
+    // The declared `test` column of the `open.terminal` row is `891/case-14`, so
+    // case 22 only OBSERVES these rows and does not own them.
+    let owner_first = capture_emit(|| {
+        let _ = eliot_host::HostComposition::open(
+            eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+                .expect("the established argv must admit"),
+        );
+    });
+    let owner_second = capture_emit(|| {
+        let _ = eliot_host::HostComposition::open(
+            eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+                .expect("the established argv must admit"),
+        );
+    });
+    for (owner_label, owner) in [
+        ("owner_first", &owner_first),
+        ("owner_second", &owner_second),
+    ] {
+        assert_eq!(
+            count_occurrences(owner, "code=\"host-open-failed\""),
+            1,
+            "single_terminal_per_failed_op: one designated terminal per failed owner operation, never two ({owner_label}): {owner}"
+        );
+        assert_eq!(
+            count_occurrences(owner, "detail=\"host.open admitted\""),
+            0,
+            "no_lifecycle_delta: the admitted row needs durable evidence and an owner lease that the failing open never obtained ({owner_label}): {owner}"
+        );
+    }
+    assert_eq!(
+        count_occurrences(&owner_first, "detail=\"host.open requested\""),
+        1,
+        "no_duplicate_evaluation: re-running the owner yields one record per call, not an accumulation: {owner_first}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_second, "detail=\"host.open requested\""),
+        1,
+        "no_duplicate_evaluation: re-running the owner yields one record per call, not an accumulation: {owner_second}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_first, "detail=\"host.open requested\"")
+            + count_occurrences(&owner_first, "code=\"host-open-failed\""),
+        2,
+        "no_mutable_global_dedup: nothing in the observation path suppressed or duplicated an emission within one owner call: {owner_first}"
+    );
+
+    // ---- the fixture's declared diff names are bound to the properties this
+    // test asserts ----
+    // The object is only bound to this test's assertions here, not re-proven by
+    // them: its five declared names must be exactly the five properties this
+    // delivery asserts, and each must stay a declared boolean rather than a
+    // free-text claim.
     let allowed = &fixture["allowed_diff"];
     let mut declared: Vec<String> = allowed
         .as_object()
