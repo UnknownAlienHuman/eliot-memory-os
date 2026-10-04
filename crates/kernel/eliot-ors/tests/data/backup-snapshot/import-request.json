@@ -1,0 +1,13 @@
+{
+  "snapshot_digest": "c953c953c953c953c953c953c953c953c953c953c953c953c953c953c953c953",
+  "source": {
+    "installation_id": "install-953-fixture-a",
+    "ors_generation": 953,
+    "schema_version": 6
+  },
+  "destination": {
+    "installation_id": "install-953-fixture-b",
+    "admission_receipt": "receipt-953-fixture-b",
+    "evidence_bound": true
+  }
+}
