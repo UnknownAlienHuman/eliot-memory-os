@@ -1363,19 +1363,33 @@ fn source_api_diff_guard_excludes_out_of_scope_changes() {
     let apply = source("src/apply.rs");
     // Rework shape: the normal-write allocation loop (fence/head reads,
     // allocation attempts, retries, canonical transaction) runs without
-    // the process-global gate; the gate survives only on the migration and
-    // erasure-dispatch entrypoints — exactly two sites — and no second
-    // global gate appears. The scheduler is not activated here.
+    // the process-global gate; the gate survives only on the migration
+    // entrypoint, and no second global gate appears. The scheduler is not
+    // activated here.
+    //
+    // The count is exactly ONE, not two: the erasure-dispatch entrypoint this
+    // assertion used to name no longer exists. `apply_surreal_erasure` was
+    // removed and the erasure body is now spliced immediately before
+    // `schema::TX_CREATE_RECEIPT` inside the single BEGIN/COMMIT of an ordinary
+    // apply, so it acquires no separate guard and must not be counted as one.
+    // The meaning being protected is unchanged and is still asserted below: no
+    // guard site remains on the normal-write allocation path.
     assert!(
         apply.contains("let _guard = adapter.write_lock.lock().await;"),
-        "migration and erasure guards retained"
+        "migration guard retained"
     );
     assert_eq!(
         apply
             .matches("let _guard = adapter.write_lock.lock().await;")
             .count(),
-        2,
+        1,
         "no guard site remains on the normal-write allocation path"
+    );
+    // The erasure leg provably runs inside an ordinary apply rather than on a
+    // dispatch entrypoint of its own, which is why it contributes no guard site.
+    assert!(
+        !apply.contains("apply_surreal_erasure"),
+        "no erasure-dispatch entrypoint remains to guard"
     );
     // The bounded retry re-enters only through the narrow allocation
     // recompute, never through full planning.
@@ -1425,7 +1439,14 @@ fn source_api_diff_guard_excludes_out_of_scope_changes() {
         "non-contention outcomes return without retry"
     );
     // No new dependencies: the adapter manifest carries exactly the admitted
-    // set from the fixture.
+    // set from the fixture. `eliot-kernel-core` is recorded because #1780
+    // (commit 71569d1df, "persist canonical notification state with
+    // receipt-bound lifecycle") added it to the adapter manifest on main
+    // without widening this denominator; this entry restores the guard's
+    // stated purpose of catching the NEXT unrecorded addition. It is a
+    // record of an already-merged manifest, not a new admission decision —
+    // whether a storage adapter may depend on the kernel crate is a
+    // boundary question for the owner of that manifest, not for this case.
     let manifest = source("Cargo.toml");
     let dependencies = manifest
         .split("[dependencies]")
