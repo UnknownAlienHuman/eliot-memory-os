@@ -515,3 +515,57 @@ pub struct ToolInputErrorData {
 pub struct ToolInputError {
     pub data: ToolInputErrorData,
 }
+
+// ---------------------------------------------------------------------------
+// RECORDED RESIDUAL, NOT REPAIRED (issue #933, Work step 7). This block is
+// deliberately at the END of the file: it adds no line ABOVE any declaration, so
+// every `mcp_contract.rs:<line>` citation in the other crates' suites, in
+// `lifecycle.rs` and in the control plane stays correct. An earlier placement
+// directly above the `Deserialize` impl shifted thirty lines and staled about
+// thirty-five citations in four files this issue does not own; that is a worse
+// trade than losing proximity, because a false coordinate is exactly the defect
+// class these records exist to remove.
+//
+// WHAT IS RECORDED. The seven `duplicate_field` guards in
+// `CompilePacketToolInputVisitor::visit_map` fire only when a raw `MapAccess`
+// delivers each object member, and the production MCP ingress for this tool does
+// not supply one:
+//
+//   crates/eliot-app/src/mcp_stdio.rs::handle_line
+//     parses the authenticated line with `serde_json::from_str` into a
+//     `serde_json::Value`                              (mcp_stdio.rs:2134)
+//   crates/eliot-app/src/mcp_stdio/task_handlers.rs:188
+//     is the single production decode site and hands that already-built document
+//     to `mcp_stdio/input_validation.rs::decode_compile_packet_input`
+//   crates/eliot-app/src/mcp_stdio/input_validation.rs:34
+//     reaches this crate's decoder through `serde_json::from_value`
+//
+// No `preserve_order` feature is enabled for `serde_json` anywhere in the
+// workspace, so that document's objects are `BTreeMap`s: the second occurrence of
+// a repeated member overwrites the first at ingress, the repeat is destroyed
+// before any typed decoder runs, and each key is then yielded exactly once. A
+// document that repeats `project_id`, `task_id`, `goal`, `candidate_handles`,
+// `max_tokens`, `material_frame` or `memory_mode` is therefore ACCEPTED on that
+// route with the LAST value instead of refused. The guards are live code on the
+// raw route; on the production route they are unreachable.
+//
+// THE OWNER AND THE DISPOSITION. The repair is to carry the raw bytes to the
+// typed decoder at the ingress. That is `eliot-app` code, outside this issue's
+// four-file production scope (`adapter.rs`, `external_agent.rs`,
+// `provider_invocation.rs`, `mcp_contract.rs`), so the owner is the `eliot-app`
+// MCP ingress and the row is RETAINED AS UNRESOLVED rather than passed. Nothing
+// here invents an envelope member, a second parser, a receipt owner or an
+// authorization gate: decoder closure and authorization are separate gates, and
+// #933's Work step 2 requirement - reject duplicate keys while reading the raw
+// map, before insertion into Value/maps - cannot be met downstream of a `Value`
+// that no longer holds the repeat.
+//
+// The acceptance corpus records this as the known non-clean row
+// `c5_production_ingress_collapses_duplicates`, and its case 5 EXECUTES both
+// routes on one document: the raw route refuses and names the repeated member,
+// while the collapsed route is asserted to SUCCEED and to yield the SECOND
+// stated identity. That success is today's measured behaviour of an un-repaired
+// route, not a pass. APPENDIX-P line 12 - "authority, scope, effect, privacy,
+// ordering and receipt fields are never silently defaulted" - is the rule this
+// touches: an ambiguous stated identity resolved last-wins is an ambiguity
+// resolved silently.
