@@ -6395,12 +6395,11 @@ mod snapshot_capture_contention_tests {
         let _serial = registry_serial();
         let fixture =
             CaptureFixture::install(3, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
-        let (before, charge_before, high_water_before) = {
+        let (before, charge_before) = {
             let states = lock_registry().expect("registry lock is free");
             (
                 evidence(&states, fixture.digest()),
                 charged(&states, BudgetDimension::ActivePageCalls),
-                high_water(&states, BudgetDimension::ActivePageCalls),
             )
         };
 
@@ -6412,6 +6411,22 @@ mod snapshot_capture_contention_tests {
         assert!(
             matches!(call.as_mut().poll(&mut context), Poll::Pending),
             "the frame must still be suspended inside its provider await"
+        );
+        let (held, held_high_water) = {
+            let states = lock_registry().expect("registry lock is free");
+            (
+                charged(&states, BudgetDimension::ActivePageCalls),
+                high_water(&states, BudgetDimension::ActivePageCalls),
+            )
+        };
+        assert_eq!(
+            held,
+            charge_before + 1,
+            "the in-flight call really did reserve its aggregate unit"
+        );
+        assert!(
+            held_high_water >= held,
+            "the reservation is recorded in the dimension's greatest charge"
         );
         drop(call);
 
@@ -6433,10 +6448,6 @@ mod snapshot_capture_contention_tests {
             charged(&states, BudgetDimension::ActivePageCalls),
             charge_before,
             "the in-flight call charge is returned"
-        );
-        assert!(
-            high_water(&states, BudgetDimension::ActivePageCalls) > high_water_before,
-            "the charge really was taken before it was returned"
         );
     }
 
@@ -6485,8 +6496,9 @@ mod snapshot_capture_contention_tests {
         assert_only_the_ledger_changed(&before, &after);
         assert_nothing_was_served(&after);
         assert_eq!(
-            after.progress_revision, 1,
-            "appending beside an existing entry is not new observable progress"
+            after.progress_revision,
+            before.progress_revision + 1,
+            "recording the first reason is observable progress; appending beside it is not"
         );
     }
 
