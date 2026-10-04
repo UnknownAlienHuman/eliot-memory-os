@@ -738,8 +738,17 @@ pub fn pre_stage_check(
         expected_revision_heads,
         expected_ordering_heads,
     );
-    let canonical_hash =
-        eliot_store_api::canonical_request_hash(&view).unwrap_or_else(|_| "0".repeat(64));
+    // I6.8/I5.27: identity decisions use the canonical encoding of the
+    // presented bytes. A request the canonical hash refuses (duplicate
+    // carried ordering scopes) keeps its own presented-bytes identity with
+    // every carried value, so two byte-different refused requests never share
+    // one identity and changed bytes under one key still reach
+    // IDENTITY_CONFLICT. Serializing the typed, string-keyed view cannot fail;
+    // the last arm keeps even that case per-request (its typed debug
+    // rendering), never a shared placeholder.
+    let canonical_hash = eliot_store_api::canonical_request_hash(&view)
+        .or_else(|_| eliot_store_api::presented_request_hash(&view))
+        .unwrap_or_else(|_| sha256_hex(format!("{view:?}").as_bytes()));
     let key = transition.identity.idempotency_key.clone();
     if let Some((stored_hash, stored)) = cache.entries.get(&key) {
         if stored_hash == &canonical_hash {
@@ -1032,6 +1041,36 @@ mod tests {
         assert!(matches!(conflict.decision, PreStageDecision::Conflict));
         assert!(
             conflict
+                .defect_codes
+                .contains(&"IDENTITY_CONFLICT".to_owned())
+        );
+    }
+
+    #[test]
+    fn uncanonicalizable_requests_keep_distinct_identities_under_one_key() {
+        let ctx = context();
+        let duplicated = |op: &str, scope: &str| {
+            let mut request = transition(op, "idem-gate-dup", &"0".repeat(64));
+            let scope = OrderingScopeId::new(scope).expect("ordering scope");
+            request.ordering_scopes = vec![scope.clone(), scope];
+            request
+        };
+        let mut cache = PreStageIdentityCache::default();
+        let Err(first) =
+            pre_stage_check(&mut cache, &ctx, &duplicated("op-a", "scope-x"), &[], &[])
+        else {
+            panic!("duplicate carried scopes must be refused pre-stage");
+        };
+        assert_ne!(first.canonical_request_hash, "0".repeat(64));
+        let Err(second) =
+            pre_stage_check(&mut cache, &ctx, &duplicated("op-b", "scope-y"), &[], &[])
+        else {
+            panic!("changed bytes under one key must be refused");
+        };
+        assert!(matches!(second.decision, PreStageDecision::Conflict));
+        assert_eq!(second.proposed_operation_id, "op-b");
+        assert!(
+            second
                 .defect_codes
                 .contains(&"IDENTITY_CONFLICT".to_owned())
         );
