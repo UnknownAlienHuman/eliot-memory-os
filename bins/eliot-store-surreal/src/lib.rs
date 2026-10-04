@@ -130,10 +130,10 @@ pub use canonical_event::{
 };
 mod connection_manager;
 pub use connection_manager::{
-    ClientClass, ClientLease, ClientSetPolicy, ConnectionPolicies, DEFAULT_HEALTH_CLIENTS,
-    DEFAULT_READ_CLIENTS, HealthAdminAdmission, LeaseAccess, ReplayVerdict, ResolvedWriteOutcome,
-    StoreConnectionManager, UnknownWriteGate, classify_receipt_lookup, decide_replay,
-    default_store_transaction_limit, default_store_transaction_limit_usize,
+    ClientClass, ClientIncarnation, ClientLease, ClientSetPolicy, ConnectionPolicies,
+    DEFAULT_HEALTH_CLIENTS, DEFAULT_READ_CLIENTS, HealthAdminAdmission, LeaseAccess, ReplayVerdict,
+    ResolvedWriteOutcome, StoreConnectionManager, UnknownWriteGate, classify_receipt_lookup,
+    decide_replay, default_store_transaction_limit, default_store_transaction_limit_usize,
 };
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
@@ -180,6 +180,44 @@ fn bounded_client_set_limits(write_limit: usize) -> Result<ClientSetLimits, Stri
     })?;
     ClientSetLimits::new(read_sessions, write_sessions, health_sessions)
         .map_err(|error| format!("invalid Store client-set profile: {error}"))
+}
+
+/// Why one admitted client-class operation did not complete (issue #1933).
+///
+/// The split matters for recovery. A transport `Unavailable` is evidence that
+/// the client generation is down, so that class's generation is marked broken
+/// and explicitly replaced. A class deadline elapsing is NOT that evidence: the
+/// provider may simply be slow rather than gone, and tearing the generation
+/// down on every slow request would turn a latency bound into a self-inflicted
+/// outage. Both surface as retryable [`StoreError::Unavailable`] — the
+/// documented contract ceiling for backpressure/deadline, since `StoreError`
+/// has no `Backpressure` or `Deadline` variant — but only the first one
+/// declares the generation broken.
+#[derive(Debug)]
+enum ClassFailure<T> {
+    /// The class's admitted deadline elapsed before the operation finished.
+    Deadline,
+    /// The provider call itself reported a typed store failure.
+    Store(T),
+}
+
+/// Runs one leased class operation under that class's admitted deadline.
+///
+/// Before this, [`ClientSetPolicy::deadline_ms`] was validated, published in
+/// diagnostics and never applied to any provider call: all three classes ran
+/// under the adapter's one shared request timeout underneath. The deadline now
+/// bounds the whole class operation — pool checkout, session connect and the
+/// request itself — so a saturated or wedged class sheds on its own admitted
+/// budget instead of occupying a slot indefinitely.
+async fn within_class_deadline<T>(
+    lease: &ClientLease,
+    future: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, ClassFailure<StoreError>> {
+    match tokio::time::timeout(lease.deadline(), future).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => Err(ClassFailure::Store(error)),
+        Err(_elapsed) => Err(ClassFailure::Deadline),
+    }
 }
 
 fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
@@ -537,7 +575,14 @@ impl StoreComposition {
         self.health_admission.require_admitted("store.health")?;
         let lease = self.connections.try_acquire(ClientClass::Health)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = self.store.health().await;
+        // The provider session behind this is the isolated `HealthAdmin` lane
+        // (issue #1933): health reaches its own bounded admin session, never the
+        // read pool or the facade socket, so it cannot consume a write slot.
+        let outcome = match within_class_deadline(&lease, self.store.health()).await {
+            Ok(health) => Ok(health),
+            Err(ClassFailure::Store(error)) => Err(error),
+            Err(ClassFailure::Deadline) => Err(StoreError::Unavailable),
+        };
         if matches!(outcome, Err(StoreError::Unavailable)) {
             self.mark_broken_and_recover(ClientClass::Health).await;
         }
@@ -562,7 +607,11 @@ impl StoreComposition {
         self.health_admission.require_admitted("store.readiness")?;
         let lease = self.connections.try_acquire(ClientClass::Health)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = self.readiness_inner().await;
+        let outcome = match within_class_deadline(&lease, self.readiness_inner()).await {
+            Ok(readiness) => Ok(readiness),
+            Err(ClassFailure::Store(error)) => Err(error),
+            Err(ClassFailure::Deadline) => Err(StoreError::Unavailable),
+        };
         if matches!(outcome, Err(StoreError::Unavailable)) {
             self.mark_broken_and_recover(ClientClass::Health).await;
         }
@@ -716,7 +765,16 @@ impl StoreComposition {
         StoreConnectionManager::admit_named_read(request.operation)?;
         let lease = self.connections.try_acquire(ClientClass::Read)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = self.store.execute_named(request).await;
+        let outcome = match Box::pin(within_class_deadline(
+            &lease,
+            self.store.execute_named(request),
+        ))
+        .await
+        {
+            Ok(response) => Ok(response),
+            Err(ClassFailure::Store(error)) => Err(error),
+            Err(ClassFailure::Deadline) => Err(StoreError::Unavailable),
+        };
         if matches!(outcome, Err(StoreError::Unavailable)) {
             self.mark_broken_and_recover(ClientClass::Read).await;
         }
@@ -800,15 +858,37 @@ impl StoreComposition {
                 crate::task_binding_gate::map_rejection(&rejection),
             ));
         }
-        let outcome = Box::pin(self.store.apply_prepared_with_authority(
-            context,
-            transition,
-            expected_revision_heads,
-            expected_ordering_heads,
-            authorities,
-        ))
+        // The write class's admitted deadline bounds the whole canonical attempt
+        // (issue #1933, blocking defect 4). Expiry here is deliberately NOT
+        // retryable: a canonical write that ran out of its budget may already
+        // have committed, exactly like a transport loss mid-transaction, so it
+        // is classified as an unknown outcome for the exact operation identity.
+        // That forces `ResolveWriteReceipt` before any replay — returning
+        // plain retryable `Unavailable` would invite the blind replay of a
+        // possibly-committed transition that this whole boundary exists to
+        // prevent.
+        let operation_id = transition.identity.operation_id.clone();
+        let outcome = match tokio::time::timeout(
+            lease.deadline(),
+            Box::pin(self.store.apply_prepared_with_authority(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                authorities,
+            )),
+        )
         .await
-        .map_err(map_adapter_error);
+        {
+            Ok(Ok(receipt)) => Ok(receipt),
+            Ok(Err(error)) => Err(map_adapter_error(error)),
+            Err(_elapsed) => Err(StoreCompositionError::UnknownOutcome {
+                operation_id,
+                reason: "canonical write exceeded its admitted client-set deadline; \
+                         reconcile by exact receipt before any replay"
+                    .to_owned(),
+            }),
+        };
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -840,9 +920,26 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
-            .await
-            .map_err(StoreCompositionError::Store);
+        // Same disposition as the ordinary canonical write (issue #1933): a
+        // reserved write that outruns its admitted deadline may already have
+        // committed, so expiry is an unknown outcome for the exact operation
+        // identity, never a retryable answer.
+        let operation_id = request.transition.identity.operation_id.clone();
+        let outcome = match tokio::time::timeout(
+            lease.deadline(),
+            CanonicalStoreClient::apply_reserved_write(&self.store, request),
+        )
+        .await
+        {
+            Ok(Ok(receipt)) => Ok(receipt),
+            Ok(Err(error)) => Err(StoreCompositionError::Store(error)),
+            Err(_elapsed) => Err(StoreCompositionError::UnknownOutcome {
+                operation_id,
+                reason: "reserved write exceeded its admitted client-set deadline; \
+                         reconcile by exact receipt before any replay"
+                    .to_owned(),
+            }),
+        };
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1171,14 +1268,42 @@ impl StoreComposition {
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
+    ///
+    /// This is the `ResolveWriteReceipt` read, and it runs inside the bounded,
+    /// currently-live read generation like every other named read (issue #1933,
+    /// blocking defect 5). It used to call the adapter directly, which meant the
+    /// one lookup that decides whether an unknown write may be replayed bypassed
+    /// the connection manager entirely: no lease, no generation binding, no
+    /// deadline, and no broken-generation recovery. After a transport loss
+    /// caused the ambiguity in the first place, that lookup could keep returning
+    /// `Unavailable` from the same retained dead transport, because nothing here
+    /// could mark the read generation broken and replace it.
+    ///
+    /// `UnknownWriteGate` semantics are unchanged: this decides WHICH physical
+    /// client generation performs the lookup, never how its answer is
+    /// classified.
     pub async fn receipt(
         &self,
         operation_id: OperationId,
     ) -> Result<Option<WriteReceipt>, StoreError> {
-        self.store
-            .reconcile(operation_id)
-            .await
-            .map_err(AdapterError::into_store_error)
+        let lease = self.connections.try_acquire(ClientClass::Read)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = match within_class_deadline(&lease, async {
+            self.store
+                .reconcile(operation_id)
+                .await
+                .map_err(AdapterError::into_store_error)
+        })
+        .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(ClassFailure::Store(error)) => Err(error),
+            Err(ClassFailure::Deadline) => Err(StoreError::Unavailable),
+        };
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.mark_broken_and_recover(ClientClass::Read).await;
+        }
+        outcome
     }
 
     /// Resolves an unknown write outcome by the original operation identity
@@ -1241,18 +1366,27 @@ impl StoreComposition {
     /// Explicitly replaces a broken client generation after its transport
     /// failure has been reconciled. Fails closed when the set is not broken.
     ///
-    /// Runs the real reconnect path: records the attempt (which returns
-    /// the policy backoff the caller waits before dialing the transport),
-    /// dials exactly once, then cuts over. Attempts past the policy budget
-    /// refuse with escalation instead of a silent replace. The proved
-    /// provider identity is forgotten on cutover: the next ownership-verified
-    /// authentication re-proves it before any gate may claim it again.
-    pub async fn replace_client_generation(
-        &self,
-        class: ClientClass,
-        dial: impl AsyncFnOnce() -> Result<(), StoreError>,
-    ) -> Result<u64, String> {
-        let outcome = self.replace_client_generation_inner(class, dial).await;
+    /// Runs the real reconnect path: records the attempt (which returns the
+    /// policy backoff the caller waits before dialing the transport), dials
+    /// exactly once, then cuts over. Attempts past the policy budget refuse with
+    /// escalation instead of a silent replace.
+    ///
+    /// The dial is no longer caller-supplied, and that is the fix for issue
+    /// #1933 blocking defect 3. It used to take a closure and the only caller
+    /// passed `self.store.connect()`, which is an already-initialised
+    /// `OnceCell` lookup: it returned the SAME failed transport without building
+    /// a new physical client, after which the logical generation counter
+    /// advanced and cleared `broken`, so new leases were admitted against the
+    /// very sockets that had just failed. The generation number was not bound to
+    /// the clients it claimed to replace.
+    ///
+    /// Now the replacement constructs the physical generation — a new facade
+    /// session and a new bounded session pool, authenticated before publication
+    /// — and binds the class's logical generation to the incarnation actually
+    /// serving it. A stale lease is refused because its physical generation was
+    /// retired, not because a process-local counter moved.
+    pub async fn replace_client_generation(&self, class: ClientClass) -> Result<u64, String> {
+        let outcome = self.replace_client_generation_inner(class).await;
         let mut events = BoundedEventLog::new();
         match &outcome {
             Ok(generation) => {
@@ -1279,19 +1413,27 @@ impl StoreComposition {
         outcome
     }
 
-    async fn replace_client_generation_inner(
-        &self,
-        class: ClientClass,
-        dial: impl AsyncFnOnce() -> Result<(), StoreError>,
-    ) -> Result<u64, String> {
+    async fn replace_client_generation_inner(&self, class: ClientClass) -> Result<u64, String> {
         let backoff_ms = self.connections.note_reconnect_attempt(class)?;
         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        dial()
+        // Build and authenticate the replacement generation, then publish it in
+        // one atomic swap. On failure nothing is published and this returns an
+        // error, so the class keeps its broken latch and never admits traffic on
+        // the generation that is still down.
+        let evidence = self
+            .store
+            .replace_client_generation()
             .await
             .map_err(|error| format!("reconnect dial failed: {error:?}"))?;
-        let generation = self.connections.replace_generation(class)?;
+        // The proved provider identity was forgotten when the class was marked
+        // broken; the replacement's own authentication re-proves it, and the
+        // adapter clears the stale observation on cutover so no gate can claim
+        // a retired generation live.
         self.store.note_connection_loss();
-        Ok(generation)
+        self.connections.bind_incarnation(
+            class,
+            ClientIncarnation::new(evidence.transport_generation, evidence.provider_process_id),
+        )
     }
 
     /// Marks one class's client generation broken after a transport failure
@@ -1305,10 +1447,11 @@ impl StoreComposition {
     /// opposite of I5.9 "a broken generation is replaced explicitly".
     ///
     /// Recovery is the existing real reconnect path,
-    /// [`Self::replace_client_generation`], and the dial is the adapter's own
-    /// reconnect entry point [`SurrealStoreAdapter::connect`] — the same entry
-    /// point [`Self::connect`] uses. No second reconnect mechanism, schedule,
-    /// or bound is introduced here.
+    /// [`Self::replace_client_generation`], which now builds and authenticates a
+    /// complete replacement facade session plus bounded session pool over the
+    /// SAME retained provider child and publishes the new physical incarnation.
+    /// No second reconnect mechanism, schedule, bound, or provider process is
+    /// introduced here.
     ///
     /// Both fail-closed properties hold by construction, not by convention:
     ///
@@ -1327,7 +1470,7 @@ impl StoreComposition {
     ///
     /// The awaited recovery is bounded and paid only by the request that just
     /// failed: one policy backoff (at most the class policy's `max_backoff_ms`)
-    /// plus one adapter connect already bounded by the configured connect
+    /// plus one replacement build already bounded by the configured connect
     /// timeout, and only while reconnect budget remains. No healthy request is
     /// delayed behind it — a broken class refuses immediately instead of
     /// queueing for the replacement.
@@ -1338,14 +1481,7 @@ impl StoreComposition {
         // disposition is its own original `Unavailable`, and the still-broken
         // latch plus the exhausted reconnect budget are the escalation a failed
         // replacement leaves behind.
-        let _replaced_generation = self
-            .replace_client_generation(class, async || {
-                self.store
-                    .connect()
-                    .await
-                    .map_err(AdapterError::into_store_error)
-            })
-            .await;
+        let _replaced_generation = self.replace_client_generation(class).await;
     }
 
     /// Reads revision heads through the neutral store boundary.
@@ -2024,6 +2160,58 @@ mod tests {
         ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, ProductId,
         RequestId, ResourceGeneration, SourceId,
     };
+
+    // WORK_UNIT_CASE: 1933/1c - the outer lease bound and the physical
+    // session set are ONE configured capacity (issue #1933, required item 2).
+    //
+    // Before this, the composition sized two independent things: an outer
+    // semaphore from `store_transaction_limit` and an adapter pool on the
+    // 1/1/1 compatibility profile. N outer write leases therefore meant N
+    // logical permits over ONE physical session. This pins the exact mapping
+    // that makes the two the same number, including the refusal that stops a
+    // bridge from starting with a write bound its own provider pool cannot
+    // physically open.
+    #[test]
+    fn one_configured_write_limit_sizes_both_the_lease_bound_and_the_session_set() {
+        for write_limit in 1..=4usize {
+            let limits = bounded_client_set_limits(write_limit).expect("bounded profile");
+            assert_eq!(
+                usize::from(limits.write_sessions()),
+                write_limit,
+                "physical write sessions must equal the configured limit"
+            );
+            // The outer lease bound is built from the same value, so an
+            // admitted lease can always be matched by a physical session.
+            let manager = StoreConnectionManager::from_configured_limits(
+                DEFAULT_READ_CLIENTS,
+                write_limit,
+                1_000,
+                1_000,
+            )
+            .expect("outer bounds");
+            assert_eq!(
+                manager.policy(ClientClass::Write).bound.get(),
+                write_limit,
+                "outer write bound must equal the physical write session count"
+            );
+            assert_eq!(
+                usize::from(limits.read_sessions()),
+                DEFAULT_READ_CLIENTS,
+                "read sessions carry the admitted read bound"
+            );
+            assert_eq!(
+                usize::from(limits.admin_sessions()),
+                DEFAULT_HEALTH_CLIENTS,
+                "the health/admin set stays the isolated single client"
+            );
+        }
+        // Outside the closed 1..=8 per-role profile the composition refuses
+        // rather than silently clamping: a bridge must never start whose own
+        // lease bound exceeds the provider session bound it will enforce.
+        assert!(bounded_client_set_limits(0).is_err());
+        assert!(bounded_client_set_limits(9).is_err());
+    }
+
     use eliot_installation::{
         INSTALLATION_ROOT_BINDING_VERSION, InstallationEpoch, InstallationRoots, RuntimeStateRoots,
     };
