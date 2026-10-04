@@ -10137,6 +10137,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///   for owner readback.
     /// - Changed content under the retained transition identity returns
     ///   `IdentityConflict` before transport.
+    /// - The exact request is retained before transport, including when the
+    ///   port refuses or returns invalid evidence. No acknowledgement can
+    ///   leave that operation identity available for different content.
     /// - An `UnknownOutcome` retains the exact request with its owner snapshot
     ///   until exact reconciliation; the crossing stays unadmitted, never
     ///   active.
@@ -10151,6 +10154,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let port = self.authority_port()?;
         let presented = PresentedAuthorityRequest::RootTransition(Box::new(request.clone()));
         let retained_receipt = self.require_admissible_transition(&presented)?;
+        self.retain_presentation(presented.clone())?;
         let receipt = match port.activate_root_transition(request) {
             Ok(receipt) => receipt,
             Err(P07PortError::UnknownOutcome { snapshot_id }) => {
@@ -14282,9 +14286,101 @@ mod tests {
 
         fn activate_root_transition(
             &self,
-            _request: &eliot_authority::RootTransitionActivationRequest,
+            request: &eliot_authority::RootTransitionActivationRequest,
         ) -> Result<eliot_authority::RootTransitionActivationReceipt, P07PortError> {
-            Err(P07PortError::Unavailable)
+            match self.behavior.lock().expect("script lock").clone() {
+                ScriptedAuthorityBehavior::UnknownAck => Err(P07PortError::UnknownOutcome {
+                    snapshot_id: request.snapshot_id().clone(),
+                }),
+                _ => Err(P07PortError::Unavailable),
+            }
+        }
+    }
+
+    fn root_transition_request_fixture(fence: &StateFence) -> RootTransitionActivationRequest {
+        let record = eliot_authority::RootTransitionRecord {
+            transition_id: "transition:test".to_owned(),
+            operation_id: "operation:root-transition".to_owned(),
+            idempotency_key: "idempotency:root-transition".to_owned(),
+            parent_grant_id: "grant-parent".to_owned(),
+            child_grant_id: "grant-child".to_owned(),
+            parent_grant_commitment: "a".repeat(64),
+            child_grant_commitment: "b".repeat(64),
+            from_authority_root_ref: "authority:parent-root".to_owned(),
+            to_authority_root_ref: "authority:child-root".to_owned(),
+            issuer: "principal:issuer".to_owned(),
+            graph_snapshot_id: "snap-1".to_owned(),
+            predecessor_graph_revision: 1,
+            expected_next_graph_revision: 2,
+            admitted_at_revision: 2,
+            policy_revision: "policy:1".to_owned(),
+            deadline_unix_ms: 1_900_000_000_000,
+            effect_ceiling: EffectClass::ReversibleMutation,
+            semantic_decision_ref: "decision:root-transition".to_owned(),
+            binding: grant_activation_fixture("grant-parent", fence).binding,
+        };
+        let subject = eliot_receipts::AuthorityRequestSubject::new(
+            "principal:issuer",
+            "session:test",
+            "scope:test",
+        )
+        .expect("structural subject");
+        // Structural test input only: this fixture issues no decision or
+        // receipt, and cannot establish an admitted graph crossing.
+        RootTransitionActivationRequest::new(record, subject).expect("structural request")
+    }
+
+    #[test]
+    fn root_transition_keeps_exact_identity_after_transport_failure() {
+        for behavior in [
+            ScriptedAuthorityBehavior::Unavailable,
+            ScriptedAuthorityBehavior::UnknownAck,
+        ] {
+            let observed = snapshot();
+            let fence = observed.state_fence();
+            let expected =
+                KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+            let script = Arc::new(ScriptedAuthorityPort {
+                behavior: Mutex::new(behavior.clone()),
+            });
+            let mut composition = GovernorComposition::new(
+                Arc::new(fake_kernel(observed)),
+                Some(script),
+                &expected,
+                QueueLimits::default(),
+            )
+            .expect("composition");
+            let request = root_transition_request_fixture(&fence);
+            let expected_state = match behavior {
+                ScriptedAuthorityBehavior::UnknownAck => AuthorityPresentationState::UnknownOutcome,
+                _ => AuthorityPresentationState::Pending,
+            };
+            for _ in 0..2 {
+                assert!(matches!(
+                    composition.activate_root_transition(&request),
+                    Err(CompositionError::Authority(
+                        P07PortError::Unavailable | P07PortError::UnknownOutcome { .. }
+                    ))
+                ));
+                let retained = composition
+                    .authority_presentations
+                    .get(&request.ledger_key())
+                    .expect("request retained before transport");
+                assert_eq!(
+                    retained.request(),
+                    &PresentedAuthorityRequest::RootTransition(Box::new(request.clone()))
+                );
+                assert_eq!(retained.state(), &expected_state);
+                assert!(retained.transition_receipt().is_none());
+            }
+            let mut changed = request.record().clone();
+            changed.to_authority_root_ref = "authority:changed-root".to_owned();
+            let changed = RootTransitionActivationRequest::new(changed, request.subject().clone())
+                .expect("changed structural request");
+            assert!(matches!(
+                composition.activate_root_transition(&changed),
+                Err(CompositionError::Authority(P07PortError::IdentityConflict))
+            ));
         }
     }
 
