@@ -5,11 +5,14 @@
 ;; A guest that can make the HOST allocate and measure is a host-lifting
 ;; exhaustion risk, so every string leaf is bounded as it is read, before it is
 ;; folded into the call's output budget. `check_cycle_result`
-;; (typed_execution.rs:3605-3632) charges `state.state-digest` with
-;; `TypedBound::text` (:828-836), which refuses a lifted string longer than
-;; `MAX_TYPED_STRING_BYTES` (4096, :46) with
+;; (`bins/eliot-wasm-host/src/typed_execution.rs`, fn `check_cycle_result`,
+;; lines 3622-3649) charges `state.state-digest` with
+;; `TypedBound::text` (same file, lines 845-853, whose guard is
+;; `if value.len() > MAX_TYPED_STRING_BYTES {`), which refuses a lifted string
+;; longer than
+;; `MAX_TYPED_STRING_BYTES` (4096, same-file line 50) with
 ;; `TypedExecutionError::LimitDenied("typed-string")`, staged at
-;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
+;; `TypedStage::Output` by `execute_domain_lane` (same file, lines 2130-2131).
 ;;
 ;; This component is an honest `dreamer-cycle` fixture except for these
 ;; differences, ALL FOUR of them: (1) the hostile lifted length below;
@@ -55,16 +58,20 @@
 ;;   result<cycle-outcome, cycle-error> retptr base 0x800 (2048)
 ;;     discriminant at +0 (CanonicalAbiInfo::variant_static,
 ;;     wasmtime-environ-47.0.4/src/component/types.rs:841; payload at
-;;     payload_offset32 = align_to(1, align32) = 8, types.rs:950) -> 2056
-;;   cycle-outcome "stepped" payload at 2056 + 8 = 2064 (types.rs:950)
+;;     payload_offset32 = align_to(1, align32) = 8,
+;;     wasmtime-environ-47.0.4/src/component/types.rs:950) -> 2056
+;;   cycle-outcome "stepped" payload at 2056 + 8 = 2064
+;;     (wasmtime-environ-47.0.4/src/component/types.rs:950)
 ;;   cycle-step-result.state at record offset 16 (operation-id string 8 bytes
 ;;     at 0; from-phase/to-phase/disposition one-byte enums at 8/9/10, so
-;;     align_to(11, 8) = 16; CanonicalAbiInfo::next_field32, types.rs:756)
+;;     align_to(11, 8) = 16; CanonicalAbiInfo::next_field32,
+;;     wasmtime-environ-47.0.4/src/component/types.rs:756)
 ;;     -> 2080
 ;;   dreamer-state.state-digest at record offset 12 (u32 `schema-version` 0,
 ;;     enum `phase` 4, u32 `revision` 8, then CanonicalAbiInfo::next_field32
-;;     types.rs:756) -> 2080 + 12 = 2092 (ptr), 2096 (len, POINTER_PAIR 8
-;;     bytes, types.rs:707)
+;;     wasmtime-environ-47.0.4/src/component/types.rs:756) -> 2080 + 12 = 2092
+;;     (ptr), 2096 (len, POINTER_PAIR 8
+;;     bytes, wasmtime-environ-47.0.4/src/component/types.rs:707)
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -192,10 +199,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; 0x0c00 is clear of the descriptor strings, of the 0x800 result tuple, of
     ;; the 0x1000/0x1200 echo scratch and of the 0x2000 hostile string region,
@@ -230,10 +237,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
@@ -254,7 +261,7 @@
       ;; left empty.
       ;; canonical-ABI: `state.state-digest` is dreamer-state record offset 12
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 12 = 2092 (ptr) and 2096 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 12 = 2092 (ptr) and 2096 (len).
       (i32.store (i32.const 2092) (i32.const 8192))
       (i32.store (i32.const 2096) (i32.const 4097))
       (i32.const 2048))

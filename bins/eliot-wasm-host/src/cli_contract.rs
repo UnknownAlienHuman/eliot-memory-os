@@ -574,13 +574,17 @@ mod tests {
             parse_args(argv),
             Err(CliError::MalformedArgument(_))
         ));
-        // Non-numeric ceiling.
+        // Non-numeric ceiling VALUE: `argv[14]` is the `--guest-exec-max-memory`
+        // value, so this reaches `parse_guest_limit`'s `u64` parse rather than
+        // the unknown-argument arm. The expected detail is bound from the flag
+        // name exactly as the production path formats it, so a mutation that
+        // drifts back to a flag index fails here instead of being satisfied by
+        // any `MalformedArgument`.
+        let flag = "--guest-exec-max-memory";
+        let expected = format!("{flag} requires a u64 value");
         let mut argv = guest_argv();
-        argv[13] = "lots".to_owned();
-        assert!(matches!(
-            parse_args(argv),
-            Err(CliError::MalformedArgument(_))
-        ));
+        argv[14] = "lots".to_owned();
+        assert_eq!(parse_args(argv), Err(CliError::MalformedArgument(expected)));
         // Stray guest piece without the mode flag.
         let mut argv = guest_argv();
         argv.remove(2);
