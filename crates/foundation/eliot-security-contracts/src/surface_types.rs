@@ -1139,6 +1139,12 @@ pub const SELECTION_INTEGRITY_SCHEMA: &str =
 /// Maximum stages one selection-integrity chain may declare.
 pub const MAX_SELECTION_STAGES: usize = 64;
 /// Maximum members one selection-integrity membership collection may declare.
+///
+/// The same bound covers the reference lists that name those members
+/// (`admitted_candidate_refs`, `rejected_candidate_refs`, `final_output_refs`
+/// and the seal's own membership, expansion-handle and membership-page lists),
+/// so a chain's evidence is finite in its header as well as in its stages
+/// (#1728 step 7).
 pub const MAX_SELECTION_MEMBERS: usize = 4_096;
 /// One-way disposition for a legacy unversioned selection receipt.
 pub const SELECTION_INTEGRITY_LEGACY_V1_DISPOSITION: &str = concat!(
@@ -1313,12 +1319,23 @@ pub struct SelectionChainSeal {
     pub chain_head_digest: String,
     /// Exact versioned recipe revision that produced the output.
     pub recipe_revision: String,
-    /// Final membership in the exact delivered order, not a set.
+    /// Final membership in the exact order the chain's last stage emitted it,
+    /// not a set.
+    ///
+    /// For a compilation stage that order is the admitted ranking order, not
+    /// the delivered presentation order: the chain's compile-stage output is the
+    /// admitted membership as recorded, and the projection reorders for
+    /// presentation by design. This field therefore binds order *as the chain
+    /// emitted it*, and must not be read as a claim about the order a consumer
+    /// sees. Substitution of the delivered packet is bound independently and
+    /// exactly by `packet_bytes_digest`, which covers the delivered bytes
+    /// themselves.
     pub final_output_refs: Vec<String>,
     /// Final ordered membership digest recomputed over
     /// `final_output_members`.
     pub final_output_digest: String,
-    /// The final ordered membership whose digest is `final_output_digest`.
+    /// The final ordered membership whose digest is `final_output_digest`,
+    /// carried in the same order as `final_output_refs`.
     pub final_output_members: Vec<SelectionMember>,
     /// Lowercase SHA-256 over the exact packet or export bytes delivered.
     pub packet_bytes_digest: String,

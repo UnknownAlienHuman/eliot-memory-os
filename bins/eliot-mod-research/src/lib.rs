@@ -654,8 +654,8 @@ impl TerminalFailure {
         }
     }
 
-    /// Builds the terminal record of a classified terminal outcome that left no
-    /// `BridgeError` behind.
+    /// Builds the terminal record of a classified non-success outcome that left
+    /// no `BridgeError` behind, or `None` for a completed acquisition.
     ///
     /// `ProviderBridge::execute` returns `Ok` for every terminal state it could
     /// classify, so a crashed, cancelled, timed-out or unknown provider reaches
@@ -663,30 +663,48 @@ impl TerminalFailure {
     /// from the crate's own `BridgeError` vocabulary through the same
     /// `reason_code`/`coverage_gap_kind` pair, so an outcome is never reported
     /// under a second, privately chosen classification.
+    ///
+    /// `None` for `Completed` is the load-bearing part: this type is a
+    /// failure/degradation projection, so it must not be constructible from a
+    /// successful run at all.
     #[must_use]
     pub fn outcome_degradation(
         outcome: ProviderOutcome,
         cancellation: Option<&CancellationEvidence>,
-    ) -> Self {
+    ) -> Option<Self> {
+        // A successful acquisition is refused here rather than given a failure code.
+        // `TerminalFailure` is a failure/degradation projection: a completed run
+        // with proven tree closure is neither a failure nor a degradation, and
+        // mapping it onto `RUNTIME_FAILED` put `outcome=Completed
+        // reason=RUNTIME_FAILED` on the receipt of a run that exited zero. I7.20
+        // reason codes describe non-success dispositions, so there is no correct
+        // code to invent for this case — the absence of one is the accurate
+        // record.
+        if outcome == ProviderOutcome::Completed {
+            return None;
+        }
         let reason_code = match outcome {
-            // Both a clean terminal classification and a crash-class
-            // classification are a runtime failure of the provider process, so
-            // they share the one runtime-failure code the vocabulary defines.
-            ProviderOutcome::Completed | ProviderOutcome::Crashed => {
-                eliot_kernel_service::REASON_RUNTIME_FAILED
-            }
+            // An observed crash-class process disposition is a runtime failure
+            // of the provider process, so it carries the one runtime-failure
+            // code the vocabulary defines.
+            ProviderOutcome::Crashed => eliot_kernel_service::REASON_RUNTIME_FAILED,
             ProviderOutcome::TimedOut => eliot_kernel_service::REASON_DEADLINE_EXCEEDED,
             ProviderOutcome::Cancelled => eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED,
             ProviderOutcome::Unknown => eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+            ProviderOutcome::Completed => {
+                unreachable!("a completed acquisition was refused above before this projection")
+            }
         };
         let coverage_gap = match outcome {
             ProviderOutcome::TimedOut => CoverageGapKind::Timeout,
-            ProviderOutcome::Crashed
-            | ProviderOutcome::Cancelled
-            | ProviderOutcome::Unknown
-            | ProviderOutcome::Completed => CoverageGapKind::Unknown,
+            ProviderOutcome::Crashed | ProviderOutcome::Cancelled | ProviderOutcome::Unknown => {
+                CoverageGapKind::Unknown
+            }
+            ProviderOutcome::Completed => {
+                unreachable!("a completed acquisition was refused above before this projection")
+            }
         };
-        Self {
+        Some(Self {
             reason_code,
             coverage_gap,
             outcome,
@@ -701,7 +719,7 @@ impl TerminalFailure {
                     CancellationOutcome::Confirmed(Box::new(receipt.clone()))
                 }),
             undischarged: Vec::new(),
-        }
+        })
     }
 }
 
@@ -867,22 +885,46 @@ pub struct StartAttemptContext {
 /// did. A crashed, cancelled, timed-out or unclassifiable attempt reaches a
 /// terminal state that is not a completion, and the terminal receipt has to
 /// carry that exact state rather than a locally chosen success label.
+///
+/// The unclassifiable and refused states are deliberately *not* merged into the
+/// crash class. An unclassified external effect is not evidence that the
+/// provider crashed, and I14.21 requires the unresolved state to be preserved
+/// so it stays reconciliation-gated. Collapsing them destroyed exactly the state
+/// the reconciliation gate depends on, and reported a crash the run never
+/// observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmittedOutcome {
     /// A clean completed exit with a zero code and proven tree closure.
     Completed,
-    /// A non-zero exit or a crash-class disposition.
+    /// A non-zero exit or a crash-class disposition observed on the process.
     Crashed,
     /// The terminal wait exceeded the deadline.
     TimedOut,
     /// Cancellation stopped the tree.
     Cancelled,
     /// The terminal state could not be classified from local evidence.
+    ///
+    /// Preserved as its own state: it is neither a completion nor an observed
+    /// crash, and it requires reconciliation by the stable operation identity
+    /// before any retry.
     Unknown,
-    /// The attempt failed at or after the executor and keeps no finer
-    /// classification; it is still crash-class acquisition evidence, never a
-    /// clean stop and never a fabricated completion.
+    /// The provider completed but the submit ack or its wire was invalid.
+    ///
+    /// The process ran and finished; what it returned was not an admissible
+    /// acquisition. This is distinct from a crash, which is a process
+    /// disposition this run never observed.
+    ProtocolViolation,
+    /// The attempt reached the executor and the run failed or was refused there.
+    ///
+    /// Distinct from `Unknown`: the attempt is known to have reached the
+    /// executor's contour, so the operation may exist there and resubmission is
+    /// refused — but the terminal state is still not an observed crash.
     Refused,
+    /// The attempt reached the executor and its retained evidence is incomplete.
+    ///
+    /// Distinct from `Unknown` in that the attempt is known to have started, and
+    /// distinct from `Crashed` in that no crash was observed.
+    EvidenceIncomplete,
 }
 
 impl SubmittedOutcome {
@@ -890,25 +932,40 @@ impl SubmittedOutcome {
     /// A fresh admission is required regardless; this flag additionally opens
     /// the `reconcile` path.
     const fn requires_reconciliation(self) -> bool {
-        matches!(self, Self::TimedOut | Self::Unknown)
+        matches!(
+            self,
+            Self::TimedOut
+                | Self::Unknown
+                | Self::ProtocolViolation
+                | Self::Refused
+                | Self::EvidenceIncomplete
+        )
     }
 
     /// Returns the provider-local outcome this retained classification carries.
     ///
-    /// `Refused` is crash-class acquisition evidence: the attempt reached the
-    /// executor or its contour, so it is never reported as a completion.
+    /// Only an *observed* crash-class process disposition projects to
+    /// [`ProviderOutcome::Crashed`]. Every state this bridge inferred — the
+    /// unclassifiable terminal state, a refused or incomplete attempt that
+    /// reached the executor, an invalid provider wire — projects to
+    /// [`ProviderOutcome::Unknown`], because none of them is evidence that the
+    /// provider crashed and each still requires reconciliation by the stable
+    /// operation identity. The exact retained classification stays readable on
+    /// this record, so nothing is lost by projecting to the unresolved state.
     #[must_use]
     pub const fn provider_outcome(self) -> ProviderOutcome {
         match self {
             Self::Completed => ProviderOutcome::Completed,
-            Self::Crashed
-            // An unclassifiable terminal state and a refusal that reached the
-            // executor are both crash-class acquisition evidence: neither is a
-            // completion, and neither stays a locally invented label.
-            | Self::Unknown
-            | Self::Refused => ProviderOutcome::Crashed,
+            Self::Crashed => ProviderOutcome::Crashed,
             Self::TimedOut => ProviderOutcome::TimedOut,
             Self::Cancelled => ProviderOutcome::Cancelled,
+            // An unclassifiable terminal state, an invalid provider wire, and an
+            // attempt whose retained evidence is incomplete are all unresolved,
+            // not crash-class: each stays reconciliation-gated instead of being
+            // promoted to a crash the run never observed.
+            Self::Unknown | Self::ProtocolViolation | Self::Refused | Self::EvidenceIncomplete => {
+                ProviderOutcome::Unknown
+            }
         }
     }
 }
@@ -1198,10 +1255,14 @@ impl ResearchBridge for AdmittedResearchBridge {
                     | BridgeError::StartReceiptMismatch { .. }
                     | BridgeError::StartBindingInstallFailed { .. }
                     | BridgeError::StreamReadbackFailed { .. } => SubmittedOutcome::Unknown,
-                    BridgeError::ProviderFailed { .. }
-                    | BridgeError::EvidenceIncomplete { .. }
-                    | BridgeError::ProtocolViolation { .. }
-                    | BridgeError::Process(_) => SubmittedOutcome::Refused,
+                    BridgeError::ProviderFailed { .. } | BridgeError::Process(_) => {
+                        SubmittedOutcome::Refused
+                    }
+                    // A provider that completed with an invalid wire is its own
+                    // state: the process finished, so this is not an unobserved
+                    // terminal state, and it is still not an observed crash.
+                    BridgeError::ProtocolViolation { .. } => SubmittedOutcome::ProtocolViolation,
+                    BridgeError::EvidenceIncomplete { .. } => SubmittedOutcome::EvidenceIncomplete,
                     BridgeError::NotAdmitted { .. }
                     | BridgeError::ProviderUnavailable
                     | BridgeError::InvalidBridgeIdentity { .. } => return Err(error),
@@ -1581,9 +1642,17 @@ pub fn project_admitted_inquiry(
             .collect(),
         retained_revisions,
         outcome: acquisition_outcome(receipt),
+        // `R6`'s terminal record requires a non-empty reason and has no success
+        // reason code, so a completed acquisition states its own closed outcome
+        // name rather than borrowing a failure code. It previously read the
+        // receipt's `RUNTIME_FAILED` here, which recorded a completed acquisition
+        // as a runtime failure in the `R6` terminal record as well as on the
+        // receipt line. Inventing a success reason code would be worse: it would
+        // add a registry entry that names an admission only the owner can make.
         reason_code: degradation
             .inquiry_reason_code()
-            .unwrap_or(receipt.reason_code)
+            .or(receipt.reason_code)
+            .unwrap_or_else(|| acquisition_outcome(receipt).wire_name())
             .to_owned(),
         assessment_time_ms,
         // Read straight off the admitted request. `freeze_predecessor` in

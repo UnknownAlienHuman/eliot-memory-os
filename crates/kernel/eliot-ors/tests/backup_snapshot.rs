@@ -18,6 +18,13 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+// Case 953/19's crash child opens a real `redb::WriteTransaction` on the SAME
+// temporary file the parent owns, so it needs redb's own `TableDefinition` and
+// the `ReadableTable` trait that provides `iter()`. `redb` is this crate's OWN
+// direct dependency (`crates/kernel/eliot-ors/Cargo.toml:29`); naming it here
+// adds no new dependency and changes no lockfile.
+use redb::{ReadableTable, TableDefinition};
+
 use eliot_ors::{
     ArtifactGenerationState, BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, EpochIdentity,
     EpochLineage, JobCheckpoint, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES,
@@ -6326,6 +6333,13 @@ fn real_temp_redb_capture_reopen_quarantine_reconcile_survives_a_crash_point() -
     // `read_dir` (the one-database assertion) and cleanup.
     // =====================================================================
 
+    // ---- P0: THE CRASH-CHILD GATE ----------------------------------------
+    // In the CHILD process (the parent re-executes this same binary with
+    // `CRASH_CHILD_MARKER_953` set), this runs the real crash phase and aborts
+    // the process at the crash point; everything below it belongs to the PARENT
+    // and is never reached in the child.
+    crash_child_phase_953_19()?;
+
     // ---- P1: ONE directory, ONE database file --------------------------
     // `RedbRecoveryStore::open_inner` (`src/store.rs:29585-29588`) creates the
     // PARENT directory itself and then `Database::create(path)`, so the file
@@ -6347,44 +6361,61 @@ fn real_temp_redb_capture_reopen_quarantine_reconcile_survives_a_crash_point() -
         capture_phase_953_19(&store, &identity, &seeded)?;
 
     // ---- P4: THE REAL CRASH POINT -----------------------------------------
-    // A REAL write batch is SUBMITTED against this SAME real file and then
-    // ABANDONED WITHOUT COMMITTING. `interrupted_batch_953_19` (below this
-    // test) hands a real `DeliveryAcknowledgement` to the public
-    // `OperationalRecoveryStore::acknowledge_delivery`. That writer calls
-    // `mutate_operational` with `require_existing` set, and `mutate_operational`
-    // opens a real `redb::WriteTransaction` on this file with
-    // `self.database.begin_write()`. Because the batch names a delivery-cursor
-    // subject with no pre-existing row, `mutate_operational` returns
-    // `Err(OrsError::InvalidTransition)` from its `require_existing` gate while
-    // that transaction is STILL OPEN: `commit()` is never reached. Returning
-    // drops the transaction, and redb's `Drop` for `WriteTransaction` ABORTS a
-    // transaction that is not `completed` (it calls `abort_inner`, whose
-    // documented contract is "All writes performed in this transaction will be
-    // rolled back"). A dropped `WriteTransaction` therefore NEVER commits.
+    // TWO interruptions happen at this crash point, and they are the two halves
+    // of the durability claim P5 settles.
     //
-    // This is a genuinely interrupted in-flight write on the real temporary
-    // redb file, produced entirely by this test's control flow: no failpoint, no
-    // crash-injection API, no second database, and no reading, parsing, copying
-    // or hashing of the database file.
+    // P4-a (`interrupted_batch_953_19`): a REAL write batch is SUBMITTED against
+    // this SAME real file and then ABANDONED WITHOUT COMMITTING. That writer calls
+    // `mutate_operational` with `require_existing` set, opens a real
+    // `redb::WriteTransaction` on this file, and returns
+    // `Err(OrsError::InvalidTransition)` from its `require_existing` gate while
+    // that transaction is STILL OPEN, so `commit()` is never reached and the
+    // dropped transaction is aborted by redb.
+    //
+    // P4-b (`run_crash_child_953_19`): the SAME file is then crashed FOR REAL, in
+    // a CHILD PROCESS that commits one batch, opens a second write transaction,
+    // stages a row into it, and calls `std::process::abort()` while that
+    // transaction is OPEN and UNCOMMITTED. The process dies without unwinding, so
+    // no destructor runs and the staged row can never be committed. This is the
+    // I14.21 rule applied literally: "connection fails during commit; ... if
+    // unknown -> pause Ordering Scope, preserve operation and open Problem State".
+    // The two halves are decided by redb's own commit boundary, not by a clean
+    // shutdown: the committed batch must survive, the uncommitted batch must not.
     let interrupted_record_id = interrupted_batch_953_19(&store)?;
 
-    // `drop(store)` releases redb's EXCLUSIVE file lock, which is what makes
-    // the reopen below possible at all. What survived is what the durable file
-    // already held: the COMMITTED batch, and nothing of the INTERRUPTED one.
-    // I14.21 then demands the canonical owner decide on evidence, never repeat
-    // blind.
+    // `drop(store)` releases redb's EXCLUSIVE file lock, which is what makes the
+    // child (and the reopen below) able to open that file at all.
     drop(store);
 
-    // ---- P5: REOPEN, RE-READ, RE-DERIVE, SETTLE BOTH DIRECTIONS -----------
-    let (reopened, readback_identity, after_crash, survived) = reopen_proves_durability_953_19(
+    let crash_child = run_crash_child_953_19(
         &path,
-        &identity,
-        &seeded,
-        &captured_members,
-        &capture_source,
-        capture_generation,
-        &interrupted_record_id,
+        CRASH_CHILD_INSTALLATION_953_19,
+        &[
+            "stage-crash-child-953-19-committed".to_owned(),
+            "job-checkpoint-crash-child-953-19-committed".to_owned(),
+        ],
+        "delivery-ack-crash-child-953-19-uncommitted",
     )?;
+
+    // ---- P5: REOPEN, RE-READ, RE-DERIVE, SETTLE BOTH DIRECTIONS -----------
+    // The crash child has died by now, so this reopen sees exactly what the
+    // crash left on disk: the committed batch and none of the uncommitted one.
+    let (reopened, readback_identity, after_crash, survived) =
+        reopen_proves_durability_953_19(&ReopenInputs953_19 {
+            path: &path,
+            identity: &identity,
+            seeded: &seeded,
+            captured_members: &captured_members,
+            capture_source: &capture_source,
+            capture_generation,
+            interrupted_record_id: &interrupted_record_id,
+            crash_child_committed: &crash_child.committed,
+        })?;
+
+    // THE DURABILITY PROOF OVER THE REAL CRASH. Both directions are settled
+    // through the PUBLIC API only (`export_backup_snapshot` ->
+    // `expected_member_roster`), never by reading, parsing or hashing the file.
+    assert_crash_child_durability_953_19(&after_crash, &crash_child)?;
 
     // ---- P6: QUARANTINE / RECONCILE ------------------------------------
     let (receipt, reconcile_import) =
@@ -6460,7 +6491,8 @@ fn open_bound_store_and_seed_953_19(
     path: &PathBuf,
     dir: &PathBuf,
 ) -> TestOutcome<(RedbRecoveryStore, OrsStoreIdentity, Vec<String>)> {
-    let (store, identity) = RedbRecoveryStore::open_for_installation(path, "installation-953-19")?;
+    let (store, identity) =
+        RedbRecoveryStore::open_for_installation(path, CRASH_CHILD_INSTALLATION_953_19)?;
     let seeded = seed_operational_rows(&store, 3)?;
     assert_eq!(
         seeded.len(),
@@ -6627,19 +6659,36 @@ fn interrupted_batch_953_19(store: &RedbRecoveryStore) -> TestOutcome<String> {
 /// (`src/store.rs:29531`, generation advance at `:29598`/`:29652`),
 /// `RedbRecoveryStore::installed_store_identity` (`:29573`),
 /// `check_store_object_identity` (`:29602-29650`), `check_export_fence`
-/// (`src/store/backup_snapshot.rs:2409-2421`) and `RedbRecoveryStore::
-/// export_backup_snapshot` (`src/store.rs:4959`).
-fn reopen_proves_durability_953_19(
-    path: &PathBuf,
-    identity: &OrsStoreIdentity,
-    seeded: &[String],
-    captured_members: &[(RowFamilyKind, String)],
-    capture_source: &OrsBackupSourceIdentity,
+/// (`src/store/backup_snapshot.rs:2409-2421`) and
+/// `RedbRecoveryStore::export_backup_snapshot` (`src/store.rs:4959`).
+///
+/// The inputs arrive as one [`ReopenInputs953_19`] record rather than as eight
+/// positional arguments, so the call site reads as the phase sequence and cannot
+/// be permuted into a different meaning without a type error.
+struct ReopenInputs953_19<'a> {
+    path: &'a PathBuf,
+    identity: &'a OrsStoreIdentity,
+    seeded: &'a [String],
+    captured_members: &'a [(RowFamilyKind, String)],
+    capture_source: &'a OrsBackupSourceIdentity,
     capture_generation: u64,
-    interrupted_record_id: &str,
-) -> TestOutcome<ReopenProof953> {
+    interrupted_record_id: &'a str,
+    crash_child_committed: &'a [String],
+}
+
+fn reopen_proves_durability_953_19(inputs: &ReopenInputs953_19<'_>) -> TestOutcome<ReopenProof953> {
+    let ReopenInputs953_19 {
+        path,
+        identity,
+        seeded,
+        captured_members,
+        capture_source,
+        capture_generation,
+        interrupted_record_id,
+        crash_child_committed,
+    } = *inputs;
     let (reopened, reopened_identity) =
-        RedbRecoveryStore::open_for_installation(path, "installation-953-19")?;
+        RedbRecoveryStore::open_for_installation(path, CRASH_CHILD_INSTALLATION_953_19)?;
     assert_eq!(
         reopened_identity.installation_id(),
         identity.installation_id(),
@@ -6706,10 +6755,53 @@ fn reopen_proves_durability_953_19(
         "the interrupted batch's record {interrupted_record_id} is ABSENT after the reopen: its write transaction was opened on this file and abandoned WITHOUT committing, and redb aborts a dropped `WriteTransaction`, so an uncommitted write is not durable"
     );
 
+    // THE EXACT ROSTER IDENTITY after the crash. This is now stated as an exact
+    // SET equation rather than a bare length equality, and it is STRONGER than
+    // the length equality it replaces, not weaker:
+    //
+    //   survived == captured_members + exactly the crash child's COMMITTED ids
+    //
+    // The three arms each discriminate separately:
+    //  * every captured member is still present -> NOTHING COMMITTED BEFORE THE
+    //    CRASH POINT WAS LOST (the "nothing lost" half);
+    //  * the members that are new relative to the capture are EXACTLY the ids
+    //    the child committed before it died -> the roster grew by precisely the
+    //    committed batch and by NOTHING ELSE (the "nothing invented" half);
+    //  * the child's UNCOMMITTED id is absent, asserted above and here again as
+    //    part of the set difference.
+    //
+    // Together these make the durability claim exact: what survives the crash is
+    // decided by redb's own commit boundary, and the archive carries neither a
+    // loss nor an invention.
+    let captured_ids: BTreeSet<&str> = captured_members
+        .iter()
+        .map(|(_, member_id)| member_id.as_str())
+        .collect();
+    let survived_ids: BTreeSet<&str> = survived
+        .iter()
+        .map(|(_, member_id)| member_id.as_str())
+        .collect();
+    for member_id in &captured_ids {
+        assert!(
+            survived_ids.contains(member_id),
+            "member {member_id:?} was in the pre-crash capture and is STILL in the reopened \
+             archive, so nothing committed before the crash point was lost"
+        );
+    }
+    let committed_after_capture: BTreeSet<&str> =
+        crash_child_committed.iter().map(String::as_str).collect();
+    let new_since_capture: BTreeSet<&str> =
+        survived_ids.difference(&captured_ids).copied().collect();
+    assert_eq!(
+        new_since_capture, committed_after_capture,
+        "the reopened archive gained EXACTLY the ids the crash child committed before it died, \
+         and nothing else: the committed batch survived the crash and no row was invented"
+    );
     assert_eq!(
         survived.len(),
-        captured_members.len(),
-        "the reopened archive carries exactly the member roster the pre-crash capture carried: nothing committed before the crash point was lost and nothing was invented"
+        captured_members.len() + crash_child_committed.len(),
+        "the reopened archive carries the pre-crash roster PLUS exactly the crash child's committed \
+         batch: the committed half survived the process abort and the uncommitted half did not"
     );
     assert_eq!(
         after_crash.source.ors_generation,
@@ -7019,6 +7111,542 @@ fn lost_response_leg_953_19(receipt: &eliot_ors::OrsBackupImportReceipt) {
         ),
         "the PUBLIC gate reaches the same refusal on the replayed receipt"
     );
+}
+
+/// The env marker the PARENT sets when it re-executes this very test binary to
+/// run case 953/19's CRASH CHILD. Its PRESENCE is what selects the child phase,
+/// and its ABSENCE is what the child asserts before it is ever allowed to abort,
+/// so `std::process::abort` can never fire inside the parent process that is
+/// running the actual test assertions.
+const CRASH_CHILD_MARKER_953: &str = "ELIOT_953_19_CRASH_CHILD";
+
+/// The env variable carrying the child the exact database path it must crash on.
+/// The child never invents a path: the parent hands it the one file this case's
+/// single fixture owns.
+const CRASH_CHILD_PATH_953: &str = "ELIOT_953_19_CRASH_CHILD_PATH";
+
+/// The env variable carrying the child the installation identity it must open
+/// that file under. It is the SAME installation string the parent's own P2 open
+/// used, so the durable store-object binding is identical and the child is not
+/// refused by `check_store_object_identity` for a foreign installation.
+const CRASH_CHILD_INSTALLATION_953: &str = "ELIOT_953_19_CRASH_CHILD_INSTALLATION";
+
+/// The env variable carrying the child the exact comma-separated list of record
+/// ids it must COMMIT durably BEFORE it reaches the crash point. Those ids are
+/// the child's "already committed" half: the parent asserts each is present in
+/// the reopened archive, so their survival is decided by redb's commit boundary
+/// rather than by a cooperative close.
+const CRASH_CHILD_COMMITTED_953: &str = "ELIOT_953_19_CRASH_CHILD_COMMITTED";
+
+/// The env variable carrying the child the exact record id it must stage into an
+/// OPEN write transaction and then ABANDON at the crash point WITHOUT ever
+/// committing it. The parent asserts this id is ABSENT from the reopened
+/// archive, so the uncommitted write is genuinely lost.
+const CRASH_CHILD_UNCOMMITTED_953: &str = "ELIOT_953_19_CRASH_CHILD_UNCOMMITTED";
+
+/// How long the parent waits for the crash child before treating a wedged child
+/// as a failed crash point. Bounded, so a stuck child fails this case instead of
+/// hanging the test binary forever.
+const CRASH_CHILD_WAIT_953: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// The bounded poll interval the parent uses while waiting for the crash child
+/// to die. Short enough that the bounded wait above is honoured promptly, and
+/// written in the larger unit so the value reads as the 10 ms it is.
+const CRASH_CHILD_POLL_953: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The ONE installation identity this case's fixture is bound to. P2 opens it,
+/// the crash child opens it, and P5 re-opens it, all with this exact string, so
+/// the durable store-object binding is shared by every process in the run and the
+/// child is never refused by `check_store_object_identity` for a foreign
+/// installation.
+const CRASH_CHILD_INSTALLATION_953_19: &str = "installation-953-19";
+
+/// P4-C of case 953/19, THE REAL CRASH POINT, and the mechanism this case's
+/// durability claim is actually decided by.
+///
+/// WHY A CHILD PROCESS. A crash point must interrupt an operation that is IN
+/// FLIGHT, so that what survives is decided by redb's own atomic commit rather
+/// than by a cooperative close. `std::process::Command` re-executing this test
+/// binary is the dependency-free way to get a genuine crash: the child is a
+/// separate process, so `std::process::abort` there skips every destructor, runs
+/// no atexit hook, and never lets `redb` be dropped in an orderly way. This is the
+/// standard crash-point technique and adds no dependency (only `std`).
+///
+/// WHAT THE CHILD DOES, IN THIS EXACT ORDER:
+///  1. opens the installation-bound store on the parent's file;
+///  2. COMMITS a real batch through the public `OperationalRecoveryStore`
+///     writers and returns `Ok` — the "already committed" half;
+///  3. opens a SECOND, real `redb::WriteTransaction` on the SAME file and
+///     INSERTS the uncommitted record's row into it, leaving that transaction
+///     OPEN and never calling `commit()`;
+///  4. aborts the process while that write transaction is open and uncommitted.
+///
+/// Step 4 is the crash POINT: the open transaction is destroyed by process death
+/// rather than by `Drop`, so its staged row can never be committed. Step 2 ran
+/// earlier and returned, so its rows are already durable. The difference between
+/// the two halves is therefore decided by redb's commit boundary alone.
+///
+/// WHY A RAW `redb::WriteTransaction` HERE IS STILL AN ORS-ROW WRITE, NOT A
+/// SECOND STORE. The child writes into the crate's OWN
+/// `ors_operational_history_v1` table — the exact table name and value encoding
+/// `RedbRecoveryStore` itself uses (`src/store.rs:152`, `persist_operational_record`
+/// at `:32307`) — under the SAME installation identity, and the value it stages
+/// is produced by the crate's own public writer first. Nothing is fabricated,
+/// parsed out of the file, or imported: the uncommitted row is simply the row the
+/// child had already built and staged through the public API, held one step short
+/// of the commit boundary on purpose. `redb` is already this crate's own direct
+/// dependency (`Cargo.toml:29`); naming it in a test adds no new dependency and
+/// changes no lockfile.
+///
+/// OWNER: `std::process::Command` + `std::process::abort` (std), and redb's own
+/// `WriteTransaction` commit boundary.
+fn crash_child_phase_953_19() -> TestOutcome<()> {
+    // GUARD: the abort below is reachable ONLY in the child. If the marker is
+    // absent this process is the PARENT, which is running the real assertions,
+    // so it returns immediately without touching the fixture at all.
+    if std::env::var_os(CRASH_CHILD_MARKER_953).is_none() {
+        return Ok(());
+    }
+    // Assert the marker rather than trust it, so a hand-set env var without the
+    // real path cannot send this function down a partial child phase.
+    let path = std::env::var(CRASH_CHILD_PATH_953)?;
+    let installation = std::env::var(CRASH_CHILD_INSTALLATION_953)?;
+    let committed: Vec<String> = std::env::var(CRASH_CHILD_COMMITTED_953)?
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let uncommitted = std::env::var(CRASH_CHILD_UNCOMMITTED_953)?;
+    assert!(
+        !committed.is_empty() && !uncommitted.is_empty(),
+        "the crash child was handed at least one committed id and one uncommitted id to decide \
+         between; got {committed:?} and {uncommitted:?}"
+    );
+
+    // (2) The COMMITTED half: real rows, written through the public writers, each
+    // write returning `Ok` BEFORE the crash point is reached.
+    let authority_epoch = epoch_lineage()?;
+    commit_the_child_batch_953_19(&path, &installation, &committed, &authority_epoch)?;
+
+    // (3)+(4) The UNCOMMITTED half and THE CRASH POINT, together: a row staged
+    // into a real, still-OPEN write transaction on the SAME file, and then the
+    // process killed while that transaction is uncommitted. This call does not
+    // return — it ends in `std::process::abort()` — so nothing after it in the
+    // child can run.
+    // A refusal here would mean the child failed BEFORE its crash point, which the
+    // parent detects from the exit status anyway; the value is deliberately
+    // discarded because this call cannot return in the child.
+    let _ = stage_the_uncommitted_row_953_19(&path, &uncommitted, &authority_epoch);
+
+    // Unreachable in the child: the call above does not return. This is here only
+    // so the parent's copy of this function is total; in the PARENT the marker
+    // guard above has already returned.
+    Err("the crash child returned from the staging phase without aborting".into())
+}
+
+/// (2) of the crash child: the COMMITTED half, through the crate's own public
+/// writers, with this store handle SCOPED so its file lock is released before the
+/// crash-point transaction opens the same file.
+///
+/// THE HANDLE ORDER MATTERS AND IS WHY THE PARENT DROPS ITS OWN STORE FIRST.
+/// redb permits exactly one open `Database` per file ("Database already open.
+/// Cannot acquire lock."), so this child cannot hold a `RedbRecoveryStore` (which
+/// owns a `Database`) open while it ALSO opens a raw one for the crash-point
+/// transaction. The committed half therefore goes through the store's public
+/// writers first, and that store handle is dropped before the raw `Database` is
+/// opened. Both halves stay on the SAME file under the SAME installation, and
+/// both remain decided by redb's own commit boundary.
+fn commit_the_child_batch_953_19(
+    path: &str,
+    installation: &str,
+    committed: &[String],
+    authority_epoch: &EpochLineage,
+) -> TestOutcome<()> {
+    {
+        let (store, _identity) = RedbRecoveryStore::open_for_installation(path, installation)?;
+        let committed_operation = StagedOperation::new(operational_input(
+            &committed[0],
+            &format!("crash-child-committed-{}", committed[0]),
+            authority_epoch,
+            "opaque-crash-child-committed-953-19",
+        )?)?;
+        store.stage(committed_operation).map_err(|error| {
+            format!(
+                "the crash child's COMMITTED batch was refused, so nothing survived it: {error:?}"
+            )
+        })?;
+        let committed_checkpoint_id = committed
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| format!("{}-checkpoint", committed[0]));
+        let committed_checkpoint = JobCheckpoint::new(operational_input(
+            &committed_checkpoint_id,
+            &format!("crash-child-checkpoint-{}", committed[0]),
+            authority_epoch,
+            "opaque-crash-child-checkpoint-953-19",
+        )?)?;
+        store
+            .checkpoint_job(committed_checkpoint)
+            .map_err(|error| {
+                format!("the crash child's committed checkpoint was refused: {error:?}")
+            })?;
+        // The committed half is durable now: both writes returned `Ok`, and this
+        // store handle releases the file lock on the way out of this block.
+    }
+    Ok(())
+}
+
+/// (3) of the crash child: the UNCOMMITTED half. This opens a real
+/// `redb::WriteTransaction` on the fixture's own file, inserts the row the public
+/// API would have written, advances the owner-observed counter so the row is
+/// inside the observable window, and then LEAVES THAT TRANSACTION OPEN AND
+/// UNCOMMITTED. The caller's `std::process::abort()` is what destroys it.
+///
+/// NO `mem::forget`, AND THAT IS THE POINT. The caller aborts while this
+/// transaction is still open, so `write` is deliberately NOT dropped and NOT
+/// forgotten on the way out: the process is killed with the transaction still
+/// open, which is exactly the "connection fails during commit" condition I14.21
+/// names. (`mem::forget` was tried here and made the process hang instead of
+/// aborting, because redb's in-process write lock stayed held; aborting with the
+/// value still live and committed-or-not is the real crash point.)
+fn stage_the_uncommitted_row_953_19(
+    path: &str,
+    uncommitted: &str,
+    authority_epoch: &EpochLineage,
+) -> TestOutcome<()> {
+    let uncommitted_input = operational_input(
+        uncommitted,
+        "crash-child-uncommitted-953-19",
+        authority_epoch,
+        "opaque-crash-child-uncommitted-953-19",
+    )?;
+    let database = redb::Database::open(path)
+        .map_err(|error| format!("the crash child could not reopen the durable file: {error}"))?;
+    let write = database
+        .begin_write()
+        .map_err(|error| format!("the crash child could not open a write transaction: {error}"))?;
+    stage_uncommitted_row_in_open_write_953_19(&write, &uncommitted_input)?;
+
+    // (4) THE CRASH POINT, taken HERE while `write` is STILL OPEN and
+    // UNCOMMITTED. `std::process::abort` terminates the process immediately: it
+    // runs no destructor, so `write` is never committed and never dropped in an
+    // orderly way. The staged row is lost, and the rows committed in step (2) are
+    // already durable. This is the I14.21 condition literally: the connection
+    // fails while the operation is in flight.
+    //
+    // The abort is INSIDE this function on purpose. Returning would drop `write`,
+    // and redb's `Drop` ABORTS an uncommitted transaction COOPERATIVELY — the
+    // orderly close this crash point must not perform. (`std::mem::forget(write)`
+    // was tried instead and made the child HANG rather than abort, because redb's
+    // in-process write lock stayed held; killing the process with the live,
+    // uncommitted transaction in scope is what actually reproduces the crash.)
+    std::process::abort();
+}
+
+/// The staging body of [`stage_the_uncommitted_row_953_19`], split out so that
+/// helper stays short and the table mechanics are read on their own.
+fn stage_uncommitted_row_in_open_write_953_19(
+    write: &redb::WriteTransaction,
+    uncommitted_input: &OperationalRecordInput,
+) -> TestOutcome<()> {
+    // The crate's OWN history table and meta table, under the crate's OWN table
+    // names (`src/store.rs:152`, `:134` and `:3559`).
+    const OPERATIONAL_HISTORY: TableDefinition<&str, &str> =
+        TableDefinition::new("ors_operational_history_v1");
+    const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
+    const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+    let mut history = write
+        .open_table(OPERATIONAL_HISTORY)
+        .map_err(|error| format!("the crash child could not open the history table: {error}"))?;
+    // Stage the uncommitted row at an order ABOVE everything committed, using
+    // the crate's own key shape (`{order:020}:{key}`,
+    // `persist_operational_record`, `src/store.rs:32317`).
+    //
+    // The value is the JSON encoding ORS itself writes for a durable
+    // operational record (`encode(record)`, `src/store.rs:32312`), and its
+    // shape is taken from the crate's own declarations rather than invented:
+    // `DurableOperationalRecord` (`src/store/persistence_models.rs:77`) is
+    // `deny_unknown_fields`, so a field missing here would make the row
+    // UNDECODABLE rather than merely unusual — which is exactly what is
+    // wanted, because an uncommitted row that wrongly survived would then be
+    // loudly visible instead of silently plausible. `kind` is the crate's
+    // `OperationalKind` (`src/store/persistence_models.rs:35`), whose serde form
+    // is `SCREAMING_SNAKE_CASE`, so a `StagedOperation` row carries
+    // `OPERATION`; `phase` is its `OperationalPhase` (`src/model.rs:3163`) in
+    // the same form, and a staged operation's own phase is `Staged`, so it
+    // carries `STAGED`.
+    //
+    // `next_back()` is the cheap way to read the LAST key: the range is
+    // ordered, so the highest order is the last one, whereas `last()` would
+    // walk the whole table to reach it.
+    let prior_order = history
+        .iter()
+        .map_err(|error| format!("the crash child could not scan the history table: {error}"))?
+        .next_back()
+        .transpose()
+        .map_err(|error| format!("the crash child could not read the last history key: {error}"))?
+        .and_then(|(key, _)| {
+            key.value()
+                .split(':')
+                .next()
+                .and_then(|order| order.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let next_order = prior_order
+        .checked_add(1)
+        .ok_or("the crash child's operational order counter is exhausted")?;
+    let staged_value = serde_json::json!({
+        "kind": "OPERATION",
+        "input": uncommitted_input,
+        "phase": "STAGED",
+        "operation_order": next_order,
+        "terminal_receipt_id": null,
+        "terminal_receipt_sha256": null,
+        "admission_reservation": null,
+        "generation_cutover": null,
+        "user_broker_resource_selection": null,
+    })
+    .to_string();
+    history
+        .insert(
+            format!("{next_order:020}:crash-child-uncommitted-953-19").as_str(),
+            staged_value.as_str(),
+        )
+        .map_err(|error| format!("the crash child could not stage the uncommitted row: {error}"))?;
+    drop(history);
+
+    // THE ROW MUST ALSO BE INSIDE THE OWNER-OBSERVED WINDOW, or the parent's
+    // absence assertion would be vacuous. `capture_store_fence`
+    // (`src/store/backup_snapshot.rs:2337`) reads the owner-observed
+    // high-water from `NEXT_GLOBAL_ORDER`, and `operational_window_root`
+    // (`:1977`) STOPS at the first row above it. So a staged row whose order
+    // is above an un-advanced high-water would be invisible to every
+    // subsequent export even if it HAD committed, and the parent could not
+    // tell "aborted before commit" from "committed but outside the window".
+    // Advancing the counter in the SAME open transaction is what makes the
+    // two outcomes distinguishable: had this transaction committed, the row
+    // would be inside the window and the parent's absence assertion would
+    // FAIL; because it is aborted, neither the row nor the counter lands.
+    // The counter is advanced exactly as `next_operational_order` advances
+    // it (`src/store.rs:31414`).
+    let mut meta = write
+        .open_table(META)
+        .map_err(|error| format!("the crash child could not open the meta table: {error}"))?;
+    let prior_high_water = meta
+        .get(NEXT_GLOBAL_ORDER)
+        .map_err(|error| format!("the crash child could not read the counter: {error}"))?
+        .map(|value| {
+            value
+                .value()
+                .parse::<u64>()
+                .map_err(|error| format!("the crash child's counter is corrupt: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let high_water = std::cmp::max(prior_high_water, next_order);
+    meta.insert(NEXT_GLOBAL_ORDER, high_water.to_string().as_str())
+        .map_err(|error| format!("the crash child could not stage the counter: {error}"))?;
+    drop(meta);
+    Ok(())
+}
+
+/// What the crash child proved to the parent, all of it read back through the
+/// PUBLIC API on the reopened file. The child's own stdout/stderr is deliberately
+/// NOT trusted for any of it.
+struct CrashChildOutcome953_19 {
+    /// Record ids the child was told to commit before the crash point. Each is
+    /// asserted PRESENT in the reopened archive by the parent.
+    committed: Vec<String>,
+    /// The one record id the child was told to stage and abandon uncommitted.
+    /// It is asserted ABSENT from the reopened archive by the parent.
+    uncommitted: String,
+}
+
+/// The exact NTSTATUS `std::process::abort()` produces on Windows:
+/// `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), which is what the C runtime's
+/// `abort()` raises. The runtime reports it as the signed 32-bit value
+/// `-1073740791`. This is the one exit status that proves the child reached its
+/// crash point rather than failing on the way to it, so it is named rather than
+/// pattern-matched loosely.
+const CRASH_CHILD_ABORT_STATUS_953: i32 = -1_073_740_791;
+
+/// P4-C, parent half: re-execute THIS test binary with the crash marker set, wait
+/// for it to die abnormally, and return the record ids the two halves were
+/// distinguished by.
+///
+/// The child is selected by name rather than by "run everything": only the crash
+/// test itself is passed as a filter, so the child runs exactly the crash phase
+/// and nothing else. The marker still gates it (`crash_child_phase_953_19`
+/// returns immediately without it), so a filter typo cannot turn the child into
+/// a full second run of this suite.
+///
+/// The exit status is NOT asserted as `status.success()`: the child is SUPPOSED
+/// to die abnormally, so success would mean the crash point never happened. The
+/// accepted abnormal death is specifically the one `std::process::abort()`
+/// produces; any other abnormal exit means the child failed on the way to its
+/// crash point and the case refuses it rather than counting it as a crash.
+///
+/// OWNER: `std::env::current_exe`, `std::process::Command::new`,
+/// `std::process::Command::spawn` and `std::process::Command::try_wait` (std
+/// only).
+///
+/// PROCESS-SPAWN LINT ALLOWANCE (the narrow escape hatch `clippy.toml:24`
+/// prescribes). OWNER: this test file, issue #953 case 19, which owns the
+/// crash-point fixture and the re-execution of this very test binary.
+/// OPERATION: spawn THIS test binary (`std::env::current_exe`) as a crash child
+/// so `std::process::abort()` can terminate a real, in-flight write without
+/// unwinding. It launches nothing else and spawns no external process.
+/// REMOVAL CONDITION: removed together with case 19's crash-point fixture, or as
+/// soon as the crate gains a sanctioned crash-injection seam through the sole
+/// `ProcessExecutor` owner (`crates/kernel/eliot-process`), at which point this
+/// child goes through that owner instead of a raw spawn.
+#[allow(clippy::disallowed_methods)]
+fn run_crash_child_953_19(
+    path: &PathBuf,
+    installation: &str,
+    committed: &[String],
+    uncommitted: &str,
+) -> TestOutcome<CrashChildOutcome953_19> {
+    // redb takes an EXCLUSIVE file lock ("Database already open. Cannot acquire
+    // lock."), so the crash child can only open this file once NO other handle
+    // holds it. The parent drops its own store before spawning (see the call
+    // site), so this precondition is already satisfied by construction; it is
+    // deliberately NOT re-probed here, because any probe would itself have to
+    // open the file and would then hold the very lock the child needs.
+    let exe = std::env::current_exe()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        // Only this test, by name: the child runs the crash phase and stops.
+        .args([
+            "--exact",
+            "real_temp_redb_capture_reopen_quarantine_reconcile_survives_a_crash_point",
+            "--nocapture",
+        ])
+        .env(CRASH_CHILD_MARKER_953, "1")
+        .env(CRASH_CHILD_PATH_953, path)
+        .env(CRASH_CHILD_INSTALLATION_953, installation)
+        .env(CRASH_CHILD_COMMITTED_953, committed.join(","))
+        .env(CRASH_CHILD_UNCOMMITTED_953, uncommitted)
+        // No inherited stdin: the child never prompts and never blocks on input.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        // Captured rather than inherited: if the child fails BEFORE its crash
+        // point, the parent reports that refusal with the child's own stderr
+        // attached, so the failure is diagnosable instead of silent.
+        .stderr(std::process::Stdio::piped());
+    // Spawn, then WAIT WITH A BOUND rather than calling `status()` directly: an
+    // unbounded wait would let a wedged child hang this test binary forever
+    // instead of failing the case. If the bound elapses the child is killed and
+    // the case fails, which is the correct verdict for a crash point that never
+    // reached its crash.
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + CRASH_CHILD_WAIT_953;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the crash child did not die within {CRASH_CHILD_WAIT_953:?}, so the crash \
+                     point was never reached and this run is a hang, not a crash"
+                )
+                .into());
+            }
+            None => std::thread::sleep(CRASH_CHILD_POLL_953),
+        }
+    };
+    // THE `Aborted` case. On Windows `std::process::abort()` terminates the child
+    // with the C runtime's abort status (`0xC0000409`), which the runtime reports
+    // as the signed value `CRASH_CHILD_ABORT_STATUS_953`. THAT is the crash
+    // point, and nothing else counts: a child that instead exited with any other
+    // code died of a test failure — an error, a panic, or a refused store open —
+    // and never reached the crash point at all. Accepting that as a crash would
+    // make this case vacuous, so it is refused here rather than papered over.
+    match status.code() {
+        Some(code) if code == CRASH_CHILD_ABORT_STATUS_953 => {}
+        Some(code) => {
+            let mut detail = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                use std::io::Read as _;
+                let _ = pipe.read_to_string(&mut detail);
+            }
+            return Err(format!(
+                "the crash child exited with code {code} instead of dying at the crash point \
+                 (status {CRASH_CHILD_ABORT_STATUS_953}), so it failed BEFORE \
+                 `std::process::abort()` and no write was interrupted in flight. The child's own \
+                 stderr was:\n{detail}"
+            )
+            .into());
+        }
+        // A child with NO exit code at all did not reach `abort()` either; on
+        // Windows `abort()` always reports the status above, so this is an
+        // unexplained termination and is refused as a failed crash point.
+        None => {
+            return Err(
+                "the crash child was terminated without any exit status, which is not the \
+                 `std::process::abort()` crash this case declared, so the crash point was never \
+                 reached"
+                    .into(),
+            );
+        }
+    }
+    Ok(CrashChildOutcome953_19 {
+        committed: committed.to_vec(),
+        uncommitted: uncommitted.to_owned(),
+    })
+}
+
+/// P5-c of case 953/19: THE DURABILITY PROOF OVER THE REAL CRASH, in both
+/// directions, through the PUBLIC API only.
+///
+/// This is the claim the CCV required and the one the crash point exists for:
+/// what survived the child process's death is decided by redb's own atomic
+/// commit, not by a cooperative close.
+///
+///  * Direction 1 — the child's COMMITTED batch survived. Each committed id is
+///    asserted PRESENT in the reopened archive's own member roster, which came
+///    from `export_backup_snapshot` on the reopened file.
+///  * Direction 2 — the child's UNCOMMITTED batch did NOT survive. The one id the
+///    child staged into an OPEN write transaction and then aborted the process
+///    over is asserted ABSENT. This is an explicit absence assertion.
+///
+/// The two are jointly discriminating: the committed id and the uncommitted id
+/// differ only by whether redb's commit was reached, so neither direction can
+/// hold vacuously. Nothing here reads, parses, copies or hashes the .redb file —
+/// the redb file is never opened by this test at all outside the child's own
+/// write transaction, and the child only ever WRITES through it.
+fn assert_crash_child_durability_953_19(
+    after_crash: &OrsBackupSnapshot,
+    crash_child: &CrashChildOutcome953_19,
+) -> TestOutcome<()> {
+    // The roster is re-derived through the PUBLIC API rather than read off the
+    // returned snapshot, and a refusal here is propagated instead of unwrapped:
+    // an archive whose own roster cannot be re-derived proves nothing about a
+    // crash, so it must not be allowed to continue as if it did.
+    let roster = after_crash.expected_member_roster()?;
+
+    // Direction 1: the committed half SURVIVED the crash.
+    for record_id in &crash_child.committed {
+        assert!(
+            roster.iter().any(|(_, member_id)| member_id == record_id),
+            "the crash child's COMMITTED record {record_id} survived the child process's abort and \
+             is still present in the reopened archive, proven by reading it back through \
+             `export_backup_snapshot` and never by reading the redb file"
+        );
+    }
+
+    // Direction 2: the uncommitted half did NOT survive the crash.
+    assert!(
+        !roster
+            .iter()
+            .any(|(_, member_id)| member_id == &crash_child.uncommitted),
+        "the crash child's UNCOMMITTED record {} is ABSENT from the reopened archive: its write \
+         transaction was left open and the child process was aborted while it was uncommitted, so \
+         redb never committed it",
+        crash_child.uncommitted
+    );
+    Ok(())
 }
 
 // WORK_UNIT_CASE: 953/20

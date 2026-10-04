@@ -509,7 +509,6 @@ fn write_governor_config(
             "transaction_timeout_ms = 15000\nstartup_timeout_ms = 20000\nrestart_backoff_ms = 200\nmax_restart_backoff_ms = 2000\n",
             "[db.surreal.capabilities]\ndeny_all = true\nallow_funcs = [\"array\", \"string\", \"time\", \"type\", \"math\", \"vector\", \"search\"]\nallow_net = []\nallow_scripting = false\nallow_guests = false\n",
             "[control_wal]\npath = \"{control}\"\n[blob_store]\nroot = \"{blobs}\"\n",
-            "[store]\nsurql_dir = \"crates/eliot-store/src/surql\"\n"
         ),
         port = port,
         storage = slash(storage),

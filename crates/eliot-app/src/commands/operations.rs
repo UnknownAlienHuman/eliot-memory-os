@@ -442,14 +442,15 @@ pub fn run_daemon_init_default(
     std::fs::create_dir_all(eliot_home)?;
     named_pipe_ipc::restrict_owned_directory_to_current_user(eliot_home)?;
 
-    let source_project_root = config_runtime_root(source_config)
-        .parent()
-        .context("source config must be inside a project runtime root")?
-        .to_path_buf();
-    let source_surql = resolve_source_resource(&source_project_root, &config.store.surql_dir);
-    let resources = eliot_home.join("resources");
-    let destination_surql = resources.join("surql");
-    copy_resource_tree(&source_surql, &destination_surql)?;
+    // Issue #1221 work item W4 / acceptance A2: this command no longer stages a
+    // legacy migration root. It used to resolve `config.store.surql_dir`,
+    // `copy_resource_tree` the whole legacy `.surql` tree into
+    // `<eliot_home>/resources/surql` and write the copied path back into the
+    // installed configuration, which is the one current packaging path that
+    // could select a root the Store schema-generation owner declares
+    // non-executable. The key is deleted from `StoreConfig`, the staging is
+    // deleted here, and the installed runtime carries no migration directory:
+    // the current Store adapter embeds its own migration graph.
 
     "EliotGovernor".clone_into(&mut config.service.service_name);
     "default".clone_into(&mut config.service.instance_id);
@@ -461,7 +462,6 @@ pub fn run_daemon_init_default(
     "surreal-runtime/default".clone_into(&mut config.db.surreal.credential_id);
     config.control_wal.path = config_path_text(&eliot_home.join("control").join("control.redb"));
     config.blob_store.root = config_path_text(&eliot_home.join("blobs"));
-    config.store.surql_dir = config_path_text(&destination_surql);
     config.validate()?;
     let encoded = toml::to_string_pretty(&config)?;
     atomic_write_bytes(destination_config, encoded.as_bytes())?;
@@ -472,49 +472,9 @@ pub fn run_daemon_init_default(
         "config_path": destination_config,
         "eliot_home": eliot_home,
         "data_root": eliot_home.join("data"),
-        "resources": resources,
         "source_config": source_config,
         "long_lived_one_drive_paths": false
     }))
-}
-
-fn resolve_source_resource(project_root: &Path, configured: &str) -> PathBuf {
-    let path = PathBuf::from(configured);
-    if path.is_absolute() {
-        path
-    } else {
-        project_root.join(path)
-    }
-}
-
-fn copy_resource_tree(source: &Path, destination: &Path) -> Result<()> {
-    if !source.is_dir() {
-        bail!(
-            "required standalone resource directory is missing: {}",
-            source.display()
-        );
-    }
-    if destination.is_dir() {
-        std::fs::remove_dir_all(destination)?;
-    }
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            bail!(
-                "standalone resources may not contain symlinks: {}",
-                entry.path().display()
-            );
-        }
-        let target = destination.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_resource_tree(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
 }
 
 fn config_path_text(path: &Path) -> String {

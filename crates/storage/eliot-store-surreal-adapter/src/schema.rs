@@ -447,6 +447,32 @@ DEFINE FIELD scope_id ON learning_record TYPE string;
 DEFINE FIELD task_id ON learning_record TYPE option<string>;
 ";
 
+/// Instrument-registry head table (issue #1814 W1.2, published under issue
+/// #1221 acceptance A1). `SCHEMAFULL`, unlike the schemaless sibling bodies,
+/// because the head row is a single opaque snapshot: every field below is the
+/// admitted row shape and an unlisted field is a provider refusal rather than a
+/// silently stored one.
+///
+/// Published as a named constant — not assembled inline by the ensure operation
+/// — so this body has one exact owner, one disposition, one schema generation
+/// and a derived digest in `crate::schema_inventory::EMBEDDED_SCHEMA_BODIES`.
+/// Before this constant existed the ensure operation formatted the same six
+/// statements at the call site, so the bytes the provider executed appeared in
+/// no inventory entry at all: an embedded DDL body with no owner, no consumer,
+/// no generation and no digest.
+///
+/// The table name is the literal [`table::INSTRUMENT_REGISTRY`]; the inventory
+/// test `instrument_registry_body_declares_the_owned_table` fails closed if the
+/// two ever diverge, because Rust cannot link a `const` body to a `const` name.
+pub(crate) const INSTRUMENT_REGISTRY_TABLES_DDL: &str = r"
+DEFINE TABLE IF NOT EXISTS instrument_registry SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS snapshot_json ON instrument_registry TYPE string;
+DEFINE FIELD IF NOT EXISTS revision ON instrument_registry TYPE int;
+DEFINE FIELD IF NOT EXISTS state_fence ON instrument_registry TYPE object;
+DEFINE FIELD IF NOT EXISTS scope_id ON instrument_registry TYPE string;
+DEFINE FIELD IF NOT EXISTS task_id ON instrument_registry TYPE option<string>;
+";
+
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;

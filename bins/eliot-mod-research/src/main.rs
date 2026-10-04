@@ -98,7 +98,11 @@ fn main() {
             let _ = writeln!(
                 io::stderr(),
                 "{RESEARCH_SOURCE_UNAVAILABLE}: reason={} coverage_gap={:?} receipt={receipt}",
-                receipt.reason_code,
+                // A degraded exit always has a reason. `None` here would mean a
+                // completed run reached the degraded disposition, and rendering
+                // it as a bare `reason=` would hide that contradiction instead of
+                // showing it.
+                receipt.reason_code.unwrap_or("none"),
                 degradation.coverage_gap,
             );
             std::process::exit(EXIT_OPERATION_DEGRADED);
@@ -192,79 +196,19 @@ fn run() -> Result<String, Failure> {
     // `ProviderBridge::execute` returns `Ok` for every terminal state it could
     // classify, including a crash, a cancellation, a timeout and an unknown
     // outcome. The outcome that was computed inside the bridge is therefore
-    // read back here and carried verbatim; nothing on this path is allowed to
-    // relabel a run as a completed acquisition.
+    // read back inside the reporting half and carried verbatim; nothing on this
+    // path is allowed to relabel a run as a completed acquisition.
     if let Ok(job) = submitted {
-        let outcome = bridge.last_outcome().map_or(
-            eliot_mod_research::ProviderOutcome::Unknown,
-            eliot_mod_research::SubmittedOutcome::provider_outcome,
-        );
-        let cancellation = bridge.last_cancellation();
-        // A positive terminal outcome needs no owner reconciliation; anything
-        // else is reconciled by the stable operation identity before it is
-        // reported, so the receipt distinguishes an owner-attested
-        // classification from a local one.
-        let reconciliation = if outcome == eliot_mod_research::ProviderOutcome::Completed {
-            ReconciliationEvidence::not_required()
-        } else {
-            reconcile_with_owner(&client, &admitted, cancellation, outcome)
-        };
-        let reason_code = terminal_reason_code(outcome, &reconciliation, cancellation);
-        let cancellation_outcome = cancellation
-            .map_or(CancellationOutcome::NotAttempted, |receipt| {
-                CancellationOutcome::Confirmed(Box::new(receipt.clone()))
-            });
-        // The retained terminal classification is absent on this path because
-        // `execute` left no `BridgeError` behind; the crate's own typed
-        // conversion still produces both the reason code the receipt carries
-        // and the degraded disposition this run exits with, so neither is a
-        // second, privately chosen classification of the same run.
-        let degradation = acquisition_coverage_degradation(Some(
-            &eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation),
-        ));
-        // A classified terminal run reached `finish_terminal`, which reads the
-        // executor's captured streams back before it classifies, so the
-        // retained evidence here was genuinely observed rather than inferred.
-        let raw = bridge.last_evidence().cloned();
-        let observation = raw
-            .as_ref()
-            .map_or(EvidenceObservation::NotAttempted, |evidence| {
-                EvidenceObservation::Observed(Box::new(evidence.clone()))
-            });
-        let receipt = terminal_receipt(
+        return report_classified_operation(
+            &client,
             &admitted,
             &client_receipt,
             &admission,
             &capability_cell_proof,
-            raw.as_ref(),
-            &observation,
-            cancellation.cloned(),
-            cancellation_outcome,
-            Vec::new(),
-            bridge.last_submission(),
-            bridge.last_provider_job_ref().cloned(),
-            Some(job.job_id),
-            outcome,
-            bridge.last_observed_disposition(),
-            reason_code,
+            &mut bridge,
             records,
-            reconciliation,
+            job.job_id,
         );
-        report_admitted_inquiry(
-            &admitted.request,
-            &admission,
-            &receipt,
-            bridge.last_failure(),
-            bridge.last_retained_stdout(),
-        );
-        // A terminal state that is not a completed acquisition degrades
-        // acquisition coverage and exits with the degraded disposition. A
-        // crashed, cancelled, timed-out or unclassifiable provider is never
-        // receipted as a completed acquisition and never exits zero.
-        return match outcome {
-            eliot_mod_research::ProviderOutcome::Completed => Ok(receipt.to_string()),
-            _ => Err(Failure::Degraded(degradation, Box::new(receipt))),
-        };
     }
     report_failed_operation(
         &mut client,
@@ -275,6 +219,106 @@ fn run() -> Result<String, Failure> {
         &mut bridge,
         records,
     )
+}
+
+/// Reports the terminal receipt and governance view of a classified attempt.
+///
+/// `submit` returning `Ok` proves only that the Rust call finished, so the
+/// retained classification is read back from the bridge rather than inferred
+/// from the exit. A completed acquisition and a degraded one are decided from
+/// the same two values — the typed outcome and the typed degradation this crate
+/// builds from it — and the two halves disagreeing is reported as a defect of
+/// this process rather than resolved in favour of whichever one is convenient.
+///
+/// A completed run carries no reason code and no acquisition gap: I7.20 reason
+/// codes describe non-success dispositions, so `outcome=Completed
+/// reason=RUNTIME_FAILED` was a contradiction on the receipt of a run that
+/// exited zero. A non-success run always carries both, because a receipt with no
+/// reason would be an unexplained failure.
+#[allow(clippy::too_many_arguments)]
+fn report_classified_operation(
+    client: &ResearchKernelClient,
+    admitted: &AdmittedOperation,
+    client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
+    admission: &ProviderAdmission,
+    capability_cell_proof: &CapabilityCellProof,
+    bridge: &mut AdmittedResearchBridge,
+    records: Vec<eliot_mod_research::ProviderEvidenceRecord>,
+    job_id: String,
+) -> Result<String, Failure> {
+    let outcome = bridge.last_outcome().map_or(
+        eliot_mod_research::ProviderOutcome::Unknown,
+        eliot_mod_research::SubmittedOutcome::provider_outcome,
+    );
+    let cancellation = bridge.last_cancellation();
+    // A positive terminal outcome needs no owner reconciliation; anything else
+    // is reconciled by the stable operation identity before it is reported, so
+    // the receipt distinguishes an owner-attested classification from a local
+    // one.
+    let reconciliation = if outcome == eliot_mod_research::ProviderOutcome::Completed {
+        ReconciliationEvidence::not_required()
+    } else {
+        reconcile_with_owner(client, admitted, cancellation, outcome)
+    };
+    let reason_code = terminal_reason_code(outcome, &reconciliation, cancellation);
+    let cancellation_outcome = cancellation.map_or(CancellationOutcome::NotAttempted, |receipt| {
+        CancellationOutcome::Confirmed(Box::new(receipt.clone()))
+    });
+    // The retained terminal classification is absent on this path because
+    // `execute` left no `BridgeError` behind; the crate's own typed conversion
+    // still produces both the reason code the receipt carries and the degraded
+    // disposition this run exits with, so neither is a second, privately chosen
+    // classification of the same run. A completed run has no degradation at all:
+    // `outcome_degradation` is `None` for it, so a success can never be given an
+    // acquisition gap to report.
+    let degradation =
+        eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation)
+            .map(|terminal| acquisition_coverage_degradation(Some(&terminal)));
+    // A classified terminal run reached `finish_terminal`, which reads the
+    // executor's captured streams back before it classifies, so the retained
+    // evidence here was genuinely observed rather than inferred.
+    let raw = bridge.last_evidence().cloned();
+    let observation = raw
+        .as_ref()
+        .map_or(EvidenceObservation::NotAttempted, |evidence| {
+            EvidenceObservation::Observed(Box::new(evidence.clone()))
+        });
+    let receipt = terminal_receipt(
+        admitted,
+        client_receipt,
+        admission,
+        capability_cell_proof,
+        raw.as_ref(),
+        &observation,
+        cancellation.cloned(),
+        cancellation_outcome,
+        Vec::new(),
+        bridge.last_submission(),
+        bridge.last_provider_job_ref().cloned(),
+        Some(job_id),
+        outcome,
+        bridge.last_observed_disposition(),
+        reason_code,
+        records,
+        reconciliation,
+    );
+    report_admitted_inquiry(
+        &admitted.request,
+        admission,
+        &receipt,
+        bridge.last_failure(),
+        bridge.last_retained_stdout(),
+    );
+    match (outcome, degradation) {
+        (eliot_mod_research::ProviderOutcome::Completed, None) => Ok(receipt.to_string()),
+        (eliot_mod_research::ProviderOutcome::Completed, Some(_)) => Err(Failure::NoAdmission(
+            "a completed acquisition reported an acquisition degradation".to_owned(),
+        )),
+        (_, Some(degradation)) => Err(Failure::Degraded(degradation, Box::new(receipt))),
+        (_, None) => Err(Failure::NoAdmission(
+            "a non-success terminal outcome reported no acquisition degradation".to_owned(),
+        )),
+    }
 }
 
 /// Reports the terminal receipt and governance view of an attempt that failed.
@@ -485,8 +529,9 @@ fn report_admitted_inquiry(
 /// Seals one verified Kernel dispatch receipt into a local admission and binds
 /// it to the generated #13 capability-cell record.
 ///
-/// The receipt was already re-proved against the presented dispatch by the wire
-/// owner's `verify_echo`. The local admission is built only from fields that
+/// The receipt was already re-proved against the presented dispatch by the
+/// client's identity and admission checks on the dispatch path. The local
+/// admission is built only from fields that
 /// receipt echoes, so a receipt can never widen the executable, generation,
 /// epoch, fence, privacy class, budget, or deadline beyond what the Kernel
 /// admitted under the live authority; and because it is assembled from those
@@ -567,6 +612,11 @@ fn admit(
     // wire owner's `verify_echo` and the field-wise comparison beside it. A
     // record built from one dispatch and a receipt for another is refused here,
     // before any port, authority, or executor is constructed.
+    //
+    // This is the admission-only re-proof, and it stays admission-only: an
+    // admission can never be sealed from a non-success receipt. That is why the
+    // client's control-operation path returns those receipts intact instead —
+    // neither this call nor any other turns a refusal into an admission.
     admission
         .bind_admitted_dispatch(dispatch, client_receipt)
         .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
@@ -652,20 +702,38 @@ fn reconcile_with_owner(
 /// violation, a policy refusal — therefore keeps the reason code its own
 /// classification already produced, instead of having its real cause
 /// overwritten with a cancellation that never happened.
+///
+/// A completed run has no failure reason at all and reports `None`. It used to
+/// report `RUNTIME_FAILED`, which put an observable
+/// `outcome=Completed reason=RUNTIME_FAILED` contradiction on the receipt of a
+/// run that exited zero with proven tree closure. I7.20 reason codes describe
+/// non-success dispositions, so a success cannot carry one: either the code is
+/// absent or it is claiming something false about a run that succeeded.
 fn terminal_reason_code(
     outcome: eliot_mod_research::ProviderOutcome,
     reconciliation: &ReconciliationEvidence,
     cancellation: Option<&CancellationEvidence>,
-) -> &'static str {
-    if reconciliation.leaves_cancellation_unconfirmed(cancellation) {
-        return eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED;
+) -> Option<&'static str> {
+    if outcome == eliot_mod_research::ProviderOutcome::Completed {
+        return None;
     }
-    let terminal = eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation);
-    match outcome {
-        eliot_mod_research::ProviderOutcome::Completed => {
-            eliot_kernel_service::REASON_RUNTIME_FAILED
-        }
-        _ => acquisition_coverage_degradation(Some(&terminal)).reason_code,
+    if reconciliation.leaves_cancellation_unconfirmed(cancellation) {
+        return Some(eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED);
+    }
+    // `outcome_degradation` is `None` only for a completed acquisition, which
+    // returned above, so this is always the retained non-success record rather
+    // than a failure invented for a success. The `None` arm is still typed and
+    // reported rather than defaulted: substituting a code here would put a
+    // reason on a run that has none.
+    match eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation) {
+        Some(terminal) => Some(acquisition_coverage_degradation(Some(&terminal)).reason_code),
+        // Unreachable for the non-success outcomes that reach here, because
+        // `outcome_degradation` declines only `Completed` and that returned
+        // above. Naming the code rather than panicking keeps the function total
+        // if that pairing ever changes: an unresolved effect is the honest
+        // reading, and it is still a real code rather than a reason invented for
+        // a run that has none.
+        None => Some(eliot_kernel_service::REASON_UNKNOWN_OUTCOME),
     }
 }
 
@@ -715,7 +783,7 @@ fn terminal_receipt(
     job_id: Option<String>,
     outcome: eliot_mod_research::ProviderOutcome,
     observed_disposition: Option<eliot_mod_research::ProviderOutcome>,
-    reason_code: &'static str,
+    reason_code: Option<&'static str>,
     records: Vec<eliot_mod_research::ProviderEvidenceRecord>,
     reconciliation: ReconciliationEvidence,
 ) -> ProviderExecutionReceipt {
