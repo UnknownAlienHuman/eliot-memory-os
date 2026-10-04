@@ -463,30 +463,366 @@ impl ContextInput {
     }
 }
 
-/// Dimensioned quality result; no scalar can hide a failed load-bearing axis.
+/// Legacy eight-Boolean quality record for one exact compilation.
+///
+/// This is a legacy-scoped compatibility record, **not** a current quality
+/// owner. The current owner of the twelve I12.13 dimensions is
+/// `eliot_context_contracts::QualityScorecard`: every current grade, refusal,
+/// applicability answer and completeness check is read from that scorecard and
+/// never from these eight Booleans. The record is retained only so the
+/// historical payloads this compiler already emitted stay readable, and only
+/// through the single named boundary [`decode_legacy_packet_quality`].
+///
+/// Each field is one frozen producer expression of the private
+/// `scorecard(units, handles, unknowns, fence)` over one exact compilation, and
+/// each field doc names that expression. A field proves only its own bounded
+/// computation at that exact packet, source set and fence: it supplies no
+/// numerator, denominator, observation window, source coverage or grade.
+///
+/// The only producer is that private producer and the only carrier is
+/// [`CompiledContext::quality`]; `facade::FACADE_DISPOSITIONS` records
+/// `PacketQualityScorecard` as a `LegacyFrozen` bounded compatibility item
+/// with no external caller, so no current consumer reads a grade from it.
+///
+/// [`LEGACY_DIMENSION_DISPOSITIONS`] freezes what each field is
+/// evidence-adjacent to, and [`legacy_packet_quality_to_dimension_results`] is
+/// the one conversion onto the current dimension states. Nothing here is a
+/// version, a scalar, a weighted utility or a total order.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "each named dimension is independently observable on the wire"
+    reason = "legacy compatibility record, eight named Booleans on the wire"
 )]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PacketQualityScorecard {
     /// Goal/acceptance represented.
+    ///
+    /// Frozen producer expression: `has(ContextRole::Goal)`. The producer's
+    /// second clause re-tests those same units against `handles`, so it cannot
+    /// widen the result. Frozen wire name: `goal_coverage`.
     pub goal_coverage: bool,
     /// Current evidence and operating model represented.
+    ///
+    /// Frozen producer expression:
+    /// `has(ContextRole::Evidence) || has(ContextRole::Model)`, one Boolean
+    /// covering two roles. Frozen wire name: `epistemic_coverage`.
     pub epistemic_coverage: bool,
     /// Exact source handles retained.
+    ///
+    /// Frozen producer expression:
+    /// `units.iter().all(|unit| !unit.source_handles.is_empty())`, which is
+    /// vacuously true for an empty unit set. Frozen wire name:
+    /// `provenance_coverage`.
     pub provenance_coverage: bool,
     /// All selected material shares the requested fence.
+    ///
+    /// Frozen producer expression: `fence.validate().is_ok()` on the compile
+    /// fence alone; per-unit fence agreement is already enforced upstream by
+    /// `ContextInput::validate`. Frozen wire name: `fence_coherent`.
     pub fence_coherent: bool,
     /// Conflicts and unknowns are visible.
+    ///
+    /// Frozen producer expression:
+    /// `!unknowns.is_empty() || has(ContextRole::Unknown)`. Frozen wire name:
+    /// `uncertainty_visible`.
     pub uncertainty_visible: bool,
     /// Safety and negative-memory role represented.
+    ///
+    /// Frozen producer expression: `has(ContextRole::Safety)`. Frozen wire
+    /// name: `safety_coverage`.
     pub safety_coverage: bool,
     /// Next action and verifier represented.
+    ///
+    /// Frozen producer expression: `has(ContextRole::DecisionTail)`. Frozen
+    /// wire name: `decision_readiness`.
     pub decision_readiness: bool,
     /// Some complete units were omitted for boundedness.
+    ///
+    /// Frozen producer expression: `!handles.is_empty() || units.is_empty()`,
+    /// so a `true` cannot distinguish retained handles from an empty view.
+    /// Frozen wire name: `bounded_omission`.
     pub bounded_omission: bool,
+}
+
+/// What one legacy Boolean is evidence-adjacent to for one current dimension.
+///
+/// This describes adjacency of evidence only. It is not a dimension list, not a
+/// `QualityDimensionState` and not a grade: no variant says a dimension
+/// passed, failed or is complete, and the one conversion in this crate emits
+/// `QualityDimensionState::Unknown` for all twelve dimensions whatever this
+/// disposition is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyQualityDisposition {
+    /// The legacy `true` observed, at the exact packet, source set and fence,
+    /// something this dimension also requires. Adjacency is not coverage: the
+    /// observed numerator, denominator and revision are still missing, and a
+    /// legacy `false` stays ambiguous between an unrepresented requirement and
+    /// an inapplicable one.
+    Supports,
+    /// The legacy `false` observed, at that exact packet, source set and fence,
+    /// a positive counter-signal for this dimension rather than a mere absence
+    /// of representation, so the Boolean is evidence-adjacent in both
+    /// directions. It is still not a current `Failed`, which needs a named
+    /// failed invariant.
+    Refutes,
+    /// The Boolean, in either direction, supplies nothing this dimension could
+    /// ever read: it names no numerator, denominator, observation window,
+    /// source coverage or grade, or it is ambiguous between several
+    /// dimensions. The dimension therefore stays explicitly unknown.
+    SaysNothing,
+}
+
+/// One row of the frozen legacy-field to current-dimension mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyDimensionDisposition {
+    /// The A-15 dimension this row describes, taken from that owner's own
+    /// denominator rather than from a local list.
+    pub dimension: eliot_context_contracts::QualityDimension,
+    /// Exact legacy wire field names evidence-adjacent to this dimension.
+    /// Empty when no legacy field observes this dimension at all.
+    pub legacy_fields: &'static [&'static str],
+    /// How those fields relate to this dimension. Evidence adjacency only.
+    pub disposition: LegacyQualityDisposition,
+}
+
+/// Frozen mapping from the eight legacy Booleans to the twelve A-15 dimensions,
+/// in the A-15 owner's own order.
+///
+/// Every row's `dimension` is `eliot_context_contracts::QUALITY_DIMENSIONS` at
+/// that same index, so the twelve canonical identities and their order are
+/// golden from the A-15 owner rather than from a local list: a rename,
+/// reorder, addition or removal on that owner changes this table with it.
+/// There is no second dimension list, no ranking and no scalar here.
+///
+/// This is deliberately **not** a bijection between eight legacy fields and
+/// twelve dimensions. Four rows name no legacy field at all, because nothing in
+/// the legacy wire observes a route, the governing instruction set, a
+/// payload/handle reconstruction cost or telemetry. One legacy Boolean is never
+/// allowed to manufacture several independent successful dimensions: a Boolean
+/// cannot supply a numerator, a denominator, an observation window, source
+/// coverage or a grade, so a row only records which field is evidence-adjacent
+/// and the dimension stays explicitly unknown until its own evidence is
+/// observed. See [`legacy_packet_quality_to_dimension_results`].
+///
+/// The eight legacy wire field names each appear exactly once, so no legacy
+/// field silently disappears from the mapping and none is claimed twice.
+pub const LEGACY_DIMENSION_DISPOSITIONS: [LegacyDimensionDisposition; 12] = [
+    // `QUALITY_DIMENSIONS[0]` is `QualityDimension::AcceptanceDecisionCoverage`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[0],
+        legacy_fields: &["goal_coverage"],
+        disposition: LegacyQualityDisposition::Supports,
+    },
+    // `QUALITY_DIMENSIONS[1]` is `QualityDimension::CausalOperationalSufficiency`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[1],
+        // One Boolean covering `Evidence` and `Model` role presence observes no
+        // causal chain, no operating model coverage and no denominator, so it is
+        // ambiguous between this dimension and its neighbours.
+        legacy_fields: &["epistemic_coverage"],
+        disposition: LegacyQualityDisposition::SaysNothing,
+    },
+    // `QUALITY_DIMENSIONS[2]` is
+    // `QualityDimension::ExactAnchorProvenanceCoverage`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[2],
+        legacy_fields: &["provenance_coverage"],
+        disposition: LegacyQualityDisposition::Supports,
+    },
+    // `QUALITY_DIMENSIONS[3]` is
+    // `QualityDimension::FreshnessStateFenceCoherence`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[3],
+        // `fence.validate().is_ok()` observed `false` is a positive
+        // counter-signal: the compile fence itself failed validation. It is
+        // still not a current `Failed`, which needs a failed invariant handle.
+        legacy_fields: &["fence_coherent"],
+        disposition: LegacyQualityDisposition::Refutes,
+    },
+    // `QUALITY_DIMENSIONS[4]` is
+    // `QualityDimension::RivalsConflictsUnknownsVisibility`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[4],
+        // A legacy `false` here cannot separate "nothing unknown exists" from
+        // "something unknown was not surfaced", so it is not a counter-signal.
+        legacy_fields: &["uncertainty_visible"],
+        disposition: LegacyQualityDisposition::Supports,
+    },
+    // `QUALITY_DIMENSIONS[5]` is
+    // `QualityDimension::NegativeMemoryInvariantCoverage`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[5],
+        legacy_fields: &["safety_coverage"],
+        disposition: LegacyQualityDisposition::Supports,
+    },
+    // `QUALITY_DIMENSIONS[6]` is `QualityDimension::VerifierActionReadiness`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[6],
+        legacy_fields: &["decision_readiness"],
+        disposition: LegacyQualityDisposition::Supports,
+    },
+    // `QUALITY_DIMENSIONS[7]` is
+    // `QualityDimension::RouteAccessibilityLayoutRisk`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[7],
+        // The legacy wire carries no route identity, no layout and no renderer,
+        // so nothing here observes this dimension in either direction.
+        legacy_fields: &[],
+        disposition: LegacyQualityDisposition::SaysNothing,
+    },
+    // `QUALITY_DIMENSIONS[8]` is `QualityDimension::InstructionSufficiency`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[8],
+        // No legacy field counts governing or active instructions.
+        legacy_fields: &[],
+        disposition: LegacyQualityDisposition::SaysNothing,
+    },
+    // `QUALITY_DIMENSIONS[9]` is
+    // `QualityDimension::PayloadHandleReconstructionCost`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[9],
+        // The legacy wire records no payload cost, no handle count, no
+        // reconstruction path and no measurement denominator.
+        legacy_fields: &[],
+        disposition: LegacyQualityDisposition::SaysNothing,
+    },
+    // `QUALITY_DIMENSIONS[10]` is
+    // `QualityDimension::KnownOmissionsExpansionPaths`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[10],
+        // `bounded_omission` is `!handles.is_empty() || units.is_empty()`, so
+        // its `true` cannot separate an omitted whole unit from an empty view
+        // and it names no expansion path.
+        legacy_fields: &["bounded_omission"],
+        disposition: LegacyQualityDisposition::SaysNothing,
+    },
+    // `QUALITY_DIMENSIONS[11]` is
+    // `QualityDimension::TelemetryMeasurementCostCoverage`.
+    LegacyDimensionDisposition {
+        dimension: eliot_context_contracts::QUALITY_DIMENSIONS[11],
+        // The legacy wire records no measurement, no coverage and no telemetry
+        // denominator.
+        legacy_fields: &[],
+        disposition: LegacyQualityDisposition::SaysNothing,
+    },
+];
+
+/// Frozen handle recorded as missing when a caller supplies no evidence of its
+/// own for the unknown-evidence set of a legacy conversion.
+///
+/// It names exactly what the legacy wire can never carry: the rule revision and
+/// the required-evidence handles of a graded dimension.
+const LEGACY_PACKET_QUALITY_ABSENT_REQUIRED_EVIDENCE: &str =
+    "legacy.packet_quality.absent_revision_and_required_evidence";
+
+/// One checked conversion from the legacy eight-Boolean record onto the twelve
+/// A-15 dimension results, in `eliot_context_contracts::QUALITY_DIMENSIONS`
+/// order.
+///
+/// The legacy wire carries no `rule_revision`, no `required_evidence`, no
+/// `evidence`, no measurement and no applicability answer, so no legacy
+/// Boolean is promoted here. The A-15 owner's own written rationale for
+/// refusing a schema-1 Boolean is the reason:
+///
+/// > a schema-1 `true` is indistinguishable from a graded pass, and a schema-1
+/// > `false` is indistinguishable from `UNKNOWN`, `DEGRADED` or
+/// > `NOT_APPLICABLE`, so accepting either would fabricate a definite grade the
+/// > wire never carried
+///
+/// Every returned state is therefore `QualityDimensionState::Unknown` with a
+/// non-empty `unknown_evidence`. That also keeps absent, measured zero with a
+/// valid denominator, failed, unavailable, omitted and not-applicable distinct:
+/// this conversion distinguishes none of them because the legacy wire
+/// distinguishes none of them.
+///
+/// Identity comes from the caller's typed `binding`, copied verbatim into every
+/// result. This function never reads `ContextInput.scope`, never invents an
+/// `attempt_id` or `scope_id` from the legacy string scope, and never derives
+/// identity from the legacy optional `DecisionId`.
+///
+/// `missing_evidence` is the caller's own statement of what these dimensions
+/// still lack. When it is empty, the frozen handle
+/// `legacy.packet_quality.absent_revision_and_required_evidence` is recorded
+/// instead, which is the only absence the legacy wire can actually prove.
+///
+/// The eight Boolean values are deliberately never read: `legacy` is addressed
+/// here so the record is named at its only conversion boundary, and no field
+/// value of it can change any returned state.
+pub fn legacy_packet_quality_to_dimension_results(
+    _legacy: &PacketQualityScorecard,
+    binding: &eliot_context_contracts::ContextBinding,
+    rule_revision: &eliot_contracts::ArtifactId,
+    missing_evidence: &[eliot_contracts::ArtifactId],
+) -> Result<Vec<eliot_context_contracts::QualityDimensionResult>, ContextError> {
+    binding.validate().map_err(|error| {
+        if matches!(error, eliot_context_contracts::ContextError::InvalidFence) {
+            ContextError::FenceMismatch
+        } else {
+            ContextError::InvalidText {
+                field: "quality.binding",
+            }
+        }
+    })?;
+    text(rule_revision.as_str(), "quality.rule_revision")?;
+    let unknown_evidence = if missing_evidence.is_empty() {
+        let absent =
+            ArtifactId::new(LEGACY_PACKET_QUALITY_ABSENT_REQUIRED_EVIDENCE).map_err(|_| {
+                ContextError::InvalidText {
+                    field: "quality.legacy_absent_evidence",
+                }
+            })?;
+        vec![absent]
+    } else {
+        missing_evidence.to_vec()
+    };
+    Ok(eliot_context_contracts::QUALITY_DIMENSIONS
+        .map(
+            |dimension| eliot_context_contracts::QualityDimensionResult {
+                schema_version: eliot_context_contracts::QUALITY_RESULT_SCHEMA_VERSION,
+                dimension,
+                state: eliot_context_contracts::QualityDimensionState::Unknown,
+                rule_revision: rule_revision.clone(),
+                required_evidence: Vec::new(),
+                evidence: Vec::new(),
+                measurements: Vec::new(),
+                failed_invariant: None,
+                unknown_evidence: unknown_evidence.clone(),
+                proof_ceiling: eliot_cue_contracts::ProofCeiling::Observation,
+                invalidation: None,
+                binding: binding.clone(),
+            },
+        )
+        .to_vec())
+}
+
+/// The single named boundary at which an eight-Boolean legacy quality payload
+/// enters this crate.
+///
+/// This is the only supported way to read the historical wire shape, which is
+/// the JSON text of exactly the eight named Booleans this record serializes.
+/// The `PacketQualityScorecard` layout is unchanged: no version field is
+/// imposed on it. A payload that is not exactly those eight named Booleans is
+/// rejected — an absent field is never defaulted to `false`, and an unknown
+/// field is never dropped, because the record denies unknown fields. A current
+/// payload is not trial-decoded here: a
+/// `eliot_context_contracts::QualityScorecard` carries `schema_version`,
+/// `binding` and `output`, none of which this record has.
+///
+/// The payload is bounded by the same `text` check `ContextInput::validate`
+/// already applies to every caller-supplied string in this crate: a blank
+/// payload or one containing a control character is rejected before any parse.
+///
+/// A current consumer must read `eliot_context_contracts::QualityScorecard`
+/// instead. Nothing returned by
+/// [`legacy_packet_quality_to_dimension_results`] is a grade, a receipt or an
+/// admission or delivery claim.
+///
+/// No caller text is retained in either outcome.
+pub fn decode_legacy_packet_quality(value: &str) -> Result<PacketQualityScorecard, ContextError> {
+    text(value, "legacy_packet_quality.payload")?;
+    serde_json::from_str(value).map_err(|_| ContextError::InvalidText {
+        field: "legacy_packet_quality.payload",
+    })
 }
 
 /// Compiled, inspectable active view.
