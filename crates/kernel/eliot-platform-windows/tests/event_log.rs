@@ -1179,9 +1179,10 @@ fn frozen_fixture_matches_the_port() -> Result<(), String> {
 /// A named checked result, so the refusal is a step this file makes visible
 /// rather than an unlabelled discard inside a loop.
 fn check_rejected_before_ffi(label: &str, insertion: &str) -> Result<(), String> {
-    validate_event_log_insertion(insertion)
-        .map_err(|_| format!("{label} must be rejected before FFI"))?;
-    Ok(())
+    match validate_event_log_insertion(insertion) {
+        Err(EventLogError::InvalidInput) => Ok(()),
+        _ => Err(format!("{label} must be rejected before FFI")),
+    }
 }
 
 // NAME, disclosed: the name is the card's own START sentence verbatim, so the
