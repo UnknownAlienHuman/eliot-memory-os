@@ -2818,9 +2818,10 @@ fn launch_06_store_before_kernel() {
     // (a) `fn launch_store_then_kernel` is a PREFIX of the twin's own
     // declaration, `fn launch_store_then_kernel_with_correlation<...>(`, so the
     // bare name above is satisfied by the twin alone and cannot tell the
-    // original from its own replacement. The original's declaration is required
-    // with its generic parameter list, which only the original spells that way
-    // (`store_kernel_launch_sequence.rs:187`).
+    // original from its own replacement. The original's declaration is located by
+    // its EXACT name - the only place it can be seen - and it is a `#[cfg(all(test,
+    // windows))]` item by design, which is why the assertions further down require it
+    // to be ABSENT from production code (`store_kernel_launch_sequence.rs:187`).
     //
     // (b) both live literals occur THREE times in that file - once in the
     // sequence and twice in its own `#[cfg(all(test, windows))] mod tests` - so a
@@ -2843,7 +2844,7 @@ fn launch_06_store_before_kernel() {
     // free of a dead-code finding without an `allow`. So a CORRECT production-code
     // read must contain the twin and must NOT contain the original. Asserting the
     // original's presence in production code instead would pin the reader's own blind
-    // spot: the original's block opens ten lines after its attribute, so a reader that
+    // spot: the original's block opens twelve lines after its attribute, so a reader that
     // looked only at the next line classified that test-only body as production.
     assert!(
         production_sequence.contains("fn launch_store_then_kernel_with_correlation<"),
@@ -3653,6 +3654,11 @@ fn launch_09_before_start_vs_timeout_disconnect_unknown() {
     // and `disconnect observed` + `reason=transport-lost` are retired - the old
     // pair claimed a disconnect on the one arm that proves the opposite.
     let frontdoor = manifest_source("src/kernel_front_door_client.rs");
+    // Production code only, for the same reason case 978/7 reads it that way: each of
+    // these five literals is ALSO declared inside this file's own
+    // `#[cfg(all(test, windows))] mod tests`, so a raw `contains` survives the
+    // deletion of the real emission.
+    let frontdoor_production = production_code(&frontdoor);
     for detail in [
         "host.kernel-front-door before-start observed",
         "host.kernel-front-door no-receipt reconcile observed",
@@ -3661,8 +3667,8 @@ fn launch_09_before_start_vs_timeout_disconnect_unknown() {
         "host.kernel-front-door reconcile requested",
     ] {
         assert!(
-            frontdoor.contains(detail),
-            "the front-door owner must pin {detail:?}"
+            frontdoor_production.contains(detail),
+            "the front-door owner must emit {detail:?} from production code, not name it in a comment or in the file's own #[cfg(all(test, windows))] module"
         );
     }
     // The retired pair must be gone from EMITTED code. `code_only` strips
