@@ -2671,7 +2671,23 @@ where
             .iter()
             .find(|(name, _)| name == "event")
             .map_or_else(String::new, |(_, value)| value.clone());
-        if delivery_event_names().contains(&event_name.as_str()) {
+        // THE SAME PREDICATE THE RECORD FILTER USES, and it reads two DIFFERENT
+        // fields: the delivery record is recognised by its `event=` name, and it
+        // is then told apart from every other record by its `outcome=` value.
+        // `delivery_event_names()` is not read as an `event=` value -- these are
+        // `outcome=` values, and no product `event=` name is one of them, so a
+        // filter built on it can only ever select the empty set.
+        let is_delivery = event_name == DELIVERY_EVENT_NAME;
+        let disposition = if is_delivery {
+            fields
+                .entries
+                .iter()
+                .find(|(name, _)| name == "outcome")
+                .map_or_else(String::new, |(_, value)| value.clone())
+        } else {
+            String::new()
+        };
+        if is_delivery && delivery_event_names().contains(&disposition.as_str()) {
             self.observed
                 .lock()
                 .unwrap()
@@ -2679,6 +2695,33 @@ where
         }
     }
 }
+
+/// The `event=` name the product writes on the record its Event Log WORKER emits
+/// from inside the synchronous OS report seam
+/// (src/windows_event_log.rs:1063-1072):
+///
+/// ```text
+/// crate::host_diagnostics::info!(
+///     target: "eliot_host::windows_event_log",
+///     event = "host.event_log_delivery",
+///     operation = event.as_str(),
+///     event_id = event.event_id(),
+///     severity = event.severity().as_str(),
+///     outcome = outcome,
+///     "host event log delivery outcome"
+/// );
+/// ```
+///
+/// The sweep's delivery arms select records by THIS name and then read the
+/// disposition off the record's `outcome=` FIELD, never off `event=`: every
+/// name in [`delivery_event_names`] is an `outcome=` value, and none of them is a
+/// product `event=` name. The filter was reading those `outcome=` values out of
+/// the `event=` field, which is why it selected the empty set on every platform
+/// and for any product. Exactly one declaration of this spelling lives here, so
+/// a product rename turns the delivery arms RED rather than quietly emptying
+/// them, and the arms below tie the name to a CENSUS of the product's own source
+/// so a rename cannot slip past as silence.
+const DELIVERY_EVENT_NAME: &str = "host.event_log_delivery";
 
 /// Every `EventLogAdmission` value paired with the product's own diagnostic
 /// name for it, so a comparison between two runs is made over the product's
@@ -5227,11 +5270,14 @@ fn sink_degradation_and_timeout_never_change_the_host_result_or_claim_a_drain() 
     // records come out exact, every projection publishes exactly one typed
     // admission outcome, every published drop total is bounded by the records
     // submitted, the producer's own start record publishes whether the worker
-    // thread exists and what the in-flight bound is, the delivery records name
-    // exactly one product thread, and the wrapper has exactly one spawn site.
-    // A writer-side thread-id set is deliberately NOT used: it records the
-    // threads that dispatched through the writer, not the threads the product
-    // created.
+    // thread exists and what the in-flight bound is, the wrapper has exactly one
+    // spawn site, and no delivery record is observable on a caller-side thread.
+    // The one-worker BOUND is a source census, not a runtime thread count: the
+    // delivery record is emitted from the product's worker, and a thread-local
+    // capture cannot see it, so nothing at runtime can count the threads a
+    // delivery reached. A writer-side thread-id set is deliberately NOT used: it
+    // records the threads that dispatched through the writer, not the threads the
+    // product created.
     //
     // The vocabulary of completion CLAIMS, `DRAIN_CLAIMS`, is declared at FILE
     // SCOPE so the census helper below sweeps exactly the words named here.
@@ -6479,31 +6525,78 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
     highest_drops
 }
 
-/// THE SINGLE WORKER, observed rather than asserted -- and, where the port is
-/// live, observed only as far as this thread-local scope can actually see.
+/// THE DELIVERY FILTER, corrected to read the field the product actually writes
+/// into, and the bounds that survive that correction.
 ///
-/// This sweep installs its layers with `tracing::subscriber::with_default`,
-/// which publishes a THREAD-LOCAL default that does not reach the product's
-/// Event Log worker thread. The product's delivery record is emitted FROM that
-/// worker, so it never appears in this capture; the arms below therefore
-/// assert what IS observable here -- that the caller-side capture carries no
-/// delivery-named record, and that the two delivery-named observers over this
-/// same scope agree -- and the single-worker BOUND itself is asserted
-/// unconditionally from the product's own spawn sites by
-/// [`assert_the_wrapper_spawns_exactly_one_named_worker`]. See the live-port
-/// arm below for why the delivery record cannot be observed from here.
+/// WHAT THE FILTER SELECTS. A record is a delivery record when its `event=`
+/// field is [`DELIVERY_EVENT_NAME`], which is the name the product writes at
+/// src/windows_event_log.rs:1066; its disposition is then read off that same
+/// record's `outcome=` FIELD, which is the field the product writes at
+/// src/windows_event_log.rs:1070. The two are never conflated: every name
+/// [`delivery_event_names`] returns is an `outcome=` value
+/// (`EventLogDelivery::as_str()`, `WindowsEventLogError::as_str()`, and the
+/// worker's own `"report_panic_contained"`), and the product's `event=` names
+/// are all `host.*`. Reading `outcome=` values out of `event=` therefore
+/// selects the empty set for ANY product, which is exactly the defect these arms
+/// replace: the three they guard could never fail.
 ///
-/// `captured` is the sweep's own record set and `observing_ids` the ids the
-/// sweep's observing layer collected, so the two sides are filled
+/// WHAT IS PROVEN AT RUNTIME, ON BOTH PLATFORMS:
+/// * the filter is LIVE. Every record in `captured` is checked against
+///   [`DELIVERY_EVENT_NAME`], so a delivery record emitted on a caller-side
+///   thread IS selected and every arm below turns red;
+/// * every such record's disposition is one the product really publishes. A
+///   record claiming a delivery under a name outside
+///   [`delivery_event_names`] fails here instead of being swept into silence;
+/// * the two delivery observers over this same scope see the SAME emitting
+///   threads -- one reads them off the records, the other off the layer's own
+///   ids, and they are filled independently;
+/// * the name this filter selects on is one the product REALLY writes, which is
+///   a census of the product's own source and not a restatement of the literal
+///   above.
+///
+/// WHAT IS NOT PROVEN AT RUNTIME, and is claimed from source census instead:
+/// that the product emits its delivery record FROM its single
+/// `eliot-event-log` worker. This sweep installs its layers with
+/// `tracing::subscriber::with_default`, which publishes a THREAD-LOCAL default
+/// and does NOT propagate it to threads spawned inside the block -- the
+/// `with_default` doc warning in tracing-core's `src/dispatcher.rs` says
+/// verbatim "with_default will not propagate the current thread's default
+/// subscriber to any threads spawned within the with_default block". A worker
+/// thread with no local default falls back to `get_global()`, which this sweep
+/// never set, so that record cannot reach this capture at all. The ONE-WORKER
+/// BOUND is therefore asserted where it can fail, by
+/// [`assert_the_wrapper_spawns_exactly_one_named_worker`], and is deliberately
+/// NOT restated here as `distinct_threads.len() == 1`: over this scope the set is
+/// empty on every platform, and a count over an empty set is a tautology wearing
+/// a proof.
+///
+/// `captured` is the sweep's own record set and `observing_threads` the cell
+/// the sweep's observing layer collected, so the two sides below are filled
 /// independently and their equality is a real one.
 fn assert_delivery_reached_one_product_thread(
     captured: &[CapturedRecord],
     observing_threads: &Arc<Mutex<Vec<std::thread::ThreadId>>>,
 ) {
-    let delivery_events = delivery_event_names();
+    // The product really writes this spelling. CENSUSED, not restated: a rename
+    // is caught HERE, and failing here is strictly better than silently
+    // selecting nothing. `line_matching` reports the one source line the name
+    // appears on, so the census also says WHERE the product writes it rather
+    // than only that it is written somewhere.
+    assert_eq!(
+        line_matching(
+            &manifest_source("src/windows_event_log.rs"),
+            "event = \"host.event_log_delivery\"",
+        )
+        .len(),
+        1,
+        "the wrapper must emit the delivery record under exactly one `event = \"{{}}\"` spelling, \
+         and it must be the spelling DELIVERY_EVENT_NAME selects on -- a rename must turn this \
+         arm red rather than leave the delivery filter matching nothing"
+    );
+    let delivery_dispositions = delivery_event_names();
     let delivery_records: Vec<&CapturedRecord> = captured
         .iter()
-        .filter(|record| delivery_events.contains(&record.event.as_str()))
+        .filter(|record| record.event == DELIVERY_EVENT_NAME)
         .collect();
     // `ThreadId` is `Eq + Hash` but not `Ord`, so the two sets below are built
     // with `HashSet` rather than by sorting a `Vec`: the DEDUPLICATION is the
@@ -6515,70 +6608,118 @@ fn assert_delivery_reached_one_product_thread(
         .collect();
     let observing_ids: std::collections::HashSet<std::thread::ThreadId> =
         observing_threads.lock().unwrap().iter().copied().collect();
-    if event_log_sink_status().is_ok() {
-        // WHY THE DELIVERY RECORD IS NOT OBSERVABLE FROM HERE, so this arm
-        // asserts what CAN be seen instead of a record it can never see. The
-        // product emits its `host.event_log_delivery` record from the Event Log
-        // WORKER thread (src/windows_event_log.rs:1064-1072). `captured` is the
-        // sweep's THREAD-LOCAL `RecordingLayer`, installed by
-        // `tracing::subscriber::with_default`; that publishes a thread-local
-        // default only and does NOT propagate it to threads spawned inside the
-        // block -- the vendored tracing-core `dispatcher.rs` states verbatim:
-        // "with_default will not propagate the current thread's default
-        // subscriber to any threads spawned within the with_default block". A
-        // worker thread with no local default falls back to `get_global()`,
-        // which this sweep never set, so the delivery record physically CANNOT
-        // reach `delivery_records` from the worker. A non-empty requirement here
-        // would therefore be deterministically RED on precisely the platform
-        // whose delivery this arm is about. Nothing can observe that record from
-        // this thread-local scope, so the requirement is dropped rather than
-        // faked.
-        //
-        // WHAT IS OBSERVABLE AND NON-VACUOUS remains: (a) the caller-side
-        // capture must contain NO delivery-named record, because a delivery
-        // record visible HERE would mean the product emitted it on a thread that
-        // DID inherit the capture -- claiming a delivery without dispatching it
-        // through its own worker; and (b) the single-worker bound itself is
-        // asserted unconditionally elsewhere in this case by
-        // `assert_the_wrapper_spawns_exactly_one_named_worker`, which reads the
-        // product's spawn sites directly. Together those still fail a product
-        // that grew a second worker or that claimed delivery off its worker.
-        assert!(
-            delivery_records.is_empty(),
-            "the delivery record is emitted on the product's own worker thread, which cannot see \
-             this thread-local capture, so a delivery-named record must never appear among the \
-             sweep's caller-side records -- got {:?}. A record here means the product claimed a \
-             delivery WITHOUT dispatching it through its own worker",
-            delivery_records
-                .iter()
-                .map(|record| record.event.as_str())
-                .collect::<Vec<_>>()
-        );
-        // `HashSet` implements `Index` never -- only `HashMap` does -- so the
-        // sets are compared directly rather than sorted. Both sides are captured
-        // from the SAME thread-local scope over the SAME delivery-named events,
-        // so they must observe the same emitting threads: a disagreement means
-        // one side saw a delivery-named event the other did not, which is
-        // exactly the "claimed a delivery without its own worker" case caught
-        // above, restated as an equality over two independently filled sets.
-        assert_eq!(
-            observing_ids, distinct_threads,
-            "both sides are captured from the same thread-local scope and watch the same \
-             delivery-named events, so they must observe the same emitting threads; a difference \
-             means one side saw a delivery-named event the other did not. Re-collecting \
-             `observing_ids` into a `HashSet` of its own would only have compared a value with \
-             itself, and is deliberately absent"
-        );
-    } else {
-        assert!(
-            delivery_records.is_empty(),
-            "with no live Event Log port the product must not claim any delivery, got {:?}",
-            delivery_records
-                .iter()
-                .map(|record| record.event.as_str())
-                .collect::<Vec<_>>()
-        );
-    }
+    // The dispositions the selected records CLAIM, held once so the arms below
+    // judge the sweep's records rather than re-reading them.
+    let claimed_dispositions: Vec<&str> = delivery_records
+        .iter()
+        .map(|record| record.field("outcome").unwrap_or(""))
+        .collect();
+    // WHY THERE IS NO `distinct_threads.len() == 1` HERE. The product emits its
+    // `host.event_log_delivery` record from the Event Log WORKER thread
+    // (src/windows_event_log.rs:1063-1072), and `captured` is the sweep's
+    // THREAD-LOCAL `RecordingLayer`, installed by
+    // `tracing::subscriber::with_default`. That publishes a thread-local
+    // default only: the `with_default` doc warning in tracing-core's
+    // `src/dispatcher.rs` states verbatim "with_default will not propagate the
+    // current thread's default subscriber to any threads spawned within the
+    // with_default block". A worker thread with no local default falls back to
+    // `get_global()`, which this sweep never set, so `distinct_threads` is empty
+    // here on a live port and off it alike. A requirement that it hold exactly
+    // one element would be deterministically RED on the live platform and
+    // provably TRUE for the wrong reason on the others -- so it is not asserted.
+    // The single-worker BOUND is not dropped, it is asserted where it can fail,
+    // by `assert_the_wrapper_spawns_exactly_one_named_worker`.
+    //
+    // WHAT SURVIVES HERE, and is not a tautology: this sweep's OWN threads all
+    // inherit the thread-local default, so their records ARE in `captured`, and
+    // the arm below bounds the threads those records can have come from. A
+    // product that grew a thread of its own INSIDE this scope would be emitting
+    // on a thread that inherited the capture, and would drive that count past
+    // the bound -- which is why the bound is stated at all rather than left as
+    // the emptiness the observer arm already implies. The delivery dispositions
+    // are checked on BOTH platforms too, because a delivery record absent from a
+    // caller-side capture is only meaningful against a capture that is known to
+    // be reaching.
+    assert!(
+        distinct_threads.len() <= 4,
+        "at most the sweep's own four worker threads can reach a thread-local capture -- the \
+         product's `eliot-event-log` worker cannot -- so more than four distinct emitting threads \
+         among these records means the product grew a thread of its own inside this scope, got {}",
+        distinct_threads.len()
+    );
+    // THE DISPOSITIONS THEMSELVES, which is where a wrong-field filter hides. A
+    // selected record that carries no `outcome=` field, or one whose `outcome=`
+    // is not a name the product's own vocabulary publishes, fails here. With the
+    // field read from the right place a realistic product record -- `event =
+    // "host.event_log_delivery"` with `outcome = "registered_source_accepted"`
+    // -- is selected AND accepted, so this arm is not a filter that can only
+    // ever see the empty set.
+    assert!(
+        delivery_records
+            .iter()
+            .all(|record| record.field("outcome").is_some()),
+        "every record carrying the product's delivery `event=` name must carry the `outcome=` \
+         field the product writes beside it; a record without one is selected here but cannot be \
+         told apart from any other, and the filter would stop being a filter"
+    );
+    assert!(
+        claimed_dispositions
+            .iter()
+            .all(|outcome| delivery_dispositions.contains(outcome)),
+        "every delivery record's `outcome=` must be a disposition the product's own vocabulary \
+         publishes; the filter reads this FIELD, so a disposition smuggled in under any other \
+         name is caught here rather than swept into silence"
+    );
+    // BOTH PLATFORMS: `event_log_sink_status()` does NOT appear in either
+    // condition below, and deliberately so. The product's single worker is
+    // started process-wide by this case and then shut down before the sweep runs,
+    // so a delivery record can be in this capture only if the product emitted one
+    // on a thread that DID inherit the capture -- that is, without dispatching it
+    // through its own worker. Live port or not, that is the claim this arm rules
+    // out, and it is the claim the former `if event_log_sink_status().is_ok()`
+    // split obscured. So the live-port branch, which asserted only that nothing
+    // appeared here, is merged into this one.
+    assert!(
+        delivery_records.is_empty(),
+        "the delivery record is emitted on the product's own worker thread, which cannot see this \
+         thread-local capture, so a delivery record must never appear among the sweep's \
+         caller-side records -- got {:?} claiming {:?}. A record here means the product claimed a \
+         delivery WITHOUT dispatching it through its own worker",
+        delivery_records
+            .iter()
+            .map(|record| record.event.as_str())
+            .collect::<Vec<_>>(),
+        claimed_dispositions
+    );
+    // `HashSet` implements `Index` never -- only `HashMap` does -- so the sets are
+    // compared directly rather than sorted. Both sides are captured from the SAME
+    // thread-local scope and both filter on the SAME two fields, but they are
+    // filled by different layers at different points, so a disagreement would
+    // mean one side saw a delivery-named event the other did not.
+    //
+    // WHAT THIS ARM PROVES, precisely, and what it CANNOT: it proves the two
+    // observers AGREE. Over this scope the two sets are empty, so the equality
+    // holds today -- and its honesty rests on the arms ABOVE it, not on this
+    // line. The observation is exactly what catches a defect of the kind being
+    // fixed here: when the filter read `outcome=` values out of the `event=`
+    // field, a delivery record appearing on a caller-side thread was invisible to
+    // BOTH observers, so each saw nothing, each saw the same nothing, and this
+    // equality reported agreement. With the filter reading `event=` for the name
+    // and `outcome=` for the disposition, a delivery record that DID appear is
+    // seen by `captured`; it would reach `observing_ids` through the SAME
+    // predicate in `ThreadObservingLayer::on_event`, and the two would still
+    // agree. So this arm is kept as a cross-check on that shared predicate and
+    // is NOT claimed as a second, independent proof of the single-worker bound
+    // -- that bound is asserted by
+    // `assert_the_wrapper_spawns_exactly_one_named_worker`.
+    assert_eq!(
+        observing_ids, distinct_threads,
+        "both sides are captured from the same thread-local scope and watch the same \
+         delivery-named events, so they must observe the same emitting threads; a difference \
+         means one side saw a delivery-named event the other did not. Re-collecting \
+         `observing_ids` into a `HashSet` of its own would only have compared a value with \
+         itself, and is deliberately absent"
+    );
 }
 
 /// The UNCONDITIONAL worker bound, which needs no runtime at all: the worker
