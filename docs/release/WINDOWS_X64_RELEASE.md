@@ -1,6 +1,7 @@
 # Windows x64 Release
 
-`scripts/build-eliot-windows-x64-release.ps1` stages an intentionally unsigned bundle containing the release governor while the legacy `crates/eliot-app` crate is a workspace member (plus `eliot-agent-bridge.exe` at the bundle root when `-ClaudeCodeFrontDoor agent-bridge` is selected to serve the delegated-host Bridge redirect, issue #1719), twelve Cargo runtime executables (`eliot.exe`, `eliot-host.exe`, `eliot-watchdog.exe`, `eliot-kernel.exe`, `eliot-store-surreal.exe`, `eliotd.exe`, `eliot-doctor.exe`, `eliot-testd.exe`, `eliot-native-worker.exe`, `eliot-wasm-host.exe`, `eliot-user-broker.exe`, and `eliot-notify.exe`), a caller-pinned canonical `surreal.exe`, required Eliot.Operator publish output, config templates, canonical host integration packages, shared skills, migrations, and operations/release runbooks. The canary materializer admits exactly twelve executable roles: `runtime/eliot-host.exe`, `runtime/eliot-watchdog.exe`, `runtime/eliot-kernel.exe`, `runtime/eliot-store-surreal.exe`, `runtime/surreal.exe`, `runtime/eliotd.exe`, `runtime/eliot-doctor.exe`, `runtime/eliot-testd.exe`, `runtime/eliot-native-worker.exe`, `runtime/eliot-wasm-host.exe`, `runtime/eliot-user-broker.exe`, and `runtime/eliot-notify.exe`, plus the three non-executable role files. The shipped `runtime/eliot.exe` is an additional install-authoritative CLI trust role signed by the same finalizer, so the finalizer's fixed runtime signing denominator is the 13 staged runtime roles - those twelve materializer executables plus the CLI. The retained Governor, its Codex-plugin copy, the bundle-root Bridge, and the Eliot.Operator PE payload are further source-bound Authenticode roles the finalizer reconstructs from the staged manifests and their receipts; they sit outside that fixed 13-role runtime list. The tracked `docs/release/SURREALDB_WINDOWS_X64.lock.json` record binds the canonical external binary to version `3.1.4`, Windows x64 PE machine `8664`, and SHA-256 `13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1`. `runtime/RUNTIME_ARTIFACTS.json` is a verified build-artifact input: it records the pinned source commit and catalog SHA-256, exact source kind, version, and Windows x64 architecture for each Cargo target and for the externally supplied database binary. It explicitly carries `installation_approval: not-issued` and `signature_evidence: not-issued`; it is not a signed `CandidateManifest` and does not perform installation, SCM registration, or activation. Host plugins live under their owning `integrations/<host>` tree; the bundle does not create a second top-level plugin copy. While the legacy crate is present, the Codex surface is a self-contained local marketplace at `integrations/codex/marketplace.json` with its plugin at `integrations/codex/plugins/eliot-governor` and the release Governor copied into that plugin's `bin` directory beside the current-owner `eliot-agent-bridge.exe` copy that the plugin MCP manifest launches (the marketplace names that bridge route explicitly). The marketplace and plugin subtree leave the release together with the governor binary only under a detached owner-proven retirement (issue #2968): the original v1 owner approval R(C) verifies against its historical source commit and tree under the admitted issuer and root-owned trust policy, while the release separately binds current candidate D and its independently recomputed closure; a missing or stale approval, unsafe D transition, or unavailable issuer blocks retirement — source absence alone, and any flag or malformed Cargo metadata, never retire anything. A retired release carrying a detached owner approval carries no Codex marketplace or plugin subtree, so no shipped plugin ever names a missing command (governor disposition `retired`; see the Claude Code front door paragraph below). Its default output root is `%LOCALAPPDATA%\Eliot\packages`; `-OutputRoot` accepts an explicit absolute path or a repository-relative override.
+`scripts/build-eliot-windows-x64-release.ps1` stages an intentionally unsigned bundle containing the release governor while the legacy `crates/eliot-app` crate is a workspace member (plus `eliot-agent-bridge.exe` at the bundle root when `-ClaudeCodeFrontDoor agent-bridge` is selected to serve the delegated-host Bridge redirect, issue #1719), twelve Cargo runtime executables (`eliot.exe`, `eliot-host.exe`, `eliot-watchdog.exe`, `eliot-kernel.exe`, `eliot-store-surreal.exe`, `eliotd.exe`, `eliot-doctor.exe`, `eliot-testd.exe`, `eliot-native-worker.exe`, `eliot-wasm-host.exe`, `eliot-user-broker.exe`, and `eliot-notify.exe`), a caller-pinned canonical `surreal.exe`, required Eliot.Operator publish output, config templates, canonical host integration packages, shared skills, migrations, and operations/release runbooks. The canary materializer admits exactly twelve executable roles: `runtime/eliot-host.exe`, `runtime/eliot-watchdog.exe`, `runtime/eliot-kernel.exe`, `runtime/eliot-store-surreal.exe`, `runtime/surreal.exe`, `runtime/eliotd.exe`, `runtime/eliot-doctor.exe`, `runtime/eliot-testd.exe`, `runtime/eliot-native-worker.exe`, `runtime/eliot-wasm-host.exe`, `runtime/eliot-user-broker.exe`, and `runtime/eliot-notify.exe`, plus the three non-executable role files. The shipped `runtime/eliot.exe` is an additional install-authoritative CLI trust role signed by the same finalizer, so the finalizer's fixed runtime signing denominator is the 13 staged runtime roles - those twelve materializer executables plus the CLI. The retained Governor, its Codex-plugin copy, the bundle-root Bridge, and the Eliot.Operator PE payload are further source-bound Authenticode roles the finalizer reconstructs from the staged manifests and their receipts; they sit outside that fixed 13-role runtime list. The staged Codex-plugin bridge copy additionally carries a
+`codex-plugin-agent-bridge` role in the staged signing inventory, which the finalizer does not reconstruct. The tracked `docs/release/SURREALDB_WINDOWS_X64.lock.json` record binds the canonical external binary to version `3.1.4`, Windows x64 PE machine `8664`, and SHA-256 `13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1`. `runtime/RUNTIME_ARTIFACTS.json` is a verified build-artifact input: it records the pinned source commit and catalog SHA-256, exact source kind, version, and Windows x64 architecture for each Cargo target and for the externally supplied database binary. It explicitly carries `installation_approval: not-issued` and `signature_evidence: not-issued`; it is not a signed `CandidateManifest` and does not perform installation, SCM registration, or activation. Host plugins live under their owning `integrations/<host>` tree; the bundle does not create a second top-level plugin copy. While the legacy crate is present, the Codex surface is a self-contained local marketplace at `integrations/codex/marketplace.json` with its plugin at `integrations/codex/plugins/eliot-governor` and the release Governor copied into that plugin's `bin` directory beside the current-owner `eliot-agent-bridge.exe` copy that the plugin MCP manifest launches (the marketplace names that bridge route explicitly). The marketplace and plugin subtree leave the release together with the governor binary only under a detached owner-proven retirement (issue #2968): the original v1 owner approval R(C) verifies against its historical source commit and tree under the admitted issuer and root-owned trust policy, while the release separately binds current candidate D and its independently recomputed closure; a missing or stale approval, unsafe D transition, or unavailable issuer blocks retirement — source absence alone, and any flag or malformed Cargo metadata, never retire anything. A retired release carrying a detached owner approval carries no Codex marketplace or plugin subtree, so no shipped plugin ever names a missing command (governor disposition `retired`; see the Claude Code front door paragraph below). Its default output root is `%LOCALAPPDATA%\Eliot\packages`; `-OutputRoot` accepts an explicit absolute path or a repository-relative override.
 
 The catalog keeps the installed `3.1.4` observation separate from the project-local patched candidate. `patched_candidate` binds the official `3.2.0` Windows x64 artifact and its source/advisory evidence. A real staging run with `-UseProjectLocalSurreal` invokes `scripts/provision-surrealdb-release.py`, consumes `.eliot/dependency-policy/surrealdb/v3.2.0/surreal-v3.2.0.windows-amd64.exe`, and copies that verified byte set to `runtime/surreal.exe`; it never changes the shared `C:\Tools\SurrealDB` installation.
 
@@ -81,9 +82,11 @@ Finalize one verified runtime-canary bundle without rebuilding, installing, or
 registering services. Every value below is explicit: the SignTool path, the
 certificate store and exact thumbprint, and the approved RFC3161 endpoint. The
 certificate must have `HasPrivateKey=true` and the Code Signing EKU. The
-finalizer signs the six materializer roles plus the install-authoritative
-`runtime/eliot.exe` CLI trust role, requests SHA-256 file and
-timestamp digests, performs independent `Get-AuthenticodeSignature`/WinTrust
+finalizer signs the thirteen fixed runtime roles - the twelve materializer
+executable roles plus the install-authoritative `runtime/eliot.exe` CLI trust
+role - and the source-bound Operator, Governor, Codex-plugin Governor, and
+bundle-root Bridge roles, requests SHA-256 file and timestamp digests,
+performs independent `Get-AuthenticodeSignature`/WinTrust
 readback plus exact-exit-zero `signtool verify /pa /all /v /tw` for every role,
 and parses the embedded RFC3161 CMS token. The token must use the Microsoft
 RFC3161 unauthenticated attribute, carry a SHA-256 TSTInfo messageImprint over
@@ -139,7 +142,8 @@ if ($LASTEXITCODE -ne 0) { throw 'signed-bundle snapshot verification failed' }
 `-VerifyBundle` alone is only a point-in-time snapshot and cannot authorize a
 later path-based CLI launch. The canonical production launcher derives only
 `runtime/eliot.exe` from `SignedBundle`, retains no-follow bundle/runtime/file
-handles that deny write and delete, reruns the seven-role public verification,
+handles that deny write and delete, reruns the public verification of every role in the
+reconstructed source-bound signing inventory,
 creates that exact CLI suspended, binds the process image path, start time,
 volume/file identity, bytes, SHA-256, signer, Code Signing EKU and RFC3161
 evidence, then resumes while every fence remains live through child completion.
@@ -197,8 +201,10 @@ cryptographic timestamp readback is mandatory, so a URL that does not produce
 a timestamp cannot finalize a bundle. `-PlanOnly` validates the explicit
 signing contract without touching the input. `-VerifyBundle` independently
 rechecks the signed manifests, exact signer/timestamp evidence, all sizes and
-hashes, and all seven signing-role signatures (the six materializer roles plus
-the CLI trust role). Verification requires the unsigned source
+hashes, and the signature of every role in the reconstructed source-bound signing
+inventory (the 13 fixed runtime roles plus the source-bound Operator, Governor,
+Codex-plugin Governor, and bundle-root Bridge roles).
+Verification requires the unsigned source
 bundle and the same external SignTool/store/thumbprint/timestamp policy; signed
 JSON is never allowed to attest its own signer policy. Signing requires the
 exact certificate's private key and real X509 Code Signing EKU; verification
@@ -234,8 +240,10 @@ immediate readback, but a mutable Windows directory namespace cannot be frozen
 through a consumer handoff. Consequently the finalizer has no success terminal.
 
 The exact source inventory is read back after copy and before commit. Only the
-seven PE certificate-table changes (six materializer roles plus the CLI trust
-role), the three manifest rewrites, and the exact
+PE certificate-table changes limited to exactly the reconstructed signing roles
+(the 13 fixed runtime roles plus the source-bound Operator, Governor,
+Codex-plugin Governor, and bundle-root Bridge roles),
+the three manifest rewrites, and the exact
 `SIGNING_REQUIRED.txt` to `SIGNING_VERIFIED.json` marker transition are allowed;
 all non-role paths, hashes, and sizes remain byte-identical. Each PE normalized
 image prefix must also remain identical after excluding only the checksum and
@@ -262,7 +270,7 @@ The provider-free process-bound launcher suite
 `tests/release-security/trusted-cli-launch-tests.ps1` covers the static and
 negative boundaries without live signing or installation. It proves that the
 shipped script rejects dot-source, has no raw argument/verifier/hook surface,
-derives all six Phase-A executable paths from one retained signed bundle, and
+derives its Phase-A executable paths from one retained signed bundle, and
 rejects mixed roles, `--help` false zero, and missing or substituted final
 receipts. It does not claim a standalone shipped success path: deterministic
 CI cannot produce public-trust/RFC3161 evidence without a signing provider.
