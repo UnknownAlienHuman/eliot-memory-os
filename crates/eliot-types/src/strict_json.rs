@@ -53,11 +53,13 @@ impl StrictJsonErrorKind {
     /// Stable, redacted, caller-safe reason string.
     ///
     /// Never contains input bytes, an offset, or the duplicate member value.
+    /// Every byte is lowercase ASCII, a space or a colon, so the string cannot
+    /// carry a mixed-case member name out of the document it rejected.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TooLarge => "strict json: document exceeds byte ceiling",
-            Self::Malformed => "strict json: malformed or trailing JSON document",
+            Self::Malformed => "strict json: malformed or trailing json document",
             Self::DuplicateKey => DUPLICATE_MEMBER_MARKER,
         }
     }
