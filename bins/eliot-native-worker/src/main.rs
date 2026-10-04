@@ -1520,20 +1520,20 @@ mod tests {
     }
 
     fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-        let body = serde_json::to_vec(frame).expect("frame");
-        let mut out = u32::try_from(body.len())
-            .expect("len")
-            .to_le_bytes()
-            .to_vec();
-        out.extend_from_slice(&body);
-        out
+        eliot_ipc::encode_frame(
+            &frame.to_ebp_frame().expect("EBP frame"),
+            eliot_ipc::TransportLimits::default(),
+        )
+        .expect("encoded EBP frame")
     }
 
     fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-        let (prefix, body) = bytes.split_at(4);
-        let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-        assert_eq!(length, body.len());
-        serde_json::from_slice(body).expect("response")
+        let frame = eliot_ipc::decode_frame(bytes, eliot_ipc::TransportLimits::default())
+            .expect("EBP response frame");
+        let eliot_protocol::ProtocolPayload::Json(response) = frame.payload else {
+            panic!("JSON worker response");
+        };
+        serde_json::from_value(response).expect("response")
     }
 
     type SliceDWorker = NativeWorker<
