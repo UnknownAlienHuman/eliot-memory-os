@@ -5456,6 +5456,151 @@ mod tests {
         );
     }
 
+    /// Every repair reference and the owner the rollback contract REQUIRES, and
+    /// the typed gap production produces for each one.
+    ///
+    /// `check_rollback_join` calls `check_rollback_contract` FIRST: before it
+    /// compares the owner with the policy and with the admission review, and
+    /// before it compares the declared references. A contract that names no
+    /// repair path is therefore refused as a gap and never reaches those
+    /// comparisons, so each case below states what the gap check really returns
+    /// rather than what a neighbouring join would return for the same field.
+    ///
+    /// All six references and the owner are refused by `.trim().is_empty()`, so
+    /// an all-whitespace value IS the gap and not a merely unusual one: it names
+    /// no contract and no owner, and it is never read as agreement.
+    ///
+    /// The admitted twin for every case below is the SAME unchanged fixture:
+    /// `one_valid_joined_fixture_reaches_the_non_authorizing_canary_handoff`
+    /// admits it and carries `rollback-2702-a`, `disable-2702-a`, `reopen-2702-a`,
+    /// `expiry-2702-a`, `forward-repair-2702-a`, `rollback-owner-2702-a` and a
+    /// three-member invalidation set into that handoff, so it is not repeated.
+    #[test]
+    fn every_required_rollback_reference_and_owner_must_be_present() {
+        let gap_detail = "missing-rollback: rollback contract required before experiment";
+        let mut group = fixture("a");
+        group.rollback.rollback_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-disable: disable contract required before experiment";
+        let mut group = fixture("a");
+        group.rollback.disable_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-reopen: reopen contract required before experiment";
+        let mut group = fixture("a");
+        group.rollback.reopen_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-expiry: expiry must bind the admitted operation";
+        let mut group = fixture("a");
+        group.rollback.expiry_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-forward-repair: forward repair required before experiment";
+        let mut group = fixture("a");
+        group.rollback.forward_repair_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        // The OWNER is a gap of exactly this kind, not the owner mismatch a
+        // different owner produces: the gap check runs first, so a blank owner
+        // is never compared against the policy at all.
+        let gap_detail = "missing-rollback-owner: rollback owner required before experiment";
+        let mut group = fixture("a");
+        group.rollback.rollback_owner_id = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+    }
+
+    /// The invalidation set is required, ceiled and member-bounded, and those
+    /// three refusals are three DIFFERENT variants with three different payloads,
+    /// so they are stated separately rather than flattened into one rollback
+    /// gap.
+    ///
+    /// The admitted twin is again the unchanged fixture: the positive handoff
+    /// above carries that fixture's three-member set while the handoff itself
+    /// keeps the proposal's own two targets.
+    #[test]
+    fn a_rollback_invalidation_set_must_be_present_ceiled_and_member_bounded() {
+        // An absent set is the named gap, and it is a gap rather than the
+        // coverage relation a set that covers too little produces.
+        let gap_detail = "missing-invalidation: invalidation set required before experiment";
+        let mut group = fixture("a");
+        group.rollback.invalidation_set = Vec::new();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        // One member past the admitted set ceiling is a PROFILE refusal on the
+        // set's own field name, not a gap: the contract does name a repair path,
+        // and this run refuses to carry a set that large. The members stay
+        // distinct so nothing here depends on the duplicate-set check, which
+        // this refusal never reaches.
+        let mut wide_set = fixture("a");
+        let mut wide_members: Vec<String> = Vec::new();
+        for index in 0..=IMPROVEMENT_MAX_SET_MEMBERS {
+            wide_members.push(format!("invalidation-wide-{index}"));
+        }
+        wide_set.rollback.invalidation_set = wide_members;
+        assert_eq!(
+            wide_set.refusal(),
+            PipelineError::InputProfileCeiling("rollback.invalidation_set")
+        );
+
+        // A member that names no target is a MISSING FIELD on the set, not a gap
+        // and not the coverage relation: the set is present and within its
+        // ceiling, so the member itself is what is read, and coverage is only
+        // considered after every member passes.
+        let mut blank_member = fixture("a");
+        blank_member.rollback.invalidation_set[0] = "   ".to_string();
+        assert_eq!(
+            blank_member.refusal(),
+            PipelineError::MissingField("rollback.invalidation_set")
+        );
+
+        // Past the reference ceiling that same member is a profile refusal, so
+        // the set ceiling and the member ceiling are two rules and not one rule
+        // stated twice.
+        let mut wide_member = fixture("a");
+        wide_member.rollback.invalidation_set[0] = "w".repeat(IMPROVEMENT_MAX_REFERENCE_BYTES + 1);
+        assert_eq!(
+            wide_member.refusal(),
+            PipelineError::InputProfileCeiling("rollback.invalidation_set")
+        );
+    }
+
     #[test]
     fn an_uncovered_required_invalidation_target_refuses() {
         let mut group = fixture("a");
