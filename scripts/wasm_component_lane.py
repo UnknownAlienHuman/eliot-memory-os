@@ -102,6 +102,16 @@ _DISPOSITIONS = frozenset({
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _SHELL_CHARS = frozenset(";&|$`()<>{}*?!~#%^\n\r\t\"'\\")
+# Observed libtest evidence only: the per-target summary line. The exact
+# "test <declared name> ... ok" line is matched per call, because the declared
+# capsule test name is a bound value and never a fixed pattern.
+_TEST_RESULT_RE = re.compile(
+    r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored", re.MULTILINE)
+# A reason in this set means the required evidence was absent or unreadable,
+# which is UNAVAILABLE; any other refusal is FAILED.
+_UNAVAILABLE_REASONS = frozenset({
+    "ARTIFACT_UNAVAILABLE", "ARTIFACT_SIZE_LIMIT", "CAPSULE_RESULT_UNAVAILABLE",
+})
 
 
 class LaneError(ValueError):
@@ -217,6 +227,8 @@ class FrozenBinding:
     capsule_operation: str
     capsule_stage: str
     capsule_oracle: str
+    capsule_test_target: str
+    capsule_test_name: str
     native_contract: str
     native_revision: str
     engine_implementation: str
@@ -304,6 +316,22 @@ def freeze_module(root: Path, module: str, entry: Mapping[str, Any]) -> FrozenBi
         bound = capsule.get(bound_key)
         if type(bound) is not int or bound <= 0 or bound > 1_073_741_824:
             raise LaneError("CAPSULE_BOUND_INVALID")
+    # The executable capsule identity, declared per entry and frozen here.
+    # A stage label is a ProofStage name, never a libtest name, so it can
+    # never select the declared capsule; the exact package test target and
+    # exact test name are the only thing ``wasm-test`` may filter on. An
+    # undeclared or malformed execution identity fails closed before any
+    # command exists rather than silently running the wrong tests.
+    execution = capsule.get("execution")
+    if type(execution) is not dict or set(execution) != {"package_test_target", "test_name"}:
+        raise LaneError("CAPSULE_EXECUTION_UNDECLARED")
+    capsule_test_target = _bounded_text(
+        execution.get("package_test_target"), "CAPSULE_TEST_TARGET")
+    if re.fullmatch(r"[a-z0-9_]{1,64}", capsule_test_target) is None:
+        raise LaneError("CAPSULE_TEST_TARGET_INVALID")
+    capsule_test_name = _bounded_text(execution.get("test_name"), "CAPSULE_TEST_NAME")
+    if re.fullmatch(r"[A-Za-z0-9_:]{1,128}", capsule_test_name) is None:
+        raise LaneError("CAPSULE_TEST_NAME_INVALID")
 
     native_contract = _bounded_text(entry.get("native_contract"), "NATIVE_CONTRACT")
     native_revision = _bounded_text(entry.get("native_revision"), "NATIVE_REVISION")
@@ -338,6 +366,8 @@ def freeze_module(root: Path, module: str, entry: Mapping[str, Any]) -> FrozenBi
         capsule_operation=capsule_operation,
         capsule_stage=capsule_stage,
         capsule_oracle=capsule_oracle,
+        capsule_test_target=capsule_test_target,
+        capsule_test_name=capsule_test_name,
         native_contract=native_contract,
         native_revision=native_revision,
         engine_implementation=engine_implementation,
@@ -412,6 +442,50 @@ def component_artifact_path(frozen: FrozenBinding, target_root: Path) -> Path:
     else:
         raise LaneError("INVALID_PROFILE")
     return target_root / GUEST_TARGET / profile_dir / f"{module}.wasm"
+
+
+def bind_artifact(frozen: FrozenBinding, target_root: Path) -> dict[str, Any]:
+    """Observed artifact identity for one actual run: real path, size, SHA-256.
+
+    Read from disk on every build and test pass. A declared or expected
+    artifact is never reported; an absent, non-regular or symlinked artifact
+    is missing expected execution and fails closed here.
+    """
+    artifact_path = component_artifact_path(frozen, target_root)
+    if artifact_path.is_symlink() or not artifact_path.is_file():
+        raise LaneError("ARTIFACT_UNAVAILABLE")
+    digest, size = sha256_file(artifact_path)
+    return {"path": str(artifact_path), "sha256": digest, "bytes": size}
+
+
+def verify_capsule_execution(output: bytes, test_name: str) -> dict[str, int]:
+    """Return the observed libtest counts only when the declared capsule test ran.
+
+    A zero exit from a filtered harness proves nothing: ``--exact`` on a name
+    no test carries still exits 0 with ``0 passed``. The declared capsule test
+    must appear in the harness output as passed, and at least one harness
+    summary line must exist, or missing expected execution is non-green.
+    """
+    text = output.decode("utf-8", errors="replace")
+    summaries = _TEST_RESULT_RE.findall(text)
+    if not summaries:
+        raise LaneError("CAPSULE_RESULT_UNAVAILABLE")
+    executed = re.compile(
+        r"^test " + re.escape(test_name) + r" \.\.\. ok\s*$", re.MULTILINE)
+    if executed.search(text) is None:
+        raise LaneError("CAPSULE_TEST_NOT_EXECUTED")
+    passed = failed = ignored = 0
+    for outcome, summary_passed, summary_failed, summary_ignored in summaries:
+        if outcome != "ok":
+            failed += 1
+        passed += int(summary_passed)
+        failed += int(summary_failed)
+        ignored += int(summary_ignored)
+    if failed:
+        raise LaneError("CAPSULE_TEST_FAILED")
+    if passed < 1:
+        raise LaneError("CAPSULE_TEST_NOT_EXECUTED")
+    return {"passed": passed, "failed": failed, "ignored": ignored}
 
 
 def cache_store_root(controller_root: Path, cache_id: str) -> Path:
@@ -624,16 +698,19 @@ def build_argv(frozen: FrozenBinding, target_root: Path) -> list[str]:
 def test_argv(frozen: FrozenBinding, target_root: Path) -> list[str]:
     """Fixed declared-capsule-only test argv for one component.
 
-    Executes only the declared capsule stage through the owning package
-    test entrypoint (accepted #760/#758 capsule execution path), never
-    the workspace gate (#750 remains its owner).
+    Selects exactly the declared capsule proof test by its frozen package
+    test target and exact test name, never the ``ProofStage`` label: a stage
+    such as ``INVOCATION`` is not a libtest name, so passing it as a filter
+    matched no guest test and a zero exit proved no execution at all. The
+    workspace gate is never run from this leaf (#750 remains its owner).
     """
     check_module_name(frozen.module)
     argv = [
         "cargo", "test", "-p", frozen.module,
         "--target", GUEST_TARGET,
         "--target-dir", str(target_root),
-        "--", frozen.capsule_stage,
+        "--test", frozen.capsule_test_target,
+        "--", "--exact", frozen.capsule_test_name,
     ]
     _assert_exact_manifest_argv(argv, frozen.module)
     return argv
@@ -772,6 +849,8 @@ def make_receipt(
             "operation": frozen.capsule_operation,
             "stage": frozen.capsule_stage,
             "oracle": frozen.capsule_oracle,
+            "test_target": frozen.capsule_test_target,
+            "test_name": frozen.capsule_test_name,
             "report": dict(capsule_report) if capsule_report is not None else None,
         },
         "execution": {
@@ -1127,21 +1206,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     disposition = "FAILED"
                 if disposition == "BUILD_PASS":
                     try:
-                        artifact_path = component_artifact_path(frozen, target_root)
-                        if artifact_path.is_symlink() or not artifact_path.is_file():
-                            raise LaneError("ARTIFACT_NOT_REGULAR")
-                        artifact_sha256, artifact_bytes = sha256_file(artifact_path)
-                    except (LaneError, OSError):
+                        artifact = bind_artifact(frozen, target_root)
+                    except (LaneError, OSError) as error:
                         # Missing expected execution is non-green.
                         artifact = None
                         disposition = "UNAVAILABLE"
-                        reason = "ARTIFACT_UNAVAILABLE"
+                        reason = str(error)
                     else:
-                        artifact = {
-                            "path": str(artifact_path),
-                            "sha256": artifact_sha256,
-                            "bytes": artifact_bytes,
-                        }
                         write_cache_record(controller_root, cache_id, {
                             "schema": CACHE_RECORD_SCHEMA,
                             "cache_identity": cache_id,
@@ -1150,14 +1221,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "source": {"base": args.base_sha, "head": args.head_sha},
                         })
                 elif disposition == "TEST_PASS":
-                    # Only the observed tool status plus the frozen capsule
-                    # identity; no parsed, counted, or invented result.
-                    capsule_report = {
-                        "operation": frozen.capsule_operation,
-                        "stage": frozen.capsule_stage,
-                        "oracle": frozen.capsule_oracle,
-                        "tool_status": result.status,
-                    }
+                    # A zero exit is not execution evidence: bind the real
+                    # artifact the capsule ran against and require the
+                    # declared capsule test to appear as passed. Anything
+                    # missing stays a distinct non-green disposition.
+                    try:
+                        artifact = bind_artifact(frozen, target_root)
+                        counts = verify_capsule_execution(
+                            result.output, frozen.capsule_test_name)
+                    except (LaneError, OSError) as error:
+                        artifact = None
+                        disposition = (
+                            "UNAVAILABLE" if str(error) in _UNAVAILABLE_REASONS
+                            else "FAILED")
+                        reason = str(error)
+                    else:
+                        capsule_report = {
+                            "operation": frozen.capsule_operation,
+                            "stage": frozen.capsule_stage,
+                            "oracle": frozen.capsule_oracle,
+                            "tool_status": result.status,
+                            "executed_test": frozen.capsule_test_name,
+                            "executed_test_target": frozen.capsule_test_target,
+                            "artifact_sha256": artifact["sha256"],
+                            "passed": counts["passed"],
+                            "failed": counts["failed"],
+                            "ignored": counts["ignored"],
+                        }
                 if cache_hit:
                     warm_s = elapsed
                 else:

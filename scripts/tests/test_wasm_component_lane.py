@@ -1,6 +1,6 @@
 """Lane-gate regressions for #764; no fake proves live component execution.
 
-The declared denominator is 21 cases (1..21), one substantive executable test per `# WORK_UNIT_CASE: 764/<case>` marker; markers 1..2, 5..15 and 17..20 are present and drive the lane helper's public APIs with the private run seam faked. Markers 16 and 21 are deliberately absent: both need `.github/workflows/wasm-modules.yml`, outside the card's EDIT scope by accepted owner decision, and 21 also needs one owner-authorized manual Actions dispatch, so the issue stays open until they land with real component execution. That real-execution proof is separate and still blocked: on main@8fb0a426f/f5cc5d2bb the guest closure does not compile for wasm32-wasip2 (error[E0392] in crates/smart/eliot-context-admission/src/lib.rs:91), so no artifact path, size or SHA-256 exists yet and the lane correctly reports a non-green disposition.
+The declared denominator is 21 cases (1..21), one substantive executable test per `# WORK_UNIT_CASE: 764/<case>` marker; 19 markers are present (1..15 and 17..20) and drive the lane helper's public APIs with the private run seam faked. Markers 16 and 21 are deliberately absent: both need `.github/workflows/wasm-modules.yml`, outside the card's EDIT scope by accepted owner decision, and 21 also needs one owner-authorized manual Actions dispatch, so the issue stays open until they land with real component execution. That real-execution proof is separate and still blocked: on main the guest closure does not compile for wasm32-wasip2 (error[E0392] in crates/smart/eliot-context-admission/src/lib.rs:91, whose `LearningGovernance<'a>` uses `'a` only inside a `#[cfg(not(target_arch = "wasm32"))]` variant), so `cargo build` never emits the component artifact; and `cargo test --target wasm32-wasip2` has no configured runner for a wasip2 harness. Both just commands therefore stay non-green by observation, not by a mocked tool status.
 """
 from __future__ import annotations
 
@@ -64,6 +64,13 @@ class WasmComponentLaneTests(unittest.TestCase):
         frozen = lane.freeze_module(ROOT, module, entry)
         self.assertEqual(frozen.capsule_stage, entry["capsule"]["stage"])
         self.assertIn(frozen.capsule_stage, lane.FROZEN_STAGES)
+        # The declared capsule test identity is frozen from the registry
+        # entry, and the stage label is never the thing cargo filters on:
+        # a ProofStage such as INVOCATION matches no libtest name, so a zero
+        # exit from it proved no capsule execution at all.
+        declared = entry["capsule"]["execution"]
+        self.assertEqual(frozen.capsule_test_target, declared["package_test_target"])
+        self.assertEqual(frozen.capsule_test_name, declared["test_name"])
         with tempfile.TemporaryDirectory() as scratch:
             target_root = Path(scratch) / "lane-target"
             argv = lane.test_argv(frozen, target_root)
@@ -74,12 +81,15 @@ class WasmComponentLaneTests(unittest.TestCase):
                 "cargo", "test", "-p", module,
                 "--target", lane.GUEST_TARGET,
                 "--target-dir", root_text,
-                "--", frozen.capsule_stage,
+                "--test", frozen.capsule_test_target,
+                "--", "--exact", frozen.capsule_test_name,
             ],
         )
         separator = argv.index("--")
         self.assertEqual(argv.count("--"), 1)
-        self.assertEqual(argv[separator + 1:], [frozen.capsule_stage])
+        self.assertEqual(
+            argv[separator + 1:], ["--exact", frozen.capsule_test_name])
+        self.assertNotIn(frozen.capsule_stage, argv)
         self.assertEqual(argv.count("-p"), 1)
         self.assertEqual(
             [argv[index + 1] for index, part in enumerate(argv) if part == "-p"],
@@ -95,10 +105,36 @@ class WasmComponentLaneTests(unittest.TestCase):
             with self.subTest(argv=forbidden):
                 with self.assertRaises(lane.LaneError) as failure:
                     lane._assert_exact_manifest_argv(
-                        ["cargo", "test", "-p", module, forbidden, frozen.capsule_stage],
+                        ["cargo", "test", "-p", module, forbidden, frozen.capsule_test_name],
                         module,
                     )
                 self.assertEqual(str(failure.exception), "WORKSPACE_LANE_DENIED")
+
+        # An undeclared or malformed execution identity fails closed while
+        # freezing, before any command exists: the lane may never fall back
+        # to some other test of the owning package.
+        import copy
+
+        for mutation, expected in (
+            ({"execution": None}, "CAPSULE_EXECUTION_UNDECLARED"),
+            ({"execution": {}}, "CAPSULE_EXECUTION_UNDECLARED"),
+            ({"execution": {"test_name": declared["test_name"]}}, "CAPSULE_EXECUTION_UNDECLARED"),
+            ({"execution": dict(declared, package_test_target="../proof")},
+             "CAPSULE_TEST_TARGET_INVALID"),
+            ({"execution": dict(declared, package_test_target="Proof/Proof")},
+             "CAPSULE_TEST_TARGET_INVALID"),
+            ({"execution": dict(declared, test_name="--nocapture")},
+             "CAPSULE_TEST_NAME_INVALID"),
+            ({"execution": dict(declared, test_name="")}, "INVALID_CAPSULE_TEST_NAME"),
+            ({"execution": dict(declared, extra="x")}, "CAPSULE_EXECUTION_UNDECLARED"),
+        ):
+            with self.subTest(mutation=sorted(mutation)):
+                broken = copy.deepcopy(entry)
+                broken["capsule"].pop("execution", None)
+                broken["capsule"].update(mutation)
+                with self.assertRaises(lane.LaneError) as failure:
+                    lane.freeze_module(ROOT, module, broken)
+                self.assertEqual(str(failure.exception), expected)
 
     # WORK_UNIT_CASE: 764/5
     def test_one_component_execution_never_invokes_workspace_or_normal_verification(self):
@@ -543,6 +579,70 @@ class WasmComponentLaneTests(unittest.TestCase):
         self.assertIsNone(empty["capsule"]["report"])
         self.assertEqual(empty["execution"]["disposition"], "SKIPPED")
         self.assertIs(empty["execution"]["cache_skipped_verification"], False)
+
+        # A real `--test` run binds the artifact read back off disk and the
+        # capsule execution actually observed in the harness output, never
+        # the declared stage/oracle echoed back as if it were a result.
+        registry_path = ROOT / "scripts/testdata/wasm-component-lane/registry.json"
+        test_name = frozen.capsule_test_name
+        harness_ok = (
+            "\n     Running tests/proof.rs (target/wasm32-wasip2/debug/deps/proof-abc)\n"
+            f"test {test_name} ... ok\n"
+            "\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.01s\n"
+        ).encode("utf-8")
+        executed_argv: list[list[str]] = []
+
+        def fake_capsule_gate(tool_argv, cwd, timeout=lane.COMMAND_TIMEOUT):
+            executed_argv.append(list(tool_argv))
+            target_dir = Path(tool_argv[tool_argv.index("--target-dir") + 1])
+            artifact_path = lane.component_artifact_path(frozen, target_dir)
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(b"\x00asm\x01\x00\x00\x00" + module.encode("ascii"))
+            return lane.CommandResult("OK", harness_ok)
+
+        with tempfile.TemporaryDirectory() as scratch_text:
+            scratch = Path(scratch_text)
+            previous_tempdir = tempfile.tempdir
+            tempfile.tempdir = str(scratch)
+            try:
+                receipt_path = scratch / "receipt-test.json"
+                with mock.patch.object(lane, "_run", fake_capsule_gate):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        exit_code = lane.main([
+                            "--test", module,
+                            "--registry", str(registry_path),
+                            "--receipt-out", str(receipt_path),
+                            "--base-sha", base_sha,
+                            "--head-sha", head_sha,
+                        ])
+                observed = json.loads(receipt_path.read_text(encoding="utf-8"))
+                observed_digest = lane.sha256_file(Path(observed["artifact"]["path"]))[0]
+            finally:
+                tempfile.tempdir = previous_tempdir
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(observed["status"], "PASS")
+        self.assertEqual(observed["execution"]["disposition"], "TEST_PASS")
+        self.assertEqual(len(executed_argv), 1)
+        produced = executed_argv[0]
+        self.assertEqual(produced[:3], ["cargo", "test", "-p"])
+        self.assertNotIn(frozen.capsule_stage, produced)
+        self.assertEqual(
+            produced[produced.index("--") + 1:], ["--exact", test_name])
+        # The bound artifact is the file the fake gate really wrote, hashed
+        # by the helper: its identity cannot be a declared constant.
+        self.assertIsNotNone(observed["artifact"])
+        self.assertEqual(
+            observed["artifact"]["bytes"], len(b"\x00asm\x01\x00\x00\x00" + module.encode("ascii")))
+        self.assertRegex(observed["artifact"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(observed["artifact"]["sha256"], observed_digest)
+        report = observed["capsule"]["report"]
+        self.assertEqual(report["executed_test"], test_name)
+        self.assertEqual(report["executed_test_target"], frozen.capsule_test_target)
+        self.assertEqual(report["tool_status"], "OK")
+        self.assertEqual(report["passed"], 1)
+        self.assertEqual(report["failed"], 0)
+        self.assertEqual(report["artifact_sha256"], observed["artifact"]["sha256"])
 
     # WORK_UNIT_CASE: 764/12
     def test_one_guest_change_selects_only_justified_dependents(self):
@@ -1289,6 +1389,94 @@ class WasmComponentLaneTests(unittest.TestCase):
                     lines = stdout_by_scenario[label].splitlines()
                     self.assertEqual(len(lines), 1)
                     self.assertTrue(lines[0].startswith("WASM_COMPONENT_LANE: FAIL "))
+
+            # A zero exit from a filtered harness is not execution evidence.
+            # Each of these tools "succeeds" yet must stay non-green, because
+            # the declared capsule test did not demonstrably run and pass.
+            frozen = lane.freeze_module(ROOT, module, lane.resolve_module(FIXTURE, module))
+            declared_test = frozen.capsule_test_name
+            artifact_bytes = b"\x00asm\x01\x00\x00\x00" + module.encode("ascii")
+            zero_selected = (
+                "\n     Running tests/proof.rs (target/debug/deps/proof-abc)\n"
+                "running 0 tests\n"
+                "\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; "
+                "1 filtered out; finished in 0.00s\n"
+            ).encode("utf-8")
+            wrong_test_passed = (
+                "\n     Running tests/proof.rs (target/debug/deps/proof-abc)\n"
+                "test some_other_proof_test ... ok\n"
+                "\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                "0 filtered out; finished in 0.01s\n"
+            ).encode("utf-8")
+            failed_summary = (
+                f"test {declared_test} ... ok\n"
+                "\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; "
+                "0 filtered out; finished in 0.01s\n"
+            ).encode("utf-8")
+            capsule_scenarios = (
+                ("zero_selected_capsule", zero_selected, True,
+                 "FAILED", "CAPSULE_TEST_NOT_EXECUTED"),
+                ("wrong_test_passed", wrong_test_passed, True,
+                 "FAILED", "CAPSULE_TEST_NOT_EXECUTED"),
+                ("no_harness_summary", b"Compiling eliot v0.1.0\n", True,
+                 "UNAVAILABLE", "CAPSULE_RESULT_UNAVAILABLE"),
+                ("failed_capsule_summary", failed_summary, True,
+                 "FAILED", "CAPSULE_TEST_FAILED"),
+                ("capsule_without_artifact",
+                 f"test {declared_test} ... ok\n"
+                 "\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                 "0 filtered out; finished in 0.01s\n".encode("utf-8"),
+                 False, "UNAVAILABLE", "ARTIFACT_UNAVAILABLE"),
+            )
+            for label, output, writes_artifact, expected_disposition, expected_reason in (
+                capsule_scenarios
+            ):
+                with self.subTest(capsule_scenario=label):
+                    # Each scenario gets its own controller root: a lane
+                    # target root is a deterministic function of the frozen
+                    # digests, so a shared root would let one scenario's
+                    # artifact satisfy a later scenario that must not have
+                    # one.
+                    with tempfile.TemporaryDirectory() as capsule_scratch_text:
+                        capsule_scratch = Path(capsule_scratch_text)
+                        capsule_tempdir = tempfile.tempdir
+                        tempfile.tempdir = str(capsule_scratch)
+                        try:
+
+                            def fake_capsule(tool_argv, cwd, timeout=lane.COMMAND_TIMEOUT,
+                                             _out=output, _writes=writes_artifact):
+                                if _writes:
+                                    target_dir = Path(tool_argv[tool_argv.index("--target-dir") + 1])
+                                    artifact_path = lane.component_artifact_path(frozen, target_dir)
+                                    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                                    artifact_path.write_bytes(artifact_bytes)
+                                return lane.CommandResult("OK", _out)
+
+                            capsule_receipt = capsule_scratch / "receipt.json"
+                            with mock.patch.object(lane, "_run", fake_capsule):
+                                with contextlib.redirect_stdout(io.StringIO()):
+                                    capsule_code = lane.main([
+                                        "--test", module,
+                                        "--registry", str(registry_path),
+                                        "--receipt-out", str(capsule_receipt),
+                                        "--base-sha", "11" * 20,
+                                        "--head-sha", "22" * 20,
+                                    ])
+                            capsule_payload = json.loads(
+                                capsule_receipt.read_text(encoding="utf-8"))
+                        finally:
+                            tempfile.tempdir = capsule_tempdir
+                    self.assertNotEqual(capsule_code, 0)
+                    self.assertEqual(capsule_payload.get("status"), "FAIL")
+                    self.assertEqual(capsule_payload.get("reason"), expected_reason)
+                    self.assertEqual(
+                        capsule_payload["execution"]["disposition"], expected_disposition)
+                    self.assertIsNone(capsule_payload["capsule"]["report"])
+                    if not writes_artifact:
+                        self.assertIsNone(capsule_payload["artifact"])
+                    self.assertEqual(capsule_payload["proof_ceiling"], ceiling)
+                    self.assertEqual(
+                        state_keys(capsule_payload) & forbidden_state_keys, set())
 
     # WORK_UNIT_CASE: 764/4
     def test_traversal_absolute_separator_shell_injection_fail_before_commands(self):
