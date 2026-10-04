@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use eliot_types::cognition::CausalCandidate;
-use eliot_types::memory::DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS;
+use eliot_types::memory::{
+    DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS, MemoryApplicabilityPacketView, MemoryProvenanceView,
+};
 use eliot_types::{
     ActionSourceScope, AgentCandidateCurationInput, AgentCandidateSubmitInput, AgentRoutingView,
     AntigravityRun, AntigravityRunState, AntigravitySafetyReceipt, AutonomyRunContract,
@@ -23,6 +25,22 @@ use eliot_types::{
     TaskAcceptanceItem, TaskCognitionView, TaskContract, TaskContractInput, UnderstandingProof,
     UnderstandingProofReceipt, VerificationRun, WorkLease, WorktreeLease, WorktreeLeaseState,
     strict_json_value,
+};
+// The names case 18 reaches through a construction path rather than a decode.
+// Every one of them is a type or function that publishes `Default`, or a
+// constructor/helper that states a key the decoder would otherwise refuse to
+// receive, in the nine frozen production files.
+use eliot_types::{
+    AntigravityCapabilities, AntigravityResponseProtocolReceipt, AuthorityPermission,
+    AuthorityProfile, BlackboardScope, COGNITIVE_JUDGE_SCHEMA_VERSION,
+    COGNITIVE_UNDERSTANDING_SCHEMA_VERSION, CodeCortexScopeBinding, CognitiveJudgeResult,
+    CognitiveProjectionReadState, CognitiveUnderstandingAnswer, DecisionLocalitySuffix,
+    DelegationState, EpistemicPacketState, L0CollapsedDuplicateTrace, L0FeatureScore, L0RankTrace,
+    L0SuppressionTrace, MemoryConfidence, MemoryCurationCorpusProfile, MemoryLifecyclePacketView,
+    MetaCandidateChangeClass, MetaExperimentDecision, MinorityPressureStatus,
+    NegativeMemoryGateInput, OPERATOR_CONTRACT_MANIFEST, OPERATOR_SCHEMA_VERSION,
+    OperatorProjectionFilter, RecallConflictObservation, WorktreeLeaseKind,
+    minimal_cognitive_judge_result, minimal_cognitive_understanding_answer,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -3031,9 +3049,31 @@ fn case_07_repeated_members_are_rejected_at_decode_time() {
 
 // WORK_UNIT_CASE: 708/8
 #[test]
-fn case_08_versions_and_control_vocabulary_outside_the_frozen_set_fail() {
-    // Case 8: a version or control value outside the frozen set is refused by
-    // the current decoder. No legacy decoder is introduced to accept it.
+fn case_08_out_of_set_control_vocabulary_fails_and_no_version_gate_exists() {
+    // Case 8 covers ONE of this issue's two sub-requirements and now says which,
+    // because the version half of the name it used to carry was false.
+    //
+    // COVERED — a CLOSED CONTROL VOCABULARY SPELLING outside the frozen set is
+    // refused by the current decoder. Five arms, unchanged, and no legacy
+    // decoder, alias or default is introduced to accept any of them.
+    //
+    // NOT COVERED, because there is nothing to test — VERSION REJECTION of an
+    // unsupported current or legacy version. I searched all nine frozen
+    // production files for a version gate, meaning any comparison of a version
+    // against a constant and any refusal conditioned on a version. Across all
+    // nine files that search returns exactly two hits and BOTH are prose in doc
+    // comments, not code:
+    //   - mcp_contract.rs:368 and mcp_contract.rs:444, which each describe a gate
+    //     owned by `crates/eliot-app/src/mcp_stdio/verification.rs::
+    //     dispatch_observe`, a different crate and not one of the nine files.
+    // The single version COMPARISON that does exist in the nine files is
+    // cognition.rs:1585-1587, inside the `#[cfg(test)] mod contract_tests` of
+    // the production file: it asserts the shipped operator-contract manifest's
+    // `schema_version` equals `OPERATOR_SCHEMA_VERSION`. That is a version PIN
+    // over a shipped string, it is publicly reachable, and it is asserted below
+    // — but it refuses nothing and gates no decode, so it is not the gate the
+    // old name claimed. The arms below therefore establish the OPPOSITE of the
+    // old name: an out-of-set version is accepted and carried, not refused.
     let run: AntigravityRun = decode_fixture("antigravity_run_positive.json");
     assert_eq!(run.state, AntigravityRunState::Succeeded);
     assert_refusal_names::<AntigravityRun>(
@@ -3058,11 +3098,58 @@ fn case_08_versions_and_control_vocabulary_outside_the_frozen_set_fail() {
         "Auto",
         "a hint spelling outside the frozen set",
     );
+
+    // An unsupported version is not refused. Substituting it into an otherwise
+    // valid current document still decodes, and the decoded value differs from
+    // the current decode in the version and in nothing else, which is what a
+    // type with no version gate looks like from the outside.
+    let retagged: ObserveInput = serde_json::from_str(&with_field(
+        &corpus("observe_input_positive.json"),
+        "schema_version",
+        "\"eliot.observe-v0\"",
+    ))
+    .expect("an out-of-set version is refused by nothing in this crate");
+    assert_eq!(retagged.schema_version, "eliot.observe-v0");
+    let mut only_the_version_changed = observe.clone();
+    only_the_version_changed.schema_version = "eliot.observe-v0".to_owned();
+    assert_eq!(
+        retagged, only_the_version_changed,
+        "the out-of-set version changes the value and nothing else, so no gate read it"
+    );
     let unsupported_version: ObserveInput =
         decode_fixture("observe_input_unsupported_schema_version.json");
     assert_ne!(
         unsupported_version.schema_version, OBSERVE_INPUT_SCHEMA_VERSION,
-        "the unsupported version must stay off the named current boundary"
+        "the unsupported fixture must stay off the named current boundary"
+    );
+
+    // The second version fact, and the only version behaviour this crate does
+    // enforce: the PRIVATE helper `default_observe_schema_version`
+    // (mcp_contract.rs:476), wired by `#[serde(default = "...")]` at
+    // mcp_contract.rs:472, silently promotes an OMITTED version to the current
+    // one. So omission is upgraded to the current boundary while an explicit
+    // out-of-set value is carried as written. The helper is private, so this is
+    // a wire-side promotion, not a public construction path; case 18 records the
+    // same helper from the construction side.
+    let omitted: ObserveInput = serde_json::from_value(without(
+        serde_json::from_str(&corpus("observe_input_positive.json"))
+            .expect("the observe fixture must parse"),
+        "schema_version",
+    ))
+    .expect("omitting the version is not refused either");
+    assert_eq!(
+        omitted.schema_version, OBSERVE_INPUT_SCHEMA_VERSION,
+        "the helper must promote an omitted version to the current one"
+    );
+
+    // The one version assertion in the nine files that is publicly reachable.
+    // A pin over a shipped string, not a decode gate.
+    let manifest: Value =
+        serde_json::from_str(OPERATOR_CONTRACT_MANIFEST).expect("the operator manifest must parse");
+    assert_eq!(
+        manifest.get("schema_version").and_then(Value::as_str),
+        Some(OPERATOR_SCHEMA_VERSION),
+        "the shipped operator contract manifest carries the pinned schema version"
     );
 }
 
@@ -3280,10 +3367,15 @@ fn case_12_compatible_current_canonical_bytes_are_unchanged() {
 
 // WORK_UNIT_CASE: 708/13
 #[test]
-fn case_13_the_seal_covers_the_retained_default_keys_so_migration_is_required() {
-    // Case 13: the sealed provider plan's own digest recomputes over exactly the
-    // emitted keys, which is why its retained defaults are a digest-seal
-    // constraint rather than a compatibility tolerance.
+fn case_13_the_seal_covers_the_retained_default_keys_and_refuses_a_missing_seal_key() {
+    // RENAMED. The previous name ended `_so_migration_is_required`, which
+    // claimed a migration this case does not perform and that nothing in the
+    // crate can perform. The new name claims only what the body below proves:
+    // the sealed provider plan's own digest recomputes over exactly the emitted
+    // keys, so its retained defaults are a digest-seal constraint rather than a
+    // compatibility tolerance, and a missing seal key is refused outright. The
+    // migration this issue's case 13 asks about is stated, in full, at the end
+    // of this body, together with its owner and the evidence that it is absent.
     let plan: CognitiveFieldProviderPlan =
         decode_fixture("cognitive_field_provider_plan_positive.json");
     assert_eq!(
@@ -3335,13 +3427,58 @@ fn case_13_the_seal_covers_the_retained_default_keys_so_migration_is_required() 
     // `schema_version` sits inside the sealed preimage, so changing only the
     // version already invalidates the digest, and asserting the two documents
     // share a `plan_hash` would assert a property of how the corpus file was
-    // written rather than of the decoder.
+    // written rather than of the decoder. The owner's gate is
+    // `crates/eliot-app/src/cognitive_field_runner.rs:8354-8364`, whose
+    // `validate_provider_plan_hash` compares `plan.schema_version` against
+    // `COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION` at :8356 — outside this
+    // crate, so no arm here can assert it.
     let unsupported: CognitiveFieldProviderPlan =
         decode_fixture("cognitive_field_provider_plan_unsupported_schema_version.json");
     assert_ne!(
         unsupported.schema_version,
         COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION
     );
+
+    // THE MIGRATION THIS CASE'S ISSUE NUMBER ASKS ABOUT, STATED AS REQUIRED AND
+    // NOT IMPLEMENTED. `docs/architecture/I05-22-schema-and-migration-rules.md`
+    // requires "core schema is explicit and versioned", "migration
+    // IDs/checksums are immutable after release", "additive/forward-compatible
+    // change is preferred", and "rollback class is declared". `CognitiveFieldProviderPlan`
+    // (crates/eliot-types/src/cognitive_field.rs:442-465) keeps five members on
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]` — at :450,
+    // :452, :455, :457 and :459 — and the arms above prove those members sit
+    // INSIDE the `plan_hash` preimage. So removing any one of them is not a
+    // compatible requiredness correction: it changes the sealed bytes and
+    // invalidates every plan already published under this schema version.
+    //
+    // What that obliges, and what does not exist anywhere in this repository:
+    //   - a named schema version bump off `eliot-cognitive-field-provider-plan-v1`,
+    //     because I5.22 makes a migration checksum immutable after release and
+    //     the current preimage cannot be edited in place;
+    //   - a forward-repair migration that re-seals every already-published plan
+    //     under the new emitted key set and re-emits `plan_hash`, since the
+    //     sealed artifacts live outside the type and are addressed by
+    //     generation (`sealed/<generation>`, crates/eliot-app/src/
+    //     cognitive_field_runner.rs:2233), not by this record;
+    //   - a migration ID and a schema snapshot plus receipt per I5.22, and a
+    //     DECLARED ROLLBACK CLASS, which this record does not have today;
+    //   - and nothing else: no `Default`, alias or `untagged` compensation,
+    //     which this issue forbids.
+    //
+    // EVIDENCE THAT NONE OF IT EXISTS, so this is a statement about the tree and
+    // not a guess: a case-insensitive search of the plan's owner,
+    // `crates/eliot-app/src/cognitive_field_runner.rs`, for `reseal`, `re-seal`
+    // or `migrat` returns zero matches (rg exit 1). The owner exposes only
+    // `provider_plan_without_hash` (:9032), `validate_provider_plan_hash`
+    // (:8354) and `next_seal_generation` (:1737), and no migration identifier,
+    // snapshot or rollback class appears on the record or in its owner.
+    //
+    // OWNER of the unimplemented migration: `crates/eliot-app/src/
+    // cognitive_field_runner.rs` together with the record type at
+    // `crates/eliot-types/src/cognitive_field.rs:442`. Its own field table
+    // already records the same dependency at cognitive_field.rs:438-439 — the
+    // `role_evidence_plan_hash` row "needs a migration decision from the
+    // `plan_hash` owner, which lives outside this issue's file scope".
 }
 
 // WORK_UNIT_CASE: 708/14
@@ -3861,8 +3998,74 @@ fn case_17_reviewed_legitimate_internal_defaults_are_retained() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn case_18_constructor_and_helper_paths_cannot_bypass_requiredness() {
-    // Case 18: no public constructor, helper or `Default` path supplies a
-    // required key. An empty object refuses every changed type.
+    // Case 18 is two DIFFERENT questions, and the comment this one replaces
+    // answered neither of them. It claimed "no public constructor, helper or
+    // `Default` path supplies a required key". That was false, and the arms
+    // below are what makes it false.
+    //
+    //   1. DECODER: does the decoder refuse a document that omits a required
+    //      key? The 39 arms that follow are this question ONLY, and they answer
+    //      yes for every one of those 39 types.
+    //   2. CONSTRUCTION: can a public path manufacture the value anyway? Thirty
+    //      types in the nine frozen files publish `Default` — twenty structs
+    //      (eighteen derived, plus `impl Default` at lifecycle.rs:813 and
+    //      antigravity.rs:484) and ten fieldless enums — and for SEVENTEEN of
+    //      the twenty structs that `Default` supplies every required key the
+    //      empty-object refusal depends on. An empty object is refused and
+    //      `<Type>::default()` is accepted, so on those seventeen types
+    //      `Default` IS a requiredness bypass. For the other three the wire has
+    //      no required key at all, so there is nothing there to bypass, and each
+    //      of those arms says so rather than manufacturing a failure.
+    //
+    // Every construction arm below builds the value through the REAL public
+    // path and asserts what is actually true of it, in one of the four shapes
+    // the block names: supplies-every-required-key, supplies-nothing-to-bypass,
+    // states-a-key-the-decoder-would-refuse, or supplies-a-control-value. Nothing
+    // here weakens an assertion to make a name fit, and nothing here claims a
+    // path is safe that the arms have not checked.
+
+    // The two assertion shapes the construction arms below use. They are nested
+    // items so their scope is exactly this case, they are declared before any
+    // statement so nothing sits between declarations, and neither can pass
+    // vacuously: the member count is what stops "the `Default` path wrote
+    // nothing" from reading as success, and the re-decode is what stops a
+    // hand-written shape from standing in for the real manufactured one.
+    fn default_states_exactly<T: serde::Serialize + DeserializeOwned>(
+        defaulted: &T,
+        members: usize,
+    ) {
+        let wire = serde_json::to_value(defaulted).expect("the type serializes");
+        assert_eq!(
+            wire.as_object()
+                .expect("the type serializes as a JSON object")
+                .len(),
+            members,
+            "the Default path must state exactly the members this arm names"
+        );
+        serde_json::from_value::<T>(wire).expect("the manufactured document must decode");
+    }
+
+    fn default_names_variant<T>(defaulted: T, spelling: &str)
+    where
+        T: Copy + serde::Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let wire = serde_json::to_value(defaulted).expect("the variant serializes");
+        assert_eq!(
+            wire,
+            json!(spelling),
+            "the default variant has exactly one wire spelling"
+        );
+        assert_eq!(
+            serde_json::from_value::<T>(wire).expect("that spelling decodes"),
+            defaulted,
+            "the manufactured control value is a value the wire accepts"
+        );
+        assert!(
+            serde_json::from_value::<T>(json!({})).is_err(),
+            "a document that names no variant is still refused"
+        );
+    }
+
     assert!(serde_json::from_value::<WorkLease>(json!({})).is_err());
     assert!(serde_json::from_value::<ProviderCallLedger>(json!({})).is_err());
     assert!(serde_json::from_value::<AutonomyRunContract>(json!({})).is_err());
@@ -3902,6 +4105,278 @@ fn case_18_constructor_and_helper_paths_cannot_bypass_requiredness() {
     assert!(serde_json::from_value::<MemoryHandlePreview>(json!({})).is_err());
     assert!(serde_json::from_value::<OperatorQueryRequest>(json!({})).is_err());
     assert!(serde_json::from_value::<OperatorCommandReceipt>(json!({})).is_err());
+
+    // ---- CONSTRUCTION, shape 1: derived `Default` on a struct whose wire HAS
+    // required keys. The empty object is refused and `Default` supplies every
+    // one of those keys, so on each of these types `Default` is a requiredness
+    // bypass. That is the finding, stated as a finding.
+
+    // cognition.rs:117 `EpistemicPacketState` — four required keys.
+    assert!(serde_json::from_value::<EpistemicPacketState>(json!({})).is_err());
+    default_states_exactly(&EpistemicPacketState::default(), 4);
+    // cognition.rs:126 `DecisionLocalitySuffix` — eight required keys, four of
+    // them vectors and four of them strings including `next_allowed_action`.
+    assert!(serde_json::from_value::<DecisionLocalitySuffix>(json!({})).is_err());
+    default_states_exactly(&DecisionLocalitySuffix::default(), 8);
+    assert!(
+        DecisionLocalitySuffix::default()
+            .next_allowed_action
+            .is_empty()
+    );
+    // cognition.rs:154 `MaterialPacketFrame` — sixteen required keys plus the
+    // five retained prediction/invariant `#[serde(default)]` members at
+    // cognition.rs:214-231, so `Default` writes all twenty-one. The corpus
+    // document states the same twenty-one.
+    assert!(serde_json::from_value::<MaterialPacketFrame>(json!({})).is_err());
+    default_states_exactly(&MaterialPacketFrame::default(), 21);
+    // cognition.rs:771 `NegativeMemoryGateInput` — six required keys, and
+    // `Default` supplies `fingerprint` as an empty string, i.e. a negative-memory
+    // gate keyed on no fingerprint.
+    assert!(serde_json::from_value::<NegativeMemoryGateInput>(json!({})).is_err());
+    default_states_exactly(&NegativeMemoryGateInput::default(), 6);
+    assert!(NegativeMemoryGateInput::default().fingerprint.is_empty());
+    // cognition.rs:1414 `MemoryCurationCorpusProfile` — five required keys, two
+    // of them through the duplicate-rejecting map decoder at cognition.rs:1380,
+    // which `Default` satisfies with an empty map.
+    assert!(serde_json::from_value::<MemoryCurationCorpusProfile>(json!({})).is_err());
+    default_states_exactly(&MemoryCurationCorpusProfile::default(), 5);
+    // memory.rs:999 `RecallConflictObservation` — two required keys, and here the
+    // fabricated VALUE is the whole point: the member's own doc comment at
+    // memory.rs:1000-1001 says `false` means "the owner never looked, not that it
+    // looked and found none". `Default` states that never-looked answer with no
+    // owner having looked.
+    assert!(serde_json::from_value::<RecallConflictObservation>(json!({})).is_err());
+    default_states_exactly(&RecallConflictObservation::default(), 2);
+    assert!(
+        !RecallConflictObservation::default().observed,
+        "the Default path states that the owner never looked"
+    );
+    assert!(
+        RecallConflictObservation::default().conflicted().is_none(),
+        "and it reports no conflict answer at all"
+    );
+    // memory.rs:1083 `L0RankTrace` — ten members, nine of them required.
+    assert!(serde_json::from_value::<L0RankTrace>(json!({})).is_err());
+    default_states_exactly(&L0RankTrace::default(), 10);
+    assert!(L0RankTrace::default().query.is_empty());
+    assert!(!L0RankTrace::default().no_useful_memory);
+    // memory.rs:1100 `L0FeatureScore` — twenty-four members, eleven required.
+    assert!(serde_json::from_value::<L0FeatureScore>(json!({})).is_err());
+    default_states_exactly(&L0FeatureScore::default(), 24);
+    assert!(L0FeatureScore::default().handle.is_empty());
+    // memory.rs:1143 `L0SuppressionTrace` — `handle` and `reason`, both required,
+    // and `Default` supplies both as EMPTY STRINGS: a suppression trace that names
+    // no handle and states no reason.
+    assert!(serde_json::from_value::<L0SuppressionTrace>(json!({})).is_err());
+    default_states_exactly(&L0SuppressionTrace::default(), 2);
+    assert!(L0SuppressionTrace::default().handle.is_empty());
+    assert!(L0SuppressionTrace::default().reason.is_empty());
+    // memory.rs:1151 `L0CollapsedDuplicateTrace` — three required keys.
+    assert!(serde_json::from_value::<L0CollapsedDuplicateTrace>(json!({})).is_err());
+    default_states_exactly(&L0CollapsedDuplicateTrace::default(), 3);
+    assert!(
+        L0CollapsedDuplicateTrace::default()
+            .authoritative_handle
+            .is_empty()
+    );
+    // memory.rs:2781 `CodeCortexScopeBinding` — five required keys, and `Default`
+    // supplies `branch`, `commit` and `dirty_state_hash` as empty strings, i.e. a
+    // scope binding naming no branch, no commit and no dirty-state proof.
+    assert!(serde_json::from_value::<CodeCortexScopeBinding>(json!({})).is_err());
+    default_states_exactly(&CodeCortexScopeBinding::default(), 5);
+    assert!(
+        CodeCortexScopeBinding::default()
+            .dirty_state_hash
+            .is_empty()
+    );
+    // memory.rs:3346 `BlackboardScope` — four required keys, all vectors.
+    assert!(serde_json::from_value::<BlackboardScope>(json!({})).is_err());
+    default_states_exactly(&BlackboardScope::default(), 4);
+    // delegation.rs:189 `ProviderCallLedger` — two required keys, and `Default`
+    // supplies both as empty vectors: it manufactures a ledger asserting that no
+    // budget and no reservation exists, with no owner having said so. This is the
+    // type the replaced comment named first, and it is the clearest counter-example.
+    assert!(serde_json::from_value::<ProviderCallLedger>(json!({})).is_err());
+    default_states_exactly(&ProviderCallLedger::default(), 2);
+    assert!(ProviderCallLedger::default().budgets.is_empty());
+    assert!(ProviderCallLedger::default().reservations.is_empty());
+    // delegation.rs:255 `DelegationState` — fifteen required keys, every one a
+    // vector, every one supplied empty.
+    assert!(serde_json::from_value::<DelegationState>(json!({})).is_err());
+    default_states_exactly(&DelegationState::default(), 15);
+    // lifecycle.rs:813 `impl Default for MemoryLifecyclePacketView` — a PUBLIC
+    // hand-written impl, not a derive. It supplies all six required keys AND
+    // fabricates a lifecycle warning no owner wrote.
+    assert!(serde_json::from_value::<MemoryLifecyclePacketView>(json!({})).is_err());
+    default_states_exactly(&MemoryLifecyclePacketView::default(), 6);
+    assert_eq!(
+        MemoryLifecyclePacketView::default().lifecycle_warnings,
+        vec!["memory lifecycle policy active".to_owned()],
+        "the Default impl states a lifecycle warning that no owner wrote"
+    );
+    // antigravity.rs:484 `impl Default for AntigravityCapabilities` — the other
+    // PUBLIC hand-written impl. It supplies all fourteen required keys and sets
+    // `text_output_supported` TRUE while every other capability is false, so it is
+    // a positive capability claim no probe produced.
+    assert!(serde_json::from_value::<AntigravityCapabilities>(json!({})).is_err());
+    default_states_exactly(&AntigravityCapabilities::default(), 14);
+    assert!(
+        AntigravityCapabilities::default().text_output_supported,
+        "the Default impl asserts that text output is supported"
+    );
+    assert!(
+        !AntigravityCapabilities::default().dangerously_skip_permissions_seen,
+        "and asserts the permission bypass was never seen"
+    );
+    // antigravity.rs:751 `AntigravityResponseProtocolReceipt` — four required
+    // booleans, on the surface its own doc comment at antigravity.rs:748-749
+    // calls "the stable serialized proof surface for the smoke protocol".
+    // `Default` supplies all four as `false`, i.e. a protocol proof on which no
+    // check was satisfied.
+    assert!(serde_json::from_value::<AntigravityResponseProtocolReceipt>(json!({})).is_err());
+    default_states_exactly(&AntigravityResponseProtocolReceipt::default(), 4);
+    assert!(
+        !AntigravityResponseProtocolReceipt::default().expected_smoke_marker_seen,
+        "the Default impl asserts the expected smoke marker was not seen"
+    );
+
+    // ---- CONSTRUCTION, shape 2: derived `Default` on a struct whose wire has NO
+    // required key. `Default` still supplies every member, but there was never a
+    // required key to bypass, so these arms state that instead of claiming a
+    // bypass they cannot show.
+
+    // cognition.rs:1245 `OperatorProjectionFilter` — every member is a bare
+    // `Option<String>`, so absence already decodes under this file's own
+    // absent-becomes-none rule and `{}` is accepted outright.
+    assert!(serde_json::from_value::<OperatorProjectionFilter>(json!({})).is_ok());
+    default_states_exactly(&OperatorProjectionFilter::default(), 7);
+    // memory.rs:2075 `MemoryProvenanceView` — four bare `Option<String>` members
+    // plus two `#[serde(default)]` vectors, so `{}` is accepted.
+    assert!(serde_json::from_value::<MemoryProvenanceView>(json!({})).is_ok());
+    default_states_exactly(&MemoryProvenanceView::default(), 6);
+    // memory.rs:2099 `MemoryApplicabilityPacketView` — all five members carry
+    // `#[serde(default)]`, so `{}` is accepted, and the `skip_serializing_if` at
+    // memory.rs:2100 keeps `current_git_scope` out of the manufactured document:
+    // four stated members out of five declared, which is why this arm says four.
+    assert!(serde_json::from_value::<MemoryApplicabilityPacketView>(json!({})).is_ok());
+    default_states_exactly(&MemoryApplicabilityPacketView::default(), 4);
+
+    // ---- CONSTRUCTION, shape 3: public constructors and helpers that state a key
+    // the decoder would otherwise refuse to receive.
+
+    // memory.rs:2953 `AuthorityProfile::read_only()` and memory.rs:2959
+    // `bounded_write()` supply the required `permissions` key the empty object is
+    // refused for, so an authority profile exists with no wire document behind it.
+    assert!(serde_json::from_value::<AuthorityProfile>(json!({})).is_err());
+    default_states_exactly(&AuthorityProfile::read_only(), 1);
+    assert!(AuthorityProfile::read_only().allows(AuthorityPermission::Read));
+    assert!(!AuthorityProfile::read_only().allows(AuthorityPermission::Write));
+    assert!(AuthorityProfile::bounded_write().allows_write());
+    // cognitive_field.rs:667 `minimal_cognitive_understanding_answer()` and
+    // cognitive_field.rs:711 `minimal_cognitive_judge_result()` supply EVERY
+    // required key of their records, `schema_version` included, and mint a fresh
+    // `ProjectId::new_v7()` / `TaskId::new_v7()` on every call, so no identity in
+    // either record is owner-stated.
+    assert!(serde_json::from_value::<CognitiveUnderstandingAnswer>(json!({})).is_err());
+    default_states_exactly(&minimal_cognitive_understanding_answer(), 32);
+    assert_eq!(
+        minimal_cognitive_understanding_answer().schema_version,
+        COGNITIVE_UNDERSTANDING_SCHEMA_VERSION
+    );
+    assert!(serde_json::from_value::<CognitiveJudgeResult>(json!({})).is_err());
+    default_states_exactly(&minimal_cognitive_judge_result(), 9);
+    assert_eq!(
+        minimal_cognitive_judge_result().schema_version,
+        COGNITIVE_JUDGE_SCHEMA_VERSION
+    );
+    // mcp_contract.rs:472 with mcp_contract.rs:476 — the ONE helper-default form
+    // in the nine files. The helper is PRIVATE, so this is not a public
+    // construction path and this arm does not claim it is; it is the helper path.
+    // `#[serde(default = "default_observe_schema_version")]` supplies an OMITTED
+    // `ObserveInput::schema_version` with the CURRENT version, so a document that
+    // omits the version is silently promoted onto the current boundary.
+    let helper_promoted: ObserveInput = serde_json::from_value(without(
+        serde_json::from_str(&corpus("observe_input_positive.json"))
+            .expect("the observe fixture must parse"),
+        "schema_version",
+    ))
+    .expect("an omitted version is supplied by the helper rather than refused");
+    assert_eq!(
+        helper_promoted.schema_version, OBSERVE_INPUT_SCHEMA_VERSION,
+        "the helper supplies the omitted version key with the current version"
+    );
+
+    // ---- CONSTRUCTION, shape 4: fieldless enums. Here `Default` supplies a
+    // control VALUE, not a map key. Whether that value can reach a record at all
+    // is decided solely by whether the parent member carries
+    // `#[serde(default)]`, so every enum below is classified.
+
+    // REACHABLE — the parent member is `#[serde(default)]`, so an omitted key
+    // becomes exactly this manufactured variant:
+    //   cognition.rs:1294 `OperatorResultMode`, parent member
+    //     `OperatorQueryRequest::result_mode` at cognition.rs:1270;
+    //   memory.rs:1045 `CognitiveProjectionReadState`, parent members
+    //     `RecallL0Response::projection_state` at memory.rs:1029 and two others;
+    //   memory.rs:1062 `MemoryConfidence`, parent members
+    //     `RecallL0Response::memory_confidence` at memory.rs:1032 and
+    //     `ContextPacketL3::memory_confidence` at memory.rs:2127;
+    //   memory.rs:3202 `WorktreeLeaseKind`, parent member
+    //     `WorktreeLease::kind` at memory.rs:3236;
+    //   mcp_contract.rs:482 `ObserveHint`, parent member `ObserveInput::hint` at
+    //     mcp_contract.rs:421.
+    default_names_variant(OperatorResultMode::default(), "human");
+    default_names_variant(CognitiveProjectionReadState::default(), "unavailable");
+    default_names_variant(MemoryConfidence::default(), "none");
+    default_names_variant(WorktreeLeaseKind::default(), "linked_git_worktree");
+    default_names_variant(ObserveHint::default(), "auto");
+    // Two of the five are proved reachable against real wire documents rather
+    // than asserted from source: both corpus documents omit the member, so the
+    // decoder installed the `Default` value.
+    let defaulted_query: OperatorQueryRequest =
+        decode_fixture("operator_query_request_positive.json");
+    assert_eq!(
+        defaulted_query.result_mode,
+        OperatorResultMode::default(),
+        "the corpus request omits result_mode, so the wire installed this exact default"
+    );
+    let defaulted_lease: WorktreeLease = decode_fixture("worktree_lease_positive.json");
+    assert_eq!(
+        defaulted_lease.kind,
+        WorktreeLeaseKind::default(),
+        "the corpus lease omits kind, so the wire installed this exact default"
+    );
+
+    // NOT REACHABLE — the parent member is REQUIRED, so the decoder refuses a
+    // document that omits it and this `Default` supplies no key at all:
+    //   lifecycle.rs:358 `MemoryLifecycleState`, parent member
+    //     `MemoryStateTransition::from_state` at lifecycle.rs:585;
+    //   lifecycle.rs:473 `MemoryEcologyDecision`, parent member
+    //     `MemoryStateTransition::expected_admission_effect` at lifecycle.rs:592;
+    //   eval.rs:504 `MetaExperimentDecision`, parent member
+    //     `MetaIsolationRejectionRecord::decision` at eval.rs:601.
+    default_names_variant(MemoryLifecycleState::default(), "active");
+    default_names_variant(MemoryEcologyDecision::default(), "KEEP_HOT");
+    default_names_variant(MetaExperimentDecision::default(), "INSUFFICIENT_EVIDENCE");
+    let transition: Value = serde_json::from_str(&corpus("memory_state_transition_positive.json"))
+        .expect("the transition fixture must parse");
+    rejects_missing::<MemoryStateTransition>(transition.clone(), "from_state");
+    rejects_missing::<MemoryStateTransition>(transition, "expected_admission_effect");
+    rejects_missing::<MetaIsolationRejectionRecord>(
+        serde_json::from_str(&corpus("meta_isolation_rejection_record_positive.json"))
+            .expect("the rejection fixture must parse"),
+        "decision",
+    );
+
+    // UNCLASSIFIED AGAINST A WIRE DOCUMENT — no corpus document in this crate
+    // states `MinorityPressureRecord::status` (lifecycle.rs:699, struct at
+    // lifecycle.rs:692) or `HarnessExperimentRecord::change_class` (eval.rs:460,
+    // struct at eval.rs:451), so these two arms claim only what is true from
+    // source: the `Default` is one named variant with one spelling, and a
+    // document naming no variant is refused. They deliberately do NOT claim the
+    // parent requires the key or defaults it, because no assertion here can
+    // establish which.
+    default_names_variant(MinorityPressureStatus::default(), "open");
+    default_names_variant(MetaCandidateChangeClass::default(), "admission_rule");
 
     // A complete owner-written budget state still decodes: the gate is the decoder,
     // not a helper, and the owner has to state every member.

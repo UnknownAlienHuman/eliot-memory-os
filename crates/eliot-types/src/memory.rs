@@ -206,6 +206,26 @@ pub enum TaskAcceptanceEvidenceKind {
     Verification,
 }
 
+/// Field decoder for the required-nullable keys of this module.
+///
+/// Serves `TaskAcceptanceItem::verification_scope_hash` (`Option<String>`) and
+/// the `action_provenance` (`Option<ActionProvenanceSet>`) and
+/// `completion_proof` (`Option<CompletionProof>`) bindings of both
+/// `TaskContractInput` and `TaskContract`. `Option<T>` under derived
+/// `Deserialize` makes an absent key decode as `None`, so a documented
+/// "required on the wire, explicitly nullable" member would silently accept an
+/// incomplete or older record as a current one. A `deserialize_with` field
+/// without `serde(default)` makes the derived visitor reject the missing key
+/// first, while this body keeps handling a present value or an explicit `null`
+/// exactly as before.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -229,6 +249,7 @@ pub struct TaskAcceptanceItem {
     /// satisfied case. The struct is `deny_unknown_fields` and has no published
     /// schema or named legacy layout, so this is a compatible requiredness
     /// correction with unchanged accepted and emitted bytes.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub verification_scope_hash: Option<String>,
 }
 
@@ -468,12 +489,14 @@ pub struct TaskContractInput {
     /// and it now fails loudly instead of claiming it did not exist. W4: no
     /// alias, `untagged` or helper default is introduced to re-accept it.
     /// `Serialize` is untouched, so emitted bytes are unchanged.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub action_provenance: Option<ActionProvenanceSet>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_grant_redemptions: Vec<ActionMemoryGrantRedemption>,
     pub observation_ids: Vec<String>,
     pub verification_ids: Vec<VerificationId>,
     pub verification_scopes: Vec<VerifierArtifactScope>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub completion_proof: Option<CompletionProof>,
     pub completion_write_id: Option<WriteId>,
 }
@@ -506,6 +529,7 @@ pub struct TaskContract {
     pub acceptance_items: Vec<TaskAcceptanceItem>,
     pub action_lease_id: Option<ActionLeaseId>,
     pub understanding_proof_hash: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub action_provenance: Option<ActionProvenanceSet>,
     /// Same field-specific exemption as `TaskContractInput` above: the paired
     /// `skip_serializing_if` means "no opaque memory offer was consumed" is
@@ -515,6 +539,7 @@ pub struct TaskContract {
     pub observation_ids: Vec<String>,
     pub verification_ids: Vec<VerificationId>,
     pub verification_scopes: Vec<VerifierArtifactScope>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub completion_proof: Option<CompletionProof>,
     pub completion_write_id: Option<WriteId>,
     pub memory_revision: MemoryRevision,

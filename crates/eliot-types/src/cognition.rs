@@ -383,8 +383,27 @@ pub struct CausalCandidate {
     /// `CausalCandidate` has exactly one in-tree construction surface and no
     /// published schema, so this is a compatible requiredness correction with
     /// unchanged accepted and emitted bytes.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub assigned_check: Option<CausalCheckAssignment>,
     pub intervention_outcomes: Vec<CausalInterventionOutcomeRecord>,
+}
+
+/// Field decoder for a required-nullable key.
+///
+/// `Option<T>` under derived `Deserialize` makes an absent key decode as
+/// `None`, so the documented "required on the wire, explicitly nullable"
+/// `CausalCandidate::assigned_check` would silently accept an incomplete or
+/// older record as a current one, reading the absent key as an unassigned
+/// check rather than as a missing field. A `deserialize_with` field without
+/// `serde(default)` makes the derived visitor reject the missing key first,
+/// while this body keeps handling a present `CausalCheckAssignment` or an
+/// explicit `null` exactly as before.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl CausalCandidate {
