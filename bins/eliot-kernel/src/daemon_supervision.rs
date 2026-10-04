@@ -661,6 +661,21 @@ pub(crate) struct DaemonSupervisionProgressState {
     pub(crate) last_observation_sha256: Option<String>,
     /// Successor revision created by the last recorded renewal, if any.
     pub(crate) last_successor_revision: Option<u64>,
+    /// Predecessor revision the LAST RECORDED renewal superseded, recovered
+    /// from that committed transition's own submission/receipt state.
+    ///
+    /// It is the original transition identity of the recorded renewal and is
+    /// never derived from the current head: after a committed renewal the head
+    /// already is the recorded successor, so an exact replay must echo the
+    /// predecessor that was actually superseded instead of one reconstructed
+    /// from the head (I14-15 line 17). Absent until a caller records it from
+    /// its own committed transition; absence is reported honestly, never
+    /// filled in.
+    pub(crate) last_renewal_predecessor_revision: Option<u64>,
+    /// Predecessor receipt digest the LAST RECORDED renewal superseded, from
+    /// the same recorded transition and under the same never-derived-from-the-
+    /// current-head rule as `last_renewal_predecessor_revision`.
+    pub(crate) last_renewal_predecessor_receipt_sha256: Option<String>,
     /// Consecutive blocked renewals with no eligible observation.
     pub(crate) missed_renewals: u64,
     /// Decision time of the last eligible observation that renewed, if any.
@@ -687,6 +702,8 @@ impl DaemonSupervisionProgressState {
             last_request_id: None,
             last_observation_sha256: None,
             last_successor_revision: None,
+            last_renewal_predecessor_revision: None,
+            last_renewal_predecessor_receipt_sha256: None,
             missed_renewals: 0,
             last_eligible_observation_ms: None,
             reconciliation_pending: false,
@@ -747,7 +764,8 @@ impl DaemonSupervisionProgressState {
     }
 
     /// Records a verified renewal: advances the channel cursor, the
-    /// monotonic evidence, and the idempotency triple, resets the miss
+    /// monotonic evidence, and the idempotency triple, retains the original
+    /// predecessor identity of that committed transition, resets the miss
     /// counter, stamps eligibility, and clears reconciliation. Call only
     /// after the ORS commit and post-verify both succeed.
     pub(crate) fn record_renewed_in_context(
@@ -775,6 +793,18 @@ impl DaemonSupervisionProgressState {
         self.last_request_id = Some(observation.observation_id.clone());
         self.last_observation_sha256 = Some(observation_sha256);
         self.last_successor_revision = Some(successor_revision);
+        // Issue #88 A2: the retained pair is the ORIGINAL predecessor identity of
+        // the transition just committed, written in the same place as the
+        // idempotency triple so the triple and what that record superseded cannot
+        // drift apart. `observation.lease_revision` and its
+        // `predecessor_receipt_sha256` are bound by the renewal request contract
+        // to the exact durable PRE-COMMIT head this renewal was evaluated
+        // against, which is what the caller passed in for this record. The
+        // advanced head cannot prove its own predecessor, so `successor_revision`
+        // above is never written here (I14-15 line 17).
+        self.last_renewal_predecessor_revision = Some(observation.lease_revision);
+        self.last_renewal_predecessor_receipt_sha256 =
+            Some(observation.predecessor_receipt_sha256.clone());
         self.missed_renewals = 0;
         self.last_eligible_observation_ms = Some(now_ms);
         self.reconciliation_pending = false;
@@ -808,6 +838,12 @@ mod daemon_supervision_diagnostics_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_runtime_contracts::{
+        DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_NAME, DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_VERSION,
+        DAEMON_SUPERVISION_HEARTBEAT_SCHEMA, DaemonHeartbeatHealth, DaemonProgressChannel,
+        DaemonProgressDisposition,
+    };
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -853,6 +889,8 @@ mod daemon_supervision_diagnostics_tests {
             last_request_id: None,
             last_observation_sha256: None,
             last_successor_revision: None,
+            last_renewal_predecessor_revision: None,
+            last_renewal_predecessor_receipt_sha256: None,
             missed_renewals: 0,
             last_eligible_observation_ms: None,
             reconciliation_pending: false,
@@ -866,6 +904,67 @@ mod daemon_supervision_diagnostics_tests {
             max_observation_age_ms: 10_000,
             max_wall_skew_ms: 5_000,
             require_watchdog_coverage: false,
+        }
+    }
+
+    fn test_digest(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn test_generation(value: u64) -> ResourceGeneration {
+        ResourceGeneration::new(value).expect("non-zero test generation")
+    }
+
+    /// A genuine forward-progress observation citing the exact durable
+    /// pre-commit predecessor the renewal join evaluates against.
+    fn test_renewal_observation(
+        observation_id: &str,
+        predecessor_revision: u64,
+        predecessor_receipt_sha256: String,
+    ) -> DaemonProgressObservation {
+        let kernel_epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("test lineage"),
+            std::num::NonZeroU64::new(4).expect("non-zero epoch sequence"),
+        )
+        .expect("valid test epoch");
+        let activation_generation = test_generation(3);
+        DaemonProgressObservation {
+            schema: DAEMON_SUPERVISION_HEARTBEAT_SCHEMA.to_owned(),
+            contract_name: DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_NAME.to_owned(),
+            contract_version: DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_VERSION,
+            observation_id: observation_id.to_owned(),
+            installation_id: "installation-1".to_owned(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation,
+            generation_binding: SupervisionGenerationBinding {
+                target_id: "eliotd".to_owned(),
+                target_generation: test_generation(1),
+                module_id: "eliotd".to_owned(),
+                module_generation: test_generation(2),
+                process_id: "process-1".to_owned(),
+                process_generation: test_generation(5),
+            },
+            daemon_artifact_id: "eliotd-artifact-88-a2".to_owned(),
+            daemon_config_digest: test_digest('c'),
+            kernel_epoch: kernel_epoch.clone(),
+            state_fence: StateFence::new(kernel_epoch, activation_generation),
+            boot_id: "boot-88-a2".to_owned(),
+            transport_session_evidence: "session-88-a2".to_owned(),
+            transport_connection_evidence: "connection-88-a2".to_owned(),
+            lease_id: "lease-88-a2".to_owned(),
+            lease_revision: predecessor_revision,
+            predecessor_receipt_sha256,
+            progress_channel: DaemonProgressChannel::Claim,
+            progress_cursor: 8,
+            previous_progress_cursor: 7,
+            observed_monotonic_ms: 2_000,
+            observed_wall_ms: 31_000,
+            disposition: DaemonProgressDisposition::ForwardProgress,
+            idle_contract_id: None,
+            waiting_on_dependency: None,
+            evidence_refs: vec!["process:process-88-a2:alive".to_owned()],
+            health: DaemonHeartbeatHealth::healthy(),
+            watchdog_covered: true,
         }
     }
 
@@ -935,5 +1034,66 @@ mod daemon_supervision_diagnostics_tests {
         for canary in ["degraded-canary", "failed-canary"] {
             assert!(!text.contains(canary), "owner payload leaked: {canary}");
         }
+    }
+
+    #[test]
+    fn recorded_renewal_retains_the_superseded_predecessor_not_the_head() {
+        // Issue #88 A2 (I14-15 line 17): after a committed `7 -> 8` renewal the
+        // durable head already IS the recorded successor, so the head cannot prove
+        // which predecessor that transition superseded. The tracker therefore
+        // retains the predecessor identity the caller evaluated against before the
+        // commit, and an exact replay echoes it instead of recreating it.
+        let mut progress = DaemonSupervisionProgressState::unbound();
+        assert_eq!(progress.last_renewal_predecessor_revision, None);
+        assert_eq!(progress.last_renewal_predecessor_receipt_sha256, None);
+
+        let predecessor_revision = 7_u64;
+        let successor_revision = 8_u64;
+        let predecessor_receipt_sha256 = test_digest('d');
+        let observation = test_renewal_observation(
+            "obs-88-a2",
+            predecessor_revision,
+            predecessor_receipt_sha256.clone(),
+        );
+        let observation_sha256 = observation.digest().expect("fixture observation digest");
+        let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+        progress.record_renewed_in_context(
+            &context,
+            &observation,
+            observation_sha256.clone(),
+            successor_revision,
+            31_000,
+        );
+
+        // One record writes the idempotency triple and the retained predecessor
+        // pair, and the pair is the PRE-commit predecessor that was superseded.
+        assert_eq!(progress.last_request_id.as_deref(), Some("obs-88-a2"));
+        assert_eq!(
+            progress.last_observation_sha256.as_deref(),
+            Some(observation_sha256.as_str())
+        );
+        assert_eq!(progress.last_successor_revision, Some(successor_revision));
+        assert_eq!(
+            progress.last_renewal_predecessor_revision,
+            Some(predecessor_revision)
+        );
+        assert_eq!(
+            progress.last_renewal_predecessor_receipt_sha256.as_deref(),
+            Some(predecessor_receipt_sha256.as_str())
+        );
+
+        // The recorded successor is never substituted for the predecessor it
+        // superseded, and the retained pair stays exactly one revision behind the
+        // recorded head rather than being rebuilt from it.
+        assert_ne!(
+            progress.last_renewal_predecessor_revision,
+            progress.last_successor_revision
+        );
+        assert_eq!(
+            progress
+                .last_renewal_predecessor_revision
+                .and_then(|predecessor| predecessor.checked_add(1)),
+            progress.last_successor_revision
+        );
     }
 }

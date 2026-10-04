@@ -1409,9 +1409,14 @@ impl From<DaemonSupervisionHeartbeatError> for SupervisionProgressRenewalError {
 ///
 /// The predecessor proof is the exact current snapshot (lease, record,
 /// revision, receipt, envelope digests); the lease window is the durable
-/// binding window. A non-active head fails closed here, and an unadmitted
-/// boot/session binding is a configuration refusal, never a silent default.
-/// `ReconciliationRequired` and `Expired` then surface from the join itself.
+/// binding window. `predecessor` is therefore the CURRENT head, which after a
+/// committed renewal is that renewal's successor: the original transition the
+/// last recorded renewal superseded travels separately in the tracker's
+/// retained `last_renewal_predecessor_*` pair, copied here verbatim and never
+/// re-derived from this head (I14.15). A non-active head fails closed here, and
+/// an unadmitted boot/session binding is a configuration refusal, never a silent
+/// default. `ReconciliationRequired` and `Expired` then surface from the join
+/// itself.
 #[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
@@ -1472,6 +1477,10 @@ pub(super) fn daemon_supervision_current_state(
         last_request_id: progress.last_request_id.clone(),
         last_observation_sha256: progress.last_observation_sha256.clone(),
         last_successor_revision: progress.last_successor_revision,
+        last_renewal_predecessor_revision: progress.last_renewal_predecessor_revision,
+        last_renewal_predecessor_receipt_sha256: progress
+            .last_renewal_predecessor_receipt_sha256
+            .clone(),
         reconciliation_pending: progress.reconciliation_pending,
     };
     current
@@ -1488,6 +1497,23 @@ pub(super) fn daemon_supervision_current_state(
 /// `NotDue`, `ExactReplay`) can never be mistaken for advanced authority.
 /// The caller supplies the live-receipt digest after publication; wave 3
 /// (MGR02) owns that publication step on the `ProbeReady` path.
+///
+/// Issue #88 A2 (steps 1 and 3): a receipt admits a successor only when THIS
+/// outcome created one. An exact replay echoes the recorded `predecessor ->
+/// successor` transition in its *decision* (from the retained original
+/// predecessor, never from the current head), but it commits nothing and
+/// publishes nothing: the committed successor and its live-receipt evidence
+/// belong to the tick that produced them and were already receipted there.
+/// Copying that echoed revision into the replay receipt would demand the two
+/// digests this tick does not have, and inventing them is forbidden — so the
+/// replay receipt admits no successor and carries no digest. The echoed
+/// transition identity is still answered in full: the decision travels beside
+/// this receipt with its `predecessor_revision` and retained predecessor
+/// digest, and this receipt is bound to the same `request_id` and
+/// `predecessor_revision`. Every existing refusal is unchanged: `Renewed`
+/// still requires both digests, every non-renewing outcome still refuses both,
+/// and `DaemonSupervisionRenewalReceipt::validate` still refuses any successor
+/// that is not exactly one past the predecessor with both digests present.
 #[cfg(windows)]
 pub(super) fn daemon_renewal_receipt_for_decision(
     decision: &DaemonSupervisionRenewalDecision,
@@ -1513,12 +1539,19 @@ pub(super) fn daemon_renewal_receipt_for_decision(
             "renewal receipt digests do not match the decision outcome".to_owned(),
         ));
     }
+    let successor_revision = match decision.outcome {
+        DaemonSupervisionRenewalOutcome::Renewed => decision.successor_revision,
+        DaemonSupervisionRenewalOutcome::ExactReplay
+        | DaemonSupervisionRenewalOutcome::NotDue
+        | DaemonSupervisionRenewalOutcome::DegradedNoRenewal
+        | DaemonSupervisionRenewalOutcome::ReconciliationRequired => None,
+    };
     let receipt = DaemonSupervisionRenewalReceipt {
         request_id: decision.request_id.clone(),
         lease_id: decision.lease_id.clone(),
         outcome: decision.outcome,
         predecessor_revision: decision.predecessor_revision,
-        successor_revision: decision.successor_revision,
+        successor_revision,
         predecessor_receipt_sha256: decision.predecessor_receipt_sha256.clone(),
         successor_receipt_sha256,
         live_receipt_sha256,
