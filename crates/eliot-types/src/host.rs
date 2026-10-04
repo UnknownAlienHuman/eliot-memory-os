@@ -11,8 +11,85 @@ use crate::{
     AgentRole, AgentSessionId, OperationPhase, ProjectId, TaintClass, TaskId, WorkItemId,
     WorkLeaseId, WorktreeLeaseId, WriteReceiptRef,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use time::OffsetDateTime;
+
+/// Bounded refusal for a protected host identity that decoded empty.
+///
+/// A lease handle is authority, not description:
+/// `HostBrokerService::validate_active_role_authority` looks the grant up by it
+/// (`eliot-engine`), `bind_launch_scope` binds the scope to it, and
+/// `AgentSessionHostBinding::task_role_lease_refs` is a membership set probed
+/// with it. An empty string is not a weaker handle, it is an absent one, so it
+/// must refuse at the decoder instead of becoming a current authority key --
+/// an empty one would satisfy an empty member of that membership set. Absence
+/// already refuses through the missing-field path; this closes the
+/// spelled-out-empty spelling of the same defect. The message is fixed and
+/// never echoes the received value onto an operator surface.
+fn empty_protected_identifier<E>(field: &'static str) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("empty protected identifier: {field}"))
+}
+
+fn deserialize_protected_string<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(empty_protected_identifier(field));
+    }
+    Ok(value)
+}
+
+fn deserialize_role_lease_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "role_lease_id")
+}
+
+fn deserialize_controller_lease_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "controller_lease_id")
+}
+
+/// The `Option`-accepting sibling of [`deserialize_protected_string`].
+///
+/// An optional lease handle has a meaningful absent state (`I5.16`: a field
+/// that does not apply remains an explicit `None`), so absence and `None` both
+/// stay acceptable; only the spelled-out-empty spelling of the same defect
+/// refuses. Reusing [`empty_protected_identifier`] keeps ONE emptiness check and
+/// ONE wording across the required and optional spellings here. The same
+/// pairing and the same wording exist independently in `runtime.rs` and
+/// `runtime_supervision.rs`; those are per-module copies by convention, not a
+/// shared helper, so this wording is matched by reading rather than by
+/// construction.
+///
+/// A field using this hook MUST also carry `#[serde(default)]`. Without it
+/// `deserialize_with` makes the member REQUIRED, which would turn "no lease
+/// applies here" into a missing-field refusal -- the opposite of what this hook
+/// exists to permit. That is the same pairing `runtime_supervision.rs` uses
+/// for its optional protected identifiers.
+fn deserialize_optional_lease_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(present) = &value
+        && present.is_empty()
+    {
+        return Err(empty_protected_identifier("role_lease_id"));
+    }
+    Ok(value)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +299,7 @@ pub struct HostLaunchContract {
     pub agent_session_id: Option<AgentSessionId>,
     pub task_id: Option<TaskId>,
     pub work_item_id: Option<WorkItemId>,
+    #[serde(default, deserialize_with = "deserialize_optional_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: u64,
     pub operation_generation: u64,
@@ -266,6 +344,7 @@ pub struct HostLaunchScope {
     pub agent_session_id: Option<AgentSessionId>,
     pub task_id: Option<TaskId>,
     pub work_item_id: Option<WorkItemId>,
+    #[serde(default, deserialize_with = "deserialize_optional_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: u64,
     pub operation_generation: u64,
@@ -341,6 +420,7 @@ pub struct AgentInvocationRequest {
     pub task_id: TaskId,
     pub work_item_id: WorkItemId,
     pub requested_capabilities: Vec<String>,
+    #[serde(deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: String,
     pub role_lease_epoch: u64,
     pub operation_generation: u64,
@@ -380,10 +460,13 @@ pub enum AuthorityLeaseLifetime {
 /// and duplicate member keys are already refused by the derived `MapAccess`.
 /// `state` and `generation` are required on the wire: a missing value must not
 /// decode as an `Active` current-generation lease. `lifetime` still defaults to
-/// `Legacy`, the honest marker for rows predating the field.
+/// `Legacy`, the honest marker for rows predating the field. `role_lease_id` is
+/// the lease's own authority handle, so the spelled-out-empty spelling refuses
+/// too rather than admitting a handle no grant can own.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRoleLease {
+    #[serde(deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: String,
     pub task_id: TaskId,
     pub agent_session_id: AgentSessionId,
@@ -422,6 +505,7 @@ pub struct TaskRoleLease {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerLease {
+    #[serde(deserialize_with = "deserialize_controller_lease_id")]
     pub controller_lease_id: String,
     pub task_id: TaskId,
     pub agent_session_id: AgentSessionId,
@@ -537,7 +621,8 @@ pub struct AgentResultDisposition {
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
 /// and duplicate member keys are already refused by the derived `MapAccess`.
 /// `generation` is required on the wire: a missing value must not decode as a
-/// current-generation job.
+/// current-generation job. `role_lease_id` is a lease handle, so the
+/// spelled-out-empty spelling refuses rather than becoming a current job key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationJob {
@@ -568,7 +653,7 @@ pub struct OperationJob {
     pub restart_count: u32,
     #[serde(default)]
     pub runtime_contract_sha256: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_lease_id")]
     pub role_lease_id: Option<String>,
     #[serde(default)]
     pub role_lease_epoch: Option<u64>,
