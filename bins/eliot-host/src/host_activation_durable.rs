@@ -51,6 +51,25 @@ fn activation_state_label(state: &PendingActivationState) -> &'static str {
     }
 }
 
+/// Stable diagnostic label for the committed result of one activation,
+/// read back from the registry after the pending row was retired.
+///
+/// This is a different vocabulary from [`activation_state_label`] on purpose.
+/// That one reports the *pending disposition* of a staged activation, and
+/// applying it after the commit was the defect: it stamped `state=pending` onto
+/// an operation the registry had already committed. Here the label states what
+/// the durable readback actually says about the active generation, so a
+/// reconciled activation and a merely staged one are never rendered the same.
+#[cfg(windows)]
+fn committed_generation_label(active: bool, last_known_good: bool) -> &'static str {
+    match (active, last_known_good) {
+        (true, true) => "committed-active-last-known-good",
+        (true, false) => "committed-active",
+        (false, true) => "committed-last-known-good",
+        (false, false) => "committed-inactive",
+    }
+}
+
 /// Current nonsecret identities bound to one activation observation
 /// (F-LOG-HOST-2 W1). Every field projects a fact the semantic owner already
 /// produced for the live pending activation, staged record, or commit fence;
@@ -251,6 +270,42 @@ impl<'a> ActivationObservation<'a> {
         observation.receipt = Some(fence.ready_receipt_digest.as_str());
         observation
     }
+
+    /// Binds the reconciled result of one completed pending activation.
+    ///
+    /// `for_pending` describes the activation *as it was staged*: it carries the
+    /// pending disposition state and no receipt, because at that point nothing
+    /// has been committed. Using it after the commit reports the pre-commit
+    /// state of a row the registry has already retired — the record claimed a
+    /// `Pending` disposition for an operation that had in fact been committed,
+    /// and it named no receipt at all, so a reader could not tell a reconciled
+    /// activation from a request.
+    ///
+    /// This constructor reports what is actually true once
+    /// `commit_pending_durable` has returned: the staged identities stay,
+    /// because they are what was committed, and the receipt plus the observed
+    /// active generation come from the post-commit durable readback rather than
+    /// from the caller's now-stale local copy. `committed_state` is the state
+    /// the readback reports for the active generation, not the pending
+    /// disposition, so the two are never presented as the same fact.
+    fn for_reconciled(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        fence: &'a ActivationCommitFence,
+        committed_state: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            transaction: Some(pending.transaction_id.as_str()),
+            plan: Some(pending.plan_digest.as_str()),
+            generation: Some(fence.generation.as_str()),
+            manifest: Some(pending.manifest_digest.as_str()),
+            state: Some(committed_state),
+            effect: None,
+            request: None,
+            receipt: Some(fence.ready_receipt_digest.as_str()),
+        }
+    }
 }
 
 /// Emits one identity-bound activation observation through the #889 facade.
@@ -334,12 +389,64 @@ impl HostComposition {
             )?;
             return Err(error);
         }
+        // WORK_UNIT_CASE: 893/14 — the reconciliation record is built from
+        // current durable evidence, not from the staged pending row.
+        //
+        // `commit_pending_durable` retires the pending row, so the record that
+        // reports reconciliation has to be read back from the registry the
+        // commit just produced. Reading `pending` here published the pre-commit
+        // disposition of an operation that had already been committed and named
+        // no receipt, which is the "reconciliation completion inferred from a
+        // stale local value" defect. The readback below is the same durable
+        // registry `self.registry` was already set to; it is re-read rather than
+        // reused so this record cannot depend on an in-memory value that a
+        // later write might invalidate, and a readback that fails refuses the
+        // reconciliation instead of reporting one.
+        let commit_fence = self.fresh_pending_commit_fence(&pending)?;
         self.commit_pending_durable(&pending, &host_capability)?;
+        let durable = self.open_registry_store()?.load().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "activation reconciliation registry readback failed after commit: {error}"
+            ))
+        })?;
+        let reconciled = durable
+            .active()
+            .filter(|active| {
+                active.manifest.generation == commit_fence.generation
+                    && active.approval == pending.approval
+            })
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "activation reconciliation readback does not name the committed generation"
+                        .to_owned(),
+                )
+            })?;
+        // Read both label inputs out of the borrow before the registry is moved
+        // back into `self`, so the record carries facts from the readback rather
+        // than from a value that outlives it.
+        let committed_state =
+            committed_generation_label(reconciled.active, reconciled.last_known_good);
+        if durable.last_committed_activation_fence() != Some(&commit_fence) {
+            return Err(HostError::RecoveryRequired(
+                "activation reconciliation readback carries a different commit fence".to_owned(),
+            ));
+        }
+        // The readback must also show the pending row retired. Reporting a
+        // reconciliation while the staged activation is still live would state
+        // a completion the registry has not accepted.
+        if durable.pending_activation().is_some() {
+            return Err(HostError::RecoveryRequired(
+                "activation reconciliation readback still carries a pending activation".to_owned(),
+            ));
+        }
+        self.registry = durable;
         // WORK_UNIT_CASE: 893/14 — pending activation reconciled and
         // committed; abort/stale paths above emit no reconciled record.
-        host_activation_observe_bound(&ActivationObservation::for_pending(
+        host_activation_observe_bound(&ActivationObservation::for_reconciled(
             "host.activation reconciled",
             &pending,
+            &commit_fence,
+            committed_state,
         ));
         Ok(())
     }

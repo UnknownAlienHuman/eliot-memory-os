@@ -714,6 +714,15 @@ enum DoctorCommand {
         /// Absolute path to the accepted release-surface manifest.
         #[arg(long, value_parser = absolute_path)]
         manifest: PathBuf,
+        /// Release payload install root of the active generation. Supplying it
+        /// together with --generation lets the report claim active-installation
+        /// verification; without them the comparison is an offline inspection of
+        /// the named bytes and says so.
+        #[arg(long, value_parser = absolute_path)]
+        install_root: Option<PathBuf>,
+        /// Canonical relative package generation identity of the active release.
+        #[arg(long)]
+        generation: Option<String>,
     },
 }
 
@@ -1251,7 +1260,11 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                 }
             }
         }
-        DoctorCommand::ReleaseSurface { manifest } => {
+        DoctorCommand::ReleaseSurface {
+            manifest,
+            install_root,
+            generation,
+        } => {
             let observed_at = match release_surface::observed_unix_seconds() {
                 Ok(value) => value,
                 Err(error) => {
@@ -1259,10 +1272,31 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
+            // The generation identity is a bounded path component, not free text
+            // spliced into a path: it is parsed through the same owner type the
+            // release generator binds it with.
+            let generation = match generation {
+                Some(raw) => match cli_handle(raw, "--generation") {
+                    Ok(generation) => Some(generation),
+                    Err(error) => {
+                        write_installation_error(
+                            "DOCTOR_RELEASE_SURFACE_INVALID",
+                            &error.to_string(),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                },
+                None => None,
+            };
             // The comparison is read-only by construction: this front door
             // decodes arguments and projects the report, and the gate never
             // regenerates, repairs, or re-signs the accepted manifest.
-            match release_surface::verify_release_surface(&manifest, observed_at) {
+            match release_surface::verify_release_surface(
+                &manifest,
+                install_root.as_deref(),
+                generation.as_ref(),
+                observed_at,
+            ) {
                 Ok(report) => {
                     let drift = report.drift_detected();
                     println!("{}", serde_json::to_string_pretty(&report)?);

@@ -260,7 +260,25 @@ where
         process,
     )) {
         Ok((actions, _ready)) => actions,
-        Err(error) => return fail_drive(&error),
+        // Refused at or before admission: nothing was attempted, so there is
+        // no observation and no finish to report.
+        Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+            return fail_drive(&error);
+        }
+        // Failed after admission (issue #1911, A10.1 steps 7-8 / A10.8): the
+        // operations that already returned keep their observations, and the run
+        // still finishes. Returning straight to `fail_drive` used to discard
+        // both, so a partial drive reported nothing about work it had done and
+        // no finish state at all.
+        Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+            let (effects, finish) = partial_drive_receipts(&actions, &recorder.receipts);
+            emit_governed_provenance(&actions);
+            emit_governed_effects(&effects);
+            if let Some(receipt) = &finish {
+                emit_finish(receipt);
+            }
+            return fail_drive(&error);
+        }
     };
     let receipts = recorder.receipts;
     emit_governed_provenance(&drive_actions);
@@ -435,6 +453,32 @@ fn recorded_effects(
             )
         })
         .collect()
+}
+
+/// Projects what a partial governed drive already owns (issue #1911, A10.8).
+///
+/// Pure projection over the admitted actions and the recorder's call-ordered
+/// receipts, so the failure path reports the same fence+verifier-linked
+/// observations the success path does instead of dropping them:
+///
+/// - effects: exactly the pairs that both exist. A receipt count below the
+///   action count means a submission never returned, and `recorded_effects`
+///   `zip`s rather than inventing the missing observation;
+/// - finish: anchored on the last action that actually produced an
+///   observation, never on an action that did not run. This binary runs no
+///   verifier, so `verifier_met`/`proof_admissible` are both `false` and the
+///   word can only be a non-complete one — a partial drive can never report
+///   `VERIFIED_COMPLETE`. With no observation at all there is no honest finish
+///   and none is invented.
+fn partial_drive_receipts(
+    actions: &[ValidatedAction],
+    receipts: &[serde_json::Value],
+) -> (Vec<RecordedEffect>, Option<serde_json::Value>) {
+    let effects = recorded_effects(actions, receipts);
+    let finish = actions
+        .get(receipts.len().saturating_sub(1))
+        .map(|action| finish_receipt(action, false, false, None));
+    (effects, finish)
 }
 
 /// Emits the recorded effects as a sibling of the provenance receipt.
@@ -769,8 +813,9 @@ mod tests {
     use eliot_native_worker::{
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
         NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, PresentationEchoAdmission,
-        ValidatedDispatchGrant, derive_admitted_intent, drive_admitted_claimed,
-        governed_action::ActionEnvelope, require_launch_grant, select_factory_for_admitted,
+        ReconcileSubmission, ValidatedDispatchGrant, derive_admitted_intent,
+        drive_admitted_claimed, governed_action::ActionEnvelope, require_launch_grant,
+        select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope,
@@ -798,8 +843,9 @@ mod tests {
 
     use super::{
         ADMITTED_DRIVE_FAILED_EXIT, FinishState, KERNEL_ADMISSION_EXIT, PROVIDER_RUNTIME_DEFERRED,
-        ValidatedAction, block_on, deny_absent_material, deny_invalid_material, deny_transport,
-        exit_for_drive_error, finish_receipt, recorded_effects, terminal_action,
+        RecordedLifecycle, ValidatedAction, block_on, deny_absent_material, deny_invalid_material,
+        deny_transport, exit_for_drive_error, finish_receipt, partial_drive_receipts,
+        recorded_effects, terminal_action,
     };
 
     /// Fake authenticated lifecycle: validates the exact presentation and
@@ -1520,20 +1566,20 @@ mod tests {
     }
 
     fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-        let body = serde_json::to_vec(frame).expect("frame");
-        let mut out = u32::try_from(body.len())
-            .expect("len")
-            .to_le_bytes()
-            .to_vec();
-        out.extend_from_slice(&body);
-        out
+        eliot_ipc::encode_frame(
+            &frame.to_ebp_frame().expect("EBP frame"),
+            eliot_ipc::TransportLimits::default(),
+        )
+        .expect("encoded EBP frame")
     }
 
     fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-        let (prefix, body) = bytes.split_at(4);
-        let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-        assert_eq!(length, body.len());
-        serde_json::from_slice(body).expect("response")
+        let frame = eliot_ipc::decode_frame(bytes, eliot_ipc::TransportLimits::default())
+            .expect("EBP response frame");
+        let eliot_protocol::ProtocolPayload::Json(response) = frame.payload else {
+            panic!("JSON worker response");
+        };
+        serde_json::from_value(response).expect("response")
     }
 
     type SliceDWorker = NativeWorker<
@@ -1894,6 +1940,30 @@ mod tests {
         }
     }
 
+    /// Same contract as [`refusal_detail`] for the governed drive entry, whose
+    /// error keeps a partial drive distinguishable from a pre-admission
+    /// refusal.
+    fn drive_refusal_detail<T>(
+        result: Result<T, eliot_native_worker::GovernedDriveFailure>,
+        what: &str,
+    ) -> String {
+        match result {
+            Ok(_) => panic!("{what} must refuse"),
+            // Every contour denial is a pre-admission refusal: these fixtures
+            // assert zero submits, so a partial-drive error would itself be the
+            // defect.
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                panic!("{what} must refuse before admission, got {actions:?} / {error:?}")
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                match error {
+                    NativeWorkerError::KernelAdmissionRequired(detail) => detail,
+                    other => panic!("expected the contour denial, got {other:?}"),
+                }
+            }
+        }
+    }
+
     fn action_currency() -> (serde_json::Value, serde_json::Value) {
         (
             serde_json::to_value(fence())
@@ -1936,6 +2006,194 @@ mod tests {
         remove_bat("governed-drive");
     }
 
+    /// A lifecycle that fails the readiness submit after the three submits
+    /// before it already returned, so the drive is partial: register, claim and
+    /// reconcile happened, `start_claimed` did not.
+    struct FailAtReadiness<'a, L> {
+        inner: &'a mut L,
+    }
+
+    impl<L: AdmittedLifecycle> AdmittedLifecycle for FailAtReadiness<'_, L> {
+        fn submit_registration(
+            &mut self,
+            registration: &NativeWorkerRegistration,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            self.inner.submit_registration(registration)
+        }
+
+        fn submit_claim(
+            &mut self,
+            admission: &ClaimAdmissionRequest,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            self.inner.submit_claim(admission)
+        }
+
+        fn submit_reconcile(
+            &mut self,
+            submission: &ReconcileSubmission,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            self.inner.submit_reconcile(submission)
+        }
+
+        fn submit_readiness(
+            &mut self,
+            _submission: &eliot_native_worker_core::ReadinessSubmission,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            Err(NativeWorkerError::KernelAdmissionRequired(
+                "owner refused the readiness submit".to_owned(),
+            ))
+        }
+    }
+
+    /// A drive that fails after admission still owns what it completed
+    /// (issue #1911, A10.1 steps 7-8, A10.8).
+    ///
+    /// The admitted actions used to die with the `Err`, so the caller could not
+    /// report the three operations that had already returned, and the run ended
+    /// with no finish state at all. Both facts are asserted here against the
+    /// real drive, and the finish word is asserted non-complete.
+    #[test]
+    #[cfg(windows)]
+    fn partial_governed_drive_reports_completed_operations_and_finishes_honestly() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-partial", drive_carriers(&fence_json, &epoch_json));
+        let mut recorder = RecordedLifecycle {
+            inner: &mut lifecycle,
+            receipts: Vec::new(),
+        };
+        let failure = {
+            let mut failing = FailAtReadiness {
+                inner: &mut recorder,
+            };
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut failing,
+                &mut worker,
+                &material,
+                process,
+            ))
+        };
+        let (actions, error) = match failure {
+            Ok(_) => panic!("a refused readiness submit must fail the drive"),
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                (actions, error)
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                panic!("admission must precede the drive, got {error:?}")
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                NativeWorkerError::KernelAdmissionRequired(ref detail) if detail.contains("readiness")
+            ),
+            "the drive error is the readiness refusal itself, got {error:?}"
+        );
+        assert_eq!(
+            actions.len(),
+            4,
+            "every driven operation keeps its admitted action after a partial drive"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.operation.as_str())
+                .collect::<Vec<_>>(),
+            ["register", "claim", "reconcile", "start_claimed"],
+            "the retained actions keep drive order"
+        );
+
+        let receipts = recorder.receipts;
+        assert_eq!(
+            receipts.len(),
+            3,
+            "the three submits that returned are exactly the observations a partial drive owns"
+        );
+        let (effects, finish) = partial_drive_receipts(&actions, &receipts);
+        assert_eq!(
+            effects.len(),
+            3,
+            "one recorded effect per completed operation, and none invented for the fourth"
+        );
+        for (effect, action) in effects.iter().zip(actions.iter()) {
+            assert_eq!(effect.operation, action.operation);
+            assert_eq!(
+                effect.state_fence, action.state_fence,
+                "each retained effect keeps the admitted state fence it ran under"
+            );
+            assert_eq!(
+                effect.verifier, action.verifier,
+                "each retained effect keeps its bound verifier"
+            );
+        }
+
+        let Some(finish) = finish else {
+            panic!("a partial drive with observations must finish");
+        };
+        assert_eq!(
+            finish["operation"], "reconcile",
+            "the finish is anchored on the last operation that actually returned"
+        );
+        assert_eq!(finish["verifier_met"], false);
+        assert_eq!(finish["proof_admissible"], false);
+        assert_eq!(
+            finish["complete"], false,
+            "a partial drive can never claim completion"
+        );
+        assert_ne!(
+            finish["finish"], "VERIFIED_COMPLETE",
+            "no unmet verifier may be reported as verified"
+        );
+
+        // Non-vacuity: anchoring on the last ADMITTED action instead of the last
+        // OBSERVED one would name an operation that never ran.
+        let anchored_on_the_wrong_operation = actions
+            .last()
+            .map(|action| finish_receipt(action, false, false, None));
+        assert_eq!(
+            anchored_on_the_wrong_operation
+                .as_ref()
+                .map(|receipt| &receipt["operation"]),
+            Some(&serde_json::json!("start_claimed")),
+            "the unobserved operation is exactly what a last-admitted anchor would have named"
+        );
+        remove_bat("governed-partial");
+    }
+
+    /// A pre-admission refusal still owns nothing: no action, no observation
+    /// and therefore no invented finish.
+    #[test]
+    #[cfg(windows)]
+    fn a_pre_admission_refusal_retains_no_action_and_invents_no_finish() {
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-prerefuse", Vec::new());
+        let failure = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ));
+        let Err(failure) = failure else {
+            panic!("missing envelopes must refuse");
+        };
+        assert!(
+            failure.retained_actions().is_empty(),
+            "a refusal before admission owns no admitted action"
+        );
+        assert!(matches!(
+            failure,
+            eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(_)
+        ));
+        let (effects, finish) = partial_drive_receipts(failure.retained_actions(), &[]);
+        assert!(effects.is_empty());
+        assert!(
+            finish.is_none(),
+            "no observation means no honest finish, and none is invented"
+        );
+        assert!(lifecycle.registration.is_none() && lifecycle.claim.is_none());
+        remove_bat("governed-prerefuse");
+    }
+
     #[test]
     #[cfg(windows)]
     fn governed_drive_refuses_missing_mismatched_or_stale_envelopes_with_zero_submits() {
@@ -1943,7 +2201,7 @@ mod tests {
         // Missing: legacy bytes carry no carriers; nothing is submitted.
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
             governed_drive_parts("governed-missing", Vec::new());
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -1968,7 +2226,7 @@ mod tests {
                 &epoch_json,
             )],
         );
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -1997,7 +2255,7 @@ mod tests {
                 &epoch_json,
             )],
         );
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -2670,7 +2928,7 @@ mod tests {
             Vec::new(),
             "nonce-kernel-drive-missing-register",
         );
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,

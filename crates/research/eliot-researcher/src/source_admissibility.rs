@@ -1021,6 +1021,8 @@ pub enum RecordReferenceSurface {
     Locator,
     /// `SourceRecord::receipt_handle` — the retained raw-evidence artifact.
     ReceiptHandle,
+    /// `SourceRecord::transformed_from` — the raw source identity a derivation names.
+    RawSourceDerivation,
     /// `SourceRecord::cites` — a citation edge to another source identity.
     CitationEdge,
     /// `SourceRecord::evidence_spans[].anchor` — a coordinate inside the source.
@@ -1035,6 +1037,7 @@ impl RecordReferenceSurface {
             Self::CandidateHandle => "candidate_handle",
             Self::Locator => "locator",
             Self::ReceiptHandle => "receipt_handle",
+            Self::RawSourceDerivation => "raw_source_derivation",
             Self::CitationEdge => "citation_edge",
             Self::SpanAnchor => "span_anchor",
         }
@@ -1079,6 +1082,12 @@ pub fn record_references(record: &SourceRecord) -> Vec<PresentedReference> {
             reference: record.receipt_handle.clone(),
         },
     ];
+    if let Some(raw_source) = &record.transformed_from {
+        presented.push(PresentedReference {
+            surface: RecordReferenceSurface::RawSourceDerivation,
+            reference: raw_source.clone(),
+        });
+    }
     for edge in &record.cites {
         presented.push(PresentedReference {
             surface: RecordReferenceSurface::CitationEdge,
@@ -1127,8 +1136,9 @@ pub fn record_references(record: &SourceRecord) -> Vec<PresentedReference> {
 ///   artifact handle at all still produced citable records. The exemption above
 ///   rests on the reference naming a position *inside the admitted source*, and
 ///   a receipt handle does not, so it does not apply here.
-/// - a **citation edge**
-///   ([`RecordReferenceSurface::CitationEdge`]) is a source identity, not a
+/// - a **citation edge or raw-source derivation**
+///   ([`RecordReferenceSurface::CitationEdge`],
+///   [`RecordReferenceSurface::RawSourceDerivation`]) is a source identity, not a
 ///   pointer, so it is admitted only by the source, evidence and artifact handle
 ///   lists and never by `url_handles`.
 /// - a **candidate handle** ([`RecordReferenceSurface::CandidateHandle`]) is an
@@ -1169,6 +1179,7 @@ pub fn admits_record_reference(
     match presented.surface {
         RecordReferenceSurface::CandidateHandle
         | RecordReferenceSurface::CitationEdge
+        | RecordReferenceSurface::RawSourceDerivation
         | RecordReferenceSurface::ReceiptHandle => manifest.allows(&presented.reference),
         RecordReferenceSurface::Locator | RecordReferenceSurface::SpanAnchor => {
             match classify_locator(&presented.reference) {

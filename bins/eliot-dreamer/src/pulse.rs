@@ -855,3 +855,188 @@ mod pulse_denominator_coverage_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pulse_conflict_stage_owner_tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence};
+    use eliot_dreamer_conflict_analysis::OwnerRecords;
+    use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence};
+    use eliot_dreamer_contracts::{
+        AtomicityMode, CurationPayload, Requester, RequesterOrigin, TargetDenominator,
+        ValidationReceipt,
+    };
+    use eliot_epistemic_contracts::{ArgumentAcceptability, ConflictKind, ConflictLifecycle};
+    use std::collections::BTreeSet;
+
+    struct ConflictStageInputs {
+        item: ValidatedCurationItem,
+        draft: ValidatedDreamDraft,
+        grounded: GroundedDreamDraft,
+        conflict_set: ConflictSet,
+        supplements: ConflictSupplements,
+        policy: ConflictAnalysisPolicy,
+    }
+
+    fn sentinel_receipt(fence: StateFence) -> ValidationReceipt {
+        ValidationReceipt {
+            schema_version: 0,
+            validator_contract: String::new(),
+            validator_policy: String::new(),
+            job_id: String::new(),
+            draft_digest: String::new(),
+            bundle_digest: String::new(),
+            manifest_digest: String::new(),
+            task_id: String::new(),
+            scope_id: String::new(),
+            input_digest: String::new(),
+            output_digest: String::new(),
+            terminal_disposition: String::new(),
+            proof_ceiling: String::new(),
+            state_fence: fence,
+            preservation_digest: String::new(),
+            budget_digest: String::new(),
+        }
+    }
+
+    fn sentinel_conflict_set() -> Result<ConflictSet, Box<dyn std::error::Error>> {
+        Ok(ConflictSet {
+            conflict_id: "conflict-sentinel".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-sentinel".to_owned(),
+            task_id: None,
+            positions: Vec::new(),
+            missing_positions: Vec::new(),
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::new(),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::new(),
+            unresolved_owners: BTreeSet::new(),
+            acceptability: ArgumentAcceptability::Undecided,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("owner-sentinel")?,
+            affected_actions: Vec::new(),
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: String::new(),
+            digest: String::new(),
+        })
+    }
+
+    // Empty preflight collections and bounded text let the analyzer reach
+    // policy shape validation; revision zero is the exact refusal. The other
+    // typed values are deliberately unvalidated sentinels, not owner evidence
+    // or a claim that the conflict stage can emit a candidate.
+    fn invalid_policy_inputs() -> Result<ConflictStageInputs, Box<dyn std::error::Error>> {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")?;
+        let epoch = EpochId::new(lineage, std::num::NonZeroU64::MIN)?;
+        let fence = StateFence::new(epoch, ResourceGeneration::genesis());
+        let receipt = sentinel_receipt(fence.clone());
+        let item = ValidatedCurationItem {
+            receipt: receipt.clone(),
+            kind_spelling: String::new(),
+            family_spelling: String::new(),
+            payload: CurationPayload::Classification(ClassificationPayload {
+                label: String::new(),
+                confidence_bps: u32::MAX,
+                target_evidence: TargetEvidence {
+                    targets: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+            }),
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: Vec::new(),
+                expected_total: 0,
+            },
+            source_digest: String::new(),
+            task_id: String::new(),
+            scope_id: String::new(),
+            state_fence: fence.clone(),
+            job_digest: String::new(),
+            requester: Requester {
+                origin: RequesterOrigin::Human,
+                principal: String::new(),
+                session: None,
+            },
+            budget_note: String::new(),
+        };
+        let draft = ValidatedDreamDraft {
+            receipt: receipt.clone(),
+            draft_digest: String::new(),
+            scope_id: String::new(),
+            task_id: String::new(),
+            state_fence: fence,
+        };
+        let grounded = GroundedDreamDraft {
+            schema_version: 0,
+            job_id: String::new(),
+            draft_digest: String::new(),
+            residues: Vec::new(),
+            coverage_note: String::new(),
+        };
+        let conflict_set = sentinel_conflict_set()?;
+        let supplements = ConflictSupplements {
+            expected_receipt: receipt,
+            frozen_bundle_digest: String::new(),
+            frozen_manifest_digest: String::new(),
+            lineage: Vec::new(),
+            objections: Vec::new(),
+            counterevidence: Vec::new(),
+            assumptions: Vec::new(),
+            unknowns: Vec::new(),
+            supplied_probes: Vec::new(),
+            comparisons: Vec::new(),
+            causal_claims: Vec::new(),
+            external_resolution: None,
+            owner_records: OwnerRecords::default(),
+        };
+        let policy = ConflictAnalysisPolicy {
+            policy_id: "pulse-test-policy".to_owned(),
+            policy_revision: 0,
+            max_positions: 2,
+            max_sources: 2,
+            max_objections: 0,
+            max_probes: 0,
+            allow_partial: false,
+            cancelled: false,
+            observation_time_ms: None,
+            deadline_ms: None,
+            analysis_note: "invalid policy revision fixture".to_owned(),
+        };
+        Ok(ConflictStageInputs {
+            item,
+            draft,
+            grounded,
+            conflict_set,
+            supplements,
+            policy,
+        })
+    }
+
+    #[test]
+    fn conflict_stage_maps_invalid_policy_refusal_and_none_stays_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inputs = invalid_policy_inputs()?;
+        assert_eq!(inputs.policy.policy_revision, 0);
+        let stage = ConflictStage {
+            item: &inputs.item,
+            draft: &inputs.draft,
+            grounded: &inputs.grounded,
+            conflict_set: &inputs.conflict_set,
+            supplements: &inputs.supplements,
+            policy: &inputs.policy,
+        };
+
+        assert!(matches!(
+            run_conflict_stage(Some(&stage)),
+            Err(PulseError::Conflict)
+        ));
+        let pending = run_conflict_stage(None)?;
+        assert_eq!(pending.id, PulseStageId::Conflict);
+        assert_eq!(pending.disposition, OrientationStageDisposition::Pending);
+        assert!(pending.output_commitment.is_none());
+        Ok(())
+    }
+}

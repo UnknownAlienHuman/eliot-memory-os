@@ -54,6 +54,15 @@
 //! honestly: the dispatch gate refuses those classes before any gateway or
 //! executor entry, and no production caller is admitted. A missing required
 //! caller check is a gap, never permission to assert the path is absent.
+//!
+//! Reading in the other direction, a live path may never be recorded as
+//! absent. Credential attachment is the worked case: no Kernel-issued
+//! `AttachCredential` grant exists, yet the Store adapter does attach a
+//! reusable credential to a live socket, so its row is
+//! [`STORE_SESSION_CREDENTIAL_ROW`], a retained-owner row naming the real
+//! `signin` send, the server-side TCP connection-owner observation it is
+//! gated by, and the retained child identity, path lease and data-root lease
+//! re-proved around that observation, and not a `"none admitted"` stub.
 
 use super::OriginControlOperation;
 
@@ -76,9 +85,14 @@ pub enum OwnerAdmission {
     /// effect-currency recheck; `NotFound` and unreadable-journal
     /// `UnknownOutcome` fail closed before the effect.
     OwnerBindingOnly,
-    /// A retained Host-owned Job branch (outer kill domain) the Host itself
-    /// created and still holds. Pre-Kernel Host authority by design: Host
-    /// start/cleanup must not depend on a running Kernel.
+    /// A retained outer owner the owning contour itself created and still
+    /// holds: a Host-owned Job branch (outer kill domain) Host start/cleanup
+    /// must not depend on a running Kernel, or the Store adapter's own
+    /// retained provider child, whose credential attachment is gated by the
+    /// retained child identity, retained path lease, data-root lease, and the
+    /// server-side TCP row owning the connected socket. Neither carries an
+    /// `OriginControlGrant`, a nonce, or a Kernel-issued authority; both
+    /// re-prove the retained proof at the effect itself.
     RetainedHostBranch,
     /// The admitted suspended-launch proof for a child with no start
     /// identity yet: approved artifacts/digests/leases, suspended spawn,
@@ -105,7 +119,10 @@ pub struct OperationOwnerRecord {
     pub lifecycle: &'static str,
     /// The challenge operation class, or `None` for rows that carry no
     /// `OriginControlGrant`: the pre-challenge Host bootstrap/recovery rows
-    /// and the owner-binding-only grant-less cancel rows.
+    /// and the owner-binding-only grant-less cancel rows. `Some(..)` records
+    /// the class a row covers, never a grant: the two blocked rows and the
+    /// retained-owner Store credential row all name a class while carrying no
+    /// Kernel-issued grant at all.
     pub operation: Option<OriginControlOperation>,
     /// The exact target admitted for this operation.
     pub admitted_target: &'static str,
@@ -119,11 +136,16 @@ pub struct OperationOwnerRecord {
     pub effect_primitive: &'static str,
     /// The durable receipt the caller reconciles afterwards.
     pub reconciliation_receipt: &'static str,
-    /// Production callers, `"; "`-separated, or `"none admitted"`.
+    /// Production callers, `"; "`-separated, or `"none admitted"` on the
+    /// blocked rows only. A live path may never be recorded as absent.
     pub production_caller: &'static str,
     /// How the owner behind this row is admitted.
     pub admission: OwnerAdmission,
-    /// Concrete gap description; empty unless blocked.
+    /// Concrete gap description; empty unless blocked. The retained-owner
+    /// Store credential row is not blocked and therefore carries no gap: its
+    /// residual is the absence of a Kernel-granted credential path, which its
+    /// [`OwnerAdmission::RetainedHostBranch`] variant and its
+    /// [`OriginControlOperation::AttachCredential`] refusal text already state.
     pub gap: &'static str,
 }
 
@@ -242,25 +264,28 @@ pub static ADOPT_BLOCKED_ROW: OperationOwnerRecord = OperationOwnerRecord {
     gap: "concrete gap: Adopt has packaging but no admitted production caller; explicit legacy inspection/import remains read-only until a separately admitted migration/ownership transition exists, and any future caller must satisfy the same per-operation gate, binding, and recheck as the Kill path before an effect primitive is named here",
 };
 
-/// Credential attachment: refused before any gateway or executor entry.
+/// Credential attachment on the Store provider session socket.
 ///
-/// The packaging function forwards `AttachCredential` yet has no non-test
-/// caller (only the `eliotd` re-export), and the dispatch gate admits Kill
-/// only, so no reusable credential can reach an unidentified listener
-/// through an admitted caller. The Host collision path likewise authorizes
-/// no credential attachment.
-pub static ATTACH_CREDENTIAL_BLOCKED_ROW: OperationOwnerRecord = OperationOwnerRecord {
-    lifecycle: "credential attachment",
+/// The credential is attached over the socket this adapter already connected
+/// to the provider child it itself spawned and retained: the send is gated by
+/// the server-side TCP row that owns that exact connection, braced before and
+/// after by the same retained child identity, path lease, and data-root lease
+/// the owner was built with. This is a retained-owner contract of the Store
+/// adapter, not a Kernel-issued `AttachCredential` grant: the dispatch gate
+/// still admits Kill only, and the foreign-occupant collision path still
+/// refuses credential attachment to any occupant this contour did not start.
+pub static STORE_SESSION_CREDENTIAL_ROW: OperationOwnerRecord = OperationOwnerRecord {
+    lifecycle: "credential attachment (Store provider session)",
     operation: Some(OriginControlOperation::AttachCredential),
-    admitted_target: "none admitted",
-    physical_observation: "no admitted connection binding exists: the endpoint preflight (bins/eliot-host/src/host_job_launch.rs::ensure_store_endpoint_available_or_owned) proves no socket identity and its directive authorizes no credential attachment",
-    proof: "none admitted",
-    authority_check: "bins/eliot-kernel/src/daemon_request_dispatch.rs::validate_origin_control_operation rejects every non-Kill class with SessionFenced before gateway and executor entry (pinned by the refusal assertion beside it)",
-    effect_primitive: "none: refused before executor entry",
-    reconciliation_receipt: "none",
-    production_caller: "none admitted",
-    admission: OwnerAdmission::Blocked,
-    gap: "concrete gap: AttachCredential has packaging (bins/eliotd/src/process_origin.rs::request_origin_control, re-exported by bins/eliotd/src/lib.rs) but zero non-test callers and no admitted dispatch path; binding an actual connection plus retained process identity through the transport/platform mechanism, or an explicit refusal when that proof is unavailable, is implementation work still open",
+    admitted_target: "the one connected provider WebSocket plus the retained provider child behind it (ProviderOwner::provider_child for ProviderOwner::provider_process_id); the socket holds only a Weak owner reference (RpcSession::owner), so a session neither prolongs process ownership nor becomes a replacement owner",
+    physical_observation: "server-side TCP connection ownership for the exact connected pair, read from the live socket inside the request guard before the credential-bearing frame is sent: crates/storage/eliot-store-surreal-adapter/src/client/session.rs::connected_tcp_endpoints over the MaybeTlsStream plain arm plus crates/kernel/eliot-platform-windows/src/tcp_listener_owner.rs::observe_loopback_tcp_connection_peer_owner(client_local_endpoint, peer_endpoint), compared against the retained child PID by crates/storage/eliot-store-surreal-adapter/src/client/provider_owner.rs::require_connected_peer_owner",
+    proof: "retained-owner proof carried by crates/storage/eliot-store-surreal-adapter/src/client/provider_owner.rs::ProviderOwner, re-proved by ::validate_connected_peer before the credential send: exact child PID plus live ProcessIdentity (::provider_process_identity, ::validate_child_process plus ::require_live_child) and the retained RetainedProcessPathLease revalidating path, work root and artifact digest (crates/kernel/eliot-platform-windows/src/process_path_lease.rs::validate_process_identity), the bracketing ::require_unchanged_identity on both sides of the observation, and the exclusive StoreDataRootLease re-bound to the configured data root (::validate_data_root_lease); a zero retained PID, an unidentifiable TCP row (missing, zero or duplicate), a peer that is not the configured provider endpoint, or a changed identity all fail closed before the send",
+    authority_check: "the credential comes from the adapter's own validated profile and the credential object is held by it, never from a caller, a port, a PID file or an occupant: crates/storage/eliot-store-surreal-adapter/src/config.rs::SurrealAdapterConfig::username plus ::password, sent only from crates/storage/eliot-store-surreal-adapter/src/client/session.rs::authenticate_provider over a socket whose retained owner was just validated (crates/storage/eliot-store-surreal-adapter/src/client.rs::RpcTransport::connect_with_limits -> session.rs::RpcSession::connect -> provider_owner.rs::ProviderOwner::validate_owned then session.rs::require_unchanged_identity). A Kernel-issued AttachCredential path remains unsupported: bins/eliot-kernel/src/daemon_request_dispatch.rs::validate_origin_control_operation refuses it with SessionFenced before gateway and executor entry (pinned by the refusal assertion beside it), and a foreign occupant's credential attachment stays refused because crates/kernel/eliot-host-service/src/foreign_occupant_recovery.rs::operation_class maps RequestedProcessOperation::AttachCredential to CollisionOperationClass::Destructive(BlockedRecoveryOperation::AttachCredential)",
+    effect_primitive: "the one authenticated signin send on the already-proven connection: crates/storage/eliot-store-surreal-adapter/src/client/session.rs::RpcSession::signin as \"auth.signin\" through ::request_with_guard with prove_connection_owner true into ::request_payload (the send at session.rs Message::Text(payload.into())); the trait declaration and its forwarding impl are ::ProviderAuthentication::signin, and the admitted caller of the trait method is session.rs::authenticate_provider",
+    reconciliation_receipt: "the authenticated provider identity of the same retained generation, read back as crates/storage/eliot-store-surreal-adapter/src/client/provider_owner.rs::ProviderOwner::record_authenticated_version plus ::authenticated_version after ::authenticate_provider returned the pinned server version, surfaced by crates/storage/eliot-store-surreal-adapter/src/lib.rs::SurrealStoreAdapter::authenticated_provider_identity; connection-loss invalidation is ::clear_authenticated_version reached through ::note_connection_loss, so a stale session is never claimed live",
+    production_caller: "crates/storage/eliot-store-surreal-adapter/src/client.rs::RpcTransport::connect_with_limits; crates/storage/eliot-store-surreal-adapter/src/client/session.rs::RpcSession::connect; crates/storage/eliot-store-surreal-adapter/src/client/session_pool.rs::SessionPool::checkout",
+    admission: OwnerAdmission::RetainedHostBranch,
+    gap: "",
 };
 
 /// Stop/cancel from the native-worker `cancel_observe` route, owner binding only.
@@ -338,7 +363,7 @@ pub static FROZEN_OPERATION_OWNER_MAP: &[OperationOwnerRecord; 10] = &[
     HOST_TERMINATE_ROW,
     MUTATE_BLOCKED_ROW,
     ADOPT_BLOCKED_ROW,
-    ATTACH_CREDENTIAL_BLOCKED_ROW,
+    STORE_SESSION_CREDENTIAL_ROW,
     NATIVE_WORKER_CANCEL_ROW,
     WIRE_CANCEL_ROW,
     DAEMON_RECOVERY_CANCEL_ROW,
@@ -378,9 +403,11 @@ pub fn bootstrap_rows() -> [&'static OperationOwnerRecord; 2] {
 
 /// Returns the only challenge classes with an admitted production caller.
 ///
-/// Today exactly [`OriginControlOperation::Kill`] is admitted; every other
-/// class maps to a blocked row. Any admission change must land in this
-/// table first.
+/// Today exactly [`OriginControlOperation::Kill`] carries a Kernel-issued
+/// `OriginControlGrant` to an effect. Every other class either maps to a
+/// blocked row or, for credential attachment, to a retained-owner row that
+/// carries no grant at all. Any admission change must land in this table
+/// first.
 #[must_use]
 pub const fn admitted_challenge_operations() -> [OriginControlOperation; 1] {
     [OriginControlOperation::Kill]

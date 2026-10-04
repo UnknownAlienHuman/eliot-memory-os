@@ -945,12 +945,22 @@ fn c8_unsupported_schema_version_refused() {
         expected.len() == 1 && expected.chars().all(|digit| digit.is_ascii_digit()),
         "the expected schema version must be a single ASCII-digit token, got {expected:?}"
     );
-    let bumped = (expected.as_bytes()[0] - b'0' + 1) as char;
+    // Derive the unsupported token as TEXT. `b'2' - b'0' + 1 == 2`, and turning
+    // that number into a `char` by either route yields U+0002 (a control
+    // character) or U+0001 -- never the digit `'2'`, whose code point is 50. The
+    // bump therefore stays in ASCII BYTE space the whole way, and only the final
+    // byte is read as the digit:
+    let bumped = expected.as_bytes()[0] - b'0' + 1 + b'0';
+    let unsupported = char::from(bumped).to_string();
     assert!(
-        bumped != expected.chars().next().expect("length checked above"),
+        unsupported != expected,
         "the derived unsupported version must differ from the expected version"
     );
-    let unsupported = bumped.to_string();
+    assert!(
+        unsupported.len() == 1 && unsupported.chars().all(|digit| digit.is_ascii_digit()),
+        "the derived unsupported version must stay a single ASCII-digit token like the shipped \
+         one, got {unsupported:?}"
+    );
 
     // (a) The byte decoder itself still succeeds: `schema_version` is a plain
     // `String` member, so an unsupported version is carried, not refused, by
@@ -1811,15 +1821,33 @@ fn w4b_c14_bounded_malformed_input_panic_free() {
     );
 
     // (e) TRUNCATED JSON is a decoder concern, and the decoder must classify it
-    // as end-of-input rather than as bad data.
+    // as end-of-input rather than as bad data. The target type must not decide
+    // the outcome first: `{"state":` supplied to a STRUCT would be refused as a
+    // wrong-typed document ("invalid type: map, expected a sequence") before the
+    // parser ever reaches the truncation. `serde_json::Value` has no expected
+    // shape, so it is the one target where the cut-off input is classified by
+    // WHAT IS MISSING rather than by what the caller wanted to read.
     let truncated = "{\"state\":";
-    let Err(truncated_error) = decode_host::<Vec<String>>(truncated) else {
+    let Err(truncated_error) = decode_host::<serde_json::Value>(truncated) else {
         panic!("the truncated document `{{\"state\":` must be refused");
     };
     assert_eq!(
         truncated_error.classify(),
         serde_json::error::Category::Eof,
         "a truncated document must be refused as Category::Eof, got: {truncated_error}"
+    );
+    // Control: the SAME bytes against a typed target are refused as bad data
+    // instead, so the Eof above is pinned to the truncation and not merely to
+    // the document being unparseable.
+    let Err(typed_truncated) = decode_host::<Vec<String>>(truncated) else {
+        panic!("the truncated document must be refused for a typed target as well");
+    };
+    assert_eq!(
+        typed_truncated.classify(),
+        serde_json::error::Category::Data,
+        "the same truncated bytes supplied where a Vec<String> is required must be refused as \
+         Category::Data, so the Eof classification above comes from the truncation, got: \
+         {typed_truncated}"
     );
 
     // (f) VALID BUT WRONG-TYPED. An object where a `Vec<String>` is required is

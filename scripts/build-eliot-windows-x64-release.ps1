@@ -1652,6 +1652,249 @@ function Get-SelectedSurrealReleasePolicyReceipt([string]$Repo, [object]$Catalog
     }
 }
 
+# Issue #1923 (I18.44 clause "SBOM/license/advisory/provenance artifacts bind
+# to release hashes"), the RELEASE half of the binding. The in-repo owners of
+# the SBOM, license and advisory run artifacts
+# (scripts/verify-dependency-policy.py build_sbom_artifact /
+# build_license_report_artifact / build_advisory_report_artifact) and the
+# `--release-hashes` recomputation fence (verify_release_hash_bindings) already
+# existed and are self-tested, but release staging never asked for any of the
+# three artifacts. Nothing was therefore bound to the release: the release
+# manifest named no SBOM/license/advisory file, so no per-file SHA-256 of those
+# artifacts was ever a release hash, and every artifact the generator can emit
+# in that situation records `release_binding.status = "not_bound"`. That gap is
+# exactly what tests/release-security/build-sandbox-cache-tests.ps1:444-445
+# recorded as provenance_binding FALLBACK_REQUIRED.
+#
+# The ORDERING problem is real and is resolved here rather than papered over.
+# `--release-hashes` can only bind REPOSITORY-RELATIVE paths, because
+# verify_release_hash_bindings reads every entry through the same contained,
+# no-follow identity fence as every other policy input
+# (_validated_node_input -> _read_validated_repo_bytes): the path must resolve
+# inside --root. The staged bundle is outside the repository root by
+# construction (`-OutputRoot`, defaulting to $env:LOCALAPPDATA), and the release
+# hashes of the BUILT binaries are unknown until the build has finished. So the
+# release hashes CANNOT name the staged bundle artifacts.
+#
+# Two halves therefore compose instead of one being faked:
+#
+#   (a) The generator is PASSED a --release-hashes file whose entries are the
+#       repository-relative inputs this release actually consumed and whose
+#       bytes already exist in the pinned tree: the workspace manifest, the
+#       dependency lock, the pinned toolchain, the two tracked policy files the
+#       receipt itself digests, the tracked SurrealDB artifact catalogue, and
+#       - only under -UseProjectLocalSurreal - the project-local SurrealDB
+#       artifact plus its provisioning receipt, both of which this builder
+#       already resolves under `.eliot/dependency-policy/surrealdb/`. Every one
+#       of those digests is recomputed here from the artifact bytes through the
+#       builder's own verified-read helpers and is additionally cross-checked
+#       against the independently verified value the builder already holds
+#       (the toolchain receipt's cargo_lock/rust_toolchain SHA-256, the
+#       catalogue SHA-256, and the SurrealDB candidate SHA-256). The verifier
+#       then recomputes each of them again inside the Python process and fails
+#       the run with DEP-009 on any divergence, so `release_binding.status` is
+#       "bound" to hashes the code produced rather than to a value this builder
+#       asserted. When -UseProjectLocalSurreal is NOT selected there is no
+#       repository-relative external artifact to bind, and the function
+#       records that as an explicit omission instead of inventing a path.
+#
+#   (b) The three artifacts are staged into the bundle and their OWN per-file
+#       SHA-256 and byte length are recomputed from the exact bytes on disk
+#       (never copied from a self-declared digest field) into RELEASE.json,
+#       STAGED_PAYLOAD_MANIFEST.json and SHA256SUMS.json, so the artifacts are
+#       covered by the very manifest whose per-file SHA-256 IS the release
+#       hash. A missing or empty artifact is a hard throw, and Test-ReleaseBundle
+#       then refuses the bundle on any later drift.
+#
+# Halves (a) and (b) together are what the acceptance clause asks for; (a)
+# alone would bind only inputs and (b) alone would leave every artifact stamped
+# `not_bound` while claiming a binding the verifier never saw.
+function Get-ReleaseSupplyChainArtifacts(
+    [string]$Repo,
+    [string]$SourceCommit,
+    [object]$ToolchainReceipt,
+    [object]$Catalog,
+    [object]$SurrealArtifact,
+    [string]$Bundle
+) {
+    # `kind` is the exact `artifact` value _artifact_envelope writes for the
+    # matching flag, so a flag that produced the wrong artifact is refused
+    # instead of being recorded under the wrong name.
+    $artifactDefinitions = @(
+        [ordered]@{ flag = '--sbom-out'; artifact = 'sbom.json'; kind = 'sbom' }
+        [ordered]@{ flag = '--license-report-out'; artifact = 'licenses.json'; kind = 'license-report' }
+        [ordered]@{ flag = '--advisory-report-out'; artifact = 'advisories.json'; kind = 'advisory-report' }
+    )
+    # (a) The release hashes the generator may bind. Every entry is a tracked
+    # file inside the pinned source tree (or, only under the project-local
+    # SurrealDB route, an evidence file this same builder resolved and already
+    # verified); none is the staged bundle, which the verifier's containment
+    # fence would refuse anyway.
+    $releaseHashes = [ordered]@{}
+    foreach ($tracked in @(
+            @{ relative = 'Cargo.toml'; purpose = 'workspace manifest' },
+            @{ relative = 'Cargo.lock'; purpose = 'dependency lock' },
+            @{ relative = 'rust-toolchain.toml'; purpose = 'pinned toolchain' },
+            @{ relative = 'deny.toml'; purpose = 'dependency policy' },
+            @{ relative = 'config/dependency-policy.toml'; purpose = 'dependency policy manifest' },
+            @{ relative = [string]$Catalog.relative_path; purpose = 'tracked SurrealDB artifact catalog' }
+        )) {
+        $relative = Assert-SafeRelativePath ([string]$tracked.relative) "release $($tracked.purpose)"
+        $file = Assert-PinnedExternalPath (Join-Path $Repo $relative.Replace('/', '\')) "release $($tracked.purpose)"
+        $evidence = Read-VerifiedResidentFile $file.FullName "release $($tracked.purpose)"
+        $releaseHashes[$relative] = $evidence.sha256
+    }
+    # The tracked lock/toolchain/catalogue digests are already bound elsewhere in
+    # this flow by independently verified sources, so a disagreement here means
+    # the file changed underneath this release and the binding would be false.
+    if ($releaseHashes['Cargo.lock'] -cne [string]$ToolchainReceipt.cargo_lock.sha256 -or
+        $releaseHashes['rust-toolchain.toml'] -cne [string]$ToolchainReceipt.rust_toolchain.sha256) {
+        throw 'release dependency lock or toolchain changed between the toolchain receipt and the supply-chain artifact binding'
+    }
+    if ($releaseHashes[[string]$Catalog.relative_path] -cne [string]$Catalog.sha256) {
+        throw 'tracked SurrealDB artifact catalog changed between the catalog verification and the supply-chain artifact binding'
+    }
+    $boundExternalEvidence = @()
+    if ([string]$SurrealArtifact.source -ceq 'project-local-provisioner') {
+        foreach ($external in @(
+                @{ relative = [string]$SurrealArtifact.project_local_input_path; expected = [string]$SurrealArtifact.sha256; purpose = 'project-local SurrealDB artifact' },
+                @{ relative = [string]$SurrealArtifact.provisioning_receipt_input_path; expected = [string]$SurrealArtifact.provisioning_receipt_sha256; purpose = 'project-local SurrealDB provisioning receipt' }
+            )) {
+            $relative = Assert-SafeRelativePath ([string]$external.relative) "release $($external.purpose)"
+            $file = Assert-PinnedExternalPath (Join-Path $Repo $relative.Replace('/', '\')) "release $($external.purpose)"
+            $evidence = Read-VerifiedResidentFile $file.FullName "release $($external.purpose)"
+            if ($evidence.sha256 -cne ([string]$external.expected).ToLowerInvariant() -or
+                [int64]$evidence.length -ne [int64]$SurrealArtifact.bytes) {
+                throw "release $($external.purpose) bytes differ from the digest this release already bound"
+            }
+            $releaseHashes[$relative] = $evidence.sha256
+            $boundExternalEvidence += $relative
+        }
+    }
+
+    # The generator is run once with every flag, so exactly one executed
+    # dependency-policy run produces all three artifacts from one receipt; they
+    # therefore share one receipt_digest and one release_binding by construction.
+    $verifierPath = [System.IO.Path]::GetFullPath((Join-Path $Repo 'scripts\verify-dependency-policy.py'))
+    if (-not (Test-Path -LiteralPath $verifierPath -PathType Leaf)) {
+        throw 'dependency-policy artifact generator is missing'
+    }
+    $python = Get-PinnedCommandFile 'python' 'release dependency-policy artifact generator'
+    # The generator writes into a staging directory first and the staged bytes
+    # are then moved into the bundle by the caller, so a generator that wrote
+    # only one of the three artifacts, or wrote none, is caught below by the
+    # missing/empty checks rather than silently becoming a shorter manifest.
+    $generated = @()
+    $stagingRoot = Join-Path (Split-Path -Parent $Bundle) ("supply-chain-artifacts-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
+    try {
+        $releaseHashesPath = Join-Path $stagingRoot 'release-hashes.json'
+        # A JSON object with one entry per release hash, written by the builder
+        # and recomputed independently by the generator.
+        $releaseHashJson = ($releaseHashes | ConvertTo-Json -Depth 4).Trim()
+        [void](Write-VerifiedResidentFile $releaseHashesPath ([System.Text.Encoding]::UTF8.GetBytes($releaseHashJson + "`n")) 'release dependency-policy release-hashes input')
+        $generateArguments = @(
+            $verifierPath,
+            '--root', $Repo,
+            '--profile', 'offline-source',
+            '--release-hashes', $releaseHashesPath
+        )
+        foreach ($definition in $artifactDefinitions) {
+            $generateArguments += @($definition.flag, (Join-Path $stagingRoot $definition.artifact))
+        }
+        $generateExecution = Invoke-CapturedNativeProcess $python.FullName $generateArguments $Repo 'release-supply-chain-artifacts'
+        # The verifier's exit code is the DEPENDENCY-POLICY verdict (0 only for
+        # status PASS), not the outcome of this binding: an offline run over a
+        # candidate with unprovisioned external evidence legitimately reports
+        # findings while still writing all three artifacts, and this slice does
+        # not convert a pre-existing policy verdict into a new release gate.
+        # What it DOES refuse is an unusable result: a failure that produced no
+        # artifacts at all is a hard error below, because a release must never
+        # publish a row for an artifact the generator did not write.
+        $generateVerdict = [ordered]@{
+            exit_code = [int]$generateExecution.exit_code
+            stdout_log = [string]$generateExecution.stdout_path
+            stderr_log = [string]$generateExecution.stderr_path
+        }
+        # (b) Read each artifact back through the verified-resident read, which
+        # re-hashes the exact bytes on disk and revalidates identity across the
+        # read. A missing, empty or unparsable artifact is a hard refusal: the
+        # release must never publish a row for an artifact it did not produce.
+        foreach ($definition in $artifactDefinitions) {
+            $generatedPath = Join-Path $stagingRoot $definition.artifact
+            if (-not (Test-Path -LiteralPath $generatedPath -PathType Leaf)) {
+                throw "release dependency-policy run did not produce the staged supply-chain artifact: $($definition.flag)"
+            }
+            $evidence = Read-VerifiedResidentFile $generatedPath "release supply-chain artifact $($definition.artifact)"
+            if ($evidence.length -le 0) {
+                throw "release dependency-policy run produced an empty supply-chain artifact: $($definition.flag)"
+            }
+            try {
+                $parsed = [System.Text.Encoding]::UTF8.GetString($evidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            }
+            catch {
+                throw "release supply-chain artifact is not valid JSON: $($definition.flag)"
+            }
+            if ([string]$parsed.artifact -cne $definition.kind -or
+                [string]$parsed.release_binding.status -cne 'bound' -or
+                @($parsed.release_binding.hashes.PSObject.Properties).Count -ne $releaseHashes.Count) {
+                throw "release supply-chain artifact does not carry the bound release hashes it was generated with: $($definition.flag)"
+            }
+            $boundHashes = [ordered]@{}
+            foreach ($property in @($parsed.release_binding.hashes.PSObject.Properties | Sort-Object -Property Name -CaseSensitive)) {
+                $boundHashes[[string]$property.Name] = [string]$property.Value
+                if ([string]$property.Value -cne [string]$releaseHashes[[string]$property.Name]) {
+                    throw "release supply-chain artifact binds a release hash this builder did not record: $($property.Name)"
+                }
+            }
+            foreach ($relative in $releaseHashes.Keys) {
+                if (-not $boundHashes.Contains($relative)) {
+                    throw "release supply-chain artifact omits a recorded release hash: $relative"
+                }
+            }
+            $generated += [ordered]@{
+                flag = [string]$definition.flag
+                kind = [string]$definition.kind
+                file = [string]$definition.artifact
+                staged_relative = "supply_chain/$([string]$definition.artifact)"
+                # `length`, not the raw byte array: this record is serialized into
+                # RELEASE.json, and a byte[] would be published as a base64
+                # string rather than as the artifact's length. The generated
+                # CONTENT travels separately under `content`, because the staging
+                # directory this function wrote it into is removed on return and
+                # the caller stages these exact bytes into the bundle.
+                bytes = [int64]$evidence.length
+                content = [byte[]]$evidence.bytes
+                sha256 = $evidence.sha256
+                length = [int64]$evidence.length
+                status = [string]$parsed.status
+                proof_ceiling = [string]$parsed.proof_ceiling
+                receipt_digest = [string]$parsed.receipt_digest
+                release_binding_status = [string]$parsed.release_binding.status
+                release_binding_hashes = $boundHashes
+                support_claim = [string]$parsed.support_claim
+            }
+        }
+        if ($generated.Count -ne $artifactDefinitions.Count) {
+            throw 'release dependency-policy run did not produce the complete SBOM/license/advisory artifact set'
+        }
+        if (@($generated | ForEach-Object { [string]$_.receipt_digest } | Sort-Object -Unique).Count -ne 1) {
+            throw 'release supply-chain artifacts do not share one executed dependency-policy receipt'
+        }
+        return [ordered]@{
+            artifacts = @($generated)
+            release_hashes = $releaseHashes
+            bound_external_evidence = @($boundExternalEvidence)
+            generator_verdict = $generateVerdict
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Assert-SafeRelativePath([string]$Path, [string]$Purpose) {
     $normalized = $Path.Replace('\', '/')
     $segments = @($normalized -split '/')
@@ -2290,11 +2533,21 @@ function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
         # root workspace's closure; root-lock membership is refused outright.
         throw "retained excluded-disposition gate receipt carries $($lockedStandalonePackages.Count) inventoried package(s) in the root Cargo.lock"
     }
+    # Issue #1811 (item A4): the digest is shaped-checked here for the same
+    # reason the Operator build receipt is (`^[0-9a-f]{64}$` at the release
+    # binding): the manifest publishes this value, and a consumer that trusts it
+    # as a SHA-256 must not be handed an empty or truncated string. The staged
+    # copy is re-hashed below and compared, so the published digest describes
+    # bytes the bundle actually contains.
+    $dispositionReceiptSha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($dispositionReceiptSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'retained excluded-disposition gate receipt digest is not a lowercase 64-hex SHA-256'
+    }
     [ordered]@{
         schema = [string]$receipt.schema
         gate = 'scripts/verify-excluded-dispositions-1811.py'
-        receipt_path = '.eliot/excluded-dispositions/gate-receipt.json'
-        receipt_sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        receipt_path = 'excluded_dispositions/GATE_RECEIPT.json'
+        receipt_sha256 = $dispositionReceiptSha256
         denominator_packages = @($decisionProjection.denominator_packages)
         denied_packages = @($decisionProjection.denied_packages)
         trust_class = [string]$receipt.trust_class
@@ -3110,7 +3363,7 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
 # below invoke that slice with the repository root, pinned source commit,
 # staged bundle root, and staged Bridge record.
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$ModuleBuildProvenance, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$ModuleBuildProvenance, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot, [object[]]$SupplyChainArtifacts = @()) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -3171,6 +3424,26 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         generation = $SourceCommit
         proof_ceiling = 'unsigned-build-evidence'
         gate = $null
+    }
+    # Issue #1923 (I18.44): the generated SBOM/license/advisory run artifacts
+    # are staged payload, not reference material. Their digests are bound by
+    # SHA256SUMS.json like every other entry, so the artifacts are covered by
+    # the manifest whose per-file SHA-256 IS the release hash. Each entry's
+    # release_binding status is the one the generator actually wrote; the
+    # per-file digest recorded beside it was recomputed from the staged bytes.
+    foreach ($supplyChainArtifact in @($SupplyChainArtifacts)) {
+        $entries += [ordered]@{
+            path = [string]$supplyChainArtifact.path
+            selection = 'generated dependency-policy run artifact bound to the recorded release hashes of this release'
+            owner = 'scripts/verify-dependency-policy.py'
+            install_destination = 'supply_chain/'
+            generation = $SourceCommit
+            proof_ceiling = 'dependency-policy evidence only; never runtime, semantic, release-acceptance or Product support'
+            gate = $null
+            artifact_sha256 = [string]$supplyChainArtifact.sha256
+            artifact_bytes = [int64]$supplyChainArtifact.bytes
+            release_binding_status = [string]$supplyChainArtifact.release_binding_status
+        }
     }
     foreach ($moduleProof in @(
             @{ path = [string]$ModuleBuildProvenance.manifest_path; selection = 'canonical `eliotd` ModuleManifest exported from the live handshake contract constructor'; owner = 'eliot-runtime-contracts ModuleManifest + eliotd build-only exporter'; proof = 'exact contract bytes bound to the built eliotd artifact' },
@@ -4944,6 +5217,37 @@ try {
     Copy-TrackedTree $repo $sourceCommit 'docs/operations' (Join-Path $bundle 'docs/operations')
     Copy-TrackedTree $repo $sourceCommit 'docs/release' (Join-Path $bundle 'docs/release')
 
+    # Issue #1923 (I18.44): the generated SBOM/license/advisory artifacts are
+    # produced here and staged under supply_chain/ so they are covered by the
+    # same per-file SHA-256 sweep as every other staged payload. The staged bytes
+    # are re-hashed from disk after the move; the generator never publishes a
+    # digest this builder trusts without recomputing it here.
+    $supplyChainArtifacts = Get-ReleaseSupplyChainArtifacts $repo $sourceCommit $stageToolchain $surrealCatalog $verifiedPinnedSurreal $bundle
+    $supplyChainDirectory = Join-Path $bundle 'supply_chain'
+    if (-not (Test-Path -LiteralPath $supplyChainDirectory)) {
+        New-Item -ItemType Directory -Path $supplyChainDirectory -Force | Out-Null
+    }
+    $stagedSupplyChain = @()
+    foreach ($generatedArtifact in @($supplyChainArtifacts.artifacts)) {
+        $stagedPath = Join-Path $supplyChainDirectory ([string]$generatedArtifact.file)
+        $stagedBytes = [byte[]]$generatedArtifact.content
+        [void](Write-VerifiedResidentFile $stagedPath $stagedBytes "staged release supply-chain artifact $([string]$generatedArtifact.file)")
+        $stagedEvidence = Read-VerifiedResidentFile $stagedPath "staged release supply-chain artifact $([string]$generatedArtifact.file)"
+        if ($stagedEvidence.sha256 -cne [string]$generatedArtifact.sha256 -or [int64]$stagedEvidence.length -ne [int64]$generatedArtifact.length) {
+            throw "staged release supply-chain artifact differs from the generated bytes it was staged from: $([string]$generatedArtifact.file)"
+        }
+        $stagedSupplyChain += [ordered]@{
+            path = [string]$generatedArtifact.staged_relative
+            sha256 = $stagedEvidence.sha256
+            bytes = [int64]$stagedEvidence.length
+            status = [string]$generatedArtifact.status
+            release_binding_status = [string]$generatedArtifact.release_binding_status
+        }
+    }
+    if ($stagedSupplyChain.Count -ne @($supplyChainArtifacts.artifacts).Count) {
+        throw 'release staging did not stage the complete SBOM/license/advisory artifact set'
+    }
+
     $verifiedOperator = Get-VerifiedOperatorBuildReceipt $repo $sourceCommit $OperatorSource $operatorBuildInvocationId
     if ($operatorBuildTool -and
         (-not [string]::Equals([string]$verifiedOperator.dotnet_path, [string]$operatorBuildTool.path, [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -4987,7 +5291,7 @@ try {
             $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes `
             ([bool]$codexPluginBridgeStaged) $(if ($codexPluginBridgeStaged) { [string]$codexPluginBridgeStaged.sha256 } else { '' }) $(if ($codexPluginBridgeStaged) { [int64]$codexPluginBridgeStaged.bytes } else { [int64]0 }))
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle $stagedSupplyChain
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     # Issue #1923 W8: select and record the isolation disposition per boundary.
@@ -5118,6 +5422,29 @@ try {
             }
         }
         else { $null }
+        # Issue #1923 (I18.44): the generated SBOM/license/advisory artifacts
+        # reference the exact release hashes. Each row's path, sha256 and bytes
+        # were recomputed from the staged bytes on disk (never copied from the
+        # artifact's own digest field), and the release_binding status is the one
+        # the generator actually wrote after verify_release_hash_bindings
+        # recomputed every bound hash inside the Python process. The bound
+        # release hashes themselves are published beside the rows so a consumer
+        # can recompute them from the repository-relative paths.
+        supply_chain_artifacts = [ordered]@{
+            schema = 'eliot-release-supply-chain-artifacts-v1'
+            generator = 'scripts/verify-dependency-policy.py'
+            generator_profile = 'offline-source'
+            # The dependency-policy verdict of the executed run is recorded, not
+            # asserted: a non-zero generator_verdict exit_code is the POLICY
+            # status of the offline profile (0 only for status PASS) and is
+            # carried here verbatim. It is deliberately not a release gate in
+            # this slice; the binding itself IS gated (every row must be bound
+            # to the recorded release hashes above).
+            generator_verdict = $supplyChainArtifacts.generator_verdict
+            release_hashes = $supplyChainArtifacts.release_hashes
+            bound_external_evidence = @($supplyChainArtifacts.bound_external_evidence)
+            artifacts = @($stagedSupplyChain)
+        }
         architecture = 'windows-x64'
         signed = $false
         signature_policy = 'pre-release-unsigned'
@@ -5177,6 +5504,26 @@ This bundle is intentionally unsigned. Before public distribution:
 '@ | Set-Content -LiteralPath (Join-Path $bundle 'SIGNING_REQUIRED.txt') -Encoding utf8
 
     Assert-NoReleaseSecrets $bundle
+    # Issue #1811 (item A4): the retained gate receipt is a build output, not a
+    # tracked source file, so it lives under the repository's ignored evidence
+    # root and was previously named there in the manifest. That made
+    # `excluded_dispositions.receipt_path` a dangling reference for any consumer
+    # holding only the bundle: the manifest published a SHA-256 of a file the
+    # bundle did not contain and could not resolve. The receipt is staged here
+    # -- before the payload hash sweep, so it is covered by SHA256SUMS.json
+    # like every other entry -- and the staged bytes are re-hashed and compared
+    # against the digest the manifest publishes, so the published digest always
+    # describes bytes the consumer can actually read.
+    $stagedDispositionDirectory = Join-Path $bundle 'excluded_dispositions'
+    if (-not (Test-Path -LiteralPath $stagedDispositionDirectory)) {
+        New-Item -ItemType Directory -Path $stagedDispositionDirectory -Force | Out-Null
+    }
+    $stagedDispositionReceipt = Join-Path $stagedDispositionDirectory 'GATE_RECEIPT.json'
+    Copy-Item -LiteralPath (Get-ExcludedDispositionReceiptPath $repo) -Destination $stagedDispositionReceipt -Force
+    $stagedDispositionSha256 = (Get-FileHash -LiteralPath $stagedDispositionReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($stagedDispositionSha256 -cne [string]$dispositionReceipt.receipt_sha256) {
+        throw 'staged excluded-disposition gate receipt differs from the digest the release manifest publishes'
+    }
     $hashes = Get-ChildItem -LiteralPath $bundle -File -Recurse |
         Sort-Object FullName |
         ForEach-Object {

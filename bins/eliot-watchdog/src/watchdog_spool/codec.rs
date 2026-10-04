@@ -85,6 +85,50 @@ pub enum WatchdogSpoolPayload {
         lineage_epoch: u64,
         governor_unavailable_reason: GapRecoveryReason,
     },
+    /// Watchdog-owned Host responsiveness/recovery **attempt** record
+    /// (I8.3: "Every attempt is recorded in the Watchdog spool and Windows
+    /// Event Log for later reconciliation").
+    ///
+    /// This is the bounded outcome of one bounded `HostResponsivenessChallenge`
+    /// over two real observations: the closed attempt code, the closed
+    /// uncertainty code when the attempt resolved nothing, the closed
+    /// responsiveness verdict, the granted bounded interval, the digest of the
+    /// observed target identity when one was observed, and the observation
+    /// digests the classification was made from. It states what this Watchdog
+    /// observed and could not establish — never whether the Host is healthy,
+    /// never that a recovery is due, and never a canonical Problem, Incident,
+    /// completion, or coverage claim.
+    HostAttempt {
+        service: String,
+        attempt: String,
+        uncertainty: Option<String>,
+        verdict: String,
+        bounded_wait_secs: u64,
+        target_identity_digest: Option<String>,
+        evidence_refs: Vec<String>,
+    },
+    /// Watchdog-owned **pre-authorized containment request** record (I8.3:
+    /// "emit a signed pre-authorized containment request to the owning
+    /// Host/Kernel boundary").
+    ///
+    /// It is written only after the boundary fence admitted one fenced request,
+    /// and it carries the request's own bound material: the stable recovery
+    /// operation identity, the installer-approved recipe digest, the Host-issued
+    /// owner-epoch digest, the approved registration digest, the
+    /// challenge-time observed identity digest, and the evidence digests the
+    /// request carries. It is a *request*, so it records no executed effect and
+    /// no outcome: the owning Host/Kernel boundary revalidates target, evidence,
+    /// recipe class, current epoch, and allowed effect before any containment
+    /// runs, and this Watchdog never performs one.
+    ContainmentRequest {
+        service: String,
+        operation_id: String,
+        recipe_digest: String,
+        owner_epoch_digest: String,
+        registration_digest: String,
+        target_identity_digest: String,
+        evidence_refs: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -114,6 +158,7 @@ pub(crate) fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolE
         ));
     }
     super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
+    super::attempt::check_stored_attempt_payload(entry.observed_at_ms, &entry.payload)?;
     Ok(bytes)
 }
 
@@ -161,6 +206,7 @@ pub(crate) fn decode_entry(sequence: u64, bytes: &[u8]) -> Result<WatchdogSpoolE
         )));
     }
     super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
+    super::attempt::check_stored_attempt_payload(entry.observed_at_ms, &entry.payload)?;
     Ok(entry)
 }
 

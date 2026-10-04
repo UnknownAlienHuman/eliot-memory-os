@@ -24,6 +24,13 @@ use crate::{
     AdmittedIsolatedDestination, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms,
 };
 
+/// Spool-local Host responsiveness/recovery attempt and pre-authorized
+/// containment request records (I8.3). They are spool-local restricted
+/// non-semantic records like the intents below, they travel inside their export
+/// window under the existing `Recovery` class, and compaction never removes
+/// them, so the retained attempt and the request this Watchdog emitted stay
+/// readable for later canonical reconciliation.
+pub(crate) mod attempt;
 pub(crate) mod backup;
 mod codec;
 /// Durable failure-episode deduplication and recurrence state (I8.3, I8.9).
@@ -1084,6 +1091,69 @@ impl WatchdogSpool {
         Ok((outcome, created_entry))
     }
 
+    /// Journals one Host responsiveness/recovery attempt record (I8.3).
+    ///
+    /// This is the ordinary append path through the owner transaction, so the
+    /// retained attempt and the record every later canonical reconciliation reads
+    /// are the same bytes. The record is observation material only: it states
+    /// what this bounded attempt did and did not establish, never health, never
+    /// restart eligibility, and never a canonical Problem or Incident.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the record is not canonical or the retained
+    /// spool, header, or high-water fails validation.
+    pub(crate) fn journal_host_attempt(
+        &self,
+        observed_at_ms: u64,
+        record: &attempt::HostAttemptRecord,
+    ) -> Result<WatchdogSpoolEntry, SpoolError> {
+        let (outcome, entry) = self.append_with_entry(observed_at_ms, record.to_payload())?;
+        let _ = outcome;
+        Ok(entry)
+    }
+    /// Journals one pre-authorized containment request record (I8.3).
+    ///
+    /// The caller reaches this only after the boundary fence admitted the
+    /// request, so the retained copy names a request this Watchdog was
+    /// authorized to emit. It records the request, never an executed effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the record is not canonical or the retained
+    /// spool, header, or high-water fails validation.
+    pub(crate) fn journal_containment_request(
+        &self,
+        observed_at_ms: u64,
+        record: &attempt::ContainmentRequestRecord,
+    ) -> Result<WatchdogSpoolEntry, SpoolError> {
+        let (outcome, entry) = self.append_with_entry(observed_at_ms, record.to_payload())?;
+        let _ = outcome;
+        Ok(entry)
+    }
+
+    /// Appends one payload and returns both the retention outcome and the exact
+    /// entry the append created.
+    ///
+    /// Under retention pressure [`WatchdogSpool::append_in_transaction`] writes
+    /// an extra pressure `Gap` marker before the payload, so reading the
+    /// high-water mark afterwards would not name the record this call created.
+    fn append_with_entry(
+        &self,
+        observed_at_ms: u64,
+        payload: WatchdogSpoolPayload,
+    ) -> Result<(SpoolAppendOutcome, WatchdogSpoolEntry), SpoolError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let (outcome, entry) = Self::append_in_transaction(&write, observed_at_ms, payload)?;
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok((outcome, entry))
+    }
+
     /// Reads the durable high-water sequence without mutating any spool state.
     ///
     /// # Errors
@@ -2053,6 +2123,8 @@ impl WatchdogSpool {
                 WatchdogSpoolPayload::Recovery { .. } => "recovery".to_owned(),
                 WatchdogSpoolPayload::ProblemIntent { .. } => "problem_intent".to_owned(),
                 WatchdogSpoolPayload::IncidentIntent { .. } => "incident_intent".to_owned(),
+                WatchdogSpoolPayload::HostAttempt { .. } => "host_attempt".to_owned(),
+                WatchdogSpoolPayload::ContainmentRequest { .. } => "containment_request".to_owned(),
             }
         }
 
@@ -3126,21 +3198,25 @@ fn store_export_cursor_bytes(write: &WriteTransaction, bytes: &[u8]) -> Result<(
 
 /// Maps one spool codec payload to its owner-neutral export class.
 ///
-/// Spool-local intents (`ProblemIntent`, `IncidentIntent`) keep the existing
-/// `Recovery` (gap-like) class here: the shared `WatchdogSpoolPayloadKind` is
-/// intentionally not extended (out-of-lane exhaustive matches would break).
-/// The class is used for retention and compaction classification only — the
-/// intent's own fenced reconciliation runs through the Kernel
-/// `watchdog-spool-batch-v1` intent route, never through this tag. Compaction
-/// retains every intent regardless of class, so an acknowledged intent is never
-/// removed and stays linked to the Governor's decision.
+/// Spool-local intents (`ProblemIntent`, `IncidentIntent`), Host attempts
+/// (`HostAttempt`), and containment requests (`ContainmentRequest`) keep the
+/// existing `Recovery` (gap-like) class here: the shared
+/// `WatchdogSpoolPayloadKind` is intentionally not extended (out-of-lane
+/// exhaustive matches would break). The class is used for retention and
+/// compaction classification only — an intent's own fenced reconciliation runs
+/// through the Kernel `watchdog-spool-batch-v1` intent route, never through this
+/// tag. Compaction retains every one of these records regardless of class, so an
+/// acknowledged intent, an attempt, and an emitted request are never removed and
+/// stay linked to the Governor's later decision.
 fn export_payload_kind(payload: &WatchdogSpoolPayload) -> WatchdogSpoolPayloadKind {
     match payload {
         WatchdogSpoolPayload::Heartbeat { .. } => WatchdogSpoolPayloadKind::Heartbeat,
         WatchdogSpoolPayload::Gap { .. } => WatchdogSpoolPayloadKind::Gap,
         WatchdogSpoolPayload::Recovery { .. }
         | WatchdogSpoolPayload::ProblemIntent { .. }
-        | WatchdogSpoolPayload::IncidentIntent { .. } => WatchdogSpoolPayloadKind::Recovery,
+        | WatchdogSpoolPayload::IncidentIntent { .. }
+        | WatchdogSpoolPayload::HostAttempt { .. }
+        | WatchdogSpoolPayload::ContainmentRequest { .. } => WatchdogSpoolPayloadKind::Recovery,
     }
 }
 
@@ -3473,10 +3549,11 @@ fn build_empty_export_batch(
 /// stops below the first unresolved `Gap` or `Recovery` marker above the
 /// cursor; that bound is implied by the candidate ceiling and enforced here
 /// explicitly so compaction can never cross an unresolved gap. A spool-local
-/// intent is never a compaction candidate at any sequence: the original
-/// Watchdog record must stay retained so the fenced Kernel record and the
-/// Governor's later decision stay forensically linked to it, and retention
-/// pressure eviction is the only thing that may ever drop it.
+/// intent, a Host attempt, and a containment request are never compaction
+/// candidates at any sequence: the original Watchdog record must stay retained so
+/// the fenced Kernel record, the Governor's later decision, and the request this
+/// Watchdog emitted stay forensically linked to it, and retention pressure
+/// eviction is the only thing that may ever drop it.
 fn compaction_plan(entries: &[WatchdogSpoolEntry], acknowledged: u64) -> Vec<u64> {
     let first_unresolved = entries
         .iter()
@@ -3491,7 +3568,7 @@ fn compaction_plan(entries: &[WatchdogSpoolEntry], acknowledged: u64) -> Vec<u64
     entries
         .iter()
         .filter(|entry| entry.sequence <= acknowledged)
-        .filter(|entry| !intent::is_intent_payload(&entry.payload))
+        .filter(|entry| !attempt::is_forensically_linked_payload(&entry.payload))
         .filter(|entry| {
             matches!(
                 export_payload_kind(&entry.payload),

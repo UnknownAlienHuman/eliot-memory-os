@@ -61,12 +61,32 @@ fn route_fingerprint(
 ///
 /// Tool names, descriptions, and shell substrings never define call
 /// semantics: the class comes from the admitted method. The bounded evidence
-/// query is broad-search, an exact Skill lifecycle tool is expensive, and a
-/// task-bound campaign packet is effect-capable. A name outside the admitted
-/// set never reaches classification; admission fails closed first.
+/// query is a cheap exact read, an exact Skill lifecycle tool is expensive,
+/// and a task-bound campaign packet is effect-capable. A name outside the
+/// admitted set never reaches classification; admission fails closed first.
+///
+/// #1838: the bounded query is [`ToolCallClass::CheapExactRead`], not
+/// `BroadSearch`. `LocalReadAdmission::Query` carries closed exact selectors —
+/// one trusted scope, one exact subject, and the fixed
+/// `EVIDENCE_PACK_MAX_RECORDS` ceiling — which is the definition of a cheap
+/// exact read, and `CheapExactRead` is the one class the receipts contract
+/// exempts from the intent gate.
+///
+/// Classifying it as `BroadSearch` made the entire local-read lane
+/// permanently unreachable. `authorize_pre_dispatch` requires a
+/// [`eliot_receipts::ToolCallIntent`] for every non-exempt class, and that
+/// intent carries `expected_delta`, `cheaper_route_insufficient`, `budget`,
+/// `stop_conditions` and `retry_conditions` — none of which any admitted
+/// `eliot.query` surface can carry. The MCP contract's
+/// [`QueryIntent`](eliot_mcp::contract::QueryIntent) deliberately declares
+/// only `mode` and is `deny_unknown_fields`, with a recorded decision that the
+/// four prose dimensions were removed precisely because "a required field
+/// promising a selector that nothing selects" would trade a working admission
+/// for an unreachable one. Requiring the block anyway therefore refused every
+/// admissible query with `SessionFenced` before any read.
 pub(crate) fn call_class(admission: &LocalReadAdmission) -> ToolCallClass {
     match admission {
-        LocalReadAdmission::Query(_) => ToolCallClass::BroadSearch,
+        LocalReadAdmission::Query(_) => ToolCallClass::CheapExactRead,
         LocalReadAdmission::Skill => ToolCallClass::Expensive,
         LocalReadAdmission::CampaignPacket { .. } => ToolCallClass::EffectCapable,
     }
@@ -276,10 +296,13 @@ pub(crate) fn observe_persisted_delivery(
 
 /// Returns whether the accepted admission requires an intent before dispatch.
 ///
-/// The answer reads off the admission-derived class, so cheap exact reads
-/// stay exempt by construction while every currently admitted method —
-/// broad-search query, expensive Skill lifecycle tool, effect-capable
-/// campaign packet — carries an intent.
+/// The answer reads off the admission-derived class, so the cheap exact read
+/// stays exempt by construction while the expensive Skill lifecycle tool and
+/// the effect-capable campaign packet both carry an intent. The bounded
+/// `eliot.query` is that cheap exact read (`call_class`): requiring an intent
+/// of it refused every admissible query before any read, because the
+/// `deny_unknown_fields` MCP `QueryIntent` carries only `mode` and cannot
+/// express the five prose dimensions `ToolCallIntent` demands.
 pub(crate) fn requires_intent(admission: &LocalReadAdmission) -> bool {
     call_class(admission).requires_intent()
 }

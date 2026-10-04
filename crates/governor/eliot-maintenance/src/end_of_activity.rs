@@ -116,6 +116,16 @@ pub struct AssessmentSourceSnapshot<T> {
 }
 
 impl<T: AssessmentSourceRecord> AssessmentSourceSnapshot<T> {
+    /// Returns this source's coverage and retained-gap count for the decision
+    /// relation. Read only after [`Self::validate`] has passed.
+    fn fact(&self, field: &'static str) -> SourceCoverageFact {
+        SourceCoverageFact {
+            field,
+            coverage: self.coverage,
+            gaps: self.gaps.len(),
+        }
+    }
+
     /// Validates exact source identity, coverage and record references.
     pub fn validate(
         &self,
@@ -134,6 +144,14 @@ impl<T: AssessmentSourceRecord> AssessmentSourceSnapshot<T> {
             return Err(EndOfActivityMaintenanceAssessmentValidationError::FenceMismatch);
         }
         validate_unique_text(&self.covered_scope_refs, "source.covered_scope_refs")?;
+        // "Complete" has to be complete over something. A `Complete` source
+        // that declares no scope at all is coverage of nothing, which would
+        // otherwise let a `no_action` decision rest on an empty read while
+        // still claiming an adequate known coverage of due work.
+        if self.coverage == AssessmentSourceCoverage::Complete && self.covered_scope_refs.is_empty()
+        {
+            return Err(EndOfActivityMaintenanceAssessmentValidationError::InvalidCoverage);
+        }
 
         let mut record_refs = Vec::with_capacity(self.records.len());
         for record in &self.records {
@@ -359,6 +377,76 @@ impl EndOfActivityMaintenanceAssessmentRequest {
             .validate(&self.source_fence)?;
         self.user_session_required_work.validate(&self.source_fence)
     }
+
+    /// Returns every declared source's coverage and retained-gap count.
+    ///
+    /// The decision relation is checked against what the request actually
+    /// read, never against a caller's claim about it. A source that is
+    /// `Partial` or `Unknown`, or that carries any retained gap, is a real
+    /// limiting condition and is never treated as a known-empty set.
+    fn coverage_facts(&self) -> Vec<SourceCoverageFact> {
+        vec![
+            self.activation_scope_set.fact("activation_scope_set"),
+            self.closed_sessions.fact("closed_sessions"),
+            self.closed_attempts.fact("closed_attempts"),
+            self.closed_jobs.fact("closed_jobs"),
+            self.closed_effects.fact("closed_effects"),
+            self.pending_observations.fact("pending_observations"),
+            self.pending_feedback.fact("pending_feedback"),
+            self.pending_projections.fact("pending_projections"),
+            self.pending_receipts.fact("pending_receipts"),
+            self.maintenance_debt.fact("maintenance_debt"),
+            self.due_policies.fact("due_policies"),
+            self.eligible_service_safe_routes
+                .fact("eligible_service_safe_routes"),
+            self.user_session_required_work
+                .fact("user_session_required_work"),
+        ]
+    }
+
+    /// Returns the first source that is not adequately covered, or `None`
+    /// when every declared source is `Complete` with no retained gap.
+    ///
+    /// "Adequate known coverage of due work" means exactly this: each named
+    /// persistence owner answered for its declared scopes. An empty record
+    /// list under `Complete` is a known-empty set; the same empty list under
+    /// `Partial`, `Unknown` or with a retained gap is not.
+    fn first_inadequately_covered_source(&self) -> Option<&'static str> {
+        self.coverage_facts()
+            .into_iter()
+            .find(|fact| fact.coverage != AssessmentSourceCoverage::Complete || fact.gaps != 0)
+            .map(|fact| fact.field)
+    }
+
+    /// True when the request carries work a decision actually has to address.
+    ///
+    /// Only the sources that can hold outstanding work are consulted. Closed
+    /// activity and the activation/scope set describe what already ended, so
+    /// their record count says nothing about whether deferral is justified.
+    fn has_outstanding_work(&self) -> bool {
+        self.pending_observations.records.len()
+            + self.pending_feedback.records.len()
+            + self.pending_projections.records.len()
+            + self.pending_receipts.records.len()
+            + self.maintenance_debt.records.len()
+            + self.user_session_required_work.records.len()
+            > 0
+    }
+
+    /// True when at least one source is incomplete or retains an explicit gap.
+    fn has_limiting_condition(&self) -> bool {
+        self.first_inadequately_covered_source().is_some()
+    }
+}
+
+/// One source's coverage and retained-gap count.
+struct SourceCoverageFact {
+    /// Request field the fact was read from.
+    field: &'static str,
+    /// Explicit coverage the source owner declared.
+    coverage: AssessmentSourceCoverage,
+    /// Number of retained, explained gaps.
+    gaps: usize,
 }
 
 /// Deterministic end-of-activity action vocabulary from I14.22.
@@ -458,6 +546,105 @@ impl EndOfActivityMaintenanceAssessmentOutcome {
             || self.outcome_receipt.decision_id != self.decision_id
         {
             return Err(EndOfActivityMaintenanceAssessmentValidationError::OutcomeReceiptMismatch);
+        }
+        self.validate_decision_relation(request)
+    }
+
+    /// Validates the complete requested-to-observed action relation.
+    ///
+    /// The decision, the runtime/wake references it carries and the shutdown
+    /// disposition must agree with each other and with what the request
+    /// actually read. Without this, a caller could claim `NO_ACTION` from
+    /// sources that never answered, claim `SCHEDULE_WAKE` with no admitted
+    /// `WakeIntent`, or claim a replacement runtime lease while also letting
+    /// shutdown continue, and the record would still validate.
+    fn validate_decision_relation(
+        &self,
+        request: &EndOfActivityMaintenanceAssessmentRequest,
+    ) -> Result<(), EndOfActivityMaintenanceAssessmentValidationError> {
+        let invalid = || EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid;
+        match self.decision {
+            // `no_action` is the strongest claim in the vocabulary: it says
+            // there is nothing to do. That is only admissible on adequate
+            // known coverage of due work, so it must not rest on a source that
+            // is partial, unknown or gap-carrying.
+            EndOfActivityAssessmentDecision::NoAction => {
+                if let Some(source) = request.first_inadequately_covered_source() {
+                    return Err(
+                        EndOfActivityMaintenanceAssessmentValidationError::InsufficientCoverage(
+                            source,
+                        ),
+                    );
+                }
+                // Nothing is admitted and nothing is scheduled, so drain stays
+                // eligible and no replacement ownership appears.
+                if self.runtime_lease.is_some() || self.wake_intent.is_some() {
+                    return Err(invalid());
+                }
+                if !self.shutdown_may_proceed {
+                    return Err(invalid());
+                }
+            }
+            // A bounded job is the only decision that may hold drain back, and
+            // only by naming the current runtime ownership that replaces the
+            // released lease. A job reference inside a historical record is
+            // not proof that a lease is live.
+            EndOfActivityAssessmentDecision::StartBoundedJob => {
+                if self.runtime_lease.is_none() {
+                    return Err(invalid());
+                }
+                if self.wake_intent.is_some() {
+                    return Err(invalid());
+                }
+                if self.shutdown_may_proceed {
+                    return Err(invalid());
+                }
+                // This is the only effect-capable decision in the vocabulary,
+                // so it is the only one whose outcome receipt must name the
+                // operation that admitted the bounded job. Without that
+                // identity the held drain has no replay handle and the same
+                // boundary could be admitted twice.
+                if self.outcome_receipt.operation_id.is_none() {
+                    return Err(invalid());
+                }
+            }
+            // `schedule_wake` must name an actual admitted Host `WakeIntent`
+            // rather than a locally fabricated scheduler record.
+            EndOfActivityAssessmentDecision::ScheduleWake => {
+                if self.wake_intent.is_none() || self.runtime_lease.is_some() {
+                    return Err(invalid());
+                }
+                // A pending wake is not admitted runtime ownership, so it must
+                // not withhold drain.
+                if !self.shutdown_may_proceed {
+                    return Err(invalid());
+                }
+            }
+            // A single preserved recommendation renews nothing: it keeps no
+            // lease and schedules nothing.
+            EndOfActivityAssessmentDecision::SuggestOnce => {
+                if self.runtime_lease.is_some() || self.wake_intent.is_some() {
+                    return Err(invalid());
+                }
+                if !self.shutdown_may_proceed {
+                    return Err(invalid());
+                }
+            }
+            // `defer` must record a real limiting condition or preserve real
+            // outstanding work. It is not the answer to a fully covered request
+            // that holds nothing, which would otherwise read as an assessment
+            // that decided nothing while looking complete.
+            EndOfActivityAssessmentDecision::Defer => {
+                if !request.has_limiting_condition() && !request.has_outstanding_work() {
+                    return Err(invalid());
+                }
+                if self.runtime_lease.is_some() || self.wake_intent.is_some() {
+                    return Err(invalid());
+                }
+                if !self.shutdown_may_proceed {
+                    return Err(invalid());
+                }
+            }
         }
         Ok(())
     }
@@ -562,28 +749,12 @@ pub fn assess_end_of_activity(
                 .to_owned(),
         });
     }
-    if [
-        &request.activation_scope_set.coverage,
-        &request.closed_sessions.coverage,
-        &request.closed_attempts.coverage,
-        &request.closed_jobs.coverage,
-        &request.closed_effects.coverage,
-        &request.pending_observations.coverage,
-        &request.pending_feedback.coverage,
-        &request.pending_projections.coverage,
-        &request.pending_receipts.coverage,
-        &request.maintenance_debt.coverage,
-        &request.due_policies.coverage,
-        &request.eligible_service_safe_routes.coverage,
-        &request.user_session_required_work.coverage,
-    ]
-    .contains(&&AssessmentSourceCoverage::Unknown)
-    {
+    if request.first_inadequately_covered_source().is_some() {
         return Ok(EndOfActivityAssessment {
             decision: EndOfActivityAssessmentDecision::Defer,
             shutdown_may_proceed: true,
             shutdown_reason:
-                "unknown source coverage preserved for a later eligible opportunity; drain continues"
+                "incomplete source coverage preserved for a later eligible opportunity; drain continues"
                     .to_owned(),
         });
     }
@@ -654,6 +825,15 @@ pub enum EndOfActivityMaintenanceAssessmentValidationError {
     /// Existing outcome receipt does not bind this fence and decision.
     #[error("end-of-activity outcome receipt mismatch")]
     OutcomeReceiptMismatch,
+    /// `no_action` claimed adequate known coverage of due work that the
+    /// request's own sources do not provide. The payload names the first
+    /// source that is partial, unknown or carries a retained gap.
+    #[error("end-of-activity decision requires coverage {0} does not provide")]
+    InsufficientCoverage(&'static str),
+    /// The decision, the runtime/wake references it carries and the shutdown
+    /// disposition do not form the requested-to-observed action relation.
+    #[error("end-of-activity decision records no admissible action relation")]
+    DecisionRelationInvalid,
 }
 
 fn validate_text(
@@ -678,4 +858,530 @@ fn validate_unique_text(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{ClockReading, DecisionId, OperationId, ReceiptId};
+    use serde_json::json;
+
+    const FENCE_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn must<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).expect("valid fixture")
+    }
+
+    /// The one fence every fixture binds to, in its wire shape.
+    fn fence_value() -> serde_json::Value {
+        json!({
+            "authority_epoch": { "lineage_id": FENCE_LINEAGE, "sequence": 1 },
+            "resource_generation": 1,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        })
+    }
+
+    fn fence() -> StateFence {
+        must(fence_value())
+    }
+
+    fn request_id() -> RequestId {
+        RequestId::new("eoa-request-1").expect("request id")
+    }
+
+    fn decision_id() -> DecisionId {
+        DecisionId::new("eoa-decision-1").expect("decision id")
+    }
+
+    /// A source that answered completely for one declared scope and holds no
+    /// records: the known-empty case the coverage rules must accept.
+    fn complete_source<T: AssessmentSourceRecord>() -> AssessmentSourceSnapshot<T> {
+        AssessmentSourceSnapshot {
+            persistence_owner: "owner-1".to_owned(),
+            source_revision: Some("rev-1".to_owned()),
+            state_fence: fence(),
+            coverage: AssessmentSourceCoverage::Complete,
+            covered_scope_refs: vec!["scope-1".to_owned()],
+            records: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    fn record_reference(reference: &str) -> AssessmentRecordReference {
+        AssessmentRecordReference {
+            reference: reference.to_owned(),
+        }
+    }
+
+    fn debt_reference(reference: &str) -> MaintenanceDebtReference {
+        MaintenanceDebtReference {
+            reference: reference.to_owned(),
+            family: MaintenanceFamily::OutboxReceiptReconciliation,
+        }
+    }
+
+    /// A request whose every named owner answered completely for `scope-1`
+    /// and reported nothing outstanding.
+    fn covered_empty_request() -> EndOfActivityMaintenanceAssessmentRequest {
+        EndOfActivityMaintenanceAssessmentRequest {
+            contract_identity: end_of_activity_assessment_contract_identity()
+                .expect("contract identity"),
+            request_id: request_id(),
+            observed_at_ms: 1_700_000_000_000,
+            source_fence: fence(),
+            activation_scope_set: must(json!({
+                "persistence_owner": "host-state-journal",
+                "source_revision": "rev-activation",
+                "state_fence": fence_value(),
+                "coverage": "COMPLETE",
+                "covered_scope_refs": ["scope-1"],
+                "records": [{"activation_ref": "activation-1", "scope_refs": ["scope-1"]}],
+                "gaps": []
+            })),
+            closed_sessions: complete_source(),
+            closed_attempts: complete_source(),
+            closed_jobs: complete_source(),
+            closed_effects: complete_source(),
+            pending_observations: complete_source(),
+            pending_feedback: complete_source(),
+            pending_projections: complete_source(),
+            pending_receipts: complete_source(),
+            maintenance_debt: complete_source(),
+            due_policies: complete_source(),
+            eligible_service_safe_routes: complete_source(),
+            user_session_required_work: complete_source(),
+        }
+    }
+
+    fn runtime_lease() -> RuntimeLease {
+        must(json!({
+            "lease_id": "lease-1",
+            "scope_ref": "scope-1",
+            "authority_epoch": { "lineage_id": FENCE_LINEAGE, "sequence": 1 },
+            "state_fence": fence_value(),
+            "state": "ACTIVE",
+            "expires_at_ms": 4_000_000_000_000u64
+        }))
+    }
+
+    fn wake_intent() -> WakeIntent {
+        must(json!({
+            "wake_id": "wake-1",
+            "reason": "later eligible maintenance opportunity",
+            "state_fence": fence_value(),
+            "state": "PENDING"
+        }))
+    }
+
+    fn outcome_receipt(operation_id: Option<&str>) -> Receipt {
+        Receipt {
+            receipt_id: ReceiptId::new("receipt-1").expect("receipt id"),
+            operation_id: operation_id.map(|value| OperationId::new(value).expect("operation id")),
+            decision_id: decision_id(),
+            status: must(json!("SUCCEEDED")),
+            state_fence: fence(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn outcome(
+        decision: EndOfActivityAssessmentDecision,
+        runtime_lease: Option<RuntimeLease>,
+        wake_intent: Option<WakeIntent>,
+        shutdown_may_proceed: bool,
+        operation_id: Option<&str>,
+    ) -> EndOfActivityMaintenanceAssessmentOutcome {
+        EndOfActivityMaintenanceAssessmentOutcome {
+            contract_identity: end_of_activity_assessment_contract_identity()
+                .expect("contract identity"),
+            request_id: request_id(),
+            decision_id: decision_id(),
+            state_fence: fence(),
+            decision,
+            runtime_lease,
+            wake_intent,
+            shutdown_may_proceed,
+            shutdown_reason: "drain disposition for one closing boundary".to_owned(),
+            assessed_at_ms: 1_700_000_001_000,
+            expires_at_ms: 1_700_000_601_000,
+            outcome_receipt: outcome_receipt(operation_id),
+        }
+    }
+
+    fn validate(
+        request: &EndOfActivityMaintenanceAssessmentRequest,
+        outcome: EndOfActivityMaintenanceAssessmentOutcome,
+    ) -> Result<(), EndOfActivityMaintenanceAssessmentValidationError> {
+        EndOfActivityMaintenanceAssessment {
+            request: request.clone(),
+            outcome,
+        }
+        .validate()
+    }
+
+    #[test]
+    fn no_action_is_admitted_only_on_complete_coverage() {
+        let request = covered_empty_request();
+        request.validate().expect("covered request");
+        // Known-empty under complete coverage: the strongest admissible case.
+        let admitted = outcome(
+            EndOfActivityAssessmentDecision::NoAction,
+            None,
+            None,
+            true,
+            None,
+        );
+        validate(&request, admitted).expect("no_action on complete coverage");
+
+        // The same decision off a partially answered owner is not admissible:
+        // `no_action` claims there is nothing to do, which needs adequate
+        // known coverage of due work.
+        let mut partial = covered_empty_request();
+        partial.maintenance_debt.coverage = AssessmentSourceCoverage::Partial;
+        partial.maintenance_debt.gaps.push(AssessmentSourceGap {
+            scope_ref: Some("scope-1".to_owned()),
+            reason: "debt owner page not fully read".to_owned(),
+        });
+        partial
+            .validate()
+            .expect("partial coverage is a valid request");
+        let refused = validate(
+            &partial,
+            outcome(
+                EndOfActivityAssessmentDecision::NoAction,
+                None,
+                None,
+                true,
+                None,
+            ),
+        );
+        assert_eq!(
+            refused,
+            Err(
+                EndOfActivityMaintenanceAssessmentValidationError::InsufficientCoverage(
+                    "maintenance_debt"
+                )
+            ),
+            "no_action was admitted off a source that only partially answered"
+        );
+
+        // Unknown coverage is equally insufficient, and names the same field.
+        let mut unknown = covered_empty_request();
+        unknown.due_policies.coverage = AssessmentSourceCoverage::Unknown;
+        unknown.due_policies.source_revision = None;
+        unknown.due_policies.covered_scope_refs.clear();
+        unknown.due_policies.gaps.push(AssessmentSourceGap {
+            scope_ref: None,
+            reason: "policy owner unavailable".to_owned(),
+        });
+        assert_eq!(
+            validate(
+                &unknown,
+                outcome(
+                    EndOfActivityAssessmentDecision::NoAction,
+                    None,
+                    None,
+                    true,
+                    None,
+                ),
+            ),
+            Err(
+                EndOfActivityMaintenanceAssessmentValidationError::InsufficientCoverage(
+                    "due_policies"
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn complete_coverage_over_no_declared_scope_is_not_coverage() {
+        // `Complete` with no declared scope is complete over nothing, so it
+        // cannot be the adequate known coverage a `no_action` rests on.
+        let mut request = covered_empty_request();
+        request.pending_receipts.covered_scope_refs.clear();
+        assert_eq!(
+            request.validate(),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::InvalidCoverage)
+        );
+        assert_eq!(
+            validate(
+                &request,
+                outcome(
+                    EndOfActivityAssessmentDecision::NoAction,
+                    None,
+                    None,
+                    true,
+                    None,
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::InvalidCoverage)
+        );
+    }
+
+    #[test]
+    fn defer_must_record_a_real_limiting_condition_or_real_work() {
+        let mut deferred_by_coverage = covered_empty_request();
+        deferred_by_coverage.pending_projections.coverage = AssessmentSourceCoverage::Partial;
+        deferred_by_coverage
+            .pending_projections
+            .gaps
+            .push(AssessmentSourceGap {
+                scope_ref: Some("scope-1".to_owned()),
+                reason: "projection owner page not fully read".to_owned(),
+            });
+        deferred_by_coverage
+            .validate()
+            .expect("partial coverage request");
+        validate(
+            &deferred_by_coverage,
+            outcome(
+                EndOfActivityAssessmentDecision::Defer,
+                None,
+                None,
+                true,
+                None,
+            ),
+        )
+        .expect("defer records an explicit limiting condition");
+
+        // Fully covered and holding nothing: `defer` would decide nothing
+        // while looking like a complete assessment.
+        assert_eq!(
+            validate(
+                &covered_empty_request(),
+                outcome(
+                    EndOfActivityAssessmentDecision::Defer,
+                    None,
+                    None,
+                    true,
+                    None,
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+
+        // Fully covered but with real outstanding debt, deferral is justified.
+        let mut deferred_by_debt = covered_empty_request();
+        deferred_by_debt
+            .maintenance_debt
+            .records
+            .push(debt_reference("debt-1"));
+        deferred_by_debt.validate().expect("debt request");
+        validate(
+            &deferred_by_debt,
+            outcome(
+                EndOfActivityAssessmentDecision::Defer,
+                None,
+                None,
+                true,
+                None,
+            ),
+        )
+        .expect("defer preserves real outstanding work");
+    }
+
+    #[test]
+    fn only_start_bounded_job_may_withhold_drain_and_only_with_live_ownership() {
+        let request = covered_empty_request();
+        let mut job_request = request.clone();
+        job_request
+            .maintenance_debt
+            .records
+            .push(debt_reference("debt-1"));
+        job_request.validate().expect("debt request");
+
+        // The admitted relation: a bounded job names the current runtime
+        // ownership that replaces the released lease and holds drain.
+        let admitted = validate(
+            &job_request,
+            outcome(
+                EndOfActivityAssessmentDecision::StartBoundedJob,
+                Some(runtime_lease()),
+                None,
+                false,
+                Some("op-eoa-job-1"),
+            ),
+        );
+        admitted.expect("bounded job with live ownership and an operation id");
+
+        // No named runtime ownership: a job reference or a claimed decision is
+        // not proof that a lease is live.
+        assert_eq!(
+            validate(
+                &job_request,
+                outcome(
+                    EndOfActivityAssessmentDecision::StartBoundedJob,
+                    None,
+                    None,
+                    false,
+                    Some("op-eoa-job-1"),
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+        // Drain proceeds while the bounded job supposedly owns work.
+        assert_eq!(
+            validate(
+                &job_request,
+                outcome(
+                    EndOfActivityAssessmentDecision::StartBoundedJob,
+                    Some(runtime_lease()),
+                    None,
+                    true,
+                    Some("op-eoa-job-1"),
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+        // The one effect-capable decision must name the admitted operation, so
+        // the held drain keeps a replay handle.
+        assert_eq!(
+            validate(
+                &job_request,
+                outcome(
+                    EndOfActivityAssessmentDecision::StartBoundedJob,
+                    Some(runtime_lease()),
+                    None,
+                    false,
+                    None,
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+
+        // A decision that renews nothing may not carry replacement ownership,
+        // and it must leave drain eligible.
+        for decision in [
+            EndOfActivityAssessmentDecision::NoAction,
+            EndOfActivityAssessmentDecision::ScheduleWake,
+            EndOfActivityAssessmentDecision::SuggestOnce,
+            EndOfActivityAssessmentDecision::Defer,
+        ] {
+            assert_eq!(
+                validate(
+                    &job_request,
+                    outcome(decision, Some(runtime_lease()), None, true, None),
+                ),
+                Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid),
+                "{decision:?} carried replacement runtime ownership"
+            );
+            assert_eq!(
+                validate(&job_request, outcome(decision, None, None, false, None)),
+                Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid),
+                "{decision:?} withheld drain without admitted ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_wake_requires_an_admitted_wake_intent_and_defers_no_drain() {
+        let mut request = covered_empty_request();
+        request
+            .maintenance_debt
+            .records
+            .push(debt_reference("debt-1"));
+        request.validate().expect("debt request");
+
+        // A locally fabricated scheduler record is not an admitted wake.
+        assert_eq!(
+            validate(
+                &request,
+                outcome(
+                    EndOfActivityAssessmentDecision::ScheduleWake,
+                    None,
+                    None,
+                    true,
+                    None,
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+        // A pending wake is not admitted runtime ownership, so it must not
+        // withhold drain.
+        assert_eq!(
+            validate(
+                &request,
+                outcome(
+                    EndOfActivityAssessmentDecision::ScheduleWake,
+                    None,
+                    Some(wake_intent()),
+                    false,
+                    None,
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+        validate(
+            &request,
+            outcome(
+                EndOfActivityAssessmentDecision::ScheduleWake,
+                None,
+                Some(wake_intent()),
+                true,
+                None,
+            ),
+        )
+        .expect("admitted wake lets drain continue");
+
+        // A suggestion keeps no lease and schedules nothing.
+        validate(
+            &request,
+            outcome(
+                EndOfActivityAssessmentDecision::SuggestOnce,
+                None,
+                None,
+                true,
+                None,
+            ),
+        )
+        .expect("suggestion drains continue");
+        assert_eq!(
+            validate(
+                &request,
+                outcome(
+                    EndOfActivityAssessmentDecision::SuggestOnce,
+                    None,
+                    Some(wake_intent()),
+                    true,
+                    None,
+                ),
+            ),
+            Err(EndOfActivityMaintenanceAssessmentValidationError::DecisionRelationInvalid)
+        );
+    }
+
+    #[test]
+    fn the_evaluator_never_claims_no_action_off_incomplete_coverage() {
+        let mut partial = covered_empty_request();
+        partial.pending_observations.coverage = AssessmentSourceCoverage::Partial;
+        partial.pending_observations.gaps.push(AssessmentSourceGap {
+            scope_ref: Some("scope-1".to_owned()),
+            reason: "observation owner page not fully read".to_owned(),
+        });
+        let deferred = assess_end_of_activity(&partial, true, false).expect("assessment");
+        assert_eq!(deferred.decision, EndOfActivityAssessmentDecision::Defer);
+        assert!(deferred.shutdown_may_proceed);
+
+        // A fully covered known-empty request still admits `no_action`.
+        let idle =
+            assess_end_of_activity(&covered_empty_request(), true, false).expect("assessment");
+        assert_eq!(idle.decision, EndOfActivityAssessmentDecision::NoAction);
+        assert!(idle.shutdown_may_proceed);
+
+        // Pending observations keep the decision off `no_action` too.
+        let mut pending = covered_empty_request();
+        pending
+            .pending_observations
+            .records
+            .push(record_reference("observation-1"));
+        assert_eq!(
+            assess_end_of_activity(&pending, true, false)
+                .expect("assessment")
+                .decision,
+            EndOfActivityAssessmentDecision::Defer
+        );
+    }
 }

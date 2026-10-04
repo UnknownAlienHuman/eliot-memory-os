@@ -338,6 +338,15 @@ pub struct ReplayEvaluationIntegrityReceipt {
     pub product_identity: String,
     /// Owner of the deciding oracle: the sealed replay evaluator.
     pub oracle_owner: String,
+    /// Version of that deciding oracle, sealed with the body (issue #1922).
+    ///
+    /// I18.47 makes `evaluator/oracle` a load-bearing invalidation dimension,
+    /// so the version travels inside the seal rather than beside it. Payloads
+    /// sealed before this field existed deserialize with the empty default and
+    /// therefore read as `STALE` against any current oracle: fail-closed, never
+    /// a silent upgrade of historical bytes.
+    #[serde(default)]
+    pub oracle_version: String,
     /// Acceptance relation between measurements and sealed evidence.
     pub acceptance_relation: String,
     /// Evidence family instance: `replay-exact:{sealed_input_hash}`.
@@ -380,6 +389,7 @@ impl ReplayEvaluationIntegrityReceipt {
             "property": self.property,
             "product_identity": self.product_identity,
             "oracle_owner": self.oracle_owner,
+            "oracle_version": self.oracle_version,
             "acceptance_relation": self.acceptance_relation,
             "evidence_family": self.evidence_family,
             "shared_dependencies": self.shared_dependencies,
@@ -601,6 +611,50 @@ pub struct MetaIsolationRejectionRecord {
     pub decision: MetaExperimentDecision,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// A declared second route or Human disposition that lifts a replay-only
+/// evaluation result above its own proof ceiling (issue #1922, I18.47).
+///
+/// I18.47 requires "second route and/or Human disposition where required", and
+/// states that "replay or simulation calibrates an oracle but cannot alone
+/// promote live Product Proof". A canonical replay receipt is `REPLAY_ONLY` and
+/// `INCONCLUSIVE` by construction, so this declaration is the only thing that can
+/// lift that ceiling — and it never edits a receipt or asserts measured
+/// validity. A blank reference is not a second route and not a disposition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaEvidenceCorroboration {
+    /// An independent route re-executed the same property outside replay.
+    SecondRoute {
+        /// Owner-issued reference to that second route's execution evidence.
+        corroboration_ref: String,
+    },
+    /// A Human disposition accepted the replay-only result explicitly.
+    HumanDisposition {
+        /// Owner-issued reference to the recorded disposition.
+        corroboration_ref: String,
+    },
+}
+
+impl MetaEvidenceCorroboration {
+    /// Returns the owner-issued reference this corroboration cites.
+    #[must_use]
+    pub fn corroboration_ref(&self) -> &str {
+        match self {
+            Self::SecondRoute { corroboration_ref }
+            | Self::HumanDisposition { corroboration_ref } => corroboration_ref,
+        }
+    }
+
+    /// Returns whether this corroboration is a real, non-blank reference.
+    ///
+    /// A blank or whitespace-only reference is neither a second route nor a
+    /// Human disposition, so it never lifts the replay-only ceiling.
+    #[must_use]
+    pub fn is_honest(&self) -> bool {
+        !self.corroboration_ref().trim().is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
