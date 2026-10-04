@@ -2389,6 +2389,8 @@ mod control_plane_diagnostics_tests {
         /// fields above cannot distinguish "absent" from "renamed", because
         /// absent is legal for three of the four, but the key set cannot.
         fields: Vec<String>,
+        /// Exact rendered field values recorded from the event itself.
+        values: std::collections::BTreeMap<String, String>,
         request_id: String,
     }
 
@@ -2498,9 +2500,9 @@ mod control_plane_diagnostics_tests {
             // exact key set the producer emitted, and `assert_capacity_records`
             // compares it, so a renamed field changes the expected key set and
             // goes red there. SCOPE, stated so the next reader does not overclaim
-            // it: that comparison exists for CAPACITY records only, and this
-            // module has no key-set assertion for `observe_control` records, so
-            // a rename confined to the control emitter is not covered by it.
+            // it: the capacity assertion and the focused lease/resume observer
+            // tests compare their own exact key sets; there is no generic
+            // key-set assertion for every `observe_control` record.
             //
             // "AUTHORED" is the operative word, and the emitted set is one key
             // LARGER than the authored one: both producers pass a format string
@@ -2523,6 +2525,7 @@ mod control_plane_diagnostics_tests {
             // the source call alone omits `message` and is therefore false on
             // every run - which is what the first version of this assertion did.
             let field = |name: &str| visitor.fields.get(name).cloned().unwrap_or_default();
+            let values = visitor.fields.clone();
             if let Ok(mut records) = self.records.lock() {
                 let mut fields: Vec<String> = visitor.fields.keys().cloned().collect();
                 fields.sort();
@@ -2532,6 +2535,7 @@ mod control_plane_diagnostics_tests {
                     code: field("code"),
                     capacity: field("capacity"),
                     fields,
+                    values,
                     request_id,
                 });
             }
@@ -2566,6 +2570,29 @@ mod control_plane_diagnostics_tests {
             records,
             _guard: tracing::subscriber::set_default(subscriber),
         }
+    }
+
+    fn assert_bounded_observation(
+        record: &CapturedRecord,
+        event: &str,
+        outcome: &str,
+        message: &str,
+    ) {
+        assert_eq!(record.event, event);
+        assert_eq!(record.outcome, outcome);
+        assert_eq!(
+            record.fields,
+            vec![
+                "event".to_owned(),
+                "message".to_owned(),
+                "outcome".to_owned(),
+            ]
+        );
+        assert_eq!(record.values.len(), 3);
+        assert_eq!(record.values.get("message").map(String::as_str), Some(message));
+        assert!(record.code.is_empty());
+        assert!(record.capacity.is_empty());
+        assert!(record.request_id.is_empty());
     }
 
     /// Counts the whole captured surface for one event name.
@@ -2613,6 +2640,99 @@ mod control_plane_diagnostics_tests {
         ));
         std::fs::create_dir_all(&root)?;
         Ok(root)
+    }
+
+    #[test]
+    fn unreadable_shutdown_state_is_reported_without_closing_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("shutdown-load-failure")?;
+        let kernel = KernelComposition::new(KernelConfig::new(&root))?;
+        let state_path = root
+            .join(".eliot")
+            .join("kernel-shutdown-drain.json");
+        std::fs::create_dir_all(
+            state_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("shutdown state path has parent"))?,
+        )?;
+        let canary = "shutdown-state-load-canary-903";
+        std::fs::write(&state_path, canary)?;
+
+        let capture = install_diagnostic_capture();
+        assert!(!kernel.request_shutdown());
+        let records = capture.take();
+        assert_eq!(records.len(), 1);
+        assert_bounded_observation(
+            &records[0],
+            "kernel.control.drain_request_failed",
+            "unavailable",
+            "control plane observation",
+        );
+        assert!(
+            !format!("{records:?}").contains(canary),
+            "load failure details stay out of the bounded observation"
+        );
+        assert!(
+            !kernel.runtime.shutdown_handle().is_requested(),
+            "a failed durable load must not close runtime admission"
+        );
+        assert_eq!(std::fs::read_to_string(&state_path)?, canary);
+
+        drop(capture);
+        drop(kernel);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_state_replace_failure_is_reported_without_closing_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = reserve_test_root("shutdown-persist-failure")?;
+        let kernel = KernelComposition::new(KernelConfig::new(&root))?;
+        let state_path = root
+            .join(".eliot")
+            .join("kernel-shutdown-drain.json");
+        std::fs::create_dir_all(
+            state_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("shutdown state path has parent"))?,
+        )?;
+        // Seed the process-wide owner while its target is absent. The cached
+        // coordinator then reaches the real persist/replace path below.
+        let coordinator = crate::coordinator_for(&root).map_err(std::io::Error::other)?;
+        drop(coordinator);
+        std::fs::create_dir(&state_path)?;
+
+        let capture = install_diagnostic_capture();
+        assert!(!kernel.request_shutdown());
+        let records = capture.take();
+        assert_eq!(records.len(), 2);
+        assert_bounded_observation(
+            &records[0],
+            "kernel.shutdown.persist_failed",
+            "rejected",
+            "shutdown drain observation",
+        );
+        assert_bounded_observation(
+            &records[1],
+            "kernel.control.drain_request_failed",
+            "unavailable",
+            "control plane observation",
+        );
+        assert!(
+            !format!("{records:?}").contains("shutdown-persist-failure"),
+            "replace failure details stay out of the bounded observations"
+        );
+        assert!(
+            !kernel.runtime.shutdown_handle().is_requested(),
+            "a failed durable replace must not close runtime admission"
+        );
+        assert!(state_path.is_dir(), "the obstruction is the exact state target");
+
+        drop(capture);
+        drop(kernel);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     /// One nonce-free candidate contour that the production
@@ -3858,5 +3978,206 @@ mod control_plane_diagnostics_tests {
             "control_legacy_correlation_unresolved",
             "control_registry_full",
         ]
+    }
+
+    /// Narrow UnitProof for the observer and its typed owner count. It does
+    /// not execute the Windows probe or activation callers at :749/:905; their
+    /// caller-path proof remains TEST-PHASE.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused proof keeps the owner transition, rendered fields, and non-interference assertion together"
+    )]
+    #[test]
+    fn runtime_lease_tick_observation_uses_owner_expiry_count_without_changing_record() {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use eliot_runtime_contracts::{LeaseState, RuntimeLease};
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-runtime-lease-observation-{}-{}",
+            std::process::id(),
+            crate::unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("runtime-lease observation test root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root))
+            .expect("kernel composition for runtime-lease observation");
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("test epoch lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test epoch"),
+        )
+        .expect("test epoch");
+        let fence = StateFence::new(
+            epoch.clone(),
+            ResourceGeneration::new(1).expect("test generation"),
+        );
+        let lease = RuntimeLease {
+            lease_id: "runtime-lease:activation-canary-903:lineage:1".to_owned(),
+            scope_ref: "activation-canary-903".to_owned(),
+            authority_epoch: epoch,
+            state_fence: fence.clone(),
+            state: LeaseState::Active,
+            expires_at_ms: 1,
+        };
+        kernel
+            .generation_gateway
+            .ors
+            .record_runtime_lease_current(&lease)
+            .expect("record valid active owner lease");
+
+        // This is the production owner expiry path. It transitions and
+        // persists the past-due Active row through ORS, and supplies the count
+        // used to form the observer's typed result. The observer proof remains
+        // narrower than either production caller at :749/:905.
+        let expired = kernel
+            .expire_past_due_runtime_leases(&fence, 2)
+            .expect("expire the past-due owner row");
+        assert_eq!(expired, 1);
+        let outcome = RuntimeLeaseTickOutcome {
+            expired,
+            ..RuntimeLeaseTickOutcome::default()
+        };
+        let owner_rows = kernel
+            .generation_gateway
+            .ors
+            .load_runtime_leases_by_state_fence(&fence)
+            .expect("read the owner row after expiry");
+        assert_eq!(owner_rows.len(), 1);
+        assert_eq!(owner_rows[0].state, LeaseState::Expired);
+
+        let capture = install_diagnostic_capture();
+        observe_runtime_lease_tick(&outcome);
+        let records = capture.take();
+        assert_eq!(records.len(), 1, "one owner tick yields one event");
+        assert_eq!(
+            records[0].fields,
+            vec![
+                "event".to_owned(),
+                "expired".to_owned(),
+                "message".to_owned(),
+                "renewed".to_owned(),
+                "superseded".to_owned(),
+            ]
+        );
+        assert_eq!(
+            records[0].values,
+            std::collections::BTreeMap::from([
+                (
+                    "event".to_owned(),
+                    "kernel.control.runtime_lease_tick".to_owned(),
+                ),
+                ("expired".to_owned(), "1".to_owned()),
+                (
+                    "message".to_owned(),
+                    "control plane runtime lease tick".to_owned(),
+                ),
+                ("renewed".to_owned(), "0".to_owned()),
+                ("superseded".to_owned(), "0".to_owned()),
+            ])
+        );
+        assert_eq!((outcome.renewed, outcome.expired, outcome.superseded), (0, 1, 0));
+        assert_eq!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_runtime_leases_by_state_fence(&fence)
+                .expect("owner row remains readable after observation"),
+            owner_rows,
+            "observation must leave the ORS owner result unchanged"
+        );
+        assert!(
+            !format!("{records:?}").contains("canary-903"),
+            "runtime lease identity and scope stay out of the event"
+        );
+
+        drop(capture);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Narrow UnitProof for the observer fed by the actual contract result.
+    /// It does not execute the production resume gate at :1133/:1183.
+    #[test]
+    fn resume_identity_gap_observation_uses_contract_verdict_order_and_preserves_result() {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use eliot_runtime_contracts::{
+            ResumeBrokerIdentity, ResumeIdentityFamily, ResumeIdentitySnapshot,
+            ResumeIdentityVerdict, ResumeProcessIdentity, revalidate_resume_identities,
+        };
+
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("test epoch lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test epoch"),
+        )
+        .expect("test epoch");
+        let current = ResumeIdentitySnapshot {
+            boot_id: "current-boot-canary-903".to_owned(),
+            process: ResumeProcessIdentity {
+                pid: 42,
+                start_100ns: 987_654_321,
+            },
+            pipe_expectation: "current-pipe-canary-903".to_owned(),
+            authority_epoch: epoch,
+            broker: ResumeBrokerIdentity {
+                windows_sid: "current-sid-canary-903".to_owned(),
+                interactive_session_id: "current-session-canary-903".to_owned(),
+                boot_session_id: "current-boot-session-canary-903".to_owned(),
+                user_broker_epoch: 7,
+            },
+            lease_ids: vec!["runtime-lease:resume-canary-903:lineage:1".to_owned()],
+        };
+        let mut presented = current.clone();
+        presented.boot_id = "presented-boot-canary-903".to_owned();
+        presented.process.pid = 43;
+        let revalidation = revalidate_resume_identities(&current, &presented)
+            .expect("both typed resume snapshots are valid");
+        assert_eq!(
+            revalidation.coverage_gap_families,
+            vec![ResumeIdentityFamily::Boot, ResumeIdentityFamily::Process]
+        );
+        assert_eq!(
+            revalidation.verdicts,
+            vec![
+                (ResumeIdentityFamily::Boot, ResumeIdentityVerdict::Stale),
+                (ResumeIdentityFamily::Process, ResumeIdentityVerdict::Stale),
+                (ResumeIdentityFamily::Pipe, ResumeIdentityVerdict::Current),
+                (ResumeIdentityFamily::Epoch, ResumeIdentityVerdict::Current),
+                (ResumeIdentityFamily::Broker, ResumeIdentityVerdict::Current),
+                (ResumeIdentityFamily::Lease, ResumeIdentityVerdict::Current),
+            ]
+        );
+        let owner_result = revalidation.clone();
+
+        let capture = install_diagnostic_capture();
+        observe_resume_identity_gap(
+            Some(&revalidation.verdicts),
+            &revalidation.coverage_gap_families,
+        );
+        let records = capture.take();
+        assert_eq!(records.len(), 2, "only the stale families are emitted");
+        for (record, outcome) in records.iter().zip(["boot", "pid"]) {
+            assert_eq!(record.event, "kernel.control.resume_identity_gap_observed");
+            assert_eq!(record.outcome, outcome);
+            assert_eq!(
+                record.fields,
+                vec!["event".to_owned(), "message".to_owned(), "outcome".to_owned()]
+            );
+            assert_eq!(
+                record.values,
+                std::collections::BTreeMap::from([
+                    (
+                        "event".to_owned(),
+                        "kernel.control.resume_identity_gap_observed".to_owned(),
+                    ),
+                    ("message".to_owned(), "control plane observation".to_owned()),
+                    ("outcome".to_owned(), outcome.to_owned()),
+                ])
+            );
+        }
+        assert_eq!(revalidation, owner_result, "observation cannot rewrite revalidation");
+        assert!(
+            !format!("{records:?}").contains("canary-903"),
+            "resume observations contain family names, not identity values"
+        );
     }
 }

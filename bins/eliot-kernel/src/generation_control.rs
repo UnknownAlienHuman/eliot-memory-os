@@ -1461,6 +1461,26 @@ mod tests {
         ] {
             assert!(text.contains(marker), "missing diagnostics marker {marker}");
         }
+        let records = generation_records(&text);
+        assert_eq!(records.len(), 4);
+        assert_generation_observation(
+            records[0],
+            "kernel.generation.cutover_requested",
+            "attempt",
+        );
+        assert_cutover_observation(
+            records[1],
+            "kernel.generation.service_fence_requested",
+            "attempt",
+            "cutover-op-903",
+        );
+        assert_cutover_observation(
+            records[2],
+            "kernel.generation.service_fenced",
+            "success",
+            "cutover-op-903",
+        );
+        assert_terminal_record(records[3], "CUTOVER_GENERATION_FENCED");
         for canary in [
             "fence-canary-service-reason-903",
             "fence-canary-snapshot",
@@ -1743,6 +1763,36 @@ mod tests {
         rest.split(['"', ' ']).next().unwrap_or("")
     }
 
+    fn generation_records(surface: &str) -> Vec<&str> {
+        surface
+            .lines()
+            .filter(|line| {
+                line.contains("kernel.generation.") || line.contains("kernel.terminal_error")
+            })
+            .collect()
+    }
+
+    fn assert_cutover_observation(
+        record: &str,
+        event: &str,
+        outcome: &str,
+        cutover_id: &str,
+    ) {
+        assert_eq!(rendered_field(record, "event"), event);
+        assert_eq!(rendered_field(record, "outcome"), outcome);
+        assert_eq!(rendered_field(record, "cutover_id"), cutover_id);
+    }
+
+    fn assert_generation_observation(record: &str, event: &str, outcome: &str) {
+        assert_eq!(rendered_field(record, "event"), event);
+        assert_eq!(rendered_field(record, "outcome"), outcome);
+    }
+
+    fn assert_terminal_record(record: &str, code: &str) {
+        assert_eq!(rendered_field(record, "event"), "kernel.terminal_error");
+        assert_eq!(rendered_field(record, "code"), code);
+    }
+
     #[test]
     fn cutover_live_endpoint_requires_the_exact_current_owner_receipt() {
         // I1.8: "Kernel verifies identity, authority, State Fence, idempotency,
@@ -1934,32 +1984,23 @@ mod tests {
                 field: "generation_cutover.live_state"
             }
         ));
-        // I13.11: the terminal is bound to the operation its own records name.
-        assert_eq!(count_records(&text, "kernel.terminal_error"), 1);
-        assert_eq!(
-            count_records(&text, "kernel.generation.cutover_requested"),
-            1
+        // The ordered records bind both observer outcomes and the terminal to
+        // the exact cutover identity produced by this owner call.
+        let records = generation_records(&text);
+        assert_eq!(records.len(), 3);
+        assert_cutover_observation(
+            records[0],
+            "kernel.generation.cutover_requested",
+            "attempt",
+            refused.cutover_id(),
         );
-        assert_eq!(count_records(&text, "kernel.generation.cutover_failed"), 1);
-        let failed = text
-            .lines()
-            .find(|line| line.contains("kernel.generation.cutover_failed"))
-            .unwrap_or("");
-        assert_eq!(rendered_field(failed, "cutover_id"), refused.cutover_id());
-        let terminal = text
-            .lines()
-            .find(|line| line.contains("kernel.terminal_error"))
-            .unwrap_or("");
-        // The literal, not a second application of the mapper: the record's
-        // `code` was itself produced by `generation_cutover_terminal_code`
-        // (generation_control.rs:841, whose `HandshakeMismatch` arm is :485), so
-        // comparing it against that same mapper on the same error would move
-        // both sides together and distinguish nothing. That arm is pinned by
-        // literal in the mapper-table test at generation_control.rs:1392.
-        assert_eq!(
-            rendered_field(terminal, "code"),
-            "CUTOVER_HANDSHAKE_MISMATCH"
+        assert_cutover_observation(
+            records[1],
+            "kernel.generation.cutover_failed",
+            "rejected",
+            refused.cutover_id(),
         );
+        assert_terminal_record(records[2], "CUTOVER_HANDSHAKE_MISMATCH");
         // Whole-surface absence: the read path's terminal vocabulary belongs to
         // :461 and must never appear on the cutover path's own records.
         assert_eq!(count_records(&text, "SNAPSHOT_"), 0);
@@ -2031,19 +2072,22 @@ mod tests {
         let text = capture(|| {
             assert!(kernel.apply_generation_cutover(&decision).is_ok());
         });
-        // Requested and committed stay distinct answers on one call.
-        assert_eq!(
-            count_records(&text, "kernel.generation.cutover_requested"),
-            1
+        // Requested and committed stay distinct answers on one call, and both
+        // carry the identity this owner committed.
+        let records = generation_records(&text);
+        assert_eq!(records.len(), 2);
+        assert_cutover_observation(
+            records[0],
+            "kernel.generation.cutover_requested",
+            "attempt",
+            decision.cutover_id(),
         );
-        assert_eq!(
-            count_records(&text, "kernel.generation.cutover_committed"),
-            1
+        assert_cutover_observation(
+            records[1],
+            "kernel.generation.cutover_committed",
+            "success",
+            decision.cutover_id(),
         );
-        // Whole-surface absence: `cutover_failed` is emitted only by the Err
-        // arm at generation_control.rs:836; a mutation that also emitted it on
-        // the committed leg would add this record here.
-        assert_eq!(count_records(&text, "kernel.generation.cutover_failed"), 0);
 
         // The published snapshot, not a local variable.
         let after = kernel
@@ -2113,21 +2157,23 @@ mod tests {
         let code = expected.unwrap_or("unavailable");
 
         assert_eq!(code, "SNAPSHOT_PLATFORM");
-        assert_eq!(count_records(&text, "kernel.terminal_error"), 1);
-        assert_eq!(
-            count_records(&text, "kernel.generation.snapshot_requested"),
-            1
+        let records = generation_records(&text);
+        assert_eq!(records.len(), 3);
+        assert_generation_observation(
+            records[0],
+            "kernel.generation.snapshot_requested",
+            "attempt",
         );
-        assert_eq!(count_records(&text, "kernel.generation.snapshot_failed"), 1);
-        let terminal = text
-            .lines()
-            .find(|line| line.contains("kernel.terminal_error"))
-            .unwrap_or("");
+        assert_generation_observation(
+            records[1],
+            "kernel.generation.snapshot_failed",
+            "rejected",
+        );
         // Anchored to the literal, not to `code`: `code` IS
         // `generation_snapshot_terminal_code` applied to the very error this call
         // returned, so comparing the rendered field against it would stay green if
         // the mapper changed. :2115 above is what ties the mapper to the literal.
-        assert_eq!(rendered_field(terminal, "code"), "SNAPSHOT_PLATFORM");
+        assert_terminal_record(records[2], "SNAPSHOT_PLATFORM");
         // Whole-surface absence, not a hand-listed string set: the cutover
         // vocabulary belongs to :481 and a read terminal reusing it would put
         // one of these on the surface.
@@ -2173,24 +2219,25 @@ mod tests {
             unreachable!("a forward-repair refusal is projected onto the reply");
         };
 
-        assert_eq!(count_records(&text, "kernel.terminal_error"), 1);
-        let terminal = text
-            .lines()
-            .find(|line| line.contains("kernel.terminal_error"))
-            .unwrap_or("");
-        assert_eq!(
-            rendered_field(terminal, "code"),
-            generation_cutover_terminal_code(&KernelServiceError::GenerationFenced)
+        let records = generation_records(&text);
+        assert_eq!(records.len(), 3);
+        assert_cutover_observation(
+            records[0],
+            "kernel.generation.cutover_requested",
+            "attempt",
+            &request.cutover_id,
         );
+        assert_cutover_observation(
+            records[1],
+            "kernel.generation.cutover_failed",
+            "rejected",
+            &request.cutover_id,
+        );
+        assert_terminal_record(records[2], "CUTOVER_GENERATION_FENCED");
         // Bound to the operation its own records name.
         assert_eq!(outcome.terminal_code, Some("CUTOVER_GENERATION_FENCED"));
         assert_eq!(outcome.cutover_id, request.cutover_id);
         assert_eq!(outcome.state_fence, fence);
-        let failed = text
-            .lines()
-            .find(|line| line.contains("kernel.generation.cutover_failed"))
-            .unwrap_or("");
-        assert_eq!(rendered_field(failed, "cutover_id"), request.cutover_id);
         // No fabricated cutover evidence rides on a refusal that never reached
         // the ORS linearization point.
         assert!(outcome.cutover_receipt.is_none());
