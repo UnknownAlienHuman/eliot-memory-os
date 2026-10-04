@@ -1831,6 +1831,7 @@ dependencies = [
  "eliot-instrument-runner",
  "eliot-instrument-rustc",
  "eliot-observability",
+ "eliot-platform",
  "eliot-process",
  "eliot-skills",
  "eliot-store",
