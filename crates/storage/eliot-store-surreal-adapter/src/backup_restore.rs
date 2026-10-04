@@ -3655,15 +3655,13 @@ fn purge_disposition_blocks_on_unproven_carrier(
 /// admission already capped, and it performs no provider write of any kind.
 ///
 /// An intended set this operation cannot express, or an empty one, is not
-/// verification, and the two are answered by the two means they deserve. An
-/// inexpressible set is a typed [`StoreError::InvalidField`] from
-/// [`intended_archive_member_carriers`] and propagates unchanged, because a
-/// malformed batch is a defect of this request rather than an unknown remote
-/// effect; mapping it to the unknown outcome would make the returned variant
-/// depend on whether this predicate happens to block. An empty set is a refusal,
-/// not a proof: [`publish_archive_member_carriers`] already refuses to read an
-/// empty published set as a proved stage ("there was nothing to publish"), so
-/// neither case raises the stage on no evidence at all.
+/// verification, and on this branch both are answered with the same typed
+/// unknown outcome — never with the stage raised on no evidence, and never with
+/// the input diagnosis [`intended_archive_member_carriers`] would give on its own.
+/// [`publish_archive_member_carriers`] already refuses to read an empty published
+/// set as a proved stage ("there was nothing to publish"), and the reason both
+/// cases refuse is the one spelled out at this branch's body: reaching it already
+/// means an earlier incarnation's carrier write is unproven.
 async fn carrier_publication_for(
     transport: &RpcTransport,
     config: &SurrealAdapterConfig,
@@ -3676,15 +3674,37 @@ async fn carrier_publication_for(
         return Ok(Vec::new());
     }
     let operation_id = batch.operation.operation_id.as_str();
-    // A typed failure stays typed across this layer: `?` propagates
-    // `intended_archive_member_carriers`' own `InvalidField` for an admitted member
-    // that carries no retained payload, exactly as `resolve_carrier_stage`
-    // propagates it on the branch that reaches the same builder. Mapping it to
-    // `unknown_outcome` here would make the returned variant of one malformed
-    // batch depend on unrelated bookkeeping state — the same batch would answer
-    // `InvalidField` when the predicate does not block and `UnknownOutcome` when
-    // it does — and would name a remote effect this invocation never waited for.
-    let intended = intended_archive_member_carriers(batch, state_fence)?;
+    // The reconciliation signal dominates the input diagnosis here, and it does so
+    // unconditionally rather than by preference. This line is reachable only
+    // after `purge_disposition_blocks_on_unproven_carrier` has answered true, and
+    // that predicate is true only for an *unproven* carrier stage — which on this
+    // arm means an EARLIER incarnation of this same identity is waiting on a
+    // carrier write whose outcome is exactly unknown. The caller is therefore
+    // being told "your JSON is malformed" when the fact that governs it is
+    // "reconcile me", and the carrier stage is unproven by construction on every
+    // single traversal of this branch.
+    //
+    // Collapsing the two onto one error loses that. The malformed input is
+    // deterministic, so a later invocation re-refuses it identically once the
+    // stage is discharged; answering `InvalidField` now instead invites a
+    // corrected retry that meets the same unproven stage, and the operator reads
+    // the correction as insufficient rather than as not yet reconcilable. The
+    // unknown outcome carries the operation identity, so the reconciliation
+    // reference survives the refusal.
+    //
+    // This is deliberately NOT what [`SurrealStoreAdapter::resolve_carrier_stage`]
+    // does with the same builder, and the asymmetry is not an oversight. That arm
+    // is reached for a `Restored` disposition, where no inherited-unknown carrier
+    // write is in question, so its `?` propagates the typed
+    // [`StoreError::InvalidField`] unchanged and the caller learns what is wrong
+    // with the batch. Do not "fix" that one to match this one.
+    //
+    // Either way the stage is not raised and the obligation stays in the slot:
+    // nothing below this line has written, and `release` keeps the slot retained
+    // for as long as either stage is unproven.
+    let Ok(intended) = intended_archive_member_carriers(batch, state_fence) else {
+        return Err(unknown_outcome(operation_id));
+    };
     if intended.is_empty() {
         return Err(unknown_outcome(operation_id));
     }
@@ -4716,18 +4736,39 @@ impl SurrealStoreAdapter {
         exposure: &mut RestoreEffectExposure,
     ) -> Result<Option<Vec<PublishedCarrier>>, StoreError> {
         let published = intended_archive_member_carriers(batch, state_fence)?;
-        // An empty intended set is answered here, before any read, for two
-        // reasons that agree with the rest of the file. It is not verification:
-        // `publish_archive_member_carriers` states at its own `Verified` arm that
-        // "an empty published set is not verification — it means there was
-        // nothing to publish", and `carrier_publication_for` keeps its refusal
-        // rather than raising the stage on an empty set. And it cannot silently
-        // discharge an obligation for one operation identity: this branch does not
-        // call `note_carrier_verified`, so an inherited carrier stage stays
-        // exactly as it was and keeps its slot retained, and an empty batch
-        // publishes nothing and imports nothing, so no effect is ever reported on
-        // the strength of it. `Some` here means "no carrier work is left for the
-        // caller", never "the carriers are durable".
+        // An empty intended set is answered here, before any read, and the reason it is
+        // safe is NOT that "an empty batch imports nothing" — that was this
+        // comment's earlier claim and it named a dependency that was never
+        // checked. The real reason is that such a batch is refused outright,
+        // further down, before the apply write.
+        //
+        // An empty intended set is reachable only through an all-`Reference`
+        // batch: [`intended_archive_member_carriers`] skips exactly the
+        // `SnapshotMemberType::Reference` members and refuses anything else that
+        // carries no retained payload, `validate_reference_closure` refuses
+        // `member_count == 0` and requires the member list to match it, and this
+        // function is reached only after that admission. On the `Restored` arm
+        // every `Reference` member is then planned as
+        // [`MemberDisposition::Rejected`], and
+        // [`validate_reference_closure_against`] requires a `Rejected` edge to
+        // land on a member whose disposition is `Restored`. In an all-`Reference`
+        // batch no member is `Restored`, so that check answers the typed
+        // [`StoreError::IdentityConflict`] — and it runs on the planned
+        // dispositions before the apply transaction is composed, so this branch
+        // can neither raise a stage nor reach a receipt.
+        //
+        // Two of the file's three empty-set answers agree with that, and the
+        // third is unreachable from production. `publish_archive_member_carriers`
+        // states at its own `Verified` arm that an empty published set is not
+        // verification, and `carrier_publication_for` refuses rather than raising
+        // a stage on one. `publish_archive_member_carriers`' own empty guard
+        // cannot be reached either: its single production caller is the `None`
+        // arm of this function, and `None` here implies a non-empty intended set.
+        //
+        // Independently of all that, this branch raises nothing: it does not call
+        // `note_carrier_verified`, so an inherited carrier stage stays exactly as
+        // it was and keeps its slot retained. `Some` here means "no carrier work
+        // is left for the caller", never "the carriers are durable".
         if published.is_empty() {
             return Ok(Some(published));
         }
