@@ -4422,12 +4422,18 @@ fn launch_14_source_guard_stays_diagnostics_only() {
         1,
         "start_approved_contour must keep exactly one declaration and no in-repo call site"
     );
-    // Both owners of the ruling must still be stated by the frozen fixture, so a
-    // re-freeze cannot quietly drop either claim.
+    // Every owner the ruling names must still be stated by the frozen fixture, so a
+    // re-freeze cannot quietly drop a claim. `other_live_terminal_owners` joined this
+    // list for the same reason the round-4 repair added the key at all: the key was
+    // otherwise read by no assertion, so dropping it again would have failed nothing.
     let ruling = fixture["single_terminal_ruling"]
         .as_object()
         .expect("the fixture must pin the single-terminal ruling");
-    for owner in ["production_path_owner", "exported_api_only_owner"] {
+    for owner in [
+        "production_path_owner",
+        "exported_api_only_owner",
+        "other_live_terminal_owners",
+    ] {
         let stated = ruling[owner]
             .as_str()
             .unwrap_or_else(|| panic!("the ruling must state {owner}"));

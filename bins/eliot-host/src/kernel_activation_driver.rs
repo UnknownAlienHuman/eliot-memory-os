@@ -18,8 +18,13 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // (`super::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open). No terminal is owned here: the single terminal for a
 // failed activation stays with the outermost #891 contour in `lib.rs`, whose armed
-// boundary on the STARTUP launch path is `BOUNDARY_OPEN_TERMINAL`, a cutover-path
-// launch's is `BOUNDARY_BACKUP_CUTOVER_TERMINAL`, and a phase-B resume by `BOUNDARY_RESUME_PENDING_TERMINAL` instead. This
+// boundary on the STARTUP PRODUCTION launch path is `BOUNDARY_OPEN_TERMINAL` (the only
+// production route to `start_approved` with an in-repo caller); a cutover-path
+// launch's is `BOUNDARY_BACKUP_CUTOVER_TERMINAL` (exported entry only, no in-repo
+// caller), and a phase-B resume's is `BOUNDARY_RESUME_PENDING_TERMINAL`. The two resume
+// routes hold one terminal by DIFFERENT means - lib.rs:8151 suppresses the phase-B
+// finalize terminal, lib.rs:7772 disarms the outer open guard - so neither is
+// "each arms exactly one". This
 // coordinates the "one terminal across nesting" rule with #891.
 //
 // Bounded identities, not stage order alone (audit 5910159678 defects 3 and 5):
