@@ -2384,6 +2384,11 @@ mod control_plane_diagnostics_tests {
         outcome: String,
         code: String,
         capacity: String,
+        /// The exact, sorted set of field names the producer emitted on this
+        /// record. This is what makes a RENAMED field red: the four typed
+        /// fields above cannot distinguish "absent" from "renamed", because
+        /// absent is legal for three of the four, but the key set cannot.
+        fields: Vec<String>,
         request_id: String,
     }
 
@@ -2481,23 +2486,27 @@ mod control_plane_diagnostics_tests {
                         .map(|captured| captured.request_id.clone())
                 })
                 .unwrap_or_default();
-            // A missing or RENAMED field is a red test, never an empty string.
-            // With `unwrap_or_default()` a production rename would make every
-            // `== 0` and `is_empty()` absence in this module pass while proving
-            // nothing, because the renamed field would simply read as absent.
-            let field = |name: &str| {
-                visitor
-                    .fields
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("a captured record must carry the field {name}"))
-            };
+            // A missing field reads as the empty string, and that is CORRECT
+            // rather than convenient: `observe_control` emits only `event` and
+            // `outcome` (:39-45) and `observe_control_capacity` only `event` and
+            // `capacity` (:120-125), and `assert_capacity_records` below ASSERTS
+            // that a capacity record's `outcome` and `code` are empty. Panicking
+            // on absence therefore turned every capture-window test red while
+            // never reaching the rename case it was meant to catch.
+            //
+            // The rename case is caught by CONTENT instead: `fields` carries the
+            // exact key set the producer emitted, and the helpers compare it, so
+            // a renamed field changes the expected key set and goes red there.
+            let field = |name: &str| visitor.fields.get(name).cloned().unwrap_or_default();
             if let Ok(mut records) = self.records.lock() {
+                let mut fields: Vec<String> = visitor.fields.keys().cloned().collect();
+                fields.sort();
                 records.push(CapturedRecord {
                     event: field("event"),
                     outcome: field("outcome"),
                     code: field("code"),
                     capacity: field("capacity"),
+                    fields,
                     request_id,
                 });
             }
@@ -2781,6 +2790,14 @@ mod control_plane_diagnostics_tests {
             assert!(
                 record.outcome.is_empty() && record.code.is_empty(),
                 "a capacity observation carries no outcome and no terminal claim"
+            );
+            // The producer's own key set, compared rather than trusted: a
+            // renamed `capacity` or `event` field changes this vector, which is
+            // what the absent-field read above cannot see.
+            assert_eq!(
+                record.fields,
+                vec!["capacity".to_owned(), "event".to_owned()],
+                "the capacity observation must emit exactly the keys its owner writes"
             );
         }
     }
@@ -3187,6 +3204,16 @@ mod control_plane_diagnostics_tests {
             kernel.control_capacity(),
             0,
             "the held protected slots are now consumed, and exhaustion is visible"
+        );
+        // NOT a duplicate of the assertion above, and it must not be removed as
+        // one: this call is the SECOND `observe_control_capacity` emission in
+        // this capture window, and `assert_capacity_records(..., 2)` below counts
+        // exactly two rendered records. Deleting it leaves the count at 1 and
+        // turns a correct run red at that assertion instead.
+        assert_eq!(
+            kernel.control_capacity(),
+            0,
+            "a repeated observation cannot acquire, refill or underflow the reserve"
         );
         let exhaustion_records = capture.take();
         assert_capacity_records(&exhaustion_records, 0, 2);
@@ -3719,7 +3746,7 @@ mod control_plane_diagnostics_tests {
         // rendered code: `assert_eq!(code, control_transition_terminal_code(&x))`
         // compares production against itself and stays green if the
         // `ReadinessNotProven` arm is deleted or renamed. The literal is the same
-        // one this module already pins for this same refusal at :3364.
+        // one this module already pins for this same refusal at :3404.
         assert_eq!(
             owned_terminals[0].code,
             control_transition_terminal_code(&owned)

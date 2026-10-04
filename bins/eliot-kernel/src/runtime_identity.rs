@@ -1018,10 +1018,13 @@ mod runtime_identity_diagnostics_tests {
     // ---------------------------------------------------------------------
     // Appended legs, closing the residual defects an adversarial read found in
     // `identity_observation_bounds_oversized_and_nested_field_values` above.
-    // They are APPENDED rather than woven into that function, and the band they
-    // occupy is NOT shift-proof: the `print_stderr` allow round added lines above
-    // them inside the same band. No citation in this file lands inside it, which
-    // is the property that matters and is checked by reading, not asserted here.
+    // They are APPENDED rather than woven into that function, so any future
+    // insertion ABOVE this point shifts every citation below it without shifting
+    // these lines. The property that matters is therefore stated as a check on
+    // citations rather than on line numbers: every `runtime_identity.rs:NNN`
+    // target in this file names a line at or below 191, i.e. production code
+    // above the test module, and none lands among these appended legs. That was
+    // verified by reading, not asserted here.
     //
     // Why the filler above is two-byte, and what the bound actually guarantees.
     // `bounded_value` (kernel_diagnostics.rs:453) screens at :455 and only

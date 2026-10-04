@@ -3,7 +3,7 @@
   "issue": 903,
   "facade_issue": 895,
   "target": "eliot_kernel::diagnostics",
-  "note": "Freezes the six-file generation/control/recovery/health/identity boundary inventory exercised by tests/kernel_generation_control_diagnostics.rs. `files` is the complete denominator of production modules this issue owns. `events_by_file` is the complete set of `kernel.*` event literals each of those modules emits, measured from source with the same rule case 1 re-measures: each module's production prefix, cut at the first `#[cfg(test)]`- or `#[cfg(all(test, ...))]`-gated test MODULE and never at a `#[cfg(test)]`-gated helper function defined above one. A new, renamed, moved or deleted emitter therefore breaks the map in both directions. `boundaries` freezes one row per WORK_UNIT_CASE 903/1..30. Every row names a real production `function` and a `role` that says which it is: `emitter` means the span is written inside that function's own body, or — when the row also carries `argument_call_sites` — that the span is passed to that function as an argument at exactly those lines of the row's own file; `propagated` means that function neither writes the record itself nor receives it as an argument, and is only on the production call path that produces it. Both directions of that cross-check are asserted by case 1, so `emitter` cannot be claimed for a function that writes nothing and `propagated` cannot be claimed for one that writes the span itself. A method's `function` may be written with the type that owns it, but case 1 resolves it on the segment after the last `::`, so a row that qualifies a free function with a type it does not belong to fails. `argument_call_sites` is present only on the rows that need it, and is compared to the measured call sites in both directions, so an invented line and an unlisted real one both fail. Every row also names the `stage` it belongs to, the exact `span` (a `kernel.*` event literal, a stable terminal code, or a typed `KernelServiceError` field written as `HandshakeMismatch:<field>`, each half of a composite matched as a complete token; no row uses any other shape), the `owner_evidence` for that stage (the durable ORS row, live fence, coordinator disposition or owner receipt the stage actually turns on, read from production values and never invented; its prose is verified by reading, and case 1 asserts only that it is present and non-empty), the `test` that asserts on that span, and, where the row is an absence or noninterference claim, what must not appear. `events_by_file` is a per-module inventory and NOT a whole-tree claim: production modules outside these six emit `kernel.*` records for their own axes through their own observation helpers or raw `tracing` calls, and no row of this map asserts otherwise. The map deliberately does NOT claim: live Windows kernel-owner or daemon-launch execution (the card's DEFER), live cutover or reserve recovery from real owner evidence, the `#[cfg(test)]`-gated source-string guards inside those modules' inline test modules, the `pub(super)` health snapshot omission arms, the `pub(crate)` runtime-identity and ORS-recovery slices, or Control Reserve Product behaviour. Those remain named blockers owned by the modules' own inline test modules and by the deferral clause, not by this fixture.",
+  "note": "Freezes the six-file generation/control/recovery/health/identity boundary inventory exercised by tests/kernel_generation_control_diagnostics.rs. `files` is the complete denominator of production modules this issue owns. `events_by_file` is the complete set of `kernel.*` event literals each of those modules emits, measured from source with the same rule case 1 re-measures: each module's production prefix, cut at the first `#[cfg(test)]`- or `#[cfg(all(test, ...))]`-gated test MODULE and never at a `#[cfg(test)]`-gated helper function defined above one. A new, renamed, moved or deleted emitter therefore breaks the map in both directions. `boundaries` freezes one row per WORK_UNIT_CASE 903/1..30. Every row names a real production `function` and a `role` that says which it is: `emitter` means the span is written inside that function's own body, or — when the row also carries `argument_call_sites` — that the span is passed to that function as an argument at exactly those lines of the row's own file; `propagated` means that function neither writes the record itself nor receives it as an argument, and is only on the production call path that produces it. Both directions of that cross-check are asserted by case 1, so `emitter` cannot be claimed for a function that writes nothing and `propagated` cannot be claimed for one that writes the span itself. A method's `function` may be written with the type that owns it, but case 1 resolves it on the segment after the last `::`, so a row that qualifies a free function with a type it does not belong to fails. `argument_call_sites` is present only on the rows that need it, and is compared to the measured call sites in both directions, so an invented line and an unlisted real one both fail. Every row also names the `stage` it belongs to, the exact `span` (a `kernel.*` event literal, a stable terminal code, or a typed `KernelServiceError` field written as `HandshakeMismatch:<field>`, each half of a composite matched as a complete token; no row uses any other shape), the `owner_evidence` for that stage (the durable ORS row, live fence, coordinator disposition or owner receipt the stage actually turns on, read from production values and never invented; its prose is verified by reading, and case 1 asserts only that it is present and non-empty), the `test` that asserts on that span, and, where the row is an absence or noninterference claim, what must not appear. `events_by_file` is a per-module inventory and NOT a whole-tree claim: production modules outside these six emit `kernel.*` records for their own axes through their own observation helpers or raw `tracing` calls, and no row of this map asserts otherwise. The map deliberately does NOT claim: live Windows kernel-owner or daemon-launch execution (the card's DEFER), live cutover or reserve recovery from real owner evidence, the `#[cfg(test)]`-gated source-string guards inside those modules' inline test modules, the `pub(super)` health snapshot omission arms, the `pub(crate)` runtime-identity and ORS-recovery slices, or Control Reserve Product behaviour. Those remain named blockers owned by the modules' own inline test modules and by the deferral clause, not by this fixture. COVERAGE, MEASURED 2026-10-04 against an emitter inventory derived independently from the six modules BEFORE this fixture was read: events_by_file is exactly reproducible (13/10/9/21/14/10 = 77 distinct kernel.* literals), but the 30 boundaries rows cover 5 of the 6 modules - runtime_identity.rs has no row at all - and 34 of the 77 events are read by no case. Two of those uncovered emitters sit in control_plane.rs, a module the map DOES cover, and until this sentence they appeared in neither this note nor the driver's disclosure: kernel.control.runtime_lease_tick (control_plane.rs:1632, emitted by observe_runtime_lease_tick) and kernel.control.resume_identity_gap_observed (control_plane.rs:2149, emitted by observe_resume_identity_gap). Both are named here so the gap is disclosed rather than undisclosed. One row per WORK_UNIT_CASE is the card's 30-row contract, so widening the map is a scope decision and is escalated, not invented.",
   "terminal_event": "kernel.terminal_error",
   "files": [
     "bins/eliot-kernel/src/control_plane.rs",
@@ -110,7 +110,9 @@
       "file": "bins/eliot-kernel/src/generation_control.rs",
       "function": "observe_generation",
       "role": "emitter",
-      "argument_call_sites": [765],
+      "argument_call_sites": [
+        765
+      ],
       "stage": "boundary_denominator",
       "span": "kernel.generation.snapshot_requested",
       "owner_evidence": "the composition's canonical GenerationRouter behind self.generations, whose clone generation_route_snapshot serves; on a fresh composition that is the daemon route and the authority epoch the router already holds, not a value this map supplies",
@@ -354,7 +356,11 @@
       "file": "bins/eliot-kernel/src/health_view.rs",
       "function": "observe_health",
       "role": "emitter",
-      "argument_call_sites": [244, 253, 267],
+      "argument_call_sites": [
+        244,
+        253,
+        267
+      ],
       "stage": "health_derivation",
       "span": "kernel.activation.view_projected",
       "owner_evidence": "KernelActivationView::FENCED: the closed fallback returned when self.service_state() or coordinator_for(&self.work_root) is unreadable, and otherwise the owner's own service_state, idle_lease_census and drain_disposition values. Every field is a closed vocabulary code, so a missing, stale or unknown input has no stronger code available to it",
@@ -387,7 +393,9 @@
       "file": "bins/eliot-kernel/src/control_plane.rs",
       "function": "observe_control_in_context",
       "role": "emitter",
-      "argument_call_sites": [189],
+      "argument_call_sites": [
+        189
+      ],
       "stage": "canary_freedom",
       "span": "kernel.control.transition_requested",
       "owner_evidence": "the operation_context(None, None, None, None) correlation scope apply_control builds and the KernelControlCommand variant being applied; the record binds the event name, the bounded outcome and that empty scope, and reads no field of the command",
@@ -399,7 +407,9 @@
       "file": "bins/eliot-kernel/src/health_view.rs",
       "function": "observe_health",
       "role": "emitter",
-      "argument_call_sites": [214],
+      "argument_call_sites": [
+        214
+      ],
       "stage": "sink_noninterference",
       "span": "kernel.health.service_state_observed",
       "owner_evidence": "the KernelServiceState value self.service.lock()?.state() returns to the caller: the same owner value, not a rendering of it. Delivery conditions replace only the subscriber; no composition state, receipt, reserve or returned result is on this path",

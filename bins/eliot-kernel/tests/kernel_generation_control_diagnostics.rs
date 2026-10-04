@@ -30,6 +30,19 @@
 //! reserve recovery from real owner evidence, the `pub(super)` health snapshot
 //! omission arms, the `pub(crate)` runtime-identity and ORS-recovery slices, and
 //! Control Reserve Product behaviour.
+//!
+//! MEASURED COVERAGE GAP, disclosed here because the map above is an inventory
+//! map and not yet a completeness map. An emitter inventory was derived from the
+//! six modules independently of this file: `events_by_file` reproduces exactly
+//! (13/10/9/21/14/10 = 77 distinct `kernel.*` literals), but the 30 rows cover
+//! five of the six modules - `runtime_identity.rs` has no row - and 34 of the 77
+//! events are read by no case. Two uncovered emitters sit in `control_plane.rs`,
+//! a module the map does cover, and they are named here so the gap is not
+//! silent: `kernel.control.runtime_lease_tick` (from `observe_runtime_lease_tick`)
+//! and `kernel.control.resume_identity_gap_observed` (from
+//! `observe_resume_identity_gap`). One row per `WORK_UNIT_CASE` is the card's
+//! 30-row contract, so widening the map is a scope decision for root, not one to
+//! invent here.
 
 // -------------------- capture seam (single, shared) --------------------
 
@@ -407,17 +420,42 @@ fn production_source(path: &Path) -> String {
     let mut index = 0usize;
     while index < lines.len() {
         let trimmed = lines[index].trim_start();
-        if trimmed.starts_with("#[cfg(test") || trimmed.starts_with("#[cfg(all(test") {
+        // A gate that admits `test` under ANY spelling ends the production
+        // prefix. The previous form matched only the literal prefixes
+        // `#[cfg(test` and `#[cfg(all(test`, so four ordinary Rust shapes let a
+        // test-only literal into the prefix - and that prefix feeds BOTH
+        // `kernel_event_literals` and `span_is_in_production`, which is the
+        // direct path to a frozen row whose span exists only under `#[cfg(test)]`
+        // while the map reports production coverage of it.
+        let gated_on_test = trimmed.starts_with("#[cfg(")
+            && trimmed.contains("test")
+            && !trimmed.starts_with("#[cfg(not(");
+        if gated_on_test {
             // Walk past the rest of this item's attribute list to the item it
-            // gates. Only a gated module ends the file's production prefix.
+            // gates, and also past a doc comment block that belongs to it. Only
+            // a gated item ends the file's production prefix.
             let mut item = index + 1;
-            while item < lines.len() && lines[item].trim_start().starts_with("#[") {
-                item += 1;
+            while item < lines.len() {
+                let next = lines[item].trim_start();
+                if next.starts_with("#[") || next.starts_with("///") || next.starts_with("//!") {
+                    item += 1;
+                } else {
+                    break;
+                }
             }
-            if lines
-                .get(item)
-                .is_some_and(|line| line.trim_start().starts_with("mod "))
-            {
+            // `mod`, `pub mod`, `pub(crate) mod` and `impl` all gate test-only
+            // code just as well, and a single-line `#[cfg(test)] mod x {` puts
+            // the gate and the item on one line.
+            let gated_item = lines.get(item).is_some_and(|line| {
+                let item = line.trim_start();
+                item.starts_with("mod ")
+                    || item.starts_with("pub mod ")
+                    || item.starts_with("pub(crate) mod ")
+                    || item.starts_with("impl ")
+                    || item.contains(" mod ")
+                    || item.contains(" impl ")
+            });
+            if gated_item {
                 break;
             }
         }
@@ -2122,11 +2160,20 @@ fn reserve_lifecycle_vocabulary_stays_distinct() {
     // substituted for the readiness refusal.
     // FIXTURE GUARD, NOT PRODUCTION EVIDENCE, and the distinction matters: these
     // three operands are values this file's own fixture supplies, so no
-    // production input reaches them. They are kept because the two assertions
-    // below bind `emitted`, `exhausted` and `closed` POSITIONALLY to one
-    // production capture (:2109 asserts production carries `emitted`, :2118
-    // asserts production carries neither of the others), and a fixture that
-    // collapsed two of its three codes would silently retarget both bindings.
+    // production input reaches them. They are kept because the two
+    // PRODUCTION-BOUND assertions bind `emitted`, `exhausted` and `closed`
+    // POSITIONALLY to one capture: the `text.contains(&emitted)` presence
+    // assertion above, and the `assert_absent(&text, &[exhausted, closed])`
+    // absence assertion below. A fixture that collapsed two of its three
+    // codes would silently retarget both bindings.
+    //
+    // Named by CONTENT, not by line number, on purpose. This comment sits
+    // BETWEEN the two assertions it describes, so a `:NNNN` citation here is
+    // invalidated by an edit to either side of it. That is not hypothetical:
+    // the earlier form of this sentence cited `:2109` and `:2118`, both
+    // correct when written, and both drifted inside one commit - to two lines
+    // of the SAME assertion, destroying the very distinction the sentence
+    // exists to draw.
     assert_ne!(emitted, exhausted);
     assert_ne!(emitted, closed);
     assert_ne!(exhausted, closed);
@@ -3105,9 +3152,15 @@ fn instrumented_paths_are_deterministic_and_diagnostic_only() {
         "the second composition must emit the same deterministic records, got: {second_drive_text}"
     );
 
-    // The exact diagnostic-only diff: the drive's own returned results are
-    // byte-identical, so no event, terminal, reserve, health, state or error
-    // result changed; only the observation vocabulary is new.
+    // DETERMINISM, NOT A DIFF AGAINST `main`, and the distinction is the whole
+    // point of this rewrite. `first_results == second_results` compares two
+    // compositions of the SAME build: it proves the instrumented paths return the
+    // same values every run, and it says NOTHING about whether the delivery
+    // changed a production result. A git diff is not a runtime assertion. The
+    // diagnostic-only property is established structurally instead - every hunk
+    // of the delivery lies inside a `#[cfg(test)]` module, the six production
+    // files are insertions-only, and case 1's `events_by_file` denominator pins
+    // every `kernel.*` literal against the frozen fixture vocabulary.
     assert_eq!(
         first_results, second_results,
         "the delivered instrumentation must not change any production result"

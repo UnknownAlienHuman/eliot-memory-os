@@ -2126,7 +2126,7 @@ mod tests {
         // Anchored to the literal, not to `code`: `code` IS
         // `generation_snapshot_terminal_code` applied to the very error this call
         // returned, so comparing the rendered field against it would stay green if
-        // the mapper changed. :2109 above is what ties the mapper to the literal.
+        // the mapper changed. :2115 above is what ties the mapper to the literal.
         assert_eq!(rendered_field(terminal, "code"), "SNAPSHOT_PLATFORM");
         // Whole-surface absence, not a hand-listed string set: the cutover
         // vocabulary belongs to :481 and a read terminal reusing it would put
