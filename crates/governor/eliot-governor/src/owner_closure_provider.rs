@@ -952,6 +952,19 @@ impl OwnerClosureProvider {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
+        let grant_validity = effective_graph
+            .grants
+            .iter()
+            .map(|grant| {
+                (
+                    grant.grant_id.as_str(),
+                    eliot_contracts::LogicalValidityInterval {
+                        issued_at: grant.issued_at,
+                        expires_at: grant.expires_at,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut declarations = Vec::with_capacity(effective_graph.grants.len());
         for target in &effective_graph.grants {
             if effective_revocations.contains(target.grant_id.as_str()) {
@@ -1022,6 +1035,14 @@ impl OwnerClosureProvider {
                     .min(hydration.proof_ceiling)
                     .min(hydration.binding.proof_ceiling);
                 members.push(GrantClosureMemberDeclaration {
+                    validity: grant_validity
+                        .get(member.grant_id.as_str())
+                        .copied()
+                        .ok_or_else(|| {
+                            CompositionError::Owner(
+                                "closure member has no canonical validity".to_owned(),
+                            )
+                        })?,
                     grant_id: member.grant_id.as_str().to_owned(),
                     parent_grant_id: member
                         .parent_grant_id
@@ -2442,7 +2463,7 @@ impl AdmittedHydrationsSnapshot {
 }
 
 #[cfg(test)]
-mod owner_closure_provider_tests {
+pub(crate) mod owner_closure_provider_tests {
     #![allow(clippy::expect_used)]
     use std::num::NonZeroU64;
 
@@ -2511,10 +2532,19 @@ mod owner_closure_provider_tests {
             grant_id: GrantId::new(grant_id).expect("id"),
             parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
             authority_root_ref: "root:alpha".to_owned(),
-            issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
+            issuer: PrincipalRef::new(if parent.is_some() {
+                "principal:holder"
+            } else {
+                "principal:issuer"
+            })
+            .expect("issuer"),
             holder: PrincipalRef::new("principal:holder").expect("holder"),
             authority: AuthoritySet::new(
-                ["op.read".to_owned()],
+                if parent.is_none() {
+                    vec!["op.read".to_owned(), "op.write".to_owned()]
+                } else {
+                    vec!["op.read".to_owned()]
+                },
                 ["res:1".to_owned()],
                 EffectClass::Read,
             )
@@ -2542,13 +2572,77 @@ mod owner_closure_provider_tests {
             7,
         )
         .expect("graph");
-        let effect_authorizer = EffectAuthorizer::default().snapshot().expect("authorizer");
-        AuthorityOwnerSnapshot::new(
-            fence.clone(),
-            graph.recovery_snapshot().expect("snapshot"),
-            effect_authorizer,
+        snapshot_with_fixture_hydrations(
+            fence,
+            &graph.recovery_snapshot().expect("snapshot"),
+            1_000,
+            10_000,
         )
         .expect("owner snapshot")
+    }
+
+    /// Compile explicit test admissions instead of pretending a non-empty graph
+    /// has no hydration registry. The two test time domains are declared by the
+    /// caller; no production logical-time conversion is introduced.
+    pub(crate) fn snapshot_with_fixture_hydrations(
+        fence: &StateFence,
+        graph: &GrantGraphRecoverySnapshot,
+        issued_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<AuthorityOwnerSnapshot, CompositionError> {
+        let empty = GrantGraph::from_grants(std::iter::empty::<CapabilityGrant>(), graph.revision)
+            .map_err(recovery)?;
+        let snapshot = AuthorityOwnerSnapshot::new(
+            fence.clone(),
+            empty.recovery_snapshot().map_err(recovery)?,
+            EffectAuthorizer::default().snapshot().map_err(recovery)?,
+        )?;
+        let mut provider = OwnerClosureProvider::restore(
+            snapshot,
+            Some(RevocationHistoryEvidence {
+                state_fence: fence.clone(),
+                source_revision: graph.revision,
+                closures: Vec::new(),
+            }),
+            fence,
+            operation(),
+        )?;
+        provider.owner.grants = GrantGraph::from_recovery_snapshot(graph).map_err(recovery)?;
+        provider.snapshot.grant_graph = graph.clone();
+        for record in graph
+            .grants
+            .iter()
+            .filter(|grant| grant.parent_grant_id.is_none())
+            .chain(
+                graph
+                    .grants
+                    .iter()
+                    .filter(|grant| grant.parent_grant_id.is_some()),
+            )
+        {
+            let mut params = grant_params(
+                fence,
+                &format!("op-fixture-{}", record.grant_id),
+                &record.grant_id,
+                record.parent_grant_id.as_deref(),
+            );
+            params.holder_principal.clone_from(&record.holder);
+            params
+                .transition_classes
+                .clone_from(&record.allowed_operations);
+            params.data_classes.clone_from(&record.allowed_resources);
+            params.allowed_effect = record.max_effect;
+            params.binding = record.binding.clone();
+            params.proof_ceiling = record.binding.proof_ceiling;
+            params.issued_at_ms = issued_at_ms;
+            params.expires_at_ms = Some(expires_at_ms);
+            if record.parent_grant_id.is_none() {
+                provider.admit_grant_root(&params, &secret(), issued_at_ms)?;
+            } else {
+                provider.admit_grant_member(&params, &secret(), issued_at_ms)?;
+            }
+        }
+        provider.owner.snapshot()
     }
 
     fn history(fence: &StateFence) -> RevocationHistoryEvidence {
@@ -2565,12 +2659,16 @@ mod owner_closure_provider_tests {
 
     fn provider() -> Result<OwnerClosureProvider, CompositionError> {
         let fence = test_fence();
-        OwnerClosureProvider::restore(
+        let mut provider = OwnerClosureProvider::restore(
             owner_snapshot(&fence),
             Some(history(&fence)),
             &fence,
             operation(),
-        )
+        )?;
+        // Admission tests start with missing local hydrations. The canonical
+        // restore fixture itself carries the full required durable registry.
+        provider.registry = AdmittedHydrations::default();
+        Ok(provider)
     }
 
     /// The one revision token these fixtures declare. No fixture models a
@@ -2621,7 +2719,7 @@ mod owner_closure_provider_tests {
             }],
             binding: binding(fence),
             allowed_effect: EffectClass::Read,
-            proof_ceiling: ProofCeiling::ScopedVerification,
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
             issued_at_ms: 1_000,
             expires_at_ms: Some(10_000),
             receipt_obligations: vec!["obligation-1".to_owned()],
@@ -2694,25 +2792,47 @@ mod owner_closure_provider_tests {
             &secret(),
             1_000,
         )?;
-        provider.admit_preserved(PreservedAdmission {
-            target_grant_id: "grant:origin".to_owned(),
-            grant_id: "grant:child".to_owned(),
-            covering_grant_id: "grant:origin".to_owned(),
-            covering_root_ref: "root:alpha".to_owned(),
-            operation_id: "op-admit-child".to_owned(),
-            operation_name: "op.read".to_owned(),
-            resource_ref: "res:1".to_owned(),
-            effect: EffectClass::Read,
-            holder_principal: "principal:holder".to_owned(),
-            session_id: "session-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            canonical_request_hash: PRESERVED_REQUEST_HASH.to_owned(),
-        })?;
+        assert!(
+            provider
+                .admit_preserved(PreservedAdmission {
+                    target_grant_id: "grant:origin".to_owned(),
+                    grant_id: "grant:child".to_owned(),
+                    covering_grant_id: "grant:origin".to_owned(),
+                    covering_root_ref: "root:alpha".to_owned(),
+                    operation_id: "op-admit-child".to_owned(),
+                    operation_name: "op.read".to_owned(),
+                    resource_ref: "res:1".to_owned(),
+                    effect: EffectClass::Read,
+                    holder_principal: "principal:holder".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    scope_id: "scope-1".to_owned(),
+                    canonical_request_hash: PRESERVED_REQUEST_HASH.to_owned(),
+                })
+                .is_err(),
+            "a cover inside the revoked closure cannot preserve its descendant"
+        );
         let restore = provider.serve_restore()?;
+        assert!(
+            restore
+                .declarations
+                .iter()
+                .flat_map(|declaration| &declaration.members)
+                .all(|member| member.validity
+                    == eliot_contracts::LogicalValidityInterval {
+                        issued_at: 1_000,
+                        expires_at: 10_000,
+                    })
+        );
+        assert_eq!(restore.declarations.len(), 2);
         assert_eq!(restore.members.len(), 1);
         assert_eq!(restore.roots.len(), 1);
         assert_eq!(restore.introductions.len(), 1);
-        assert_eq!(restore.preserved.len(), 1);
+        assert!(
+            restore
+                .preserved
+                .iter()
+                .all(|(_, survivors)| survivors.is_empty())
+        );
         assert!(restore.revocation_history.is_some());
         // The sealed opaque record carries the admitted identity contour.
         assert_eq!(
@@ -2777,6 +2897,16 @@ mod owner_closure_provider_tests {
             &secret(),
             1_000,
         )?;
+        provider.admit_grant_member(
+            &grant_params(
+                &fence,
+                "op-admit-child",
+                "grant:child",
+                Some("grant:origin"),
+            ),
+            &secret(),
+            1_000,
+        )?;
         let bytes = provider.export_registry()?;
         let fence2 = test_fence();
         let mut fresh = OwnerClosureProvider::restore(
@@ -2785,6 +2915,7 @@ mod owner_closure_provider_tests {
             &fence2,
             operation(),
         )?;
+        fresh.registry = AdmittedHydrations::default();
         assert!(fresh.serve_restore().is_err());
         fresh.import_registry(&bytes)?;
         assert_eq!(fresh.serve_restore()?.roots.len(), 1);

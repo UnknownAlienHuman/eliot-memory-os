@@ -360,9 +360,16 @@ pub fn serve_authority_revocation_history(
         // closure identity to whichever read projected it instead of to the
         // epoch the revocation was actually committed at.
         let commit_fence = &commit.authority.state_fence;
+        let grant_validity = commit
+            .declaration
+            .members
+            .iter()
+            .map(|member| (member.grant_id.clone(), member.validity))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let canonical_request_digest =
             revocation_closure_canonical_digest(&RevocationClosureDigestInput {
                 evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
+                grant_validity: &grant_validity,
                 closure_id: &closure_id,
                 owner_namespace: root,
                 root_ref: target,
@@ -388,6 +395,7 @@ pub fn serve_authority_revocation_history(
             })
             .ok_or(StoreError::InvalidProjection)?;
         let record = RecordedRevocation {
+            grant_validity,
             closure_id,
             root_ref: target.to_owned(),
             dependent_refs: dependents,

@@ -129,11 +129,6 @@ WRAP_PATHS = {
 }
 
 UNKNOWN_PATHS = {
-    "crates/security/eliot-influence": (
-        "security.influence (component owner TBD); coordinated by bins/eliotd (#1860)",
-        "Origin-bound influence/provenance policy owner with no admitted production consumer. "
-        "UNKNOWN: requires owner experiment; no retirement inferred.",
-    ),
     "crates/smart/eliot-context": (
         "smart.context (component owner TBD, ref #248); coordinated by bins/eliotd (#1860)",
         "Pre-wave context donor crate with no module owner record. UNKNOWN: requires owner "
@@ -157,6 +152,15 @@ UNKNOWN_PATHS = {
 }
 
 KEEP_PATHS = {
+    "crates/security/eliot-influence": (
+        "Canonical semantic owner crates/governor/eliot-authority (I6.15); pure evaluator "
+        "crates/security/eliot-influence; live bins/eliotd owner-feed/restore caller through GrantGraph",
+        "KEEP as the pure origin-bound influence closure evaluator used by the reachable "
+        "bins/eliotd owner-feed/restore path: publish_owner_feed and serve_restore call "
+        "complete_closure_verdict/revocation_closure_verdict_with_quarantine, then "
+        "transitive_revocation_closure and revoke_bounded_page over GrantGraph. This records "
+        "a current source consumer only; installed acceptance remains TEST-PHASE (#11/#19/#1113).",
+    ),
     "crates/agent/eliot-swarm": (
         "A-07 swarm planning cell (lifecycle_owner A-07)",
         "Bounded swarm planning/coordination/review cell. KEEP; production wiring via the future agent path.",
@@ -395,6 +399,10 @@ def _nearest_agents_issues(root: Path, manifest_dir: str) -> tuple[str | None, l
 
 
 def resolve_owner(root: Path, manifest_dir: str) -> str:
+    # This live binary-reachable evaluator retains the same explicit semantic
+    # owner as its disposition rule; reachability must not reset it to area TBD.
+    if manifest_dir == "crates/security/eliot-influence":
+        return KEEP_PATHS[manifest_dir][0]
     meta = _crate_meta(root, manifest_dir)
     if meta["lifecycle_owner"]:
         return f"{meta['lifecycle_owner']} (module/package owner record)"
@@ -723,6 +731,19 @@ def run_self_tests() -> int:
     assert d == "RETIRE" and o and r, "facade rule"
     d, o, r = assign_disposition("crates/instrument/eliot-x-new", {})
     assert d == "KEEP" and o and r, "instrument rule"
+    d, o, r = assign_disposition("crates/security/eliot-influence", {})
+    assert d == "KEEP", "live influence evaluator disposition"
+    assert resolve_owner(Path("."), "crates/security/eliot-influence") == o, "reachable influence owner"
+    assert "crates/governor/eliot-authority" in o and "I6.15" in o, "canonical influence owner"
+    assert "crates/security/eliot-influence" in o and "bins/eliotd" in o and "GrantGraph" in o, (
+        "live influence evaluator and caller"
+    )
+    assert "publish_owner_feed" in r and "serve_restore" in r, "owner-feed/restore caller"
+    assert "transitive_revocation_closure" in r and "revoke_bounded_page" in r, "live closure evaluator"
+    assert all(token in r for token in ("TEST-PHASE", "#11", "#19", "#1113")), (
+        "installed acceptance remains unproven"
+    )
+    assert "no admitted production consumer" not in r and "TBD" not in o, "no stale influence claim"
     d, o, r = assign_disposition("crates/totally-new/eliot-x", {})
     assert d == "UNKNOWN" and o and "fail-closed" in r, "drift fallback rule"
     for path in list(RETIRE_PATHS) + list(WRAP_PATHS) + list(UNKNOWN_PATHS) + list(KEEP_PATHS):

@@ -469,8 +469,9 @@ impl AuthorityBinding {
 
 /// Stable schema identity for the versioned grant-closure contract family.
 pub const GRANT_CLOSURE_SCHEMA: &str = "eliot.receipts.grant-closure";
-/// Current grant-closure declaration/receipt wire version.
-pub const GRANT_CLOSURE_VERSION: u16 = 1;
+/// Current grant-closure declaration/receipt wire version. Version 2 adds a
+/// required logical validity interval to each member and remains single-root.
+pub const GRANT_CLOSURE_VERSION: u16 = 2;
 
 /// Canonical owner declaration of one grant and every same-root descendant.
 ///
@@ -482,14 +483,15 @@ pub const GRANT_CLOSURE_VERSION: u16 = 1;
 /// unless the revocation-closure verdict for the target is honestly
 /// complete with no receipt-authorized cross-root descendants. A
 /// partial/unknown verdict, or a complete verdict with cross-root
-/// descendants the single-root v1 shape cannot fence on their own roots
+/// descendants the single-root v2 shape cannot fence on their own roots
 /// with their authorizing receipts, refuses instead of emitting a
-/// silently-incomplete closure. The quarantined frontier is consumed by
-/// that complete gate — every omission bound to a verified
-/// separate-quarantine receipt — and its inert identities never appear in
+/// silently-incomplete closure. Version 2 adds member validity intervals but
+/// still admits only single-root closures. The complete gate consumes the
+/// quarantined frontier with each omission bound to a verified
+/// separate-quarantine receipt; its inert identities never appear in
 /// `members`. This refusal rule is the smaller conforming option: carrying
-/// the verdict's cross-root sections on the wire would require a schema-v2
-/// shape plus multi-root fencing on the Kernel port, so multi-root
+/// the verdict's cross-root sections on the wire would require a separately
+/// versioned shape plus multi-root fencing on the Kernel port, so multi-root
 /// closures stay explicit recovery-required refusals until that follow-up.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -520,6 +522,20 @@ pub struct GrantClosureMemberDeclaration {
     pub grant_id: String,
     /// Parent grant identity; absent only for the closure target/root.
     pub parent_grant_id: Option<String>,
+    /// Canonical owner-declared logical validity interval for this grant.
+    pub validity: eliot_contracts::LogicalValidityInterval,
+}
+
+impl GrantClosureMemberDeclaration {
+    fn validate_validity(&self) -> Result<(), ReceiptError> {
+        if self.validity.expires_at <= self.validity.issued_at {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.member.validity",
+                reason: "expires_at must be greater than issued_at",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// One exact use that remains covered by an independent valid root path.
@@ -671,6 +687,7 @@ impl GrantClosureDeclaration {
             .collect::<std::collections::BTreeSet<_>>();
         let mut seen = std::collections::BTreeSet::new();
         for (index, member) in self.members.iter().enumerate() {
+            member.validate_validity()?;
             text(&member.grant_id, "grant_closure.member.grant_id")?;
             if !seen.insert(member.grant_id.as_str()) {
                 return Err(ReceiptError::InvalidChain("duplicate grant-closure member"));
@@ -1428,6 +1445,26 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    fn grant_closure_fixture() -> GrantClosureDeclaration {
+        GrantClosureDeclaration {
+            schema: GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: GRANT_CLOSURE_VERSION,
+            target_grant_id: "grant-root".to_owned(),
+            authority_root_ref: "authority-root".to_owned(),
+            grant_graph_revision: 1,
+            members: vec![GrantClosureMemberDeclaration {
+                grant_id: "grant-root".to_owned(),
+                parent_grant_id: None,
+                validity: eliot_contracts::LogicalValidityInterval {
+                    issued_at: 10,
+                    expires_at: 20,
+                },
+            }],
+            preserved: Vec::new(),
+            proof_ceiling: ProofCeiling::Observation,
+        }
+    }
+
     #[test]
     fn issue_roundtrips_and_identity_is_deterministic() -> TestResult {
         let first = ReceiptEnvelope::issue(fixture_core()?)?;
@@ -1547,6 +1584,81 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn grant_closure_member_validity_changes_canonical_declaration_digest() -> TestResult {
+        let declaration = grant_closure_fixture();
+        declaration.validate()?;
+        let digest_before = sha256_hex(&canonical_json_bytes(&declaration)?);
+
+        let mut changed = declaration;
+        changed.members[0].validity = eliot_contracts::LogicalValidityInterval {
+            issued_at: 11,
+            expires_at: 20,
+        };
+        changed.validate()?;
+        let digest_after = sha256_hex(&canonical_json_bytes(&changed)?);
+
+        assert_ne!(digest_before, digest_after);
+        Ok(())
+    }
+
+    #[test]
+    fn grant_closure_rejects_empty_or_reversed_member_validity() {
+        let mut historical = grant_closure_fixture();
+        historical.members[0].validity = eliot_contracts::LogicalValidityInterval {
+            issued_at: 1,
+            expires_at: 2,
+        };
+        assert!(historical.validate().is_ok());
+
+        for (issued_at, expires_at) in [(20, 20), (21, 20)] {
+            let mut declaration = grant_closure_fixture();
+            declaration.members[0].validity = eliot_contracts::LogicalValidityInterval {
+                issued_at,
+                expires_at,
+            };
+            assert_eq!(
+                declaration.validate(),
+                Err(ReceiptError::InvalidField {
+                    field: "grant_closure.member.validity",
+                    reason: "expires_at must be greater than issued_at",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn grant_closure_v1_or_missing_member_validity_is_rejected() -> TestResult {
+        let mut legacy = grant_closure_fixture();
+        legacy.version = 1;
+        assert!(matches!(
+            legacy.validate(),
+            Err(ReceiptError::InvalidField {
+                field: "grant_closure.schema",
+                ..
+            })
+        ));
+
+        let mut wire = serde_json::to_value(grant_closure_fixture())?;
+        {
+            let object = wire.as_object_mut().ok_or_else(|| {
+                std::io::Error::other("grant-closure fixture was not a JSON object")
+            })?;
+            object.insert("version".to_owned(), serde_json::Value::from(1));
+        }
+        let member = wire
+            .get_mut("members")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|members| members.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                std::io::Error::other("grant-closure fixture member was not an object")
+            })?;
+        member.remove("validity");
+        assert!(serde_json::from_value::<GrantClosureDeclaration>(wire).is_err());
         Ok(())
     }
 }

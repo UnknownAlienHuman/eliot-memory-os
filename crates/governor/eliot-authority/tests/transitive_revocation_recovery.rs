@@ -15,16 +15,16 @@
 
 #![allow(clippy::expect_used)] // test-only panic-acceptable, mirroring the in-crate recovery tests.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_authority::{
-    AuthorityRevocationClosureEvidence, AuthoritySet, CapabilityGrant, EffectAuthorizer,
-    GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRestoreOutcome,
-    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId,
-    IntroductionRevocationRequest, LogicalTime, P07AuthorityPort, P07PortError, PrincipalRef,
-    REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationEvidenceDisposition, RevocationHistoryError,
-    RevocationHistoryEvidence, RevocationOperationIdentity, SuppressionCause,
-    UnavailableP07AuthorityPort,
+    AuthorityError, AuthorityRevocationClosureEvidence, AuthoritySet, CapabilityGrant,
+    EffectAuthorizer, GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot, GrantId,
+    GrantRestoreOutcome, GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
+    IntroductionId, IntroductionRevocationRequest, LogicalTime, P07AuthorityPort, P07PortError,
+    PrincipalRef, REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationEvidenceDisposition,
+    RevocationHistoryError, RevocationHistoryEvidence, RevocationOperationIdentity,
+    SuppressionCause, UnavailableP07AuthorityPort,
 };
 use eliot_contracts::{
     ClockReading, ContractId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, StateFence,
@@ -163,6 +163,33 @@ fn assert_full_lineage_retained(restored: &GrantGraphRecoverySnapshot, denominat
         by_id[denominator.tip_grant.as_str()],
         Some(denominator.leaf_grant.as_str())
     );
+}
+
+fn assert_validity_intervals_retained(
+    source: &GrantGraphRecoverySnapshot,
+    restored: &GrantGraphRecoverySnapshot,
+) {
+    let source_intervals: BTreeMap<&str, (u64, u64)> = source
+        .grants
+        .iter()
+        .map(|record| {
+            (
+                record.grant_id.as_str(),
+                (record.issued_at, record.expires_at),
+            )
+        })
+        .collect();
+    let restored_intervals: BTreeMap<&str, (u64, u64)> = restored
+        .grants
+        .iter()
+        .map(|record| {
+            (
+                record.grant_id.as_str(),
+                (record.issued_at, record.expires_at),
+            )
+        })
+        .collect();
+    assert_eq!(restored_intervals, source_intervals);
 }
 
 fn fence() -> StateFence {
@@ -333,6 +360,31 @@ fn closure(
     let bounds = eliot_influence::RevocationBounds::default_bounds();
     let disposition = RevocationEvidenceDisposition::Complete;
     let omissions: Vec<String> = Vec::new();
+    let mut grant_validity = affected
+        .iter()
+        .filter(|reference| reference.as_str() != owner_namespace)
+        .map(|reference| {
+            (
+                reference.clone(),
+                eliot_contracts::LogicalValidityInterval {
+                    issued_at: 1,
+                    expires_at: 10,
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // A typed authority-root origin represents its root grant even when the
+    // historical affected list uses the root marker instead of that grant ID.
+    let fixture = denominator();
+    if root_ref == fixture.authority_root {
+        grant_validity.insert(
+            fixture.origin_grant,
+            eliot_contracts::LogicalValidityInterval {
+                issued_at: 1,
+                expires_at: 10,
+            },
+        );
+    }
     let affected_member_count = affected.len() as u64;
     // The declared digest is computed over the SAME presentation the record
     // carries, coordinate for coordinate. Recovery recomputes it from the
@@ -343,6 +395,7 @@ fn closure(
         AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
             &RevocationClosureDigestInput {
                 evidence_version,
+                grant_validity: &grant_validity,
                 closure_id,
                 owner_namespace,
                 root_ref,
@@ -372,6 +425,7 @@ fn closure(
         )
         .expect("closure presentation is addressable");
     AuthorityRevocationClosureEvidence {
+        grant_validity,
         evidence_version,
         closure_id: closure_id.to_owned(),
         owner_namespace: owner_namespace.to_owned(),
@@ -437,21 +491,108 @@ fn context(
     (snapshot_id, work_scope, session)
 }
 
+fn bounded_closure(
+    graph: &GrantGraph,
+    denominator: &Denominator,
+    fence: &StateFence,
+) -> Result<eliot_influence::BoundedRevocationOutcome, Box<dyn std::error::Error>> {
+    let origin = GrantId::new(denominator.origin_grant.clone())?;
+    Ok(graph.transitive_revocation_closure(
+        &origin,
+        fence,
+        &eliot_influence::RevocationBounds::default_bounds(),
+        &operation(),
+    )?)
+}
+
+fn assert_expiry_updates_are_digest_bound(
+    baseline: &GrantGraphRecoverySnapshot,
+    denominator: &Denominator,
+    fence: &StateFence,
+    updates: &[(&str, u64)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let baseline_graph = GrantGraph::from_recovery_snapshot(baseline)?;
+    let before = bounded_closure(&baseline_graph, denominator, fence)?;
+    assert_eq!(baseline_graph.recovery_snapshot()?, baseline.clone());
+    let mut changed = baseline.clone();
+    for &(grant_id, expires_at) in updates {
+        let record = changed
+            .grants
+            .iter_mut()
+            .find(|record| record.grant_id.as_str() == grant_id)
+            .ok_or_else(|| format!("owner snapshot omitted {grant_id}"))?;
+        assert!(expires_at > record.issued_at, "valid grant interval");
+        record.expires_at = expires_at;
+    }
+
+    assert_eq!(changed.revision, baseline.revision);
+    assert_eq!(changed.grants.len(), baseline.grants.len());
+    for original in &baseline.grants {
+        let current = changed
+            .grants
+            .iter()
+            .find(|record| record.grant_id.as_str() == original.grant_id.as_str())
+            .ok_or_else(|| format!("changed snapshot omitted {}", original.grant_id))?;
+        assert_eq!(current.parent_grant_id, original.parent_grant_id);
+        assert_eq!(current.issued_at, original.issued_at);
+        assert_eq!(current.status, original.status);
+    }
+    for record in &changed.grants {
+        assert!(record.expires_at > record.issued_at, "valid grant interval");
+        if let Some(parent_id) = &record.parent_grant_id {
+            let parent = changed
+                .grants
+                .iter()
+                .find(|candidate| candidate.grant_id.as_str() == parent_id.as_str())
+                .ok_or_else(|| format!("missing parent {parent_id}"))?;
+            assert!(
+                record.expires_at <= parent.expires_at,
+                "child validity stays within parent validity: {} -> {}",
+                record.grant_id,
+                parent.grant_id
+            );
+        }
+    }
+
+    let changed_graph = GrantGraph::from_recovery_snapshot(&changed)?;
+    let after = bounded_closure(&changed_graph, denominator, fence)?;
+    assert_eq!(after.affected_refs, before.affected_refs);
+    assert_ne!(after.grant_validity, before.grant_validity);
+    assert_ne!(after.request_digest, before.request_digest);
+    let after_closure_snapshot = changed_graph.recovery_snapshot()?;
+    assert_eq!(
+        after_closure_snapshot, changed,
+        "closure does not mutate or activate grants"
+    );
+    assert_validity_intervals_retained(&changed, &after_closure_snapshot);
+
+    let encoded = serde_json::to_vec(&after_closure_snapshot)?;
+    let wire_roundtrip: GrantGraphRecoverySnapshot = serde_json::from_slice(&encoded)?;
+    assert_eq!(wire_roundtrip, changed);
+    let roundtrip_graph = GrantGraph::from_recovery_snapshot(&wire_roundtrip)?;
+    let roundtrip = bounded_closure(&roundtrip_graph, denominator, fence)?;
+    assert_eq!(roundtrip.affected_refs, after.affected_refs);
+    assert_eq!(roundtrip.grant_validity, after.grant_validity);
+    assert_eq!(roundtrip.request_digest, after.request_digest);
+    assert_eq!(roundtrip_graph.recovery_snapshot()?, changed);
+    Ok(())
+}
+
 // WORK_UNIT_CASE: 686/15
 #[test]
-fn revoke_origin_recovery_suppresses_origin_and_dependents() {
+fn revoke_origin_recovery_suppresses_origin_and_dependents()
+-> Result<(), Box<dyn std::error::Error>> {
     let denominator = denominator();
     assert_eq!(denominator.invalidation_reason, "SOURCE_REVOKED");
     let fence = fence();
     let graph = chain(&fence, &denominator);
-    let snapshot = graph.recovery_snapshot().expect("snapshot");
+    let snapshot = graph.recovery_snapshot()?;
     let evidence = origin_evidence(&fence, &denominator);
     let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
         &snapshot,
         Some(&evidence),
         &operation(),
-    )
-    .expect("current evidence restores");
+    )?;
     let suppressed: BTreeSet<&str> = outcome
         .suppressed
         .iter()
@@ -486,7 +627,8 @@ fn revoke_origin_recovery_suppresses_origin_and_dependents() {
     );
     // History is retained, never deleted: suppressed grants round-trip with
     // the revoked set carrying every suppression.
-    let restored = outcome.graph.recovery_snapshot().expect("re-emit");
+    let restored = outcome.graph.recovery_snapshot()?;
+    assert_validity_intervals_retained(&snapshot, &restored);
     for suppressed_id in &suppressed {
         assert!(
             restored.revoked.contains(&(*suppressed_id).to_owned()),
@@ -496,35 +638,36 @@ fn revoke_origin_recovery_suppresses_origin_and_dependents() {
     assert_eq!(restored.grants.len(), 5, "no historical grant is deleted");
     // The unrelated grant restores effective for its holder.
     let (snapshot_id, work_scope, session) = context(&fence);
-    let view = outcome
-        .graph
-        .snapshot(
-            snapshot_id,
-            &PrincipalRef::new("principal:unrelated").expect("holder"),
-            &work_scope,
-            &session,
-            LogicalTime::new(2),
-        )
-        .expect("unrelated grant stays effective");
+    let unrelated_holder = PrincipalRef::new("principal:unrelated")?;
+    let view = outcome.graph.snapshot(
+        snapshot_id,
+        &unrelated_holder,
+        &work_scope,
+        &session,
+        LogicalTime::new(2),
+    )?;
     assert!(view.allows("read", "resource:z", EffectClass::Read));
     // A suppressed holder has no effective path left.
     let (snapshot_id, work_scope, session) = context(&fence);
+    let revoked_holder = PrincipalRef::new("principal:end")?;
     let revoked = outcome.graph.snapshot(
         snapshot_id,
-        &PrincipalRef::new("principal:end").expect("holder"),
+        &revoked_holder,
         &work_scope,
         &session,
         LogicalTime::new(2),
     );
     assert!(revoked.is_err(), "revoked origin dependents do not revive");
+    Ok(())
 }
 
 #[test]
-fn revoke_mid_tree_recovery_reports_transitive_suppression() {
+fn revoke_mid_tree_recovery_reports_transitive_suppression()
+-> Result<(), Box<dyn std::error::Error>> {
     let denominator = denominator();
     let fence = fence();
     let graph = chain(&fence, &denominator);
-    let snapshot = graph.recovery_snapshot().expect("snapshot");
+    let snapshot = graph.recovery_snapshot()?;
     let evidence = RevocationHistoryEvidence {
         state_fence: fence.clone(),
         source_revision: denominator.source_revision,
@@ -546,8 +689,9 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
         &snapshot,
         Some(&evidence),
         &operation(),
-    )
-    .expect("current evidence restores");
+    )?;
+    let restored = outcome.graph.recovery_snapshot()?;
+    assert_validity_intervals_retained(&snapshot, &restored);
     let by_id: std::collections::BTreeMap<&str, &eliot_authority::SuppressedGrant> = outcome
         .suppressed
         .iter()
@@ -568,11 +712,12 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
     );
     assert_eq!(
         by_id[denominator.tip_grant.as_str()].cause,
-        SuppressionCause::Transitive(denominator.leaf_grant.clone()),
-        "the tip falls transitively through its suppressed parent"
+        SuppressionCause::Direct,
+        "complete versioned history declares the tip explicitly"
     );
     assert!(!by_id.contains_key(denominator.origin_grant.as_str()));
     assert!(!by_id.contains_key(denominator.unrelated_grant.as_str()));
+    Ok(())
 }
 
 // WORK_UNIT_CASE: 686/16
@@ -886,4 +1031,110 @@ fn history_suppression_retains_all_grants_and_lineage() {
         !mid_suppressed.contains(&denominator.unrelated_grant),
         "mid revocation leaves the unrelated grant restorable"
     );
+}
+
+#[test]
+fn origin_expiry_changes_closure_identity_and_survives_snapshot_roundtrip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let denominator = denominator();
+    let fence = fence();
+    let graph = chain(&fence, &denominator);
+    let snapshot = graph.recovery_snapshot()?;
+
+    // Extending only the origin leaves every child interval attenuated.
+    assert_expiry_updates_are_digest_bound(
+        &snapshot,
+        &denominator,
+        &fence,
+        &[(denominator.origin_grant.as_str(), 11)],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn descendant_expiry_changes_closure_identity_and_survives_snapshot_roundtrip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let denominator = denominator();
+    let fence = fence();
+    let graph = chain(&fence, &denominator);
+    let snapshot = graph.recovery_snapshot()?;
+
+    // Shortening the terminal descendant stays within its parent's interval.
+    assert_expiry_updates_are_digest_bound(
+        &snapshot,
+        &denominator,
+        &fence,
+        &[(denominator.tip_grant.as_str(), 9)],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn historical_closure_does_not_reactivate_owner_expired_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    let denominator = denominator();
+    let fence = fence();
+    let graph = chain(&fence, &denominator);
+    let before = graph.recovery_snapshot()?;
+
+    let outcome = bounded_closure(&graph, &denominator, &fence)?;
+    assert!(!outcome.affected_refs.is_empty());
+    assert_eq!(
+        graph.recovery_snapshot()?,
+        before,
+        "closure is observational"
+    );
+
+    let (snapshot_id, work_scope, session) = context(&fence);
+    let holder = PrincipalRef::new("principal:end")?;
+    // These are owner logical-time reads, independent of operation/HLC time.
+    let still_valid = graph.snapshot(
+        snapshot_id.clone(),
+        &holder,
+        &work_scope,
+        &session,
+        LogicalTime::new(9),
+    )?;
+    assert!(still_valid.allows("read", "resource:a", EffectClass::Read));
+    assert!(matches!(
+        graph.snapshot(
+            snapshot_id,
+            &holder,
+            &work_scope,
+            &session,
+            LogicalTime::new(10)
+        ),
+        Err(AuthorityError::NoEffectivePath)
+    ));
+    assert_eq!(graph.recovery_snapshot()?, before);
+    Ok(())
+}
+
+#[test]
+fn original_revocation_intervals_refuse_restore_after_grant_expiry_drift()
+-> Result<(), Box<dyn std::error::Error>> {
+    let denominator = denominator();
+    let fence = fence();
+    let graph = chain(&fence, &denominator);
+    let snapshot = graph.recovery_snapshot()?;
+    let evidence = origin_evidence(&fence, &denominator);
+    for (id, expiry) in [(&denominator.origin_grant, 11), (&denominator.tip_grant, 9)] {
+        let mut changed = snapshot.clone();
+        changed
+            .grants
+            .iter_mut()
+            .find(|grant| &grant.grant_id == id)
+            .ok_or("missing grant")?
+            .expires_at = expiry;
+        // This remains a structurally valid canonical grant graph. Only the
+        // ORIGINAL recorded validity differs; recovery must not replace it.
+        GrantGraph::from_recovery_snapshot(&changed)?;
+        assert!(
+            matches!(GrantGraph::from_recovery_snapshot_with_revocation_history(
+            &changed, Some(&evidence), &operation()),
+            Err(RevocationHistoryError::IdentityConflict(conflict))
+                if conflict.field == "recovery.closure_grant_validity")
+        );
+    }
+    Ok(())
 }

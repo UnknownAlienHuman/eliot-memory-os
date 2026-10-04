@@ -42,6 +42,17 @@ pub use peer_blackboard::*;
 /// The current wire revision of this foundation surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Owner-issued validity interval in logical time coordinates.
+/// This is immutable identity data, not a clock, deadline policy or grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LogicalValidityInterval {
+    /// Exact owner-issued logical time.
+    pub issued_at: u64,
+    /// Exact exclusive expiry in the same logical coordinate system.
+    pub expires_at: u64,
+}
+
 /// Maximum original correlation payload size, in UTF-8 bytes.
 pub const MAX_HOST_CORRELATION_PROJECTION_BYTES: usize = 512;
 

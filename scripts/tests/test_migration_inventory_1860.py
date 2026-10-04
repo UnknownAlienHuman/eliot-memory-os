@@ -33,7 +33,9 @@ class TestMigrationInventory1860(unittest.TestCase):
             + [(p, inv.UNKNOWN_PATHS[p]) for p in inv.UNKNOWN_PATHS]
             + [(p, inv.KEEP_PATHS[p]) for p in inv.KEEP_PATHS]
         )
-        self.assertGreaterEqual(len(rows), 20, "explicit ledger must be non-trivial")
+        paths = {path for path, _ in rows}
+        self.assertIn("crates/security/eliot-influence", paths, "live evaluator remains owned")
+        self.assertNotIn("crates/security/eliot-erasure", paths, "deleted package is not a fallback")
         for path, (owner, rationale) in rows:
             with self.subTest(path=path):
                 disp, got_owner, got_rationale = inv.assign_disposition(path, {})

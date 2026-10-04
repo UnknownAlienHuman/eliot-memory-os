@@ -5,8 +5,8 @@ use eliot_contracts::{
     ClockReading, EpochId, ReceiptId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_influence::{
-    BoundedRevocationRequest, ClosureCompleteness, InfluenceEdgeDisposition, OmissionCause,
-    QualifiedInfluenceEdge, RevocationOmission,
+    BoundedRevocationRequest, ClosureCompleteness, GrantValidityInterval, InfluenceEdgeDisposition,
+    OmissionCause, QualifiedInfluenceEdge, RevocationOmission,
 };
 use eliot_receipts::{
     AuthorityBinding, EffectClass, ReceiptIdentity, SessionBinding, WorkScopeBinding,
@@ -2593,6 +2593,32 @@ impl GrantGraph {
                 eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
             ));
         }
+        // Compare ORIGINAL intervals with current canonical owner data before
+        // suppression. Changed expiry under the same identity is a conflict.
+        let expected_validity = denominator
+            .members
+            .iter()
+            .map(|reference| {
+                let grant = self
+                    .grant(reference)
+                    .ok_or(RevocationHistoryError::UnknownHistory)?;
+                Ok((
+                    reference.clone(),
+                    GrantValidityInterval {
+                        issued_at: grant.issued_at.value(),
+                        expires_at: grant.expires_at.value(),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, RevocationHistoryError>>()?;
+        if closure.grant_validity != expected_validity {
+            return Err(RevocationHistoryError::IdentityConflict(
+                ClosureIdentityConflict {
+                    closure_id: closure.closure_id.clone(),
+                    field: "recovery.closure_grant_validity",
+                },
+            ));
+        }
         AdmittedRevocationClosure::admit(closure, origin, owner_namespace, denominator)
     }
 
@@ -2986,6 +3012,7 @@ impl GrantGraph {
             operation_clock: operation.operation_clock,
             reason: RevocationReason::SourceRevoked,
             state_fence: fence.clone(),
+            grant_validity: Some(self.revocation_grant_validity(origin, &edges)?),
             edges,
             completeness: ClosureCompleteness::Complete,
             resumed_visited: Vec::new(),
@@ -3058,6 +3085,47 @@ impl GrantGraph {
             }
         }
         Ok(outcome)
+    }
+
+    /// Bind the retained owner-issued lifetimes of every node in this exact
+    /// snapshot, without granting current authority to expired or quarantined
+    /// members. `LogicalTime` is never compared with the operation's host/HLC
+    /// reading; current-use enforcement remains with the grant owner.
+    fn revocation_grant_validity(
+        &self,
+        origin: &GrantId,
+        edges: &[QualifiedInfluenceEdge],
+    ) -> Result<BTreeMap<String, GrantValidityInterval>, AuthorityError> {
+        let required: BTreeSet<&str> = std::iter::once(origin.as_str())
+            .chain(
+                edges
+                    .iter()
+                    .flat_map(|edge| [edge.source_ref.as_str(), edge.dependent_ref.as_str()]),
+            )
+            .collect();
+        let mut validity = BTreeMap::new();
+        for grant in self
+            .grants
+            .values()
+            .chain(self.quarantined.values().map(|relation| &relation.child))
+        {
+            if !required.contains(grant.grant_id.as_str()) {
+                continue;
+            }
+            let interval = GrantValidityInterval {
+                issued_at: grant.issued_at.value(),
+                expires_at: grant.expires_at.value(),
+            };
+            if let Some(known) = validity.insert(grant.grant_id.as_str().to_owned(), interval)
+                && known != interval
+            {
+                return Err(AuthorityError::IdentityConflict);
+            }
+        }
+        if validity.len() != required.len() {
+            return Err(AuthorityError::InvalidField("revocation.grant_validity"));
+        }
+        Ok(validity)
     }
 
     /// Qualifies every grant edge the graph currently knows, plus each

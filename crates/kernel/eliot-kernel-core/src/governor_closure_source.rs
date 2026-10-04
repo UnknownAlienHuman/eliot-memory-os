@@ -596,6 +596,8 @@ impl GovernorClosureSource {
                     })?;
                 if graph_member.parent_grant_id != declared.parent_grant_id
                     || graph_member.authority_root_ref != declaration.authority_root_ref
+                    || declared.validity.issued_at != graph_member.issued_at
+                    || declared.validity.expires_at != graph_member.expires_at
                 {
                     return Err(KernelError::InvalidField {
                         field: "restore.declaration.members",
@@ -1347,6 +1349,11 @@ impl RootGrantHydrationSource for GovernorClosureSource {
             members.push(member);
         }
         Ok(GrantClosureEnumeration {
+            grant_validity: declaration
+                .members
+                .iter()
+                .map(|member| (member.grant_id.clone(), member.validity))
+                .collect(),
             authority_root_ref: declaration.authority_root_ref.clone(),
             grant_graph_revision: declaration.grant_graph_revision,
             members,
@@ -1524,6 +1531,10 @@ mod tests {
             authority_root_ref: "root-test".to_owned(),
             grant_graph_revision: 5,
             members: vec![GrantClosureMemberDeclaration {
+                validity: eliot_contracts::LogicalValidityInterval {
+                    issued_at: 1,
+                    expires_at: 10_000,
+                },
                 grant_id: "grant-test-root".to_owned(),
                 parent_grant_id: None,
             }],
@@ -1571,7 +1582,29 @@ mod tests {
         assert_eq!(enumeration.grant_graph_revision, 5);
         assert_eq!(enumeration.members.len(), 1);
         assert_eq!(enumeration.members[0].intent.grant_id, "grant-test-root");
+        assert_eq!(
+            enumeration.grant_validity.get("grant-test-root"),
+            Some(&eliot_contracts::LogicalValidityInterval {
+                issued_at: 1,
+                expires_at: 10_000,
+            })
+        );
         assert!(enumeration.preserved.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_declared_validity_drift_before_serving_closure() -> Result<(), KernelError> {
+        let mut bundle = restore_bundle()?;
+        bundle.declarations[0].members[0].validity.issued_at = 2;
+
+        assert!(matches!(
+            GovernorClosureSource::restore(bundle),
+            Err(KernelError::InvalidField {
+                field: "restore.declaration.members",
+                ..
+            })
+        ));
         Ok(())
     }
 

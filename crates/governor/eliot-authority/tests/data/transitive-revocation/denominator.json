@@ -12,6 +12,15 @@
   "mid_closure_id": "revocation-686-mid-01",
   "source_revision": 9,
   "invalidation_reason": "SOURCE_REVOKED",
-  "origin_affected": ["grant:leaf-gamma", "grant:mid-beta", "grant:tip-delta", "root:alpha"],
-  "mid_affected": ["grant:leaf-gamma", "grant:mid-beta"]
+  "origin_affected": [
+    "grant:leaf-gamma",
+    "grant:mid-beta",
+    "grant:tip-delta",
+    "root:alpha"
+  ],
+  "mid_affected": [
+    "grant:leaf-gamma",
+    "grant:mid-beta",
+    "grant:tip-delta"
+  ]
 }

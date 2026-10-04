@@ -42,7 +42,8 @@ use crate::{InfluenceState, RevocationReason};
 /// or count, and no declared omissions. Those bytes are not migrated: the
 /// durable history owner pre-partitions its evidence under this version,
 /// and a v1 presentation is refused rather than read with defaults.
-pub const REVOCATION_HISTORY_EVIDENCE_VERSION: u16 = 2;
+/// Version 3 binds original grant validity; older rows are never defaulted.
+pub const REVOCATION_HISTORY_EVIDENCE_VERSION: u16 = 3;
 
 /// Canonical spelling of the `Complete` disposition inside the digest preimage.
 ///
@@ -87,6 +88,9 @@ pub struct RevocationClosureDigestBounds {
 pub struct RevocationClosureDigestInput<'a> {
     /// Declared evidence version.
     pub evidence_version: u16,
+    /// Exact original owner-issued intervals for the committed grant membership.
+    pub grant_validity:
+        &'a std::collections::BTreeMap<String, eliot_contracts::LogicalValidityInterval>,
     /// Stable closure identity.
     pub closure_id: &'a str,
     /// Declared graph/snapshot owner namespace.
@@ -182,6 +186,7 @@ pub fn revocation_closure_canonical_digest(
     omissions.sort_unstable();
     let bytes = canonical_json_bytes(&RevocationClosureCanonicalPreimage {
         evidence_version: input.evidence_version,
+        grant_validity: input.grant_validity,
         closure_id: input.closure_id,
         owner_namespace: input.owner_namespace,
         root_ref: input.root_ref,
@@ -216,6 +221,8 @@ struct RevocationAffectedMembersPreimage<'a> {
 #[derive(Serialize)]
 struct RevocationClosureCanonicalPreimage<'a> {
     evidence_version: u16,
+    grant_validity:
+        &'a std::collections::BTreeMap<String, eliot_contracts::LogicalValidityInterval>,
     closure_id: &'a str,
     owner_namespace: &'a str,
     root_ref: &'a str,

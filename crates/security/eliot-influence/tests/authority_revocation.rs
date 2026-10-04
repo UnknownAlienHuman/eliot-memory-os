@@ -860,3 +860,109 @@ fn mutation_sequences_preserve_unique_members_and_integrate() {
         decision.reasons
     );
 }
+
+fn bounded_frozen_request(
+    root: &str,
+    fixture: &str,
+) -> Result<eliot_influence::BoundedRevocationRequest, Box<dyn std::error::Error>> {
+    let edges = parse_edges(fixture)
+        .into_iter()
+        .map(|edge| eliot_influence::QualifiedInfluenceEdge {
+            source_ref: edge.source_ref,
+            dependent_ref: edge.dependent_ref,
+            disposition: eliot_influence::InfluenceEdgeDisposition::PermittedCurrent,
+        })
+        .collect::<Vec<_>>();
+    let nodes = std::iter::once(root)
+        .chain(
+            edges
+                .iter()
+                .flat_map(|edge| [edge.source_ref.as_str(), edge.dependent_ref.as_str()]),
+        )
+        .collect::<BTreeSet<_>>();
+    let grant_validity = nodes
+        .into_iter()
+        .map(|reference| {
+            (
+                reference.to_owned(),
+                eliot_influence::GrantValidityInterval {
+                    issued_at: 1,
+                    expires_at: 10,
+                },
+            )
+        })
+        .collect();
+    Ok(eliot_influence::BoundedRevocationRequest {
+        request_id: format!("revocation:1142:{root}"),
+        root_ref: root.to_owned(),
+        principal_ref: "principal:1142-fixture".to_owned(),
+        admitted_task: eliot_contracts::TaskId::new("task:1142-fixture")?,
+        work_scope_ref: "scope:1142-fixture".to_owned(),
+        observing_receipt: eliot_contracts::ReceiptId::new("receipt:1142-fixture")?,
+        operation_clock: eliot_contracts::ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: Some(eliot_contracts::TransactionSequence::genesis()),
+            monotonic_ns: None,
+        },
+        reason: RevocationReason::SourceRevoked,
+        state_fence: test_fence(),
+        edges,
+        grant_validity: Some(grant_validity),
+        completeness: eliot_influence::ClosureCompleteness::Complete,
+        resumed_visited: Vec::new(),
+    })
+}
+
+#[test]
+fn frozen_chain_cycle_diamond_and_duplicate_graphs_bind_expiry_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            "origin:alpha",
+            include_str!("data/transitive-revocation/chain.txt"),
+        ),
+        (
+            "node:a",
+            include_str!("data/transitive-revocation/cycle.txt"),
+        ),
+        (
+            "origin:alpha",
+            include_str!("data/transitive-revocation/diamond.txt"),
+        ),
+        (
+            "origin:alpha",
+            include_str!("data/transitive-revocation/duplicates.txt"),
+        ),
+    ];
+    let bounds = eliot_influence::RevocationBounds::default_bounds();
+    for (root, fixture) in cases {
+        let request = bounded_frozen_request(root, fixture)?;
+        let original = eliot_influence::revoke_bounded(&request, &bounds)?;
+        assert!(original.complete);
+        original.verify_binding(&request, &bounds)?;
+        assert_eq!(
+            original,
+            eliot_influence::revoke_bounded(&request, &bounds)?,
+            "exact expiry replay is stable"
+        );
+        for reference in &original.affected_refs {
+            let mut changed = request.clone();
+            changed
+                .grant_validity
+                .as_mut()
+                .and_then(|map| map.get_mut(reference))
+                .ok_or("missing interval")?
+                .expires_at = 9;
+            assert_ne!(request.digest()?, changed.digest()?);
+            assert!(matches!(
+                original.verify_binding(&changed, &bounds),
+                Err(eliot_influence::InfluenceError::OutcomeBindingMismatch(_))
+            ));
+            let changed_outcome = eliot_influence::revoke_bounded(&changed, &bounds)?;
+            assert_eq!(changed_outcome.affected_refs, original.affected_refs);
+            assert_ne!(changed_outcome.request_digest, original.request_digest);
+        }
+    }
+    Ok(())
+}

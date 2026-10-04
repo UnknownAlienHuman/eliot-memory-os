@@ -166,9 +166,11 @@ pub enum RevocationEvidenceDisposition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityRevocationClosureEvidence {
+    /// Original declared member intervals, never inferred from the recovering graph.
+    pub grant_validity: BTreeMap<String, eliot_contracts::LogicalValidityInterval>,
     /// Declared evidence version; must equal
     /// [`REVOCATION_HISTORY_EVIDENCE_VERSION`]. Checked before any other
-    /// field, so a v1 presentation is never read under v2 semantics.
+    /// field, so an older presentation never receives current defaults.
     pub evidence_version: u16,
     /// Stable closure identity, and the idempotency identity the committed
     /// closure is reused under (I5.27).
@@ -297,6 +299,7 @@ impl AuthorityRevocationClosureEvidence {
     fn digest_input(&self) -> RevocationClosureDigestInput<'_> {
         RevocationClosureDigestInput {
             evidence_version: self.evidence_version,
+            grant_validity: &self.grant_validity,
             closure_id: &self.closure_id,
             owner_namespace: &self.owner_namespace,
             root_ref: &self.root_ref,
@@ -506,6 +509,9 @@ fn conflicted_closure_field(
     if previous.owner_namespace != closure.owner_namespace {
         return Some("closure.owner_namespace");
     }
+    if previous.grant_validity != closure.grant_validity {
+        return Some("closure.grant_validity");
+    }
     if previous.bounds != closure.bounds {
         return Some("closure.bounds");
     }
@@ -577,6 +583,8 @@ fn closure_canonical_digest(
 /// declared [`RevocationOrigin`] (see [`AdmittedRevocationClosure`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedRevocationClosure {
+    /// Original member intervals retained for owner-versus-record comparison.
+    pub grant_validity: BTreeMap<String, eliot_contracts::LogicalValidityInterval>,
     /// Stable closure identity carried by the evidence.
     pub closure_id: String,
     /// Declared owner namespace the evidence was served under, untyped on
@@ -704,6 +712,14 @@ impl ValidatedRevocationClosure {
             .validate()
             .map_err(RevocationHistoryError::BoundedRevocation)?;
         let affected = closure.affected_members();
+        if closure.grant_validity.is_empty()
+            || closure.grant_validity.iter().any(|(grant, interval)| {
+                validate_text(grant, "grant_validity.grant_id").is_err()
+                    || interval.expires_at <= interval.issued_at
+            })
+        {
+            return Err(RevocationHistoryError::UnknownHistory);
+        }
         if closure.affected_member_count != affected.len() as u64 {
             return Err(RevocationHistoryError::IdentityConflict(
                 ClosureIdentityConflict {
@@ -746,6 +762,7 @@ impl ValidatedRevocationClosure {
             reason,
             revision: closure.revision,
             source_revision: evidence.source_revision,
+            grant_validity: closure.grant_validity.clone(),
             bounds: closure.bounds.clone(),
             commit_state_fence: closure.commit_state_fence.clone(),
             disposition: closure.disposition,

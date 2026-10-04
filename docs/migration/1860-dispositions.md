@@ -5,7 +5,7 @@ Owner: `bins/eliotd` migration coordination. Verbs follow I19.3
 reuse the checked-in #1811 verbs verbatim. No row confers workspace, runtime,
 state, authority, or production support admission.
 
-Distribution over the 73 bins-unreachable workspace packages:
+Distribution at the recorded #1860 source snapshot over 73 bins-unreachable workspace packages:
 **KEEP 53 · REWORK 7 · RETIRE 6 · UNKNOWN 6 · WRAP 1**.
 Excluded scope: **REWORK 3 · EXTRACT 1 · WRAP 7** over 11 packages.
 
@@ -52,11 +52,24 @@ parallel agent runtime.
 Rationale (#1811 semantics): concept valid, contract pending. REWORK before any
 admission-to-runtime claim; integration via cognitive-wave-integrator.
 
-## UNKNOWN (6) — explicit, fail-closed, owner-assigned
+## Live canonical consumer — influence (#1142)
+
+`crates/security/eliot-influence` is KEEP. Canonical grant semantics and retained
+lineage belong to `crates/governor/eliot-authority` (I6.15); influence evaluates
+the immutable bounded closure and performs no canonical mutation or purge.
+The current consumer is `bins/eliotd`'s owner-feed/restore route through
+`publish_owner_feed` → `serve_restore` → `complete_closure_verdict` →
+`revocation_closure_verdict_with_quarantine` → `transitive_revocation_closure` →
+`revoke_bounded_page`. Its disposition is no longer UNKNOWN or owner-TBD.
+`eliot-erasure` was deleted in dcc64164 / PR #3542 and is not a fallback.
+Installed acceptance remains TEST-PHASE (#11/#19/#1113); source reachability
+does not establish Product support. The live machine registry is
+`scripts/migration_inventory_1860.py`; the snapshot totals above are historical.
+
+## UNKNOWN (4) — explicit, fail-closed, owner-assigned
 
 | Path | Package | Owner | Active reference |
 |---|---|---|---|
-| `crates/security/eliot-influence` | eliot-influence | security.influence (component owner TBD); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |
 | `crates/smart/eliot-context` | eliot-context | smart.context (component owner TBD, ref #248); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |
 | `crates/smart/eliot-cues` | eliot-cues | smart.cues (component owner TBD); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |
 | `crates/smart/eliot-dreamer-core` | eliot-dreamer-core | smart.dreamer.core (component owner TBD); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |

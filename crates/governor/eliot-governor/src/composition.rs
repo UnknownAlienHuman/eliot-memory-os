@@ -14649,6 +14649,10 @@ mod tests {
                 authority_root_ref: "authority:test-root".to_owned(),
                 grant_graph_revision: 1,
                 members: vec![eliot_receipts::GrantClosureMemberDeclaration {
+                    validity: eliot_contracts::LogicalValidityInterval {
+                        issued_at: 1,
+                        expires_at: 10,
+                    },
                     grant_id: "grant-a".to_owned(),
                     parent_grant_id: None,
                 }],

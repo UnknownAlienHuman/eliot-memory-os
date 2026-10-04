@@ -725,6 +725,7 @@ pub fn decode_revocation_history_evidence(
             RecordedRevocationDisposition::Unknown => RevocationEvidenceDisposition::Unknown,
         };
         closures.push(AuthorityRevocationClosureEvidence {
+            grant_validity: row.grant_validity,
             evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
             closure_id: row.closure_id,
             owner_namespace: row.owner_namespace,
@@ -893,8 +894,8 @@ mod authority_revocation_tests {
 
     use super::*;
     use eliot_authority::{
-        AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantGraph, GrantId, GrantStatus,
-        LogicalTime, PrincipalRef, RevocationOperationIdentity,
+        AuthoritySet, CapabilityGrant, GrantGraph, GrantId, GrantStatus, LogicalTime, PrincipalRef,
+        RevocationOperationIdentity,
     };
     use eliot_contracts::{
         ClockReading, ContractId, EpochId, EpochLineageId, ProductId, ReceiptId, RequestId,
@@ -1016,16 +1017,16 @@ mod authority_revocation_tests {
             max_uses: 2,
             status: GrantStatus::Active,
         };
-        GrantGraph::from_grants([origin, child], 7)
+        GrantGraph::from_grants([origin, child], 9)
             .expect("graph")
             .recovery_snapshot()
             .expect("snapshot")
     }
 
     fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
-        let effect_authorizer = EffectAuthorizer::default().snapshot().expect("authorizer");
-        AuthorityOwnerSnapshot::new(fence.clone(), grant_snapshot(fence), effect_authorizer)
-            .expect("owner snapshot")
+        crate::owner_closure_provider::owner_closure_provider_tests::snapshot_with_fixture_hydrations(
+            fence, &grant_snapshot(fence), 1, 10,
+        ).expect("owner snapshot")
     }
 
     fn param(envelope: &CanonicalWriteEnvelope, name: &str) -> Option<String> {
@@ -1200,6 +1201,18 @@ mod authority_revocation_tests {
         let invalidation_reason = eliot_store_api::RevocationReason::SourceRevoked;
         let disposition = eliot_store_api::RecordedRevocationDisposition::Complete;
         let omissions: Vec<String> = Vec::new();
+        let grant_validity = dependent_refs
+            .iter()
+            .map(|reference| {
+                (
+                    reference.clone(),
+                    eliot_contracts::LogicalValidityInterval {
+                        issued_at: 1,
+                        expires_at: 10,
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         let affected_member_count = affected.len() as u64;
         let recorded_bounds = recorded_bounds(&bounds);
         let canonical_request_digest =
@@ -1212,10 +1225,12 @@ mod authority_revocation_tests {
                 &omissions,
                 affected_member_count,
                 &affected_member_digest,
+                &grant_validity,
             ))
             .map(|bytes| eliot_store_api::sha256_hex(&bytes))
             .expect("recorded revocation is addressable");
         RecordedRevocation {
+            grant_validity,
             closure_id: "revocation-686-01".to_owned(),
             root_ref: root_ref.to_owned(),
             dependent_refs,
@@ -1261,9 +1276,15 @@ mod authority_revocation_tests {
         omissions: &'a [String],
         affected_member_count: u64,
         affected_member_digest: &'a str,
+        grant_validity: &'a std::collections::BTreeMap<
+            String,
+            eliot_contracts::LogicalValidityInterval,
+        >,
     ) -> impl serde::Serialize + 'a {
         #[derive(serde::Serialize)]
         struct Preimage<'a> {
+            grant_validity:
+                &'a std::collections::BTreeMap<String, eliot_contracts::LogicalValidityInterval>,
             evidence_version: u16,
             closure_id: &'a str,
             owner_namespace: &'a str,
@@ -1281,6 +1302,7 @@ mod authority_revocation_tests {
             affected_member_digest: &'a str,
         }
         Preimage {
+            grant_validity,
             evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION as u16,
             closure_id: "revocation-686-01",
             owner_namespace: root_ref,
@@ -1340,6 +1362,10 @@ mod authority_revocation_tests {
                 .expect("decode");
         assert_eq!(evidence.source_revision, 9);
         assert_eq!(evidence.closures.len(), 1);
+        assert_eq!(
+            evidence.closures[0].grant_validity,
+            recorded_revocation("root:alpha").grant_validity
+        );
         let snapshot = owner_snapshot(&fence);
         let outcome = AuthorityOwner::from_snapshot_with_revocation_history(
             &snapshot,
@@ -1386,8 +1412,22 @@ mod authority_revocation_tests {
             .is_err()
         );
         let mut bad_version = history_response(&fence);
-        bad_version.payload["version"] = serde_json::json!(999);
-        assert!(decode_revocation_history_evidence(&bad_version, &fence, "root:alpha").is_err());
+        for legacy_version in [1, 2, 999] {
+            bad_version.payload["version"] = serde_json::json!(legacy_version);
+            assert!(
+                decode_revocation_history_evidence(&bad_version, &fence, "root:alpha").is_err()
+            );
+        }
+        let mut missing_validity = history_response(&fence);
+        assert!(matches!(
+            missing_validity.payload["closures"][0]
+                .as_object_mut()
+                .map(|closure| closure.remove("grant_validity")),
+            Some(Some(_))
+        ));
+        assert!(
+            decode_revocation_history_evidence(&missing_validity, &fence, "root:alpha").is_err()
+        );
     }
 
     #[test]

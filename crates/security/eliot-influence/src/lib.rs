@@ -619,12 +619,16 @@ pub struct RevocationOmission {
     pub cause: OmissionCause,
 }
 
+/// Owner-issued grant lifetime retained as revocation lineage evidence (I6.15).
+pub use eliot_contracts::LogicalValidityInterval as GrantValidityInterval;
+
 /// Bounded revocation request over an explicit qualified edge set.
 ///
 /// The identities this request freezes are the ones
 /// [`digest`](Self::digest) hashes: the request id, the origin grant the closure
 /// is rooted at (`root_ref`), the revocation reason, the state fence, the
-/// declared completeness, the exact qualified-edge multiset digest, and the four
+/// declared completeness, the exact qualified-edge multiset and grant-validity
+/// snapshot digest, and the four
 /// admitted identities below. The authority epoch is frozen inside
 /// `state_fence.authority_epoch`, so it travels with the same canonical bytes
 /// rather than as a separate field.
@@ -693,6 +697,13 @@ pub struct BoundedRevocationRequest {
     pub reason: RevocationReason,
     pub state_fence: StateFence,
     pub edges: Vec<QualifiedInfluenceEdge>,
+    /// Exact validity intervals of the origin and every qualified grant edge
+    /// endpoint. `GrantGraph` supplies these from canonical retained grants,
+    /// including quarantined lineage; no lifetime is invented by the evaluator.
+    /// `None` identifies a non-grant influence graph and proves no grant validity.
+    /// Expired grants remain revocable: this is historical identity, not permission
+    /// to activate a grant or a comparison with the operation's separate clock.
+    pub grant_validity: Option<BTreeMap<String, GrantValidityInterval>>,
     pub completeness: ClosureCompleteness,
     pub resumed_visited: Vec<String>,
 }
@@ -851,6 +862,8 @@ impl BoundedRevocationContinuationToken {
 /// continuation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct BoundedRevocationOutcome {
+    /// Exact owner-issued lineage validity carried by this receipt.
+    pub grant_validity: Option<BTreeMap<String, GrantValidityInterval>>,
     pub root_ref: String,
     pub request_id: String,
     pub request_digest: String,
@@ -933,7 +946,8 @@ impl BoundedRevocationOutcome {
         request: &BoundedRevocationRequest,
         bounds: &RevocationBounds,
     ) -> Result<(), InfluenceError> {
-        if self.request_digest != request.digest()?
+        if self.grant_validity != request.grant_validity
+            || self.request_digest != request.digest()?
             || self.bounds_digest != bounds.digest()?
             || self.request_id != request.request_id
             || self.root_ref != request.root_ref
@@ -1164,6 +1178,8 @@ impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
             where
                 A: MapAccess<'de>,
             {
+                let mut grant_validity: Option<Option<BTreeMap<String, GrantValidityInterval>>> =
+                    None;
                 let mut root_ref = None;
                 let mut request_id = None;
                 let mut request_digest = None;
@@ -1179,6 +1195,9 @@ impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
                 let mut continuation: Option<Option<BoundedRevocationContinuation>> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
+                        "grant_validity" => {
+                            set_field(&mut grant_validity, "grant_validity", map.next_value()?)?;
+                        }
                         "root_ref" => set_field(&mut root_ref, "root_ref", map.next_value()?)?,
                         "request_id" => {
                             set_field(&mut request_id, "request_id", map.next_value()?)?;
@@ -1212,6 +1231,7 @@ impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
                     }
                 }
                 Ok(BoundedRevocationOutcome {
+                    grant_validity: required(grant_validity, "grant_validity")?,
                     root_ref: required(root_ref, "root_ref")?,
                     request_id: required(request_id, "request_id")?,
                     request_digest: required(request_digest, "request_digest")?,
@@ -1259,7 +1279,7 @@ fn canonical_digest<T: Serialize>(value: &T) -> Result<String, InfluenceError> {
 }
 
 const BOUNDED_REVOCATION_REQUEST_IDENTITY_SCHEMA: &str =
-    "eliot-bounded-revocation-request-identity-v1";
+    "eliot-bounded-revocation-request-identity-v2";
 
 #[derive(Serialize)]
 struct BoundedRequestIdentity<'a> {
@@ -1281,7 +1301,8 @@ impl BoundedRevocationRequest {
     /// Return the canonical identity of this valid bounded request.
     ///
     /// Edge order is normalized before hashing, while the independently bound
-    /// graph digest preserves the exact qualified-edge multiset. The legacy
+    /// graph digest preserves the exact qualified-edge multiset and owner-issued
+    /// grant validity intervals. The legacy
     /// `resumed_visited` compatibility field is not part of this identity and
     /// is refused by the bounded engine when nonempty.
     ///
@@ -1318,8 +1339,9 @@ impl BoundedRevocationRequest {
         })
     }
 
-    /// Return the identity of the exact qualified-edge snapshot in canonical
-    /// source/dependent/disposition order.
+    /// Return the identity of the exact qualified-edge snapshot and grant
+    /// validity intervals, with edges in source/dependent/disposition order
+    /// and validity keyed in grant-reference order.
     pub fn graph_snapshot_digest(&self) -> Result<String, InfluenceError> {
         let mut edges = self.edges.clone();
         edges.sort_by(|left, right| {
@@ -1334,7 +1356,9 @@ impl BoundedRevocationRequest {
                     edge_disposition_rank(right.disposition),
                 ))
         });
-        canonical_digest(&edges)
+        // Validity is part of the graph snapshot, so neither a complete receipt
+        // nor a continuation can be reused after a grant's expiry changes.
+        canonical_digest(&(edges, &self.grant_validity))
     }
 }
 
@@ -1998,6 +2022,7 @@ impl BoundedTraversal {
                     digest: continuation.continuation_digest.clone(),
                 });
         Ok(BoundedRevocationOutcome {
+            grant_validity: request.grant_validity.clone(),
             root_ref: request.root_ref.clone(),
             request_id: self.request_id.clone(),
             request_digest: self.request_digest.clone(),
@@ -2086,6 +2111,7 @@ impl BoundedTraversal {
             }
         }
         Some(BoundedRevocationOutcome {
+            grant_validity: request.grant_validity.clone(),
             root_ref: request.root_ref.clone(),
             request_id: self.request_id.clone(),
             request_digest: self.request_digest.clone(),
@@ -2112,6 +2138,7 @@ fn check_bounded_header(
         .map_err(|_| InfluenceError::InvalidRequest("request_id"))?;
     text(&request.root_ref, "root_ref").map_err(|_| InfluenceError::InvalidRequest("root_ref"))?;
     check_bounded_identities(request)?;
+    check_grant_validity(request)?;
     request
         .state_fence
         .validate()
@@ -2159,6 +2186,31 @@ fn check_bounded_identities(request: &BoundedRevocationRequest) -> Result<(), In
         .map_err(|_| InfluenceError::InvalidRequest("operation_clock"))?;
     if request.operation_clock.transaction_sequence.is_none() {
         return Err(InfluenceError::InvalidRequest("operation_clock"));
+    }
+    Ok(())
+}
+
+fn check_grant_validity(request: &BoundedRevocationRequest) -> Result<(), InfluenceError> {
+    let Some(validity) = &request.grant_validity else {
+        return Ok(());
+    };
+    let required: BTreeSet<&str> = std::iter::once(request.root_ref.as_str())
+        .chain(
+            request
+                .edges
+                .iter()
+                .flat_map(|edge| [edge.source_ref.as_str(), edge.dependent_ref.as_str()]),
+        )
+        .collect();
+    if validity.len() != required.len()
+        || required
+            .iter()
+            .any(|reference| !validity.contains_key(*reference))
+        || validity
+            .values()
+            .any(|interval| interval.expires_at <= interval.issued_at)
+    {
+        return Err(InfluenceError::InvalidRequest("grant_validity"));
     }
     Ok(())
 }
@@ -4945,5 +4997,143 @@ mod tests {
             Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
             Err(other) => panic!("expected binding mismatch, got {other:?}"),
         }
+    }
+
+    fn bounded_grant_request() -> Result<BoundedRevocationRequest, Box<dyn std::error::Error>> {
+        Ok(BoundedRevocationRequest {
+            request_id: "revocation:1142".to_owned(),
+            root_ref: "grant:root".to_owned(),
+            principal_ref: "principal:1142".to_owned(),
+            admitted_task: TaskId::new("task:1142")?,
+            work_scope_ref: "scope:1142".to_owned(),
+            observing_receipt: ReceiptId::new("receipt:1142")?,
+            operation_clock: ClockReading {
+                valid_time_ms: None,
+                known_time_ms: None,
+                transaction_sequence: Some(eliot_contracts::TransactionSequence::genesis()),
+                monotonic_ns: None,
+            },
+            reason: RevocationReason::SourceRevoked,
+            state_fence: test_fence(),
+            edges: [("grant:root", "grant:child"), ("grant:child", "grant:leaf")]
+                .map(|(source, dependent)| QualifiedInfluenceEdge {
+                    source_ref: source.to_owned(),
+                    dependent_ref: dependent.to_owned(),
+                    disposition: InfluenceEdgeDisposition::PermittedCurrent,
+                })
+                .to_vec(),
+            grant_validity: Some(
+                ["grant:root", "grant:child", "grant:leaf"]
+                    .map(|id| {
+                        (
+                            id.to_owned(),
+                            GrantValidityInterval {
+                                issued_at: 1,
+                                expires_at: 10,
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            completeness: ClosureCompleteness::Complete,
+            resumed_visited: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn grant_expiry_drift_refuses_complete_receipt_and_resumed_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = bounded_grant_request()?;
+        let bounds = RevocationBounds::default_bounds();
+        let receipt = revoke_bounded(&request, &bounds)?;
+        receipt.verify_binding(&request, &bounds)?;
+        let limits = BoundedRevocationPageLimits {
+            max_page_edges: 1,
+            max_page_work: 3,
+        };
+        let page = revoke_bounded_page(&request, &bounds, limits)?;
+        assert!(!page.complete);
+        let continuation = page.continuation.as_ref().ok_or("missing continuation")?;
+        let token = page.continuation_token().ok_or("missing token")?;
+        for id in ["grant:root", "grant:child", "grant:leaf"] {
+            for change_issue_time in [false, true] {
+                let mut changed = request.clone();
+                let interval = changed
+                    .grant_validity
+                    .as_mut()
+                    .and_then(|validity| validity.get_mut(id))
+                    .ok_or("missing grant")?;
+                if change_issue_time {
+                    interval.issued_at = 2;
+                } else {
+                    interval.expires_at = 9;
+                }
+                assert_ne!(
+                    request.graph_snapshot_digest()?,
+                    changed.graph_snapshot_digest()?
+                );
+                assert_ne!(request.digest()?, changed.digest()?);
+                assert!(matches!(
+                    receipt.verify_binding(&changed, &bounds),
+                    Err(InfluenceError::OutcomeBindingMismatch(_))
+                ));
+                assert!(matches!(
+                    resume_bounded_revocation(&changed, continuation, token, &bounds, limits),
+                    Err(InfluenceError::ContinuationBindingMismatch)
+                ));
+            }
+        }
+        let mut reversed = request.clone();
+        reversed.edges.reverse();
+        assert_eq!(request.digest()?, reversed.digest()?);
+        let resumed = resume_bounded_revocation(&request, continuation, token, &bounds, limits)?;
+        resumed.verify_binding(&request, &bounds)?;
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_or_invalid_grant_validity_refuses_before_traversal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = bounded_grant_request()?;
+        let bounds = RevocationBounds::default_bounds();
+        let mut missing = request.clone();
+        missing
+            .grant_validity
+            .as_mut()
+            .ok_or("missing validity")?
+            .remove("grant:leaf");
+        let mut invalid = request.clone();
+        invalid
+            .grant_validity
+            .as_mut()
+            .and_then(|map| map.get_mut("grant:child"))
+            .ok_or("missing child")?
+            .expires_at = 1;
+        let mut extra = request.clone();
+        extra
+            .grant_validity
+            .as_mut()
+            .ok_or("missing validity")?
+            .insert(
+                "grant:unrelated".to_owned(),
+                GrantValidityInterval {
+                    issued_at: 1,
+                    expires_at: 10,
+                },
+            );
+        for changed in [missing, invalid, extra] {
+            assert!(matches!(
+                revoke_bounded(&changed, &bounds),
+                Err(InfluenceError::InvalidRequest("grant_validity"))
+            ));
+        }
+        // Non-grant graphs carry no grant validity claim, and cannot share the
+        // operation identity of a qualified grant graph.
+        let mut non_grant = request.clone();
+        non_grant.grant_validity = None;
+        assert_ne!(request.digest()?, non_grant.digest()?);
+        assert!(revoke_bounded(&non_grant, &bounds)?.complete);
+        Ok(())
     }
 }

@@ -42,7 +42,8 @@ use crate::StoreError;
 /// `EVIDENCE_PACK_PAYLOAD_VERSION`. Version 2 rows carry the full
 /// producer-declared evidence coordinates (issue #2966, step 2); version 1
 /// rows carry none and are refused, never upgraded with defaults.
-pub const REVOCATION_HISTORY_PAYLOAD_VERSION: u32 = 2;
+/// Version 3 carries original member validity; legacy rows fail closed.
+pub const REVOCATION_HISTORY_PAYLOAD_VERSION: u32 = 3;
 
 /// Maximum revocation closures one history read may return.
 ///
@@ -131,6 +132,9 @@ pub enum RecordedRevocationDisposition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedRevocation {
+    /// Original owner-issued grant intervals, projected from the immutable commit.
+    pub grant_validity:
+        std::collections::BTreeMap<String, eliot_contracts::LogicalValidityInterval>,
     /// Stable closure identity from the recording mutation.
     pub closure_id: String,
     /// Revoked origin named by the closure.
