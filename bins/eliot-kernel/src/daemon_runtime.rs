@@ -3823,7 +3823,11 @@ mod daemon_manifest_restart_admission_tests {
 /// OBSERVATION, and LIVENESS is not READINESS.
 ///
 /// Doc anchors, CONDENSED from the read fragments in
-/// `.eliot/docs-read-bundle-903.md` — the fragments' own line breaks are
+/// `.eliot/docs-read-bundle-903-fix.md` (read receipt
+/// sha256:19d9ee154718e6b96d75bd6dfeb024a57071fd9abafa5d67992d77099f87c73e; a copy
+/// sits beside this delivery as v2/issues/903/docs-read-bundle-903-fix.md, because
+/// `.eliot/` is gitignored and no reader or CI job can resolve a path in it) -
+/// the fragments' own line breaks are
 /// reflowed to fit a comment, their `→` glyphs are reproduced as they are
 /// spelled, and `...` marks fragment lines a quote skips:
 /// * I14.20: "Process liveness/readiness and capability-generation state
