@@ -1,0 +1,13 @@
+{
+  "bundle_hex": "5eedc0de5eedc0de5eedc0de5eedc0de5eedc0de5eedc0de5eedc0de5eedc0de",
+  "destination_authorization_hex": "00c0ffee00c0ffee",
+  "target_id": "synthetic-restore-target",
+  "target_lineage": "550e8400-e29b-41d4-a716-446655440000",
+  "target_sequence": 1,
+  "target_generation": 1,
+  "dest_store_id": "synthetic-isolated-dest-store",
+  "residency_denominator_digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "source_snapshot_digest": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "capture_operation_id": "synthetic-capture-operation",
+  "introductions": []
+}
