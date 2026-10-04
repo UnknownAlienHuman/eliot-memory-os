@@ -89,11 +89,13 @@
 //! a guard on release), while the fresh-write gate before the canonical apply
 //! consults the apply stage alone ([`RestoreEffectExposure::apply_stage`]) because
 //! the carrier stage is never answered from the apply's evidence: it is decided
-//! by its own exact readback, and there are exactly four such call sites —
+//! by its own exact readback, and there are exactly five such call sites —
 //! [`SurrealStoreAdapter::resolve_carrier_stage`] immediately before the
 //! publication it governs, the same bounded readback on the publication's own
-//! success/duplicate arm after the provider answered, and its refusal arm when the
-//! write was handed to the transport and did not answer. Relaxing any one of them
+//! success/duplicate arm after the provider answered, its refusal arm when the
+//! write was handed to the transport and did not answer, and the reconciliation
+//! [`carrier_publication_for`] attempts on the disposition that publishes no
+//! carrier row of its own. Relaxing any one of them
 //! therefore cannot silently relax another. A dropped future releases only its own
 //! incarnation while an effect that may already have been submitted stays an
 //! exact-reconciliation obligation on that stage alone.
@@ -3484,8 +3486,9 @@ fn check_cancellation(
     Err(StoreError::Unavailable)
 }
 
-/// Reports whether a purge disposition that publishes no carrier row must still
-/// refuse this operation, because the carrier stage of its slot is still owed.
+/// Reports whether a purge disposition that publishes no carrier row must first
+/// reconcile the carrier stage its slot still owes, before this operation may
+/// proceed at all.
 ///
 /// `scope_disposition` is what [`decide_purge`] decided from the *current*
 /// purge-ledger readback, and that readback happens on every invocation, so one
@@ -3497,39 +3500,54 @@ fn check_cancellation(
 /// stage by bounded exact carrier readback and, on an absent row, authorises the
 /// same-identity carrier retry the card names.
 ///
-/// Every other disposition publishes no carrier row and therefore reads none
-/// back, so nothing on that path can discharge the stage: the standing obligation
-/// has no evidence either way, and the only writer that can discharge it is an
-/// invocation whose own exact readback proves the rows. This is the card clause
-/// "carrier unknown -> block only until carrier reconciliation", and the refusal
-/// it produces is the one [`publish_archive_member_carriers`] already returns for
-/// exactly this state — its `CarrierVerification::NotApplied` arm answers
+/// Every other disposition publishes no carrier row *of its own*, so this
+/// invocation makes no carrier write whose outcome it could be waiting for. That
+/// is not the same as the standing obligation being undecidable: the write an
+/// earlier incarnation of this same identity handed to the provider is still
+/// settled by this operation's own rows, and reading them back is a read, not a
+/// second effect. So this predicate is the card clause
+/// "carrier unknown -> block only until carrier reconciliation" read as a gate on
+/// reconciliation rather than as a permanent refusal, and
+/// [`carrier_publication_for`] is where that reconciliation is attempted before
+/// anything refuses. The refusal that survives it is the one
+/// [`publish_archive_member_carriers`] already returns for exactly this state —
+/// its `CarrierVerification::NotApplied` arm answers
 /// `unknown_outcome(batch.operation.operation_id.as_str())` — and the one
 /// [`check_cancellation`] returns while either stage owes a reconciliation.
-/// Inherited uncertainty is never reset by an invocation that has not written.
+/// Inherited uncertainty is never reset by an invocation that has not written:
+/// the reconciliation can raise the stage only on its own exact readback, and a
+/// verdict that proves nothing leaves it precisely where it was.
 ///
 /// Every other decision is preserved: the purge reading, the disposition
 /// mapping and the commit below are untouched, nothing is published and nothing
 /// is written, and the refusal is the same typed value the carrier publication
 /// already returns for an unproven write.
 ///
-/// The exits are exactly these two, and there is no third:
+/// The exits are exactly these four, and there is no fifth:
 ///
-/// 1. a later invocation of the same identity reads a disposition whose subject
+/// 1. the bounded exact carrier readback over this operation's own rows proves
+///    every one of them, which discharges the stage through the existing
+///    [`RestoreEffectExposure::note_carrier_verified`] and lets this identity
+///    proceed;
+/// 2. that same readback finds an absent row — [`CarrierVerification::NotApplied`]
+///    — which answers `unknown_outcome` and leaves the stage unproven and owed;
+/// 3. that same readback finds a divergent row, which is the existing typed
+///    [`StoreError::IdentityConflict`] that readback already returns; and
+/// 4. a later invocation of the same identity reads a disposition whose subject
 ///    may be served again — a cleared ledger decides
 ///    [`MemberDisposition::Restored`], which reaches
-///    [`SurrealStoreAdapter::resolve_carrier_stage`] and its bounded exact
-///    carrier readback; and
-/// 2. that same `Restored` readback, when it proves the carriers, discharges
-///    the stage and authorises the same-identity carrier retry.
+///    [`SurrealStoreAdapter::resolve_carrier_stage`]; and its bounded exact
+///    carrier readback, when it proves the carriers, discharges the stage and
+///    authorises the same-identity carrier retry.
 ///
-/// There is deliberately **no** exit for a subject that must never become
-/// servable again. While the ledger keeps the member scope out of the
-/// destination, no carrier row can be published, none can be read back, and so
-/// the stage cannot be proved: for that subject this refusal is not bounded by
-/// anything this process controls, and nothing here claims a bound it cannot
-/// show. The block stops the operation from committing; it does not promise that
-/// the obligation ever clears on its own.
+/// Exit 1 is bounded by the same thing every other exit is: the rows are read
+/// back under this operation's own key, so a subject the current ledger keeps out
+/// of the destination is proved only by rows this operation itself published.
+/// Nothing here claims that an obligation always clears — a subject that must
+/// never become servable again has no row to prove and no row to publish, so for
+/// it the readback answers [`CarrierVerification::NotApplied`] every time and the
+/// refusal stands until the ledger changes. The block stops the operation from
+/// committing; it does not promise that the obligation ever clears on its own.
 ///
 /// In particular [`SurrealStoreAdapter::reconcile_operation`] is **not** one of
 /// the exits, and it is named here so the next reader does not assume otherwise.
@@ -3539,10 +3557,11 @@ fn check_cancellation(
 /// `attempt.effect_state.apply = attempt.effect_state.apply.max(provider_state)`
 /// assignment plus the lock and the missing-attempt early return. There is no
 /// carrier projection there or anywhere else: the carrier stage is raised only
-/// by [`RestoreEffectExposure::note_carrier_verified`], and its only two
-/// production call sites are the bounded exact carrier readbacks in
-/// [`publish_archive_member_carriers`] and
-/// [`SurrealStoreAdapter::resolve_carrier_stage`]. A committed canonical import
+/// by [`RestoreEffectExposure::note_carrier_verified`], and its only production
+/// call sites are the bounded exact carrier readbacks in
+/// [`publish_archive_member_carriers`],
+/// [`SurrealStoreAdapter::resolve_carrier_stage`] and
+/// [`carrier_publication_after_reconciliation`]. A committed canonical import
 /// is not evidence that the carrier publication happened exactly once, so
 /// [`project_provider_apply_state`] cannot answer this predicate.
 fn purge_disposition_blocks_on_unproven_carrier(
@@ -3553,36 +3572,104 @@ fn purge_disposition_blocks_on_unproven_carrier(
 }
 
 /// Decides the published carrier set for the disposition that publishes no
-/// carrier row.
+/// carrier row of its own.
 ///
 /// This is the whole non-`Restored` arm of the `let published` decision in
 /// [`SurrealStoreAdapter::apply_canonical_batch`], hoisted out so that decision
-/// is executable without a live provider. It has exactly one production caller,
-/// [`SurrealStoreAdapter::apply_canonical_batch`], and it does one thing:
+/// is reachable from one place. It has exactly one production caller,
+/// [`SurrealStoreAdapter::apply_canonical_batch`], and it does three things:
 ///
 /// - it asks the one closed predicate
-///   [`purge_disposition_blocks_on_unproven_carrier`], unchanged; and
-/// - on an answer of "blocks", it returns that predicate's refusal — the
-///   existing typed [`StoreError::UnknownOutcome`] built by [`unknown_outcome`]
-///   over this operation's own identity. No new error variant, no new reason
-///   string and no new mechanism is introduced here; the value is byte-for-byte
-///   the one [`publish_archive_member_carriers`]'s `NotApplied` arm and
-///   [`check_cancellation`] already return for an unproven carrier write.
+///   [`purge_disposition_blocks_on_unproven_carrier`], unchanged;
+/// - when that predicate answers "blocks", it *attempts the reconciliation* the
+///   card clause requires — "carrier unknown -> block only until carrier
+///   reconciliation" is honoured by trying, not by skipping — and the readback's
+///   own verdict decides, through
+///   [`carrier_publication_after_reconciliation`]. No new error variant, no new
+///   reason string and no new mechanism is introduced here: the refusal that
+///   survives is byte-for-byte the one [`publish_archive_member_carriers`]'s
+///   `NotApplied` arm and [`check_cancellation`] already return for an unproven
+///   carrier write;
 /// - otherwise it returns an empty published set, because a disposition other
 ///   than [`MemberDisposition::Restored`] has no carrier row to publish.
 ///
-/// `operation_id` is a parameter rather than read from the exposure because the
-/// refusal must name the operation that is being refused, and the exposure
-/// carries no identity: it is a pair of stages and nothing else.
-fn carrier_publication_for(
+/// The reconciliation is the production one, used unchanged.
+/// [`intended_archive_member_carriers`] derives the intended set from the
+/// admitted batch alone — the members, their retained references and the state
+/// fence, no write and no provider call — and
+/// [`verify_archive_member_carriers`] reads that set back through
+/// [`read_archive_member`], whose fixed label
+/// [`crate::client::RESTORE_OPERATION_ARCHIVE_MEMBERS`] is already one of the
+/// entries `crate::client::validate_restore_operation` admits through the closed
+/// `crate::client::RESTORE_PROVIDER_OBSERVATIONS` slice, so this arm needs no new
+/// pinned write, no new operation vocabulary entry and no card amendment. The
+/// readback is bounded by the same [`MAX_RESTORE_BATCH_MEMBERS`] members the
+/// admission already capped, and it performs no provider write of any kind.
+///
+/// An intended set this operation cannot express, or an empty one, is not
+/// verification. [`publish_archive_member_carriers`] already refuses to read an
+/// empty published set as a proved stage ("there was nothing to publish"), so
+/// both cases keep the refusal instead of raising the stage on no evidence at
+/// all.
+async fn carrier_publication_for(
+    transport: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    batch: &CanonicalRestoreBatch,
+    state_fence: &StateFence,
     scope_disposition: MemberDisposition,
-    exposure: RestoreEffectExposure,
-    operation_id: &str,
+    exposure: &mut RestoreEffectExposure,
 ) -> Result<Vec<PublishedCarrier>, StoreError> {
-    if purge_disposition_blocks_on_unproven_carrier(scope_disposition, exposure) {
+    if !purge_disposition_blocks_on_unproven_carrier(scope_disposition, *exposure) {
+        return Ok(Vec::new());
+    }
+    let operation_id = batch.operation.operation_id.as_str();
+    let Ok(intended) = intended_archive_member_carriers(batch, state_fence) else {
+        return Err(unknown_outcome(operation_id));
+    };
+    if intended.is_empty() {
         return Err(unknown_outcome(operation_id));
     }
-    Ok(Vec::new())
+    // The readback's verdicts are its own: a divergent row arrives here as the
+    // typed `IdentityConflict` `verify_archive_member_carriers` already returns,
+    // and never as an absence.
+    let verification = verify_archive_member_carriers(transport, config, batch, &intended).await?;
+    carrier_publication_after_reconciliation(&verification, exposure, operation_id)
+}
+
+/// Turns one carrier reconciliation verdict into this arm's answer.
+///
+/// Provider-free and total over [`CarrierVerification`]'s two variants, so the
+/// half of the arm's decision that follows the readback stays executable without
+/// a provider, while the read that produces the verdict stays exactly the
+/// production one. It has exactly one production caller,
+/// [`carrier_publication_for`].
+///
+/// A proved set raises the stage through the same
+/// [`RestoreEffectExposure::note_carrier_verified`] every other carrier readback
+/// uses and then returns an empty published set: this member's payload is purged,
+/// so nothing is published — which is the rule [`publish_archive_member_carriers`]
+/// states for a member the current purge ledger keeps out of the destination,
+/// because it is never imported either.
+///
+/// An absent row is not a licence to write: the stage stays unproven, no second
+/// publication is started, no success is reported, and the answer is the typed
+/// unknown outcome rather than the transport-level refusal that reached this
+/// arm.
+///
+/// `operation_id` is a parameter rather than read from the exposure because the
+/// exposure carries no identity: it is a pair of stages and nothing else.
+fn carrier_publication_after_reconciliation(
+    verification: &CarrierVerification,
+    exposure: &mut RestoreEffectExposure,
+    operation_id: &str,
+) -> Result<Vec<PublishedCarrier>, StoreError> {
+    match verification {
+        CarrierVerification::Verified => {
+            exposure.note_carrier_verified();
+            Ok(Vec::new())
+        }
+        CarrierVerification::NotApplied => Err(unknown_outcome(operation_id)),
+    }
 }
 
 /// Verifies the expected-state identity: every expected head must carry the
@@ -4810,23 +4897,20 @@ impl SurrealStoreAdapter {
                 }
             }
         } else {
-            // A disposition that publishes no carrier row also reads none back,
-            // so nothing below this branch can discharge an inherited carrier
-            // stage, and the canonical apply below would commit while that
-            // obligation is still open — a schedule the create-only carrier key
-            // and the destination's bookkeeping rows can never settle, because
-            // the ledger that suppressed the member scope can keep the carrier
-            // unprovable for as long as it stays suppressed. The disposition is
-            // re-read on every invocation, so it can differ between two of them
-            // for one identity; the slot's carrier stage cannot. This branch
-            // therefore asks the carrier stage the question the publication
-            // branch answers by readback, and refuses with that branch's own
-            // typed outcome when the answer is "unproven": the card clause
-            // "carrier unknown -> block only until carrier reconciliation", and
-            // the DONE clause "inherited uncertainty is never reset by an
-            // invocation that has not written". A carrier stage that is proved,
-            // or that was never submitted, is untouched here — only the unproven
-            // case waits, and it waits without writing anything.
+            // A disposition that publishes no carrier row of its own also writes
+            // none, so nothing below this branch commits canonical data — but the
+            // carrier stage an earlier incarnation of this same identity may have
+            // left unproven is still owed, and what settles it is this
+            // operation's own carrier rows, read back exactly, not an assumption
+            // about them. The disposition is re-read on every invocation, so it
+            // can differ between two of them for one identity; the slot's carrier
+            // stage cannot. This branch therefore performs the bounded exact
+            // carrier reconciliation the card clause requires: "carrier unknown ->
+            // block only until carrier reconciliation" bounds the refusal to what
+            // the readback could not discharge, it does not forbid the readback.
+            // Only an absent row, or an intended set with no row in it, still
+            // refuses here; a divergent row is the typed conflict that readback
+            // already returns.
             //
             // The whole arm is one call to [`carrier_publication_for`], which
             // owns that decision and refuses with the same typed value the
@@ -4834,10 +4918,14 @@ impl SurrealStoreAdapter {
             // caller of that helper, so this arm cannot grow a second path
             // around it.
             carrier_publication_for(
+                transport,
+                &self.config,
+                batch,
+                &ctx.state_fence,
                 scope_disposition,
-                *exposure,
-                batch.operation.operation_id.as_str(),
-            )?
+                exposure,
+            )
+            .await?
         };
         let resolved = resolve_archive_members(transport, &self.config, batch).await?;
         let imports: Vec<&ResolvedArchiveMember> = if scope_disposition
@@ -7637,27 +7725,35 @@ mod tests {
         }
     }
 
-    // WORK_UNIT_CASE: 2666/18 — the readback's content half is the whole-value
-    // comparison, and the identity comparator cannot stand in for it.
+    // WORK_UNIT_CASE: 2666/18 — the four content fields participate in the derived
+    // equality of `ArchiveMemberCarrier`, and `carrier_answers_for` reads none of
+    // them.
     //
-    // The production expression pinned here is `if existing != entry.carrier`
-    // (:2838) inside `verify_archive_member_carriers`: `entry` is one
-    // `PublishedCarrier` of the intended set and `existing` is what
-    // `read_archive_member` returned for that member, so the equality that turns a
-    // publication into a verified one is `PartialEq` over the whole
-    // `ArchiveMemberCarrier` — payload, payload digest, class and destination
-    // address included. `carrier_answers_for` deliberately says nothing about any
-    // of those four, which this case demonstrates rather than assumes: each
-    // content mutation below still passes the identity comparator and still fails
-    // the whole-value one.
+    // What this case proves, and only this, about the two facts it executes:
+    // `payload`, `payload_digest`, `class` and `record_id` each take part in the
+    // derived `PartialEq` for `ArchiveMemberCarrier` — a carrier that differs in
+    // any one of them compares unequal to the intended row — and the identity
+    // comparator `carrier_answers_for` (:3113-3128), the comparator
+    // `read_archive_member` applies before it hands a row on at all, accepts all
+    // four divergences unchanged.
     //
-    // Measured sites: `existing != entry.carrier` at :2838; the four fields only it
-    // covers are the ones `carrier_for` sets at :3031-3035.
+    // What it does NOT prove, and must not be read as proving: that the
+    // production readback rejects such a row. `verify_archive_member_carriers`
+    // (:2827) is `async` over a live `&RpcTransport` and is never executed here,
+    // so the expression this case is written about — `if existing != entry.carrier`
+    // (:2838) — is neither run nor observable from these pure seams. Narrowing
+    // that production comparison to the identity facts, comparing
+    // `carrier_answers_for(existing, ..)` instead of the whole value, therefore
+    // leaves every assertion below passing, and this case says nothing about it.
     //
-    // The single mutation that would kill this case is narrowing that comparison
-    // to the identity facts — comparing `carrier_answers_for(existing, ..)`
-    // instead of the whole value — which makes every content assertion below fail
-    // on its `carrier_answers_for` clause.
+    // Measured sites: the derived `PartialEq` and the four fields it covers; the
+    // intended values are the ones `carrier_for` (:2984) builds at :3031-3035.
+    //
+    // The single mutation that would kill this case is a change to either of the
+    // two facts it does execute: dropping one of these four fields from the
+    // derived equality, which fails that field's `assert_ne!`, or giving
+    // `carrier_answers_for` a clause that reads one of them, which fails that
+    // field's `carrier_answers_for` assertion.
     #[test]
     fn the_readback_whole_value_comparison_rejects_a_content_the_identity_comparator_accepts() {
         let batch = carrier_batch("dest-carrier-content", "op-carrier-content", &["member-1"]);
@@ -7724,26 +7820,29 @@ mod tests {
         }
     }
 
-    // WORK_UNIT_CASE: 2666/19 — the basis the readback verifies is complete, and a
-    // divergence in a later row does not escape behind an earlier row's agreement.
+    // WORK_UNIT_CASE: 2666/19 — the intended set holds one row per importable
+    // member, in admitted order, and its two exclusions hold.
     //
-    // What this case does NOT claim, and why: `verify_archive_member_carriers`
-    // (:2827) is `async` over a live `&RpcTransport`, so its loop's *ordering*
-    // property — that it returns at the first absent or divergent row and never
-    // reads the rows after it, and that `CarrierVerification::Verified` is
-    // reachable only when every row agreed — cannot be observed without calling
-    // it, and no pure seam encodes it. Restating the loop here would be a mock of
-    // the function under proof, so it is not done. What IS observable on the pure
-    // seams is pinned here: the intended set holds a row for every importable
-    // member, so a set that is short is never a set that verifies; an importable
-    // member with no retained payload is refused typed instead of published as a
-    // short set; a reference edge is never published at all; and the comparison
-    // the loop applies per row is a whole-value one that a divergence in a later
-    // row does not survive by matching an earlier one.
+    // What this case proves, and only this: the basis the readback verifies is
+    // complete. The intended set holds exactly one row per importable member, in
+    // admitted order, so a set that silently omitted a member could never be a set
+    // that verifies; an importable member that retained no payload is refused
+    // typed rather than published as a short set; and a reference edge contributes
+    // no row at all.
     //
-    // Measured sites: the membership of the intended set and its two exclusions are
-    // `intended_archive_member_carriers` (:2756-2788); the per-row comparison is
-    // `existing != entry.carrier` (:2838), the same expression case 2666/18 pins.
+    // What it does NOT prove, and must not be read as proving: anything at all
+    // about the readback loop. `verify_archive_member_carriers` (:2827) is `async`
+    // over a live `&RpcTransport` and is never executed here, so its *ordering*
+    // property — that it returns at the first absent or divergent row, never reads
+    // the rows after it, and can answer [`CarrierVerification::Verified`] only
+    // when every row agreed — is unobservable from these pure seams. Restating the
+    // loop here would be a mock of the function under proof, so it is not done.
+    // In particular no claim is made that "a later row still diverges": the
+    // divergence asserted below compares a mutated row against that row's own
+    // intended value, and row 0 never participates in it.
+    //
+    // Measured sites: the membership of the intended set and its two exclusions
+    // are `intended_archive_member_carriers` (:2756-2788).
     //
     // The single mutation that would kill this case is building the intended set
     // from the batch's declared count instead of from its admitted members — or
@@ -7780,9 +7879,12 @@ mod tests {
             );
         }
 
-        // The earlier row agrees exactly while the later one carries other content:
-        // `existing != entry.carrier` is false for the first row and true for the
-        // second, so agreeing on one row can never stand in for the whole set.
+        // What this block establishes, and no more: each row of the intended set is
+        // the value its own member publishes, and a carrier differing in one row's
+        // payload is unequal to that row's own intended value. Row 0 is paired and
+        // equal here; it is never compared against row 1's mutated value, so
+        // nothing below observes how the readback loop would treat two rows at
+        // once. See the marker comment.
         let first_row_intended =
             carrier_for(&batch, &published[0].member, &batch.retained_members[0])
                 .expect("the first member's own retained payload publishes a carrier");
@@ -7913,11 +8015,12 @@ mod tests {
     // `Restored` branch, while `decide_purge` re-reads the CURRENT purge ledger on
     // every invocation, so one operation identity could reach the canonical apply
     // under `Suppressed`/`Unresolved` with a carrier stage an earlier incarnation
-    // had left unproven. Nothing on that path publishes or reads a carrier row, so
-    // the obligation could never be discharged, and `release` (:1538
-    // `!merged.any_unproven()`) can never evict a slot that still carries one: the
-    // identity stays occupied for as long as the ledger keeps the member scope out
-    // of the destination.
+    // had left unproven. Nothing on that path publishes a carrier row, so the
+    // obligation could not be discharged by a write of its own, and `release`
+    // (:1540 `!merged.any_unproven()`) can never evict a slot that still carries
+    // one. What discharges it is the bounded exact carrier readback this arm now
+    // attempts, and a subject the ledger keeps out of the destination has no row
+    // to prove, so for it the refusal stands until the ledger changes.
     //
     // What this case executes: the real guard lifecycle that produces the inherited
     // exposure (`RestoreAttemptGuard::acquire` / `Drop` -> `release`), the real
@@ -7926,45 +8029,47 @@ mod tests {
     // retention predicate.
     //
     // The wiring is asserted BEHAVIOURALLY, not over this file's bytes. The
-    // non-`Restored` arm of `apply_canonical_batch` was hoisted verbatim into the
-    // pure production helper `carrier_publication_for` (:3577), whose single
-    // production caller is that arm (:4836); the case calls the same helper and
-    // asserts, for the disposition/exposure pairs the real ledger reading
-    // produces, exactly what the arm would therefore do. The mutation this case
-    // kills is a `carrier_publication_for` body that returns `Ok(Vec::new())`
-    // where it must return the typed refusal — replacing the refusal with an
-    // empty published set, or exempting `Suppressed`/`Unresolved` from the
-    // predicate, or swapping the predicate for one that ignores the carrier stage
-    // — because the first assertion below executes that body and would observe
-    // `Ok` instead of the `UnknownOutcome` naming this operation. An earlier
-    // revision of this case asserted the same wiring by reading this file's own
-    // text with `include_str!`; that assertion proved nothing, because
+    // non-`Restored` arm of `apply_canonical_batch` is one call to the production
+    // helper `carrier_publication_for`, whose single production caller is that
+    // arm; the helper is now `async` because it performs the bounded exact carrier
+    // reconciliation, so this case executes the two provider-free halves the
+    // helper is made of — the closed predicate it consults, and
+    // `carrier_publication_after_reconciliation`, the verdict-to-answer mapping
+    // with exactly one production caller, the helper itself — over the same
+    // inherited exposure the arm would be handed. The mutations this case kills
+    // are a helper or a mapping that answers `Ok(Vec::new())` where it must refuse
+    // — replacing the refusal with an empty published set, exempting
+    // `Suppressed`/`Unresolved` from the predicate, swapping the predicate for one
+    // that ignores the carrier stage, or mapping `NotApplied` to `Ok` — because
+    // the assertions below execute those bodies and would observe `Ok` instead of
+    // the `UnknownOutcome` naming this operation, or a carrier stage left unproven.
+    // An earlier revision of this case asserted the same wiring by reading this
+    // file's own text with `include_str!`; that assertion proved nothing, because
     // `std::hint::black_box(false) && …` around the call, naming the predicate in
     // the arm's prose comment, or an earlier duplicate of the predicate's
     // signature would all have kept every asserted byte and its ordering, so it
     // was deleted rather than patched.
     //
-    // What it does NOT cover, and does not claim: `apply_canonical_batch` is
-    // `async` over a live `&RpcTransport` obtained from `restore_transport(self)`
-    // (:4624), so whether the arm is *reached* on any given invocation — and the
-    // provider calls that would follow it — cannot be observed here without a
-    // provider; the card assigns those poll/drop proofs to the assembled-product
-    // test phase. Removing the `carrier_publication_for` call from the arm
-    // altogether is likewise not observable from here, because the helper is
-    // pure and has no side channel back into this test; what bounds that risk is
-    // the structural one, that the helper has exactly one production caller and
-    // therefore cannot be inlined away, skipped, or given a second path around
-    // it without that caller changing. No boundedness is claimed for a subject
-    // that must never become servable again: no carrier row can be published or
-    // read back for it, so the refusal for that subject is not bounded by
-    // anything this process controls.
+    // What it does NOT cover, and does not claim: `apply_canonical_batch`,
+    // `carrier_publication_for` and `verify_archive_member_carriers` are all
+    // `async` over a live `&RpcTransport` obtained from `restore_transport(self)`,
+    // so whether the arm is *reached* on any given invocation — and whether the
+    // reconciliation it now attempts answers `Verified`, `NotApplied` or a
+    // conflict against a real provider — cannot be observed here; the card assigns
+    // those poll/drop proofs to the assembled-product test phase. The verdicts
+    // below are therefore supplied to the production mapping, never obtained from
+    // a readback. Removing the `carrier_publication_for` call from the arm
+    // altogether is likewise not observable from here; what bounds that risk is
+    // the structural one, that the helper and the mapping each have exactly one
+    // production caller and therefore cannot be inlined away, skipped, or given a
+    // second path around them without that caller changing.
     //
-    // Measured sites: the hoisted arm at :4836 inside the `let published = if
-    // scope_disposition == MemberDisposition::Restored` arm (:4771); the helper at
-    // :3577; the predicate it consults at :3548; the refusal it shares with the
-    // carrier publication's `NotApplied` arm (:2945) and with `check_cancellation`
-    // (:3479); the apply-stage gate at :4691 that does NOT answer this schedule;
-    // the retention predicate at :1538.
+    // Measured sites: the hoisted arm inside the `let published = if
+    // scope_disposition == MemberDisposition::Restored` arm; the helper and the
+    // mapping it alone calls; the predicate it consults; the refusal it shares
+    // with the carrier publication's `NotApplied` arm and with
+    // `check_cancellation`; the apply-stage gate that does NOT answer this
+    // schedule; the retention predicate in `RestoreAttemptGuard::release`.
     #[test]
     fn a_suppressed_disposition_blocks_on_an_inherited_unproven_carrier_stage() {
         let _serial = ledger_serial();
@@ -8031,9 +8136,9 @@ mod tests {
         for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
             assert!(
                 purge_disposition_blocks_on_unproven_carrier(suppressed, exact.exposure),
-                "{suppressed:?} publishes no carrier row and reads none back, so an \
-                 inherited unproven carrier stage must wait for carrier \
-                 reconciliation instead of riding into the canonical apply"
+                "{suppressed:?} publishes no carrier row of its own, so an inherited \
+                 unproven carrier stage must first be reconciled by the bounded exact \
+                 readback instead of riding into the canonical apply"
             );
         }
         assert!(
@@ -8056,22 +8161,27 @@ mod tests {
         // The wiring itself, executed rather than asserted over this file's bytes.
         //
         // The non-`Restored` arm of `apply_canonical_batch` is exactly one call to
-        // `carrier_publication_for`, hoisted out of the `async` function for that
-        // reason, and that helper has no other production caller. Calling it here
-        // therefore asserts what the arm does, over the same inherited exposure the
-        // arm would be handed, instead of restating the arm as a mock of itself.
+        // `carrier_publication_for`, and that helper has no other production caller.
+        // The helper is `async` because it attempts the bounded exact carrier
+        // reconciliation, so what this block executes is the two provider-free
+        // halves it is made of — the closed predicate and
+        // `carrier_publication_after_reconciliation`, the verdict-to-answer mapping
+        // the helper alone calls — over the same inherited exposure the arm would
+        // be handed.
         //
-        // The mutation this kills is a `carrier_publication_for` body that answers
+        // The mutations this kills are a helper or a mapping that answers
         // `Ok(Vec::new())` where it must refuse: the refusal replaced by an empty
-        // published set, `Suppressed`/`Unresolved` exempted from the predicate, or
-        // a predicate swapped for one that ignores the carrier stage. Every such
-        // mutation leaves the predicate assertions above passing, and this block
-        // observes `Ok` where it requires the typed `UnknownOutcome` naming this
-        // operation. It reads no source text, so `std::hint::black_box(false) && …`
-        // around the production call, the predicate's name appearing in the arm's
-        // prose comment, and an earlier duplicate of the predicate's signature all
-        // fail to affect it. What it cannot observe is the arm's *reachability* on
-        // a live provider — see the marker comment above.
+        // published set, `Suppressed`/`Unresolved` exempted from the predicate, a
+        // predicate swapped for one that ignores the carrier stage, or
+        // `NotApplied` mapped to `Ok`. Every such mutation leaves the predicate
+        // assertions above passing, and this block observes `Ok` where it requires
+        // the typed `UnknownOutcome` naming this operation, or a carrier stage
+        // raised where it must stay unproven. It reads no source text, so
+        // `std::hint::black_box(false) && …` around a production call, the
+        // predicate's name appearing in the arm's prose comment, and an earlier
+        // duplicate of the predicate's signature all fail to affect it. What it
+        // cannot observe is the arm's *reachability* on a live provider, nor the
+        // readback that produces the verdict — see the marker comment above.
         let inherited = exact.exposure;
         carrier_publication_arm_decides_by_disposition_and_stage(inherited, operation_id);
 
@@ -8100,44 +8210,88 @@ mod tests {
         forget_slot(&batch, &config);
     }
 
-    /// The production `carrier_publication_for` truth table, executed. Each arm
-    /// observes a value the production helper returns, so a helper that answers
-    /// `Ok` where it must refuse, dispositions exempted from the predicate, or a
-    /// predicate that ignores the carrier stage all fail here. It reads no source
-    /// text, so a `black_box(false) &&` conjunct around the production call cannot
-    /// hide from it. What it cannot observe is the arm's reachability on a live
-    /// provider; see the marker comment.
+    /// The production `carrier_publication_for` decision table, executed at the two
+    /// provider-free halves that helper is made of. The arm consults the closed
+    /// predicate and, when that predicate blocks, turns the bounded exact carrier
+    /// reconciliation's own verdict into its answer; both halves have exactly one
+    /// production caller each (the helper, and the arm for the helper). This
+    /// executes both over the same inherited exposure the arm would be handed, so
+    /// a predicate that ignores the carrier stage, a mapping that answers `Ok`
+    /// where it must refuse, and a `NotApplied` mapped to `Ok` all fail here.
+    ///
+    /// It reads no source text, so a `black_box(false) &&` conjunct around a
+    /// production call cannot hide from it. What it cannot observe is the arm's
+    /// reachability on a live provider, nor the readback that produces the verdict
+    /// it supplies here; see the marker comment.
     fn carrier_publication_arm_decides_by_disposition_and_stage(
         inherited: RestoreEffectExposure,
         operation_id: &str,
     ) {
         for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
-            match carrier_publication_for(suppressed, inherited, operation_id) {
+            assert!(
+                purge_disposition_blocks_on_unproven_carrier(suppressed, inherited),
+                "{suppressed:?} owes a carrier reconciliation, so the arm must reach \
+                 the bounded exact readback before it may proceed"
+            );
+            // An absent row is what the readback reports about that create-only
+            // transaction, and it discharges nothing.
+            let mut after_absence = inherited;
+            match carrier_publication_after_reconciliation(
+                &CarrierVerification::NotApplied,
+                &mut after_absence,
+                operation_id,
+            ) {
                 Err(refusal) => assert!(
                     matches!(
                         refusal,
                         StoreError::UnknownOutcome { operation_id: reported }
                             if reported.as_str() == operation_id
                     ),
-                    "the arm's refusal is the existing typed unknown outcome over this \
-                     operation identity — no new variant and no new reason string"
+                    "an absent carrier row leaves the arm's answer the existing typed \
+                     unknown outcome over this operation identity — no new variant and \
+                     no new reason string"
                 ),
                 Ok(_) => panic!(
-                    "{suppressed:?} owes a carrier reconciliation, so the arm must refuse \
-                     instead of returning a carrier set"
+                    "{suppressed:?} owes a carrier reconciliation that an absent row \
+                     cannot discharge, so the arm must refuse instead of returning a \
+                     carrier set"
                 ),
             }
+            assert!(
+                after_absence.carrier_stage().is_unproven(),
+                "a refused reconciliation leaves the carrier stage exactly where it \
+                 was: inherited uncertainty is never reset by an invocation that has \
+                 not written"
+            );
+            // Every row present and equal to the intended carrier discharges the
+            // stage, and this disposition still publishes nothing of its own.
+            let mut after_proof = inherited;
+            let published = carrier_publication_after_reconciliation(
+                &CarrierVerification::Verified,
+                &mut after_proof,
+                operation_id,
+            )
+            .expect("a proved carrier reconciliation owes nothing, so the arm proceeds");
+            assert!(
+                published.is_empty(),
+                "{suppressed:?} publishes no carrier row of its own, so a proved stage \
+                 yields an empty set rather than a publication"
+            );
+            assert_eq!(
+                after_proof.carrier_stage(),
+                RestoreEffectState::DurableResultVerified,
+                "the exact readback raises the carrier stage through the same \
+                 `note_carrier_verified` every other carrier readback uses"
+            );
         }
-        // A `Restored` disposition never takes that refusal path here: it is decided
-        // by exact carrier readback in `resolve_carrier_stage`, and blocking it would
-        // close the same-identity carrier retry the card clause requires.
-        let restored =
-            carrier_publication_for(MemberDisposition::Restored, inherited, operation_id)
-                .expect("Restored is exempt from the carrier block and cannot refuse here");
+        // A `Restored` disposition never takes that path at all: it is decided by
+        // exact carrier readback in `resolve_carrier_stage`, and gating it here
+        // would close the same-identity carrier retry the card clause requires.
         assert!(
-            restored.is_empty(),
-            "and `Restored` publishes nothing through this path either: \
-             `carrier_publication_for` is only ever the non-Restored arm's set"
+            !purge_disposition_blocks_on_unproven_carrier(MemberDisposition::Restored, inherited),
+            "Restored is exempt from the carrier gate: it reaches \
+             `resolve_carrier_stage` and its bounded exact readback instead, so \
+             nothing here may close that path"
         );
 
         for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
@@ -8147,25 +8301,17 @@ mod tests {
                 apply: RestoreEffectState::NoWriteSubmitted,
             });
             proved.note_carrier_verified();
-            let published = carrier_publication_for(suppressed, proved, operation_id).expect(
-                "a proved carrier stage owes nothing, so the arm proceeds with an empty \
-                 published set rather than refusing",
-            );
             assert!(
-                published.is_empty(),
-                "{suppressed:?} publishes no carrier row of its own, so the set is empty \
-                 rather than refused"
+                !purge_disposition_blocks_on_unproven_carrier(suppressed, proved),
+                "a proved carrier stage owes nothing, so the arm proceeds with an \
+                 empty published set rather than reading anything back"
             );
             // A carrier stage that was never submitted at all.
             let never = RestoreEffectExposure::new(RestoreStageExposure::NONE);
-            let published = carrier_publication_for(suppressed, never, operation_id).expect(
-                "a slot that never submitted a carrier write owes nothing, so the arm \
-                 proceeds rather than refusing",
-            );
             assert!(
-                published.is_empty(),
-                "{suppressed:?} still publishes no carrier row, and an unproven stage it \
-                 never reached is not an obligation"
+                !purge_disposition_blocks_on_unproven_carrier(suppressed, never),
+                "a slot that never submitted a carrier write owes nothing, so the arm \
+                 proceeds rather than reading anything back"
             );
         }
     }
@@ -8217,5 +8363,275 @@ mod tests {
             "the refusal is not a receipt-envelope failure: nothing is missing, the \
              outcome is unknown"
         );
+    }
+
+    // WORK_UNIT_CASE: 2666/21 - a reconciliation that proved the carriers lifts the
+    // suppressed-disposition block for every inherited carrier stage.
+    //
+    // What this pins: the card clause "carrier unknown -> block only until carrier
+    // reconciliation" is only a bounded block if the reconciliation can end it. The
+    // non-`Restored` arm of `apply_canonical_batch` consults the closed predicate
+    // and, when that predicate answers "blocks", turns the bounded exact carrier
+    // readback's own verdict into its answer through
+    // `carrier_publication_after_reconciliation`. A proved set must therefore be an
+    // exit for EVERY stage an earlier incarnation could have left, not only for one
+    // hand-picked one, and the stage it leaves behind must be the production raise
+    // rather than a silent continuation.
+    //
+    // What this case executes: the real `RestoreEffectExposure` constructor, the
+    // real `note_carrier_verified` the reconciliation itself calls, the real
+    // closed predicate, and the real verdict-to-answer mapping this module's
+    // production helper alone calls. It asserts the returned `Result` and its exact
+    // value, so a mapping that refused on `Verified`, returned a non-empty carrier
+    // set, or skipped the raise fails here; and a predicate that blocked a proved
+    // carrier stage fails on the predicate assertion.
+    //
+    // What it does NOT cover, and does not claim: the reconciliation itself is
+    // `async` over a live `RpcTransport` inside the production helper, so NO case
+    // here executes a carrier readback — the `CarrierVerification` this case
+    // supplies to the production mapping is an input, never a result obtained from
+    // a provider. For the same reason the ordering property of
+    // `verify_archive_member_carriers` itself is deliberately NOT restated or
+    // mocked here: restating it would be asserting a copy of the function under
+    // proof rather than the function. Whether the arm reaches the readback on a
+    // live provider, and what a real readback answers, stay with the controlled
+    // poll/drop proofs the card assigns to the assembled-product test phase. The
+    // case name is not weakened to hide this: it claims the block is liftable once
+    // the reconciliation proves the carriers, and claims nothing about reaching it.
+    #[test]
+    fn a_proved_carrier_reconciliation_lifts_the_block_for_every_inherited_carrier_stage() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-carrier-reconciled", "install-carrier-reconciled");
+        let batch = scoped_batch("dest-carrier-reconciled", "op-carrier-reconciled");
+        forget_slot(&batch, &config);
+        let operation_id = batch.operation.operation_id.as_str();
+
+        // Every state the closed carrier stage can carry, including the two that
+        // keep the slot reconciliation-required and the two that do not.
+        let every_stage = [
+            RestoreEffectState::NoWriteSubmitted,
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            RestoreEffectState::ResponseObserved,
+            RestoreEffectState::DurableResultVerified,
+        ];
+        // The control every loop below is read against: an unproven carrier stage,
+        // which the predicate blocks for a suppressed disposition and never blocks
+        // for a restored one.
+        let unproven = RestoreEffectExposure::new(RestoreStageExposure {
+            carrier: RestoreEffectState::WriteMayHaveBeenSubmitted,
+            apply: RestoreEffectState::NoWriteSubmitted,
+        });
+        assert!(
+            unproven.carrier_stage().is_unproven(),
+            "the control exposure really does owe a carrier reconciliation, so the \
+             `Restored` answer below is a contrast and not a tautology"
+        );
+        assert!(
+            !purge_disposition_blocks_on_unproven_carrier(MemberDisposition::Restored, unproven),
+            "`Restored` reaches `resolve_carrier_stage` and its own readback, so the \
+             predicate must answer false for it even on this unproven exposure"
+        );
+
+        for stage in every_stage {
+            let was_unproven = stage.is_unproven();
+            assert_eq!(
+                was_unproven,
+                matches!(
+                    stage,
+                    RestoreEffectState::WriteMayHaveBeenSubmitted
+                        | RestoreEffectState::ResponseObserved
+                ),
+                "the sweep covers the whole closed stage enum, and only the two \
+                 intermediate states may keep the slot reconciliation-required"
+            );
+            let mut exposure = RestoreEffectExposure::new(RestoreStageExposure {
+                carrier: stage,
+                apply: RestoreEffectState::NoWriteSubmitted,
+            });
+            assert_eq!(
+                exposure.carrier_stage(),
+                stage,
+                "an invocation inherits exactly the carrier stage its predecessor left"
+            );
+            // The one raise the production reconciliation performs, applied here
+            // because the readback that would perform it needs a live provider.
+            exposure.note_carrier_verified();
+            assert_eq!(
+                exposure.carrier_stage(),
+                RestoreEffectState::DurableResultVerified,
+                "the production raise lifts every prior stage, including the two that \
+                 were unproven and the one that had submitted nothing at all"
+            );
+            assert!(
+                !exposure.carrier_stage().is_unproven(),
+                "after the raise the stage owes nothing whatever"
+            );
+
+            for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
+                assert!(
+                    !purge_disposition_blocks_on_unproven_carrier(suppressed, exposure),
+                    "{suppressed:?} with a stage an exact carrier readback already \
+                     proved owes nothing, so the block this case is about is lifted"
+                );
+                let published = carrier_publication_after_reconciliation(
+                    &CarrierVerification::Verified,
+                    &mut exposure,
+                    operation_id,
+                )
+                .expect(
+                    "a proved carrier reconciliation must not refuse: the block is \
+                     bounded by the reconciliation, and this is the reconciliation",
+                );
+                assert!(
+                    published.is_empty(),
+                    "{suppressed:?} publishes no carrier row of its own, so the \
+                     decision yields an empty published set and publishes nothing"
+                );
+                assert_eq!(
+                    exposure.carrier_stage(),
+                    RestoreEffectState::DurableResultVerified,
+                    "the decision raised the carrier stage and left it raised"
+                );
+            }
+        }
+
+        forget_slot(&batch, &config);
+    }
+
+    // WORK_UNIT_CASE: 2666/22 - an unproven carrier stage with no reconciliation
+    // still refuses, and refuses with this operation's own typed unknown outcome.
+    //
+    // What this pins: making the block reachable-for-lifting must not make it
+    // optional. An invocation that inherits an unproven carrier stage and whose
+    // reconciliation did not prove the rows still owes the obligation, still
+    // publishes nothing, and still answers the typed
+    // `StoreError::UnknownOutcome` over THIS operation identity — the card clause
+    // "carrier unknown -> block only until carrier reconciliation" forbids a second
+    // publication and forbids the fresh-write branch until the rows are read back.
+    //
+    // What this case executes: the real guard lifecycle that produces the inherited
+    // exposure (`RestoreAttemptGuard::acquire` / `Drop` -> `release`, plus the
+    // production pre-poll carrier mark), so the exposure is never hand-built here;
+    // the real closed predicate; the real verdict-to-answer mapping; and the real
+    // refusal value. It asserts the returned `Result` and its exact value, so a
+    // mapping that answered `Ok` for an absent row, or a different variant, or an
+    // operation id other than this one, fails here. The `Restored` contrast
+    // assertion is the control: the same predicate must answer `false` for
+    // `MemberDisposition::Restored` on that same unproven exposure, so this case
+    // cannot pass by a predicate that blocks everything.
+    //
+    // What it does NOT cover, and does not claim: the reconciliation itself is
+    // `async` over a live `RpcTransport` inside the production helper, so NO case
+    // here executes a carrier readback; `CarrierVerification::NotApplied` is
+    // supplied to the production mapping here, never obtained from a provider, and
+    // the ordering property of `verify_archive_member_carriers` is deliberately not
+    // restated or mocked here, because restating it would assert a copy of the
+    // function under proof rather than the function. Whether the arm reaches the
+    // readback on a live provider stays with the controlled poll/drop proofs the
+    // card assigns to the assembled-product test phase.
+    #[test]
+    fn an_unreconciled_carrier_stage_still_refuses_this_operations_typed_unknown() {
+        let _serial = ledger_serial();
+        let config = scoped_config("store-carrier-unreconciled", "install-carrier-unreconciled");
+        let batch = scoped_batch("dest-carrier-unreconciled", "op-carrier-unreconciled");
+        forget_slot(&batch, &config);
+        let operation_id = batch.operation.operation_id.as_str();
+
+        // An earlier incarnation handed the carrier publication to the provider and
+        // never learned what became of it, so this identity inherits an obligation.
+        abandoned_carrier_publication(&batch, &config);
+        let exact = acquire_guard(&batch, &config);
+        let inherited = exact.exposure;
+        assert!(
+            inherited.carrier_stage().is_unproven(),
+            "the inherited carrier stage is unproven, which is the only thing that \
+             could make the arm wait"
+        );
+
+        // The control: the same predicate, the same unproven exposure, and a
+        // disposition that reaches its own readback instead of this gate.
+        assert!(
+            !purge_disposition_blocks_on_unproven_carrier(MemberDisposition::Restored, inherited),
+            "`Restored` must never be blocked here: it reaches `resolve_carrier_stage` \
+             and the same-identity carrier retry the card clause requires"
+        );
+
+        for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
+            assert!(
+                purge_disposition_blocks_on_unproven_carrier(suppressed, inherited),
+                "{suppressed:?} publishes no carrier row of its own, so an inherited \
+                 unproven carrier stage is owed a reconciliation before the canonical \
+                 apply may run"
+            );
+            let mut exposure = inherited;
+            // `PublishedCarrier` carries no `Debug`, so the refusal is taken by
+            // `let...else` rather than `expect_err`.
+            let Err(refusal) = carrier_publication_after_reconciliation(
+                &CarrierVerification::NotApplied,
+                &mut exposure,
+                operation_id,
+            ) else {
+                panic!(
+                    "an absent carrier row discharges nothing, so the arm must refuse \
+                     instead of returning a carrier set"
+                );
+            };
+            assert!(
+                matches!(
+                    &refusal,
+                    StoreError::UnknownOutcome { operation_id: reported }
+                        if reported.as_str() == operation_id
+                ),
+                "the refusal is the existing typed unknown outcome over THIS \
+                 operation identity: no new variant, no new reason string, and never a \
+                 receipt for an effect nobody proved"
+            );
+            assert_eq!(
+                refusal,
+                unknown_outcome(operation_id),
+                "and it is byte-for-byte the value the carrier publication's \
+                 `NotApplied` arm and `check_cancellation` already return"
+            );
+            assert!(
+                exposure.carrier_stage().is_unproven(),
+                "a refused reconciliation leaves the carrier stage exactly where it \
+                 was: inherited uncertainty is never reset by an invocation that has \
+                 not written"
+            );
+
+            // The refusal is conditional on the verdict, not a constant answer: the
+            // same exposure with a proved set proceeds. Without this the case could
+            // not distinguish a real decision from a blanket refusal.
+            let mut proved = inherited;
+            let published = carrier_publication_after_reconciliation(
+                &CarrierVerification::Verified,
+                &mut proved,
+                operation_id,
+            )
+            .expect("the same exposure proceeds once the reconciliation proves the rows");
+            assert!(
+                published.is_empty(),
+                "and a proved reconciliation under {suppressed:?} still publishes no \
+                 carrier row of its own"
+            );
+        }
+
+        // The refused invocation wrote nothing, so the obligation it inherited must
+        // survive it untouched and keep the slot retained.
+        drop(exact);
+        let Some(after) = slot_for(&batch, &config) else {
+            panic!("the refused invocation must release only its local running owner")
+        };
+        assert_eq!(
+            after.effect_state.carrier,
+            RestoreEffectState::WriteMayHaveBeenSubmitted,
+            "the open obligation is exactly what it was before the refusal"
+        );
+        assert!(
+            after.effect_state.any_unproven(),
+            "which is what keeps the slot retained: the identity waits for carrier \
+             reconciliation and is never silently evicted"
+        );
+        forget_slot(&batch, &config);
     }
 }
