@@ -439,8 +439,11 @@ struct DrainRearmAttempt {
     drain_generation: EpochTransition,
     /// Owner census binding read at the re-arm boundary, never the caller's
     /// cached code: `idle:<owner-fence-digest>` over the exact `#1751`
-    /// `RuntimeLeaseCensus` fence that admitted this attempt, which the
-    /// retirement barrier revalidates before commit.
+    /// `RuntimeLeaseCensus` fence that admitted this attempt. The retirement
+    /// barrier revalidates that same fence only *after* the durable
+    /// `DrainCommit` exists, so it is post-commit by construction; the
+    /// pre-commit revalidation of this binding is
+    /// [`HostComposition::verify_drain_commit_census_binding`].
     census_binding: String,
     /// Record checksum of the re-armed `Requested` record itself. It is the
     /// value carried in the `Draining` continuation's
@@ -1254,9 +1257,14 @@ impl HostComposition {
         // `HostComposition::read_runtime_lease_census_for_activation` and
         // `HostComposition::require_generation_retirement_barrier`), digested
         // into the attempt identity and evidence — never a cached zero, a bare
-        // code, or a second Host-local counter. The barrier revalidates the
-        // same fence before commit, so new work is either included in that
-        // census or prevents the drain.
+        // code, or a second Host-local counter. The retirement barrier
+        // revalidates that same fence only *after* the durable `DrainCommit`
+        // exists (it refuses with "generation retirement has no durable
+        // DrainCommit" otherwise), so it cannot close the pre-commit gap; the
+        // re-proof that new work is either included in this census or prevents
+        // the drain is `HostComposition::verify_drain_commit_census_binding`,
+        // which re-reads the census and compares this binding at the commit
+        // boundary.
         let census_binding = format!(
             "idle:{}",
             sha256_json(&(
@@ -1270,8 +1278,10 @@ impl HostComposition {
         // consumed by this attempt (see `note_observable_use`) and keeps this
         // re-arm a pure function of durable state.
         let mut evidence_refs = vec![
-            PlatformHandle::new(format!("drain-rearm-predecessor:{predecessor_checksum}"))
-                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new(format!(
+                "{DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX}{predecessor_checksum}"
+            ))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
             PlatformHandle::new(census_binding.clone())
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         ];
@@ -1305,6 +1315,105 @@ impl HostComposition {
         self.append_record(HostStateRecord::Drain(requested))?;
         host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_REQUESTED);
         Ok(Some(attempt))
+    }
+
+    /// Re-proves the I1.5 idle condition at the drain COMMIT boundary.
+    ///
+    /// I1.5 "Idle drain": "Idle drain starts only when no `RuntimeLease` remains
+    /// and no valid `SupervisionLease` requires live sensing/containment", and
+    /// that ordered sequence places "when no data/maintenance lease remains" and
+    /// "when no `SupervisionLease` remains" *inside* it, before step 8 publishes
+    /// the clean shutdown manifest. I14.23 states the same boundary for the store
+    /// leg — "stop store only when no canonical data lease remains" — and makes
+    /// the `DrainCommitRecord` the linearization point: a wake/attach racing
+    /// shutdown "follows I1.5 `DrainCommitRecord`: before linearization it
+    /// cancels drain; afterward it waits for a fresh activation generation."
+    /// The drain condition must therefore still hold at the instant the
+    /// `DrainCommitRecord` append happens, which is exactly the boundary this
+    /// method guards.
+    ///
+    /// [`HostComposition::idle_lease_census`] proves the property once, at the
+    /// window-OPEN boundary, so an attempt that stays open across ticks could
+    /// otherwise reach the linearization point under a census that has since
+    /// moved — and while the activation is `Draining` the material-admission
+    /// guard does not refuse (it reads only process/pending state and never
+    /// `Draining`), so an authenticated trigger is the only thing that can still
+    /// close the window. This guard is that re-proof: it takes the same
+    /// owner-issued read through
+    /// `HostComposition::read_runtime_lease_census_for_activation` — the
+    /// exact-fence `#1751` `RuntimeLeaseCensus` the Kernel gate and
+    /// [`HostComposition::require_generation_retirement_barrier`] consume —
+    /// never the caller's cached census and never a second counter, and requires
+    /// it to be `Idle` and fully retired. The in-repo precedent for re-reading
+    /// and comparing owner state before authorizing a drain is the Kernel's
+    /// `drain_admission_coherence` (`bins/eliot-kernel/src/lib.rs`), which pairs
+    /// a double read with a fence/admission coherence comparison.
+    ///
+    /// The durable binding comparison is the second half. A re-armed attempt
+    /// records the exact census that admitted it, and this guard recomputes the
+    /// same binding from the fresh read and refuses unless the two agree. That
+    /// comparison is what stops a re-armed attempt from committing under a
+    /// census that moved after the re-arm admitted it: a legacy unfenced binding
+    /// proves no fence at all, and a durable binding that no longer matches
+    /// means the owner census the re-arm was admitted under is not the one in
+    /// force now. A first attempt carries no such binding, so the fresh `Idle`
+    /// and fully-retired census is its whole authority and no durable comparison
+    /// applies to it.
+    ///
+    /// Fail-closed (A0.3): stopping the contour is an irreversible effect, so a
+    /// busy census, an unestablished read, an absent record, an unparseable
+    /// binding or a moved census refuses the commit instead of publishing it.
+    /// F-LOG-HOST-1: the refusals name no identity, lease id, digest, path or
+    /// error text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::OwnerLeaseRecovery`] when the fresh census is not
+    /// `Idle` or is not fully retired, and [`HostError::RecoveryRequired`] when
+    /// the commit boundary has no activation or pre-commit drain record, or when
+    /// a re-armed attempt's durable census binding is legacy, unparseable, or no
+    /// longer equal to the recomputed binding.
+    pub fn verify_drain_commit_census_binding(&self) -> Result<(), HostError> {
+        let state = self.snapshot()?;
+        // A commit boundary without both records is not a lawful state: refuse
+        // instead of continuing on an unproven projection.
+        let _activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "drain commit boundary has no activation record; recovery required".to_owned(),
+            )
+        })?;
+        let drain = state.drain.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "drain commit boundary has no pre-commit drain record; recovery required"
+                    .to_owned(),
+            )
+        })?;
+        // One fresh owner read per commit decision: the caller must never reach
+        // this guard holding a cached census, and no second counter exists.
+        let census = self.idle_lease_census()?;
+        let IdleLeaseCensus::Idle { owner_census } = &census else {
+            return Err(HostError::OwnerLeaseRecovery(
+                "owner lease census is not idle at the drain commit boundary".to_owned(),
+            ));
+        };
+        if !owner_census.is_fully_retired() {
+            return Err(HostError::OwnerLeaseRecovery(
+                "owner lease census reports an unretired obligation at the drain commit boundary"
+                    .to_owned(),
+            ));
+        }
+        // Exactly the binding `rearm_cancelled_drain` writes, over exactly the
+        // same two census inputs. The digest inputs are deliberately narrow:
+        // widening them would stop every already-durable re-arm record from
+        // reconstructing its own operation identity.
+        let recomputed = format!(
+            "idle:{}",
+            sha256_json(&(
+                &owner_census.state_fence,
+                &owner_census.supervision_lease_id
+            ))?
+        );
+        verify_rearm_census_binding_at_commit(drain, &recomputed)
     }
 
     /// Appends the `Draining` continuation of a durable re-armed `Requested`
@@ -2088,6 +2197,17 @@ fn verify_drain_activation_binding(
     verify_drain_fence_binding(activation, drain)
 }
 
+/// Evidence marker that distinguishes a re-armed pre-commit drain attempt from
+/// a first attempt.
+///
+/// The re-arm writer stamps this prefix on the first evidence reference of both
+/// records of a re-armed attempt, and [`rearm_census_binding_from`] parses the
+/// layout it introduces. The commit-boundary discriminator
+/// ([`drain_is_rearmed_attempt`]) reads the same constant, so a record carrying
+/// this layout is always classified as a re-armed attempt and handed to that
+/// parser — never silently classified as a first attempt.
+const DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX: &str = "drain-rearm-predecessor:";
+
 /// Reads the owner census binding a durable re-armed `Requested` record was
 /// admitted under.
 ///
@@ -2111,7 +2231,7 @@ fn rearm_census_binding_from(requested: &DrainRecord) -> Result<String, HostErro
     })?;
     if !predecessor_ref
         .as_str()
-        .starts_with("drain-rearm-predecessor:")
+        .starts_with(DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX)
     {
         return Err(HostError::RecoveryRequired(
             "re-armed Requested record carries no predecessor evidence; recovery required"
@@ -2127,6 +2247,68 @@ fn rearm_census_binding_from(requested: &DrainRecord) -> Result<String, HostErro
                 .to_owned(),
         ))
     }
+}
+
+/// Whether one durable pre-commit drain record is a re-armed attempt.
+///
+/// The discriminator reads the same
+/// [`DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX`] marker
+/// [`rearm_census_binding_from`] parses, so the two agree by construction
+/// rather than as two independent copies of the layout spelling. A record that
+/// carries the marker but an unparseable binding is therefore classified as a
+/// re-armed attempt and refused by that parser, never admitted through the
+/// first-attempt verdict.
+fn drain_is_rearmed_attempt(drain: &DrainRecord) -> bool {
+    let Some(evidence) = drain.evidence_refs.first() else {
+        return false;
+    };
+    evidence
+        .as_str()
+        .starts_with(DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX)
+}
+
+/// Applies the commit-boundary census-binding decision to one durable
+/// pre-commit drain record against the binding recomputed from the fresh owner
+/// read.
+///
+/// A first attempt carries no re-arm evidence, so the fresh `Idle` and
+/// fully-retired census the caller already proved is its whole authority and no
+/// durable comparison applies. A re-armed attempt names the census that admitted
+/// it, and that recorded admission must still describe the same exact owner
+/// fence: a legacy bare binding proves no fence, and a binding that differs from
+/// the recomputed one means the census moved after the re-arm was admitted. Both
+/// refuse the commit rather than let the attempt close on a census that no
+/// longer supports it. The original recorded value is parsed with the existing
+/// [`rearm_census_binding_from`] and its refusal is propagated, never replaced by
+/// a recomputed digest.
+///
+/// # Errors
+///
+/// Returns [`HostError::RecoveryRequired`] when a re-armed attempt carries the
+/// legacy bare binding or a binding that differs from the recomputed one, and
+/// propagates the parser's own refusal for a record that carries the re-arm
+/// marker without a parseable census binding.
+fn verify_rearm_census_binding_at_commit(
+    drain: &DrainRecord,
+    recomputed: &str,
+) -> Result<(), HostError> {
+    if !drain_is_rearmed_attempt(drain) {
+        return Ok(());
+    }
+    let durable = rearm_census_binding_from(drain)?;
+    if durable == "idle" {
+        return Err(HostError::RecoveryRequired(
+            "re-armed attempt records the legacy unfenced census binding; recovery required"
+                .to_owned(),
+        ));
+    }
+    if durable != recomputed {
+        return Err(HostError::RecoveryRequired(
+            "owner lease census moved since the re-armed attempt was admitted; recovery required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn activation_admission_from(state: &HostState) -> Result<ActivationAdmission, HostError> {
@@ -2223,4 +2405,84 @@ fn unix_millis() -> Result<u64, HostError> {
             u64::try_from(elapsed.as_millis())
                 .map_err(|error| HostError::Platform(error.to_string()))
         })
+}
+
+/// Proof of the commit-boundary census-binding decision itself.
+///
+/// The decision is pure: one durable [`DrainRecord`] plus the binding recomputed
+/// from the fresh owner read. No journal root, no ORS read and no
+/// [`HostComposition`] fixture is involved, so these cases prove exactly the
+/// comparison and nothing about the read that produces `recomputed`.
+#[cfg(test)]
+mod tests {
+    use eliot_host_state::{
+        EpochLineageId, HostInstallationEpoch, IdempotencyIdentity, RecordFence,
+    };
+
+    use super::*;
+
+    /// A test handle with the same plain-factual failure mapping production uses.
+    fn handle(value: &str) -> Result<PlatformHandle, HostError> {
+        PlatformHandle::new(value).map_err(|error| HostError::Platform(error.to_string()))
+    }
+
+    /// One re-armed attempt's durable record, carrying exactly the evidence
+    /// layout [`HostComposition::rearm_cancelled_drain`] writes: the
+    /// [`DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX`] predecessor link first, then
+    /// the owner census binding this attempt was admitted under.
+    fn rearmed_attempt(census_binding: &str) -> Result<DrainRecord, HostError> {
+        let lineage = EpochLineageId::new("00000000-0000-4000-8000-000000000001")
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let activation_generation = EpochTransition::genesis(lineage);
+        let predecessor = "predecessor-checksum";
+        let predecessor_evidence =
+            format!("{DRAIN_REARM_PREDECESSOR_EVIDENCE_PREFIX}{predecessor}");
+        Ok(DrainRecord {
+            fence: RecordFence {
+                host: HostInstallationEpoch {
+                    installation: handle("test-installation")?,
+                    epoch: activation_generation.clone(),
+                    nonce: handle("test-host-nonce")?,
+                    recovery: None,
+                },
+                activation_id: handle("test-activation")?,
+                activation_generation: activation_generation.clone(),
+            },
+            operation: IdempotencyIdentity {
+                operation_id: handle("test-drain-rearm-request")?,
+                idempotency_key: handle("test-drain-rearm-request-idempotency")?,
+            },
+            drain_generation: activation_generation,
+            state: DrainState::Draining,
+            evidence_refs: vec![handle(&predecessor_evidence)?, handle(census_binding)?],
+            expected_predecessor: Some(predecessor.to_owned()),
+        })
+    }
+
+    #[test]
+    fn commit_boundary_accepts_a_rearmed_attempt_under_its_own_census() -> Result<(), HostError> {
+        let recomputed = "idle:owner-fence-digest-current-at-commit";
+        let drain = rearmed_attempt(recomputed)?;
+        verify_rearm_census_binding_at_commit(&drain, recomputed)
+    }
+
+    #[test]
+    fn commit_boundary_refuses_the_legacy_bare_idle_binding() -> Result<(), HostError> {
+        let drain = rearmed_attempt("idle")?;
+        assert!(matches!(
+            verify_rearm_census_binding_at_commit(&drain, "idle:owner-fence-digest-current"),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn commit_boundary_refuses_a_census_that_moved_after_admission() -> Result<(), HostError> {
+        let drain = rearmed_attempt("idle:owner-fence-digest-at-rearm-admission")?;
+        assert!(matches!(
+            verify_rearm_census_binding_at_commit(&drain, "idle:owner-fence-digest-current"),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        Ok(())
+    }
 }
