@@ -50,7 +50,7 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // `LaunchPhaseCorrelation`. This sequence owns no operation id, installation,
 // artifact, process-start identity, generation or fence: it receives only opaque
 // `S`/`K` values and closures, while the contour identities stay with the
-// caller that holds them, so those sites bind `LaunchPhaseCorrelation::NONE`.
+// caller that holds them, so each site binds the correlation its caller forwards.
 // The one typed fact it does hold is the already-classified
 // `StoreLivenessEvidence`, whose kind name is bound as `reason` while its
 // `Unknown` payload text never is. An absent identity renders as the
@@ -89,7 +89,8 @@ pub(super) enum StoreKernelLaunchError<S> {
 }
 
 #[cfg(windows)]
-pub(super) fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(
+pub(super) fn launch_store_then_kernel_with_correlation<S, K, LF, OF, KF, CF>(
+    correlation: &LaunchPhaseCorrelation<'_>,
     launch_store: LF,
     observe_store: OF,
     launch_kernel: KF,
@@ -103,7 +104,7 @@ where
 {
     // WORK_UNIT_CASE: 978/6 — Store launch requested before any Kernel work;
     // Store-before-Kernel ordering is observed, never reordered.
-    store_kernel_observe("host.store-launch requested", &LaunchPhaseCorrelation::NONE);
+    store_kernel_observe("host.store-launch requested", correlation);
     let store = launch_store().map_err(StoreKernelLaunchError::Launch)?;
     if let Err(evidence) = observe_store(&store) {
         // WORK_UNIT_CASE: 978/6 — Store liveness outcome observed separately
@@ -115,13 +116,13 @@ where
             StoreLivenessEvidence::Dead => {
                 store_kernel_observe(
                     "host.store-launch store-dead observed",
-                    &LaunchPhaseCorrelation::NONE.with_reason("dead"),
+                    &correlation.with_reason("dead"),
                 );
             }
             StoreLivenessEvidence::Unknown(_) => {
                 store_kernel_observe(
                     "host.store-launch store-unknown observed",
-                    &LaunchPhaseCorrelation::NONE.with_reason("unknown"),
+                    &correlation.with_reason("unknown"),
                 );
             }
         }
@@ -138,13 +139,10 @@ where
     // semantic acceptance; Kernel is invoked only after this barrier.
     store_kernel_observe(
         "host.store-launch store-liveness-proven observed",
-        &LaunchPhaseCorrelation::NONE,
+        correlation,
     );
     // WORK_UNIT_CASE: 978/6 — Kernel launch requested only after Store liveness.
-    store_kernel_observe(
-        "host.kernel-launch requested",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    store_kernel_observe("host.kernel-launch requested", correlation);
     let kernel = match launch_kernel() {
         Ok(kernel) => kernel,
         Err(error) => {
@@ -165,11 +163,46 @@ where
     // WORK_UNIT_CASE: 978/6 — Kernel launch observed distinctly from Store
     // liveness: a returned child handle is not Kernel acceptance, which needs
     // the owner evidence validated in `DurableKernelActivationDriver::active`.
-    store_kernel_observe(
-        "host.kernel-launch kernel-launched observed",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    store_kernel_observe("host.kernel-launch kernel-launched observed", correlation);
     Ok((store, kernel))
+}
+
+/// The Store-before-Kernel sequence for a call site that holds no identity.
+///
+/// This delegates to [`launch_store_then_kernel_with_correlation`] with
+/// [`LaunchPhaseCorrelation::NONE`], so an identity-free call site keeps the
+/// exact same records in the exact same order, the same typed results, the same
+/// launch count and the same cleanup/drop behaviour, with every unproven
+/// identity rendered as the shared renderer's absence marker. A call site that
+/// already holds bounded identities calls
+/// [`launch_store_then_kernel_with_correlation`] directly, so no record on that
+/// path renders an identity the caller held as missing.
+///
+/// Its only callers are the test-only callers in `src/tests.rs` and this
+/// module's own `#[cfg(all(test, windows))]` tests, because the production
+/// contour calls [`launch_store_then_kernel_with_correlation`] instead; this
+/// `#[cfg(all(test, windows))]` attribute is therefore what keeps a non-test
+/// build free of a dead-code finding without `#[allow(dead_code)]`.
+#[cfg(all(test, windows))]
+pub(super) fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(
+    launch_store: LF,
+    observe_store: OF,
+    launch_kernel: KF,
+    cleanup_store: CF,
+) -> Result<(S, K), StoreKernelLaunchError<S>>
+where
+    LF: FnOnce() -> Result<S, HostError>,
+    OF: FnOnce(&S) -> Result<(), StoreLivenessEvidence>,
+    KF: FnOnce() -> Result<K, HostError>,
+    CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
+{
+    launch_store_then_kernel_with_correlation(
+        &LaunchPhaseCorrelation::NONE,
+        launch_store,
+        observe_store,
+        launch_kernel,
+        cleanup_store,
+    )
 }
 
 #[cfg(all(test, windows))]
@@ -178,7 +211,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        HostError, StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
+        HostError, LaunchPhaseCorrelation, StoreKernelLaunchError, StoreLivenessEvidence,
+        launch_store_then_kernel, launch_store_then_kernel_with_correlation,
     };
 
     /// Bounded facade output captured from the live instrumented sequence.
@@ -357,5 +391,156 @@ mod tests {
             "caller evidence text must stay out of the record: {text}"
         );
         assert!(!text.contains("ready"), "no acceptance claim, got: {text}");
+    }
+
+    // A call site that already holds bounded identities forwards them into the
+    // sequence, so each of the four success-path phases asserted below carries
+    // them instead of the renderer's absence marker. This case carries no
+    // `WORK_UNIT_CASE` marker of its own: case 978/6 is already carried by
+    // `live_sequence_records_liveness_and_launch_but_no_acceptance` above, and
+    // the declared 1..14 denominator belongs to
+    // `tests/host_launch_diagnostics.rs`. The `store-dead` and `store-unknown`
+    // refusal arms are covered by the sibling case
+    // `forwarded_correlation_carries_the_callers_identities_on_the_refusal_arms`.
+    // The identity values below are composed BY THIS CASE, not held by this cell:
+    // the sequence owns no operation id, installation, generation, artifact,
+    // process-start identity or fence of its own, so it cannot read one off the
+    // opaque `S`/`K` values it receives. They are therefore named as what they
+    // are - forwarded labels a caller would hold - and deliberately NOT named
+    // after the Store or Kernel handle, so no record can be misread as this cell
+    // having derived an installation from its Store handle. Nothing is probed,
+    // re-derived or read from the environment here.
+    const FORWARDED_INSTALLATION: &str = "forwarded-installation-label";
+    const FORWARDED_GENERATION: u64 = 978;
+    const FORWARDED_FENCE: &str = "forwarded-fence-label";
+    #[test]
+    fn forwarded_correlation_carries_the_callers_identities_on_every_phase() {
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(FORWARDED_INSTALLATION)
+            .with_generation(FORWARDED_GENERATION)
+            .with_fence(FORWARDED_FENCE);
+        let text = captured(|| {
+            let result = launch_store_then_kernel_with_correlation(
+                &correlation,
+                || Ok::<_, HostError>("store-handle"),
+                |store| {
+                    assert_eq!(*store, "store-handle");
+                    Ok(())
+                },
+                || Ok::<_, HostError>("kernel-handle"),
+                |store| -> Result<(), Box<(&str, String)>> {
+                    Err(Box::new((store, "cleanup unknown".to_owned())))
+                },
+            );
+            // The forwarded correlation changes only what a record carries:
+            // same result, same launch count, same untouched cleanup behaviour.
+            assert!(matches!(result, Ok(("store-handle", "kernel-handle"))));
+        });
+        // The exact frozen slot order `render` emits: the three identities this
+        // caller already held keep their real values, and every identity it did
+        // not bind still spells the renderer's explicit absence marker.
+        let slots = "installation=forwarded-installation-label generation=978 operation=missing \
+                     artifact=missing process_start=missing fence=forwarded-fence-label \
+                     reason=missing";
+        for phase in [
+            "host.store-launch requested",
+            "host.store-launch store-liveness-proven observed",
+            "host.kernel-launch requested",
+            "host.kernel-launch kernel-launched observed",
+        ] {
+            assert!(
+                text.contains(&format!("phase={phase} {slots}")),
+                "the forwarded correlation must reach {phase}, got: {text}"
+            );
+        }
+        assert!(!text.contains("ready"), "no acceptance claim, got: {text}");
+    }
+
+    // Refusal-arm proof for the same forwarded correlation. When the caller's
+    // own `observe_store` classifies the Store as dead or unknown, the sequence
+    // still forwards the identities that caller already held into the refusal
+    // record instead of dropping them for the renderer's absence marker, still
+    // names the classified kind as `reason`, and still keeps the `Unknown`
+    // payload text out of the record. The forwarded correlation is the one the
+    // sibling case composes, from the same three labels: nothing is probed,
+    // re-derived or read from the environment here.
+    #[test]
+    fn forwarded_correlation_carries_the_callers_identities_on_the_refusal_arms() {
+        const EVIDENCE_CANARY: &str = "canary-store-reap-timeout-978";
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation(FORWARDED_INSTALLATION)
+            .with_generation(FORWARDED_GENERATION)
+            .with_fence(FORWARDED_FENCE);
+        let dead_text = captured(|| {
+            let result = launch_store_then_kernel_with_correlation(
+                &correlation,
+                || Ok::<_, HostError>("store-handle"),
+                |store| {
+                    assert_eq!(*store, "store-handle");
+                    Err(StoreLivenessEvidence::Dead)
+                },
+                || Ok::<_, HostError>("kernel-handle"),
+                |store| -> Result<(), Box<(&str, String)>> {
+                    assert_eq!(store, "store-handle");
+                    Ok(())
+                },
+            );
+            // The forwarded correlation changes only what the refusal record
+            // carries: the refusal stays the same typed error either way.
+            assert!(matches!(
+                result,
+                Err(StoreKernelLaunchError::StoreNotLive {
+                    evidence: StoreLivenessEvidence::Dead
+                })
+            ));
+        });
+        // The exact frozen slot order `render` emits: the identities this caller
+        // already held keep their real values on a refusal record too, the
+        // classified kind is the one typed reason this sequence holds, and every
+        // identity the caller did not bind still spells the renderer's explicit
+        // absence marker.
+        let dead_slots = "installation=forwarded-installation-label generation=978 operation=missing \
+                          artifact=missing process_start=missing fence=forwarded-fence-label \
+                          reason=dead";
+        assert!(
+            dead_text.contains(&format!(
+                "phase=host.store-launch store-dead observed {dead_slots}"
+            )),
+            "the forwarded correlation must reach the refusal record, got: {dead_text}"
+        );
+        let unknown_text = captured(|| {
+            let result = launch_store_then_kernel_with_correlation(
+                &correlation,
+                || Ok::<_, HostError>("store-handle"),
+                |store| {
+                    assert_eq!(*store, "store-handle");
+                    Err(StoreLivenessEvidence::Unknown(EVIDENCE_CANARY.to_owned()))
+                },
+                || Ok::<_, HostError>("kernel-handle"),
+                |store| -> Result<(), Box<(&str, String)>> {
+                    assert_eq!(store, "store-handle");
+                    Ok(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(StoreKernelLaunchError::StoreNotLive {
+                    evidence: StoreLivenessEvidence::Unknown(_)
+                })
+            ));
+        });
+        let unknown_slots = "installation=forwarded-installation-label generation=978 operation=missing \
+                              artifact=missing process_start=missing fence=forwarded-fence-label \
+                              reason=unknown";
+        assert!(
+            unknown_text.contains(&format!(
+                "phase=host.store-launch store-unknown observed {unknown_slots}"
+            )),
+            "the forwarded correlation must reach the refusal record, got: {unknown_text}"
+        );
+        assert!(
+            !unknown_text.contains(EVIDENCE_CANARY),
+            "caller evidence text must stay out of the record: {unknown_text}"
+        );
     }
 }
