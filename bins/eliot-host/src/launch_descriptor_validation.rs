@@ -67,20 +67,41 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // missing instead of being invented. Bounding limits size, not sensitivity
 // (I15.4).
 //
+// The two approved-descriptor validators forward the caller's correlation rather
+// than re-deriving it: `validate_store_bootstrap_descriptor_with_correlation`
+// and `validate_eliotd_launch_descriptor_with_correlation` render the identities
+// their caller already holds - on the approved-start contour the Host
+// installation identity, the launch authority generation and the Host epoch
+// fence - into every record they emit, and chain the approved descriptor digest
+// handle they are given onto it exactly as the no-correlation path chains that
+// same handle onto `LaunchPhaseCorrelation::NONE`. Forwarding is pure: a twin
+// derives, re-computes, re-reads and probes nothing, and the only slot
+// `validate_store_bootstrap_descriptor_with_correlation` fills from its own
+// arguments is that already-held approved descriptor digest, while
+// `validate_eliotd_launch_descriptor_with_correlation` also fills the launch
+// descriptor's own installation lineage and authority generation, read out of
+// the launch descriptor it already holds.
+// `validate_store_bootstrap_descriptor` and `validate_eliotd_launch_descriptor`
+// remain the one-line delegations that pass `LaunchPhaseCorrelation::NONE`, so
+// their read-only callers in `lib.rs` and `host_composition_store_recovery.rs`
+// keep byte-identical records, order, results and verdicts.
+//
 // Substitution and refusal paths record the retained approved identity that is
 // already in hand, never the rejected or substituted path text (case 978/3);
 // descriptor rejections stay typed and never become admissions (case 978/2).
 //
-// Slots this cell has no evidence for stay explicitly absent (rendered by the
-// shared correlation as `missing`) on purpose. The approved `StateFence` is a
-// numeric epoch/generation pair with no owner-produced string handle, so `fence`
-// is never composed here. The retained
-// Host process identity lives in `KernelLaunchBinding`, which emits no phase
-// record of its own, so `process_start` is absent from every record in this file
-// and a bare PID is never promoted into one (case 978/5). No typed cause enum
-// exists in this cell, so `reason` stays missing and the typed `HostError`
-// refusal text is never bound (case 978/12). `verify_user_broker_artifact`
-// emits no phase record of its own, so no correlation is built there either.
+// A slot this cell composes nothing for stays absent unless the caller's own
+// already-held correlation supplies it: forwarding can only carry an identity
+// the caller proved, never one built here. The approved `StateFence` is a
+// numeric epoch/generation pair with no owner-produced string handle in this
+// cell, so `fence` is never composed here and a record that spells one carries
+// only the fence its caller had already bound. The retained Host process
+// identity lives in `KernelLaunchBinding`, which emits no phase record of its
+// own, so `process_start` is never composed here and a bare PID is never
+// promoted into one (case 978/5). No typed cause enum exists in this cell, so
+// `reason` is never composed here and the typed `HostError` refusal text is
+// never bound (case 978/12). `verify_user_broker_artifact` emits no phase
+// record of its own, so no correlation is built there either.
 //
 // Readiness rule: an admitted descriptor is a launch/admission observation,
 // never readiness — process identity is distinct from the launch request and
@@ -137,12 +158,29 @@ fn launch_descriptor_manifest_correlation(
 ///
 /// Never the descriptor path, the descriptor bytes, a launch nonce, or any
 /// rejected value the comparison is about to fail on.
+///
+/// This is the ONE composition of the DESCRIPTOR-UNDER-VALIDATION triple in this
+/// cell: the approved digest handle, the descriptor's own installation lineage
+/// and its authority generation. It is not the only composition of those three
+/// slot KEYS here - `launch_descriptor_manifest_correlation` fills the same keys
+/// from a different value source, the candidate manifest - and that one is not
+/// duplicated here. This composition is rooted at the correlation its caller hands
+/// it, so a caller that already holds identities keeps them, and the three slots
+/// are then OVERWRITTEN by the values the launch descriptor itself carries:
+/// `with_*` is an unconditional slot overwrite, not a merge, so `installation`
+/// and `generation` end up naming the DESCRIPTOR's lineage and authority
+/// generation rather than the caller's. That is deliberate and unchanged from the
+/// pre-forwarding behaviour of this cell: the descriptor under validation is the
+/// authority for its own lineage. An
+/// identity-free call site passes `&LaunchPhaseCorrelation::NONE` and gets exactly
+/// the three slots and nothing else.
 #[cfg(windows)]
 fn launch_descriptor_install_correlation<'a>(
+    forwarded: &'a LaunchPhaseCorrelation<'a>,
     launch: &'a RuntimeLaunchDescriptor,
     approved_digest: &'a PlatformHandle,
 ) -> LaunchPhaseCorrelation<'a> {
-    LaunchPhaseCorrelation::NONE
+    forwarded
         .with_artifact(approved_digest.as_str())
         .with_installation(launch.installation_epoch.installation.as_str())
         .with_generation(launch.authority_generation.value())
@@ -233,7 +271,11 @@ pub(super) fn verify_host_artifact_at(
                         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
                         launch_descriptor_observe(
                             "host.launch-descriptor host artifact typed rejection",
-                            &launch_descriptor_install_correlation(launch, approved_digest),
+                            &launch_descriptor_install_correlation(
+                                &LaunchPhaseCorrelation::NONE,
+                                launch,
+                                approved_digest,
+                            ),
                         );
                         HostError::ProcessContour("portable root is missing".to_owned())
                     })?
@@ -243,7 +285,11 @@ pub(super) fn verify_host_artifact_at(
                 // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
                 launch_descriptor_observe(
                     "host.launch-descriptor host artifact typed rejection",
-                    &launch_descriptor_install_correlation(launch, approved_digest),
+                    &launch_descriptor_install_correlation(
+                        &LaunchPhaseCorrelation::NONE,
+                        launch,
+                        approved_digest,
+                    ),
                 );
                 HostError::ProcessContour(error.to_string())
             })?,
@@ -256,7 +302,11 @@ pub(super) fn verify_host_artifact_at(
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
             launch_descriptor_observe(
                 "host.launch-descriptor substitution preserved",
-                &launch_descriptor_install_correlation(launch, approved_digest),
+                &launch_descriptor_install_correlation(
+                    &LaunchPhaseCorrelation::NONE,
+                    launch,
+                    approved_digest,
+                ),
             );
         })?;
     let lease = open_launch_lease(launch.profile, portable_root.as_ref(), &current_executable)
@@ -264,7 +314,11 @@ pub(super) fn verify_host_artifact_at(
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
             launch_descriptor_observe(
                 "host.launch-descriptor host artifact typed rejection",
-                &launch_descriptor_install_correlation(launch, approved_digest),
+                &launch_descriptor_install_correlation(
+                    &LaunchPhaseCorrelation::NONE,
+                    launch,
+                    approved_digest,
+                ),
             );
         })?;
     let result = verify_launch_digest(&lease, approved_digest, "runtime.host_artifact");
@@ -274,14 +328,22 @@ pub(super) fn verify_host_artifact_at(
             // launch observation, never readiness.
             launch_descriptor_observe(
                 "host.launch-descriptor host artifact admitted",
-                &launch_descriptor_install_correlation(launch, approved_digest),
+                &launch_descriptor_install_correlation(
+                    &LaunchPhaseCorrelation::NONE,
+                    launch,
+                    approved_digest,
+                ),
             );
         }
         Err(_) => {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
             launch_descriptor_observe(
                 "host.launch-descriptor host artifact typed rejection",
-                &launch_descriptor_install_correlation(launch, approved_digest),
+                &launch_descriptor_install_correlation(
+                    &LaunchPhaseCorrelation::NONE,
+                    launch,
+                    approved_digest,
+                ),
             );
         }
     }
@@ -350,11 +412,45 @@ pub(super) fn validate_store_bootstrap_descriptor(
     expected_config: &PlatformHandle,
     expected_nonce: &PlatformHandle,
 ) -> Result<HostStoreBootstrapRequirement, HostError> {
+    // WORK_UNIT_CASE: 978/1 — store bootstrap requested.
+    validate_store_bootstrap_descriptor_with_correlation(
+        &LaunchPhaseCorrelation::NONE,
+        lease,
+        approved_digest,
+        expected_artifact,
+        expected_config,
+        expected_nonce,
+    )
+}
+
+/// [`validate_store_bootstrap_descriptor`] with the caller's already-held launch
+/// correlation forwarded into every record this seam emits.
+///
+/// Identical body, phase literals, order, returns and error mapping; the only
+/// difference is the correlation each observation receives. The forwarded slots
+/// are rendered through `host_diagnostics::bound_field` by
+/// `LaunchPhaseCorrelation::render`, and the approved descriptor digest handle
+/// this call site is already given is chained onto the forwarded correlation
+/// exactly as the no-correlation path chains it onto `LaunchPhaseCorrelation::NONE`,
+/// so nothing is re-derived, re-read or probed here and no locator, canonical
+/// path, expected artifact/config handle or launch nonce is bound (I15.4).
+#[cfg(windows)]
+pub(super) fn validate_store_bootstrap_descriptor_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    lease: &LaunchLease,
+    approved_digest: &PlatformHandle,
+    expected_artifact: &PlatformHandle,
+    expected_config: &PlatformHandle,
+    expected_nonce: &PlatformHandle,
+) -> Result<HostStoreBootstrapRequirement, HostError> {
     // The approved Store bootstrap descriptor digest handle is already in hand
     // and is the only identity this operation validates; the approved artifact
-    // and config hashes it must bind and the launch nonce are never bound.
-    let descriptor_correlation =
-        LaunchPhaseCorrelation::NONE.with_artifact(approved_digest.as_str());
+    // and config hashes it must bind and the launch nonce are never bound. It
+    // is chained onto the caller's already-held correlation rather than onto an
+    // empty one, so the caller's own operation, installation, generation and
+    // fence survive into every record below. This seam composes none of those
+    // itself: forwarding can only carry an identity the caller already held.
+    let descriptor_correlation = correlation.with_artifact(approved_digest.as_str());
     // WORK_UNIT_CASE: 978/1 — store bootstrap requested.
     launch_descriptor_observe(
         "host.launch-descriptor store bootstrap requested",
@@ -435,7 +531,43 @@ pub(super) fn validate_eliotd_launch_descriptor(
     approved_digest: &PlatformHandle,
     launch: &RuntimeLaunchDescriptor,
 ) -> Result<(), HostError> {
-    let descriptor_correlation = launch_descriptor_install_correlation(launch, approved_digest);
+    // WORK_UNIT_CASE: 978/1 — eliotd requested.
+    validate_eliotd_launch_descriptor_with_correlation(
+        &LaunchPhaseCorrelation::NONE,
+        lease,
+        approved_digest,
+        launch,
+    )
+}
+
+/// [`validate_eliotd_launch_descriptor`] with the caller's already-held launch
+/// correlation forwarded into every record this seam emits.
+///
+/// Identical body, phase literals, order, returns and error mapping; the only
+/// difference is the correlation each observation receives. It composes through
+/// [`launch_descriptor_install_correlation`] itself — the one composition of those
+/// slots in this cell — rooted at the correlation this seam's caller forwards
+/// rather than at `LaunchPhaseCorrelation::NONE`. That helper's three chained
+/// slots OVERWRITE whatever the caller forwarded: `artifact` becomes the
+/// descriptor digest handle under validation, and `installation` and `generation`
+/// become the launch descriptor's OWN installation lineage and authority
+/// generation, because the descriptor under validation is the authority for its
+/// own lineage. So on this seam a caller-forwarded `installation` or `generation`
+/// does not survive into the record, and that is deliberate and unchanged from
+/// this cell's pre-forwarding behaviour — it is stated here rather than left for a
+/// reader to infer from the builder. What the forwarding does contribute is every
+/// other slot the caller held, above all the epoch fence. Nothing is re-derived,
+/// re-read or probed here, and no locator, argv, config path or launch nonce is
+/// bound (I15.4).
+#[cfg(windows)]
+pub(super) fn validate_eliotd_launch_descriptor_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    lease: &LaunchLease,
+    approved_digest: &PlatformHandle,
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<(), HostError> {
+    let descriptor_correlation =
+        launch_descriptor_install_correlation(correlation, launch, approved_digest);
     // WORK_UNIT_CASE: 978/1 — eliotd requested.
     launch_descriptor_observe(
         "host.launch-descriptor eliotd requested",
@@ -475,7 +607,11 @@ pub(super) fn validate_eliotd_launch_descriptor_bytes(
     approved_digest: &PlatformHandle,
     launch: &RuntimeLaunchDescriptor,
 ) -> Result<(), HostError> {
-    let descriptor_correlation = launch_descriptor_install_correlation(launch, approved_digest);
+    let descriptor_correlation = launch_descriptor_install_correlation(
+        &LaunchPhaseCorrelation::NONE,
+        launch,
+        approved_digest,
+    );
     let actual = Sha256::digest(bytes);
     if format!("{actual:x}") != approved_digest.as_str() {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
@@ -528,11 +664,14 @@ pub(super) fn validate_eliotd_launch_descriptor_bytes(
 
 // F-LOG-HOST-3 (#978) inline proof for this cell's private observation
 // contract. Every case drives a real instrumented call site of this cell
-// through its existing seam — the descriptor-bytes seam
-// (`validate_eliotd_launch_descriptor_bytes`) and the retained-lease Store
+// through its existing seam - the descriptor-bytes seam
+// (`validate_eliotd_launch_descriptor_bytes`), the retained-lease Store
 // bootstrap seam (`validate_store_bootstrap_descriptor`, reached through the
 // real `open_launch_lease` and a real `UserOwnedRootLease` over a temporary
-// descriptor) — and widens no visibility. No case here calls
+// descriptor), the retained-lease eliotd descriptor seam
+// (`validate_eliotd_launch_descriptor`), and the `_with_correlation` twins of
+// the last two, which the forwarding case drives with a correlation it composes
+// from this module's own fixtures - and widens no visibility. No case here calls
 // `launch_descriptor_observe` and none renders a detail of its own, so no case
 // can pass on a record it fabricated. Outcomes that need a fully validated
 // approved `CandidateManifest` stay with the integration fixture owner; what is
@@ -1047,10 +1186,16 @@ mod tests {
 
     /// The same refusal invariants on the retained-lease Store bootstrap seam,
     /// whose refused window also holds the request record that seam emits before
-    /// it refuses, plus the two identity slots this seam can never hold:
-    /// `validate_store_bootstrap_descriptor` takes no launch descriptor and
-    /// binds only the approved descriptor digest handle, so `installation` and
-    /// `generation` are explicitly missing here instead of invented.
+    /// it refuses, plus the two identity slots every case below leaves missing:
+    /// the five cases here drive `validate_store_bootstrap_descriptor`, which
+    /// delegates with `LaunchPhaseCorrelation::NONE` and binds only the approved
+    /// descriptor digest handle it is given, so `installation` and `generation`
+    /// render as `missing` here instead of being invented. The forwarding twin
+    /// `validate_store_bootstrap_descriptor_with_correlation` renders its
+    /// caller's own slots instead and binds the same single digest handle, so it
+    /// leaves the same two slots missing;
+    /// `forwarding_twins_bind_only_the_identities_their_own_arguments_hold`
+    /// drives both forwarding twins from this module's own fixtures.
     fn assert_retained_store_bootstrap_record(text: &str, phase: &str, approved: &PlatformHandle) {
         let records = captured_records(text);
         assert_eq!(
@@ -1683,5 +1828,142 @@ mod tests {
             !text.contains(arrived_digest.as_str()),
             "the arrived bytes' own digest is never the bound identity: {text}"
         );
+    }
+
+    /// The two forwarding twins bind exactly the identities their own arguments
+    /// hold: the approved descriptor digest handle each of them is given, and -
+    /// on the eliotd twin only - the launch descriptor it is given, from which
+    /// it reads that descriptor's own installation lineage and authority
+    /// generation. Neither twin invents an identity it holds no argument for.
+    ///
+    /// The correlation handed to both twins here is `LaunchPhaseCorrelation::NONE`
+    /// on purpose, the value the two one-line delegations already pass. That makes
+    /// this case insensitive to forwarding in EITHER direction — it cannot tell
+    /// "the twin bound nothing because its caller held nothing" from "the twin
+    /// discarded what its caller held" — and it is named for what it proves: each
+    /// twin binds only the identities its own arguments carry. The proof that the
+    /// production call sites actually forward the contour's correlation is not here;
+    /// it is the integration target's source-byte all-sites scan over
+    /// `start_approved`, recorded in the frozen fixture. Every slot read back below
+    /// is therefore one the twin bound itself.
+    /// Both twins are driven over the retained-lease seam this module's cases
+    /// already use - a real `UserOwnedRootLease`, the real `open_launch_lease`,
+    /// and one descriptor one byte past the bound both call sites pass to
+    /// `read_bounded` - so each twin really publishes its own request record and
+    /// exactly one refusal, and every record asserted on is read back out of the
+    /// scoped subscriber. No case here renders a record or a detail of its own.
+    #[test]
+    fn descriptor_twins_bind_only_the_identities_their_own_arguments_hold() {
+        use super::{
+            validate_eliotd_launch_descriptor_with_correlation,
+            validate_store_bootstrap_descriptor_with_correlation,
+        };
+        use crate::host_job_launch::LaunchPhaseCorrelation;
+
+        // The request phase each twin publishes before that shared bounded-read
+        // refusal, spelled out beside the rejection phases this module already
+        // retains, so every record below is selected by the phase its own
+        // production call site emitted.
+        const BOOTSTRAP_REQUESTED_PHASE: &str = "host.launch-descriptor store bootstrap requested";
+        const ELIOTD_REQUESTED_PHASE: &str = "host.launch-descriptor eliotd requested";
+
+        let fixture = BootstrapDescriptor::create(approved_store_bootstrap_requirement());
+        let over_limit = vec![b'x'; BOOTSTRAP_BOUNDED_READ_LIMIT + 1];
+        fixture.write_bytes(&over_limit);
+        // The one approved descriptor digest handle this case already holds,
+        // given unchanged to both twins.
+        let approved = approved_digest_handle(APPROVED_DIGEST);
+        let forwarded = LaunchPhaseCorrelation::NONE;
+        let launch = fixture_launch(APPROVED_ELIOTD_EXECUTABLE);
+
+        // The Store bootstrap twin, over a real retained lease opened before the
+        // capture scope so the window holds only the records this seam emits.
+        let bootstrap_lease = fixture.lease();
+        let (bootstrap_text, bootstrap_outcome) = capture_rejection(|| {
+            validate_store_bootstrap_descriptor_with_correlation(
+                &forwarded,
+                &bootstrap_lease,
+                &approved,
+                &fixture.requirement.approved_artifact_hash,
+                &fixture.requirement.approved_config_hash,
+                &fixture.requirement.launch_nonce,
+            )
+        });
+        let Err(error) = bootstrap_outcome else {
+            panic!("a descriptor over the bounded read limit must stay rejected");
+        };
+        let reason = process_contour_reason(error);
+        assert!(
+            reason.starts_with(BOOTSTRAP_READ_REJECTION_PREFIX),
+            "the bounded read refusal keeps its own exact typed prefix: {reason}"
+        );
+        // This twin's refusal record binds the approved digest handle it was
+        // given and leaves the two identities the eliotd twin binds explicitly
+        // missing, because it holds no argument for either of them.
+        assert_retained_store_bootstrap_record(
+            &bootstrap_text,
+            BOOTSTRAP_TYPED_REJECTION_PHASE,
+            &approved,
+        );
+        // Its request record carries the same single bound slot and the same
+        // explicit absence markers as its refusal record, so the request record
+        // of a refused window satisfies the same shared refusal invariants.
+        let requested = records_naming_phase(
+            &captured_records(&bootstrap_text),
+            BOOTSTRAP_REQUESTED_PHASE,
+        );
+        assert_eq!(
+            requested.len(),
+            1,
+            "the call site emits its own request exactly once: {bootstrap_text}"
+        );
+        let request = requested[0];
+        assert_refusal_record(&bootstrap_text, request, &approved);
+        for absent in ["installation", "generation"] {
+            assert!(
+                request.contains(&format!("{absent}=missing")),
+                "this twin fills {absent} from no argument of its own: {request}"
+            );
+        }
+
+        // The eliotd twin, over the same real retained lease and the same
+        // refused read, given the launch descriptor its own signature takes.
+        let eliotd_lease = fixture.lease();
+        let (eliotd_text, eliotd_outcome) = capture_rejection(|| {
+            validate_eliotd_launch_descriptor_with_correlation(
+                &forwarded,
+                &eliotd_lease,
+                &approved,
+                &launch,
+            )
+        });
+        let Err(error) = eliotd_outcome else {
+            panic!("an eliotd descriptor over the bounded read limit must stay rejected");
+        };
+        let reason = process_contour_reason(error);
+        assert!(
+            reason.starts_with(ELIOTD_READ_REJECTION_PREFIX),
+            "the bounded read refusal keeps its own exact typed prefix: {reason}"
+        );
+        let eliotd_records = captured_records(&eliotd_text);
+        assert_eq!(
+            eliotd_records.len(),
+            2,
+            "this seam records its request, then exactly one refusal: {eliotd_text}"
+        );
+        // Both of this twin's records bind all three slots its own arguments
+        // hold - the approved descriptor digest, the launch descriptor's own
+        // installation lineage and its authority generation - and spell the
+        // explicit absence marker for the four slots this cell composes nothing
+        // for, exactly as the descriptor-bytes twin of the same body does.
+        for phase in [ELIOTD_REQUESTED_PHASE, ELIOTD_TYPED_REJECTION_PHASE] {
+            let phase_records = records_naming_phase(&captured_records(&eliotd_text), phase);
+            assert_eq!(
+                phase_records.len(),
+                1,
+                "the call site emits {phase} exactly once: {eliotd_text}"
+            );
+            assert_retained_rejection_record(phase_records[0], phase, &approved, &launch);
+        }
     }
 }

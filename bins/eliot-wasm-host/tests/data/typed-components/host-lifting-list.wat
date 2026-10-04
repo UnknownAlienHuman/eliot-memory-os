@@ -3,11 +3,11 @@
 ;;
 ;; A guest that can make the HOST allocate and measure is a host-lifting
 ;; exhaustion risk, so every list leaf is bounded before it is folded into the
-;; call's output budget. `check_cycle_result` (typed_execution.rs:3542-3569)
-;; measures `state.pending` with `TypedBound::list` (:832-843), which refuses
+;; call's output budget. `check_cycle_result` (typed_execution.rs:3605-3632)
+;; measures `state.pending` with `TypedBound::list` (:838-848), which refuses
 ;; more than `MAX_TYPED_LIST_ITEMS` (256) items with
 ;; `TypedExecutionError::LimitDenied("typed-list")`, staged at
-;; `TypedStage::Output` by `execute_domain_lane` (:2080-2081).
+;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
 ;;
 ;; This component is an honest `dreamer-cycle` fixture except for the hostile
 ;; lifted length: `describe` reports the true frozen descriptor, the domain
@@ -122,7 +122,7 @@
     (case "internal" $cycle_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome $cycle_error))))
+  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 45056))
@@ -142,19 +142,33 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, flattened in WIT field order.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 13)
-      (i32.const 1037)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1056)
-      (i32.const 19)
-      (i32.const 1075)
-      (i32.const 5)
-      (i32.const 1080)
-      (i32.const 64)
+    ;; the frozen ABI revision, lowered in WIT field order into guest memory.
+    ;;
+    ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
+    ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
+    ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
+    ;; pointer to guest-owned memory: wasmparser-0.256.0
+    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; and push exactly one pointer for `Abi::Lift`, and
+    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
+    ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
+    ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x8000..0xa0d0
+    ;; the hostile `state.pending` region, 0xb000 the `realloc` bump region.
+    ;; 0x0c00 is clear of all five and inside the single exported page.
+    (func (export "describe") (result i32)
+      (i32.store (i32.const 3072) (i32.const 1024))
+      (i32.store (i32.const 3076) (i32.const 13))
+      (i32.store (i32.const 3080) (i32.const 1037))
+      (i32.store (i32.const 3084) (i32.const 19))
+      (i32.store (i32.const 3088) (i32.const 1))
+      (i32.store (i32.const 3092) (i32.const 1056))
+      (i32.store (i32.const 3096) (i32.const 19))
+      (i32.store (i32.const 3100) (i32.const 1075))
+      (i32.store (i32.const 3104) (i32.const 5))
+      (i32.store (i32.const 3108) (i32.const 1080))
+      (i32.store (i32.const 3112) (i32.const 64))
+      (i32.const 3072)
     )
     ;; `step`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
@@ -168,13 +182,16 @@
       (i32.store (i32.const 2056) (i32.const 0))
       ;; Hostile lifted length: `state.pending` is a `list<pending_request>` of
       ;; 300 elements pointing into the zeroed high region of this memory
-      ;; (32768 .. 32768 + 300*32 = 42368, inside the 1-page core memory and
+      ;; (32768 .. 32768 + 300*28 = 41168, inside the 1-page core memory and
       ;; clear of every other region above; the `realloc` bump region starts at
       ;; 45056 so nothing this call lowers can overlap it). The host lifts all
       ;; 300 records and then measures the result, so the item ceiling -- not the
       ;; engine -- is what refuses it.
-      (i32.store (i32.const 2108) (i32.const 32768))
-      (i32.store (i32.const 2112) (i32.const 300))
+      ;; canonical-ABI: `state.pending` is dreamer-state record offset 20
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 20 = 2100 (ptr) and 2104 (len).
+      (i32.store (i32.const 2100) (i32.const 32768))
+      (i32.store (i32.const 2104) (i32.const 300))
       ;; echo "operation-id" back out of the lowered request
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 8))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
@@ -182,11 +199,14 @@
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
       ;; echo "state.fence-epoch" back out of the lowered request
+      ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2124) (i32.const 4608))
-      (i32.store (i32.const 2128) (local.get $n))
+      (i32.store (i32.const 2116) (i32.const 4608))
+      (i32.store (i32.const 2120) (local.get $n))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")
