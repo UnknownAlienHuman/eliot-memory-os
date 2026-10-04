@@ -7122,9 +7122,9 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     // `observe_entrypoint`, `observe_terminal_error` or `observe_host_request`
     // itself, with an event string it built itself. The observation-statement
     // scan collects that route too, every such statement is judged against the
-    // already-allowed shapes here, and the collected set is pinned
-    // exactly below, so a free string or a `format!` reaching a facade call
-    // directly fails and a removed frozen seam site fails as well.
+    // already-allowed shapes here, and the collected set is pinned exactly
+    // below, so a free string or a `format!` reaching a facade call directly
+    // fails and a removed frozen seam site fails as well.
     let identity_seam = case22_body(&lib, "fn host_lifecycle_observe_identity(");
     let mut facade_statements: Vec<String> = Vec::new();
     for source in [&lib, &activation] {
@@ -7156,13 +7156,12 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     facade_statements.sort_unstable();
     assert_eq!(
         facade_statements,
-        vec![
-            "frozen-identity-seam: host_diagnostics::observe_host_request(projection);"
-                .to_owned(),
-            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::ScmDispatch, host_lifecycle_frozen_event(boundary), );".to_owned(),
-            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::ShutdownDrain, host_lifecycle_frozen_event(boundary), );".to_owned(),
-            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::Startup, host_lifecycle_frozen_event(boundary), );".to_owned(),
-            "frozen-projection-detail: host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));".to_owned(),
+        [
+            "frozen-identity-seam: host_diagnostics::observe_host_request(projection);",
+            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::ScmDispatch, host_lifecycle_frozen_event(boundary), );",
+            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::ShutdownDrain, host_lifecycle_frozen_event(boundary), );",
+            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::Startup, host_lifecycle_frozen_event(boundary), );",
+            "frozen-projection-detail: host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));",
         ],
         "no_unowned_edit: the #889 facade must be reached from exactly these frozen statements, one per seam site, over `lib.rs` and `activation_lifecycle.rs` together: an added direct facade call is an unedited observation of the observation path and a missing statement is an owned edit this case no longer proves: {facade_statements:?}"
     );
@@ -7477,7 +7476,7 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     published_surface.sort_unstable();
     assert_eq!(
         published_surface,
-        vec!["pub use host_diagnostics::note_event_log_sink_status;".to_owned()],
+        ["pub use host_diagnostics::note_event_log_sink_status;"],
         "the only published observation-surface item must stay the single #889 re-export this suite enumerates: any other `pub`/`pub(crate)` item or `pub use` re-export naming the seam helpers, the frozen projection, the row table, the guard, a row identifier or a facade entry point is new visibility, and losing the re-export itself is new non-visibility this case no longer proves: {published_surface:?}"
     );
 
