@@ -974,6 +974,7 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
 fn normalize_schedule_returns_owner_issued_gap_shift_revision() {
     use eliot_kernel_core::user_automation::{
         DstFoldPolicy, DstGapPolicy, PINNED_ZONE_DATABASE_REVISION, ScheduleNormalizationReceipt,
+        UserAutomationError,
     };
 
     // A pending Edit-style revision: a new immutable revision id that
@@ -1049,9 +1050,14 @@ fn normalize_schedule_returns_owner_issued_gap_shift_revision() {
             occurrence_count: 1,
         }),
     };
+    let refusal = super::user_automation_store::normalize_user_automation_operation(&forged)
+        .expect_err("a draft supplying its own owner output must be refused");
     assert!(
-        super::user_automation_store::normalize_user_automation_operation(&forged).is_err(),
-        "a draft supplying its own owner output must be refused"
+        matches!(
+            refusal,
+            UserAutomationError::Invalid("schedule.normalization.input_contains_owner_output")
+        ),
+        "the refusal names the caller-supplied owner output, got {refusal:?}"
     );
 
     // The source digest and the pinned release are read back from the owner
@@ -1081,7 +1087,7 @@ fn normalize_schedule_returns_owner_issued_gap_shift_revision() {
             "America/New_York",
             PINNED_ZONE_DATABASE_REVISION,
             "2026-03-08T02:30:00",
-            "2026-03-08T02:30:00",
+            "2026-03-08T03:30:00",
             "-04:00",
             "2026-03-08T07:30:00Z",
             "-05:00~-04:00",
