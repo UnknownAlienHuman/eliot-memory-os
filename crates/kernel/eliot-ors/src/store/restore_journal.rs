@@ -1578,6 +1578,29 @@ impl RedbRecoveryStore {
         })
     }
 
+    /// Names every restore-journal stream this store has durably accepted.
+    ///
+    /// A maintenance owner holds a store, not a stream name, so the set of
+    /// streams is read out of the journal's own durable index. It is never
+    /// supplied, guessed or remembered by a caller, so a caller cannot
+    /// reclaim a stream that was never bound and cannot skip one that was.
+    ///
+    /// This is a read-only enumeration: it starts no retention pass of its own
+    /// and opens a read transaction only, so it never contends with the single
+    /// write transaction a retention pass owns. A store that never accepted
+    /// this journal family names nothing. A foreign, partial or mixed table
+    /// family is refused here exactly as on every other journal read, because
+    /// an unreadable family is not an absent one; and a family that is present
+    /// is re-read through the same strict validating path every other read
+    /// uses, so a partial family can never be presented as a shorter list.
+    ///
+    /// The names come back in the journal's own durable order, so the same
+    /// store state always enumerates the same way.
+    pub fn list_restore_journal_streams(&self) -> Result<Vec<String>, OrsError> {
+        let state = self.read_restore_journal_state()?;
+        Ok(state.streams.into_keys().collect())
+    }
+
     /// Runs exactly one retention pass in its own write transaction and returns
     /// the durable decision that pass committed.
     fn run_restore_journal_retention(
