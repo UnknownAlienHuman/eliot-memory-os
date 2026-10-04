@@ -1,0 +1,21 @@
+{
+  "project_id": "project-1",
+  "task_id": "task-1",
+  "write_id": "write-1",
+  "topic": "silent defaults",
+  "statement": "an omitted key must not state the claim",
+  "where_applicable": [
+    "memory.rs"
+  ],
+  "where_not_applicable": [
+    "cognition.rs"
+  ],
+  "negative_constraints": [],
+  "provenance_refs": [
+    "evidence-1"
+  ],
+  "freshness_rule": "one release",
+  "auto_bind": null,
+  "expected_reuse_note": "candidate capture",
+  "curation": null
+}

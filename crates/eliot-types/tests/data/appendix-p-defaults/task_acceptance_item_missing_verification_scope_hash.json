@@ -1,0 +1,8 @@
+{
+  "item_id": "item-1",
+  "description": "the required key fails when omitted",
+  "required_evidence": "verification",
+  "satisfied": true,
+  "observation_id": null,
+  "verification_id": "00000000-0000-7000-8000-000000000005"
+}

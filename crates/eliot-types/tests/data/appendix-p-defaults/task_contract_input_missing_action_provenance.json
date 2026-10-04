@@ -1,0 +1,15 @@
+{
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "title": "close the silent-default hole",
+  "status": "open",
+  "acceptance_items": [],
+  "expected_revision": null,
+  "action_lease_id": null,
+  "understanding_proof_hash": null,
+  "memory_grant_redemptions": [],
+  "observation_ids": [],
+  "verification_ids": [],
+  "verification_scopes": [],
+  "completion_proof": null,
+  "completion_write_id": null
+}

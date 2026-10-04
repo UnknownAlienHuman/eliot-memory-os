@@ -1,0 +1,20 @@
+{
+  "eval_run_id": "00000000-0000-7000-8000-000000000001",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "suite_id": "00000000-0000-7000-8000-000000000001",
+  "dataset_manifest_id": "00000000-0000-7000-8000-000000000003",
+  "profile": {
+    "profile_id": "profile-1",
+    "deterministic": true,
+    "no_external_network": true,
+    "no_mutation": true,
+    "max_runtime_seconds": 60,
+    "allowed_services": []
+  },
+  "status": "completed",
+  "case_results": [],
+  "mutation_attempts_blocked": [],
+  "blocked_reason": null,
+  "started_at": "2026-09-07T12:00:00Z",
+  "finished_at": "2026-09-07T12:00:01Z"
+}

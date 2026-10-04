@@ -1,0 +1,38 @@
+{
+  "schema_version": "eliot-cognitive-field-provider-plan-v1",
+  "run_id": "run-1",
+  "contract_hash": "contract-sha",
+  "calls": [
+    {
+      "call_number": 1,
+      "call_id": "call-1",
+      "role": "codex_worker",
+      "host": "codex",
+      "requested_model": "gpt-test",
+      "expected_provider_executable_sha256": "exec-sha",
+      "prompt_ref": "prompt-1",
+      "prompt_sha256": "prompt-sha",
+      "canonical_schema_sha256": "schema-sha",
+      "provider_schema_sha256": "provider-schema-sha",
+      "provider_smoke": true,
+      "counts_against_cap": true,
+      "executions": [],
+      "runtime_contract_ref": "runtime-contract-1",
+      "runtime_contract_sha256": "runtime-sha",
+      "adapter_version": "1",
+      "execution_request_ref": "request-1",
+      "execution_request_sha256": "request-sha"
+    }
+  ],
+  "planned_provider_calls": 1,
+  "planned_smoke_calls": 1,
+  "planned_reused_roles": 0,
+  "role_evidence_plan_hash": null,
+  "seal_attempt_id": null,
+  "seal_generation": 0,
+  "authority_activation_ref": null,
+  "runtime_manifest_sha256": null,
+  "artifact_manifest_sha256": null,
+  "plan_hash": "blake3:6675b8349fb892407faf2bd706fbd437825e3aea023bd637adbe9f160cec3f25",
+  "sealed_at": "2026-09-07T12:00:00Z"
+}

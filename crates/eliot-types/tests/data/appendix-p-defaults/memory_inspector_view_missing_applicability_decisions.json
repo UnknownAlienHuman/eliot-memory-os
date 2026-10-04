@@ -1,0 +1,26 @@
+{
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "active_current_claim_refs": [],
+  "recalled_candidate_refs": [],
+  "stale_or_superseded_refs": [],
+  "support_and_counterevidence_refs": [],
+  "decisions": [],
+  "influence": [],
+  "cargo": [],
+  "lifecycle": {
+    "suppressed_refs": [],
+    "demoted_refs": [],
+    "superseded_refs": [],
+    "archived_refs": [],
+    "minority_preserved_refs": [],
+    "lifecycle_warnings": [
+      "memory lifecycle policy active"
+    ]
+  },
+  "experience_cases": [],
+  "experience_patterns": [],
+  "negative_transfer": [],
+  "cognitive_lab_results": [],
+  "failure_localization": [],
+  "corpus_profile": null
+}

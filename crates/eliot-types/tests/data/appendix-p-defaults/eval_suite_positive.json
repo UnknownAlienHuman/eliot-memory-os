@@ -1,0 +1,12 @@
+{
+  "eval_suite_id": "00000000-0000-7000-8000-000000000001",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "name": "silent-default-suite",
+  "purpose": "prove requiredness",
+  "cases": [],
+  "fixed": true,
+  "holdout": true,
+  "integrity_checksum": "checksum",
+  "created_from_refs": [],
+  "created_at": "2026-09-07T12:00:00Z"
+}
