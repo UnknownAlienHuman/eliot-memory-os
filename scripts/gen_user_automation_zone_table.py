@@ -125,10 +125,32 @@ ZONE_NAME = re.compile(r"[A-Za-z0-9_+/-]{1,64}")
 #: refuses to write one.
 ISSUE_EVIDENCE_ZONE = "America/New_York"
 
-#: Zones that MUST be proven against the oracle and admitted, or the generator
-#: reports them loudly as withheld. These carry the issue's own evidence and the
-#: canonical spellings an owner automation is most likely to declare.
-MUST_PROVE_ZONES = (
+#: Zones the generator names EXPLICITLY in its run report: the issue's own
+#: evidence zone plus the canonical spellings an owner automation is most likely
+#: to declare. Each is looked up in the oracle result and its outcome is reported
+#: one by one.
+#:
+#: RENAMED from ``MUST_PROVE_ZONES`` (#2882, audit item 5). The old name claimed a
+#: policy the generator did not have: it implied that every zone listed here must
+#: be proven and admitted or generation must stop. It never did that. Only
+#: :data:`ISSUE_EVIDENCE_ZONE` is a hard stop (:func:`main`); every other zone here
+#: was merely printed as ``REQUIRED-ZONE-WITHHELD`` and generation continued to
+#: write the table with exit 0.
+#:
+#: The claim was also false against the shipped artifact: the committed table
+#: withholds two of these zones as ``oracle-disagreement``
+#: (``Australia/Lord_Howe`` and ``America/Argentina/Buenos_Aires``), so its
+#: digest-pinned bytes are the product of a run that "MUST"-proved neither.
+#:
+#: The audit allowed either enforcement or honest narrowing. Enforcement was NOT
+#: chosen, and deliberately so: those two zones are withheld because the pinned
+#: oracle disagrees about them, permanently, so refusing to generate would make
+#: the table unreproducible and break ``PINNED_ZONE_TABLE_SHA256``. Narrowing the
+#: claim keeps the artifact lineage intact and makes the stated policy the one
+#: that actually runs. A zone the oracle does not confirm is still withheld
+#: explicitly, loudly, and by name - unavailability stays visible rather than
+#: being resolved from a guess.
+REPORTED_ZONES = (
     "America/New_York",
     "Europe/London",
     "Asia/Kolkata",
@@ -1131,20 +1153,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 6
 
-    # Every other required zone that could not be proven is named loudly. It is
+    # Every other REPORTED zone that could not be proven is named loudly. It is
     # withheld, so a schedule declaring it is refused as an unknown zone rather
-    # than resolved from a guess.
-    unproven = [name for name in MUST_PROVE_ZONES if name not in admitted]
+    # than resolved from a guess. Being withheld here is NOT a generation stop:
+    # :data:`ISSUE_EVIDENCE_ZONE` above is the only hard stop, which is why
+    # `REPORTED_ZONES` is named for reporting rather than for a proof
+    # obligation (#2882, audit item 5).
+    unproven = [name for name in REPORTED_ZONES if name not in admitted]
     if unproven:
         print(
-            "REQUIRED-ZONE-WITHHELD: these required zones are NOT admitted "
-            "because the independent oracle does not confirm them: "
+            "REPORTED-ZONE-WITHHELD: these reported zones are NOT admitted "
+            "because the independent oracle does not confirm them, so each is "
+            "withheld from the table and refused as an unknown zone: "
             + " ".join(unproven),
             file=sys.stderr,
         )
         for name in unproven:
             print(
-                f"REQUIRED-ZONE-WITHHELD {name} reason={withheld.get(name, 'unknown')}",
+                f"REPORTED-ZONE-WITHHELD {name} reason={withheld.get(name, 'unknown')}",
                 file=sys.stderr,
             )
 
