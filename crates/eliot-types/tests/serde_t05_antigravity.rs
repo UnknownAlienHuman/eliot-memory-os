@@ -442,6 +442,10 @@ fn c2_valid_current_bytes_round_trip_byte_stably() {
         64,
         "a blake3 hex digest is 64 characters; the fingerprint must keep that shape"
     );
+    assert_eq!(
+        digest, "1807249a5d3131b35ea40a2b3d9122a0936d7324768ae9312822df3b60599cd6",
+        "hash_bytes_hex must keep its current BLAKE3 output for the fixed input"
+    );
     assert_ne!(
         digest,
         hash_bytes_hex(b"eliot-antigravity-fingerprint-inpu"),
@@ -450,6 +454,11 @@ fn c2_valid_current_bytes_round_trip_byte_stably() {
     let executable = "C:/tools/agy/agy.exe";
     let version = "1.12.3";
     let help = "Usage: agy [OPTIONS]";
+    assert_eq!(
+        fingerprint_hash_for(executable, version, help),
+        "c4dda57d490ab36eed638f553ab94832affde7e9370fcc2255ee92ec8dc12379",
+        "fingerprint_hash_for must keep its current output for the existing fixed input"
+    );
     assert_eq!(
         fingerprint_hash_for(executable, version, help),
         fingerprint_hash_for(executable, version, help),
@@ -593,6 +602,39 @@ fn c5_duplicate_control_identity_and_cursor_keys_refused() {
     assert_eq!(
         frame.frame_version, ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION,
         "the accepted counterpart must keep the supported frame_version"
+    );
+
+    // The cursor is a second protected control key: keep its repeated wire
+    // member raw through the real NDJSON entrypoint so the first value cannot
+    // win by way of an intermediate JSON map.
+    let repeated_seq = frame_raw("c5_frame_repeated_seq_refuse");
+    assert_eq!(
+        repeated_seq.matches("\"seq\"").count(),
+        2,
+        "the refusal fixture must repeat the seq key exactly twice"
+    );
+    assert_eq!(
+        AntigravityPersistentFrame::from_ndjson_line(
+            &repeated_seq,
+            ANTIGRAVITY_PERSISTENT_MAX_FRAME_BYTES,
+        ),
+        Err("malformed frame".to_owned()),
+        "the real entrypoint must refuse a repeated seq key as malformed frame"
+    );
+
+    // deny_unknown_fields must be exercised at the same raw outer-frame seam.
+    let unknown_outer = frame_raw("c5_frame_unknown_outer_member_refuse");
+    assert!(
+        unknown_outer.contains("c5_unknown_outer_member"),
+        "the unknown-frame fixture must carry its injected outer member"
+    );
+    assert_eq!(
+        AntigravityPersistentFrame::from_ndjson_line(
+            &unknown_outer,
+            ANTIGRAVITY_PERSISTENT_MAX_FRAME_BYTES,
+        ),
+        Err("malformed frame".to_owned()),
+        "the real entrypoint must refuse an unknown outer frame member as malformed frame"
     );
 
     // (b) The receipt repeats `prompt_hash_blake3` - a protected identity digest.
@@ -835,6 +877,49 @@ fn c7_missing_model_observation_cannot_default_into_a_valid_current_value() {
         null_receipt.timeout_ms, 120_000,
         "the accepted null-key counterpart must keep the fixture's own remaining members"
     );
+
+    // A complete run reaches the required-nullable member through its actual
+    // nested receipt. Its current canonical bytes round-trip unchanged.
+    let full_run_bytes = raw("c7_run_full_model_observation_canonical");
+    let full_run: AntigravityRun = decode_receipt(&full_run_bytes)
+        .expect("a complete run with a full nested model observation must decode");
+    assert!(
+        full_run.safety_receipt.model_observation.is_some(),
+        "the complete run must carry its own nested model observation"
+    );
+    assert_eq!(
+        serde_json::to_string(&full_run).expect("the complete run must serialize again"),
+        full_run_bytes,
+        "the complete run with a nested model observation must round-trip byte for byte"
+    );
+
+    // The paired run fixture differs only by the nested required-nullable key.
+    // Compare as JSON values to prove that no other run or receipt member moved.
+    let absent_nested_run_bytes = raw("c7_run_absent_nested_model_observation_refuse");
+    let mut expected_absent: serde_json::Value = serde_json::from_str(&full_run_bytes)
+        .expect("the complete run fixture must parse before its nested key is removed");
+    let removed = expected_absent
+        .get_mut("safety_receipt")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the complete run must carry a safety_receipt object")
+        .remove("model_observation");
+    assert!(
+        removed.is_some(),
+        "the complete run must really carry safety_receipt.model_observation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&absent_nested_run_bytes)
+            .expect("the absent-key run fixture must remain valid JSON text"),
+        expected_absent,
+        "the refusal run fixture must differ only by the nested model_observation key"
+    );
+    let Err(run_error) = decode_receipt::<AntigravityRun>(&absent_nested_run_bytes) else {
+        panic!("a complete run without nested model_observation must be refused");
+    };
+    assert!(
+        run_error.to_string().contains("model_observation"),
+        "the nested-run refusal must name model_observation, got: {run_error}"
+    );
 }
 
 /// Case 8: an unsupported frame version cannot quietly become the supported
@@ -927,7 +1012,9 @@ const W2_ALIAS_ENABLEMENT_CANDIDATE: &str = "enabled_for_worktree_candidate_smok
 const W2_ALIAS_SCOPE_AUDIT: &str = "read_only_smoke_only";
 const W2_ALIAS_SCOPE_CANDIDATE: &str = "worktree_candidate_smoke_only";
 const W2_ALIAS_SMOKE_MODE_AUDIT: &str = "read_only_audit";
+const W2_ALIAS_SMOKE_MODE_CANDIDATE: &str = "worktree_candidate_no_apply";
 const W2_ALIAS_WORKDIR_AUDIT: &str = "controller_repo_read_only";
+const W2_ALIAS_WORKDIR_CANDIDATE: &str = "worktree_for_candidate_implementation";
 
 /// The derived CANONICAL (primary) spellings of the very same variants. An
 /// alias that merely decodes is worth nothing unless it decodes to the SAME
@@ -939,7 +1026,9 @@ const W2_CANONICAL_ENABLEMENT_CANDIDATE: &str = "enabled_for_disposable_worktree
 const W2_CANONICAL_SCOPE_AUDIT: &str = "disposable_worktree_audit_only";
 const W2_CANONICAL_SCOPE_CANDIDATE: &str = "disposable_worktree_candidate_only";
 const W2_CANONICAL_SMOKE_MODE_AUDIT: &str = "disposable_worktree_audit";
+const W2_CANONICAL_SMOKE_MODE_CANDIDATE: &str = "disposable_worktree_candidate_no_apply";
 const W2_CANONICAL_WORKDIR_AUDIT: &str = "disposable_worktree_for_audit";
+const W2_CANONICAL_WORKDIR_CANDIDATE: &str = "disposable_worktree_for_candidate_implementation";
 
 /// The control-imitating payload member names cases 11-12 inject. They are
 /// spelled once so an assertion names the exact key that must stay inert.
@@ -1088,6 +1177,19 @@ fn c9_declared_compatibility_aliases_decode_to_their_canonical_variants() {
         "the alias decode must keep the request's own expected marker"
     );
 
+    let candidate_smoke_text = raw("c9_live_smoke_request_candidate_alias");
+    assert!(
+        candidate_smoke_text.contains(W2_ALIAS_SMOKE_MODE_CANDIDATE),
+        "the candidate request fixture must carry the retained live-smoke alias"
+    );
+    let candidate_smoke: AntigravityLiveSmokeRequest = decode_receipt(&candidate_smoke_text)
+        .expect("the worktree_candidate_no_apply alias must decode on the live-smoke request");
+    assert_eq!(
+        serde_json::to_value(candidate_smoke.mode).expect("the candidate mode must re-encode"),
+        serde_json::json!(W2_CANONICAL_SMOKE_MODE_CANDIDATE),
+        "the candidate live-smoke alias must re-encode to its declared canonical spelling"
+    );
+
     // (c) AntigravityWorkdirPolicy's `controller_repo_read_only` alias, nested
     // inside the real `AntigravityCommandContract` carrier, whose nested closed
     // structs keep their `deny_unknown_fields`, so the alias really is admitted
@@ -1107,6 +1209,20 @@ fn c9_declared_compatibility_aliases_decode_to_their_canonical_variants() {
     assert!(
         contract.dangerous_flags_forbidden && contract.json_output_required,
         "the aliased contract must keep both of its own `true` effect facts"
+    );
+
+    let candidate_contract_text = raw("c9_command_contract_workdir_candidate_alias");
+    assert!(
+        candidate_contract_text.contains(W2_ALIAS_WORKDIR_CANDIDATE),
+        "the candidate contract fixture must carry the retained workdir-policy alias"
+    );
+    let candidate_contract: AntigravityCommandContract = decode_receipt(&candidate_contract_text)
+        .expect("the candidate workdir alias must decode on the command contract");
+    assert_eq!(
+        serde_json::to_value(candidate_contract.workdir_policy)
+            .expect("the candidate workdir policy must re-encode"),
+        serde_json::json!(W2_CANONICAL_WORKDIR_CANDIDATE),
+        "the candidate workdir alias must re-encode to its declared canonical spelling"
     );
 
     // (d) The alias is DECLARED and CLOSED: an UNDECLARED spelling of the very

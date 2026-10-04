@@ -12,8 +12,11 @@
 ;; Apart from that one ambient import this is the honest `dreamer-cycle`
 ;; surface: the exact types of bins/eliot-wasm-host/wit/typed/dreamer-cycle.wit,
 ;; ZERO core-module imports, and the single exported interface
-;; `eliot:current/cycle@0.1.0` exposing exactly `describe` and `step`. The
-;; component declares an ambient wall clock through the WASI clock interface
+;; `eliot:current/cycle@0.1.0` exposing exactly `describe` and `step`. One more
+;; executable difference from `dreamer-cycle.wat`, which changes nothing about
+;; the reported descriptor: its `describe` retarea sits at base 0x0c00 here
+;; (eleven core words ending 0x0c2b) instead of 0x0600 there. The component
+;; declares an ambient wall clock through the WASI clock interface
 ;; instead of proving zero ambient inheritance (issue #758 P5.4).
 ;;
 ;; The ambient dependency is declared at the component level, which is exactly

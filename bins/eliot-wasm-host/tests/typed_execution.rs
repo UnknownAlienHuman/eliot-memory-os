@@ -239,6 +239,7 @@ struct CueOptions {
     include_domain_export: bool,
     extra_core_module: bool,
     extra_core_memory: bool,
+    extra_core_table: bool,
     world_len_override: Option<u32>,
     describe_decl: Option<&'static str>,
     domain_decl: Option<&'static str>,
@@ -257,6 +258,7 @@ impl Default for CueOptions {
             include_domain_export: true,
             extra_core_module: false,
             extra_core_memory: false,
+            extra_core_table: false,
             world_len_override: None,
             describe_decl: None,
             domain_decl: None,
@@ -464,6 +466,35 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
     } else {
         ""
     };
+    // A SECOND defined table in the SAME core module, for the table-COUNT
+    // ceiling. It is the exact table-shaped twin of `extra_memory` above and
+    // carries the same single-variable argument: `MAX_TYPED_TABLES = 1`
+    // (`src/typed_execution.rs:54`) reaches the engine as the Store's table
+    // count (`src/typed_execution.rs:1408`, read back through
+    // `StoreState::tables` at `:1484-1486`), and the count is checked by
+    // `StoreOpaque::bump_resource_counts`
+    // (`StoreLimits` snapshots `ResourceLimiter::tables` as
+    // `StoreOpaque::table_limit`, wasmtime-47.0.4 `src/runtime/store.rs:936-943`;
+    // `wasmtime-environ-47.0.4/src/module.rs:566-570` counts the tables the
+    // core module DEFINES, so both tables below are counted), whose `bump`
+    // bails at `src/runtime/store.rs:1523` before any table is allocated. The
+    // extra table is unreferenced and unexported, so every alias, export and
+    // body in the template is unchanged: the one difference between this
+    // fixture and the cooperative one is the count the engine is asked to
+    // honour.
+    // TWO tables, not one, and the reason is arithmetic rather than taste. The
+    // base template declares exactly one memory at `(memory (export "memory") 1)`
+    // and NO table at all, so injecting a single extra table would leave the
+    // module declaring ONE table - equal to `MAX_TYPED_TABLES = 1`, and
+    // `bump(&mut table_count, 1, 1, "table")` computes `1 > 1` as false, so
+    // nothing would bail and the count ceiling would never be exercised. The
+    // memory leg works precisely because its base declaration exists. Two
+    // injected tables make the module declare 2 against a maximum of 1.
+    let extra_table = if options.extra_core_table {
+        "    (table $extra-table-a 1 funcref)\n    (table $extra-table-b 1 funcref)\n"
+    } else {
+        ""
+    };
     let domain_export = if options.include_domain_export {
         "    (export \"activate\" (func $activate))\n"
     } else {
@@ -485,7 +516,7 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
         r#"(component
 {CUE_TYPES}{ambient_import}  (core module $guest
     (memory (export "memory") 1)
-{extra_memory}    {data}    (func $realloc (param i32 i32 i32 i32) (result i32)
+{extra_memory}{extra_table}    {data}    (func $realloc (param i32 i32 i32 i32) (result i32)
       (i32.const {realloc_offset}))
     (func $activate-core (param i32) (result i32)
       (unreachable))
@@ -1700,6 +1731,84 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
         TYPED_EXECUTION_SOURCE
             .contains("fn memory_grow_failed(&mut self, _error: wasmtime::Error)")
     );
+
+    // THE MEMORY-BYTE CEILING ITSELF, TIGHTENED BELOW THE DECLARED MINIMUM AND
+    // EXECUTED. Every leg above varies the ceiling by whole pages and always
+    // reaches `describe`; this leg drops `max_memory_bytes` to HALF a page,
+    // below the single page every fixture here declares as its memory minimum,
+    // so the engine refuses the component BEFORE any linear memory exists and
+    // the denial lands on a different stage and a different code. That is the
+    // one shape the source guard above cannot produce: it needs the forwarded
+    // ceiling to reach the Store's limiter, not a line of owner text.
+    //
+    // Where the refusal is produced, verified by opening each range:
+    // - the ceiling is `limits.max_memory_bytes`, forwarded to
+    //   `wasmtime::StoreLimitsBuilder::memory_size`
+    //   (`src/typed_execution.rs:1405`), and `StoreLimits::memory_growing`
+    //   returns `Ok(false)` for any `desired > limit`
+    //   (wasmtime-47.0.4 `src/runtime/limits.rs:337-355`, the comparison at
+    //   `:344`);
+    // - the limiter is consulted BEFORE the memory is allocated, from
+    //   `Memory::new_dynamic` (`src/runtime/vm/memory.rs:249`) into
+    //   `Memory::limit_new` (`src/runtime/vm/memory.rs:299-354`), whose
+    //   `limiter.memory_growing(0, minimum, maximum)` at `:344-348` bails at
+    //   `:349` when the limiter says no; the component's own core instance
+    //   reaches that allocator through `Instance::new_raw`'s
+    //   `allocate_instance(limiter.as_deref_mut(), ...)`
+    //   (`src/runtime/instance.rs:327-336`) called from the component
+    //   initializer (`src/runtime/component/instance.rs:838-841`);
+    // - this Host records the refusal: `StoreState::memory_growing` stores
+    //   `ResourceLimitHit::Memory` in `limit_hit` on the not-allowed branch
+    //   (`src/typed_execution.rs:1429-1449`, `:1445-1447`);
+    // - and `map_instantiate_error` consults `limit_hit` FIRST, before it reads
+    //   the engine message at all (`src/typed_execution.rs:1309-1311`), so the
+    //   typed cause is the owner-typed `MemoryLimit` from
+    //   `resource_limit_error` (`src/typed_execution.rs:1253-1259`, mapping
+    //   `ResourceLimitHit::Memory` to `EngineTermination::MemoryLimit` at
+    //   `:1255`), NOT a substring of the engine's own "memory minimum size of
+    //   1 pages exceeds memory limits" bail. No generic internal-error prose is
+    //   reported as normal control behaviour: the cause is the exact owner-typed
+    //   limit code.
+    //
+    // The stage is the one actually reached -- component instantiation, before
+    // the descriptor call -- from `describe_cue_activation`'s instantiate arm
+    // (`src/typed_execution.rs:1694-1700`), so it is `Instantiate`, not the
+    // `Cleanup` the soft growth refusal above reports.
+    //
+    // Half a page is as far below as this lane can go: a ZERO ceiling is refused
+    // by the Host's own envelope validation (`src/typed_execution.rs:500-513`)
+    // as `LIMIT_DENIED:envelope` before the engine is ever built, so it would
+    // prove the envelope gate, not the Store ceiling.
+    //
+    // The component is the byte-identical one the completing and denying legs
+    // above already drive, which is asserted rather than assumed, so the ONLY
+    // difference between the completed receipt and this denial is the ceiling.
+    let half_page = cue_activation_artifact(
+        &cooperative_guest(),
+        &CueOptions {
+            kind: DescribeKind::GrowOnePage,
+            ..CueOptions::default()
+        },
+    );
+    assert_eq!(
+        half_page, grower,
+        "the tightened-ceiling leg must drive the identical component bytes as the legs above"
+    );
+    let mut sub_page = default_experimental_limits(Sha256Digest::of_bytes(&half_page));
+    sub_page.max_memory_bytes = 32_768;
+    let Err(observed_byte_ceiling) = run_describe(TypedWorld::CueActivation, &half_page, &sub_page)
+    else {
+        panic!("a memory ceiling below the declared one page must refuse the component");
+    };
+    assert_eq!(
+        observed_byte_ceiling,
+        staged(TypedStage::Instantiate, engine("MemoryLimit")),
+        "the tightened memory-byte ceiling must refuse at instantiation with the typed cause"
+    );
+    assert_eq!(
+        denial_of(&observed_byte_ceiling),
+        "STAGE:instantiate:ENGINE:MemoryLimit"
+    );
 }
 
 // WORK_UNIT_CASE: 758/16
@@ -1756,6 +1865,129 @@ fn table_instance_and_resource_bounds_are_enforced() {
     assert!(TYPED_EXECUTION_SOURCE.contains(".instances(usize::try_from(limits.max_instances)"));
     assert!(TYPED_EXECUTION_SOURCE.contains("fn table_growing("));
     assert!(TYPED_EXECUTION_SOURCE.contains("if is_instance_limit_error(error) {"));
+
+    // THE TABLE-ELEMENT CEILING, TIGHTENED AND EXECUTED. The default admits
+    // EIGHT elements (`default_experimental_limits`,
+    // `src/typed_execution.rs:460`); this leg admits ONE, which is exactly the
+    // fixture's own declared table minimum `(table 1 256 funcref)`
+    // (`tests/data/typed-components/table-exhaustion.wat:127`), so the guest is
+    // refused its very first `table.grow`. The refusal is still the engine's own
+    // soft refusal: `wasmtime::StoreLimits::table_growing` returns `Ok(false)`
+    // for any `desired > limit` (wasmtime-47.0.4 `src/runtime/limits.rs:366-384`,
+    // the comparison at `:373`), so `table.grow` returns -1, the guest runs to
+    // completion, and `StoreState::table_growing` records
+    // `ResourceLimitHit::Table` in `limit_hit` on the not-allowed branch
+    // (`src/typed_execution.rs:1457-1472`, `:1468-1470`). `run_guarded` then
+    // denies the COMPLETED call at teardown from that recorded hit
+    // (`src/typed_execution.rs:1574` and `:1576-1589`, the staged refusal at
+    // `:1579`), which `resource_limit_error` renders as the owner-typed
+    // `TableLimit` (`src/typed_execution.rs:1253-1259`, mapping
+    // `ResourceLimitHit::Table` to `EngineTermination::TableLimit` at `:1256`).
+    // The tightened value is therefore not decoration: it is what moves the
+    // refusal from the tail of the guest's growth attempts to its very first
+    // one, and the denial still names the ceiling that refused it. One element is
+    // the floor this lane can reach: a ZERO ceiling is refused by the Host's own
+    // envelope validation (`src/typed_execution.rs:500-513`) as
+    // `LIMIT_DENIED:envelope` before any engine work, and the fixture's declared
+    // one-element minimum is already admitted at a ceiling of one, so an
+    // instantiation-time element refusal is unreachable here and is NOT claimed.
+    let mut one_element = default_experimental_limits(Sha256Digest::of_bytes(&grower));
+    one_element.max_table_elements = 1;
+    let Err(observed_element_ceiling) =
+        run_describe(TypedWorld::DreamerCycle, &grower, &one_element)
+    else {
+        panic!("a one-element table ceiling must refuse a fixture that grows its table");
+    };
+    assert_eq!(
+        observed_element_ceiling,
+        staged(TypedStage::Cleanup, engine("TableLimit")),
+        "the tightened table-element ceiling must produce the exact typed refusal"
+    );
+    assert_eq!(
+        denial_of(&observed_element_ceiling),
+        "STAGE:cleanup:ENGINE:TableLimit"
+    );
+
+    // THE TABLE-COUNT CEILING, EXECUTED. `MAX_TYPED_TABLES = 1` is a Host
+    // constant with no `InvocationLimits` field behind it
+    // (`src/typed_execution.rs:52-54`), forwarded to the engine's Store as
+    // `StoreLimitsBuilder::tables` (`src/typed_execution.rs:1408`) and read back
+    // through `StoreState::tables` (`src/typed_execution.rs:1484-1486`). This
+    // component declares TWO core tables in the same core module, and the base
+    // template declares none, so the engine really is asked to honour a count
+    // of two against `MAX_TYPED_TABLES = 1`, and the count really is
+    // checked: `Store::limiter` snapshots the limiter's `tables()` into
+    // `StoreOpaque::table_limit` (wasmtime-47.0.4 `src/runtime/store.rs:936-943`,
+    // assignment at `:942`), `StoreOpaque::bump_resource_counts` compares the
+    // core module's DEFINED table count against it
+    // (wasmtime-environ-47.0.4 `src/module.rs:566-570`; the comparison itself in
+    // `src/runtime/store.rs:1519-1543`, the table `bump` at `:1540` over an
+    // `if new > max` check whose own `bail!` is at `:1523`) and it runs from
+    // `Instance::new_raw` (`src/runtime/instance.rs:309`) on the component's own
+    // core instantiation (`src/runtime/component/instance.rs:838-841`), BEFORE
+    // any table is allocated and therefore before `table_growing` can ever run.
+    //
+    // Three consequences, all read off the executed value and none invented:
+    // `limit_hit` stays `None`, so this Host does NOT type a count refusal as a
+    // table ceiling; `map_instantiate_error`
+    // (`src/typed_execution.rs:1305-1338`) cannot classify it either --
+    // `is_instance_limit_error` requires "instance" in the message
+    // (`src/wasmtime_provider.rs:767-770`) and this bail spells "resource limit
+    // exceeded: table count too high at 2"; the bail is not a `wasmtime::Trap`,
+    // so `trap_termination` returns `None` (`src/typed_execution.rs:1276-1285`);
+    // and the message matches none of "import"/"export"/"missing"/"type" in the
+    // `:1329-1337` fallbacks. The real, observable denial is therefore the
+    // staged generic component-error instantiation denial, asserted in full
+    // below with its exact rendered string -- the ceiling IS enforced by the
+    // Store limiter; it simply carries no table-count code of its own, and this
+    // leg pins that down instead of pretending one exists. The discriminator is
+    // the cooperative component, built by the same generator one table shorter,
+    // which completes under the very same envelope.
+    let two_tables = cue_activation_artifact(
+        &cooperative_guest(),
+        &CueOptions {
+            extra_core_table: true,
+            ..CueOptions::default()
+        },
+    );
+    let count_limits = default_experimental_limits(Sha256Digest::of_bytes(&two_tables));
+    let Err(observed_table_count_refusal) =
+        run_describe(TypedWorld::CueActivation, &two_tables, &count_limits)
+    else {
+        panic!("a component declaring more tables than the configured maximum must be refused");
+    };
+    assert_eq!(
+        observed_table_count_refusal,
+        staged(
+            TypedStage::Instantiate,
+            engine("instantiate:component-error")
+        ),
+        "the table-count ceiling is refused, not typed as a table ceiling"
+    );
+    assert_eq!(
+        denial_of(&observed_table_count_refusal),
+        "STAGE:instantiate:ENGINE:instantiate:component-error"
+    );
+
+    // The discriminator, executed: the same generator with no second table
+    // completes under the same ceilings and the same envelope. The allow-listed
+    // digest is the cooperative component's own preflight digest, so the only
+    // difference from the refusing run above is the table count.
+    let cooperative_single_table = cooperative_cue_artifact();
+    let cooperative_limits =
+        default_experimental_limits(Sha256Digest::of_bytes(&cooperative_single_table));
+    assert_eq!(cooperative_limits.max_memory_bytes, 65_536);
+    assert_eq!(cooperative_limits.max_table_elements, 8);
+    let (cooperative_receipt, _) = must(
+        run_describe(
+            TypedWorld::CueActivation,
+            &cooperative_single_table,
+            &cooperative_limits,
+        )
+        .map_err(|error| error.to_string()),
+    );
+    assert_eq!(cooperative_receipt.terminal, "Completed");
+    assert_eq!(cooperative_receipt.instances, 1);
 }
 
 // WORK_UNIT_CASE: 758/17

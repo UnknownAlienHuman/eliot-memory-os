@@ -104,9 +104,10 @@ use super::super::host_job_launch::LaunchPhaseCorrelation;
 // Sink outcome never alters result/order/count/handle/cleanup/timeout. There is
 // no mutable global dedup cache and no terminal emission here: the designated
 // terminal for one failed launch is `lib.rs`'s
-// `HostTerminalGuard(BOUNDARY_START_TERMINAL)` ("host-start-failed"), and the
-// `HostJobBranches::start_approved` leaf guard is phase-only (issue #978 audit
-// defect 2), so this cell can never emit a second terminal. Retained identity on
+// `HostTerminalGuard` on the OUTER contour (`BOUNDARY_OPEN_TERMINAL` on the STARTUP
+// path; a cutover-path launch is owned by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`), and
+// the `start_approved` leaf guard is phase-only (#978 audit defect 2), so this cell
+// cannot emit a second terminal. Retained identity on
 // substitution failure is preserved (case 978/3); digest/descriptor rejections
 // stay typed (case 978/2).
 fn launch_artifact_note_event_log_unavailable() {

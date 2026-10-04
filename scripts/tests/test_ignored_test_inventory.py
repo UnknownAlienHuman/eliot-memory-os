@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -187,6 +188,46 @@ class TestIgnoredTestInventory(unittest.TestCase):
             self.assertGreaterEqual(record["ignored_test_count"], 0)
             self.assertEqual(set(record["file_identity"]), {"device", "inode", "size", "mtime_ns"})
             self.assertRegex(record["sha256"], r"\A[0-9a-f]{64}\Z")
+            executable = record["executable"]
+            self.assertIsInstance(executable, str)
+            if isinstance(executable, str):
+                self.assertTrue(executable)
+                self.assertFalse(ntpath.isabs(executable))
+                drive, _tail = ntpath.splitdrive(executable)
+                self.assertEqual(drive, "")
+                self.assertNotIn("\\", executable)
+                components = executable.split("/")
+                self.assertTrue(all(components))
+                self.assertTrue(all(component not in {".", ".."} for component in components))
+
+        for row_dict in parsed["rows"]:
+            if row_dict["executable"] is None:
+                continue
+            row_identity = (
+                row_dict["package_id"],
+                row_dict["target_kind"],
+                row_dict["target_name"],
+                row_dict["executable_digest"],
+            )
+            matching_artifacts = [
+                record
+                for record in header["artifact_denominator"]
+                if (
+                    record["package_id"],
+                    record["target_kind"],
+                    record["target_name"],
+                    record["sha256"],
+                )
+                == row_identity
+            ]
+            self.assertEqual(
+                len(matching_artifacts),
+                1,
+                f"row has no unique artifact binding: {row_identity}",
+            )
+            artifact = matching_artifacts[0]
+            self.assertEqual(row_dict["executable"], artifact["executable"])
+            self.assertEqual(row_dict["executable_digest"], artifact["sha256"])
 
         self.assertIs(header["source_identity"]["untracked_tree_clean"], True)
         self.assertIs(header["source_identity"]["working_tree_clean"], True)
@@ -2678,6 +2719,10 @@ class TestIgnoredTestInventory(unittest.TestCase):
             metadata_baseline = build_inventory(root, runner=runner)
             repeated_baseline = build_inventory(root, runner=runner)
             self.assertEqual(repeated_baseline, metadata_baseline)
+            self.assertEqual(
+                _canonical_bytes(metadata_baseline) + b"\n",
+                _canonical_bytes(repeated_baseline) + b"\n",
+            )
             self.assertIsNone(metadata_output[0]["packages"][0]["source"])
             self.assertEqual(metadata_output[0]["resolve"]["root"], package_id)
             baseline_header = metadata_baseline["header"]
@@ -2786,10 +2831,416 @@ class TestIgnoredTestInventory(unittest.TestCase):
             )
             admitted_root.mkdir(parents=True, exist_ok=True)
             inventory_fixture = json.loads((self.fixture_dir / "sample_inventory.json").read_bytes())
-            list_executable = admitted_root / inventory_fixture["header"]["artifact_denominator"][0]["executable"]
+            target_record = inventory_fixture["header"]["target_denominator"][0]
+            artifact_record = inventory_fixture["header"]["artifact_denominator"][0]
+            fixture_row = next(
+                row for row in inventory_fixture["rows"]
+                if row["package_id"] == target_record["package_id"]
+            )
+            source_path = troot / target_record["src_path"]
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text("", encoding="utf-8")
+            manifest = source_path.parent.parent / "Cargo.toml"
+            package_version = target_record["package_id"].split(" ", 2)[1]
+            target_edition = "2021"
+            manifest.write_text(
+                "[package]\n"
+                f"name = {json.dumps(target_record['package_name'])}\n"
+                f"version = {json.dumps(package_version)}\n"
+                f"edition = {json.dumps(target_edition)}\n",
+                encoding="utf-8",
+            )
+            list_executable = admitted_root / artifact_record["executable"]
             list_executable.parent.mkdir(parents=True, exist_ok=True)
             list_executable.write_bytes(b"synthetic libtest identity")
             list_argv = (str(list_executable), "--list", "--ignored", "--format", "terse")
+            admitted_identity, admitted_sha256 = iti._observe_executable(
+                troot, admitted_root, list_executable
+            )
+            cargo_target = {
+                "kind": [target_record["target_kind"]],
+                "crate_types": [target_record["target_kind"]],
+                "name": target_record["target_name"],
+                "src_path": str(source_path),
+                "edition": target_edition,
+                "doc": True,
+                "doctest": target_record["doctest_enabled"],
+                "test": target_record["test_enabled"],
+            }
+            metadata_target = {
+                **cargo_target,
+                "required-features": list(target_record["required_features"]),
+            }
+            package_id = target_record["package_id"]
+            metadata = {
+                "version": 1,
+                "metadata": None,
+                "workspace_root": str(troot),
+                "target_directory": str(admitted_root),
+                "workspace_members": [package_id],
+                "workspace_default_members": [package_id],
+                "packages": [{
+                    "id": package_id,
+                    "name": target_record["package_name"],
+                    "version": package_version,
+                    "manifest_path": str(manifest),
+                    "source": None,
+                    "targets": [metadata_target],
+                    "features": {},
+                    "dependencies": [],
+                }],
+                "resolve": {
+                    "root": package_id,
+                    "nodes": [{
+                        "id": package_id,
+                        "features": list(artifact_record["features"]),
+                        "deps": [],
+                        "dependencies": [],
+                    }],
+                },
+            }
+            target = iti._targets(troot, metadata)[0]
+            cargo_artifact = {
+                "reason": "compiler-artifact",
+                "package_id": package_id,
+                "manifest_path": str(manifest),
+                "target": cargo_target,
+                "profile": artifact_record["profile"],
+                "features": artifact_record["features"],
+                "filenames": [str(list_executable)],
+                "executable": str(list_executable),
+                "fresh": True,
+            }
+            cargo_stream = b"\n".join((
+                json.dumps(cargo_artifact).encode("utf-8"),
+                json.dumps({"reason": "build-finished", "success": True}).encode("utf-8"),
+            )) + b"\n"
+            listing_stdout = f"{fixture_row['test_name']}: test\n".encode("utf-8")
+            original_fixed = iti._run_fixed
+            original_open_lease = iti._open_artifact_launch_lease
+            original_verify_image = iti._verify_suspended_artifact_image
+            original_details = iti._windows_handle_details
+            original_close_handle = iti._close_windows_handle
+            original_hash_handle = iti._windows_handle_sha256
+            guarded_launches: list[Mock] = []
+
+            def run_guarded_listing(
+                queried_image: Path,
+                *,
+                foreign_native_identity: bool = False,
+                attempt_component_rename: bool = False,
+                query_failure: BaseException | None = None,
+                mutate_before_listing: bool = False,
+                caller_deadline: float | None = None,
+            ) -> dict[str, object]:
+                events: list[str] = []
+                lease_handles: list[int] = []
+                closed_handles: list[int] = []
+                deadlines: dict[str, float | None] = {}
+                handler_started: list[float] = []
+                rename_results: list[OSError | None] = []
+                captured_carriers: list[Artifact] = []
+                receipt_sha256: list[str] = []
+                lease_receipts: list[tuple[Artifact, tuple[tuple[str, int], ...], str]] = []
+                image_sha256: list[str] = []
+                mutation_observations: list[dict[str, object]] = []
+                job = object()
+                process_handle = 5000 + len(guarded_launches)
+                process = Mock()
+                process._handle = process_handle
+                process.pid = process_handle + 100
+                process.stdout = io.BytesIO(listing_stdout)
+                process.stderr = io.BytesIO(b"")
+                process.returncode = 0
+                process_state = ["suspended"]
+                process.poll.side_effect = lambda: 0 if process_state[0] == "completed" else None
+
+                def reap_process(*args, **kwargs):
+                    events.append("reap")
+                    process_state[0] = "terminated"
+                    process.returncode = 1
+                    return 1
+
+                process.wait.side_effect = reap_process
+                process.kill.side_effect = lambda: events.append("kill")
+                guarded_launches.append(process)
+                process_created = [False]
+                identity_mutated = [False]
+
+                def move_while_lease_is_held(source: Path, destination: Path) -> OSError | None:
+                    self.assertFalse(destination.exists())
+                    try:
+                        os.replace(source, destination)
+                    except OSError as exc:
+                        return exc
+                    os.replace(destination, source)
+                    return None
+
+                def launch_process(*args, **kwargs):
+                    events.append("popen")
+                    process_created[0] = True
+                    self.assertEqual(kwargs["executable"], str(list_executable))
+                    if attempt_component_rename:
+                        rename_results.append(move_while_lease_is_held(
+                            list_executable,
+                            list_executable.with_name(list_executable.name + ".renamed"),
+                        ))
+                        rename_results.append(move_while_lease_is_held(
+                            list_executable.parent,
+                            list_executable.parent.with_name(list_executable.parent.name + ".renamed"),
+                        ))
+                    return process
+
+                def dispatch_fixed_command(
+                    launch_root: Path,
+                    command: Sequence[str],
+                    timeout: float | None = None,
+                    *,
+                    deadline: float | None = None,
+                    admitted_executable: Path | None = None,
+                    admitted_target_root: Path | None = None,
+                    admitted_artifact: Artifact | None = None,
+                ) -> CommandResult:
+                    if tuple(command) == iti._CARGO_BUILD_ARGV:
+                        events.append("cargo-build")
+                        return CommandResult(cargo_stream, b"")
+                    if (
+                        len(command) == 1 + len(iti._LIBTEST_LIST_ARGS)
+                        and tuple(command[1:]) == iti._LIBTEST_LIST_ARGS
+                    ):
+                        events.append("listing-dispatch")
+                        self.assertEqual(launch_root, troot)
+                        self.assertEqual(admitted_executable, list_executable)
+                        self.assertEqual(admitted_target_root, admitted_root)
+                        self.assertIsNotNone(admitted_artifact)
+                        captured_carriers.append(admitted_artifact)
+                        receipt_sha256.append(admitted_artifact.executable_sha256)
+                        if mutate_before_listing:
+                            before = list_executable.read_bytes()
+                            changed = bytes((before[0] ^ 1,)) + before[1:]
+                            self.assertEqual(len(changed), len(before))
+                            list_executable.write_bytes(changed)
+                            mtime_ns = admitted_artifact.file_identity["mtime_ns"]
+                            os.utime(list_executable, ns=(mtime_ns, mtime_ns))
+                            live_identity, live_sha = iti._observe_executable(
+                                troot, admitted_root, list_executable
+                            )
+                            mutation_observations.append({
+                                "receipt_identity": dict(admitted_artifact.file_identity),
+                                "receipt_sha256": admitted_artifact.executable_sha256,
+                                "live_identity": live_identity,
+                                "live_sha256": live_sha,
+                            })
+                        handler_started.append(iti.time.monotonic())
+                        return original_fixed(
+                            launch_root,
+                            command,
+                            timeout=timeout,
+                            deadline=deadline,
+                            admitted_executable=admitted_executable,
+                            admitted_target_root=admitted_target_root,
+                            admitted_artifact=admitted_artifact,
+                        )
+                    self.fail(f"unexpected fixed command in controlled discovery: {tuple(command)!r}")
+
+                def open_lease(
+                    launch_root: Path,
+                    artifact: Artifact,
+                    expected_identity: tuple[tuple[str, int], ...],
+                    expected_sha256: str,
+                    deadline: float | None,
+                ) -> tuple[int, ...]:
+                    deadlines["lease"] = deadline
+                    lease_receipts.append((artifact, expected_identity, expected_sha256))
+                    handles = original_open_lease(
+                        launch_root, artifact, expected_identity, expected_sha256, deadline
+                    )
+                    lease_handles.extend(handles)
+                    events.append("lease-open")
+                    return handles
+
+                def verify_image(
+                    child_handle: int,
+                    artifact: Artifact,
+                    held_handles: tuple[int, ...],
+                    expected_identity: tuple[tuple[str, int], ...],
+                    expected_sha256: str,
+                    deadline: float | None,
+                ) -> None:
+                    deadlines["verify"] = deadline
+                    original_verify_image(
+                        child_handle,
+                        artifact,
+                        held_handles,
+                        expected_identity,
+                        expected_sha256,
+                        deadline,
+                    )
+                    events.append("image-verified")
+
+                def query_image(child_handle: int) -> str:
+                    self.assertEqual(child_handle, process_handle)
+                    events.append("query-image")
+                    if query_failure is not None:
+                        raise query_failure
+                    return str(queried_image)
+
+                def details(handle: int):
+                    value = original_details(handle)
+                    if foreign_native_identity and process_created[0] and not identity_mutated[0]:
+                        identity_mutated[0] = True
+                        return dataclasses.replace(
+                            value,
+                            native_identity=(
+                                value.native_identity[0],
+                                value.native_identity[1],
+                                value.native_identity[2] + 1,
+                            ),
+                        )
+                    return value
+
+                def close_handle(handle: int) -> None:
+                    closed_handles.append(handle)
+                    events.append(f"close-handle:{handle}")
+                    original_close_handle(handle)
+
+                def observe_image_sha256(handle: int, deadline: float | None) -> str:
+                    digest = original_hash_handle(handle, deadline)
+                    image_sha256.append(digest)
+                    return digest
+
+                def query_job(handle: int) -> int:
+                    self.assertIs(handle, job)
+                    events.append("active:0")
+                    return 0
+
+                def resume_process(pid: int) -> None:
+                    self.assertEqual(pid, process.pid)
+                    events.append("resume")
+                    process_state[0] = "completed"
+
+                artifact_records: list[dict[str, object]] = []
+                try:
+                    with (
+                        patch.object(iti, "_run_fixed", side_effect=dispatch_fixed_command),
+                        patch.object(iti.subprocess, "Popen", side_effect=launch_process),
+                        patch.object(iti, "_create_job_object", side_effect=lambda: events.append("job-create") or job),
+                        patch.object(iti, "_assign_job_object", side_effect=lambda handle, child: events.append("assign")),
+                        patch.object(iti, "_resume_suspended_process", side_effect=resume_process),
+                        patch.object(iti, "_query_suspended_image_path", side_effect=query_image),
+                        patch.object(iti, "_open_artifact_launch_lease", side_effect=open_lease),
+                        patch.object(iti, "_verify_suspended_artifact_image", side_effect=verify_image),
+                        patch.object(iti, "_windows_handle_details", side_effect=details),
+                        patch.object(iti, "_windows_handle_sha256", side_effect=observe_image_sha256),
+                        patch.object(iti, "_close_windows_handle", side_effect=close_handle),
+                        patch.object(iti, "_terminate_job_object", side_effect=lambda handle, code: events.append("terminate")),
+                        patch.object(iti, "_query_job_active_processes", side_effect=query_job),
+                        patch.object(iti, "_close_job_object", side_effect=lambda handle: events.append("close-job")),
+                    ):
+                        compiled = discover_compiled(
+                            troot,
+                            [target],
+                            runner=None,
+                            metadata=metadata,
+                            artifact_denominator_records=artifact_records,
+                            deadline=caller_deadline,
+                        )
+                    error = None
+                except BaseException as caught:
+                    compiled = None
+                    error = caught
+                return {
+                    "compiled": compiled,
+                    "error": error,
+                    "events": events,
+                    "lease_handles": lease_handles,
+                    "closed_handles": closed_handles,
+                    "deadlines": deadlines,
+                    "handler_started": handler_started,
+                    "rename_results": rename_results,
+                    "carriers": captured_carriers,
+                    "lease_receipts": lease_receipts,
+                    "artifact_records": artifact_records,
+                    "receipt_sha256": receipt_sha256,
+                    "image_sha256": image_sha256,
+                    "mutation_observations": mutation_observations,
+                    "process": process,
+                    "popen_count": len([event for event in events if event == "popen"]),
+                    "identity_mutated": identity_mutated[0],
+                    "query_image_called": "query-image" in events,
+                }
+
+            launch_deadline = iti.time.monotonic() + float(BOUNDS.command_timeout_seconds)
+            admitted_launch = run_guarded_listing(
+                list_executable,
+                attempt_component_rename=True,
+                caller_deadline=launch_deadline,
+            )
+            self.assertIsNone(admitted_launch["error"])
+            self.assertEqual(len(admitted_launch["carriers"]), 1)
+            self.assertEqual(len(admitted_launch["artifact_records"]), 1)
+            admitted_artifact = admitted_launch["carriers"][0]
+            admitted_record = admitted_launch["artifact_records"][0]
+            self.assertEqual(
+                [item.test_name for item in admitted_launch["compiled"]],
+                [fixture_row["test_name"]],
+            )
+            self.assertEqual(admitted_artifact.package_id, target.package_id)
+            self.assertEqual(admitted_artifact.target_kind, target.target_kind)
+            self.assertEqual(admitted_artifact.target_name, target.target_name)
+            self.assertEqual(admitted_artifact.executable, list_executable)
+            self.assertEqual(admitted_artifact.target_root, admitted_root)
+            self.assertEqual(admitted_artifact.profile, artifact_record["profile"])
+            self.assertEqual(admitted_artifact.file_identity, admitted_identity)
+            self.assertEqual(admitted_artifact.executable_sha256, admitted_sha256)
+            self.assertEqual(admitted_launch["receipt_sha256"], [admitted_sha256])
+            self.assertEqual(len(admitted_launch["lease_receipts"]), 1)
+            leased_artifact, leased_identity, leased_sha256 = admitted_launch["lease_receipts"][0]
+            self.assertEqual(leased_artifact.executable, admitted_artifact.executable)
+            self.assertEqual(leased_artifact.target_root, admitted_artifact.target_root)
+            self.assertEqual(leased_artifact.package_id, admitted_artifact.package_id)
+            self.assertEqual(leased_artifact.target_kind, admitted_artifact.target_kind)
+            self.assertEqual(leased_artifact.target_name, admitted_artifact.target_name)
+            self.assertEqual(leased_artifact.profile, admitted_artifact.profile)
+            self.assertEqual(leased_identity, tuple(sorted(admitted_identity.items())))
+            self.assertEqual(leased_sha256, admitted_artifact.executable_sha256)
+            self.assertEqual(admitted_record["executable"], artifact_record["executable"])
+            self.assertEqual(admitted_record["profile"], admitted_artifact.profile)
+            self.assertEqual(admitted_record["file_identity"], admitted_artifact.file_identity)
+            self.assertEqual(admitted_record["sha256"], admitted_artifact.executable_sha256)
+            self.assertIsNot(admitted_record["profile"], admitted_artifact.profile)
+            self.assertIsNot(admitted_record["file_identity"], admitted_artifact.file_identity)
+            admitted_events = admitted_launch["events"]
+            admitted_leases = admitted_launch["lease_handles"]
+            admitted_closes = admitted_launch["closed_handles"]
+            admitted_deadlines = admitted_launch["deadlines"]
+            self.assertTrue(admitted_leases)
+            self.assertEqual(len(admitted_leases), len(set(admitted_leases)))
+            self.assertEqual(
+                len(admitted_leases),
+                len(Path(os.path.abspath(list_executable)).parts),
+            )
+            self.assertEqual(len(admitted_launch["rename_results"]), 2)
+            self.assertTrue(all(isinstance(error, OSError) for error in admitted_launch["rename_results"]))
+            self.assertLess(admitted_events.index("lease-open"), admitted_events.index("popen"))
+            self.assertIn("query-image", admitted_events)
+            self.assertLess(admitted_events.index("assign"), admitted_events.index("resume"))
+            self.assertLess(admitted_events.index("image-verified"), admitted_events.index("resume"))
+            self.assertIn("active:0", admitted_events)
+            self.assertIn("close-job", admitted_events)
+            self.assertEqual(set(admitted_deadlines), {"lease", "verify"})
+            self.assertEqual(admitted_deadlines["lease"], admitted_deadlines["verify"])
+            cutoff = admitted_deadlines["lease"]
+            self.assertIsInstance(cutoff, float)
+            self.assertGreater(cutoff, admitted_launch["handler_started"][0])
+            self.assertLessEqual(cutoff, launch_deadline)
+            for handle in admitted_leases:
+                self.assertEqual(admitted_closes.count(handle), 1)
+                self.assertLess(
+                    admitted_events.index("resume"),
+                    admitted_events.index(f"close-handle:{handle}"),
+                )
+
             real_lstat = Path.lstat
             reparse_stat = Mock()
             reparse_stat.st_mode = 0o40755
@@ -2815,10 +3266,12 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 timeout: float = 1.0,
                 argv: Sequence[str] = ("git", "rev-parse", "HEAD"),
                 admitted_executable: Path | None = None,
+                admitted_artifact: Artifact | None = None,
                 active_count_fallback: int = 0,
             ) -> tuple[InventoryError, list[str], Mock]:
                 job = object()
                 process_handle = 4242
+                lease_handle = process_handle + 1
                 process = Mock()
                 process._handle = process_handle
                 process.pid = 42
@@ -2840,6 +3293,13 @@ class TestIgnoredTestInventory(unittest.TestCase):
                     patch.object(iti, "_create_job_object", return_value=job),
                     patch.object(iti, "_assign_job_object", side_effect=lambda handle, child: events.append("assign")),
                     patch.object(iti, "_resume_suspended_process", side_effect=lambda pid: events.append("resume")),
+                    patch.object(iti, "_open_artifact_launch_lease", return_value=(lease_handle,)),
+                    patch.object(
+                        iti,
+                        "_verify_suspended_artifact_image",
+                        side_effect=lambda *args: events.append("image-verified"),
+                    ),
+                    patch.object(iti, "_close_windows_handle", side_effect=lambda handle: events.append("lease-close")),
                     patch.object(iti, "_terminate_job_object", terminate_job),
                     patch.object(
                         iti,
@@ -2859,10 +3319,13 @@ class TestIgnoredTestInventory(unittest.TestCase):
                             argv,
                             timeout=timeout,
                             admitted_executable=admitted_executable,
+                            admitted_artifact=admitted_artifact,
                         )
                 self.assertIn("terminate", events)
                 self.assertIn("close", events)
                 self.assertEqual(active_counts, [])
+                if admitted_artifact is not None:
+                    self.assertEqual(events.count("lease-close"), 1)
                 return cm.exception, events, terminate_job
 
             overflow_error, overflow_events, overflow_terminate = run_fixed_failure(
@@ -2919,6 +3382,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
                     timeout=10.0,
                     argv=list_argv,
                     admitted_executable=list_executable,
+                    admitted_artifact=admitted_artifact,
                 )
             self.assertEqual(timeout_error.code, "COMPILED_GRAPH_UNAVAILABLE")
             self.assertEqual(timeout_terminate.call_count, 1)
@@ -2968,6 +3432,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
                     timeout=10.0,
                     argv=list_argv,
                     admitted_executable=list_executable,
+                    admitted_artifact=admitted_artifact,
                     active_count_fallback=1,
                 )
             self.assertEqual(uncertain_error.code, "COMPILED_GRAPH_UNAVAILABLE")
@@ -2980,6 +3445,109 @@ class TestIgnoredTestInventory(unittest.TestCase):
             self.assertIn("tail-marker", uncertain_error.detail)
             self.assertLessEqual(uncertain_clock_calls[0], 128)
             self.assertLessEqual(uncertain_sleep_calls[0], 64)
+
+            missing_carrier_popen = Mock()
+            with patch.object(iti.subprocess, "Popen", missing_carrier_popen):
+                with self.assertRaises(InventoryError) as cm:
+                    _run_fixed(
+                        troot,
+                        list_argv,
+                        admitted_executable=list_executable,
+                        admitted_target_root=admitted_root,
+                    )
+            self.assertEqual(cm.exception.code, "COMMAND_NOT_ALLOWED")
+            missing_carrier_popen.assert_not_called()
+
+            alternate_executable = list_executable.with_name(list_executable.name + ".alternate")
+            alternate_executable.write_bytes(list_executable.read_bytes() + b"\x00")
+            outside_image = Path(__file__).resolve()
+
+            def assert_refusal_cleanup(observation: dict[str, object]) -> None:
+                events = observation["events"]
+                leases = observation["lease_handles"]
+                self.assertNotIn("resume", events)
+                self.assertTrue(observation["process"].wait.called)
+                self.assertIn("reap", events)
+                self.assertTrue(leases)
+                first_release = min(
+                    events.index(f"close-handle:{handle}") for handle in leases
+                )
+                if "assign" in events:
+                    self.assertIn("terminate", events)
+                    self.assertIn("active:0", events)
+                    self.assertIn("close-job", events)
+                    for settled_event in ("terminate", "reap", "active:0"):
+                        self.assertLess(events.index(settled_event), first_release)
+                else:
+                    self.assertIn("kill", events)
+                    self.assertLess(events.index("reap"), first_release)
+                for handle in leases:
+                    self.assertEqual(observation["closed_handles"].count(handle), 1)
+
+            mismatched_launches = (
+                run_guarded_listing(outside_image),
+                run_guarded_listing(alternate_executable),
+                run_guarded_listing(list_executable, foreign_native_identity=True),
+            )
+            for mismatched_launch in mismatched_launches:
+                self.assertIsInstance(mismatched_launch["error"], InventoryError)
+                self.assertEqual(mismatched_launch["error"].code, "COMPILED_GRAPH_UNAVAILABLE")
+                self.assertTrue(mismatched_launch["query_image_called"])
+                assert_refusal_cleanup(mismatched_launch)
+            self.assertTrue(mismatched_launches[2]["identity_mutated"])
+
+            query_failure_launch = run_guarded_listing(
+                list_executable,
+                query_failure=OSError("injected suspended image query failure"),
+            )
+            self.assertIsInstance(query_failure_launch["error"], InventoryError)
+            self.assertEqual(query_failure_launch["error"].code, "COMPILED_GRAPH_UNAVAILABLE")
+            cancellation_signal = KeyboardInterrupt("injected suspended image query cancellation")
+            cancellation_launch = run_guarded_listing(
+                list_executable,
+                query_failure=cancellation_signal,
+            )
+            self.assertIs(cancellation_launch["error"], cancellation_signal)
+            for interrupted_launch in (query_failure_launch, cancellation_launch):
+                self.assertTrue(interrupted_launch["query_image_called"])
+                assert_refusal_cleanup(interrupted_launch)
+
+            stale_original_bytes = list_executable.read_bytes()
+            stale = run_guarded_listing(
+                list_executable,
+                mutate_before_listing=True,
+            )
+            mutation = stale["mutation_observations"][0]
+            self.assertEqual(mutation["receipt_identity"], admitted_identity)
+            self.assertEqual(mutation["live_identity"], admitted_identity)
+            self.assertEqual(mutation["receipt_sha256"], admitted_sha256)
+            self.assertNotEqual(mutation["live_sha256"], mutation["receipt_sha256"])
+            self.assertEqual(stale["error"].code, "COMPILED_GRAPH_UNAVAILABLE")
+            self.assertEqual(stale["popen_count"], 0)
+            self.assertNotIn("resume", stale["events"])
+            self.assertEqual(len(stale["carriers"]), 1)
+            self.assertEqual(stale["receipt_sha256"], [admitted_sha256])
+            stale_carrier = stale["carriers"][0]
+            self.assertEqual(stale_carrier.file_identity, admitted_identity)
+            self.assertEqual(stale_carrier.executable_sha256, admitted_sha256)
+            self.assertEqual(len(stale["lease_receipts"]), 1)
+            stale_lease_artifact, stale_identity, stale_sha256 = stale["lease_receipts"][0]
+            self.assertEqual(stale_lease_artifact.file_identity, admitted_identity)
+            self.assertEqual(stale_identity, tuple(sorted(admitted_identity.items())))
+            self.assertEqual(stale_sha256, admitted_sha256)
+            self.assertEqual(stale["image_sha256"], [mutation["live_sha256"]])
+            self.assertFalse(stale["lease_handles"])
+            self.assertTrue(stale["closed_handles"])
+            self.assertEqual(len(stale["closed_handles"]), len(set(stale["closed_handles"])))
+            self.assertEqual(
+                len(stale["closed_handles"]),
+                len(Path(os.path.abspath(list_executable)).parts),
+            )
+            list_executable.write_bytes(stale_original_bytes)
+            os.utime(
+                list_executable,
+                ns=(admitted_identity["mtime_ns"], admitted_identity["mtime_ns"]),
+            )
 
     # WORK_UNIT_CASE: 905/26
     def test_no_provisioning_ignored_test_execution_workflow_secret_rust_mutation_path(self) -> None:

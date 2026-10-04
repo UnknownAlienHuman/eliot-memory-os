@@ -17,8 +17,8 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // seam stays typed-Unavailable
 // (`super::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open). No terminal is owned here: the single terminal for a
-// failed activation stays with the outermost #891 contour (e.g.
-// `host-start-failed` / `host-resume-pending-failed` in `lib.rs`). This
+// failed activation stays with the outermost #891 contour in `lib.rs`, whose armed
+// boundary on the STARTUP production launch path arms `BOUNDARY_OPEN_TERMINAL`, while a cutover-path launch is owned by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`. This
 // coordinates the "one terminal across nesting" rule with #891.
 //
 // Bounded identities, not stage order alone (audit 5910159678 defects 3 and 5):

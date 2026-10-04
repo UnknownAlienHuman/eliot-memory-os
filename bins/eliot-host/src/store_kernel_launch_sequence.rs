@@ -33,8 +33,8 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // seam stays typed-Unavailable
 // (`crate::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open). No terminal is owned here: the single terminal for a
-// failed launch stays with the outermost #891 contour (`host-start-failed` in
-// `lib.rs`).
+// failed launch stays with the outermost #891 contour in `lib.rs`, which arms
+// `BOUNDARY_OPEN_TERMINAL` ("host-open-failed") on the STARTUP launch path, and a cutover-path launch by `BOUNDARY_BACKUP_CUTOVER_TERMINAL`.
 //
 // Physical truth only, never semantic acceptance (audit 5910159678 defect 1).
 // The Store barrier this cell observes is the caller's `StoreLivenessEvidence`
