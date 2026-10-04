@@ -4,13 +4,56 @@
 //! MEASURED reason is written down at `UNDISPATCHED_CASES` rather than left to be
 //! inferred from a missing marker.
 //!
+//! THE PROOF CEILING OF THIS FILE, WHICH IS ZERO EXECUTED EXPECTED TESTS, stated here
+//! because a reader who opens this artifact must not have to infer it. NOTHING IN THIS FILE
+//! HAS EVER BEEN EXECUTED BY THE LANE THAT WROTE IT. Not once, not partially, and not
+//! through any filter or selector: the lane that wrote these fourteen thousand lines ran no
+//! test, so no assertion in this file has been observed to pass or to fail.
+//!
+//! THE GOVERNING SENTENCE IS CANONICAL AND MAY BE QUOTED AS IT STANDS:
+//! "Zero executed expected tests is not PASS" (`A14.8`,
+//! `docs/architecture/A14-08-development-doctrine.md`, the known-proof-ceiling requirement
+//! of an independently invocable proof surface).
+//!
+//! WHAT WAS RUN, AND IT IS A COMPILE GATE AND NOT A MODULE PROOF:
+//! * `cargo fmt --package eliot-types -- --check` — exit 0;
+//! * `cargo clippy --locked -p eliot-types --all-targets --no-deps -- -D warnings` — exit 0,
+//!   zero findings;
+//! * `git diff --check`.
+//!
+//! All three were measured at the revision this file's own bytes record, and they are
+//! recorded AS A MEASUREMENT RATHER THAN AS A STANDING PROPERTY, because this file is under
+//! concurrent edit in the same delivery that wrote it: a bare "clippy is clean" is false the
+//! moment the file changes, so the revision is part of the claim and not an afterthought.
+//!
+//! NONE OF THAT IS ACCEPTANCE OF BEHAVIOUR. A compile gate establishes that the crate
+//! builds and that this file is lint-clean under the workspace's `pedantic` configuration.
+//! It establishes nothing about whether any assertion below holds, and a green gate here is
+//! compatible with every assertion in this file being wrong.
+//!
+//! SO THE CARD'S "OBSERVED PASSING" CONDITION IS NOT CLAIMED AND CANNOT BE CLAIMED FROM
+//! HERE. The card asks that the dispatched cases exist and are observed passing. The first
+//! half is checkable from this file's bytes and is checked by
+//! `test_attributes_are_bound_to_case_markers`; the second half is an EXECUTION result, and
+//! no amount of reading substitutes for it. Asserting it from this lane would be the one
+//! class of claim this delivery is not permitted to make.
+//!
+//! AND THEREFORE EVERY BEHAVIOURAL STATEMENT IN THIS FILE IS A CODE-READING CLAIM, not an
+//! observation: a statement about what a PINNED DEPENDENCY SOURCE says at a cited line of
+//! `serde-1.0.151`, `serde-1.0.229` or `uuid-1.26.1`, derived by reading that source and
+//! not by running it. Where this file says a decoder "proves" or "discharges" something, it
+//! means the ASSERTION is written to establish it IF EXECUTED, and that its construction is
+//! auditable by reading. That is a different and weaker thing than an outcome, and the
+//! distinction is the whole of this paragraph.
 //! WHAT IS READ AT RUNTIME IS SEVEN SOURCE FILES PLUS THIS CRATE'S MANIFEST, and the
 //! five allocated files are not all of it. The five allocated files — `lib.rs`,
 //! `error.rs`, `ids.rs`, `records.rs` and `task_execution.rs` — alone are the
 //! serde-candidate denominator. Case 16 reads three further paths, and each of the three
 //! is a claim ABOUT the allocation rather than an addition to it:
 //! * `crates/eliot-types/src/health.rs` supplies the deferred `HealthStatus` vocabulary
-//!   that case 16 proves is still OUT of the wire shape;
+//!   that case 16's assertion is written to ESTABLISH is still OUT of the wire shape —
+//!   which is what the assertion would establish if it were executed, and this lane
+//!   executes nothing;
 //! * `crates/eliot-store/src/surreal_store.rs` is read as TEXT ONLY, for the consumer
 //!   outside this crate whose `status` assignment is what keeps that field open — this
 //!   crate has no `[dev-dependencies]`, so no link exists and text is the honest form;
@@ -108,8 +151,8 @@
 //!   `store_health_record_stays_outside_the_vocabulary` as
 //!   `let source = read_workspace(STORE_HEALTH_CONSUMER)?;`, handed to the construction
 //!   scan, whose first guard fails the case outright when the scan finds nothing — the
-//!   failure names the absence and says "{STORE_HEALTH_CONSUMER} constructs no
-//!   {HEALTH_RECORD_TYPE}, so the narrowing claim cannot be checked". The tempting
+//!   failure names the absence and says "{`STORE_HEALTH_CONSUMER`} constructs no
+//!   {`HEALTH_RECORD_TYPE`}, so the narrowing claim cannot be checked". The tempting
 //!   alternative is RELOCATION onto one of the three `eliot-store` files the card DOES
 //!   name, and the repository forecloses it: `HealthRecord` is constructed in exactly
 //!   two places under `crates/` outside its own definition, both of them in this
@@ -149,25 +192,26 @@
 //! `health.rs`, nothing under `surreal_store.rs` and nothing under this crate's own
 //! manifest is modified by this delivery.
 //!
-//! Case 1 proves the allocation table is complete and honest: one row for every
+//! Case 1's assertion is written to establish that the allocation table is complete and
+//! honest — what it WOULD establish if executed, which is what this lane can say: one row for every
 //! type the five allocated files declare, read from live source rather than
 //! counted here, plus the declared `meta.count`, the exact per-file split, the
 //! closed `shape` vocabulary and `also_in_cases` cross-references, every
 //! `id_type!` expansion present by name, and a recorded row-level reason for
 //! every inapplicable shape rather than an ignored row.
 //!
-//! Case 2 discharges TWO distinct claims, from two different row sets, and it is
+//! Case 2 makes TWO distinct assertions, from two different row sets, and it is
 //! worth keeping them apart:
 //! * the **valid-bytes** claim — every canonical payload decodes and
-//!   re-serializes without drift — is discharged by the **case-1 allocation
-//!   rows**, via `round_trip_row` over `allocation_rows`. It is not discharged by
-//!   the absence rows.
+//!   re-serializes without drift — is what the **case-1 allocation rows** are
+//!   asserted to establish, via `round_trip_row` over `allocation_rows`. The absence
+//!   rows would not establish it.
 //! * the **absence** claim — an empty identity and an unsupported or empty
 //!   `schema_version` decode with their recorded values PRESERVED, because the
 //!   five allocated files declare no `validate` and no `check` function and the
 //!   empty-string gates live in `runtime.rs` and `runtime_supervision.rs` on
-//!   different types — is discharged by the **case-2 absence rows**. Asserting a
-//!   refusal there would be false against live source.
+//!   different types — is what the **case-2 absence rows** are asserted to
+//!   establish. Asserting a refusal there would be false against live source.
 //!
 //! Case 2 also runs the L2 optional-member claims on every page row it owns, the
 //! allocation page and the case-12 absence pages, so the present and the absent
@@ -177,10 +221,13 @@
 //! the only top-level explicit null in all 162 rows is `"continuation":null`, and
 //! `continuation` is an always-emitted member.
 //!
-//! Case 3 proves an unknown top-level member is refused by the closed structs.
-//! Case 4 proves an unknown member nested inside an owned member is refused too.
-//! Case 11 proves the `strict_json.rs` ingress and the `alias` / `#[serde(default)]`
-//! / `#[serde(untagged)]` paths cannot erase protected input, and it is PARTIAL: the
+//! Case 3's assertion is written to establish that an unknown top-level member is refused
+//! by the closed structs.
+//! Case 4's assertion is written to establish that an unknown member nested inside an
+//! owned member is refused too.
+//! Case 11's assertion is written to establish that the `strict_json.rs` ingress and the
+//! `alias` / `#[serde(default)]` / `#[serde(untagged)]` paths cannot erase protected input,
+//! and it is PARTIAL: the
 //! capacity-receipt half of its card clause is unreachable from this crate and that
 //! is written down in the test's own comment, not here.
 //! Cases 1-4, 5, 6, 7, 10, 11, 12, 14, 15 and 16 are the whole scope of this file,
@@ -217,6 +264,7 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::fmt::Write;
 use std::path::PathBuf;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -276,7 +324,7 @@ struct Row {
 /// SHA-256 values and a promise that a test would recompute them, with no reader
 /// anywhere in the repository. The pairs are `(repository-relative path, hex
 /// digest)`; `serde_json::Map` is a `BTreeMap`, so the order is the map's own
-/// sorted order and is stable across runs.
+/// sorted order and is stable across runs. CITED AND CFG-CHECKED ONCE, at `decode_row` and at the case-11 erasure site; this mention carries no citation of its own.
 struct Fixture {
     declared_count: i64,
     rows: Vec<Row>,
@@ -428,8 +476,8 @@ const WORK_UNIT_CASE_MARKER: &str = "// WORK_UNIT_CASE: 930/";
 /// three below names the symbol or the fixture row that settles it.
 ///
 /// CASE 8 — "wrong payload, missing/empty protected identity and unsupported version
-/// rejected without fabricated values". The two legs with no refusal in this crate
-/// are EMPTY PROTECTED IDENTITY and UNSUPPORTED VERSION, and refusing them here would
+/// rejected without fabricated values". The two legs with no REACHABLE refusal are
+/// EMPTY PROTECTED IDENTITY and UNSUPPORTED VERSION, and refusing them here would
 /// be FALSE against live source rather than merely unproven. Every protected identity
 /// in `records.rs` is a plain `String` (`records.rs:12, 32, 52, 76, 114, 133, 146`),
 /// both `schema_version` members are a plain `String` (`records.rs:31` and `:51`),
@@ -450,16 +498,73 @@ const WORK_UNIT_CASE_MARKER: &str = "// WORK_UNIT_CASE: 930/";
 /// leg by `case_07_missing_required_member_is_refused`. A `930/8` marker here would
 /// either duplicate those two or assert a refusal that does not exist.
 ///
+/// THE VERSION AND EMPTY-VALUE SUBJECTS ARE NOT ONLY THE TWO `records.rs` MEMBERS, and the
+/// previous version of this paragraph was incomplete in leaving it that way. `error.rs`
+/// — which IS one of the five `ALLOCATED_SOURCE_FILES` — carries two more:
+///   * `error.rs:5-9`, `UnsupportedSchemaVersion { expected: &'static str, actual: String }`,
+///     rendered `"schema_version must be {expected}, got {actual}"`;
+///   * `error.rs:11-12`, `EmptyField { field: &'static str }`, rendered
+///     `"{field} must not be empty"`.
+///
+/// So this crate DOES name an unsupported-version and an empty-value subject inside an
+/// allocated file, which is exactly what the enumeration above appeared to deny. THEY ARE
+/// UNREACHABLE ALL THE SAME, for a reason independent of the allocation argument:
+/// `error.rs:3` derives only `Debug, Error, Eq, PartialEq`, and the word `serde` appears
+/// NOWHERE in its 44 lines, so no raw-byte row can exercise either variant — they are
+/// constructed in Rust, never deserialized. `zero_candidate_files_are_proved`
+/// already discharges their emptiness from those same two facts. The undispatch stands on
+/// THAT ground. What changed here is that the list of subjects is now complete rather
+/// than flattering, so a reader who finds `ConfigError` in an allocated file learns the
+/// real reason from this paragraph instead of concluding the reason was never checked.
+///
 /// CASE 9 — "supported named legacy migration preserves evidence; unsafe migration
-/// refuses". There is NO NAMED LEGACY MIGRATION in this crate to preserve anything
-/// through. `MigrationRecord` declares exactly three wire members and no version
-/// member at all, and this file's own `migration_schema_admits_no_legacy_form`
-/// ACTIVELY ASSERTS that its generated schema admits no legacy form, which is the
-/// opposite of a migration surface. The named legacy selector is
-/// `crates/eliot-store/src/canonical_record.rs:332 struct EnvelopeVisitor<T>`, a
-/// private type owned by issue #976, unreachable from this target for the same
-/// `[dev-dependencies]` reason. Inventing a legacy document here would author the
-/// very artifact whose absence is the finding.
+/// refuses".
+///
+/// THE PREVIOUS VERSION OF THIS PARAGRAPH WAS FALSE, and the correction is recorded here
+/// rather than made silently because a reader who checks the source will land on the
+/// subject below and must be able to see that this file once claimed there was nothing to
+/// find. It read: "There is NO NAMED LEGACY MIGRATION in this crate to preserve anything
+/// through." That is false on both counts, and both were verified against live source.
+///
+/// (A) THE SUBJECT EXISTS. `crates/eliot-types/src/ul/cue.rs:63` declares
+/// `pub struct LegacyCueKindV1MigrationDescriptor` — a NAMED legacy migration descriptor,
+/// in this crate, sealed by a private `_sealed: ()` field, documented at `:61-62` as "any
+/// change to the pinned target revision or digest invalidates this descriptor; revalidate
+/// against `smart.cue.contracts` before any migration use". It has a companion type
+/// `LegacyCueKindV1` (`ul/cue.rs:24`) and a full set of provenance constants —
+/// `SOURCE_SCHEMA`, `SOURCE_GENERATION`, `SOURCE_BASE_SHA`, `SOURCE_SEAM_ISSUE` (706),
+/// `TARGET_MODULE`, `TARGET_CRATE` — whose whole purpose is to govern a named migration.
+///
+/// (B) IT IS REACHABLE FROM AN ALLOCATED FILE'S OWN PUBLIC SURFACE. `src/lib.rs:449-455`
+/// re-exports the cue vocabulary including `LegacyCueKindV1`, and `lib.rs` IS one of the
+/// five `ALLOCATED_SOURCE_FILES`. So the false sentence was not merely overlooking a type
+/// in a file nobody names — that defence is unavailable here.
+///
+/// SO CASE 9 IS STILL UNDISPATCHED, ON A DIFFERENT AND SUFFICIENT GROUND: ALLOCATION, NOT
+/// ABSENCE. `ul/cue.rs` is not one of the five allocated files, and this file's own
+/// `decode_row` matches on `source_leaf(&row.source)` and admits exactly three
+/// leaves — `ids.rs`, `records.rs`, `task_execution.rs` — failing with "names an
+/// unallocated source file" for anything else. Every raw-byte row this file decodes
+/// therefore enters one of those three modules, and none of them can name
+/// `LegacyCueKindV1MigrationDescriptor`. A migration probe here would have to reach a
+/// module the fixture cannot address, which is a DIFFERENT and SUPPORTABLE statement
+/// from the one this paragraph used to make.
+///
+/// WHAT ELSE WAS TRUE AND IS KEPT. `MigrationRecord` declares exactly three wire members
+/// and no version member at all, and this file's own
+/// `migration_schema_admits_no_legacy_form` ACTIVELY ASSERTS that its generated schema
+/// admits no legacy form. The named legacy SELECTOR outside this crate is
+/// `crates/eliot-store/src/canonical_record.rs:332 struct EnvelopeVisitor<T>`, a private
+/// type owned by issue #976, unreachable from this target because `eliot-types` declares no
+/// `[dev-dependencies]` and `eliot-store` depends on `eliot-types`. Inventing a legacy
+/// document here would author the very artifact whose absence is the finding.
+///
+/// WHETHER CASE 9 OUGHT TO BE DISPATCHED IS NOT DECIDED HERE. The allocation ground above
+/// is sufficient to justify the undispatch and is what this file claims. Whether a case
+/// whose subject demonstrably EXISTS but is unreachable by raw bytes should still be
+/// discharged by some other mechanism is a question about what this test is for; it is
+/// escalated rather than answered, and a future reader must not read this paragraph as
+/// either a ruling that the case belongs here or a ruling that it does not.
 ///
 /// CASE 13 — "exact exceptions invalidate on use change; bounded malformed input is
 /// panic-free". BOTH clauses are unavailable, in opposite directions. The panic-free
@@ -472,6 +577,51 @@ const WORK_UNIT_CASE_MARKER: &str = "// WORK_UNIT_CASE: 930/";
 /// in this file, `store_health_record_stays_outside_the_vocabulary`, proves the
 /// OPPOSITE direction — that closing the field today would be a compile error — not
 /// the forward "a use change invalidates the exception" direction the clause names.
+/// The nesting depths case 4's hand-written `Step` path list actually probes, DERIVED FROM
+/// THIS FILE'S OWN BYTES rather than transcribed beside them.
+///
+/// A derived set and not a constant, and the reason is the whole of the limitation this
+/// guards: a second hand-written list would be the same defect in a new place. Deriving it
+/// from the call sites means DELETING the last depth-3 path reds the case-4 guard instead
+/// of quietly reducing what the case covers.
+///
+/// WHAT "UPDATES AUTOMATICALLY" DOES NOT MEAN, because a previous version of this comment
+/// said "adding a path updates the depths automatically" and that is FALSE for any path
+/// whose depth is already present: the set is of DISTINCT depths, so adding a second
+/// depth-3 path leaves it byte-identical and the guard cannot tell the difference. Adding
+/// a path changes the set only when it introduces a depth not already there. What is
+/// genuinely derived is the set of depths EXISTING, which is what the guard needs; the
+/// count of paths is not derived anywhere and is stated in prose instead.
+fn nested_probe_depths() -> Vec<usize> {
+    let mut depths: Vec<usize> = Vec::new();
+    for line in THIS_FILE.lines() {
+        let trimmed = line.trim();
+        // Each nested probe passes its path as a bracketed `Step` list on its own line, so
+        //
+        // RECORDED RISK, MEASURED AND NOT FIXED, because this predicate is LINE-ORIENTED and
+        // FORMATTING-DEPENDENT, which is a real fragility rather than a hypothetical one. A
+        // `Step` path split across two lines would leave each half failing this prefix test,
+        // the site would be SILENTLY DROPPED from the derived set, and the guard would keep
+        // passing while probing less than it appears to.
+        // WHAT HOLDS TODAY, measured on this file's bytes rather than assumed: all seven
+        // `Step` sites are single-line, the longest of those lines is 72 columns against this
+        // repository's `max_width = 100`, and there is no `rustfmt.toml` anywhere in the
+        // repository, so no configured width would force a wrap. THAT MEASUREMENT IS A
+        // PROPERTY OF TODAY'S CORPUS AND NOT OF THIS CODE, and it is stated here so a reader
+        // who runs `cargo fmt` knows which invariant just moved underneath the predicate.
+        // counting the steps on that line is counting a real call site's path length.
+        if !trimmed.starts_with("&[Step::") {
+            continue;
+        }
+        let depth = trimmed.matches("Step::").count();
+        if depth != 0 && !depths.contains(&depth) {
+            depths.push(depth);
+        }
+    }
+    depths.sort_unstable();
+    depths
+}
+
 const UNDISPATCHED_CASES: [i64; 3] = [8, 9, 13];
 
 /// The `case` of the unknown-top-level-member acceptance case.
@@ -1187,7 +1337,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     }
     let mut hex = String::with_capacity(64);
     for word in &state {
-        hex.push_str(&format!("{word:08x}"));
+        let _ = write!(hex, "{word:08x}");
     }
     hex
 }
@@ -1624,6 +1774,21 @@ where
 /// not exist, and used it to omit an assertion that the issue's cases 1-4 require
 /// ("unchanged valid bytes/digests") and that `scalar_round_trip` already makes for
 /// the forty scalar rows.
+///
+/// THE CLAUSE'S NOUN IS "DIGESTS" AND NO DIGEST OVER WIRE BYTES IS RECORDED HERE, so
+/// the property is discharged while the noun is not, and that gap is named rather than
+/// left for a reader to notice. The card's case-2 clause reads "unchanged
+/// valid-byte round-trips/digests". What this helper asserts is STRICTLY STRONGER over
+/// the same bytes than digest-equality would be: `encoded == row.raw.trim()` — byte
+/// identity, not a collision-resistant function of the bytes. So nothing here is weaker
+/// than the clause asks for. What is absent is the DIGEST ARTIFACT: the only digests
+/// anywhere in this file are `meta.source_digests`, taken over the five decoder SOURCE
+/// files and asserted in case 16, and no digest is computed over any row's VALID WIRE
+/// BYTES. A reader who wants the digest half of the clause should look for it in case 16
+/// and understand that it is about source, not about rows. The gap is recorded, NOT
+/// closed: adding a wire-byte digest would be a weaker assertion than the one above, and
+/// this file prefers the stronger measurement and says so rather than adding the weaker
+/// one to satisfy a noun.
 ///
 /// WHAT THE OMISSION HID, which is why the correction is an assertion and not a
 /// comment. `decoded == again` and `to_string(&again) == encoded` both compare serde
@@ -2371,6 +2536,35 @@ fn inject_nested_unknown(
 /// `is_err` plus a substring naming the offending member. Never an exact
 /// equality against a serde message: the text is version-dependent and an
 /// exact match would prove nothing about this contract.
+/// THE POSITIVE HALF IS `message.contains(key)`, AND IT IS NOT ON ITS OWN A CLAIM THAT THE
+/// REFUSAL IS AN UNKNOWN-MEMBER REFUSAL. This is why the negative conjunct below exists.
+///
+/// THE HAZARD, and this file names it itself at the duplicate-key ledger: `UNKNOWN_FIELD_PREFIX`
+/// ENUMERATES EVERY declared field of a closed struct, so a refusal reading
+/// "unknown field `statu`, expected one of `component`, `status`, `detail`" contains the
+/// substring `status` WITHOUT `status` ever being absent from the document. The same
+/// substitution is available from every other prefix `serde` emits, because several of them
+/// list the members they were not looking for. A `contains(key)` conjunct alone is
+/// therefore satisfied by a refusal about a DIFFERENT member, which is a false pass rather
+/// than a weak one.
+///
+/// THE INJECTED KEYS ARE FRESH `930_unknown_*` NAMES, WHICH IS EXACTLY WHY THE CONJUNCT
+/// BELOW HAS TO BE THERE. A key that no `records.rs` struct declares cannot also be a member
+/// that a missing-field or duplicate-field refusal would name, and injecting a key cannot
+/// remove one — so the risk is low in practice. LOW IS NOT ABSENT, and an assertion
+/// that is safe only because of an unstated fact about the call sites is one that a future
+/// call site can invalidate silently. The conjunction is cheap and it turns an argument
+/// about the fixtures into a property of the message.
+///
+/// WHERE THE SAME EXCLUSION IS ALREADY APPLIED, so a reader can see this is the file's
+/// standing rule rather than a local invention: the duplicate-member ledger
+/// (`duplicate_member_is_refused`), the absent-member ledger
+/// (`missing_member_is_refused`), and the derived decoder's own visitor
+/// (`OrderVisitor`), which is the arm that produces the message this function checks
+/// for. THOSE ARE SYMBOLS AND NOT LINE NUMBERS, deliberately: a line number in a
+/// comment about another part of this file goes stale the moment anything above it is
+/// edited, which is how the five numeric references this paragraph replaced became
+/// wrong while reading as though they were current.
 fn reject_unknown_top_level<T>(row: &Row, key: &str) -> TestResult
 where
     T: DeserializeOwned,
@@ -2393,9 +2587,93 @@ where
                 "row {} must name the offending member {key}: {message}",
                 row.id
             );
+            assert_unknown_member_refusal(&message, &row.id, key);
             Ok(())
         }
     }
+}
+
+/// The shared negative half for both unknown-member helpers, factored out because the two
+/// sites differ only in where the member sits and a duplicated assertion is one that can be
+/// weakened in one place and left strict in the other.
+///
+/// WHAT IT EXCLUDES, and WHY EACH PREFIX IS EXCLUDED — each one is a refusal that would
+/// satisfy the bare `contains(key)` conjunct above while being the WRONG refusal. The two
+/// excluded prefixes that CARRY A LIST are the enumeration hazard, and the two that do not
+/// are excluded because the prefix alone must not appear, which is a different and weaker
+/// reason, so both are stated separately rather than lumped together as they were:
+///   * `UNKNOWN_FIELD_PREFIX` is what we are asserting, and the hazard it poses to the
+///     OTHER conjunct is that its `else` arm enumerates every declared field of a closed
+///     struct (`serde-1.0.229/src/core/de/mod.rs:277-281`) — the hazard is named in full at
+///     `missing_member_is_refused`, which excludes the same prefixes for the same reason.
+///   * `UNKNOWN_VARIANT_PREFIX` DOES ALSO CARRY A LIST, through the same `OneOf`
+///     (`serde-1.0.229/src/core/de/mod.rs:259-263`), so an unrecognized-variant refusal
+///     over an enum-typed member would enumerate the variants and could name the injected
+///     key as one of them. A previous version of this comment claimed `unknown_field` was
+///     the ONLY constructor that appends an expected-list, and THAT IS FALSE — `OneOf`
+///     serves both — which is why the exclusion is argued from the two arms of the match
+///     rather than from a uniqueness claim that does not hold.
+///   * `MISSING_FIELD_PREFIX` AND `DUPLICATE_FIELD_PREFIX` CARRY NO LIST AT ALL, and an
+///     earlier version of this comment said they listed "the members serde wanted", which
+///     is false: `missing_field` is `Error::custom(format_args!("missing field `{}`",
+///     field))` at `serde-1.0.229/src/core/de/mod.rs:289-291` and `duplicate_field` is the
+///     same shape with one argument at `:296-298`. Neither takes an `expected` parameter.
+///     They are still excluded, because a refusal for a DIFFERENT member would not name
+///     the injected key and so is not the failure being hunted here, and because this file
+///     applies the same exclusion uniformly at every ledger. The honest reason is prefix
+///     discipline, not a co-occurrence argument.
+///   * `INVALID_TYPE_PREFIX` is excluded for the same prefix-discipline reason and is
+///     added here for consistency with the other ledgers: an `invalid type: <unexp>,
+///     expected <exp>` message carries no member NAME at all, so there is no co-occurrence
+///     risk from it either. Nothing about its removal was load-bearing.
+///
+/// WHAT THE POSITIVE CONJUNCT ACTUALLY ENFORCES, stated to the predicate and not to a wish.
+/// It is a `contains`, so it accepts BOTH of serde's `unknown_field` arms: the bare
+/// `"unknown field `{key}`"` and the enumerated `"unknown field `{key}`, expected one of
+/// `a`, `b`, `c`"`. A previous version of this comment called the bare form "the only
+/// message shape this function accepts", and the code does not enforce that. It is NOT
+/// tightened into a negative conjunct for ", expected one of", because a new assertion on
+/// unexecuted output is the risk this lane cannot retire: the enumerated form is what a
+/// CLOSED struct produces, which is every struct this case probes, so excluding it would
+/// be excluding the live case rather than hardening it. What the predicate does establish is
+/// narrower and still load-bearing: the refusal NAMES the injected member with serde's
+/// unknown-member wording, and none of the four excluded prefixes appears anywhere in it.
+///
+/// WHY THIS IS SAFE TO ASSERT WITHOUT HAVING RUN IT. Not because of a uniqueness claim, and
+/// not because the exclusion list was checked against output — it was not. Every prefix
+/// excluded above is excluded by PREFIX, which is decidable from the four constructors'
+/// own `format_args!` at the lines cited, so no conjunct here depends on how any of them
+/// renders its arguments. The positive conjunct depends on the derived visitor's own
+/// format string, which this crate holds in its OWN SOURCE: `OrderVisitor`'s key arm
+/// formats `"{UNKNOWN_FIELD_PREFIX} `{key}`"` from the key it read, with no member list,
+/// and the duplicate arm beside it formats the `DUPLICATE_FIELD_PREFIX` spelling the same
+/// way. So the shape asserted is one this file can point at in its own bytes rather than
+/// one it has observed at run time.
+fn assert_unknown_member_refusal(message: &str, row_id: &str, key: &str) {
+    for (prefix, refusal) in [
+        (MISSING_FIELD_PREFIX, "an absent required member"),
+        (DUPLICATE_FIELD_PREFIX, "a repeated member"),
+        (UNKNOWN_VARIANT_PREFIX, "an unrecognized variant"),
+        (INVALID_TYPE_PREFIX, "a wrong JSON kind"),
+    ] {
+        assert!(
+            !message.contains(prefix),
+            "row {row_id}: the refusal for the injected member {key} is serde's {refusal} refusal (`{prefix}`), not its \
+             unknown-member refusal. This function claims the refusal is an UNKNOWN-MEMBER refusal, so every other \
+             refusal prefix must be absent: one that enumerates what serde was looking for could carry the injected \
+             key as an item of that list even though {key} is the member actually absent from the document, and one that \
+             does not is simply the wrong refusal. The full message was: {message}"
+        );
+    }
+    assert!(
+        message.contains(&format!("{UNKNOWN_FIELD_PREFIX} `{key}`")),
+        "row {row_id}: the refusal for the injected member {key} must name it with serde's unknown-member wording, \
+         i.e. it must contain `{UNKNOWN_FIELD_PREFIX} `{key}``; the bare `contains({key})` conjunct above is satisfied by \
+         any refusal that merely MENTIONS the key, so this is the conjunct that makes the claim about WHICH refusal it \
+         was. Both of serde's unknown_field arms are accepted here — the bare form and the enumerated one that \
+         follows with `, expected one of ...` — because a closed struct produces the enumerated form and this case \
+         probes closed structs. The full message was: {message}"
+    );
 }
 
 fn reject_unknown_nested<T>(row: &Row, steps: &[Step], key: &str) -> TestResult
@@ -2422,6 +2700,14 @@ where
                 row.id,
                 path_label(steps)
             );
+            // The same exclusion the top-level helper applies, and for the same reason: a
+            // bare `contains(key)` is satisfied by any refusal that merely MENTIONS the key.
+            // An earlier version of this comment said `unknown field`, `missing field`,
+            // `duplicate field` and `unknown variant` "all list members", and that is FALSE
+            // for two of the four: `missing_field` and `duplicate_field` take a single `field`
+            // argument and render no list at all. See `assert_unknown_member_refusal` for the
+            // per-prefix reasons, which are what make this asserted rather than assumed safe.
+            assert_unknown_member_refusal(&message, &row.id, key);
             Ok(())
         }
     }
@@ -3675,34 +3961,72 @@ const JSON_NULL: &str = "null";
 /// which name the failure direction each way.
 ///
 /// THE CONTAINER ARM COUNTS DEPTH AND NEVER CHECKS THAT A CLOSER MATCHES ITS OPENER. It
-/// pushes on `{` and `[` alike and pops on `}` and `]` alike, so `{"a":[1}` returns an
-/// extent ending at the `}` even though the container there was opened as `[`. That is
-/// CROSSED BRACKETS, which the JSON grammar does not admit, and the failure direction is
-/// a TOO-SHORT extent that ends while the caller still believes a container is open: the
-/// spliced result would then be missing the tail of the value it meant to replace. It is
-/// a red rather than a wrong answer for the caller at `document_with_member_value`, whose
-/// boundary probe rejects an extent that does not tile, and unreachable at
-/// `repeated_member_value_tokens` for the same reason its input is a refusal row.
+/// pushes on `{` and `[` alike and pops on `}` and `]` alike, so a `}` can close a `[`.
+/// That is CROSSED BRACKETS, which the JSON grammar does not admit.
 ///
-/// WHAT THE CORPUS DOES WITNESS IS THE OTHER DIRECTION — a container left OPEN at end
-/// of input, which three rows carry: `930-138`, `930-140` and `930-142`, each of which
-/// leaves a `{` on the stack at the last byte. For those the arm runs off the end and
-/// returns `bytes.len()`, so the extent is too LONG rather than too short, and the failure
-/// is contained because all three are REFUSED rows: a malformed document is rejected
-/// before any value extent is measured on it. CROSSED brackets are the direction nothing
-/// witnesses: scanning all 162 rows, every closer matches its own opener in every row, so
-/// the too-short extent described above is unreachable from any input the fixture owns and
-/// the paragraph about it is a construction argument rather than an observation.
+/// READ OFF THE ARM, and the earlier version of this paragraph got the direction wrong, so
+/// the worked example is derived here rather than asserted. THE ARM STARTS AT THE VALUE'S
+/// OWN OPENING BRACKET and never sees the document's `{`, so its depth is 0 before that
+/// bracket and 1 after it. `{"a":[1}` therefore does NOT stop short: depth falls to 0 at
+/// the `}` on byte 7 and the extent is `5..8`, which is `bytes.len()` — TOO LONG, and
+/// the splice is `{"a":REPL`, a document with no closing brace at all. An earlier version
+/// claimed this example produced a too-SHORT extent and said the following paragraph
+/// contradicted it; the contradiction was in the example, not the paragraph. THE MINIMAL
+/// TOO-SHORT WITNESS IS `{"a":{]}}`: the arm reads `{`, then `]` takes depth back to 0, so
+/// the extent is `5..7`, the token is `{]`, BOTH closers are left behind it, and the splice
+/// is `{"a":REPL}}` — a document whose members are lost rather than one whose tail is.
+///
+/// AND NOTHING DOWNSTREAM CATCHES EITHER. The caller at `document_with_member_value` does
+/// NOT run a tiling check: `top_level_value_span`'s only two guards are
+/// `end <= start || end > bytes.len()` and a whitespace-skipping probe that accepts `,`,
+/// `}`, `]` or end of input. That is a TERMINATOR check, not a tiling check, and an
+/// earlier version of this comment called it one. On the two examples above the probe
+/// passes in both directions: in `{"a":[1}` the probe lands on end of input and in
+/// `{"a":{]}}` it lands on the `}` at 7. So the crossed-bracket case is a WRONG ANSWER for
+/// a caller, not a red, and it is unreachable from this file's own rows only because the
+/// corpus contains no crossed brackets — see the measurement below.
+///
+/// MEASURED, on the live fixture, NOT DERIVED FROM THE CODE: what the corpus witnesses is
+/// NOT a container left open, because the container arm is entered by NONE of the three
+/// unbalanced rows. `930-138` and `930-140` end inside a STRING, so every member of theirs
+/// reaches the STRING arm or the bare-token arm and never the container arm — and the
+/// last member of each is an unterminated string whose extent comes back as
+/// `bytes.len() + 1`, which is OUT OF RANGE. They are the only two value-extent refusals in
+/// all 162 rows, and that is what makes the `end > bytes.len()` clause in
+/// `top_level_value_span` load-bearing rather than a formality. `930-142` is different
+/// again: its `detail` is a CLOSED string and simply the last member, so its extent is
+/// `60..83` = `bytes.len()`, both guards accept it, and on the one row that carries the
+/// too-long direction NOTHING catches it. That row is unreachable only because no caller is
+/// handed it, which is a fact about this file's call sites and not about the helper.
+/// An earlier version of this paragraph named all three rows as container-arm witnesses and
+/// said the arm "runs off the end"; both clauses were wrong, the arm named was the wrong one
+/// and the two rows that do exercise it reach the string arm.
+///
+/// CROSSED brackets remain the direction NOTHING witnesses: scanning all 162 rows, every
+/// closer matches its own opener in every row, so the too-short extent above is a
+/// construction argument about the code and not an observation about the corpus.
 ///
 /// THE BARE-TOKEN ARM DOES NOT VALIDATE WHAT IT PASSED OVER. It advances to the next
 /// `,`, `}` or `]` without asking whether the bytes between are a legal scalar, so on a
-/// document whose bare token is not one — `{"a":1 2}`, where two scalars stand where
-/// the grammar allows one — it returns `1 2` as a single value extent. The direction is
-/// a TOO-LONG extent, which is the opposite of what the false paragraph above claimed,
-/// and it is caught by the same boundary probe. Both residual cases are malformed input
-/// reaching a helper that only has to tile WELL-FORMED documents; the honest statement is
-/// that this helper measures a token's extent and does not certify that the token is
-/// well-formed, which is `serde_json`'s job and not this one's.
+/// document whose bare token is not one it returns the bytes up to the next terminator as
+/// a single value extent. TWO EXAMPLES, BOTH READ OFF THE ARM, and they are not equally
+/// harmless:
+///   * `{"a":1 2}` is the HARMLESS case. The extent is `5..8`, the token is `1 2`, and the
+///     splice is `{"a":REPL}` — which is what the caller wanted, with the stray scalar
+///     consumed along with it.
+///   * `{"a":1 "b":2,"c":3}` is NOT. The extent is `5..12` and the token is `1 "b":2`, so
+///     the scan has swallowed a WHOLE MEMBER the caller never named, and the splice is
+///     `{"a":REPL,"c":3}` — `b` is silently deleted. The terminator probe does not
+///     catch it: the probe skips whitespace from 12 and finds the `,` there, which is a
+///     legal terminator.
+///
+/// The direction is a TOO-LONG extent, the opposite of what the false paragraph above
+/// claimed, and an earlier version of this paragraph said "it is caught by the same
+/// boundary probe", which is FALSE for the second example. So both residual cases are
+/// malformed input reaching a helper whose only two guards are a range check and a
+/// terminator check; the honest statement is that this helper measures a token's extent and
+/// does not certify that the token is well-formed, nor that it is ONE token, which is
+/// `serde_json`'s job and not this one's.
 fn skip_json_value(bytes: &[u8], index: usize) -> usize {
     match bytes.get(index).copied() {
         Some(b'"') => string_closing_quote(bytes, index) + 1,
@@ -3894,10 +4218,10 @@ fn scan_repetitions(raw: &str) -> Repetition {
 /// * the BARE arm returns its cursor UNCLAMPED once the loop exits on end of input,
 ///   which is the same `bytes.len() + 1` by a different line — a `"` met inside a
 ///   bare token takes the same `+ 1` step and lands past the end.
-/// Only the container arm and the out-of-range arm are genuinely bounded by
-/// `bytes.len()`. So the clause CAN fire, and the earlier claim that this helper
-/// "fails loudly when its value token does not tile the document" described a check
-/// that was live after all.
+///   Only the container arm and the out-of-range arm are genuinely bounded by
+///   `bytes.len()`. So the clause CAN fire, and the earlier claim that this helper
+///   "fails loudly when its value token does not tile the document" described a check
+///   that was live after all.
 ///
 /// IT IS ALSO THE SOLE BARRIER ON THE ONE PATH THAT WOULD PANIC.
 /// `document_with_member_value` slices `raw[..start]`, `raw[end..]` and rebuilds, and
@@ -3993,7 +4317,8 @@ fn top_level_value_span(
 /// Everything outside that one token survives untouched — including any duplicate
 /// member, which is exactly what must NOT be collapsed. A `Value` round trip would
 /// be wrong here for the reason `skip_json_value` is a byte scan: re-encoding
-/// through `serde_json` collapses a duplicate member last-wins.
+/// through `serde_json` collapses a duplicate member last-wins. (The backing store
+/// and the cfg condition are cited at `decode_row`.)
 fn document_with_member_value(
     raw: &str,
     member: &str,
@@ -4449,8 +4774,43 @@ enum Outcome {
 /// Decode `raw` through `serde_json::from_str::<T>` and report the outcome.
 ///
 /// This is the ONLY decode path the accept/reject cases use, and the string
-/// path is mandatory rather than incidental. `serde_json::Map` is a `BTreeMap`,
-/// so the moment raw bytes become a `Value` a repeated member collapses
+/// path is mandatory rather than incidental. `serde_json::Map` is a `BTreeMap`
+/// — CITED HERE, AND THIS IS THE FILE'S ONE AUTHORITATIVE SITE FOR THAT CLAIM, because
+/// this is where the string-path mandate is stated and every other mention in the file
+/// points back to this paragraph rather than repeating the citation.
+///
+/// THE CITATION, AND THE CFG CONDITION THAT GOES WITH IT, because the claim is
+/// CONDITIONAL in the source and was written here as though it were not. At the pinned
+/// `serde_json-1.0.151`, `src/map.rs:29-31` declares
+/// `pub struct Map<K, V> { map: MapImpl<K, V> }`, and the backing store is a **conditional
+/// type alias** at `src/map.rs:33-36`:
+///   * `#[cfg(not(feature = "preserve_order"))] type MapImpl<K, V> = BTreeMap<K, V>;`
+///   * `#[cfg(feature = "preserve_order")] type MapImpl<K, V> = IndexMap<K, V>;`
+///
+/// The crate's own doc sentence agrees (`src/map.rs:3-4`): "By default the map is backed
+/// by a [`BTreeMap`]. Enable the `preserve_order` feature of `serde_json` to use
+/// [`IndexMap`] instead."
+///
+/// WHY THAT CONDITION MATTERS ENOUGH TO CITE RATHER THAN ASSUME. A `cfg` alias is the
+/// one kind of declaration that flips SILENTLY: enabling one feature elsewhere in the
+/// workspace would change `insert` from last-wins to first-wins, and the two halves of
+/// this file's erasure measurement would then compare the wrong occurrences and still
+/// pass. No such assertion exists that would catch it, because every measurement here
+/// is consistent with either ordering once the feature is on. So the condition is
+/// CHECKED rather than assumed, and the check is recorded rather than left to a reader:
+///   * a scan of every `Cargo.toml` in this workspace finds the string `preserve_order`
+///     in NONE of them, so the `not(preserve_order)` arm is the one compiled;
+///   * `Cargo.lock` corroborates it independently: the `serde_json 1.0.151` entry's
+///     dependency list is `itoa`, `memchr`, `serde`, `serde_core`, `zmij` — and
+///     `indexmap`, which the `preserve_order` arm requires, is ABSENT from it.
+///
+/// That second check is the stronger of the two, because it would still hold if a
+/// manifest requested a feature the lockfile had not yet resolved, whereas the manifest
+/// scan alone would not.
+///
+/// SO THE CLAIM AS IT MAY BE STATED HERE, with the condition attached: with no
+/// `preserve_order` feature resolved in this workspace, `serde_json::Map` IS backed by a
+/// `BTreeMap`, so the moment raw bytes become a `Value` a repeated member collapses
 /// last-wins and the derived `MapAccess` never sees a duplicate at all: a
 /// `from_value` case 5 row would pass for entirely the wrong reason. The same
 /// holds for the escape-equivalent rows, whose whole point is that `\u0061pplied`
@@ -4633,7 +4993,10 @@ fn fold_spelling(spelling: &str) -> String {
 const DUPLICATE_FIELD_PREFIX: &str = "duplicate field";
 
 /// serde's undeclared-member refusal, quoted from `unknown_field` at
-/// `serde-1.0.229/src/core/de/mod.rs:270-273`. Never a substring of
+/// `serde-1.0.229/src/core/de/mod.rs:270-283` — the WHOLE `fn`, closing brace included,
+/// so the range contains BOTH of its arms: the `expected.is_empty()` one whose text is
+/// "unknown field `{field}`, there are no fields" at `:272-275`, and the `else` arm at
+/// `:277-281` that a closed struct actually produces. Never a substring of
 /// `DUPLICATE_FIELD_PREFIX` and never a substring of it in the other direction, so
 /// requiring the absence of this one excludes a duplicate refusal without excluding
 /// a duplicate refusal's own text.
@@ -4653,10 +5016,16 @@ const UNKNOWN_VARIANT_PREFIX: &str = "unknown variant";
 /// `Error::custom(format_args!("missing field `{}`", field))`.
 ///
 /// THE DERIVED DECODER REACHES IT THROUGH `serde::__private::de::missing_field`
-/// (`serde-1.0.229/src/private/de.rs:24-43`), whose every `deserialize_*` arm except
-/// `deserialize_option` returns `Err(Error::missing_field(self.0))`; `deserialize_option`
-/// calls `visitor.visit_none()`, which is why an absent `Option` member decodes rather
-/// than failing. So this wording is what a REQUIRED member's absence produces, and the
+/// (`serde-1.0.229/src/private/de.rs:24-61`, the whole `fn` through its tail
+/// `Deserialize::deserialize(deserializer)` at `:60`). THE RANGE HAS TO REACH `:45`,
+/// because `deserialize_option` is AT `:45` and is the exception the sentence names; a
+/// range ending before it would exclude the very thing being claimed about. Inside that
+/// span `deserialize_any` (`:38-43`) is the one arm written out by hand and it returns
+/// `Err(Error::missing_field(self.0))`, `deserialize_option` (`:45-50`) calls
+/// `visitor.visit_none()`, and every other `deserialize_*` arm is generated by the
+/// `forward_to_deserialize_any!` at `:52-56`, which routes it to `deserialize_any` and so
+/// to the same refusal. That is why an absent `Option` member decodes while an absent
+/// required one fails. So this wording is what a REQUIRED member's absence produces, and the
 /// `Option` exception is the same fact the L2-page assertions rest on.
 ///
 /// NEITHER A SUBSTRING OF NOR A SUBSTRING INTO any of the three refusal prefixes
@@ -4710,8 +5079,9 @@ const U64_PAYLOAD_TYPE: &str = "u64";
 /// REACHED BECAUSE THE INPUT IS NOT A STRING, not because the string is wrong:
 /// `Uuid::deserialize` takes the human-readable branch and calls
 /// `deserialize_str`, and `peek_invalid_type`
-/// (`serde_json-1.0.151/src/de.rs:269-315`, `b'{' => de::Error::invalid_type(Unexpected::Map, exp)`
-/// at line 312) answers `{` before any string is read.
+/// (`serde_json-1.0.151/src/de.rs:269-317`, `peek_invalid_type`, the WHOLE
+/// `fn` from its signature to its closing brace, whose `b'{'` arm is
+/// `de::Error::invalid_type(Unexpected::Map, exp)` at line 312) answers `{` before any string is read.
 const UUID_MAP_REFUSAL_TEXT: [&str; 1] = ["invalid type: map, expected a formatted UUID string"];
 
 /// The `Uuid` family's refusal when the input IS a quoted string that does not
@@ -5785,7 +6155,7 @@ fn carried_member_names(raw: &str) -> Vec<String> {
 /// closing quote, and `bytes.len()` is a LEGAL index, so slicing
 /// `value_start + 1..end` here returned THE REST OF THE DOCUMENT TO END OF INPUT as
 /// this member's value — and returned success, not an error. The callers would then
-/// measure those wrong bytes and report a confident wrong verdict: a schema_version
+/// measure those wrong bytes and report a confident wrong verdict: a `schema_version`
 /// probe reads a whole malformed document as its version, a codecortex pair reads one.
 /// `raw_value_end` and `recorded_member` both check this already; this site is the
 /// third reader of the same scan and was the one that did not.
@@ -6207,10 +6577,10 @@ fn optional_member_claims_hold_on_every_page(all: &[Row]) -> TestResult {
 /// * the case-12 absence and surrogate rows, which are decoded by case 12 through
 ///   `l2_page_absence_row_is_accepted` and `health_record_surrogate_row_is_accepted`,
 ///   neither of which re-serializes and compares against `row.raw`.
-/// So `byte` in this case's name is scoped to the ALLOCATION population, which is what
-/// the name says. A byte-level defect in a LATER-CASE accept row would not be caught
-/// here, and that remains a real gap: those rows are decoded by value-level helpers, so
-/// nothing compares their re-serialization against their own bytes.
+///   So `byte` in this case's name is scoped to the ALLOCATION population, which is what
+///   the name says. A byte-level defect in a LATER-CASE accept row would not be caught
+///   here, and that remains a real gap: those rows are decoded by value-level helpers, so
+///   nothing compares their re-serialization against their own bytes.
 ///
 /// ONE SUCH DEFECT WAS FOUND AND HAS SINCE BEEN FIXED AT THE SOURCE, and the record is
 /// kept because it is what the gap is worth. The case-12 accept row on numeric stem
@@ -6517,6 +6887,65 @@ fn case_04_unknown_nested_member_rejected() -> TestResult {
         &[Step::Field("segments"), Step::Index(0), Step::Field("blob")],
         "930_unknown_nested_l2_segment_blob",
     )?;
+
+    // RECORDED LIMITATION, NOT FIXED, and recorded at the site rather than in a distant
+    // ledger because this list is where a reader looks when a nested probe goes missing.
+    // THE SEVEN `Step` PATHS ABOVE ARE A HAND-WRITTEN LITERAL, so this case's coverage of
+    // nested closed members is fixed at seven and does NOT follow the source. A new nested
+    // closed member, or a new nesting depth in one of the three files, is silently uncovered
+    // here: nothing derives this list the way `closed_type_names` derives case 3's set, and
+    // nothing would red. THAT ASYMMETRY IS THE POINT OF THE COMPARISON: case 3's top-level
+    // typed dispatch's `other` arm fails naming it as a closed struct with no
+    // unknown-top-level probe, so a NINTH STRUCT IS RED, while this list goes quietly
+    // stale. (The mechanism in case 3 is that `other` arm of the match on `name.as_str()`
+    // in `case_03_unknown_top_level_member_rejected` itself, not a separate guard; an
+    // earlier version of this comment pointed at "the guard above", which does not exist.) The list cannot be
+    // derived for the same reason the dispatch cannot: each entry names a Rust type and a
+    // path into that type's own shape, and only a human can say which nesting is worth
+    // probing. What is asserted instead is that the paths are NON-EMPTY and that the
+    // depth-2 and depth-3 sites are both present, so the list cannot be emptied or flattened
+    // into a single depth without going red.
+    assert!(
+        !nested_probe_depths().is_empty(),
+        "no `Step` path list is present anywhere in this file, so the predicate this guard reads finds nothing and the \
+         depths it derives are empty; every assertion in case 4 would then be vacuous while the case stayed green. \
+         NOTE THE SCOPE: the predicate scans the WHOLE FILE, not case 4's seven call sites, and the two coincide \
+         today only because case 4 holds every `Step` site in the file, which is TRUE OF THIS REVISION: all seven \
+         `&[Step::` sites in the file are call sites inside this function. If a second case ever added one, this guard \
+         would still pass while describing case 4's coverage only indirectly"
+    );
+    for depth in [2, 3] {
+        // BOUND TO A LOCAL INSIDE THE LOOP BODY, and that placement is the whole point of
+        // the fix. Two reasons, one mechanical and one about what the message may claim.
+        // MECHANICALLY: a format string's implicit capture accepts a plain IDENTIFIER
+        // only, so `{nested_probe_depths():?}` is not a capture at all — the parser reads it
+        // as a named argument and stops at the `(`. Binding first is what makes the
+        // format string well formed, and it also collapses two evaluations of the
+        // predicate into one: the `contains` conjunct and the message now read the SAME
+        // value, so the depths the message reports are provably the depths the conjunct
+        // tested.
+        // ABOUT STALENESS: binding BEFORE the loop would be wrong in principle, because
+        // the message is only rendered when the conjunct FAILS, and a value captured
+        // once outside would be whatever the predicate returned before any iteration.
+        // Here the risk is nil and the placement is chosen anyway: `nested_probe_depths`
+        // is a pure function of `THIS_FILE`, which is a `include_str!` CONSTANT fixed at
+        // compile time, so its answer cannot change between two statements of the same
+        // run. The binding is inside the loop so that the code does not DEPEND on that
+        // fact to be correct.
+        let depths = nested_probe_depths();
+        assert!(
+            depths.contains(&depth),
+            "the nested path list must carry a depth-{depth} site as well as its shallower ones, so a closed struct whose \
+             closure is shallow at every site cannot pass this case without a deep probe; the depths present are \
+             {depths:?}"
+        );
+    }
+    // `Ok(())` IS THE FUNCTION'S TAIL EXPRESSION, and it is last for a reason that is a
+    // compile error if it is forgotten: a `for` loop has value `()`, so with `Ok(())`
+    // above this guard the body would end in `();` and the function would return `()`
+    // against a `TestResult` signature — `mismatched types: expected Result<...>, found ()`.
+    // Equally, `Ok(())` cannot sit here without its own `;`, because it is a call
+    // expression rather than a block-like one and cannot stand as a block tail either way.
     Ok(())
 }
 
@@ -6658,7 +7087,8 @@ fn case_05_duplicate_keys_are_refused() -> TestResult {
     // is a different byte sequence from the plain key yet decodes to the same
     // member name. A decoder comparing raw key bytes would miss the repetition;
     // and because `serde_json::Map` is a `BTreeMap`, routing these rows through
-    // a `Value` would collapse the pair before the decoder ever saw it. Dropping
+    // a `Value` would collapse the pair before the decoder ever saw it. (Cited at
+    // `decode_row`, with the `preserve_order` condition checked there.) Dropping
     // the string path would silently weaken this case to a green assertion that
     // proves nothing, so the subgroup is selected explicitly and the string
     // path is what makes it bite.
@@ -6743,7 +7173,7 @@ fn carries_an_escaped_top_level_key(raw: &str) -> bool {
 /// that compares decoded names — which is the whole reason these payloads are
 /// held as raw strings instead of being routed through `serde_json::from_value`,
 /// where `serde_json::Map` being a `BTreeMap` would collapse the pair at insert
-/// time and the collision could never be observed at all.
+/// time and the collision could never be observed at all. (Cited at `decode_row`.)
 ///
 /// `top_level_member_spans` is used rather than a `Value` walk for the same
 /// reason, and it yields each key's RAW text (`MemberSpan.key` is the bytes
@@ -6931,10 +7361,21 @@ fn strict_ingress_cannot_erase_protected_input(all: &[Row]) -> TestResult {
             "the strict ingress's `Display` is `write_str(self.kind.as_str())` (strict_json.rs:80-84), so what rendered must BE that category's own bounded string and nothing else, and every redaction claim made about this text is a claim about exactly these bytes"
         );
         strict_refusal_withholds_the_repetition(row, &rendered)?;
+        // NO `.map` HERE, AND THE SITES BELOW ARE NOT THE SAME SHAPE — the two differ in
+        // the `Ok` type of the function they wrap, which is the only thing that matters.
+        // `strict_json_has_no_duplicate_members` returns `Result<(), StrictJsonError>`
+        // (`strict_json.rs:118`), so its `Ok` is ALREADY `()` and any `.map(..)` to `()` is
+        // the identity function; `clippy::map_identity` rejects it and the correct repair is
+        // DELETION, not a different pattern. `strict_json_value` returns
+        // `Result<Value, StrictJsonError>` (`strict_json.rs:96`), so ITS `Ok` is a `Value`,
+        // its `.map(|_| ())` DISCARDS a value rather than passing one through, and it is
+        // both necessary and correct — a `|()|` pattern there would not even type-check,
+        // because `()` is not a `Value`.
+        //
+        // THE CRATE ITSELF SHOWS BOTH HALVES: `strict_json.rs:119` is
+        // `strict_json_value(bytes, bytes.len()).map(|_| ())`, the `Value`-returning shape.
         assert_eq!(
-            eliot_types::strict_json_has_no_duplicate_members(bytes)
-                .map(|_| ())
-                .map_err(|error| error.kind),
+            eliot_types::strict_json_has_no_duplicate_members(bytes).map_err(|error| error.kind),
             Err(eliot_types::StrictJsonErrorKind::DuplicateKey),
             "the no-ceiling entry point must REACH duplicate detection: it passes `max_bytes = bytes.len()` into a strict greater-than, so an edit that made duplicate detection itself unreachable would answer `Ok` or `TooLarge` here instead of the same category this ceiling call reported"
         );
@@ -6961,9 +7402,7 @@ fn strict_ingress_cannot_erase_protected_input(all: &[Row]) -> TestResult {
             row.id
         );
         assert_eq!(
-            eliot_types::strict_json_has_no_duplicate_members(bytes)
-                .map(|_| ())
-                .map_err(|error| error.kind),
+            eliot_types::strict_json_has_no_duplicate_members(bytes).map_err(|error| error.kind),
             Ok(()),
             "the no-ceiling entry point must accept an accept row, so on this corpus it is never answering `TooLarge` where the exact-length call below answers `Ok`"
         );
@@ -7854,12 +8293,30 @@ fn migration_is_refused_for_missing_member(payload: &str, missing: &str) -> Test
 /// A payload with one declared member omitted, keyed values BY NAME.
 ///
 /// The earlier version zipped a filtered member list positionally against a
-/// `[identity, checksum]` pair, so omitting `migration_id` produced a payload
-/// whose `applied` carried the hex STRING. serde refused that as
-/// `invalid type: string, expected a boolean` rather than as a missing member,
-/// and because `missing_field` is only reported after the whole map is consumed
-/// the type error fired first and masked it. Keying by name is what makes the
-/// refusal the one the row is about.
+/// `[identity, checksum]` pair, so omitting `migration_id` produced a payload whose
+/// `applied` carried the hex STRING INSTEAD OF THE BOOLEAN, because the two filtered
+/// lists were of different lengths and the surviving identifier was spliced into the
+/// `checksum` slot.
+///
+/// WHY THAT PUTS A TYPE ERROR WHERE THE ROW NEEDS A MISSING-MEMBER REFUSAL — stated as a
+/// MECHANISM, because a rendered message reported in the past tense would be a claim
+/// about a decode this lane never performed. `applied`'s declared type is `bool`, so the
+/// derived decoder reads that member through serde's boolean visitor, and a JSON STRING
+/// reaching a boolean member is an `invalid type` refusal: `invalid_type` at
+/// `serde-1.0.229/src/core/de/mod.rs:213-215`, which renders `"invalid type: {}, expected
+/// {}"`, with the expectation supplied by `bool`'s own `expecting` at
+/// `serde-1.0.229/src/core/de/impls.rs:141-143`. The type error is therefore reachable at
+/// the `applied` member, while the absent `migration_id` can only be reported once the
+/// whole map has been consumed, because the derived decoder raises `missing_field` from
+/// the tail of the visit (— see the `missing_field` citation on this file's `missing_member_is_refused`
+/// for its span in `serde::__private::de`). So a type error at an EARLIER member is what
+/// a decoder reaches FIRST, and it MASKS the absent-member refusal the row is about.
+/// THAT is the defect; the message text is not the argument, and no observation of any
+/// message is offered or needed.
+///
+/// Keying by name is what removes the ambiguity, because the two members are then looked
+/// up by what they are rather than by position, so the payload this helper builds omits
+/// `migration_id` WITHOUT altering the type of any member that remains.
 fn migration_payload_without(
     identity: &str,
     checksum: &str,
@@ -8593,9 +9050,9 @@ fn case_11_partial_ingress_and_attribute_paths_cannot_erase_protected_input() ->
 /// depth of at least one and no nested container can ever report depth 0. Therefore
 /// every token `repeated_member_value_tokens` returns at depth 0 is a genuine
 /// top-level `member: value` pair of the root object, and the ONE INDEPENDENT FACT in
-/// the comparison is `permissive.get(&member)`, which comes from serde_json's own
+/// the comparison is `permissive.get(&member)`, which comes from `serde_json`'s own
 /// decode of the bytes rather than from this file's parser. The assertion is thus
-/// "serde_json kept the value this file's scan says came last, and did not keep the one
+/// "`serde_json` kept the value this file's scan says came last, and did not keep the one
 /// it says came first" — one side observed by the dependency, one side derived by the
 /// test, joined on a member name and a depth that cannot be confused.
 ///
@@ -8703,7 +9160,27 @@ fn permissive_ingress_erases_the_earlier_occurrence(all: &[Row]) -> TestResult {
         // THE ERASURE, both halves. `last` because `serde_json::Map` is a `BTreeMap`
         // here and `insert` is last-wins; `first` because the assertion that the
         // earlier value is ABSENT is the half that makes this an erasure rather than
-        // a choice. Without the second conjunct this would only say the projection
+        // a choice.
+        //
+        // THE CITED GROUND, restated once here rather than left to the other site:
+        // `serde_json-1.0.151/src/map.rs:29-31` declares `pub struct Map<K, V> {
+        // map: MapImpl<K, V> }`, and `:33-36` makes the backing store a CONDITIONAL alias
+        // — `BTreeMap` under `not(feature = "preserve_order")`, `IndexMap` under
+        // `preserve_order`. THE CONDITION IS CHECKED, NOT ASSUMED: the string
+        // `preserve_order` appears in NO `Cargo.toml` in this workspace, and `indexmap`
+        // is ABSENT from `serde_json 1.0.151`'s dependency list in `Cargo.lock`. Without
+        // the feature, `insert` is last-wins; with it, first-wins, and BOTH conjuncts
+        // below would still pass while comparing the wrong occurrences.
+        //
+        // SECOND AUTHORITATIVE SITE FOR THAT CLAIM, and the reason there are two rather
+        // than one is this file's reasoning chain: `decode_row` states the string-path
+        // MANDATE and case 5's last-wins reasoning hangs off it, while THIS is where the
+        // claim is actually MEASURED, at the far end of the chain. A reader who arrives
+        // from the erasure measurement and never opens `decode_row` still gets the
+        // citation and the cfg condition here, rather than an uncited premise. The two
+        // sites cite the same lines and the same checked condition; they are not
+        // independent confirmations of each other and are not offered as such.
+        // Without the second conjunct this would only say the projection
         // kept one of two values, which a reader could satisfy by believing the
         // first had been the one kept.
         //
@@ -10015,6 +10492,20 @@ fn brace_delta_outside_strings(line: &str) -> isize {
 /// behaviourally below; the dependency shape is asserted from this crate's manifest; and
 /// visibility is not expanded anywhere, which is recorded by the zero-candidate walk
 /// over `lib.rs` and `error.rs`.
+///
+/// WHAT THAT LAST CLAIM IS AND IS NOT, because "visibility" is one of the clause's nouns
+/// and NOTHING HERE ASSERTS VISIBILITY AS A PROPERTY. The zero-candidate walk is an
+/// EMPTINESS WALK OVER TWO FILES: it proves `lib.rs` declares no struct or enum of its own
+/// and that `error.rs` carries no serde impl, so neither contributes a decodable type. That
+/// is a statement about the CANDIDATE SET, and it happens to bear on visibility only
+/// indirectly — a file can be empty of types and still change what it re-exports, or a
+/// `pub use` line can change the crate's public surface without adding one. Nothing in this
+/// file enumerates the crate's re-exports, reads a visibility modifier off a declaration as
+/// a fact about reachability, or compares the public API before and after anything. So the
+/// honest statement is: the SCOPE clause is asserted where this crate can see it, the
+/// VISIBILITY noun is PROXIED BY AN EMPTINESS WALK over two files, and no visibility
+/// property is asserted. Recorded, not closed: a real visibility assertion would mean
+/// deriving the crate's public surface, which is a different walk from any this file owns.
 ///
 /// THIS BLOCK SITS ABOVE THE WORK-UNIT MARKER, and that placement is load-bearing.
 /// The marker must be IMMEDIATELY followed by its `#[test]`, and the work-unit gate
@@ -12118,8 +12609,29 @@ fn hex_escape_value(bytes: &[u8], start: usize) -> Option<u32> {
 /// ASSUMPTION: the low-surrogate range is `DC00`-`DFFF`, which is what the UTF-16
 /// specification fixes and what `serde_json` implements. No input can be well-formed and
 /// disagree, so the failure direction here would be a red, not a wrong answer.
+///
+/// ADJACENCY IS A `serde_json` GUARANTEE AND NOT A WHITESPACE ASSUMPTION, which is what
+/// the `b'u'` test above rests on. `parse_unicode_escape` reads a high surrogate and then
+/// requires the very next byte to be `u`: `read.rs:939` is
+/// `if tri!(peek_or_eof(read)) == b'u' { read.discard(); } else { … }`, and the `else`
+/// branch returns `UnexpectedEndOfHexEscape` when `validate` is on. So there is no input
+/// on which a high surrogate is legitimately continued by anything other than an adjacent
+/// `\u` escape, and the earlier version of this helper, which did not test for the `u`,
+/// was not being permissive about a case the parser tolerates — it was reading four
+/// hex digits out of a sequence that is not a `\u` escape. Measured on the live corpus: the
+/// fix changes NO row of the 162, and it changes all three of `{"a":"\ud800\nDC00"}`,
+/// `{"a":"\ud800\\DC00"}` and `{"a":"\ud800\tDC00"}` from the complete-document
+/// refusal to `LoneLeadingSurrogate`, which is where `serde_json` puts them.
 fn continues_with_low_surrogate(bytes: &[u8], after: usize) -> bool {
-    if bytes.get(after) != Some(&b'\\') {
+    // THE `u` IS CHECKED, and omitting it was a real defect rather than a shortcut. An
+    // earlier version tested only that a backslash followed and then handed
+    // `after + 2 .. after + 6` to `hex_escape_value`, which reads four bytes REGARDLESS of
+    // what the byte after the backslash is. So `\nDC00`, `\tDC00` and `\\DC00` were each
+    // accepted as a low-surrogate continuation: the four characters `DC00` are hex
+    // digits even though the escape they sit in is not a `\u` escape at all. This helper's
+    // own documentation above already said the next escape must be `\uXXXX`, so the code
+    // was narrower-reading than the prose beside it.
+    if bytes.get(after) != Some(&b'\\') || bytes.get(after + 1) != Some(&b'u') {
         return false;
     }
     hex_escape_value(bytes, after).is_some_and(|scalar| (0xDC00..=0xDFFF).contains(&scalar))
@@ -12131,12 +12643,84 @@ fn continues_with_low_surrogate(bytes: &[u8], after: usize) -> bool {
 /// the trailing-comma rule reads it from inside the scan, and the top-level-value rule
 /// reads it from the classifier once the scan has returned. A closure would have had to
 /// be built twice or handed across the split.
+/// ASSUMPTION, AND IT CLAIMS MORE THAN THE PARSER GUARANTEES. This skips
+/// `is_ascii_whitespace()`, which is SPACE, TAB, `\n`, `\r` AND FORM FEED. `serde_json`
+/// skips only the first four: its whitespace set is the JSON grammar's, so FORM FEED is not
+/// whitespace to the parser and a document separated by one is not what this helper calls
+/// a boundary. Measured on `{"a":1}\f{"b":2}` the attributed reason changes, though the
+/// DIRECTION does not: the row reds either way, because a wrong reason on a malformed row
+/// is caught by the same guard that catches a right one.
+///
+/// WHY THE PREDICATE IS NOT NARROWED. This is inherited unchanged from the code before the
+/// scan/classify split, so narrowing it is a BEHAVIOUR CHANGE rather than a repair, and it
+/// would change which kind some malformed input is attributed to — the same trade the
+/// escape section above argues explicitly and decides against making silently. The defect
+/// is the undocumented over-claim, not the wider set: a reader who believes this matches the
+/// parser would draw a conclusion about form feeds that does not hold, and one who does not
+/// read it is no worse off than before. So the claim is corrected here and the set is left
+/// as it is, with the difference recorded.
 fn whitespace_after(bytes: &[u8], probe: usize) -> usize {
     let mut cursor = probe;
     while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_whitespace()) {
         cursor += 1;
     }
     cursor
+}
+
+/// One recorded observation: whether the pass saw the condition at all.
+///
+/// NOT A `bool`, and the difference is load-bearing rather than stylistic. Four of these
+/// sit side by side in `MalformationFacts`, and four bare `bool`s in a row invite the one
+/// reading that is wrong here — that they are interchangeable flags a caller combines with
+/// `&&` as the scan happens to run. They are INDEPENDENT observations of the SAME document
+/// and several are true of it at once, and `classify_malformation` resolves a document
+/// carrying several by PRECEDENCE rather than by combination. Naming the slot says which
+/// kind of thing it is. It is also the extension point a `bool` is not: an observation that
+/// later has to report WHERE it was seen becomes a third variant rather than a breaking
+/// change to every reader of the struct.
+enum Observation {
+    /// The pass never saw the condition.
+    Absent,
+    /// The pass saw the condition at least once.
+    Present,
+}
+
+impl Observation {
+    /// Whether the condition was seen. Each of the classifier's rules asks exactly this and
+    /// nothing more, which is why the rules keep their one-guard-each shape.
+    ///
+    /// IT IS NAMED `present()` AND NOT `is_present()`, and it takes `&self`. Both halves were
+    /// forced by the code rather than chosen for taste. `clippy::wrong_self_convention` rejects
+    /// an `is_*` method taking `self` BY VALUE, which is what this one did. AND `Observation`
+    /// does not derive `Copy` — so `self` by value was not free: every
+    /// `facts.<slot>.present()` call PARTIALLY MOVED that field out of the owned local
+    /// `facts`, which compiles only because each of the four calls names a DIFFERENT field.
+    /// That is a latent use-after-move trap for the next reader who wants to consult a
+    /// second time, and `&self` removes it at no cost. `matches!` on a `&Observation` against
+    /// a non-reference pattern matches through the reference, so the body is unchanged.
+    ///
+    /// A PURE RENAME PLUS A BORROW IS BEHAVIOUR-PRESERVING, which matters because a
+    /// behavioural review of this region transcribed both the old and the new classifier
+    /// control flow and used `is_present` as its anchor for the old boolean read. Every
+    /// decision that review recorded is still made at the same point in the same order; only
+    /// the spelling of the question changed.
+    fn present(&self) -> bool {
+        matches!(self, Observation::Present)
+    }
+}
+
+/// The one place a `bool` crosses into `MalformationFacts`.
+///
+/// The scan's own accumulators stay `bool` because that is what a running flag IS, and
+/// `lone_leading_surrogate = true` inside the loop should read like the flag it is. This
+/// conversion happens once, on the way out, so the type that leaves the scan says
+/// "observation" rather than "flag".
+fn observed(flag: bool) -> Observation {
+    if flag {
+        Observation::Present
+    } else {
+        Observation::Absent
+    }
 }
 
 /// Everything one pass over a document's raw bytes establishes, and nothing else.
@@ -12146,11 +12730,24 @@ fn whitespace_after(bytes: &[u8], probe: usize) -> usize {
 /// "decide what kind it is" consumes. The two halves are one pass followed by one
 /// ordered sequence of tests, and the order the classifier tests these facts in is the
 /// order the facts are listed here.
+///
+/// WHY THE FOUR `Observation` SLOTS ARE FOUR AND NOT ONE VARIANT, because a single enum
+/// carrying the most significant defect is the other shape this could have taken and it is
+/// the wrong one. The observations are not exclusive states of a walk: they co-occur. The
+/// seven bytes `{"a":"\` end inside a string literal AND carry a malformed escape, so both
+/// `inside_string` and `invalid_escape` are true of that one document; the thirteen bytes
+/// `{"a":"\ud800\` end inside a string literal AND carry an unpaired high surrogate, so
+/// `inside_string` and `lone_leading_surrogate` are both true. Collapsing the four into one
+/// variant would have to discard a true observation to do it, and which one it discarded
+/// would be decided by the classifier's precedence order — pushing a choice that belongs to
+/// `classify_malformation` down into the scan, across the responsibility split the paragraph
+/// above records, and silently losing the secondary fact for every document that has one.
+/// Four independent slots keep every observation and leave the ordering where it is argued.
 struct MalformationFacts {
-    inside_string: bool,
-    invalid_escape: bool,
-    lone_leading_surrogate: bool,
-    trailing_comma: bool,
+    inside_string: Observation,
+    invalid_escape: Observation,
+    lone_leading_surrogate: Observation,
+    trailing_comma: Observation,
     unclosed_containers: usize,
     top_level_end: Option<usize>,
 }
@@ -12158,9 +12755,13 @@ struct MalformationFacts {
 /// THE SCAN HALF of `classify_malformation`: the single pass over the raw bytes that
 /// fills in a `MalformationFacts` and refuses, by name, the one thing it cannot place.
 ///
-/// The two refusals and every observation are carried over unchanged from the body this
-/// was lifted out of; see `classify_malformation`'s own documentation for why each one
-/// sits where it does and what it costs.
+/// THE REFUSAL COUNT WAS WRONG HERE, and a reader auditing the split for losslessness
+/// was told the refusal set moved intact when it was divided. This function contains ONE
+/// refusal: the container-close guard, which fails loudly on a bracket that closes
+/// something never opened. The OTHER TWO live in the classifier, not here: the
+/// complete-document guard and the no-top-level-value guard. All three are carried over
+/// unchanged from the body this was lifted out of; see `classify_malformation`'s own
+/// documentation for why each one sits where it does and what it costs.
 fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::error::Error>> {
     let bytes = row.raw.as_bytes();
     let mut index = 0usize;
@@ -12181,25 +12782,23 @@ fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::er
                     // makes the high-surrogate rule expressible at all: the rule needs the
                     // FOUR HEX DIGITS and the escape that FOLLOWS them, and a flag that
                     // consumed one byte could never have them. `escape_after` returns the
-                    // byte just past a well-formed escape, or `None` for anything else —
-                    // and `None` is what sets the invalid-escape fact, replacing the old
+                    // byte just past an escape of the right SHAPE, or `None` for anything else —
+                    // and it is the CALLER, not `escape_after`, that reads the four digits.
+                    // `None` is what sets the invalid-escape fact, replacing the old
                     // membership test over the single byte after the backslash. Ordinary
                     // string content still cannot reach here, because this arm is only
                     // entered on a literal backslash.
-                    match escape_after(bytes, index) {
-                        Some(after) => {
-                            if hex_escape_value(bytes, index)
-                                .is_some_and(|scalar| (0xD800..=0xDBFF).contains(&scalar))
-                                && !continues_with_low_surrogate(bytes, after)
-                            {
-                                lone_leading_surrogate = true;
-                            }
-                            index = after;
+                    if let Some(after) = escape_after(bytes, index) {
+                        if hex_escape_value(bytes, index)
+                            .is_some_and(|scalar| (0xD800..=0xDBFF).contains(&scalar))
+                            && !continues_with_low_surrogate(bytes, after)
+                        {
+                            lone_leading_surrogate = true;
                         }
-                        None => {
-                            invalid_escape = true;
-                            index += 1;
-                        }
+                        index = after;
+                    } else {
+                        invalid_escape = true;
+                        index += 1;
                     }
                 }
                 b'"' => {
@@ -12245,10 +12844,10 @@ fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::er
         }
     }
     Ok(MalformationFacts {
-        inside_string: in_string,
-        invalid_escape,
-        lone_leading_surrogate,
-        trailing_comma,
+        inside_string: observed(in_string),
+        invalid_escape: observed(invalid_escape),
+        lone_leading_surrogate: observed(lone_leading_surrogate),
+        trailing_comma: observed(trailing_comma),
         unclosed_containers: depth,
         top_level_end,
     })
@@ -12265,7 +12864,10 @@ fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::er
 /// exactly that reason. The bytes are the only thing the decoder sees, so they are
 /// the only thing an expectation about the decoder may be built from.
 ///
-/// WHAT IT MEASURES. ONE strict structural scan collecting five facts, each from
+/// WHAT IT MEASURES. ONE strict structural scan, collecting SIX facts, and the count
+/// was FIVE until this paragraph was corrected: `MalformationFacts` has six fields, the
+/// classifier tests six conditions, and `unclosed_containers` — the sole basis of the
+/// `MissingClosingBrace` kind — was absent from the list. The five scan facts, each from
 /// the bytes alone:
 /// * whether end of input arrives while a string literal is still open;
 /// * whether any backslash inside a string literal is followed by something that is
@@ -12273,11 +12875,43 @@ fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::er
 /// * whether any `\uXXXX` escape names a high surrogate that the next escape does not
 ///   continue with a low surrogate — `Malformation::LoneLeadingSurrogate`;
 /// * whether any `,` is followed, past JSON whitespace, by `}` or `]`;
-/// * where the first complete top-level value ends, and what the next
-///   non-whitespace byte after it is.
+/// * how many containers are still open at end of input — the sixth fact, and the one
+///   this enumeration omitted.
 ///
-/// THE THIRD FACT IS NOT A STRUCTURAL ONE, AND SAYING SO IS THE POINT. The other four
-/// are decidable from brace and quote nesting alone. This one is not: `\uD800` is a
+/// AND ONE MORE FACT THE CLASSIFIER COMPUTES ITSELF, which is not a scan fact and was
+/// wrongly listed as one: WHERE the first complete top-level value ends. The scan records
+/// the offset in `top_level_end`; the classifier then reads the next non-whitespace byte at
+/// that offset through `whitespace_after`. So `top_level_end` is a scan fact and the byte it
+/// points at is a classifier fact, and the list above now says so rather than merging them.
+///
+/// A DELIBERATE CHANGE IN THE OTHER DIRECTION, recorded because it is UNRECORDED
+/// BEHAVIOUR rather than a defect and because the file's claim about this region is that
+/// the precedence is auditable. A `\u` escape SHORTER than six bytes used to be reported as
+/// whatever the structural rules made of the document; it is now `InvalidEscape`. Measured
+/// on the pre-rewrite code: `{"a":"\u"}` went from `Err(holds no complete top-level value)`
+/// to `Ok(InvalidEscape)`, and `{"a":"\ud800\u0041",}` went from `TrailingComma` to
+/// `LoneLeadingSurrogate`. That pair accounts for 612 of the 613 disagreements an
+/// exhaustive comparison over inputs up to six bytes long found.
+///
+/// IT IS KEPT, AND THE REASON IS THE SAME ONE THE `LoneLeadingSurrogate` VARIANT'S OWN
+/// DOCUMENTATION USES: the new attribution NAMES A REAL DEFECT where the old one reported
+/// an ABSENCE. `{"a":"\u"}` is a document whose `u` escape is cut short, and saying "this
+/// document holds no complete top-level value" about it is true only by accident — the
+/// same guard fires on a well-formed document, which is the case it exists for. RESTORING
+/// the old attribution would mean reintroducing a kind (`Err(no-top-level)`) that is
+/// indistinguishable from the well-formed case, in exchange for reproducing a defect that
+/// no fixture row exercises: measured over all 162 rows, the change alters ZERO
+/// classifications. The kind DOES change for an input a future fixture row could carry, and
+/// that is a real consequence, stated here rather than left for a reader of the precedence
+/// list to discover.
+///
+/// THE THIRD SCAN FACT IS NOT A STRUCTURAL ONE, AND SAYING SO IS THE POINT. The other
+/// FOUR scan facts are decidable from brace and quote nesting alone, EXCEPT the second:
+/// deciding it needs the ESCAPE ALPHABET, not nesting, because the question is whether
+/// the byte after a backslash is one of the nine escape introducers. An earlier version of
+/// this paragraph said "the other four" without that exception, which was false for the
+/// escape bullet, and it also counted the depth fact among them. This one is not structural
+/// either: `\uD800` is a
 /// legal escape sequence, so a document carrying it nests perfectly and every other
 /// fact here is FALSE for it. It becomes a refusal only when the decoder reads the
 /// FOLLOWING escape and finds it outside `DC00-DFFF`. That is why the scan reads whole
@@ -12361,11 +12995,15 @@ fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::er
 /// tell a correct scanner from an incorrect one:
 /// * THE ESCAPE-STATE MACHINE IS UNWITNESSED. No row in the whole corpus contains `\"`
 ///   or `\\`, so a scanner that toggled string state on every `0x22` and ignored
-///   backslashes entirely would agree with this one on every row there is. Only the
-///   `invalid_escape` branch exercises the backslash path at all, and it exercises it on
-///   `930-141`, whose escape is `\x`. The class of input that would expose the difference
-///   is any row with an escaped quote inside a string value, where the naive scanner would
-///   end the string early and then read the remainder as structure.
+///   backslashes entirely would agree with this one on every row there is. The backslash
+///   path is exercised by TWO rows and not one, and an earlier version of this entry said
+///   only one: `930-141` takes the `None` branch of `escape_after` and sets
+///   `invalid_escape`, while `930-162` reaches the SAME `b'\\'` arm, takes the OTHER branch,
+///   and sets the surrogate fact. So both OUTCOMES of that arm are witnessed and the arm
+///   itself is not unwitnessed — what remains unwitnessed is the `"` and `\\` ESCAPES
+///   THEMSELVES, which is the narrower and accurate claim. The class of input that would
+///   expose the difference is any row with an escaped quote inside a string value, where the
+///   naive scanner would end the string early and then read the remainder as structure.
 /// * THE WHITESPACE SKIP IN THE TRAILING-COMMA RULE HAS NO WITNESS. Every comma in the
 ///   group is followed by a byte that is not whitespace, and `930-144`'s comma is
 ///   followed directly by `0x7d`, so the skip never advances. The input that would
@@ -12374,16 +13012,30 @@ fn scan_for_malformation(row: &Row) -> Result<MalformationFacts, Box<dyn std::er
 /// * THE WHITESPACE SKIP AFTER THE TOP-LEVEL VALUE HAS EXACTLY ONE WITNESS. The other
 ///   use of `whitespace_after` is read once, on `930-139`, so a scanner that skipped no
 ///   whitespace there would still classify every other row identically.
+/// * THE SCAN STEPS FOUR BYTES FORWARD AFTER `\u`, SO A `"` INSIDE THOSE FOUR NO LONGER
+///   CLOSES THE STRING. This is the FOURTH gap and it was missing from the list above, which
+///   is itself the defect: the three entries above were all written before the escape
+///   rewrite, and none of them is in the direction this one fails.
+///   THE DIRECTION IS OPPOSITE TO THE OTHERS, and that is why it needed saying. Every gap
+///   above is a scanner that models LESS than the parser, which reports a malformed
+///   document as well-formed and surfaces as a RED. This one is a scanner that models MORE
+///   than the pre-rewrite scan did: `escape_after` returns `start + 6`, so the four hex
+///   digits are consumed as a unit and a `"` among them is never seen as the closing
+///   quote. Measured: `"\u"Z0:d[` classified `MissingClosingBrace` before the rewrite and
+///   classifies `TruncatedInsideString` now — still a REFUSAL, still a RED, but for a
+///   different reason, and the string the document actually contains is lost. So the
+///   direction is a LOSS OF PRECISION rather than a wrong answer: the row reds either way,
+///   and no well-formed document is reported malformed.
 ///
 /// The synthetic control below is the one gap this file CAN close, and it closes only the
 /// surrogate-pair direction; the three above need corpus rows this lane does not own.
 fn classify_malformation(row: &Row) -> Result<Malformation, Box<dyn std::error::Error>> {
     let bytes = row.raw.as_bytes();
     let facts = scan_for_malformation(row)?;
-    if facts.inside_string {
+    if facts.inside_string.present() {
         return Ok(Malformation::TruncatedInsideString);
     }
-    if facts.invalid_escape {
+    if facts.invalid_escape.present() {
         return Ok(Malformation::InvalidEscape);
     }
     // AHEAD OF EVERY STRUCTURAL RULE BELOW, and that placement is the whole point of
@@ -12391,10 +13043,10 @@ fn classify_malformation(row: &Row) -> Result<Malformation, Box<dyn std::error::
     // strings and no trailing comma, so without this arm first it would fall through
     // every rule below and be reported as a COMPLETE document — the exact misclassification
     // that made this row a red.
-    if facts.lone_leading_surrogate {
+    if facts.lone_leading_surrogate.present() {
         return Ok(Malformation::LoneLeadingSurrogate);
     }
-    if facts.trailing_comma {
+    if facts.trailing_comma.present() {
         return Ok(Malformation::TrailingComma);
     }
     if facts.unclosed_containers != 0 {
@@ -12446,17 +13098,24 @@ fn classify_malformation(row: &Row) -> Result<Malformation, Box<dyn std::error::
 /// is what puts those twelve bytes into the probe's `raw` — the fixture's JSON string
 /// escaping is not involved, because the probe never round-trips through the fixture.
 fn well_formed_escaped_surrogate_pair_is_not_a_lone_surrogate(all: &[Row]) -> TestResult {
-    // Borrowed from a real `HealthRecord` row so every other byte of the probe is the
-    // crate's own recorded shape rather than something written here.
-    let donor = applicable_row(all, "HealthRecord")?;
     // A RAW string, and that is what makes the token ASCII: inside `r#"..."#` a
     // backslash is a backslash, so this is the twelve characters
     // `\`,`u`,`D`,`8`,`3`,`D`,`\`,`u`,`D`,`E`,`0`,`0` between two quote marks and
     // nothing else. A normal literal would have needed four doubled backslashes to
     // produce the same bytes, and a literal emoji would have produced UTF-8 and
     // exercised none of the escape path this control exists for.
-    const ESCAPED_PAIR: &str = r#""\ud83d\ude00""#;
-    let probe_raw = document_with_member_value(&donor.raw, "detail", ESCAPED_PAIR)?;
+    //
+    // IT IS AN INLINED `let` AND NOT A `const`, and that is a lint rather than a taste.
+    // A `const` declared here is an ITEM, and an item after a statement inside a block
+    // is what `clippy::items_after_statements` rejects; this file runs under `-D warnings`
+    // and is not permitted to silence a lint with an attribute. A `let` binding is a
+    // statement, so it reads in the same place and costs nothing: the token is used twice,
+    // and a binding makes both uses name one value rather than repeating the literal.
+    let escaped_pair = r#""\ud83d\ude00""#;
+    // Borrowed from a real `HealthRecord` row so every other byte of the probe is the
+    // crate's own recorded shape rather than something written here.
+    let donor = applicable_row(all, "HealthRecord")?;
+    let probe_raw = document_with_member_value(&donor.raw, "detail", escaped_pair)?;
     assert_ne!(
         probe_raw, donor.raw,
         "the synthetic probe must actually carry the escaped pair, or it witnesses nothing: donor row {} and its detail member is not spelled the way this probe assumes",
@@ -12466,7 +13125,7 @@ fn well_formed_escaped_surrogate_pair_is_not_a_lone_surrogate(all: &[Row]) -> Te
     probe.raw = probe_raw;
     match classify_malformation(&probe) {
         Ok(kind) => fail(format!(
-            "row {} carries a WELL-FORMED escaped surrogate pair ({ESCAPED_PAIR}), so it must not be classified as {kind:?}; a detector that refuses a legal pair would red a row that has to be accepted",
+            "row {} carries a WELL-FORMED escaped surrogate pair ({escaped_pair}), so it must not be classified as {kind:?}; a detector that refuses a legal pair would red a row that has to be accepted",
             probe.id
         )),
         Err(error) => {
@@ -13293,8 +13952,10 @@ fn case_15_row_refuses_at_its_offending_member(row: &Row) -> TestResult {
     // SOURCE rather than measured in this lane:
     //   * the UPPER bound. `unknown_field` and `duplicate_field` are serde `Message`
     //     codes, so `de::Error::custom` builds them UNPOSITIONED, with `line: 0` and
-    //     `column: 0` (`error.rs:483-490`), and `deserialize_struct` re-positions
-    //     that error afterwards with `fix_position` (`de.rs:1862-1865`) →
+    //     `column: 0` — `Error::custom` builds them UNPOSITIONED, and
+    //     `fix_position` (`serde_json-1.0.151/src/error.rs:337-346`) is what detects
+    //     `self.err.line == 0` at `:341` and re-derives the position. `deserialize_struct`
+    //     calls it afterwards at `de.rs:1862-1865`, so the error lands at →
     //     `Deserializer::error` (`de.rs:241-244`) → `SliceRead::position`
     //     (`read.rs:573-575`), which reads the reader's index for the NEXT UNREAD
     //     byte. By then `MapKey::deserialize_any` (`de.rs:2214-2225`) has eaten the
