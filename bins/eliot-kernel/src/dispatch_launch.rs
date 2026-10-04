@@ -6438,6 +6438,100 @@ mod tests {
         eliot_contracts::StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
+    /// One valid authenticated TestD owner-submit request whose identity names
+    /// neither `RequestMetadata::task_id` nor `StateFence::task_revision`.
+    ///
+    /// Both fields are optional and their own validators admit absence, so this
+    /// is an admissible exploratory scope (I4.4 Level 0 provisional), not a
+    /// malformed request: the paired check in `submit_testd_owner_job` rejects
+    /// only a one-sided or zero-revision binding and deliberately lets the
+    /// both-absent case reach the readiness refusal. The owner-observed tool
+    /// identity is shape-valid only — the refusal precedes every tool, source
+    /// and store read, so none of those bytes is ever re-read here.
+    ///
+    /// `InstrumentInvocation` is owned by `eliot-instrument-api`, which this
+    /// composition root does not depend on directly, so the typed invocation is
+    /// built through `TestdOwnerJobSubmission`'s own Deserialize implementation
+    /// and then revalidated by the unchanged production
+    /// `TestdOwnerJobSubmission::validate` chain inside
+    /// `submit_testd_owner_job`.
+    fn taskless_owner_submit(
+        request_id: &str,
+        state_fence: &StateFence,
+        source_root: &Path,
+    ) -> (
+        eliot_protocol::RequestIdentity,
+        eliot_testd_core::TestdOwnerSubmitRequest,
+    ) {
+        let metadata = eliot_contracts::RequestMetadata {
+            request_id: eliot_contracts::RequestId::new(request_id)
+                .expect("owner-submit request id"),
+            session_id: Some(
+                eliot_contracts::SessionId::new("owner-submit-session")
+                    .expect("owner-submit session id"),
+            ),
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("owner-submit-product")
+                .expect("owner-submit product id"),
+            source_id: eliot_contracts::SourceId::new("owner-submit-source")
+                .expect("owner-submit source id"),
+            state_fence: state_fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
+        };
+        metadata
+            .validate()
+            .expect("owner-submit metadata validates");
+        let submission: eliot_testd_core::TestdOwnerJobSubmission =
+            serde_json::from_value(serde_json::json!({
+                "project_id": "owner-submit-project",
+                "source_root": source_root.to_string_lossy(),
+                "invocation": {
+                    "request": metadata,
+                    "instrument": "eliot.testd.productive",
+                    "kind": "TEST",
+                    "profile": TESTD_PRODUCTIVE_PROFILE,
+                    "target": "owner-submit-target",
+                    "arguments": [],
+                    "input_artifacts": [],
+                    "declared_scope": "owner-submit-scope",
+                    "requested_at": eliot_contracts::ClockReading::default(),
+                },
+            }))
+            .expect("owner-submit typed submission");
+        let identity = eliot_protocol::RequestIdentity {
+            request: eliot_receipts::RequestBinding {
+                metadata: metadata.clone(),
+                state_fence: state_fence.clone(),
+            },
+            idempotency_key: format!("idem-{request_id}"),
+            deadline_unix_ms: 60_000,
+            cancellation_id: format!("cancel-{request_id}"),
+        };
+        identity
+            .validate()
+            .expect("owner-submit identity validates");
+        let request = eliot_testd_core::TestdOwnerSubmitRequest {
+            wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_SUBMIT_WIRE_VERSION,
+            submission,
+            process_tool: eliot_testd_core::TestdProcessToolIntent {
+                observation: eliot_testd_core::TestdToolObservation {
+                    nextest_path: "C:\\eliot\\tools\\cargo-nextest.exe".to_owned(),
+                    nextest_sha256: "1".repeat(64),
+                    cargo_path: "C:\\eliot\\tools\\cargo.exe".to_owned(),
+                    cargo_sha256: "2".repeat(64),
+                    rustc_path: "C:\\eliot\\tools\\rustc.exe".to_owned(),
+                    rustc_sha256: "3".repeat(64),
+                    selected_toolchain: "owner-submit-toolchain".to_owned(),
+                },
+            },
+            request_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("owner-submit request digest");
+        (identity, request)
+    }
+
     /// Exact process invocation value the R1 Governor producer canonicalizes.
     ///
     /// The same `canonical_json_bytes` + `sha256_hex` the Governor
@@ -6829,6 +6923,57 @@ mod tests {
         };
         assert_eq!(admission.job_id, "job-dispatch-live-1");
         admission.validate().expect("admission validates");
+
+        // 3a. Issue #1789 A1, TestD owner-submit leg: a valid authenticated
+        // owner submission whose identity names neither a task nor a task
+        // revision is refused with the typed readiness directive as a domain
+        // result, never as a transport failure, and before the process gateway,
+        // the source/work-root filesystem checks, the store open or any durable
+        // job write. `frame_dispatch::execute_testd_owner_submit` collapses only
+        // `Err` into `TransportError::SessionFenced` and serializes an `Ok`
+        // value into a `MessageType::Result` payload, so an `Ok` denial is
+        // exactly the response that reaches the authenticated caller as
+        // `TASK_SELECTION_REQUIRED`. This closes the TestD owner-submit ingress
+        // only; it is not a claim about any other mutation path.
+        let (taskless_identity, taskless_request) =
+            taskless_owner_submit("dispatch-lifecycle-taskless-1", &native_live_fence(), &root);
+        assert!(taskless_identity.request.metadata.task_id.is_none());
+        assert!(
+            taskless_identity
+                .request
+                .state_fence
+                .task_revision
+                .is_none()
+        );
+        let taskless_response = submit_testd_owner_job(
+            &kernel,
+            &taskless_identity,
+            &taskless_request,
+            super::super::unix_ms(),
+        )
+        .await
+        .expect("a task-less owner submission answers typed, never fenced");
+        let TestdOwnerSubmitResponse::Denied {
+            wire_id,
+            wire_version,
+            request_digest,
+            operation_id,
+            directive,
+        } = taskless_response.clone()
+        else {
+            panic!("a task-less owner submission must be denied, got {taskless_response:?}");
+        };
+        assert_eq!(directive, TestdOwnerSubmitDirective::TaskSelectionRequired);
+        assert_eq!(wire_id, TESTD_OWNER_SUBMIT_OPERATION);
+        assert_eq!(wire_version, TESTD_OWNER_SUBMIT_WIRE_VERSION);
+        assert_eq!(request_digest, taskless_request.request_digest);
+        assert_eq!(
+            operation_id,
+            taskless_identity.request.metadata.request_id.as_str()
+        );
+        taskless_response
+            .validate()
+            .expect("the typed refusal is a valid owner-submit response");
 
         // 4. The heartbeat flag is covered by its own test below (it
         // echoes the live composed value); the lifecycle continues with

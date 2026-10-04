@@ -1190,6 +1190,10 @@ mod tests {
     };
 
     use eliot_store_surreal_adapter::SnapshotBudgetDimension;
+    // The 742/8 boundary-split helpers below name the recorded event type in
+    // their signatures, so the import is scoped to the same platform gate.
+    #[cfg(windows)]
+    use eliot_store_surreal::diagnostics::BridgeDiagnosticEvent;
 
     use super::*;
 
@@ -1455,6 +1459,405 @@ mod tests {
                 "extra".into(),
             ])
             .is_err()
+        );
+    }
+
+    // WORK_UNIT_CASE: 742/2
+    #[cfg(windows)]
+    #[test]
+    fn launch_gate_states_record_distinct_boundary_codes() {
+        use eliot_store_surreal::diagnostics::RequestOutcome;
+
+        // The two launch-gate states this binary distinguishes before any
+        // composition, connect or pipe: a launch mode that requests no
+        // one-shot bootstrap descriptor, and a descriptor request whose Store
+        // config cannot be loaded. Both reach `emit_bootstrap_descriptor`, the
+        // one-shot arm `run` reaches after the launch-config decode.
+        let writer_launch =
+            parse_launch_mode(args(&["--config", "C:\\ProgramData\\Eliot\\store.json"]))
+                .expect("protected mode should parse");
+        // A directory component nothing in this process creates, so the
+        // configuration read is refused rather than skipped.
+        let absent_root = std::env::temp_dir().join("eliot-742-case2-absent-root");
+        let descriptor_launch = LaunchMode::EmitBootstrapDescriptor {
+            config_path: absent_root.join("store.json"),
+            output_path: absent_root.join("bootstrap.json"),
+        };
+
+        // The states are separated by the gate's own returned outcome: the
+        // writer launch asks for no descriptor at all, and the unloadable
+        // descriptor request is refused rather than silently skipped.
+        assert_eq!(
+            emit_bootstrap_descriptor(&writer_launch),
+            Ok(false),
+            "a writer launch requests no bootstrap descriptor"
+        );
+        assert!(
+            emit_bootstrap_descriptor(&descriptor_launch).is_err(),
+            "an unloadable descriptor config is refused, never silently skipped"
+        );
+
+        // The admitted launch-config receipt and the refused bootstrap
+        // descriptor are recorded through the entries this binary's own call
+        // sites use, and each record carries the stable machine code of the
+        // boundary that observed it.
+        let mut admitted = BoundedEventLog::new();
+        emit_received(
+            &mut admitted,
+            BridgeBoundary::LaunchConfig,
+            "launch_config",
+            &BridgeIdentity::new(),
+        );
+        let mut refused = BoundedEventLog::new();
+        emit_validation_rejected(
+            &mut refused,
+            BridgeBoundary::BootstrapDescriptor,
+            "bootstrap_descriptor",
+            &BridgeIdentity::new(),
+            None,
+        );
+        let admitted_event = admitted.last().expect("the admitted record is retained");
+        let refused_event = refused.last().expect("the refused record is retained");
+
+        assert_eq!(admitted_event.boundary().as_str(), "launch_config");
+        assert_eq!(refused_event.boundary().as_str(), "bootstrap_descriptor");
+        assert_eq!(admitted_event.outcome(), RequestOutcome::Received);
+        assert_eq!(
+            refused_event.outcome(),
+            RequestOutcome::ValidationRejected,
+            "a refused launch state is never recorded as an admitted receipt"
+        );
+        assert_ne!(
+            admitted_event.boundary().as_str(),
+            refused_event.boundary().as_str(),
+            "two different launch states emit two different boundary codes"
+        );
+
+        // Startup is a third boundary, reported after launch preparation and
+        // again after connect, so a startup state can never be read as either
+        // configuration-validation state.
+        let startup_code = BridgeBoundary::Startup.as_str();
+        assert_eq!(startup_code, "startup");
+        assert_ne!(
+            startup_code,
+            admitted_event.boundary().as_str(),
+            "the startup state does not reuse the launch-config code"
+        );
+        assert_ne!(
+            startup_code,
+            refused_event.boundary().as_str(),
+            "the startup state does not reuse the bootstrap-descriptor code"
+        );
+    }
+
+    /// Case 742/8 boundary split: the mutation result and the receipt-transport
+    /// emission are two records at two boundaries, and neither record borrows
+    /// the other's boundary code or outcome.
+    #[cfg(windows)]
+    fn assert_mutation_result_and_response_send_are_separate(
+        mutation_event: &BridgeDiagnosticEvent,
+        transport_event: &BridgeDiagnosticEvent,
+    ) {
+        use eliot_store_surreal::diagnostics::RequestOutcome;
+
+        assert_eq!(mutation_event.boundary().as_str(), "mutation_result");
+        assert_eq!(
+            mutation_event.outcome(),
+            RequestOutcome::Unknown,
+            "response loss after mutation preserves the unknown outcome"
+        );
+        assert_eq!(transport_event.boundary().as_str(), "response_send");
+        assert_eq!(
+            transport_event.outcome(),
+            RequestOutcome::LifecycleObserved,
+            "a transport loss is a lifecycle observation, never a result"
+        );
+        assert_ne!(
+            mutation_event.boundary().as_str(),
+            transport_event.boundary().as_str(),
+            "receipt creation and receipt transport emission are separate boundaries"
+        );
+    }
+
+    /// Case 742/8 identity survival: the operation identity the unproven
+    /// outcome projects is exactly the operation id, carries no receipt-derived
+    /// evidence, and reaches the transport-loss record unchanged.
+    #[cfg(windows)]
+    fn assert_operation_identity_survives_transport_loss(
+        identity: &BridgeIdentity,
+        transport_event: &BridgeDiagnosticEvent,
+    ) {
+        use eliot_store_api::OperationId;
+
+        assert_eq!(
+            identity.operation_id().map(OperationId::as_str),
+            Some("operation-742-8"),
+            "the exact operation identity survives an unproven outcome"
+        );
+        assert!(
+            identity.idempotency_ref().is_none(),
+            "no idempotency reference is admitted without a receipt"
+        );
+        assert!(
+            identity.manifest_digest().is_none(),
+            "no manifest digest is admitted without a receipt"
+        );
+        assert_eq!(
+            transport_event
+                .identity()
+                .operation_id()
+                .map(OperationId::as_str),
+            Some("operation-742-8"),
+            "the transport loss carries the same operation identity"
+        );
+    }
+
+    /// Case 742/8 fabricated-delivery absence: neither the mutation-result
+    /// record nor the transport-loss record admits a receipt, a recovery action
+    /// or response prose that a failed send never earned.
+    #[cfg(windows)]
+    fn assert_transport_loss_records_fabricate_no_delivery(
+        mutation_event: &BridgeDiagnosticEvent,
+        transport_event: &BridgeDiagnosticEvent,
+    ) {
+        assert!(
+            mutation_event.receipt_status().is_none(),
+            "no receipt status is recorded without owner receipt evidence"
+        );
+        assert!(
+            mutation_event.detail().is_none(),
+            "response prose never reaches the recorded outcome"
+        );
+        assert!(
+            transport_event.receipt_status().is_none(),
+            "output failure cannot fabricate a delivered receipt"
+        );
+        assert!(
+            transport_event.recovery().is_none(),
+            "logging a send loss schedules no reconciliation and no resubmission"
+        );
+    }
+
+    /// Case 742/8 fabricated-delivery absence on the real output-failure path:
+    /// the rejected frame is a typed defect with no mutation attempted, and its
+    /// record carries no receipt status.
+    #[cfg(windows)]
+    fn assert_frame_rejection_defect_fabricates_no_delivery() {
+        use eliot_store_api::{StoreFailureDisposition, StoreMutationDisposition};
+        use eliot_store_surreal::Response;
+        use eliot_store_surreal::diagnostics::{RequestOutcome, classify_response};
+
+        let defect = frame_rejection_defect(None, "EBP frame rejected".to_owned());
+        assert_eq!(
+            classify_response(&defect),
+            RequestOutcome::Defect,
+            "an output failure classifies as a defect, never as a delivered receipt"
+        );
+        let mut round = BoundedEventLog::new();
+        emit_dispatch_outcome(
+            &mut round,
+            BridgeBoundary::FrameRejection,
+            "frame",
+            &BridgeIdentity::from_response(&defect),
+            &defect,
+        );
+        let defect_event = round.last().expect("the frame rejection is retained");
+        assert!(
+            defect_event.receipt_status().is_none(),
+            "a pre-dispatch defect carries no receipt status"
+        );
+        assert_eq!(
+            defect_event.failure_disposition(),
+            Some(StoreFailureDisposition::InternalDefect)
+        );
+        let Response::Failure { failure } = &defect else {
+            panic!("a frame-rejection defect is always the typed failure envelope");
+        };
+        assert_eq!(
+            failure.mutation_disposition,
+            StoreMutationDisposition::NotAttempted,
+            "the output-failure response attempted no mutation"
+        );
+    }
+
+    /// Case 742/8 transport-log accounting: reporting the send loss is a
+    /// read-only projection — one retained record, nothing dropped, nothing
+    /// retried and no receipt manufactured.
+    #[cfg(windows)]
+    fn assert_transport_log_reporting_is_read_only(transport: &BoundedEventLog) {
+        assert_eq!(
+            transport.len(),
+            1,
+            "reporting the send loss never appends a second record"
+        );
+        assert_eq!(
+            transport.dropped(),
+            0,
+            "reporting the send loss drops nothing and retries nothing"
+        );
+    }
+
+    // WORK_UNIT_CASE: 742/8
+    #[cfg(windows)]
+    #[test]
+    fn mutation_result_and_response_send_records_stay_separate_on_response_loss() {
+        use eliot_store_api::OperationId;
+        use eliot_store_surreal::Response;
+
+        // The typed unknown outcome a mutation that crossed the provider
+        // boundary without a proven outcome leaves behind.
+        let unknown = Response::Unknown {
+            operation_id: OperationId::new("operation-742-8")
+                .expect("operation id should be admissible"),
+            reason: "EBP response failed: pipe closed before send".to_owned(),
+        };
+        // Receipt creation is logged only with owner evidence. The unknown
+        // outcome carries no receipt, so the identity it projects is the
+        // operation id alone.
+        let identity = BridgeIdentity::from_response(&unknown);
+
+        // The mutation result keeps `Unknown`: response loss after mutation is
+        // never re-decided into commit or rollback on the recorded outcome.
+        let mut mutation = BoundedEventLog::new();
+        emit_dispatch_outcome(
+            &mut mutation,
+            BridgeBoundary::MutationResult,
+            "mutation_result",
+            &identity,
+            &unknown,
+        );
+        let mutation_event = mutation.last().expect("the mutation result is retained");
+
+        // Receipt transport emission is a separate record at its own boundary:
+        // a created receipt is not a delivered one.
+        let mut transport = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut transport,
+            BridgeBoundary::ResponseSend,
+            "response_send",
+            &identity,
+            None,
+        );
+        let transport_event = transport.last().expect("the transport loss is retained");
+
+        // Each proved property is asserted by the helper named for it: the
+        // boundary split, the identity survival, and the two claims that a lost
+        // response fabricates no delivery.
+        assert_operation_identity_survives_transport_loss(&identity, transport_event);
+        assert_mutation_result_and_response_send_are_separate(mutation_event, transport_event);
+        assert_transport_loss_records_fabricate_no_delivery(mutation_event, transport_event);
+        assert_frame_rejection_defect_fabricates_no_delivery();
+
+        // Logging the send loss is a read-only projection: it appends no second
+        // record, drops nothing, retries nothing and manufactures no receipt.
+        report_events(&transport);
+        assert_transport_log_reporting_is_read_only(&transport);
+    }
+
+    // WORK_UNIT_CASE: 742/12
+    #[test]
+    fn shutdown_and_process_exit_record_their_exact_bridge_dispositions() {
+        use eliot_store_surreal::diagnostics::RequestOutcome;
+
+        // Every transport-loop termination site in `serve_handshake_loop` is
+        // gated on this exact predicate, so a latched quiesce is the one
+        // reachable shutdown state without a live pipe.
+        let (owner_quiesce, owner_quiesce_receiver) = tokio::sync::watch::channel(None);
+        assert_eq!(
+            owner_quiesce_reason(&owner_quiesce_receiver),
+            None,
+            "an unquiesced owner records no shutdown disposition"
+        );
+        owner_quiesce.send_replace(Some("snapshot owner accounting is unusable".to_owned()));
+        assert_eq!(
+            owner_quiesce_reason(&owner_quiesce_receiver).as_deref(),
+            Some("snapshot owner accounting is unusable"),
+            "the quiesce reason is the exact disposition the termination sites return"
+        );
+
+        // The in-flight operation identity the termination sites pass alongside
+        // the disposition when a request was already dispatched.
+        let operation_id = eliot_store_api::OperationId::new("operation-742-12")
+            .expect("operation id should be admissible");
+        let identity = BridgeIdentity::new().with_operation(&operation_id);
+
+        // The loop-termination disposition is exactly one lifecycle
+        // observation at the shutdown boundary, carrying no fabricated reason,
+        // recovery, receipt status or detail.
+        let mut shutdown = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut shutdown,
+            BridgeBoundary::Shutdown,
+            "shutdown",
+            &identity,
+            None,
+        );
+        assert_eq!(
+            shutdown.len(),
+            1,
+            "the loop-termination disposition is recorded exactly once"
+        );
+        let shutdown_event = shutdown
+            .last()
+            .expect("the shutdown disposition is retained");
+        assert_eq!(shutdown_event.boundary().as_str(), "shutdown");
+        assert_eq!(shutdown_event.operation(), "shutdown");
+        assert_eq!(shutdown_event.outcome(), RequestOutcome::LifecycleObserved);
+        assert_eq!(shutdown_event.reason(), None);
+        assert_eq!(shutdown_event.recovery(), None);
+        assert_eq!(shutdown_event.receipt_status(), None);
+        assert_eq!(shutdown_event.failure_disposition(), None);
+        assert_eq!(shutdown_event.detail(), None);
+        assert_eq!(
+            shutdown_event
+                .identity()
+                .operation_id()
+                .map(eliot_store_api::OperationId::as_str),
+            Some("operation-742-12"),
+            "the in-flight operation identity survives into the disposition"
+        );
+
+        // The exit-code projection is a second, distinct disposition.
+        let mut exit = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut exit,
+            BridgeBoundary::ProcessExit,
+            "process_exit",
+            &BridgeIdentity::new(),
+            None,
+        );
+        let exit_event = exit
+            .last()
+            .expect("the process-exit disposition is retained");
+        assert_eq!(exit_event.boundary().as_str(), "process_exit");
+        assert_eq!(exit_event.operation(), "process_exit");
+        assert_eq!(exit_event.outcome(), RequestOutcome::LifecycleObserved);
+        assert!(
+            exit_event.identity().operation_id().is_none(),
+            "the exit-code projection admits no operation identity"
+        );
+        assert_ne!(
+            shutdown_event.boundary().as_str(),
+            exit_event.boundary().as_str(),
+            "loop termination and process exit are distinct dispositions"
+        );
+        assert_ne!(
+            shutdown_event.boundary().as_str(),
+            BridgeBoundary::ResponseSend.as_str(),
+            "the shutdown disposition is never the transport-loss boundary"
+        );
+
+        // Reporting the disposition emits it once and fabricates nothing more.
+        report_events(&shutdown);
+        assert_eq!(
+            shutdown.len(),
+            1,
+            "reporting the disposition never appends a second record"
+        );
+        assert_eq!(
+            shutdown.dropped(),
+            0,
+            "reporting the disposition drops nothing and retries nothing"
         );
     }
 }

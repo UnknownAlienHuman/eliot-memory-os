@@ -33,24 +33,6 @@ fn completion_error(error: impl std::fmt::Display) -> DaemonError {
     DaemonError::Lifecycle(format!("TestD terminal completion: {error}"))
 }
 
-/// Denies one terminal material commit when the admitted identity carries no
-/// task (issue #1789 A1, task-binding leg production consult).
-///
-/// Both terminal legs publish canonical Material effects, so the task-binding
-/// leg of the material-readiness gate is enforced with the gate's own typed
-/// directive before anything launches. This mirrors the full evaluator's
-/// no-task verdict (`TASK_SELECTION_REQUIRED`, missing
-/// `current_task_contract`); the remaining legs (coverage, truth surface,
-/// verifier, authority route, lease, guard currency) have no production
-/// producer yet and stay with the existing authorities (admitted identity,
-/// task owner, `#1787` guard).
-fn no_task_material_denial(context: &str) -> DaemonError {
-    completion_error(format!(
-        "material readiness denies {context}: {}; missing: current_task_contract",
-        eliot_workscope::MaterialReadinessDirective::TaskSelectionRequired.kind_str()
-    ))
-}
-
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -236,13 +218,24 @@ impl DaemonComposition {
                 "canonical verifier plan changed after TestD dispatch",
             ));
         }
+        // Issue #1789 A1: this is a total conversion of an optional field into
+        // the required `TaskId`, not an enforcement point.
+        // `TestdVerifierDispatchBinding::validate_for_job` above already
+        // refuses a binding whose `RequestMetadata::task_id` is absent with
+        // `TestdError::InvalidBinding`, and it reads the very
+        // `binding.request_identity` whose task id is unwrapped here, so on any
+        // row that reaches this line the task id is present. This lane
+        // therefore cannot emit the readiness gate's `TASK_SELECTION_REQUIRED`
+        // directive and does not claim to: a task-less row never arrives, and
+        // the request-to-mutation typed refusal belongs to the Kernel TestD
+        // owner-submit ingress (`dispatch_launch::submit_testd_owner_job`).
         let task_id = binding
             .request_identity
             .request
             .metadata
             .task_id
             .clone()
-            .ok_or_else(|| no_task_material_denial("TestD terminal publication"))?;
+            .ok_or_else(|| completion_error("admitted terminal identity names no task"))?;
         // The current task revision is resolved by the Governor finish owner from
         // its live task-lifecycle record, not from the admitted identity's
         // `StateFence::task_revision`: that field is structurally `None` on every
@@ -342,29 +335,32 @@ impl DaemonComposition {
     /// later, after the fact leg publishes, so the evidence join reads the
     /// published fact image.
     ///
-    /// The task-binding denial stays ahead of both legs exactly as before: a
-    /// missing admitted task denies the whole completion with the readiness
-    /// gate's typed directive before anything launches. The finish candidate is
-    /// derived here rather than after the fact leg, and that reorder is not
-    /// observable: its only rejection cases are an absent task id or task
-    /// revision fence and a job state that is not settled terminal, and the
-    /// fact prepare already refuses exactly those rows.
+    /// An absent task id still ends the whole completion before anything
+    /// launches, but it is not a typed readiness refusal here: the only live
+    /// producer of this row, `TestdStore::pending_terminal_completion_evidence`,
+    /// already ran `TestdVerifierDispatchBinding::validate_for_job` and rejects
+    /// a task-less binding with `TestdError::InvalidBinding` before it yields
+    /// evidence, so this lane can only convert an always-present field. The
+    /// finish candidate is derived here rather than after the fact leg, and that
+    /// reorder is not observable: its only rejection cases are an absent task id
+    /// or task revision fence and a job state that is not settled terminal, and
+    /// the fact prepare already refuses exactly those rows.
     pub fn plan_testd_terminal_owner_fact(
         &self,
         evidence: &TestdTerminalCompletionEvidence,
     ) -> Result<TestdTerminalOwnerPlan, DaemonError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
-        // Issue #1789 A1: both legs below publish canonical Material effects, so
-        // the readiness gate's typed directive is the very refusal that also
-        // yields the task id — the denial stays ahead of both legs exactly as
-        // before, and it is not restated as a second check.
+        // Issue #1789 A1: as in the publication leg above, this unwraps an
+        // always-present field rather than enforcing a directive — the live
+        // evidence producer refuses a task-less binding upstream with
+        // `TestdError::InvalidBinding`.
         let task_id = identity
             .request
             .metadata
             .task_id
             .clone()
-            .ok_or_else(|| no_task_material_denial("TestD terminal completion"))?;
+            .ok_or_else(|| completion_error("terminal evidence identity names no task"))?;
         // The candidate's stale-write guard is the task-lifecycle owner record's
         // own current revision, read here from the same owner the Governor
         // resolves it from again inside the fact leg. The admitted identity's
@@ -581,8 +577,8 @@ pub async fn commit_testd_terminal_owner_fact(
     composition: &SharedTestdOwnerComposition,
     evidence: &TestdTerminalCompletionEvidence,
 ) -> Result<WriteReceipt, DaemonError> {
-    // (0) guard held, no exchange: deny a task-free row and derive the Task
-    // Controller's current plan for this row's task.
+    // (0) guard held, no exchange: derive the Task Controller's current
+    // plan for this row's task.
     //
     // Issue #1741, I7.9: the current `TaskContract`'s plan revision is an owner
     // fact, and the fact leg below reads it from the canonical owner image. That
@@ -594,16 +590,20 @@ pub async fn commit_testd_terminal_owner_fact(
     // supplies only the admitted identity, the row's operation identity and the
     // task id, so it cannot hand the canonical owner a plan of its own.
     //
-    // The task-binding denial stays ahead of every leg exactly as phase (1)
-    // places it: a missing admitted task denies the whole completion with the
-    // readiness gate's typed directive before anything launches.
+    // Issue #1789 A1: the row's task id is unwrapped here ahead of every leg,
+    // but this is not a typed readiness refusal. The live producer of this
+    // evidence, `TestdStore::pending_terminal_completion_evidence`, already ran
+    // `TestdVerifierDispatchBinding::validate_for_job` and refuses a task-less
+    // binding with `TestdError::InvalidBinding`, so a task-free row never
+    // reaches this function and no `TASK_SELECTION_REQUIRED` directive can be
+    // emitted from here.
     let row_task_id = evidence
         .request_identity
         .request
         .metadata
         .task_id
         .clone()
-        .ok_or_else(|| no_task_material_denial("TestD terminal completion"))?;
+        .ok_or_else(|| completion_error("terminal evidence identity names no task"))?;
     let plan_operation_id = OperationId::new(format!(
         "{}/current-plan",
         testd_terminal_finish_operation_id(&evidence.job.job_id)?.as_str()
