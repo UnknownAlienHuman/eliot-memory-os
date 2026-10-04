@@ -4831,12 +4831,38 @@ mod tests {
         );
         // The one commitment this crate computes for these bytes, carried through
         // unchanged: no second digest, no fallback, no legacy value.
+        //
+        // What the handoff must answer is "is this commitment the commitment OF
+        // THIS PROPOSAL", and re-deriving it here with `proposal_digest` cannot
+        // answer that: production computes that very value from that very input,
+        // so a deterministic function would only be compared with itself. The
+        // binding is proved by MUTATION instead — a second proposal differing in
+        // exactly one content field, whose commitment must then differ.
+        let mut mutated = proposal("a");
+        mutated.expected_delta = "expected-delta-2702-b".to_string();
+        let mutated_normalized = match canonical_proposal(&mutated) {
+            Ok(normalized) => normalized,
+            Err(error) => panic!("the mutated fixture proposal must normalize, got {error:?}"),
+        };
+        let mutated_commitment = match commitment_of(&mutated_normalized) {
+            Ok(commitment) => commitment,
+            Err(error) => panic!("the mutated fixture proposal must commit, got {error:?}"),
+        };
+        // The operation and idempotency identities are held constant, so the
+        // difference below is content and is not an identity swap in disguise.
         assert_eq!(
-            handoff.proposal_commitment,
-            match proposal_digest(&group.proposal) {
-                Ok(commitment) => commitment,
-                Err(error) => panic!("the fixture proposal must commit, got {error:?}"),
-            }
+            mutated_commitment.operation_ref,
+            handoff.proposal_commitment.operation_ref
+        );
+        assert_eq!(
+            mutated_commitment.idempotency_key,
+            handoff.proposal_commitment.idempotency_key
+        );
+        // One content field changed, so this is NOT the admitted handoff's
+        // commitment: the digest is bound to the proposal's own bytes.
+        assert_ne!(
+            mutated_commitment.digest,
+            handoff.proposal_commitment.digest
         );
         assert_eq!(
             handoff.proposal_commitment.algorithm,
@@ -4846,12 +4872,17 @@ mod tests {
             handoff.proposal_commitment.domain,
             IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN
         );
+        // The discriminator projection is bound to the same bytes by the same
+        // argument, not by recomputation: the mutated proposal projects the
+        // mutated content, and that projection is not the handoff's projection.
+        let mutated_discriminator = discriminator_of(&mutated_normalized);
         assert_eq!(
-            handoff.proposal_discriminator,
-            discriminator_of(&match canonical_proposal(&group.proposal) {
-                Ok(normalized) => normalized,
-                Err(error) => panic!("the fixture proposal must normalize, got {error:?}"),
-            })
+            mutated_discriminator.expected_delta,
+            "expected-delta-2702-b"
+        );
+        assert_ne!(
+            mutated_discriminator.expected_delta,
+            handoff.proposal_discriminator.expected_delta
         );
         // The readable projection is populated but is not the join and is not a
         // permit.
@@ -4925,7 +4956,25 @@ mod tests {
             decision.proposal_commitment,
             Some(handoff.proposal_commitment.clone())
         );
-        assert_eq!(decision.disposition, disposition);
+        // The disposition is carried VERBATIM, and this is how that is checked
+        // without comparing a value with its own clone:
+        // `improvement_terminal_decision` takes the disposition by reference and
+        // clones it into the record, so `assert_eq!(decision.disposition,
+        // disposition)` held by construction and could never fail. What CAN fail
+        // is a record that substituted a branch, dropped the handoff, or rewrote
+        // any handoff field on the way in. The identities below are literals this
+        // module's own fixture builders state, so the admitted branch is pinned
+        // without consulting the run's output at all; the equality then pins the
+        // transport itself, handoff for handoff.
+        match &decision.disposition {
+            ImprovementTerminalDisposition::CanaryAdmitted { handoff: recorded } => {
+                assert_eq!(recorded.candidate_id, "cand-2702-a");
+                assert_eq!(recorded.experiment_id, "exp-2702-a");
+                assert_eq!(recorded.rollback_owner_id, "rollback-owner-2702-a");
+                assert_eq!(**recorded, *handoff);
+            }
+            other => panic!("the decision must record the admitted branch, got {other:?}"),
+        }
 
         // The same record with execution authority spliced into it is refused as
         // a verdict that disagrees with its own evidence: no shape and no
@@ -5380,6 +5429,23 @@ mod tests {
             }
         );
 
+        // The reopen reference is bound exactly as the rollback, disable and
+        // expiry references are: a declared review reference that names a
+        // different reopen handle than the rollback contract is a disagreement,
+        // not a second valid way to reopen. The admitted twin for an UNCHANGED
+        // `reopen_ref` is already bound by
+        // `one_valid_joined_fixture_reaches_the_non_authorizing_canary_handoff`,
+        // which admits this same fixture and carries `reopen-2702-a` into the
+        // handoff, so it is not repeated here.
+        let mut group = fixture("a");
+        group.admission_evidence.reopen_ref = Some("reopen-2702-b".to_string());
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-evidence: reopen-reference-disagreement",
+            }
+        );
+
         let mut group = fixture("a");
         group.admission_evidence.expiry_ref = Some("expiry-2702-b".to_string());
         assert_eq!(
@@ -5412,6 +5478,8 @@ mod tests {
                 "invalidation-store".to_string()
             ]
         );
+        // Admitted for one canary, and admitted without authority to run it.
+        assert!(!group.admitted().execution_authorized);
     }
 
     #[test]
@@ -5475,6 +5543,10 @@ mod tests {
         let group_b = fixture("b");
         assert_eq!(group_a.admitted().candidate_id, "cand-2702-a");
         assert_eq!(group_b.admitted().candidate_id, "cand-2702-b");
+        // Both are admitted handoffs, so both are non-authorizing records: the
+        // mixing question never changes what an admission is allowed to grant.
+        assert!(!group_a.admitted().execution_authorized);
+        assert!(!group_b.admitted().execution_authorized);
 
         // The explicit A/B counterexample: proposal, plan, evaluation evidence
         // and rollback contract of group A, with the independently valid candidate
@@ -5578,5 +5650,8 @@ mod tests {
             control.admitted().admission_pulse_ref,
             "pulse-evidence-2702-a"
         );
+        // The control's handoff is an admitted handoff too, so it carries the
+        // owner's pulse evidence AND no execution authority.
+        assert!(!control.admitted().execution_authorized);
     }
 }
