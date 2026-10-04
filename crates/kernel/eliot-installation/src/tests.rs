@@ -10908,13 +10908,18 @@ fn canary_removal_plan_stdout_round_trips_as_the_owner_envelope() {
 /// per-row drive and the terminal walk never ask anything about them — and the
 /// fence is therefore the only place their frozen identity and classification are
 /// ever compared against the transaction the durable store holds.
+///
+/// The name says `fence`, not `readback`, and that is the point rather than a
+/// hedge: a name promising a readback direction would credit this case with a
+/// refusal it cannot produce. The refusal asserted below is `IdentityConflict`
+/// from `require_quiesced_owner_effects`, raised BEFORE any row is driven.
 #[cfg(windows)]
 #[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the drift, the refusal and the untouched durable state are each asserted"
 )]
-fn canary_removal_owner_derived_drift_between_plan_and_readback_never_completes() {
+fn canary_removal_owner_derived_drift_between_plan_and_fence_never_completes() {
     let _lock = PRODUCTION_INSTALLER_TEST_LOCK
         .lock()
         .unwrap_or_else(|_| unreachable!());
@@ -12332,6 +12337,7 @@ fn assert_no_row_was_closed_with_a_plan_carried_owner_claim(
     let mut retained_installer_effect_rows = 0_usize;
     let mut removed_rows = 0_usize;
     let mut out_of_scope_rows = 0_usize;
+    let mut open_destructive_rows = 0_usize;
     for (row, progress) in durable.plan.effects.iter().zip(&durable.effect_progress) {
         assert_eq!(
             progress.effect_id, row.effect_id,
@@ -12388,6 +12394,24 @@ fn assert_no_row_was_closed_with_a_plan_carried_owner_claim(
                     ),
                 }
             }
+            // The terminal registry row is `Remove` and is EXPECTED to be still
+            // open in the refused walk this helper was written for: recovery was
+            // refused before the terminal commit, so nothing drove it. It gets its
+            // own arm rather than falling through, because the catch-all below
+            // would panic on exactly the shape its one caller produces.
+            (
+                _,
+                state @ (CanaryRemovalEffectState::Pending
+                | CanaryRemovalEffectState::IntentCommitted { .. }),
+            ) => {
+                assert!(
+                    matches!(state, CanaryRemovalEffectState::Pending),
+                    "row {} is a destructive row the refused walk never drove, so it must be \
+                     still Pending rather than checkpointed; it ended {state:?}",
+                    row.effect_id.as_str()
+                );
+                open_destructive_rows += 1;
+            }
             (_, state) => panic!(
                 "row {} did not close at all, which no claim below depends on; it ended {state:?}",
                 row.effect_id.as_str()
@@ -12403,6 +12427,11 @@ fn assert_no_row_was_closed_with_a_plan_carried_owner_claim(
         removed_rows >= 2,
         "the denominator must carry at least one destructive installer-effect row plus the \
          terminal registry row"
+    );
+    assert_eq!(
+        open_destructive_rows, 1,
+        "exactly one destructive row may stay open in this walk: the terminal registry row, \
+         which the refusal happened before any row could drive"
     );
     assert_eq!(
         out_of_scope_rows, 2,

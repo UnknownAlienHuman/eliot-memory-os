@@ -2342,9 +2342,12 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             host_state_root,
             generation,
             request,
-        } => {
-            canary_removal_entry::run_remove_canary(&store, &host_state_root, &generation, &request)
-        }
+        } => Ok(canary_removal_entry::run_remove_canary(
+            &store,
+            &host_state_root,
+            &generation,
+            &request,
+        )),
         InstallationCommand::PlanCanaryRemoval {
             store,
             host_state_root,
@@ -2360,20 +2363,27 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             store,
             host_state_root,
             plan,
-        } => canary_removal_entry::run_apply_canary_removal(&store, &host_state_root, &plan),
+        } => Ok(canary_removal_entry::run_apply_canary_removal(
+            &store,
+            &host_state_root,
+            &plan,
+        )),
         InstallationCommand::CanaryRemovalStatus {
             store,
             removal_transaction_id,
-        } => canary_removal_entry::run_canary_removal_status(&store, &removal_transaction_id),
+        } => Ok(canary_removal_entry::run_canary_removal_status(
+            &store,
+            &removal_transaction_id,
+        )),
         InstallationCommand::RecoverCanaryRemoval {
             store,
             host_state_root,
             removal_transaction_id,
-        } => canary_removal_entry::run_recover_canary_removal(
+        } => Ok(canary_removal_entry::run_recover_canary_removal(
             &store,
             &host_state_root,
             &removal_transaction_id,
-        ),
+        )),
         InstallationCommand::MaterializeSourceBundle {
             eliot_host,
             eliot_watchdog,
