@@ -7116,8 +7116,69 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     // `lib.rs` selects its frozen row by identifier at every site. The one
     // child-module seam that decides its row from a semantic outcome must name
     // only frozen rows while it does so.
+    //
+    // The facade has a second route in, which no identifier-selected seam site
+    // can see: a statement may call `observe_entrypoint_with_detail`,
+    // `observe_entrypoint`, `observe_terminal_error` or `observe_host_request`
+    // itself, with an event string it built itself. The observation-statement
+    // scan collects that route too, every such statement is judged against the
+    // already-allowed shapes here, and the collected set is pinned
+    // exactly below, so a free string or a `format!` reaching a facade call
+    // directly fails and a removed frozen seam site fails as well.
+    let identity_seam = case22_body(&lib, "fn host_lifecycle_observe_identity(");
+    let mut facade_statements: Vec<String> = Vec::new();
+    for source in [&lib, &activation] {
+        for statement in case22_observation_statements(&[source]) {
+            let Some(shape) = case22_allowed_facade_shape(statement.as_str(), &identity_seam)
+            else {
+                assert!(
+                    case22_facade_callee(statement.as_str()).is_none(),
+                    "no_unowned_edit: a statement that calls the #889 facade directly must reach the observation path only through one of the already-allowed shapes (the frozen `host_lifecycle_observe_*` seam, the frozen `host_lifecycle_frozen_event`/`host_lifecycle_boundary` projection, the one already-pinned `pub use` seam re-export, or the identity seam's own projection), never through a free event string or a `format!` it built itself: {statement}"
+                );
+                continue;
+            };
+            assert!(
+                !statement.contains('"'),
+                "no_unowned_edit: a direct facade call must carry no free event string: {statement}"
+            );
+            for forbidden in ["format!", "concat!", ".as_str()", "to_owned()"] {
+                assert!(
+                    !statement.contains(forbidden),
+                    "no_unowned_edit: a direct facade call must carry no {forbidden:?}: {statement}"
+                );
+            }
+            facade_statements.push(format!(
+                "{shape}: {}",
+                case22_normalized(statement.as_str())
+            ));
+        }
+    }
+    facade_statements.sort_unstable();
+    assert_eq!(
+        facade_statements,
+        vec![
+            "frozen-identity-seam: host_diagnostics::observe_host_request(projection);"
+                .to_owned(),
+            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::ScmDispatch, host_lifecycle_frozen_event(boundary), );".to_owned(),
+            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::ShutdownDrain, host_lifecycle_frozen_event(boundary), );".to_owned(),
+            "frozen-projection-detail: host_diagnostics::observe_entrypoint_with_detail( host_diagnostics::EntrypointStage::Startup, host_lifecycle_frozen_event(boundary), );".to_owned(),
+            "frozen-projection-detail: host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));".to_owned(),
+        ],
+        "no_unowned_edit: the #889 facade must be reached from exactly these frozen statements, one per seam site, over `lib.rs` and `activation_lifecycle.rs` together: an added direct facade call is an unedited observation of the observation path and a missing statement is an owned edit this case no longer proves: {facade_statements:?}"
+    );
+    assert_eq!(
+        count_occurrences(&lib, "observe_host_request("),
+        1,
+        "no_unowned_edit: the identity seam must own the only host-request projection site in lib.rs, so the one allowed `observe_host_request` shape is the one frozen statement and not a family of lookalikes"
+    );
+
     let mut call_sites = 0;
     for statement in &case22_observation_statements(&[&lib]) {
+        if case22_allowed_facade_shape(statement, &identity_seam).is_some() {
+            // A direct facade call is already judged above by its exact frozen
+            // shape; here only identifier-selected seam sites are counted.
+            continue;
+        }
         if statement.starts_with("fn host_lifecycle_observe_")
             || statement.starts_with("host_lifecycle_observe_terminal(self.boundary)")
         {
@@ -7164,6 +7225,11 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     // either names one frozen row outright or names a local whose only values
     // are frozen rows chosen by a match on the semantic outcome.
     for statement in &case22_observation_statements(&[&activation]) {
+        if case22_allowed_facade_shape(statement, &identity_seam).is_some() {
+            // A direct facade call is already judged above by its exact frozen
+            // shape; here only identifier-selected seam sites are counted.
+            continue;
+        }
         call_sites += 1;
         assert!(
             statement.ends_with(");"),
@@ -7395,6 +7461,24 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     assert!(
         facade.contains("pub fn note_event_log_sink_status()"),
         "the published seam must resolve to an existing facade item, not a new one"
+    );
+    // The seven substrings above can only prove the names they spell, so the
+    // property itself is proved here instead: every `pub`/`pub(crate)` item and
+    // every `pub use` re-export of either instrumented source that names the
+    // observation surface, read out of the declaration lines themselves, must be
+    // EXACTLY the one publication this suite already enumerates. An exact set
+    // comparison sees both directions, so a new `pub use` of a private
+    // observation helper fails here where no named substring can, and removing
+    // the one published seam fails here too.
+    let mut published_surface: Vec<String> = Vec::new();
+    for source in [&lib, &activation] {
+        published_surface.extend(case22_published_surface(source));
+    }
+    published_surface.sort_unstable();
+    assert_eq!(
+        published_surface,
+        vec!["pub use host_diagnostics::note_event_log_sink_status;".to_owned()],
+        "the only published observation-surface item must stay the single #889 re-export this suite enumerates: any other `pub`/`pub(crate)` item or `pub use` re-export naming the seam helpers, the frozen projection, the row table, the guard, a row identifier or a facade entry point is new visibility, and losing the re-export itself is new non-visibility this case no longer proves: {published_surface:?}"
     );
 
     // ---- executed pass: the #889 facade's own formatting and delivery for the
@@ -7877,6 +7961,15 @@ fn case22_armed_sites(sources: &[&str]) -> Vec<String> {
 
 /// The observation statements of the instrumented sources, with multi-line
 /// sites joined so no argument is skipped.
+///
+/// A statement is collected when it calls the frozen seam family
+/// (`host_lifecycle_observe_*`) OR when it reaches the #889 facade directly
+/// (`observe_entrypoint_with_detail`, `observe_entrypoint`,
+/// `observe_terminal_error`, `observe_host_request`). The second route is how an
+/// unedited observation enters the same observation path, so it is collected
+/// here too and judged by `case22_allowed_facade_shape`; collecting only seam
+/// spellings would let a direct facade call with a free event string through
+/// unremarked.
 fn case22_observation_statements(sources: &[&str]) -> Vec<String> {
     let mut statements = Vec::new();
     for source in sources {
@@ -7884,7 +7977,8 @@ fn case22_observation_statements(sources: &[&str]) -> Vec<String> {
         let mut index = 0;
         while index < lines.len() {
             let line = lines[index];
-            if line.contains("host_lifecycle_observe_")
+            let reaches_facade = case22_facade_callee(line).is_some();
+            if (line.contains("host_lifecycle_observe_") || reaches_facade)
                 && line.contains('(')
                 && !line.trim_start().starts_with("//")
             {
@@ -7902,6 +7996,128 @@ fn case22_observation_statements(sources: &[&str]) -> Vec<String> {
         }
     }
     statements
+}
+
+/// The `pub`/`pub(crate)` items and `pub use` re-exports of `source` that name
+/// the observation surface, as normalized declaration statements, in source
+/// order.
+///
+/// The surface is the `host_lifecycle_observe_*` seam family and the
+/// `host_lifecycle_frozen_event`/`host_lifecycle_boundary` projection beside
+/// them, the `HostLifecycleBoundary`/`HOST_LIFECYCLE_BOUNDARY_TABLE` row table
+/// with its `BOUNDARY_`/`PROPAGATED_` identifiers, the `HostTerminalGuard`, the
+/// `note_event_log_sink_status` seam re-export, and the facade entry points that
+/// are the only way to observe anything at all.
+///
+/// A declaration is read whole — a `pub use` brace group or a `const` value
+/// split across lines joins into one statement — but never past the body a
+/// signature opens, so a published function is judged by its own signature and
+/// never by the seam calls its body happens to make.
+fn case22_published_surface(source: &str) -> Vec<String> {
+    const OBSERVATION_SURFACE: [&str; 12] = [
+        "host_lifecycle_observe_",
+        "host_lifecycle_frozen_event",
+        "host_lifecycle_boundary",
+        "HOST_LIFECYCLE_BOUNDARY_TABLE",
+        "HostLifecycleBoundary",
+        "HostTerminalGuard",
+        "note_event_log_sink_status",
+        "BOUNDARY_",
+        "PROPAGATED_",
+        "observe_entrypoint",
+        "observe_terminal_error",
+        "observe_host_request",
+    ];
+    let lines: Vec<&str> = source.lines().collect();
+    let mut published = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if !(trimmed.starts_with("pub ") || trimmed.starts_with("pub(")) {
+            index += 1;
+            continue;
+        }
+        // A re-export is only complete once its brace group closes; any other
+        // item is complete at its own signature's `{`/`;`, never at a body.
+        let is_re_export = trimmed
+            .split_once(|c: char| c.is_whitespace())
+            .is_some_and(|(_, keyword)| keyword.starts_with("use"));
+        let mut statement = trimmed.to_owned();
+        while index + 1 < lines.len() && case22_publication_needs_line(&statement, is_re_export) {
+            index += 1;
+            statement.push(' ');
+            statement.push_str(lines[index].trim());
+        }
+        if OBSERVATION_SURFACE
+            .iter()
+            .any(|surface| statement.contains(surface))
+        {
+            published.push(case22_normalized(&statement));
+        }
+        index += 1;
+    }
+    published
+}
+
+/// Whether one `pub`/`pub(crate)` declaration statement still has lines to join.
+fn case22_publication_needs_line(statement: &str, is_re_export: bool) -> bool {
+    let parentheses =
+        count_occurrences(statement, "(").saturating_sub(count_occurrences(statement, ")"));
+    let brackets =
+        count_occurrences(statement, "[").saturating_sub(count_occurrences(statement, "]"));
+    if is_re_export {
+        let braces =
+            count_occurrences(statement, "{").saturating_sub(count_occurrences(statement, "}"));
+        return parentheses > 0 || brackets > 0 || braces > 0 || !statement.ends_with(';');
+    }
+    parentheses > 0 || brackets > 0 || statement.ends_with('=') || statement.ends_with(',')
+}
+
+/// The facade entry point a line calls directly, if any.
+fn case22_facade_callee(line: &str) -> Option<&'static str> {
+    const FACADE_CALLEES: [&str; 4] = [
+        "observe_entrypoint_with_detail(",
+        "observe_entrypoint(",
+        "observe_terminal_error(",
+        "observe_host_request(",
+    ];
+    FACADE_CALLEES
+        .iter()
+        .find(|callee| line.contains(*callee))
+        .copied()
+}
+
+/// The already-allowed shape of a collected statement that calls the #889 facade
+/// directly, or `None` when the statement is not such a call at all.
+///
+/// The allowed set is named exactly, because the file's own seam bodies are the
+/// allowed shapes and a rule that rejected them would prove nothing: a direct
+/// facade call must be the frozen seam family, the frozen projection itself, the
+/// one already-published seam re-export, or the identity seam's own
+/// `HostRequestProjection` argument.
+fn case22_allowed_facade_shape(statement: &str, identity_seam: &str) -> Option<&'static str> {
+    let callee = case22_facade_callee(statement)?;
+    if statement.contains("host_lifecycle_observe_") {
+        return Some("frozen-seam-call");
+    }
+    if statement.contains("host_lifecycle_frozen_event(")
+        || statement.contains("host_lifecycle_boundary(")
+    {
+        return Some("frozen-projection-detail");
+    }
+    if statement.trim() == "pub use host_diagnostics::note_event_log_sink_status;" {
+        return Some("published-seam-re-export");
+    }
+    if callee == "observe_host_request(" && identity_seam.contains(statement.trim()) {
+        return Some("frozen-identity-seam");
+    }
+    None
+}
+
+/// One statement with its runs of whitespace collapsed, so a declaration's
+/// identity does not depend on where it happened to be wrapped.
+fn case22_normalized(statement: &str) -> String {
+    statement.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The observation surface itself: the helpers, the guard, the table and the
