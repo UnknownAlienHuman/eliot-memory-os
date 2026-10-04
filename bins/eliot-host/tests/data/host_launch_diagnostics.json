@@ -2,7 +2,7 @@
   "contract": "F-LOG-HOST-3 launch + retained-artifact diagnostics",
   "issue": 978,
   "target": "eliot_host::diagnostics",
-  "note": "Every case in tests/host_launch_diagnostics.rs is an execution of instrumented production code through an existing public seam of the eliot_host library target (HostLaunchOptions::{parse,parse_system_service,validate_service_main_argv}, classify_host_scm_inspection, validate_host_scm_bootstrap driven to its pre-SCM refusal). The facade is never called directly from the test target, so no expected log record is hand-constructed and no case compares the facade to itself. Records are read back out of a scoped tracing subscriber after real production code ran. Boundaries whose owner is a private module behind pub(super) items (host_job_launch, launch_artifact_lease, launch_descriptor_validation, store_kernel_launch_sequence, kernel_activation_driver, kernel_front_door_client) are proven by inline #[cfg(test)] cases in their owning file; the integration case names the owner and asserts the private source binding (see inline_case_owners and unreachable_positive_arms). Audit 5910159678: the two false readiness phase tokens are retired (see renamed_phase_tokens) and the frozen structured correlation now carries the owner-held identities. Sink outcome never alters result/order/status/cleanup. Package fixtures never claim live launch. Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the Event Log seam reports the platform's own live answer - available on Windows where #984's safe port is live, typed EventLogUnavailable off Windows - while the facade's own Event Log arm stays typed EventLogUnavailable on every platform because it routes to tracing only. No fixture drives a real OS report, no FFI is acquired in Host, and no delivery is faked either way.",
+  "note": "Every case in tests/host_launch_diagnostics.rs is an execution of instrumented production code through an existing public seam of the eliot_host library target (HostLaunchOptions::{parse,parse_system_service,validate_service_main_argv}, classify_host_scm_inspection, validate_host_scm_bootstrap driven to its pre-SCM refusal, publish_supervision_record_table driven to its publication refusal). The facade is never called directly from the test target, so no expected log record is hand-constructed and no case compares the facade to itself. Records are read back out of a scoped tracing subscriber after real production code ran. Boundaries whose owner is a private module behind pub(super) items (host_job_launch, launch_artifact_lease, launch_descriptor_validation, store_kernel_launch_sequence, kernel_activation_driver, kernel_front_door_client) are proven by inline #[cfg(test)] cases in their owning file; the integration case names the owner and asserts the private source binding (see inline_case_owners and unreachable_positive_arms). Audit 5910159678: the two false readiness phase tokens are retired (see renamed_phase_tokens) and the frozen structured correlation now carries the owner-held identities. Sink outcome never alters result/order/status/cleanup. Package fixtures never claim live launch. Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the Event Log seam reports the platform's own live answer - available on Windows where #984's safe port is live, typed EventLogUnavailable off Windows - while the facade's own Event Log arm stays typed EventLogUnavailable on every platform because it routes to tracing only. No fixture drives a real OS report, no FFI is acquired in Host, and no delivery is faked either way. Audit 5910159678 follow-up (W2/AUD3): the correlated entry points that close the forwarded-correlation defect are recorded under correlated_entry_points, forwarded_correlation_contour, forwarded_refusal_arms and forwarded_reason_arms, and executed_forwarded_correlation names the one seam per case whose phase record this target can really execute against an already-held handle, so every claim about forwarded identities is read out of a captured record rather than asserted from prose.",
   "stages": {
     "startup": "startup",
     "launch_config": "launch_config"
@@ -229,10 +229,10 @@
   "cases": {
     "1": "complete eight-file source/terminal-boundary/test mapping bound to real source and to the executed public seams",
     "2": "options/descriptor typed rejection vs admitted launch, with the exact typed reason per argv defect",
-    "3": "retained identity preserved exactly across a substitution failure, with no path value in the record",
+    "3": "retained identity preserved exactly across a substitution failure, with no path value in the record, and the forwarded-correlation slots bound on a real executed seam carry the identities its caller already held",
     "4": "SCM request vs observed process vs readiness, each from its own executed inspection",
     "5": "SCM request identity vs reusable pid, proved from two executed classifications",
-    "6": "Store-before-Kernel order read from emitted records; the private sequence order is the inline owner case",
+    "6": "Store-before-Kernel order read from emitted records; the private sequence order is the inline owner case, and a real executed typed-refusal record carries the identities its caller already held, not only its typed reason",
     "7": "nonce/handshake/auth vs activation distinct with no secret output; the nonce boundary is executed",
     "8": "readiness never claimed by an executed launch or SCM boundary; only the activation owner may claim it",
     "9": "before-start refusal vs possible-start unsettled vs settled failure, each from its own execution",
@@ -247,7 +247,8 @@
     "HostLaunchOptions::parse_system_service",
     "HostLaunchOptions::validate_service_main_argv",
     "classify_host_scm_inspection",
-    "validate_host_scm_bootstrap"
+    "validate_host_scm_bootstrap",
+    "publish_supervision_record_table"
   ],
   "inline_case_owners": {
     "2": [
@@ -255,12 +256,22 @@
     ],
     "3": [
       "src/host_job_launch.rs:approved_launch_paths",
+      "src/host_job_launch.rs:approved_launch_paths_with_correlation",
+      "src/host_job_launch.rs:kernel_arguments_with_doctor_anchor_with_correlation",
       "src/launch_artifact_lease.rs:approved_locator",
+      "src/launch_artifact_lease.rs:approved_locator_with_correlation",
+      "src/launch_artifact_lease.rs:open_launch_lease",
+      "src/launch_artifact_lease.rs:open_launch_lease_with_correlation",
+      "src/launch_artifact_lease.rs:verify_launch_digest",
+      "src/launch_artifact_lease.rs:verify_launch_digest_with_correlation",
       "src/launch_artifact_lease.rs:approved_phase_b_destination_locator",
-      "src/launch_descriptor_validation.rs:validate_eliotd_launch_descriptor_bytes"
+      "src/launch_descriptor_validation.rs:validate_eliotd_launch_descriptor_bytes",
+      "src/launch_descriptor_validation.rs:validate_store_bootstrap_descriptor_with_correlation",
+      "src/launch_descriptor_validation.rs:validate_eliotd_launch_descriptor_with_correlation"
     ],
     "6": [
-      "src/store_kernel_launch_sequence.rs:launch_store_then_kernel"
+      "src/store_kernel_launch_sequence.rs:launch_store_then_kernel",
+      "src/store_kernel_launch_sequence.rs:launch_store_then_kernel_with_correlation"
     ],
     "7": [
       "src/kernel_activation_driver.rs:DurableKernelActivationDriver::issue_nonce",
@@ -279,6 +290,171 @@
       "src/kernel_activation_driver.rs:DurableKernelActivationDriver::fail",
       "src/store_kernel_launch_sequence.rs:launch_store_then_kernel"
     ]
+  },
+  "inline_case_owner_cases": {
+    "src/host_job_launch.rs:approved_launch_paths_with_correlation": "a_forwarded_correlation_reaches_both_twins_real_phase_records",
+    "src/host_job_launch.rs:kernel_arguments_with_doctor_anchor_with_correlation": "a_forwarded_correlation_reaches_both_twins_real_phase_records",
+    "src/launch_artifact_lease.rs:approved_locator_with_correlation": "forwarded_correlations_name_the_callers_own_identities",
+    "src/launch_artifact_lease.rs:open_launch_lease_with_correlation": "forwarded_correlations_name_the_callers_own_identities",
+    "src/launch_artifact_lease.rs:verify_launch_digest_with_correlation": "forwarded_correlations_name_the_callers_own_identities",
+    "src/launch_descriptor_validation.rs:validate_store_bootstrap_descriptor_with_correlation": "descriptor_twins_bind_only_the_identities_their_own_arguments_hold",
+    "src/launch_descriptor_validation.rs:validate_eliotd_launch_descriptor_with_correlation": "descriptor_twins_bind_only_the_identities_their_own_arguments_hold",
+    "src/store_kernel_launch_sequence.rs:launch_store_then_kernel_with_correlation": "forwarded_correlation_carries_the_callers_identities_on_every_phase"
+  },
+  "inline_case_owner_cases_note": "Every #978 forwarding twin is pub(crate)/pub(super) inside a private module, so no integration target can call one and never could: each twin's OWN rendered records are the inline owner case in its own file, and this map names that case per twin - the same mapping `inline_case_owners` lists, keyed by the twin rather than by the integration case that must cite it. The originals listed beside the twins in `inline_case_owners` are there because their inline cases really execute those original signatures, which is what proves each twin is behaviour-preserving beside an unchanged original. The case-3 and case-6 EXECUTED halves prove only the forwarding property on a reachable, already-forwarding seam - see executed_forwarded_correlation - and never a twin's own rendered record. Checked against real source, not trusted from prose: every case name here exists as `fn <name>` in the named file, and every twin named here appears as a call inside that case.",
+  "correlated_entry_points": [
+    "src/launch_artifact_lease.rs:fn approved_locator_with_correlation",
+    "src/launch_artifact_lease.rs:fn open_launch_lease_with_correlation",
+    "src/launch_artifact_lease.rs:fn verify_launch_digest_with_correlation",
+    "src/host_job_launch.rs:fn kernel_arguments_with_doctor_anchor_with_correlation",
+    "src/store_kernel_launch_sequence.rs:fn launch_store_then_kernel_with_correlation",
+    "src/launch_descriptor_validation.rs:fn validate_store_bootstrap_descriptor_with_correlation",
+    "src/launch_descriptor_validation.rs:fn validate_eliotd_launch_descriptor_with_correlation"
+  ],
+  "correlated_entry_points_count": 7,
+  "correlated_entry_points_note": "SEVEN entries, one per twin that start_approved calls with the caller's correlation, and nothing else. The list is exhaustive on purpose: it is what the all-sites argument scan in the integration target walks, so a twin missing from it is a twin whose call sites and whose own emission sites are reachable from NO assertion on that contour, and reverting that twin to a fresh LaunchPhaseCorrelation::NONE fails nothing. The two approved-descriptor validators were exactly that gap - start_approved calls both with &correlation (host_job_launch.rs:1669 and host_job_launch.rs:1713) and both are mapped to their inline owner case under inline_case_owner_cases, but before this correction neither appeared here. Checked against real source, not trusted from prose: the fixture asserts that every entry here is a key of inline_case_owner_cases spelled the same way, that the count below is exact, and that the set difference against the delivered twins is exactly correlated_entry_points_excluded. The delivery's EIGHT twins therefore are all pinned, seven through this list and the eighth through forwarded_correlation_branch_contour, because start_approved never calls it.",
+  "correlated_entry_points_excluded": [
+    {
+      "twin": "src/host_job_launch.rs:fn approved_launch_paths_with_correlation",
+      "pinned_by": "forwarded_correlation_branch_contour",
+      "why": "It is a delivered twin and it does take the forwarded correlation, but start_approved NEVER calls it: its only production call site is HostJobBranches::launch (host_job_launch.rs:1020), plus the original's own one-line delegation at host_job_launch.rs:378. Listing it under correlated_entry_points would make the start_approved all-sites scan look for a call the contour does not make and panic, so it is pinned on the contour that really calls it. It also binds no correlation slot of its own - see forwarded_correlation_contour.note - so it forwards what its caller bound without adding any identity."
+    }
+  ],
+  "forwarded_correlation_contour": {
+    "caller": "src/host_job_launch.rs:HostJobBranches::start_approved",
+    "correlation_binding": "correlation",
+    "first_parameter_type": "&LaunchPhaseCorrelation",
+    "held_slot_bindings": [
+      ".with_installation(host.installation.as_str())",
+      ".with_generation(launch.authority_generation.value())",
+      ".with_fence(host.epoch.current.lineage_id.as_str())"
+    ],
+    "bound_slots": [
+      "installation",
+      "generation",
+      "fence"
+    ],
+    "forwarded_callers": [
+      "approved_locator_with_correlation",
+      "open_launch_lease_with_correlation",
+      "verify_launch_digest_with_correlation",
+      "kernel_arguments_with_doctor_anchor_with_correlation",
+      "launch_store_then_kernel_with_correlation",
+      "validate_store_bootstrap_descriptor_with_correlation",
+      "validate_eliotd_launch_descriptor_with_correlation"
+    ],
+    "forwarded_call_site_count": 22,
+    "forwarded_call_site_count_note": "Every call site of the seven twins above inside HostJobBranches::start_approved's own body, counted from source: approved_locator_with_correlation 7, open_launch_lease_with_correlation 6, verify_launch_digest_with_correlation 5, kernel_arguments_with_doctor_anchor_with_correlation 1, launch_store_then_kernel_with_correlation 1, validate_store_bootstrap_descriptor_with_correlation 1, validate_eliotd_launch_descriptor_with_correlation 1. That is 22 of the contour's 31 &correlation-consuming sites; the other 9 are the contour's OWN host_launch_observe emissions, which the held_slot_bindings and bound_slots claims already cover and which are not forwarded-twin call arguments. Every one of the 22 is pinned: the argument read is per occurrence, so an unforwarded site names its own occurrence index and body line.",
+    "note": "The counterexample this contour closes: the real calls that emit the locator, lease, digest, doctor-anchor, store and kernel phase records used to pass nothing, so render turned installation, generation and fence into `missing` on same-operation records whose caller already held all three. Each correlated entry point now takes that correlation as its FIRST parameter and each original signature is unchanged and still delegates with NONE, so the un-forwarded API keeps its exact behaviour while the approved-start contour forwards the identities it holds. Every value comes from a handle the caller already holds (host.installation, launch.authority_generation.value(), host.epoch.current.lineage_id); nothing is re-derived, probed, or read from a locator, lease, argv, nonce or path (I15.4). `approved_launch_paths` is NOT listed: it holds only locators and approved handles, so it still binds nothing on its own and never had an already-held installation, generation or fence to forward. RESIDUAL, stated not papered over: the rendered records of these correlated entry points are private-module and Windows-only, so their runtime proof is the inline owner case in each owning file (see inline_case_owners). This integration target can prove only the forwarding chain itself and the rendering property on the reachable seams under executed_forwarded_correlation; it does not claim a captured record from the private contour."
+  },
+  "forwarded_correlation_branch_contour": {
+    "caller": "src/host_job_launch.rs:HostJobBranches::launch",
+    "correlation_binding": "correlation",
+    "held_slot_bindings": [
+      ".with_installation(host.installation.as_str())",
+      ".with_fence(host.epoch.current.lineage_id.as_str())",
+      ".with_artifact(artifact.as_str())"
+    ],
+    "bound_slots": [
+      "installation",
+      "fence",
+      "artifact"
+    ],
+    "forwarded_callers": [
+      "approved_launch_paths_with_correlation"
+    ],
+    "forwarded_call_site_count": 1,
+    "note": "The SECOND forwarded-correlation caller edge, and the reason it was a hole: HostJobBranches::launch builds its OWN LaunchPhaseCorrelation from the identities it already holds and forwards that binding into approved_launch_paths_with_correlation - a twin start_approved never calls - at host_job_launch.rs:1020. forwarded_correlation_contour above names ONLY start_approved, and its all-sites scan is scoped to that one body, so this edge had no structural assertion anywhere and reverting it to a fresh NONE failed nothing in this suite. This entry pins it: the three binding expressions are read out of launch's own body (its correlation is the Host installation identity, the lineage of the Host installation epoch it runs under, and the approved artifact digest of the exact branch it launches - all already in hand as arguments), and the forwarded callee's call site is scanned with the SAME per-occurrence all-sites reader the start_approved check uses, bounded to launch's own braces. NOTE the deliberate asymmetry with forwarded_correlation_contour: launch's contour binds no generation, because the generation argument it receives is an opaque identity handle with no bounded numeric spelling, so that slot stays explicitly missing rather than being re-derived or guessed - and the branch Job Object name, the executable/config paths and the raw locator values are likewise never bound."
+  },
+  "forwarded_refusal_arms": {
+    "approved_locator_with_correlation": [
+      "host.launch-artifact substitution preserved",
+      "host.launch-artifact locator typed rejection"
+    ],
+    "open_launch_lease_with_correlation": [
+      "host.launch-artifact lease typed rejection"
+    ],
+    "verify_launch_digest_with_correlation": [
+      "host.launch-artifact digest typed rejection"
+    ],
+    "kernel_arguments_with_doctor_anchor_with_correlation": [
+      "host.launch doctor anchor typed rejection"
+    ],
+    "launch_store_then_kernel_with_correlation": [
+      "host.store-launch store-dead observed",
+      "host.store-launch store-unknown observed"
+    ],
+    "validate_store_bootstrap_descriptor_with_correlation": [
+      "host.launch-descriptor substitution preserved",
+      "host.launch-descriptor store bootstrap typed rejection"
+    ],
+    "validate_eliotd_launch_descriptor_with_correlation": [
+      "host.launch-descriptor substitution preserved",
+      "host.launch-descriptor eliotd typed rejection"
+    ]
+  },
+  "forwarded_refusal_arms_note": "Seven twins, each with the refusal phase literals that really occur inside ITS OWN body, counted from source and not invented: approved_locator_with_correlation emits substitution preserved 2 and locator typed rejection 3; open_launch_lease_with_correlation emits lease typed rejection 1; verify_launch_digest_with_correlation emits digest typed rejection 1; kernel_arguments_with_doctor_anchor_with_correlation emits doctor anchor typed rejection 5; launch_store_then_kernel_with_correlation emits store-dead 1 and store-unknown 1; validate_store_bootstrap_descriptor_with_correlation emits substitution preserved 2 and store bootstrap typed rejection 4; validate_eliotd_launch_descriptor_with_correlation emits substitution preserved 1 and eliotd typed rejection 1. That is 22 emission sites. Every occurrence of every listed literal is pinned, never only the first, so a twin that reverted one of several sites to a fresh NONE still fails. Note that the eliotd typed rejection literal is a DIFFERENT phase from the store bootstrap typed rejection literal even though both are refusals of a descriptor validator, and that neither descriptor twin appears in forwarded_reason_arms because neither one binds a typed reason.",
+  "forwarded_reason_arms": {
+    "host.store-launch store-dead observed": "dead",
+    "host.store-launch store-unknown observed": "unknown"
+  },
+  "forwarded_chained_correlation": {
+    "validate_store_bootstrap_descriptor_with_correlation": {
+      "local": "descriptor_correlation",
+      "rooted_at": "correlation",
+      "root_expression": "correlation.with_artifact(approved_digest.as_str())"
+    },
+    "validate_eliotd_launch_descriptor_with_correlation": {
+      "local": "descriptor_correlation",
+      "rooted_at": "correlation",
+      "root_expression": "launch_descriptor_install_correlation(correlation, launch, approved_digest)",
+      "root_helper": "launch_descriptor_install_correlation",
+      "root_helper_parameter": "forwarded"
+    }
+  },
+  "forwarded_chained_correlation_note": "Not every twin renders the caller's binding verbatim. The two approved-descriptor validators each chain one already-held handle onto the forwarded correlation and render THAT local at every call site: validate_store_bootstrap_descriptor_with_correlation declares `let descriptor_correlation = correlation.with_artifact(approved_digest.as_str());` (launch_descriptor_validation.rs:448), and validate_eliotd_launch_descriptor_with_correlation declares the same local through this cell's ONE composition of those slots, `let descriptor_correlation = launch_descriptor_install_correlation(correlation, launch, approved_digest);` (launch_descriptor_validation.rs:564). Every record either twin emits renders `&descriptor_correlation`. So a reader that demanded the raw binding name would reject a twin that forwards perfectly, and a reader that accepted the local name without reading its declaration would happily accept a twin that re-rooted the chain at a fresh NONE. This map therefore declares, per such twin, the local it renders, the binding it must be rooted at, and the EXACT root expression - and for the mediated case also the helper and the helper parameter the chain must be built from, because the helper is the one place that could be reverted to `LaunchPhaseCorrelation::NONE` and silently drop every forwarded identity without changing this twin's own bytes. The other five twins render `&correlation` directly and are deliberately absent from this map.",
+  "forwarded_reason_arms_note": "Exactly the two Store liveness refusal phases, and the TYPED reason value each one must bind on top of the forwarded identities. The values are not hand-copied from an old fixture: store_kernel_launch_sequence.rs classifies the caller's StoreLivenessEvidence, whose two typed kinds are declared with the thiserror message arms 'dead' on StoreLivenessEvidence::Dead and 'unknown: {0}' on StoreLivenessEvidence::Unknown, and the sequence binds exactly those two kind names - with_reason(\"dead\") on the store-dead arm and with_reason(\"unknown\") on the store-unknown arm - while the Unknown PAYLOAD text never enters a record. Asserting only the .with_reason( method would be satisfied by any argument at all, so the value is required too. No other delivered twin qualifies: the other five refusal-bearing twins of this delivery emit no typed reason anywhere, and launch_descriptor_validation.rs has no typed cause enum, so reason is never composed in either descriptor twin.",
+  "executed_forwarded_correlation": {
+    "3": {
+      "seam": "validate_host_scm_bootstrap",
+      "phase": "host.scm-launch requested",
+      "proves": "the forwarding property and the slot rendering on a reachable, already-forwarding seam",
+      "delivered_twin_records_owner": "inline_case_owners",
+      "seam_is_a_delivered_twin": false,
+      "bound_slots": [
+        "installation",
+        "generation",
+        "artifact"
+      ],
+      "absent_slots": [
+        "operation",
+        "process_start",
+        "fence",
+        "reason"
+      ],
+      "typed_refusal": "host platform: SystemService requires the registration nonce pair",
+      "proves_scope": "This seam lives in src/scm_launch.rs, which #978 does not modify, and it already forwarded its correlation before this delivery (scm_bootstrap_correlation builds it from the admitted HostLaunchOptions the caller holds). Its captured record therefore proves the FORWARDING PROPERTY and the slot rendering on a reachable, already-forwarding seam: the identities its caller already held render bound, and every slot the caller does not hold renders the explicit missing marker. It does NOT prove any delivered twin's own rendered record. All eight #978 twins are pub(crate)/pub(super) inside private modules, so no integration target can call one and never could; each twin's own rendered record is the inline owner case in its own file, and that path:symbol mapping lives in inline_case_owners. This seam is deliberately NOT listed in correlated_entry_points for that reason: the rule that every forwarded refusal arm belongs to a correlated entry point governs the delivered twins, and a reachable pre-existing seam is not one of them. The twins' own forwarding is proved from real source bytes instead - first parameter, unchanged original delegating with NONE, and the approved-start caller forwarding its own binding at every call site."
+    },
+    "6": {
+      "seam": "publish_supervision_record_table",
+      "phase": "host.scm-launch supervision record publication failed",
+      "proves": "the forwarding property and the slot rendering on a reachable, already-forwarding seam",
+      "delivered_twin_records_owner": "inline_case_owners",
+      "seam_is_a_delivered_twin": false,
+      "bound_slots": [
+        "installation",
+        "generation"
+      ],
+      "absent_slots": [
+        "operation",
+        "artifact",
+        "process_start",
+        "fence",
+        "reason"
+      ],
+      "typed_refusal": "a durable staging write that cannot create the file because the named Host state root does not exist; the exact text is the platform's own IO error and is deliberately NOT pinned here, only the typed refusal and its refusal record are",
+      "proves_scope": "This seam lives in src/scm_launch.rs, which #978 does not modify, and it already forwarded its correlation before this delivery (publish_supervision_record_table binds the installation identity and the Host epoch sequence its caller already held). Its refusal record therefore proves the FORWARDING PROPERTY and the slot rendering on a reachable, already-forwarding seam: a typed-refusal arm that RECEIVES already-held identities carries them ON the refusal record rather than only its typed reason. It does NOT prove any delivered twin's own rendered refusal record. All eight #978 twins are pub(crate)/pub(super) inside private modules, so no integration target can call one and never could; each twin's own rendered refusal record is the inline owner case in its own file, and that path:symbol mapping lives in inline_case_owners. This seam is deliberately NOT listed in correlated_entry_points for that reason: the rule that every forwarded refusal arm belongs to a correlated entry point governs the delivered twins, and a reachable pre-existing seam is not one of them. The twins' own refusal arms are proved from real source bytes instead - every occurrence of each named refusal phase inside the twin's own body must render the forwarded binding, and a twin whose body a fresh NONE could satisfy at even one site fails. The executed half of this seam is Windows-only because the durable staging write it drives to its refusal is; off Windows the mirror arm still asserts the fixture's slot declaration against the frozen identity keys, that the declared seam is really executed here, that the declared phase is still real code in its owning file, and that the private source-bound proof still has real subjects."
+    }
   },
   "unreachable_positive_arms": [
     "classify_host_scm_inspection Matching arm: ServiceRegistrationRuntimeInspection::Matching carries a ServiceRuntimeObservation whose fields are pub(super) inside eliot-platform-windows, so no eliot-host seam can construct it; only that crate's own tests and a live SCM readback can observe it",
