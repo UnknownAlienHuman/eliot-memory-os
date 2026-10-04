@@ -22,6 +22,34 @@
 //!   request through the read owner rather than the raw Store port is what
 //!   keeps this leg a consumer of the one read engine instead of a second
 //!   answer to the same source/fence/freshness questions (#1144).
+//! - [`read_experience_range_page`]: the bounded outcome-experience page
+//!   read, one family per call. Issues the bank or feedback range operation
+//!   (`GetExperienceBankRange` / `GetAgentFeedbackRange`), but selects it
+//!   through the Store's own exported read names
+//!   ([`EXPERIENCE_BANK_READ_NAME`], [`EXPERIENCE_FEEDBACK_READ_NAME`]) and
+//!   the Store's own read catalogue
+//!   ([`named_read_operation_by_name`], [`named_read_operation_name`]), with
+//!   the request itself built by the Store's own builders
+//!   ([`experience_bank_read_request`], [`experience_feedback_read_request`]),
+//!   as a [`ReadApi::bound_query`] read over a per-call [`ReadService`] with
+//!   the same observed scope-head dependency minimum the position leg uses.
+//!
+//!   The `NamedReadOperation` variant is deliberately **not** restated as code
+//!   anywhere in this entry, so a Store rename moves it with the rename
+//!   instead of leaving a stale literal here. One reader-visible consequence
+//!   is worth stating plainly, because it looks like a defect otherwise: a
+//!   reader who greps `bins/` for the literal `GetExperienceBankRange` finds
+//!   only prose — this paragraph and the entry's own doc — and never a
+//!   request construction. That absence is the design, not an omission; the
+//!   construction is the Store builder reached through the catalogue lookup,
+//!   and a `NamedReadOperation` literal added to satisfy that grep would be
+//!   precisely the drift this rule prevents (#1144).
+//!
+//!   It is the production issuer of the two operations whose Store page
+//!   coverage statement the read owner gates on: through it a
+//!   source-declared truncated page is refused as `ReadOutcome::Partial`
+//!   instead of reaching the experience leg as a page whose truncation nobody
+//!   classified (#1144).
 //! - [`produce_journal_projection`]: the terminal journal-leg call. Runs
 //!   the provider chain
 //!   ([`produce_journal_read`](eliot_experience_provider::produce_journal_read))
@@ -30,11 +58,13 @@
 //!   `GetAuditRange` handler (#19 join); the call itself rides existing
 //!   path machinery, exactly like the projection-inputs port-shape probe.
 //!
-//! Bank/feedback durable supply stays canonical-owner side, and
-//! per-attempt receipts plus obligation handles arrive with the trigger
-//! edge (O1 registration hunk): this driver invents none of them. No
-//! policy, admission, or semantic rule lives here; fence agreement and
-//! response identity fail closed before any shaping.
+//! Bank/feedback durable supply is read through the read owner by
+//! [`read_experience_range_page`] and stays canonical-owner side; the
+//! admission context that read is projected under, plus per-attempt receipts
+//! and obligation handles, arrive with the trigger edge (O1 registration
+//! hunk): this driver invents none of them. No policy, admission, or semantic
+//! rule lives here; fence agreement and response identity fail closed before
+//! any shaping.
 //!
 //! # Live status
 //!
@@ -51,8 +81,11 @@
 //!   `pub use` block in `lib.rs`. `read_current_position`,
 //!   `propose_memory_extinction_candidate` and `derive_commit_ingress` each
 //!   have exactly one in-file caller, and
-//!   `produce_journal_projection` is reached only from the uncalled
-//!   `run_experience_quality_event`.
+//!   `produce_journal_projection` and `read_experience_range_page` are reached
+//!   only from the uncalled `run_experience_quality_event`. The new entry is
+//!   not in the `lib.rs` `pub use` list either (that block is outside this
+//!   delivery's mutable path), so nothing outside this crate can reach it
+//!   today either way.
 //! - `eliotd` declares **no reverse dependency** in any workspace
 //!   `Cargo.toml` and none in `Cargo.lock`, so nothing outside this crate can
 //!   call the re-exported surface either.
@@ -121,14 +154,18 @@ use eliot_observation_contracts::{
 };
 use eliot_protocol::RequestIdentity;
 use eliot_read::{
-    NamedParameters, ReadApi, ReadError, ReadOrderingBinding, ReadService, StateRequest,
-    prove_page_state_fence,
+    BoundRead, BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode,
+    QueryRequest, QueryResult, ReadApi, ReadError, ReadOrderingBinding, ReadService,
+    RequiredAssurance, StateRequest, TimeScope, prove_page_state_fence,
 };
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
-    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, NamedReadOperation, OrderingHeadExpectation,
-    ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
-    epistemic_revision::EpistemicPositionReadback,
+    CanonicalReadClient, EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME,
+    EXPERIENCE_PAGE_NEXT_CURSOR, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation,
+    OrderingHeadExpectation, ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId,
+    StoreError, WriteReceipt, epistemic_revision::EpistemicPositionReadback,
+    experience_bank_read_request, experience_feedback_read_request, named_read_operation_by_name,
+    named_read_operation_name,
 };
 use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
@@ -444,6 +481,198 @@ pub async fn read_current_position(
     )
 }
 
+/// Requested page bound for one outcome-experience range read (#1144).
+///
+/// Derived from the Store's own ceiling rather than restated as a second page
+/// size here, because both backends decide truncation by limit-plus-one: the
+/// Surreal contour fetches `start + limit + 1` rows so one probe row decides
+/// truncation without a second query
+/// (`crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs:3425`),
+/// and the memory contour pushes one row past the bound and pops it back out
+/// while setting `truncated`
+/// (`crates/storage/eliot-store-memory/src/lib.rs:2591`). A page is therefore
+/// refused as `ReadOutcome::Partial` exactly when the scope holds MORE rows
+/// than the requested bound, which makes the bound the one page-size fact this
+/// leg would otherwise be inventing: it is the largest bound strictly below
+/// [`MAX_EXPERIENCE_PAGE_RECORDS`], i.e. the closest admissible page to the
+/// ceiling. [`read_experience_range_page`] refuses the ceiling itself rather
+/// than trusting every call site to stay below it.
+const EXPERIENCE_RANGE_PAGE_BOUND: u16 = MAX_EXPERIENCE_PAGE_RECORDS - 1;
+
+/// Read ONE bounded page of an outcome-experience family through the
+/// Governor read owner.
+///
+/// This is the production issuer of the only two operations whose page coverage
+/// statement the read owner gates on. The Store declares both
+/// ([`EXPERIENCE_BANK_READ_NAME`], [`EXPERIENCE_FEEDBACK_READ_NAME`]), both
+/// backends project both, and the Store's own builders
+/// ([`experience_bank_read_request`], [`experience_feedback_read_request`])
+/// build both, but before this entry nothing in the tree dispatched one — so
+/// the owner's only `ReadOutcome::Partial` construction site (the truncated arm
+/// of its page-coverage classification, reached only through these two
+/// operations) had no issuer at all, and a caller-carried page could reach the
+/// experience leg with its truncation flag classified by nobody.
+///
+/// The family is selected through the Store's own exported read names and the
+/// Store's own name owner: `read_name` is resolved into the closed read
+/// catalogue, matched against those two names, and the request itself (the
+/// operation plus the closed `max_records` selector) is built by the Store's
+/// builder. No `NamedReadOperation` variant and no selector spelling is
+/// restated here, so a Store rename moves this entry with it. Any other name —
+/// including a `NamedReadOperation` this driver cannot spell as a Store read
+/// name — is refused before transport.
+///
+/// # How to find the construction, and why a grep for the literal fails
+///
+/// This is the place to look when auditing the issuer, and the answer is
+/// deliberately not a line that spells `GetExperienceBankRange`. The
+/// construction is [`named_read_operation_by_name`] resolving `read_name`
+/// against the Store's closed catalogue, [`named_read_operation_name`] naming
+/// the resolved operation back into the two exported read names, and the
+/// matching [`experience_bank_read_request`] /
+/// [`experience_feedback_read_request`] builder minting the request — three
+/// Store-owned calls, none of which restates a variant here. So a text search
+/// for `GetExperienceBankRange` under `bins/` returns this doc's prose and no
+/// request construction, and the correct reading of that result is that the
+/// variant is resolved at runtime from the Store's own exported name rather
+/// than hardcoded. Writing the literal into the `match` or a binding would
+/// satisfy the search and reintroduce the Store-rename drift this rule
+/// prevents (#1144); the norm against restating the two operations as
+/// `NamedReadOperation` literals is the stronger one.
+///
+/// The read is served through [`ReadApi::bound_query`], exactly like the
+/// sibling [`read_current_position`] leg, so this path gains the source/schema/
+/// coverage comparison, the observed-head closure, the exact-fence stale check
+/// and the page-coverage gate that classifies a source-declared truncated page
+/// as `ReadOutcome::Partial`. A truncated page is therefore refused in the
+/// owner's own vocabulary instead of being consumed as if it were complete, and
+/// the returned payload is the owner's proven, non-truncated page together with
+/// the exact identity closure (`BoundRead::identity`) it was served under.
+///
+/// The `ExactFence` dependency is **observed, not invented**, by the same rule
+/// [`read_current_position`] follows: the scope revision head is read first and
+/// its revision becomes the declared minimum, so a head that moves between the
+/// two reads fails closed as [`ReadError::StaleRevision`] rather than being
+/// served as current. One scope head therefore serves both legs of one
+/// assessment run.
+///
+/// `max_records` is the caller's page bound and must be positive and strictly
+/// below [`MAX_EXPERIENCE_PAGE_RECORDS`]; the leg passes
+/// [`EXPERIENCE_RANGE_PAGE_BOUND`]. The bound is a real ceiling on what one
+/// call can serve, not a completeness claim: a scope holding more rows than the
+/// bound is refused as `ReadOutcome::Partial` rather than silently shortened,
+/// and the continuation cursor the Store mints for exactly that case lives on
+/// the refused page, so this entry cannot page past it. That limit belongs to
+/// the Store page contract and the read owner's coverage gate, not to this
+/// driver.
+///
+/// Not reached from a run of this daemon, exactly like the rest of this module:
+/// its only call sites are the two inside
+/// [`run_experience_quality_event`], which itself has none. See this module's
+/// "Live status" section.
+pub async fn read_experience_range_page(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    ctx: &RequestMetadata,
+    scope: ScopeId,
+    read_name: &str,
+    max_records: u16,
+) -> Result<BoundRead<QueryResult>, ExperienceDriverError> {
+    ctx.validate()
+        .map_err(|_| ExperienceDriverError::Position {
+            field: "request_metadata",
+            reason: "invalid request metadata",
+        })?;
+    // The Store's own page ceiling is not this entry's page bound: a bound at
+    // or above it asks for the largest page the Store can return, which is the
+    // page most likely to arrive truncated and be refused below. Refusing it
+    // here keeps that decision with the entry that issues the read instead of
+    // leaving it to each call site.
+    if max_records == 0 || max_records >= MAX_EXPERIENCE_PAGE_RECORDS {
+        return Err(ExperienceDriverError::Position {
+            field: "experience.max_records",
+            reason: "page bound must be positive and below the store's declared maximum",
+        });
+    }
+    let client = composition
+        .context_read_client(kernel)
+        .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
+    let scope_key = RevisionKey::new(format!("scope:{scope}"))?;
+    let observed = client.revision_heads(vec![scope_key.clone()]).await?;
+    let minimum = observed.iter().find(|head| head.key == scope_key).ok_or(
+        ExperienceDriverError::Position {
+            field: "revision_heads",
+            reason: "store observed no head for the requested scope",
+        },
+    )?;
+    let mut dependency_revisions = BTreeMap::new();
+    dependency_revisions.insert(scope_key, minimum.revision);
+    let operation =
+        named_read_operation_by_name(read_name).ok_or(ExperienceDriverError::Position {
+            field: "experience.read_name",
+            reason: "read name is not in the store's closed read catalogue",
+        })?;
+    let request = match named_read_operation_name(operation) {
+        EXPERIENCE_BANK_READ_NAME => {
+            experience_bank_read_request(scope.clone(), max_records, ctx.state_fence.clone())?
+        }
+        EXPERIENCE_FEEDBACK_READ_NAME => {
+            experience_feedback_read_request(scope.clone(), max_records, ctx.state_fence.clone())?
+        }
+        _ => {
+            return Err(ExperienceDriverError::Position {
+                field: "experience.read_name",
+                reason: "read name is not an outcome-experience range read",
+            });
+        }
+    };
+    let reads = ReadService::new(client);
+    reads
+        .bound_query(
+            ctx,
+            QueryRequest {
+                // The mode is the read owner's own intent gate for these two
+                // operations, not a second answer to it: only
+                // `HistoricalReconstruction` and `Provenance` admit them, and
+                // this leg reconstructs a bounded captured record set rather
+                // than tracing one record's lineage, so it asks for the former
+                // and the owner decides whether that pairing is admissible.
+                intent: QueryIntent {
+                    mode: QueryMode::HistoricalReconstruction,
+                    // The window is this request's own dependency-bound
+                    // evidence window; freshness is the exact captured records
+                    // rather than a re-read, because the leg must describe the
+                    // records the owner captured; and the assurance is
+                    // reconstruction-only, because nothing this leg reads may be
+                    // presented as verified evidence.
+                    time_scope: TimeScope::EvidenceWindow,
+                    branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+                    freshness_policy: FreshnessPolicy::ExactCapturedRecords,
+                    required_assurance: RequiredAssurance::InputReconstructionOnly,
+                },
+                operation: request.operation,
+                scope_id: Some(scope),
+                consistency: ReadConsistency::ExactFence,
+                dependency_revisions,
+                // This page read declares no conflict-serialization head: its
+                // coherence is proven by the scope revision head observed above
+                // plus the request fence, exactly as the sibling position leg
+                // states. The declaration is explicit so the resolved identity
+                // records the absence instead of leaving the order-head
+                // dimension unstated.
+                ordering: ReadOrderingBinding::without_order_dependency(),
+                // The closed selectors are the Store builder's own map, moved
+                // verbatim: the read owner re-derives the envelope (scope,
+                // consistency, fence) from `ctx` and the Store re-gates every
+                // selector against its own catalogue before dispatch.
+                parameters: NamedParameters::from_map(request.parameters)?,
+                provenance_handles: Vec::new(),
+            },
+        )
+        .await
+        .map_err(ExperienceDriverError::ReadOwner)
+}
+
 /// Journal-leg driver inputs: projection context plus live binding.
 pub struct ExperienceJournalDriverInputs<'a> {
     /// Stable identity minted by the caller for the projection envelope.
@@ -495,36 +724,62 @@ pub async fn produce_journal_projection(
     .map_err(ExperienceDriverError::Provider)
 }
 
-/// Bank-family event inputs: durable range payload plus the read
-/// context the edge owns.
+/// Bank-family event inputs: the admission context the edge owns for the
+/// bank page this run reads.
+///
+/// #1144: the durable page itself is no longer an input. The bank range read
+/// is issued by [`read_experience_range_page`] through the read owner, so the
+/// page, its fence proof and its truncation verdict all come from the owner
+/// that classifies them; a caller-carried payload would be a second answer to
+/// the same source/fence/coverage questions.
+///
+/// Every remaining member is an admission binding rather than read evidence:
+/// each one is stamped onto the projection envelope that
+/// [`supply_bank_projection_from_store`] assembles, and none of them describes
+/// or stands in for the page. In particular the page's own coverage statement
+/// and truncation verdict are the read owner's to classify from the page
+/// itself, so `coverage` here cannot widen, narrow, or override what that
+/// gate proved.
 pub struct ExperienceBankEventInputs {
-    /// Verbatim durable range payload (`records` array of wrapper rows or
-    /// owner-held bare documents) from the bank range read.
-    pub payload: serde_json::Value,
     /// Stable identity minted by the caller for the bank envelope.
     pub projection_id: ArtifactId,
-    /// Owner revision marker read at, supplied with the durable read.
+    /// Owner revision marker recorded on the assembled bank projection
+    /// envelope. Edge-declared: the revision the page is actually read at is
+    /// observed by the read owner, not asserted here.
     pub source_revision: String,
-    /// Owner coverage binding for the durable read.
+    /// Owner coverage binding recorded on the assembled bank projection
+    /// envelope. Edge-declared; the read owner independently classifies the
+    /// page's own Store coverage statement.
     pub coverage: ProjectionCoverage,
-    /// Owner omissions for the durable read.
+    /// Owner omissions recorded on the assembled bank projection envelope,
+    /// alongside the `ProtectedWithheld` omissions the supply driver derives
+    /// from the retention schedule. Edge-declared.
     pub omissions: Vec<ProjectionOmission>,
     /// Owner source identity cursors resolve under (edge passes the
     /// Governor bank source identity); never invented here.
     pub source_id: String,
 }
 
-/// Feedback-family event inputs. Same durable-read rule as bank.
+/// Feedback-family event inputs. Same durable-read rule as bank: the page is
+/// read by the entry through the read owner, and only the admission context
+/// arrives from the edge. Same member-by-member rule: every field below is an
+/// admission binding stamped onto the projection envelope
+/// [`supply_feedback_projection_from_store`] assembles, not read evidence and
+/// not a substitute for the page.
 pub struct ExperienceFeedbackEventInputs {
-    /// Verbatim durable range payload from the feedback range read.
-    pub payload: serde_json::Value,
     /// Stable identity minted by the caller for the feedback envelope.
     pub projection_id: ArtifactId,
-    /// Owner revision marker read at, supplied with the durable read.
+    /// Owner revision marker recorded on the assembled feedback projection
+    /// envelope. Edge-declared: the revision the page is actually read at is
+    /// observed by the read owner, not asserted here.
     pub source_revision: String,
-    /// Owner coverage binding for the durable read.
+    /// Owner coverage binding recorded on the assembled feedback projection
+    /// envelope. Edge-declared; the read owner independently classifies the
+    /// page's own Store coverage statement.
     pub coverage: ProjectionCoverage,
-    /// Owner omissions for the durable read.
+    /// Owner omissions recorded on the assembled feedback projection
+    /// envelope, alongside the `ProtectedWithheld` omissions the supply
+    /// driver derives from the retention schedule. Edge-declared.
     pub omissions: Vec<ProjectionOmission>,
     /// Owner source identity cursors resolve under (edge passes the
     /// Governor feedback source identity); never invented here.
@@ -603,8 +858,8 @@ pub struct CommonGroundEventInputs<'a> {
 
 /// The event producer (operator/planner edge, O1 trigger) assembles this
 /// from explicit owner-issued inputs only: bridge scope and position
-/// subject, journal presence inputs, durable bank/feedback documents with
-/// their read context, the owner-issued retention schedule with
+/// subject, journal presence inputs, the bank/feedback admission context their
+/// pages are read and projected under, the owner-issued retention schedule with
 /// caller-carried holds, per-attempt receipts, obligation handles, edge
 /// attestation, plus the memory request and understanding leg when those
 /// families run. Reads stay reads: nothing here writes, persists, or
@@ -666,16 +921,19 @@ pub struct ExperienceQualityEventOutput {
     /// Memory ecology assessment, when the memory family ran.
     pub memory_assessment: Option<MemoryEcologyAssessment>,
     /// Owner-minted bank continuation cursor echoed verbatim from the
-    /// consumed range payload (`next_cursor`), or `None` when the page
-    /// ends the enumeration.
+    /// consumed range payload ([`EXPERIENCE_PAGE_NEXT_CURSOR`]), or `None`
+    /// when the page ends the enumeration.
     ///
-    /// Multi-page enumeration contract: the trigger edge re-issues the
-    /// owner range read with this cursor echoed back as the `cursor`
-    /// selector and runs this entry again per page until the echoed
-    /// cursor is `None`. Cursors bind fence plus revision heads exactly
-    /// like the audit range, so a cursor read under drifted fence/heads
-    /// fails closed at the store and the caller restarts from the head
-    /// page; this entry never synthesizes or advances a cursor itself.
+    /// #1144: the consumed page is the read owner's own answer, and the owner
+    /// refuses a source-declared truncated page as `ReadOutcome::Partial`
+    /// before its payload is returned. The Store mints `next_cursor` exactly
+    /// on a truncated page, so through this entry the cursor is `None` on every
+    /// page that reaches here: a caller that needs the next page gets the
+    /// typed `Partial` refusal, not a silent short page. Whether a refused
+    /// truncated page should still yield its continuation cursor is a
+    /// question for the Store page contract and the read owner's coverage
+    /// gate, not for this driver, which neither restates that rule nor
+    /// synthesizes or advances a cursor itself.
     pub bank_next_cursor: Option<String>,
     /// Owner-minted feedback continuation cursor, same contract as
     /// `bank_next_cursor` above.
@@ -708,7 +966,9 @@ fn range_next_cursor(payload: &serde_json::Value) -> Option<String> {
 ///
 /// Runs the full connected runtime path in source terms: TRUE position
 /// bridge read, optional journal bridge leg with live presence binding,
-/// bank/feedback range-payload consume through the owner supply drivers
+/// bank/feedback range pages read through the Governor read owner
+/// ([`read_experience_range_page`], so a source-declared truncated page is a
+/// typed `Partial` refusal) and consumed through the owner supply drivers
 /// ([`supply_bank_projection_from_store`] /
 /// [`supply_feedback_projection_from_store`]: wrapper-aware decode with
 /// digest re-proof, retention gating, per-ref snapshot resolution),
@@ -757,12 +1017,17 @@ pub async fn run_experience_quality_event(
         None => (None, None),
     };
     let mut ledger = ExperienceRevisionLedger::new();
-    // #1144: both edge-supplied range pages are owner-minted
-    // `ExperienceRangePage` payloads, so the read owner's coverage gate applies
-    // to them even though the edge performed the read rather than this entry.
-    // Each page's fence is proved FIRST, before any coverage member of that
-    // page is read: `bank_records_from_range_payload` below reads `records`
-    // and `range_next_cursor` reads `next_cursor`, and a truncation or cursor
+    // #1144: both outcome-experience pages are READ HERE, through the
+    // Governor read owner, instead of arriving as caller-carried payloads.
+    // Before this the reconstruction consumed `event.bank.payload` and
+    // `event.feedback.payload` directly, so the two operations the read owner
+    // admits for this intent were issued by nothing, the Store request builders
+    // that own their closed selectors had no issuer, and the owner's
+    // `ReadOutcome::Partial` truncation arm could never be taken: a truncated
+    // page was indistinguishable from a complete one here. Each page is still
+    // proved against this request's fence FIRST, before any coverage member of
+    // it is read — `bank_records_from_range_payload` below reads `records` and
+    // `range_next_cursor` reads `next_cursor`, and a truncation or cursor
     // member on a page projected under another fence describes that other
     // fence's rows. The proof is the owner's own rule, called rather than
     // restated, so an absent or foreign `state_fence` member is
@@ -770,9 +1035,17 @@ pub async fn run_experience_quality_event(
     // (the source answered) and from `Partial` (nothing claims rows past the
     // bound). The bound compared against is `ctx.state_fence`, the same fence
     // every projection below is assembled at.
-    prove_page_state_fence(&event.bank.payload, &ctx.state_fence)?;
-    prove_page_state_fence(&event.feedback.payload, &ctx.state_fence)?;
-    let bank_records = bank_records_from_range_payload(&event.bank.payload)?;
+    let bank_page = read_experience_range_page(
+        composition,
+        kernel,
+        ctx,
+        event.scope_id.clone(),
+        EXPERIENCE_BANK_READ_NAME,
+        EXPERIENCE_RANGE_PAGE_BOUND,
+    )
+    .await?;
+    prove_page_state_fence(&bank_page.view.payload, &ctx.state_fence)?;
+    let bank_records = bank_records_from_range_payload(&bank_page.view.payload)?;
     let bank_live = supply_bank_projection_from_store(
         &mut ledger,
         BankStoreSnapshot {
@@ -798,7 +1071,21 @@ pub async fn run_experience_quality_event(
             holds: event.holds,
         },
     })?;
-    let feedback_records = feedback_records_from_range_payload(&event.feedback.payload)?;
+    // The feedback leg is read through the same owner range read, for the same
+    // reason as the bank leg: a caller-carried payload carries no truncation
+    // verdict, so a truncated feedback page was indistinguishable from a
+    // complete one here too.
+    let feedback_page = read_experience_range_page(
+        composition,
+        kernel,
+        ctx,
+        event.scope_id.clone(),
+        EXPERIENCE_FEEDBACK_READ_NAME,
+        EXPERIENCE_RANGE_PAGE_BOUND,
+    )
+    .await?;
+    prove_page_state_fence(&feedback_page.view.payload, &ctx.state_fence)?;
+    let feedback_records = feedback_records_from_range_payload(&feedback_page.view.payload)?;
     let feedback_live = supply_feedback_projection_from_store(
         &mut ledger,
         FeedbackStoreSnapshot {
@@ -903,8 +1190,8 @@ pub async fn run_experience_quality_event(
         bank_withheld: bank_shaped.withheld,
         feedback_withheld: feedback_shaped.withheld,
         memory_assessment,
-        bank_next_cursor: range_next_cursor(&event.bank.payload),
-        feedback_next_cursor: range_next_cursor(&event.feedback.payload),
+        bank_next_cursor: range_next_cursor(&bank_page.view.payload),
+        feedback_next_cursor: range_next_cursor(&feedback_page.view.payload),
         understanding,
         common_ground,
     })
@@ -1027,8 +1314,9 @@ pub fn derive_commit_ingress(
 /// [`ExperienceCommitOutput`]; the read entry
 /// ([`run_experience_quality_event`]) is unchanged and stays read-only.
 /// Checklist for the O1 copy:
-/// - call with the SAME decoded record slices the read entry consumed
-///   (bank/feedback range payloads already digest re-proved upstream);
+/// - call with the SAME decoded record slices the read entry consumed (the
+///   bank/feedback pages it read through the read owner, already digest
+///   re-proved by the owner supply drivers);
 /// - pass `event.scope_id` verbatim; scope/record mismatch fails closed
 ///   in the commit caller with an exact owner error;
 /// - pass edge-supplied live head expectations when held, else empty
