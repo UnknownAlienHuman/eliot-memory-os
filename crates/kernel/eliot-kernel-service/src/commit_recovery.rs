@@ -83,9 +83,11 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use eliot_ors::{RedbRecoveryStore, UnknownCommitOutcome, UnknownCommitRecord};
+use eliot_ors::{
+    MAX_RECOVERY_PAGE, RedbRecoveryStore, UnknownCommitOutcome, UnknownCommitRecord,
+    UnknownCommitRecoveryCursor,
+};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableRequestIdentity};
 use eliot_store_api::{
     OperationIdentity, Resubmission, StoreError, WriteReceipt, WriteReceiptStatus,
@@ -307,40 +309,33 @@ fn ors_error(detail: impl std::fmt::Display) -> CommitRecoveryError {
 /// not reach, so it closes admission rather than admitting on a partial read.
 pub const MAX_OBSERVED_OPEN_COMMITS: usize = 4096;
 
-/// Identity of the owner that answered one observation, plus the monotonic
-/// observation revision.
+/// The owner-issued durable revision one checked pause observation was read
+/// under.
 ///
-/// `owner` is the concrete durable pause-ledger handle that produced the
-/// answer, so a gateway reconstructed against a different handle cannot
-/// mistake its own uninitialized empty mirror for a ledger that owner has
-/// cleared. `revision` increases once per observation and is what the mirror
-/// records per entry, so a later release can prove which observation an entry
-/// came from instead of guessing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `revision` is the unknown-commit family's own monotone counter, read out of
+/// the owner in the same read transaction that served the page. It is therefore
+/// a fact about the durable family rather than about this process: it advances
+/// in the same ORS write transaction as every stage and every resolution, so a
+/// pause published by any writer — this process, another gateway instance, or
+/// another process entirely — moves it.
+///
+/// That is what lets admission and release order against it. A clearance decided
+/// under revision R is stale the moment the family reaches R+1, and a mirror
+/// entry stamped with a revision the owner has since passed describes a pause
+/// that is provably newer than the scan that decided the answer. `None` means no
+/// revision could be read at all, which is an unavailable answer and never a
+/// cleared one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PauseLedgerBinding {
-    /// Identity of the answering owner handle.
-    pub owner: String,
-    /// Monotonic observation revision assigned by the observing mirror.
-    pub revision: u64,
+    /// Owner-issued family revision, or `None` when none could be read.
+    pub revision: Option<u64>,
 }
 
 impl PauseLedgerBinding {
-    /// Renders the owner identity for a handle reference.
-    ///
-    /// `RedbRecoveryStore` owns no published path or name, so the handle
-    /// address is the honest current-owner identity available here: it
-    /// distinguishes one live owner from a rebound one, which is exactly the
-    /// property admission needs, and it is never compared across processes.
-    fn of_owner(ors: Option<&RedbRecoveryStore>, revision: u64) -> Self {
-        Self {
-            owner: match ors {
-                Some(store) => {
-                    format!("ors:{:p}", std::ptr::from_ref::<RedbRecoveryStore>(store))
-                }
-                None => "ors:absent".to_owned(),
-            },
-            revision,
-        }
+    /// Returns the durable revision, or the typed absence of one.
+    #[must_use]
+    pub const fn revision(&self) -> Option<u64> {
+        self.revision
     }
 }
 
@@ -418,8 +413,10 @@ impl CheckedPauseObservation {
         match self {
             Self::Unavailable { binding, detail } => Some(CommitRecoveryError::OrsUnavailable {
                 detail: format!(
-                    "durable unknown-commit pause state is unavailable at observation revision {} from owner {}: {detail}; dependent durable mutation admission is closed and a permitted read of an exact receipt stays available",
-                    binding.revision, binding.owner
+                    "durable unknown-commit pause state is unavailable at owner-issued family revision {}: {detail}; dependent durable mutation admission is closed and a permitted read of an exact receipt stays available",
+                    binding
+                        .revision
+                        .map_or_else(|| "unreadable".to_owned(), |revision| revision.to_string()),
                 ),
             }),
             Self::CompleteEmpty { .. } | Self::CompleteWithRecords { .. } => None,
@@ -476,7 +473,7 @@ pub struct PausedScopeEntry {
 #[derive(Default)]
 struct PausedScopeMirrorState {
     entries: BTreeMap<String, PausedScopeEntry>,
-    owner: Option<String>,
+    observed_revision: Option<u64>,
     coverage: PauseCoverage,
     last_refresh_limitation: Option<String>,
 }
@@ -504,7 +501,6 @@ pub enum PauseCoverage {
 /// object shared by reference with the gateway — there is no second pause
 /// index anywhere.
 pub struct PausedScopeMirror {
-    revision: AtomicU64,
     state: Mutex<PausedScopeMirrorState>,
 }
 
@@ -518,16 +514,8 @@ impl PausedScopeMirror {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            revision: AtomicU64::new(0),
             state: Mutex::new(PausedScopeMirrorState::default()),
         }
-    }
-
-    /// Returns the next monotonic observation revision.
-    fn next_revision(&self) -> u64 {
-        self.revision
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            .saturating_add(1)
     }
 
     /// Observes the durable pause ledger through the owner and reconciles
@@ -543,44 +531,102 @@ impl PausedScopeMirror {
     /// erase a possibly issued effect, because a failed query is `Unavailable`
     /// and keeps every last-known positive entry with its source.
     pub fn observe(&self, ors: Option<&RedbRecoveryStore>) -> CheckedPauseObservation {
-        let binding = PauseLedgerBinding::of_owner(ors, self.next_revision());
         let Some(store) = ors else {
             return self.record_unavailable(
-                binding,
+                PauseLedgerBinding { revision: None },
                 "no durable recovery owner is bound to this gateway, so the pause ledger was \
                  never read"
                     .to_owned(),
             );
         };
-        let records = match store.list_open_unknown_commits() {
-            Ok(records) => records,
+        // The owner-issued family revision is read first and frozen for the whole
+        // answer. Every page is then served under it, so a pause staged while
+        // this read is in flight moves the revision and the next page refuses
+        // rather than answering from a torn set.
+        let revision = match store.unknown_commit_recovery_revision() {
+            Ok(revision) => revision,
             Err(error) => {
                 return self.record_unavailable(
-                    binding,
-                    format!("the durable pause ledger could not be read: {error}"),
+                    PauseLedgerBinding { revision: None },
+                    format!(
+                        "the durable pause ledger revision could not be read: {error}; the open \
+                         set was not enumerated at all"
+                    ),
                 );
             }
         };
-        if records.len() > MAX_OBSERVED_OPEN_COMMITS {
-            return self.record_unavailable(
-                binding,
-                format!(
-                    "the bounded owner query returned {} open records, above the {MAX_OBSERVED_OPEN_COMMITS} coverage bound; the answer is incomplete, not empty",
-                    records.len()
-                ),
-            );
+        let binding = PauseLedgerBinding {
+            revision: Some(revision),
+        };
+        let mut records: Vec<UnknownCommitRecord> = Vec::new();
+        // The per-page ceiling is the owner's `MAX_RECOVERY_PAGE`, not the
+        // coverage bound: the coverage bound caps how much this answer may
+        // accumulate, while the page ceiling caps how much any single read does.
+        // The two are different limits and conflating them would either reject
+        // every observation or restore an unbounded read.
+        let mut cursor = match UnknownCommitRecoveryCursor::start(revision, MAX_RECOVERY_PAGE) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                return self.record_unavailable(
+                    binding,
+                    format!("the bounded pause cursor is unusable: {error}"),
+                );
+            }
+        };
+        loop {
+            let page = match store.scan_unknown_commit_recovery_page(&cursor) {
+                Ok(page) => page,
+                Err(error) => {
+                    return self.record_unavailable(
+                        binding,
+                        format!(
+                            "the bounded owner query could not be continued under revision \
+                             {revision}: {error}; the open set is not completely known"
+                        ),
+                    );
+                }
+            };
+            records.extend(page.records);
+            // The bound is applied to what has actually been accumulated, so an
+            // over-large family is refused rather than materialised. A page that
+            // stopped at its ceiling proves nothing about the records it did not
+            // reach, so exhaustion is incomplete, never empty.
+            if records.len() > MAX_OBSERVED_OPEN_COMMITS {
+                return self.record_unavailable(
+                    binding,
+                    format!(
+                        "the bounded owner query returned more than \
+                         {MAX_OBSERVED_OPEN_COMMITS} open records under revision {revision}; the \
+                         answer is incomplete, not empty"
+                    ),
+                );
+            }
+            if page.complete {
+                break;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => {
+                    return self.record_unavailable(
+                        binding,
+                        format!(
+                            "the bounded owner query reported an incomplete page with no \
+                             continuation under revision {revision}; the open set is not \
+                             completely known"
+                        ),
+                    );
+                }
+            }
         }
         let observation = if records.is_empty() {
-            CheckedPauseObservation::CompleteEmpty {
-                binding: binding.clone(),
-            }
+            CheckedPauseObservation::CompleteEmpty { binding }
         } else {
             CheckedPauseObservation::CompleteWithRecords {
-                binding: binding.clone(),
+                binding,
                 records: records.clone(),
             }
         };
-        self.apply_complete(&binding, &records);
+        self.apply_complete(revision, &records);
         observation
     }
 
@@ -592,7 +638,7 @@ impl PausedScopeMirror {
     /// pause. Everything else is replaced, and an entry this observation no
     /// longer covers is healed because its original record is resolved or
     /// otherwise authoritatively dispositioned.
-    fn apply_complete(&self, binding: &PauseLedgerBinding, records: &[UnknownCommitRecord]) {
+    fn apply_complete(&self, revision: u64, records: &[UnknownCommitRecord]) {
         let mut entries: BTreeMap<String, PausedScopeEntry> = BTreeMap::new();
         for record in records {
             for scope in &record.ordering_scopes {
@@ -601,7 +647,7 @@ impl PausedScopeMirror {
                     .or_insert_with(|| PausedScopeEntry {
                         scope: scope.clone(),
                         paused_by_key: record.idempotency_key.clone(),
-                        observed_revision: binding.revision,
+                        observed_revision: revision,
                     });
             }
         }
@@ -613,14 +659,14 @@ impl PausedScopeMirror {
             return;
         };
         state.entries.retain(|scope, entry| {
-            if entry.observed_revision > binding.revision {
+            if entry.observed_revision > revision {
                 // Concurrently staged after this observation was read.
                 return true;
             }
             !entries.contains_key(scope)
         });
         state.entries.extend(entries);
-        state.owner = Some(binding.owner.clone());
+        state.observed_revision = Some(revision);
         state.coverage = PauseCoverage::Complete;
         state.last_refresh_limitation = None;
     }
@@ -634,7 +680,7 @@ impl PausedScopeMirror {
     ) -> CheckedPauseObservation {
         if let Ok(mut state) = self.state.lock() {
             state.coverage = PauseCoverage::Unavailable;
-            state.owner = Some(binding.owner.clone());
+            state.observed_revision = binding.revision;
             state.last_refresh_limitation = Some(detail.clone());
         }
         CheckedPauseObservation::Unavailable { binding, detail }
@@ -643,15 +689,16 @@ impl PausedScopeMirror {
     /// Records a pause proved by a successful durable stage.
     ///
     /// Called only after ORS accepted the record, so the mirror never names a
-    /// pause that no durable record backs. The entry is stamped with a freshly
-    /// allocated revision, so it is strictly newer than any observation taken
-    /// before the stage: a release or refresh already in flight cannot erase
-    /// this pause with the older scan it decided on.
-    pub fn record_paused(&self, scopes: &[String], key: &str) {
+    /// pause that no durable record backs. The entry is stamped with the
+    /// owner-issued family revision the stage advanced to, so it is strictly
+    /// newer than any observation read before that stage: a release or refresh
+    /// already in flight cannot erase this pause with the older revision it
+    /// decided on. The revision is the durable one, so a pause published by any
+    /// writer orders the same way as one published here.
+    pub fn record_paused(&self, revision: u64, scopes: &[String], key: &str) {
         if scopes.is_empty() {
             return;
         }
-        let revision = self.next_revision();
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -695,11 +742,14 @@ impl PausedScopeMirror {
             .map_or(PauseCoverage::Unavailable, |state| state.coverage)
     }
 
-    /// Returns the identity of the owner the mirror is currently bound to,
-    /// or `None` while it has never been answered.
+    /// Returns the owner-issued durable family revision the mirror is currently
+    /// bound to, or `None` while it has never been answered.
     #[must_use]
-    pub fn owner(&self) -> Option<String> {
-        self.state.lock().ok().and_then(|state| state.owner.clone())
+    pub fn observed_revision(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.observed_revision)
     }
 
     /// Returns the retained limitation from the last failed refresh, if any.
@@ -748,7 +798,17 @@ impl PausedScopeMirror {
                 detail,
             };
         }
-        let revision = observation.binding().revision;
+        // A complete observation always carries the owner-issued revision it was
+        // read under. A revision-less complete answer is not one this mirror can
+        // have produced, so it releases nothing rather than guessing an order.
+        let Some(revision) = observation.binding().revision else {
+            return PauseReleaseOutcome::RefreshUnavailable {
+                scopes: scopes.to_owned(),
+                detail: "the refresh proved no owner-issued unknown-commit family revision, so \
+                         no scope could be released"
+                    .to_owned(),
+            };
+        };
         let retained: Vec<String> = scopes
             .iter()
             .filter(|scope| {
@@ -797,13 +857,12 @@ impl PausedScopeMirror {
             }
         }
         state.last_refresh_limitation = None;
-        state.owner = Some(observation.binding().owner.clone());
+        state.observed_revision = observation.binding().revision;
         PauseReleaseOutcome::Released {
             scopes: removed,
             retained,
             superseded,
-            binding: observation.binding().clone(),
-            revision,
+            binding: *observation.binding(),
         }
     }
 }
@@ -828,10 +887,8 @@ pub enum PauseReleaseOutcome {
         /// Scopes left paused because a pause was staged concurrently, after
         /// the observation this release decided on was read.
         superseded: Vec<String>,
-        /// Owner and revision the release decision was made under.
+        /// Owner-issued revision the release decision was made under.
         binding: PauseLedgerBinding,
-        /// Revision recorded with the removal decision.
-        revision: u64,
     },
     /// Nothing was released because the refresh could not be proven
     /// complete. The recorded terminal disposition stands.
@@ -1272,8 +1329,15 @@ fn open_problem_state(
     let record = open_record_for(identity, ordering_scopes)?;
     ors.stage_unknown_commit(&record).map_err(ors_error)?;
     // Only a durably staged record may mark a scope paused, and the mirror
-    // keeps that source with the entry.
-    paused.record_paused(ordering_scopes, identity.idempotency_key.as_str());
+    // keeps that source with the entry. The stamp is the owner-issued family
+    // revision the stage advanced to, read back from ORS rather than minted
+    // here, so a pause published by any writer orders identically.
+    let staged_revision = ors.unknown_commit_recovery_revision().map_err(ors_error)?;
+    paused.record_paused(
+        staged_revision,
+        ordering_scopes,
+        identity.idempotency_key.as_str(),
+    );
     Err(CommitRecoveryError::UnknownCommitOpen {
         idempotency_key: identity.idempotency_key.clone(),
         paused_scopes: ordering_scopes.to_owned(),
@@ -1583,7 +1647,7 @@ pub fn paused_scopes_snapshot(
         scopes,
         observation,
         coverage: paused.coverage(),
-        owner: paused.owner(),
+        observed_revision: paused.observed_revision(),
         limitation,
     }
 }
@@ -1600,9 +1664,9 @@ pub struct PausedScopeSnapshot {
     pub observation: CheckedPauseObservation,
     /// Coverage the mirror entries were last observed under.
     pub coverage: PauseCoverage,
-    /// Owner the mirror is currently bound to, or `None` while it has never
-    /// been answered by one.
-    pub owner: Option<String>,
+    /// Owner-issued durable family revision the mirror is currently bound
+    /// to, or `None` while it has never been answered by one.
+    pub observed_revision: Option<u64>,
     /// `Some` exactly when durable recovery state was unavailable, carrying
     /// the typed reason. Consumers label the scope list unavailable; they
     /// never report it as zero.
@@ -1652,7 +1716,7 @@ pub fn paused_ordering_scope_view(
         scopes: view,
         observation,
         coverage: paused.coverage(),
-        owner: paused.owner(),
+        observed_revision: paused.observed_revision(),
         limitation,
     }
 }
@@ -1667,9 +1731,9 @@ pub struct PauseScopeView {
     pub observation: CheckedPauseObservation,
     /// Coverage the mirror entries were last observed under.
     pub coverage: PauseCoverage,
-    /// Owner the mirror is currently bound to, or `None` while it has never
-    /// been answered by one.
-    pub owner: Option<String>,
+    /// Owner-issued durable family revision the mirror is currently bound
+    /// to, or `None` while it has never been answered by one.
+    pub observed_revision: Option<u64>,
     /// `Some` exactly when durable recovery state was unavailable. A
     /// diagnostic consumer reports the scope list as a bounded known subset
     /// with this label and never as "zero paused".
