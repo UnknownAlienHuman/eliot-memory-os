@@ -3523,6 +3523,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "eliot-contracts",
+ "eliot-evaluation-contracts",
  "eliot-host-state",
  "eliot-installation",
  "eliot-ipc",
