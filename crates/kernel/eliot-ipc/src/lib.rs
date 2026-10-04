@@ -3657,12 +3657,32 @@ mod tests {
                 "version": {"major": 1, "minor": 0, "patch": 0},
                 "artifact_id": "a".repeat(64),
                 "protocols": ["eliot.agent-bridge.v1"],
+                "capabilities": [],
                 "required_capabilities": ["agent.bridge.activate"],
                 "optional_capabilities": [],
                 "advisory_capabilities": [],
                 "state_owner": "eliot-host",
                 "failure_domain": "agent-bridge",
-                "hot_replace": false
+                "owner": "eliot-agent-bridge",
+                "hot_replace": false,
+                "startup_after": [],
+                "drain_before": [],
+                "invalidation_triggers": [],
+                "supervision_plan": "one_for_one",
+                "child_restart": "transient",
+                "restart_intensity": "3/10m",
+                "resource_profile": "background-medium",
+                "privacy_classes": ["PUBLIC"],
+                "permissions": [],
+                "health_contract": "health/agent-bridge-v1",
+                "checkpoint_contract": "checkpoint/agent-bridge-v1",
+                "compatibility_state": "rebuildable",
+                "independent_test_profile": "module/agent-bridge",
+                "contract_fixture_set": "eliot.agent-bridge.v1/agent-bridge",
+                "affected_test_tags": ["agent-bridge"],
+                "architecture": [],
+                "telemetry": "telemetry/agent-bridge-v1",
+                "removal_boundary": "eliot-agent-bridge"
             },
             "module_generation": {
                 "module_id": AGENT_BRIDGE_MODULE_ID,
@@ -3913,9 +3933,12 @@ mod tests {
         );
         let mut wrong_kind = peer_challenge_frame("server-connection", &challenge)?;
         wrong_kind.kind = FrameKind::Event;
-        assert_eq!(
-            decode_peer_challenge_frame(&wrong_kind, "server-connection"),
-            Err(TransportError::SessionFenced)
+        assert!(
+            matches!(
+                decode_peer_challenge_frame(&wrong_kind, "server-connection"),
+                Err(TransportError::Protocol(_))
+            ),
+            "a challenge on a non-canonical frame kind must be refused with a typed reason"
         );
         let mut wrong_type = peer_challenge_frame("server-connection", &challenge)?;
         wrong_type.message_type = MessageType::Start;
@@ -4020,6 +4043,192 @@ mod tests {
             fenced.accept_client_hello(&hello_frame, &declaration),
             Err(TransportError::SessionFenced)
         );
+        Ok(())
+    }
+
+    /// Builds the server-owned handshake policy for one registered generation.
+    ///
+    /// The policy is the evidence side of the comparison: the registered
+    /// current generation, the admitted capability/effect sets and the launch
+    /// nonce the server owner selected. A client assertion is never copied
+    /// into it, which is what makes the fencing arms below meaningful.
+    fn handshake_policy_for(
+        declaration: &AgentBridgeClientDeclaration,
+        generation: ModuleGeneration,
+    ) -> ServerHandshakePolicy {
+        ServerHandshakePolicy {
+            protocol_range: declaration.protocol_range,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            module_generation: generation,
+            launch_nonce: "launch-nonce-1".to_owned(),
+            allowed_capabilities: vec![
+                "agent.bridge.activate".to_owned(),
+                "agent.bridge.inspect".to_owned(),
+            ],
+            allowed_privacy_classes: vec!["PUBLIC".to_owned()],
+            allowed_effects: vec!["effect.read".to_owned()],
+            session_principal_binding: "kernel:agent-bridge".to_owned(),
+            control_channel: "control-channel-1".to_owned(),
+            heartbeat_ms: 1_000,
+            config_snapshot: serde_json::json!({"revision": 1}),
+            max_frame: 4_194_304,
+        }
+    }
+
+    /// An authenticated peer identity, reused across the refusal arms.
+    fn bridge_peer() -> Result<PeerIdentity, Box<dyn std::error::Error>> {
+        Ok(PeerIdentity::authenticated_for_test(
+            ProcessBinding::from_observation(41, 99, r"C:\Eliot\bridge.exe")?,
+            "S-1-5-21-1000".to_owned(),
+            "4".to_owned(),
+        )?)
+    }
+
+    /// Acceptance (#1876): an old generation and a foreign authority epoch are
+    /// explicitly fenced at the handshake, and a fenced session cannot reattach.
+    ///
+    /// Both refusals happen against a valid, authenticated peer identity and an
+    /// internally consistent `ClientHello`, so neither is an incidental decode
+    /// failure: the generation the client asserts is simply not the generation
+    /// the server owner registered.
+    #[test]
+    fn server_handshake_fences_old_generation_and_foreign_epoch() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let peer = bridge_peer()?;
+        let client = declaration.client_hello("launch-nonce-1")?;
+
+        // The registered current generation: the same module, one generation
+        // ahead and one authority-epoch sequence ahead of the client claim.
+        let mut current = declaration.module_generation.clone();
+        current.generation = eliot_contracts::ResourceGeneration::new(2)?;
+        current.state_fence.authority_epoch = test_epoch(8);
+        let policy = handshake_policy_for(&declaration, current);
+
+        assert_eq!(
+            Session::establish_with_server("old-generation", peer.clone(), &client, &policy),
+            Err(TransportError::SessionFenced),
+            "an old generation must be refused, not admitted against the current one"
+        );
+
+        // A foreign lineage is a different authority, not a newer sequence of
+        // the same one. The client stays internally consistent by carrying the
+        // foreign epoch in both the claim and its registered generation fence.
+        let mut foreign = declaration.client_hello("launch-nonce-1")?;
+        let foreign_epoch: EpochId = serde_json::from_value(serde_json::json!({
+            "lineage_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "sequence": 9
+        }))?;
+        foreign.authority_epoch = foreign_epoch.clone();
+        foreign.module_generation.state_fence.authority_epoch = foreign_epoch;
+        foreign.validate()?;
+        assert_eq!(
+            Session::establish_with_server("foreign-epoch", peer.clone(), &foreign, &policy),
+            Err(TransportError::SessionFenced),
+            "a foreign authority lineage must be refused"
+        );
+
+        // A wrong launch nonce is the same class of self-assertion: the nonce
+        // is owner-issued material, never a client claim.
+        let wrong_nonce = declaration.client_hello("substituted-nonce")?;
+        assert_eq!(
+            Session::establish_with_server("wrong-nonce", peer.clone(), &wrong_nonce, &policy),
+            Err(TransportError::SessionFenced),
+            "a substituted launch nonce must be refused"
+        );
+
+        // The current generation is admitted, and once fenced it cannot
+        // reattach: a later reconnect attempt on the same identity fails.
+        let mut session = Session::establish_with_server(
+            "current-generation",
+            peer,
+            &client,
+            &handshake_policy_for(&declaration, declaration.module_generation.clone()),
+        )
+        .map_err(|error| format!("the registered current generation must be admitted: {error}"))?
+        .session;
+        assert_eq!(session.state, SessionState::Open);
+        session.fence();
+        assert_eq!(session.state, SessionState::Fenced);
+        assert_eq!(
+            session.begin_reconnect(),
+            Err(TransportError::SessionFenced),
+            "a fenced session must not reattach"
+        );
+        Ok(())
+    }
+
+    /// Acceptance (#1876): an unsupported artifact hash and an unregistered
+    /// claimed capability are rejected with a recorded reason, and a correctly
+    /// registered current generation receives a hello reporting only its own
+    /// allowed capabilities and effects.
+    #[test]
+    fn server_handshake_rejects_unregistered_claims_and_reports_only_allowed() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let peer = bridge_peer()?;
+        let policy = handshake_policy_for(&declaration, declaration.module_generation.clone());
+
+        // An artifact hash no registered generation supports. The client keeps
+        // its own three artifact fields consistent, so the refusal is the
+        // registry comparison rather than a self-inconsistent hello.
+        let mut foreign_artifact = declaration.client_hello("launch-nonce-1")?;
+        let artifact = eliot_contracts::ArtifactId::new("b".repeat(64))?;
+        foreign_artifact.artifact_hash = artifact.clone();
+        foreign_artifact.module_contract.artifact_id = artifact.clone();
+        foreign_artifact.module_generation.artifact_id = artifact;
+        foreign_artifact.validate()?;
+        assert_eq!(
+            Session::establish_with_server(
+                "foreign-artifact",
+                peer.clone(),
+                &foreign_artifact,
+                &policy
+            ),
+            Err(TransportError::SessionFenced),
+            "an artifact hash outside the registered generation must be refused"
+        );
+
+        // A claimed capability outside the admitted set, refused with the
+        // field-level reason the front door records.
+        let mut unregistered = declaration.client_hello("launch-nonce-1")?;
+        unregistered
+            .capabilities
+            .push("agent.bridge.unregistered".to_owned());
+        match Session::establish_with_server("unregistered", peer, &unregistered, &policy) {
+            Err(TransportError::Protocol(eliot_protocol::ProtocolError::InvalidField {
+                field,
+                ..
+            })) => assert_eq!(
+                field, "client.capabilities",
+                "the refusal must name the claim it refused"
+            ),
+            other => {
+                return Err(
+                    format!("an unregistered capability must be refused, got {other:?}").into(),
+                );
+            }
+        }
+
+        // A correctly registered current generation is admitted, and the hello
+        // reports only what the client asked for AND the server admitted: the
+        // policy's extra admitted capability is never echoed back.
+        let hello = Session::establish_with_server(
+            "admitted",
+            bridge_peer()?,
+            &declaration.client_hello("launch-nonce-1")?,
+            &policy,
+        )?
+        .server_hello;
+        assert_eq!(
+            hello.allowed_capabilities,
+            vec!["agent.bridge.activate".to_owned()],
+            "the hello reports only the requested-and-admitted capability set"
+        );
+        assert_eq!(
+            hello.allowed_effects,
+            vec!["effect.read".to_owned()],
+            "effects come from the server owner, never from the client claim"
+        );
+        assert_eq!(hello.rejection_reason, None);
         Ok(())
     }
 

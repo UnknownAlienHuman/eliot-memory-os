@@ -1,9 +1,10 @@
 use eliot_engine::{
     CanonicalMetaExperimentAssessment, CanonicalMetaExperimentInput, CanonicalReplayExecutionInput,
-    CanonicalTraceCompletenessInput, MetaHarnessService, MetaPolicyExecutor, ReplayCaseInput,
-    ReplayCaseObservation, ReplayCaseService, ReplayRunnerService, ReplaySealBundle,
-    ReplaySealInput, ReplaySealService, ReplaySetInput, ReplaySetService, SealedReplayInput,
-    SleepConsolidationService, SleepRunInput, TraceCompletenessInput, TraceCompletenessService,
+    CanonicalTraceCompletenessInput, MetaExperimentGate, MetaHarnessService, MetaPolicyExecutor,
+    ReplayCaseInput, ReplayCaseObservation, ReplayCaseService, ReplayRunnerService,
+    ReplaySealBundle, ReplaySealInput, ReplaySealService, ReplaySetInput, ReplaySetService,
+    SealedReplayInput, SleepConsolidationService, SleepRunInput, TraceCompletenessInput,
+    TraceCompletenessService,
 };
 use eliot_types::{
     CanonicalReplayExecutionRecord, CanonicalReplayObservationEvidence,
@@ -311,6 +312,125 @@ fn legacy_trace_strings_are_marked_unverified_and_canonical_evidence_is_tamper_e
 }
 
 #[test]
+fn canonical_execution_identity_requires_its_bound_evaluation_integrity_receipt() {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let (bundle, contracts) = replay_fixture(
+        project_id,
+        task_id,
+        ReplaySetRole::Fixed,
+        "trace:receipt-binding",
+    );
+    let execution = execute(&bundle, &contracts, "baseline", "candidate");
+
+    // The producer always seals a receipt, and the canonical identity admits it.
+    let Some(receipt) = execution.run.evaluation_integrity_receipt.clone() else {
+        panic!("run_canonical must produce an evaluation-integrity receipt");
+    };
+    assert!(receipt.verify_seal());
+    assert_eq!(receipt.proof_ceiling, "REPLAY_ONLY");
+    assert_eq!(receipt.status, "INCONCLUSIVE");
+    assert!(
+        ReplayRunnerService::validate_canonical_execution_identity(&execution).is_ok(),
+        "a receipted canonical record must validate"
+    );
+
+    // Defect 1, first counterexample: drop the receipt. The record can no longer
+    // be "exact", because the receipt is inside the identity rather than beside it.
+    let mut without_receipt = execution.clone();
+    without_receipt.run.evaluation_integrity_receipt = None;
+    assert!(
+        ReplayRunnerService::validate_canonical_execution_identity(&without_receipt).is_err(),
+        "a canonical record with no evaluation-integrity receipt must be refused"
+    );
+
+    // Defect 1, second counterexample: a foreign but SELF-CONSISTENT receipt.
+    // Re-sealing a receipt that claims a different oracle still fails, because
+    // the identity validator also requires the receipt to bind THIS record.
+    let mut foreign = execution.clone();
+    let mut foreign_receipt = receipt.clone();
+    foreign_receipt.oracle_owner = "some-other-owner::Oracle".to_owned();
+    let foreign_seal = must(
+        foreign_receipt.compute_seal(),
+        "seal the substituted foreign receipt",
+    );
+    foreign_receipt.receipt_id =
+        eliot_types::ReplayEvaluationIntegrityReceipt::receipt_id_for_seal(&foreign_seal);
+    foreign_receipt.seal = foreign_seal;
+    assert!(
+        foreign_receipt.verify_seal(),
+        "the substituted receipt is internally consistent by construction"
+    );
+    foreign.run.evaluation_integrity_receipt = Some(foreign_receipt);
+    assert!(
+        ReplayRunnerService::validate_canonical_execution_identity(&foreign).is_err(),
+        "a self-consistent but foreign receipt must not stand in for the bound one"
+    );
+
+    // A broken seal is refused with the seal reason, not silently accepted.
+    let mut tampered = execution.clone();
+    let mut tampered_receipt = receipt.clone();
+    tampered_receipt.proof_ceiling = "PRODUCT".to_owned();
+    tampered.run.evaluation_integrity_receipt = Some(tampered_receipt);
+    assert!(
+        ReplayRunnerService::validate_canonical_execution_identity(&tampered).is_err(),
+        "an edited receipt must be refused"
+    );
+}
+
+/// Refuting half of `canonical_execution_identity_requires_its_bound_evaluation_integrity_receipt`:
+/// an intact receipt sealed under an EARLIER oracle build is drifted, not foreign.
+#[test]
+fn drifted_replay_oracle_version_is_stale_while_the_record_stays_readable() {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let (bundle, contracts) = replay_fixture(
+        project_id,
+        task_id,
+        ReplaySetRole::Fixed,
+        "trace:oracle-drift",
+    );
+    let execution = execute(&bundle, &contracts, "baseline", "candidate");
+    let Some(receipt) = execution.run.evaluation_integrity_receipt.clone() else {
+        panic!("run_canonical must produce an evaluation-integrity receipt");
+    };
+
+    let mut drifted = receipt.clone();
+    drifted.oracle_version = "0.0.0-ancient".to_owned();
+    let seal = must(drifted.compute_seal(), "seal the drifted receipt");
+    drifted.receipt_id = eliot_types::ReplayEvaluationIntegrityReceipt::receipt_id_for_seal(&seal);
+    drifted.seal = seal;
+    let mut stale = execution.clone();
+    stale.run.evaluation_integrity_receipt = Some(drifted.clone());
+
+    let disposition = eliot_engine::replay::replay_evidence_disposition(&stale);
+    assert_eq!(
+        disposition.validity,
+        eliot_engine::replay::ReplayEvidenceValidity::Stale,
+        "an oracle-version drift must read STALE, got {:?}",
+        disposition.blocking_reasons
+    );
+    assert!(
+        disposition.blocking_reasons.iter().any(|reason| reason
+            == "sealed replay oracle version differs from the current oracle version"),
+        "the drift must name the oracle-version dimension, got {:?}",
+        disposition.blocking_reasons
+    );
+    assert!(
+        !disposition.is_current_evidence(),
+        "stale evidence may never support a load-bearing claim"
+    );
+    assert!(
+        drifted.verify_seal(),
+        "the original receipt bytes stay immutable and self-consistent"
+    );
+    assert!(
+        ReplayRunnerService::validate_canonical_execution_identity(&stale).is_ok(),
+        "staleness is not an identity error: the record stays readable"
+    );
+}
+
+#[test]
 fn sealed_replay_rejects_tampered_membership_and_derives_results() {
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
@@ -420,34 +540,8 @@ fn meta_isolation_rejection_is_receiptable_and_policy_rolls_back_exactly() {
         ReplaySetRole::Holdout,
         "trace:holdout-meta",
     );
-    let baseline_payload = ExperimentalMetaPolicyPayload::ReplayThresholdV1 {
-        policy: ReplayThresholdPolicyV1 {
-            schema_version: "1".to_owned(),
-            evaluator_version: "v1".to_owned(),
-            minimum_pass_basis_points: 9_000,
-            maximum_counter_regressions: 0,
-        },
-    };
-    let candidate_payload = ExperimentalMetaPolicyPayload::ReplayThresholdV1 {
-        policy: ReplayThresholdPolicyV1 {
-            schema_version: "1".to_owned(),
-            evaluator_version: "v1".to_owned(),
-            minimum_pass_basis_points: 10_000,
-            maximum_counter_regressions: 0,
-        },
-    };
-    let baseline_hash = blake3::hash(&must(
-        serde_json::to_vec(&baseline_payload),
-        "serialize baseline policy",
-    ))
-    .to_hex()
-    .to_string();
-    let candidate_hash = blake3::hash(&must(
-        serde_json::to_vec(&candidate_payload),
-        "serialize candidate policy",
-    ))
-    .to_hex()
-    .to_string();
+    let (baseline_payload, candidate_payload, baseline_hash, candidate_hash) =
+        meta_policy_payloads();
     let fixed_baseline = execute(&fixed, &fixed_contract, &baseline_hash, &baseline_hash);
     let fixed_candidate = execute(&fixed, &fixed_contract, &baseline_hash, &candidate_hash);
     let holdout_baseline = execute(&holdout, &holdout_contract, &baseline_hash, &baseline_hash);
@@ -477,6 +571,7 @@ fn meta_isolation_rejection_is_receiptable_and_policy_rolls_back_exactly() {
         holdout_candidate,
         threshold: threshold.clone(),
         attempted_fence: None,
+        evidence_corroboration: None,
     };
     let mut isolated_attempt = base_input.clone();
     isolated_attempt.attempted_fence = Some(MetaIsolationFence {
@@ -498,11 +593,122 @@ fn meta_isolation_rejection_is_receiptable_and_policy_rolls_back_exactly() {
     assert!(rejected.records.isolation_rejection.is_some());
 
     let assessment = must(
-        MetaHarnessService::assess_canonical(base_input),
+        MetaHarnessService::assess_canonical(base_input.clone()),
         "meta assessment",
     );
-    assert!(assessment.eligible_for_promotion);
-    exercise_policy_roundtrip(project_id, &assessment, baseline_payload, candidate_payload);
+    // Issue #1922: four green replay thresholds are NOT promotable on their own.
+    // A canonical replay receipt is REPLAY_ONLY + INCONCLUSIVE by construction,
+    // so with no declared second route or Human disposition the
+    // evaluation-integrity gate must refuse and name the causal reason. This is
+    // the over-credit the issue exists to prevent.
+    assert_uncorroborated_evidence_blocks_promotion(&assessment);
+
+    // With a declared Human disposition the same measurements become promotable,
+    // and the exact policy roundtrip still holds.
+    let mut corroborated_input = base_input;
+    corroborated_input.evidence_corroboration =
+        Some(eliot_types::MetaEvidenceCorroboration::HumanDisposition {
+            corroboration_ref: "human-disposition:meta-1922".to_owned(),
+        });
+    let corroborated = must(
+        MetaHarnessService::assess_canonical(corroborated_input),
+        "corroborated meta assessment",
+    );
+    assert!(
+        corroborated.eligible_for_promotion,
+        "a declared Human disposition lifts the replay-only ceiling, got {:?}",
+        corroborated.blocking_reasons
+    );
+    exercise_policy_roundtrip(
+        project_id,
+        &corroborated,
+        baseline_payload,
+        candidate_payload,
+    );
+}
+
+/// The matched baseline/candidate policy pair under test, with their content hashes.
+fn meta_policy_payloads() -> (
+    ExperimentalMetaPolicyPayload,
+    ExperimentalMetaPolicyPayload,
+    String,
+    String,
+) {
+    let baseline_payload = ExperimentalMetaPolicyPayload::ReplayThresholdV1 {
+        policy: ReplayThresholdPolicyV1 {
+            schema_version: "1".to_owned(),
+            evaluator_version: "v1".to_owned(),
+            minimum_pass_basis_points: 9_000,
+            maximum_counter_regressions: 0,
+        },
+    };
+    let candidate_payload = ExperimentalMetaPolicyPayload::ReplayThresholdV1 {
+        policy: ReplayThresholdPolicyV1 {
+            schema_version: "1".to_owned(),
+            evaluator_version: "v1".to_owned(),
+            minimum_pass_basis_points: 10_000,
+            maximum_counter_regressions: 0,
+        },
+    };
+    let baseline_hash = blake3::hash(&must(
+        serde_json::to_vec(&baseline_payload),
+        "serialize baseline policy",
+    ))
+    .to_hex()
+    .to_string();
+    let candidate_hash = blake3::hash(&must(
+        serde_json::to_vec(&candidate_payload),
+        "serialize candidate policy",
+    ))
+    .to_hex()
+    .to_string();
+    (
+        baseline_payload,
+        candidate_payload,
+        baseline_hash,
+        candidate_hash,
+    )
+}
+
+/// Issue #1922 negative case: green replay thresholds alone must never promote.
+///
+/// The evaluation-integrity gate must be present, failing, and must name BOTH the
+/// aggregate refusal and the per-arm causal dimension, so an operator can see
+/// that the missing corroboration is what blocked it.
+fn assert_uncorroborated_evidence_blocks_promotion(assessment: &CanonicalMetaExperimentAssessment) {
+    assert!(
+        !assessment.eligible_for_promotion,
+        "replay-only INCONCLUSIVE evidence must not promote without corroboration"
+    );
+    assert!(
+        assessment
+            .gate_results
+            .iter()
+            .any(|gate| { gate.gate == MetaExperimentGate::EvaluationIntegrity && !gate.passed }),
+        "the evaluation-integrity gate must be present and failing, got {:?}",
+        assessment.gate_results
+    );
+    assert!(
+        assessment.blocking_reasons.iter().any(|reason| reason
+            == "evaluation-integrity evidence does not support a load-bearing promotion"),
+        "the aggregate gate must state its own refusal, got {:?}",
+        assessment.blocking_reasons
+    );
+    for arm in [
+        "fixed_baseline",
+        "fixed_candidate",
+        "holdout_baseline",
+        "holdout_candidate",
+    ] {
+        assert!(
+            assessment.blocking_reasons.iter().any(|reason| {
+                reason.starts_with(arm)
+                    && reason.ends_with("carries no declared second route or Human disposition")
+            }),
+            "{arm} must name the missing corroboration as the causal dimension, got {:?}",
+            assessment.blocking_reasons
+        );
+    }
 }
 
 fn exercise_policy_roundtrip(

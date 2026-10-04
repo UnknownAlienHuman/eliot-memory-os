@@ -186,9 +186,10 @@ pub use eval::{
     EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage, EvalRun, EvalRunProfile,
     EvalRunStatus, EvalSuite, EvalTrendDirection, EvalTrendReport, EvalVerdict, EvalVerdictStatus,
     ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
-    HarnessExperimentRecord, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
-    MetaIsolationRejectionRecord, MetaPolicyAuthorization, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, ReplayEvaluationIntegrityReceipt, ReplayThresholdPolicyV1,
+    HarnessExperimentRecord, MetaCandidateChangeClass, MetaEvidenceCorroboration,
+    MetaExperimentDecision, MetaIsolationFence, MetaIsolationRejectionRecord,
+    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
+    ReplayEvaluationIntegrityReceipt, ReplayThresholdPolicyV1,
 };
 pub use external_agent::{
     ExternalAgentExecutionRequest, ExternalAgentPurpose, OPERATION_AUTHORITY_SCHEMA_VERSION,
