@@ -1045,4 +1045,533 @@ mod tests {
             );
         }
     }
+
+    /// The bounded wait the production caller grants the owner contour. The
+    /// interval is this file's own `MAX_CHALLENGE_WAIT_SECS` because that is the
+    /// bound the Host endpoint's bounded owner queue enforces
+    /// (`QUEUE_RESPONSE_TIMEOUT`), and a longer wait would outlive that
+    /// guarantee and be refused at construction.
+    fn bounded_wait() -> BoundedChallengeWait {
+        BoundedChallengeWait::new(MAX_CHALLENGE_WAIT_SECS)
+            .unwrap_or_else(|| panic!("MAX_CHALLENGE_WAIT_SECS is admissible by construction"))
+    }
+
+    /// One validated live Host, read through the same readback classifier the
+    /// liveness sensor itself uses. `Running` and the handle-bound process
+    /// identity are the platform adapter's own comparison over the existing
+    /// `matching_readback` fixture, so the fixture's liveness verdict is real
+    /// code output rather than a hand-written observation.
+    fn observed_live_host() -> HostObservation {
+        let mut monitor = HostIdentityMonitor::new(None);
+        monitor.observe_runtime_readback(matching_readback())
+    }
+
+    /// One terminal-absent readback through the same classifier.
+    fn observed_absent_host() -> HostObservation {
+        let mut monitor = HostIdentityMonitor::new(None);
+        monitor.observe_runtime_readback(WatchdogRuntimeReadback::Absent)
+    }
+
+    /// A second observation of the same monitor taken after one live baseline,
+    /// so the identity comparison inside `observe_process_identity` — not a
+    /// hand-written state — produces the non-`Running` verdict under test.
+    fn observed_after_baseline(second: ProcessIdentity) -> HostObservation {
+        let mut monitor = HostIdentityMonitor::new(None);
+        let baseline = monitor.observe_process_identity(ProcessIdentity {
+            process_id: 4_200,
+            start_time_100ns: 1_000_000,
+            image_path: r"C:\Program Files\Eliot\eliot-host.exe".to_owned(),
+        });
+        assert_eq!(
+            baseline.state,
+            HostObservationState::Running,
+            "the first observation of a fresh monitor is the live baseline"
+        );
+        monitor.observe_process_identity(second)
+    }
+
+    /// Every observation state the classifier can produce, each reached through
+    /// real code: the live readback, a terminal-absent readback, and the three
+    /// identity-gap verdicts that require a baseline to compare against.
+    fn observed_states() -> Vec<HostObservation> {
+        let mut monitor = HostIdentityMonitor::new(None);
+        let identity = |process_id: u32, start_time_100ns: u64, image_path: &str| ProcessIdentity {
+            process_id,
+            start_time_100ns,
+            image_path: image_path.to_owned(),
+        };
+        let transient = monitor.observe_runtime_readback(WatchdogRuntimeReadback::Matching {
+            state: WatchdogRuntimeState::Starting,
+            process: None,
+            checkpoint: 0,
+            wait_hint_ms: 0,
+        });
+        vec![
+            observed_live_host(),
+            observed_absent_host(),
+            transient,
+            observed_after_baseline(identity(4_200, 2_000_000, LIVE_IMAGE)),
+            observed_after_baseline(identity(4_200, 1_000_000, SUBSTITUTED_IMAGE)),
+            observed_after_baseline(identity(9_001, 1_000_000, LIVE_IMAGE)),
+        ]
+    }
+
+    /// The approved Host image the `matching_readback` fixture reports.
+    const LIVE_IMAGE: &str = r"C:\Program Files\Eliot\eliot-host.exe";
+    /// A different image at the same path identity: the same PID and start time
+    /// with different bytes, which `observe_process_identity` classifies as
+    /// `ImageSubstituted`.
+    const SUBSTITUTED_IMAGE: &str = r"C:\Program Files\Eliot\other-host.exe";
+
+    /// Every `ChallengeAttemptOutcome` a challenger can report: the one
+    /// competent attempt plus one incompetent attempt per named uncertainty.
+    fn every_attempt() -> Vec<ChallengeAttemptOutcome> {
+        let mut attempts = vec![ChallengeAttemptOutcome::CompetentTimeout];
+        attempts.extend(
+            [
+                ChallengeUncertainty::Unauthenticated,
+                ChallengeUncertainty::ConnectionDenied,
+                ChallengeUncertainty::TargetChanged,
+                ChallengeUncertainty::InadequateCoverage,
+                ChallengeUncertainty::TargetNotLive,
+            ]
+            .map(ChallengeAttemptOutcome::Uncertain),
+        );
+        attempts
+    }
+
+    /// Positive: a live disposable Host whose control loop is deliberately
+    /// stalled — validated `Running` target, competently attempted challenge,
+    /// uncancelled bounded wait, no correlated owner answer — is
+    /// `AliveUnresponsive` and never health. The verdict is the *observation* of
+    /// a live-but-unresponsive control owner, which is what makes the stalled
+    /// process visible to the supervisor instead of silently healthy.
+    #[test]
+    fn live_stalled_control_loop_is_alive_unresponsive_never_health() {
+        let host = observed_live_host();
+        assert_eq!(
+            host.state,
+            HostObservationState::Running,
+            "the fixture must be the validated live target the challenge ran against"
+        );
+        let verdict =
+            host.responsiveness(&bounded_wait(), &ChallengeAttemptOutcome::CompetentTimeout);
+        assert_eq!(verdict, HostResponsiveness::AliveUnresponsive);
+        assert_ne!(
+            verdict,
+            HostResponsiveness::Responsive,
+            "a stalled control loop is liveness evidence only and is never health"
+        );
+    }
+
+    /// The positive `Responsive` case is NOT reachable through this function.
+    /// `HostObservation::responsiveness` has no `Responsive` arm at all: it is a
+    /// pure function of already-observed liveness plus an already-classified
+    /// attempt, and it never sees an owner answer. Exhaustive sweep over every
+    /// observation state the classifier can produce, every attempt outcome, and
+    /// both wait dispositions, so a forged, replayed, or wrong-epoch response
+    /// cannot establish health here — no response can, because no input reaches
+    /// `Responsive`. The positive case is owned exclusively by the owner-path
+    /// correlation validator in the Host endpoint lane
+    /// (`eliot-host-control-endpoint`'s
+    /// `responsiveness_challenge::validate_owner_challenge_response`), which this
+    /// composition root does not depend on.
+    #[test]
+    fn responsiveness_is_unreachable_from_liveness_evidence_and_any_attempt() {
+        let observations = observed_states();
+        let attempts = every_attempt();
+        for state in [
+            HostObservationState::Running,
+            HostObservationState::AbsentOrStopped,
+            HostObservationState::PidReused,
+            HostObservationState::ImageSubstituted,
+            HostObservationState::IdentityChanged,
+            HostObservationState::Unknown,
+        ] {
+            assert!(
+                observations
+                    .iter()
+                    .any(|observation| observation.state == state),
+                "the sweep must cover {state:?}, the state the classifier produces"
+            );
+        }
+        for observation in &observations {
+            for attempt in &attempts {
+                for cancelled in [false, true] {
+                    let mut wait = bounded_wait();
+                    if cancelled {
+                        wait.cancel();
+                    }
+                    let verdict = observation.responsiveness(&wait, attempt);
+                    assert_ne!(
+                        verdict,
+                        HostResponsiveness::Responsive,
+                        "liveness evidence plus one attempt ({observation:?}, {attempt:?}, \
+                         cancelled={cancelled}) must never be health"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An incompetent attempt stays an explicit named uncertainty: never
+    /// `AliveUnresponsive` (which would silently grant restart eligibility) and
+    /// never `Responsive`. Each reported reason survives classification
+    /// unchanged, so a stored journal row can say *what* was unknown instead of
+    /// collapsing every insufficient signal into the timeout arm.
+    #[test]
+    fn incompetent_attempt_stays_an_explicit_named_uncertainty() {
+        let host = observed_live_host();
+        for reason in [
+            ChallengeUncertainty::Unauthenticated,
+            ChallengeUncertainty::ConnectionDenied,
+            ChallengeUncertainty::TargetChanged,
+            ChallengeUncertainty::InadequateCoverage,
+            ChallengeUncertainty::TargetNotLive,
+        ] {
+            let verdict =
+                host.responsiveness(&bounded_wait(), &ChallengeAttemptOutcome::Uncertain(reason));
+            assert_eq!(
+                verdict,
+                HostResponsiveness::Uncertain(reason),
+                "the reported uncertainty must survive classification unchanged"
+            );
+            assert_ne!(
+                verdict,
+                HostResponsiveness::AliveUnresponsive,
+                "an attempt that never became competent is not a competent timeout"
+            );
+            assert_ne!(
+                verdict,
+                HostResponsiveness::Responsive,
+                "an unproven challenge is never health"
+            );
+        }
+    }
+
+    /// Refused/denied connection, changed target identity, and inadequate
+    /// sensor coverage stay three distinguishable verdicts rather than one
+    /// undifferentiated refusal: two challengers that failed for different
+    /// reasons must not leave the same journal evidence. The check is
+    /// pairwise distinctness of the classified verdicts, so it also proves the
+    /// classifier collapses nothing.
+    #[test]
+    fn refused_connection_changed_target_and_inadequate_coverage_stay_distinct() {
+        let host = observed_live_host();
+        let verdicts = [
+            ChallengeUncertainty::Unauthenticated,
+            ChallengeUncertainty::ConnectionDenied,
+            ChallengeUncertainty::TargetChanged,
+            ChallengeUncertainty::InadequateCoverage,
+            ChallengeUncertainty::TargetNotLive,
+        ]
+        .map(|reason| {
+            host.responsiveness(&bounded_wait(), &ChallengeAttemptOutcome::Uncertain(reason))
+        });
+        for (left, left_reason) in verdicts.iter().zip([
+            ChallengeUncertainty::Unauthenticated,
+            ChallengeUncertainty::ConnectionDenied,
+            ChallengeUncertainty::TargetChanged,
+            ChallengeUncertainty::InadequateCoverage,
+            ChallengeUncertainty::TargetNotLive,
+        ]) {
+            assert_eq!(*left, HostResponsiveness::Uncertain(left_reason));
+            for (right, right_reason) in verdicts.iter().zip([
+                ChallengeUncertainty::Unauthenticated,
+                ChallengeUncertainty::ConnectionDenied,
+                ChallengeUncertainty::TargetChanged,
+                ChallengeUncertainty::InadequateCoverage,
+                ChallengeUncertainty::TargetNotLive,
+            ]) {
+                if left != right {
+                    assert_ne!(
+                        left, right,
+                        "{left_reason:?} and {right_reason:?} are different failures and must \
+                         stay different verdicts"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Negative: a competently attempted challenge against a target that is not
+    /// live is never `AliveUnresponsive`. A timeout proves the control owner was
+    /// unreachable *at a live target*; without one it proves nothing, so it
+    /// stays `TargetNotLive` and can never become restart eligibility.
+    #[test]
+    fn competent_timeout_against_a_non_live_target_is_never_alive_unresponsive() {
+        for observation in observed_states() {
+            if observation.state == HostObservationState::Running {
+                continue;
+            }
+            let verdict = observation
+                .responsiveness(&bounded_wait(), &ChallengeAttemptOutcome::CompetentTimeout);
+            assert_eq!(
+                verdict,
+                HostResponsiveness::Uncertain(ChallengeUncertainty::TargetNotLive),
+                "{observation:?} is not a validated live target, so a timeout establishes nothing"
+            );
+        }
+    }
+
+    /// Negative: a cancelled bounded wait never produces a verdict, even for the
+    /// live/competent combination that would otherwise be `AliveUnresponsive`.
+    /// Abandoning the wait abandons only the wait; it never interrupts in-flight
+    /// OS work, so the outcome is coverage uncertainty rather than an observed
+    /// stall.
+    #[test]
+    fn cancelled_wait_yields_coverage_uncertainty_never_health() {
+        let host = observed_live_host();
+        let mut wait = bounded_wait();
+        assert!(!wait.is_cancelled(), "the fixture wait starts uncancelled");
+        wait.cancel();
+        assert!(wait.is_cancelled());
+        for attempt in every_attempt() {
+            let verdict = host.responsiveness(&wait, &attempt);
+            assert_eq!(
+                verdict,
+                HostResponsiveness::Uncertain(ChallengeUncertainty::InadequateCoverage),
+                "a cancelled wait is an abandoned observation, not a verdict ({attempt:?})"
+            );
+        }
+    }
+
+    /// The bound is a real bound: a zero-length or over-bound wait cannot be
+    /// constructed, so no unbounded observation can enter this classifier. The
+    /// accepted maximum is the crate's own constant, not a literal chosen here.
+    #[test]
+    fn bounded_wait_construction_refuses_unbounded_intervals() {
+        assert_eq!(
+            BoundedChallengeWait::new(0),
+            None,
+            "a zero-length wait would observe nothing"
+        );
+        assert_eq!(
+            BoundedChallengeWait::new(MAX_CHALLENGE_WAIT_SECS + 1),
+            None,
+            "a wait beyond the owner-queue bound would outlive the guarantee"
+        );
+        let wait = bounded_wait();
+        assert_eq!(wait.timeout_secs(), MAX_CHALLENGE_WAIT_SECS);
+        assert!(!wait.is_cancelled());
+    }
+
+    /// An opaque coordination identity. It carries no process value and no
+    /// approval; only the budget gate's own comparison semantics read it, and
+    /// `PlatformHandle::new` enforces its own shape at construction.
+    fn coordination_identity(character: char) -> PlatformHandle {
+        PlatformHandle::new(character.to_string().repeat(32))
+            .unwrap_or_else(|error| panic!("coordination identity fixture: {error}"))
+    }
+
+    /// One installation-approved recovery policy. `max_attempts` is the only
+    /// field the responsiveness budget gate reads, so it is the parameter; the
+    /// rest is a fixed, valid envelope (`failure_threshold` and
+    /// `budget_window_secs` non-zero, which is what `validate` requires) built
+    /// from opaque coordination identities.
+    fn approved_recovery_policy(max_attempts: u32) -> ApprovedRecoveryPolicy {
+        ApprovedRecoveryPolicy {
+            installation: coordination_identity('1'),
+            service: coordination_identity('2'),
+            owner_epoch_digest: coordination_identity('3'),
+            recipe_digest: coordination_identity('4'),
+            failure_threshold: 1,
+            max_attempts,
+            budget_window_secs: 3_600,
+            cooldown_secs: 0,
+            exclusive_attempt: true,
+            audit_failure_refuses_effects: false,
+        }
+    }
+
+    /// Positive: `AliveUnresponsive` inside the durable budget admits one fenced
+    /// recovery attempt, and the remainder is exact at every point in the
+    /// window — never off by one, never rounded, never capped. The expected
+    /// remainder is derived from the policy's own `max_attempts` field so the
+    /// assertion cannot drift from the value the gate reads.
+    #[test]
+    fn alive_unresponsive_within_budget_admits_the_exact_remainder() {
+        let policy = approved_recovery_policy(3);
+        assert!(
+            policy.validate().is_ok(),
+            "the fixture must be a valid policy or it proves nothing"
+        );
+        for used_attempts in 0..u64::from(policy.max_attempts) {
+            let decision =
+                HostResponsiveness::AliveUnresponsive.recovery_eligibility(&policy, used_attempts);
+            assert_eq!(
+                decision,
+                RecoveryBudgetDecision::Admitted {
+                    remaining_attempts: u64::from(policy.max_attempts) - used_attempts
+                },
+                "{used_attempts} used attempts of {} must leave exactly the remaining count",
+                policy.max_attempts
+            );
+            assert!(
+                decision.admits_effect(),
+                "an admitted decision is the only one that may request an SCM effect"
+            );
+        }
+    }
+
+    /// Negative: at or over the budget, `AliveUnresponsive` exhausts instead of
+    /// admitting. Both boundaries are checked because the gate compares
+    /// `used_attempts >= max_attempts`, so the last admitted attempt and the
+    /// first exhausted one must be adjacent, not overlapping.
+    #[test]
+    fn alive_unresponsive_at_or_over_budget_is_exhausted_and_admits_no_effect() {
+        let policy = approved_recovery_policy(3);
+        for used_attempts in [u64::from(policy.max_attempts), 4, 17] {
+            let decision =
+                HostResponsiveness::AliveUnresponsive.recovery_eligibility(&policy, used_attempts);
+            assert_eq!(
+                decision,
+                RecoveryBudgetDecision::Exhausted,
+                "{used_attempts} used attempts of {} must exhaust the budget",
+                policy.max_attempts
+            );
+            assert!(
+                !decision.admits_effect(),
+                "an exhausted budget permits no SCM restart and no SCM effect"
+            );
+        }
+    }
+
+    /// Zero is a valid policy, not a malformed one: `validate` accepts it, and it
+    /// exhausts from the very first verdict, including the zero-used-attempt
+    /// case a fresh Watchdog would pass.
+    #[test]
+    fn zero_attempt_policy_is_valid_and_exhausted_from_the_first_verdict() {
+        let policy = approved_recovery_policy(0);
+        assert!(
+            policy.validate().is_ok(),
+            "a zero-attempt policy is a valid installed policy that admits nothing"
+        );
+        for used_attempts in [0, 1, 9] {
+            let decision =
+                HostResponsiveness::AliveUnresponsive.recovery_eligibility(&policy, used_attempts);
+            assert_eq!(
+                decision,
+                RecoveryBudgetDecision::Exhausted,
+                "a zero-attempt policy admits nothing at {used_attempts} used attempts"
+            );
+            assert!(!decision.admits_effect());
+        }
+    }
+
+    /// A missing/unproven policy leaves nothing to admit against, so the same
+    /// zero-budget verdict is what a refusal amounts to. `Uncertain(_)` is
+    /// `ChallengeUnresolved` for ANY used-attempt count including zero:
+    /// uncertainty is never restart eligibility, at any point in any window.
+    #[test]
+    fn uncertainty_is_never_restart_eligibility_at_any_used_attempt_count() {
+        for max_attempts in [0, 1, 3] {
+            let policy = approved_recovery_policy(max_attempts);
+            for used_attempts in [0, 1, 2, 5] {
+                for reason in [
+                    ChallengeUncertainty::Unauthenticated,
+                    ChallengeUncertainty::ConnectionDenied,
+                    ChallengeUncertainty::TargetChanged,
+                    ChallengeUncertainty::InadequateCoverage,
+                    ChallengeUncertainty::TargetNotLive,
+                ] {
+                    let decision = HostResponsiveness::Uncertain(reason)
+                        .recovery_eligibility(&policy, used_attempts);
+                    assert_eq!(
+                        decision,
+                        RecoveryBudgetDecision::ChallengeUnresolved,
+                        "{reason:?} at {used_attempts}/{max_attempts} used attempts is unresolved, \
+                         never eligible"
+                    );
+                    assert!(
+                        !decision.admits_effect(),
+                        "an unresolved challenge permits no SCM effect"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Responsive` needs no recovery at all, so it is the one verdict whose
+    /// budget decision ignores the policy and the used-attempt count.
+    #[test]
+    fn responsive_requests_no_recovery_whatever_the_budget() {
+        for max_attempts in [0, 1, 3] {
+            let policy = approved_recovery_policy(max_attempts);
+            for used_attempts in [0, 1, 9] {
+                let decision =
+                    HostResponsiveness::Responsive.recovery_eligibility(&policy, used_attempts);
+                assert_eq!(
+                    decision,
+                    RecoveryBudgetDecision::NoRecoveryRequired,
+                    "an answered challenge needs no recovery at {used_attempts}/{max_attempts}"
+                );
+                assert!(!decision.admits_effect());
+            }
+        }
+    }
+
+    /// The zero-SCM-effects consequence, stated through the only API that
+    /// exposes it: `admits_effect`. Exactly one of the four decision variants
+    /// may request an SCM effect; the exhausted and unresolved arms — the two a
+    /// stalled or unproven Host produces — may not, whatever the budget says.
+    #[test]
+    fn only_an_admitted_decision_admits_an_scm_effect() {
+        let policy = approved_recovery_policy(3);
+        let admitted = HostResponsiveness::AliveUnresponsive.recovery_eligibility(&policy, 0);
+        let exhausted = HostResponsiveness::AliveUnresponsive.recovery_eligibility(&policy, 3);
+        let zero_policy = HostResponsiveness::AliveUnresponsive
+            .recovery_eligibility(&approved_recovery_policy(0), 0);
+        let unresolved = HostResponsiveness::Uncertain(ChallengeUncertainty::TargetChanged)
+            .recovery_eligibility(&policy, 0);
+        let healthy = HostResponsiveness::Responsive.recovery_eligibility(&policy, 0);
+        assert!(admitted.admits_effect(), "only the admitted arm effects");
+        for (decision, label) in [
+            (exhausted, "Exhausted"),
+            (zero_policy, "Exhausted (zero-attempt policy)"),
+            (unresolved, "ChallengeUnresolved"),
+            (healthy, "NoRecoveryRequired"),
+        ] {
+            assert!(
+                !decision.admits_effect(),
+                "{label} must admit no SCM operation, got {decision:?}"
+            );
+        }
+    }
+
+    /// Exhaustion persists across a Watchdog restart, and it does so precisely
+    /// because this struct carries no attempt counter: the durable count is the
+    /// `used_attempts` argument, so a freshly constructed policy with no memory
+    /// of any previous verdict still refuses once that count reaches the budget.
+    /// The only difference between the two policy values below is that they were
+    /// built by two independent constructions, as two Watchdog lifetimes would.
+    #[test]
+    fn exhaustion_survives_a_watchdog_restart_that_remembered_no_verdict() {
+        let before_restart = approved_recovery_policy(2);
+        assert!(
+            HostResponsiveness::AliveUnresponsive
+                .recovery_eligibility(&before_restart, 1)
+                .admits_effect(),
+            "the first attempt of a two-attempt window is still inside the budget"
+        );
+        // A restarted Watchdog reconstructs the policy from the installation and
+        // reads the durable count from its journal. Nothing about the new value
+        // differs, which is exactly the property under test.
+        let after_restart = approved_recovery_policy(2);
+        assert_eq!(
+            after_restart, before_restart,
+            "restart reconstructs the same installed policy"
+        );
+        assert_eq!(
+            HostResponsiveness::AliveUnresponsive.recovery_eligibility(&after_restart, 2),
+            RecoveryBudgetDecision::Exhausted,
+            "the durable count carries exhaustion across the restart"
+        );
+        assert!(
+            !HostResponsiveness::AliveUnresponsive
+                .recovery_eligibility(&after_restart, 2)
+                .admits_effect(),
+            "no SCM effect after restart either"
+        );
+    }
 }
