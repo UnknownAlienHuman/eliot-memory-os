@@ -2173,8 +2173,6 @@ fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResul
     let storage = slash(&runtime.join("surrealdb-rocks"));
     let wal = slash(&runtime.join("control").join("control.redb"));
     let blobs = slash(&runtime.join("blobs"));
-    let repo = repository_root()?;
-    let surql = slash(&repo.join("crates/eliot-store/src/surql"));
     let config = format!(
         r#"schema_version = "1"
 
@@ -2215,9 +2213,6 @@ path = "{wal}"
 
 [blob_store]
 root = "{blobs}"
-
-[store]
-surql_dir = "{surql}"
 "#
     );
     fs::write(config_path, config)?;
