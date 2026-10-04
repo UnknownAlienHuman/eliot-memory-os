@@ -5,16 +5,24 @@
 //! is unavailable, the plan receipt explicitly escalates or defers rather
 //! than silently substituting a same-family or paid route. The receipt
 //! identifies the selected route classes, routes, budget/privacy constraints,
-//! and evidence inputs used. Provider switching mid-attempt is denied without
-//! an explicit receipted policy-authorized degradation.
+//! the outcome profiles consulted, and evidence inputs used. Provider switching
+//! mid-attempt is denied without an explicit receipted policy-authorized
+//! degradation.
+
+use std::collections::HashMap;
 
 use eliot_agent_api::{BudgetEnvelope, RouteFingerprint};
 use eliot_contracts::sha256_hex;
+use eliot_governor::{
+    ExecutionIdentity, RouteBehaviorFingerprint, RouteOutcomeCounts, RouteOutcomeProfile,
+    RouteOutcomeProfileIndex,
+};
 use eliot_security_contracts::PrivacyClass;
 use eliotd::staffing_policy::{
-    PolicyAuthorizedDegradation, RouteCandidate, RouteClassEvidence, RouteEligibility,
-    StaffingConstraints, StaffingPolicyError, UnavailableDispositionKind,
-    check_attempt_route_continuity, plan_staffing, verify_receipt_digest,
+    MIN_ROUTE_OUTCOME_SAMPLES, PolicyAuthorizedDegradation, RouteCandidate, RouteClassEvidence,
+    RouteEligibility, RouteOutcomeBinding, RouteOutcomeEvidence, StaffingConstraints,
+    StaffingPolicyError, UnavailableDispositionKind, check_attempt_route_continuity, plan_staffing,
+    route_outcome_evidence, verify_receipt_digest,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -69,6 +77,17 @@ fn candidate(
     admits: bool,
     evidence: &str,
 ) -> RouteCandidate {
+    with_outcome(route, family, paid, admits, evidence, None)
+}
+
+fn with_outcome(
+    route: RouteFingerprint,
+    family: &str,
+    paid: bool,
+    admits: bool,
+    evidence: &str,
+    outcome: Option<RouteOutcomeEvidence>,
+) -> RouteCandidate {
     RouteCandidate {
         route,
         family: family.to_owned(),
@@ -79,6 +98,65 @@ fn candidate(
             privacy_admits: admits,
         },
         evidence_ref: evidence.to_owned(),
+        outcome,
+    }
+}
+
+/// An outcome profile over equal-stack samples that produced nothing verified.
+fn failing_profile(reference: &str) -> RouteOutcomeEvidence {
+    RouteOutcomeEvidence {
+        verified_complete: 0,
+        partial: 0,
+        failed: MIN_ROUTE_OUTCOME_SAMPLES,
+        unknown: 1,
+        stale: false,
+        evidence_refs: vec![reference.to_owned()],
+    }
+}
+
+/// Owner-issued behaviour identity for the exact effective route, standing in
+/// for what the route owner supplies. This test constructs it; the policy never
+/// derives one from a `RouteFingerprint`.
+fn behavior_fingerprint(seed: &str) -> RouteBehaviorFingerprint {
+    RouteBehaviorFingerprint {
+        host_family: format!("host-{seed}"),
+        adapter_id: format!("adapter-{seed}"),
+        adapter_version: format!("adapter-{seed}-v1"),
+        protocol_kind: "test-protocol".to_owned(),
+        transport_kind: "test-transport".to_owned(),
+        runtime_version: format!("runtime-{seed}-v1"),
+        runtime_hash: format!("runtime-hash-{seed}"),
+        adapter_hash: format!("adapter-hash-{seed}"),
+        provider_and_model_request: format!("provider-{seed}/model-{seed}"),
+        auth_profile_class: "user-broker".to_owned(),
+        billing_mode: "subscription".to_owned(),
+        account_mode: "named-account".to_owned(),
+        execution_identity: ExecutionIdentity::InteractiveUser,
+        required_user_broker_class: "user-broker".to_owned(),
+        retention_policy: "bounded".to_owned(),
+        network_policy: "egress-allowed".to_owned(),
+        session_locator_semantics: "per-attempt".to_owned(),
+        workspace_scope_policy: "scope-bound".to_owned(),
+        serializer_fingerprint: format!("serializer-{seed}"),
+        tool_call_id_and_role_ordering: format!("tool-ordering-{seed}"),
+        reasoning_continuation_and_compaction: format!("reasoning-{seed}"),
+        feature_flags_and_behavior_affecting_profiles: format!("features-{seed}"),
+    }
+}
+
+fn outcome_profile(counts: RouteOutcomeCounts) -> RouteOutcomeProfile {
+    RouteOutcomeProfile {
+        task_class_and_recipe: "assurance-task/recipe-1963".to_owned(),
+        governance_and_environment_profile: "installation-1".to_owned(),
+        sample_window_and_distribution: "window-1".to_owned(),
+        outcome_counts: counts,
+        verifier_coverage_and_quality_measures: "verifier-coverage-1".to_owned(),
+        latency_cost_quota_and_cleanup_measures: "latency-cost-1".to_owned(),
+        continuation_context_and_route_mismatch_failures: "continuation-failures-0".to_owned(),
+        independence_and_common_lineage_notes: "single-family".to_owned(),
+        confidence_coverage_and_known_biases: "confidence-low".to_owned(),
+        evidence_refs: vec!["outcome-evidence-1".to_owned()],
+        valid_until_and_stale_dependencies: "valid-until-window-1".to_owned(),
     }
 }
 
@@ -341,6 +419,265 @@ fn blank_evidence_identity_rejects_fail_closed() -> TestResult {
             Err(StaffingPolicyError::Contract(_))
         ),
         "blank auditor lineage must reject before any lane is staffed"
+    );
+    Ok(())
+}
+
+/// I3.4/I3.6: staffing is computed from task outcomes, so a route whose own
+/// equal-stack samples rejected this task class is not staffed while another
+/// eligible route exists, and the counts it was decided on stay in the receipt.
+#[test]
+fn observed_outcome_failure_keeps_its_route_out_of_the_selection() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let rejected_route = test_route("rejected", "provider-a", "model-a")?;
+    let kept_route = test_route("kept", "provider-c", "model-c")?;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![
+            with_outcome(
+                rejected_route.clone(),
+                "family-a",
+                false,
+                true,
+                "capability-writer-1",
+                Some(failing_profile("outcome-rejected-1")),
+            ),
+            candidate(
+                kept_route.clone(),
+                "family-c",
+                false,
+                true,
+                "capability-writer-2",
+            ),
+        ],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let receipt = plan_staffing(&policy, "assurance-task", false, &evidence, &constraints())?;
+    assert_eq!(receipt.lanes.len(), 1);
+    assert_eq!(
+        receipt.lanes[0].route, kept_route,
+        "a route whose own outcome samples produced nothing verified must not be staffed while an eligible alternative exists"
+    );
+    // The refused profile stays visible, bound to the exact route, with its
+    // counts: aggregated success elsewhere cannot hide them.
+    let refused = receipt
+        .route_outcome_evidence
+        .iter()
+        .find(|record| record.route == rejected_route)
+        .ok_or("the consulted outcome profile is not recorded in the receipt")?;
+    assert_eq!(refused.profile.failed, MIN_ROUTE_OUTCOME_SAMPLES);
+    assert_eq!(refused.profile.unknown, 1);
+    assert_eq!(refused.profile.verified_complete, 0);
+    assert!(
+        receipt
+            .evidence_refs
+            .contains(&"outcome-rejected-1".to_owned()),
+        "outcome evidence inputs are part of the receipt's evidence inputs"
+    );
+    verify_receipt_digest(&receipt)?;
+    Ok(())
+}
+
+/// A route every eligible candidate rejected on its own samples is a typed
+/// refusal, never a fallback onto the route that was already ruled out.
+#[test]
+fn every_outcome_rejected_writer_is_a_typed_refusal() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let rejected_route = test_route("rejected", "provider-a", "model-a")?;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![with_outcome(
+            rejected_route,
+            "family-a",
+            false,
+            true,
+            "capability-writer-1",
+            Some(failing_profile("outcome-rejected-1")),
+        )],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let refusal = plan_staffing(&policy, "assurance-task", false, &evidence, &constraints());
+    assert!(
+        matches!(refusal, Err(StaffingPolicyError::NoWriterRoute(_))),
+        "a writer class whose only routes were rejected by their own outcomes refuses instead of staffing one"
+    );
+    Ok(())
+}
+
+/// I3.4 keeps routing on policy defaults and controlled pilots until enough
+/// equal-stack evidence exists, and a profile whose declared stale dependencies
+/// moved is not read as success or as failure. Neither moves a route.
+#[test]
+fn sparse_and_stale_outcome_profiles_carry_no_signal() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let sparse_route = test_route("sparse", "provider-a", "model-a")?;
+    let stale_route = test_route("stale", "provider-b", "model-b")?;
+    let mut sparse = failing_profile("outcome-sparse-1");
+    // One failed sample: too sparse to say anything about this route.
+    sparse.failed = 1;
+    sparse.unknown = 0;
+    let mut stale = failing_profile("outcome-stale-1");
+    stale.stale = true;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![
+            with_outcome(
+                sparse_route.clone(),
+                "family-a",
+                false,
+                true,
+                "capability-writer-1",
+                Some(sparse),
+            ),
+            with_outcome(
+                stale_route.clone(),
+                "family-b",
+                false,
+                true,
+                "capability-writer-2",
+                Some(stale),
+            ),
+        ],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let receipt = plan_staffing(&policy, "assurance-task", false, &evidence, &constraints())?;
+    assert_eq!(
+        receipt.lanes[0].route, sparse_route,
+        "policy-default order stands until enough equal-stack evidence exists"
+    );
+    // Both profiles are still recorded, so their absence of signal is auditable.
+    assert_eq!(receipt.route_outcome_evidence.len(), 2);
+    Ok(())
+}
+
+/// Aggregated success authorizes nothing: a route with verified samples is not
+/// promoted over one with none, and its own minority failures stay in the
+/// receipt rather than being averaged away.
+#[test]
+fn outcome_success_never_promotes_a_route_over_policy_default_order() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let first_route = test_route("first", "provider-a", "model-a")?;
+    let second_route = test_route("second", "provider-b", "model-b")?;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![
+            candidate(
+                first_route.clone(),
+                "family-a",
+                false,
+                true,
+                "capability-writer-1",
+            ),
+            with_outcome(
+                second_route.clone(),
+                "family-b",
+                false,
+                true,
+                "capability-writer-2",
+                Some(RouteOutcomeEvidence {
+                    verified_complete: MIN_ROUTE_OUTCOME_SAMPLES,
+                    partial: 0,
+                    failed: MIN_ROUTE_OUTCOME_SAMPLES,
+                    unknown: 0,
+                    stale: false,
+                    evidence_refs: vec!["outcome-mixed-1".to_owned()],
+                }),
+            ),
+        ],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let receipt = plan_staffing(&policy, "assurance-task", false, &evidence, &constraints())?;
+    assert_eq!(
+        receipt.lanes[0].route, first_route,
+        "an outcome profile is never a promotion signal"
+    );
+    let mixed = receipt
+        .route_outcome_evidence
+        .iter()
+        .find(|record| record.route == second_route)
+        .ok_or("the consulted outcome profile is not recorded in the receipt")?;
+    assert_eq!(
+        mixed.profile.failed, MIN_ROUTE_OUTCOME_SAMPLES,
+        "a minority failure beside a success stays visible in the counts"
+    );
+    Ok(())
+}
+
+/// The live staffing path reads the Governor's own retained outcome profiles,
+/// keyed by the exact effective route, and never derives a behaviour identity
+/// from a route fingerprint to do it.
+#[test]
+fn retained_outcome_profiles_are_read_from_the_governor_index() -> TestResult {
+    let route = test_route("profiled", "provider-a", "model-a")?;
+    let sibling = test_route("sibling", "provider-a", "model-a")?;
+    let mut profiles = RouteOutcomeProfileIndex::new();
+    profiles
+        .record(
+            &behavior_fingerprint("profiled"),
+            outcome_profile(RouteOutcomeCounts {
+                verified_complete: 0,
+                partial: 1,
+                failed: MIN_ROUTE_OUTCOME_SAMPLES,
+                unknown: 2,
+            }),
+        )
+        .map_err(|error| format!("record profile: {error}"))?;
+
+    // The owner binds the exact effective route to its behaviour identity.
+    let route_key =
+        eliotd::effective_route_key(&route).map_err(|error| format!("route key: {error}"))?;
+    let bindings = HashMap::from([(
+        route_key.clone(),
+        RouteOutcomeBinding {
+            fingerprint: behavior_fingerprint("profiled"),
+            stale: false,
+        },
+    )]);
+    let profile = route_outcome_evidence(&profiles, &bindings, &route)?
+        .ok_or("the retained profile for the exact effective route was not read")?;
+    assert_eq!(profile.verified_complete, 0);
+    assert_eq!(profile.partial, 1);
+    assert_eq!(profile.failed, MIN_ROUTE_OUTCOME_SAMPLES);
+    assert_eq!(profile.unknown, 2);
+    assert!(!profile.stale);
+    assert_eq!(profile.evidence_refs, vec!["outcome-evidence-1".to_owned()]);
+
+    // A provider/model-identical sibling under a different behaviour identity
+    // holds no profile of its own, so nothing is borrowed from it.
+    assert!(
+        route_outcome_evidence(&profiles, &bindings, &sibling)?.is_none(),
+        "a route with no owner binding consumes no profile"
+    );
+    // An empty index and a stale binding are absences, never assumed success.
+    assert!(
+        route_outcome_evidence(&RouteOutcomeProfileIndex::new(), &bindings, &route)?.is_none(),
+        "an empty profile index consumes nothing"
+    );
+    let stale_bindings = HashMap::from([(
+        route_key,
+        RouteOutcomeBinding {
+            fingerprint: behavior_fingerprint("profiled"),
+            stale: true,
+        },
+    )]);
+    assert!(
+        route_outcome_evidence(&profiles, &stale_bindings, &route)?.is_none(),
+        "a stale binding contributes no signal"
+    );
+    // A retained profile with no evidence reference proves nothing and is
+    // refused rather than consumed.
+    let mut unevidenced = RouteOutcomeProfileIndex::new();
+    let mut bare = outcome_profile(RouteOutcomeCounts::default());
+    bare.evidence_refs.clear();
+    unevidenced
+        .record(&behavior_fingerprint("profiled"), bare)
+        .map_err(|error| format!("record bare profile: {error}"))?;
+    assert!(
+        matches!(
+            route_outcome_evidence(&unevidenced, &bindings, &route),
+            Err(StaffingPolicyError::Contract(_))
+        ),
+        "a profile with no evidence reference must not be consumed"
     );
     Ok(())
 }
