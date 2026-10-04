@@ -200,7 +200,13 @@ fn pool_seam_keeps_its_fixed_structural_contract() {
         "pub fn try_checkout(",
         "pub async fn query(",
         "Semaphore::new(slot_count)",
-        "RpcSession::connect(&self.inner.owner, deadline)",
+        // Issue #1933 (blocking defect 4): the session connect now carries the
+        // lane's own admitted request deadline, so each role's request runs
+        // under the deadline its class published instead of one shared query
+        // timeout underneath all three.
+        "RpcSession::connect(&self.inner.owner, deadline, slot.request_timeout)",
+        "Duration::from_millis(owner.config.connect_timeout_ms.max(1))",
+        "Duration::from_millis(owner.config.query_timeout_ms.max(1))",
     ] {
         assert!(pool.contains(required), "pool seam lost: {required}");
     }
@@ -227,7 +233,16 @@ fn pool_seam_keeps_its_fixed_structural_contract() {
         "fn query_admin(",
         "is_pool_read_operation",
         "ProviderOwner::start(config, Arc::clone(process_lease))",
-        "RpcSession::connect(&provider, deadline)",
+        // The facade session also takes an explicit request deadline now
+        // (issue #1933), rather than reading one generic query timeout inside
+        // the session constructor.
+        "RpcSession::connect(",
+        // ...and the isolated health/admin lane is production code, not a
+        // `#[cfg(test)]` preview: health/readiness reach a real admin session.
+        "fn query_admin(",
+        "ADMIN_OPERATIONS",
+        "SessionRole::HealthAdmin",
+        "NamedOperationUnavailable",
     ] {
         assert!(
             facade.contains(required),

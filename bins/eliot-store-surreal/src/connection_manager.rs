@@ -9,9 +9,13 @@
 //! The bridge keeps a fixed bounded client set per class — named reads,
 //! canonical-write transactions, and an isolated health/admin path — instead
 //! of growing one connection per request. Each set carries an explicit
-//! generation, a per-class deadline, and a bounded reconnect-backoff
+//! generation, the physical transport incarnation that generation was
+//! admitted against, a per-class deadline, and a bounded reconnect-backoff
 //! schedule. A broken generation is replaced explicitly; in-flight leases of
-//! the old generation drain while new acquisitions carry the new one.
+//! the old generation drain while new acquisitions carry the new one. A
+//! logical rotation alone never replaces a transport: a replacement binds a
+//! strictly newer incarnation, and a lease is current only while BOTH its
+//! generation and its incarnation still match.
 //! A write whose transport outcome is unknown is never replayed blindly: the
 //! caller resolves the exact operation identity through `ResolveWriteReceipt`
 //! first ([`UnknownWriteGate`]), and the health/admin path admits only its
@@ -24,6 +28,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eliot_store_api::{
     NamedReadOperation, OperationId, Resubmission, StoreError, WriteReceipt, WriteReceiptStatus,
@@ -54,12 +59,56 @@ impl ClientClass {
     }
 }
 
+/// Evidence binding one client-set generation to the concrete physical
+/// clients it was admitted against (issue #1933, I5.9).
+///
+/// A logical generation counter names a lineage, not a transport: rotating it
+/// alone leaves the same provider sessions in place. This binding is the
+/// evidence that a generation was admitted against a specific physical
+/// incarnation, so a stale handle can be told apart from a fresh one.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ClientIncarnation {
+    /// Monotonic generation of the provider transport/session-pool
+    /// incarnation observed when this generation was installed.
+    pub transport_generation: u64,
+    /// Retained provider process id; `0` until an ownership-verified
+    /// authentication proves one.
+    pub provider_process_id: u32,
+}
+
+impl ClientIncarnation {
+    /// Binds one client-set generation to the physical transport incarnation
+    /// observed at admission time.
+    #[must_use]
+    pub const fn new(transport_generation: u64, provider_process_id: u32) -> Self {
+        Self {
+            transport_generation,
+            provider_process_id,
+        }
+    }
+
+    /// Monotonic generation of the provider transport/session-pool
+    /// incarnation this binding names.
+    #[must_use]
+    pub const fn transport_generation(&self) -> u64 {
+        self.transport_generation
+    }
+
+    /// Retained provider process id, or `0` while no ownership-verified
+    /// authentication has proven one. Diagnostics only: never a capability.
+    #[must_use]
+    pub const fn provider_process_id(&self) -> u32 {
+        self.provider_process_id
+    }
+}
+
 /// Fixed bound, deadline, and reconnect schedule for one client set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientSetPolicy {
     /// Maximum concurrent clients in this set; never grows per request.
     pub bound: NonZeroUsize,
-    /// Per-operation deadline in milliseconds for this class.
+    /// Per-operation deadline in milliseconds for this class. Applied by the
+    /// composition around the provider call — see [`Self::deadline`].
     pub deadline_ms: u64,
     /// Maximum reconnect attempts before the generation is declared broken.
     pub max_reconnect_attempts: u32,
@@ -70,6 +119,17 @@ pub struct ClientSetPolicy {
 }
 
 impl ClientSetPolicy {
+    /// The admitted per-operation deadline for this class.
+    ///
+    /// `deadline_ms` is the deadline the composition applies AROUND the
+    /// provider call, not a value merely reported to a caller: every lease
+    /// drawn from this class carries this bound for the duration of its
+    /// provider touch.
+    #[must_use]
+    pub const fn deadline(&self) -> Duration {
+        Duration::from_millis(self.deadline_ms)
+    }
+
     /// Validates that the bound, deadline, and backoff schedule are non-zero
     /// and internally consistent.
     pub fn validate(&self) -> Result<(), String> {
@@ -129,6 +189,9 @@ struct ManagerState {
     read_generation: u64,
     write_generation: u64,
     health_generation: u64,
+    read_incarnation: ClientIncarnation,
+    write_incarnation: ClientIncarnation,
+    health_incarnation: ClientIncarnation,
     read_broken: bool,
     write_broken: bool,
     health_broken: bool,
@@ -192,6 +255,9 @@ impl StoreConnectionManager {
                 read_generation: 1,
                 write_generation: 1,
                 health_generation: 1,
+                read_incarnation: ClientIncarnation::default(),
+                write_incarnation: ClientIncarnation::default(),
+                health_incarnation: ClientIncarnation::default(),
                 read_broken: false,
                 write_broken: false,
                 health_broken: false,
@@ -274,7 +340,8 @@ impl StoreConnectionManager {
     }
 
     /// Current explicit generation of one client set. Starts at 1 and only
-    /// advances through [`Self::replace_generation`].
+    /// advances through [`Self::replace_generation`] or
+    /// [`Self::bind_incarnation`].
     ///
     /// A poisoned set reports generation 0, which is never issued: every
     /// lease compares stale and the set drains instead of serving new work
@@ -288,6 +355,44 @@ impl StoreConnectionManager {
                 ClientClass::Health => state.health_generation,
             },
             Err(_) => 0,
+        }
+    }
+
+    /// Physical incarnation the class's current generation was admitted
+    /// against (issue #1933, I5.9).
+    ///
+    /// A poisoned set reports the default incarnation, which is never the
+    /// result of an admitted binding: the class has no proven physical
+    /// binding and every comparison fails closed.
+    #[must_use]
+    pub fn incarnation(&self, class: ClientClass) -> ClientIncarnation {
+        match self.state.lock() {
+            Ok(state) => match class {
+                ClientClass::Read => state.read_incarnation,
+                ClientClass::Write => state.write_incarnation,
+                ClientClass::Health => state.health_incarnation,
+            },
+            Err(_) => ClientIncarnation::default(),
+        }
+    }
+
+    /// Whether one incarnation is still the class's admitted physical binding.
+    ///
+    /// Fail-closed: a poisoned set matches nothing, so a lease can never
+    /// reach the provider on unproven state.
+    #[must_use]
+    pub fn is_current_incarnation(
+        &self,
+        class: ClientClass,
+        incarnation: ClientIncarnation,
+    ) -> bool {
+        match self.state.lock() {
+            Ok(state) => match class {
+                ClientClass::Read => state.read_incarnation == incarnation,
+                ClientClass::Write => state.write_incarnation == incarnation,
+                ClientClass::Health => state.health_incarnation == incarnation,
+            },
+            Err(_) => false,
         }
     }
 
@@ -321,13 +426,17 @@ impl StoreConnectionManager {
     ///
     /// Fails closed with [`StoreError::Unavailable`] when the class is
     /// exhausted or its generation is broken — never by growing the set.
-    /// The lease releases its slot on drop, so repeated concurrent use reuses
-    /// the fixed set.
+    /// The lease stamps the class's current generation, the physical
+    /// incarnation that generation was admitted against, and the class's
+    /// per-operation deadline; it releases its slot on drop, so repeated
+    /// concurrent use reuses the fixed set.
     pub fn try_acquire(&self, class: ClientClass) -> Result<ClientLease, StoreError> {
         if self.is_broken(class) {
             return Err(StoreError::Unavailable);
         }
         let generation = self.generation(class);
+        let incarnation = self.incarnation(class);
+        let deadline = self.policy(class).deadline();
         let permit = self
             .semaphore(class)
             .clone()
@@ -336,6 +445,8 @@ impl StoreConnectionManager {
         Ok(ClientLease {
             class,
             generation,
+            incarnation,
+            deadline,
             _permit: permit,
         })
     }
@@ -358,13 +469,16 @@ impl StoreConnectionManager {
     }
 
     /// Validates that a lease still belongs to the set's current generation
-    /// and returns the [`LeaseAccess`] proof for this provider touch
+    /// and the physical incarnation that generation was admitted against, and
+    /// returns the [`LeaseAccess`] proof for this provider touch
     /// (issue #1933 H4).
     ///
-    /// Sealed-generation and fabricated handles refuse with
-    /// [`StoreError::Unavailable`]: a poisoned set reports generation 0,
-    /// which is never issued, and lease fields are module-private so no
-    /// caller can fabricate a current handle.
+    /// The staleness test is exactly [`ClientLease::is_current`], so the proof
+    /// and the handle can never disagree. Sealed-generation, rebound-transport,
+    /// and fabricated handles refuse with [`StoreError::Unavailable`]: a
+    /// poisoned set reports generation 0 and no incarnation, which is never
+    /// issued, and lease fields are module-private so no caller can fabricate
+    /// a current handle.
     pub fn validate_lease<'a>(
         &'a self,
         lease: &'a ClientLease,
@@ -408,6 +522,72 @@ impl StoreConnectionManager {
                 if !state.health_broken {
                     return Err(not_broken(class));
                 }
+                state.health_generation = state.health_generation.saturating_add(1).max(1);
+                state.health_broken = false;
+                state.health_reconnect_attempts = 0;
+                Ok(state.health_generation)
+            }
+        }
+    }
+
+    /// Binds one class to a strictly newer physical transport incarnation and
+    /// returns the generation that binding installed (issue #1933, I5.9).
+    ///
+    /// This is the composition's physical-replacement evidence.
+    /// [`Self::replace_generation`] rotates a logical counter and leaves the
+    /// same provider sessions in place, so it cannot be the whole of a
+    /// replacement: the caller must also name the concrete incarnation the new
+    /// generation was admitted against.
+    ///
+    /// Fail-closed on every refusal. A poisoned set refuses. A transport
+    /// generation that does not strictly advance is refused, so re-observing
+    /// the same session pool can never masquerade as a replacement and reopen
+    /// a broken class. On success the incarnation is stored, that class's
+    /// generation advances by exactly one, its broken flag clears, and its
+    /// reconnect budget resets.
+    ///
+    /// Unlike [`Self::replace_generation`] this needs no prior
+    /// [`Self::mark_broken`]: installing a strictly newer physical incarnation
+    /// IS the declared replacement.
+    pub fn bind_incarnation(
+        &self,
+        class: ClientClass,
+        incarnation: ClientIncarnation,
+    ) -> Result<u64, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "connection state is poisoned".to_owned())?;
+        // Each arm touches only its own class fields in sequence, so no two
+        // mutable borrows overlap.
+        match class {
+            ClientClass::Read => {
+                if incarnation.transport_generation <= state.read_incarnation.transport_generation {
+                    return Err(transport_must_advance(class));
+                }
+                state.read_incarnation = incarnation;
+                state.read_generation = state.read_generation.saturating_add(1).max(1);
+                state.read_broken = false;
+                state.read_reconnect_attempts = 0;
+                Ok(state.read_generation)
+            }
+            ClientClass::Write => {
+                if incarnation.transport_generation <= state.write_incarnation.transport_generation
+                {
+                    return Err(transport_must_advance(class));
+                }
+                state.write_incarnation = incarnation;
+                state.write_generation = state.write_generation.saturating_add(1).max(1);
+                state.write_broken = false;
+                state.write_reconnect_attempts = 0;
+                Ok(state.write_generation)
+            }
+            ClientClass::Health => {
+                if incarnation.transport_generation <= state.health_incarnation.transport_generation
+                {
+                    return Err(transport_must_advance(class));
+                }
+                state.health_incarnation = incarnation;
                 state.health_generation = state.health_generation.saturating_add(1).max(1);
                 state.health_broken = false;
                 state.health_reconnect_attempts = 0;
@@ -470,9 +650,15 @@ impl StoreConnectionManager {
 }
 
 /// One bounded client lease. The slot returns to its fixed set on drop.
+///
+/// A lease names the generation AND the physical incarnation that generation
+/// was admitted against, plus the per-operation deadline the composition
+/// applies around the provider call.
 pub struct ClientLease {
     class: ClientClass,
     generation: u64,
+    incarnation: ClientIncarnation,
+    deadline: Duration,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -482,6 +668,8 @@ impl std::fmt::Debug for ClientLease {
             .debug_struct("ClientLease")
             .field("class", &self.class)
             .field("generation", &self.generation)
+            .field("incarnation", &self.incarnation)
+            .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
 }
@@ -499,10 +687,29 @@ impl ClientLease {
         self.generation
     }
 
-    /// Whether the lease still belongs to the set's current generation.
+    /// Physical incarnation this lease was admitted against.
+    #[must_use]
+    pub const fn incarnation(&self) -> ClientIncarnation {
+        self.incarnation
+    }
+
+    /// Per-operation deadline the composition applies around the provider
+    /// call for this class.
+    #[must_use]
+    pub const fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    /// Whether the lease still belongs to the set's current generation AND
+    /// the incarnation that generation was admitted against.
+    ///
+    /// Both axes must hold: a counter that advanced without a new transport,
+    /// or a transport rebound without a counter advance, both drain the lease
+    /// instead of letting it reach the provider under a replaced lineage.
     #[must_use]
     pub fn is_current(&self, manager: &StoreConnectionManager) -> bool {
         self.generation == manager.generation(self.class)
+            && manager.is_current_incarnation(self.class, self.incarnation)
     }
 }
 
@@ -510,10 +717,11 @@ impl ClientLease {
 /// (issue #1933 H4).
 ///
 /// A `LeaseAccess` only exists after [`StoreConnectionManager::validate_lease`]
-/// confirms the lease still belongs to the set's admitted generation:
-/// sealed-generation and fabricated handles refuse with `Unavailable`
-/// instead of reaching the provider. Generations fence CLIENTS, never
-/// canonical data: replacement changes handle admission only.
+/// confirms the lease still belongs to the set's admitted generation and its
+/// admitted physical incarnation: sealed-generation, rebound-transport, and
+/// fabricated handles refuse with `Unavailable` instead of reaching the
+/// provider. Generations fence CLIENTS, never canonical data: replacement
+/// changes handle admission only.
 #[derive(Debug)]
 pub struct LeaseAccess<'a> {
     lease: &'a ClientLease,
@@ -531,12 +739,34 @@ impl LeaseAccess<'_> {
     pub const fn generation(&self) -> u64 {
         self.lease.generation()
     }
+
+    /// Physical incarnation admitted by this access proof.
+    #[must_use]
+    pub const fn incarnation(&self) -> ClientIncarnation {
+        self.lease.incarnation()
+    }
+
+    /// Per-operation deadline the composition applies around this provider
+    /// call.
+    #[must_use]
+    pub const fn deadline(&self) -> Duration {
+        self.lease.deadline()
+    }
 }
 
 /// Error for a generation replacement requested without a marked failure.
 fn not_broken(class: ClientClass) -> String {
     format!(
         "client set {} is not broken; generation replacement requires a marked failure",
+        class.as_str()
+    )
+}
+
+/// Error for an incarnation binding that would not advance the class's
+/// admitted physical transport.
+fn transport_must_advance(class: ClientClass) -> String {
+    format!(
+        "client set {} transport incarnation must advance; the same physical transport is not a replacement",
         class.as_str()
     )
 }
@@ -953,5 +1183,162 @@ mod tests {
             proven_not_applied_verdict(None),
             ReplayVerdict::RequiresGapDisposition
         );
+    }
+
+    // WORK_UNIT_CASE: 1933/6 — a lease names the physical incarnation its generation was admitted against.
+    #[test]
+    fn lease_generation_is_bound_to_the_physical_incarnation() {
+        let manager = StoreConnectionManager::new(policies()).expect("manager");
+        let lease = manager.try_acquire(ClientClass::Write).expect("lease");
+        assert_eq!(lease.incarnation(), manager.incarnation(ClientClass::Write));
+        assert_eq!(manager.generation(ClientClass::Write), lease.generation());
+        assert!(lease.is_current(&manager));
+        // A logical rotation alone leaves the same transport in place, so the
+        // replacement is only complete once a newer incarnation is bound; the
+        // lease issued before it then compares stale on both axes.
+        let admitted = manager.incarnation(ClientClass::Write);
+        let replaced = manager
+            .bind_incarnation(
+                ClientClass::Write,
+                ClientIncarnation::new(admitted.transport_generation + 1, 4_242),
+            )
+            .expect("newer transport");
+        assert_eq!(replaced, lease.generation() + 1);
+        assert_eq!(
+            manager.incarnation(ClientClass::Write),
+            ClientIncarnation::new(admitted.transport_generation + 1, 4_242)
+        );
+        assert!(!lease.is_current(&manager));
+        assert_eq!(
+            manager
+                .validate_lease(&lease)
+                .expect_err("a lease sealed by a newer incarnation must refuse"),
+            StoreError::Unavailable
+        );
+        drop(lease);
+        let fresh = manager
+            .try_acquire(ClientClass::Write)
+            .expect("fresh lease");
+        assert!(fresh.is_current(&manager));
+        assert_eq!(fresh.generation(), replaced);
+        assert!(manager.validate_lease(&fresh).is_ok());
+    }
+
+    // WORK_UNIT_CASE: 1933/6 — a non-advancing transport incarnation is refused as a replacement.
+    #[test]
+    fn binding_a_stale_or_equal_transport_incarnation_is_refused() {
+        let manager = StoreConnectionManager::new(policies()).expect("manager");
+        assert_eq!(
+            manager.incarnation(ClientClass::Health),
+            ClientIncarnation::default()
+        );
+        // The unbound default transport is not an advance over itself, even
+        // though no failure was marked.
+        assert!(
+            manager
+                .bind_incarnation(ClientClass::Health, ClientIncarnation::new(0, 0))
+                .is_err()
+        );
+        let first = manager
+            .bind_incarnation(ClientClass::Health, ClientIncarnation::new(1, 11))
+            .expect("first transport");
+        // An equal transport generation is refused however the process id
+        // differs: the same physical transport is never a replacement.
+        assert!(
+            manager
+                .bind_incarnation(ClientClass::Health, ClientIncarnation::new(1, 12))
+                .is_err()
+        );
+        // A stale transport generation is refused too.
+        assert!(
+            manager
+                .bind_incarnation(ClientClass::Health, ClientIncarnation::new(0, 13))
+                .is_err()
+        );
+        assert_eq!(manager.generation(ClientClass::Health), first);
+        let second = manager
+            .bind_incarnation(ClientClass::Health, ClientIncarnation::new(2, 14))
+            .expect("second transport");
+        assert_eq!(second, first + 1);
+        assert_eq!(manager.generation(ClientClass::Health), second);
+        assert_eq!(
+            manager.incarnation(ClientClass::Health),
+            ClientIncarnation::new(2, 14)
+        );
+    }
+
+    // WORK_UNIT_CASE: 1933/8 — every class carries its own admitted per-operation deadline.
+    #[test]
+    fn each_class_carries_its_own_admitted_deadline() {
+        let manager = StoreConnectionManager::from_timeouts(
+            NonZeroUsize::new(4).expect("read bound"),
+            NonZeroUsize::new(2).expect("write limit"),
+            1_000,
+            1_000,
+        )
+        .expect("manager");
+        assert_eq!(manager.policy(ClientClass::Read).deadline_ms, 1_000);
+        assert_eq!(manager.policy(ClientClass::Health).deadline_ms, 1_000);
+        // The admitted millisecond deadline is the one the lease carries:
+        // `from_secs(1)` is exactly the admitted `deadline_ms` of 1_000.
+        assert_eq!(
+            manager.policy(ClientClass::Read).deadline(),
+            Duration::from_secs(1)
+        );
+        let read = manager.try_acquire(ClientClass::Read).expect("read lease");
+        assert_eq!(read.deadline(), Duration::from_secs(1));
+        assert_eq!(read.deadline().as_millis(), 1_000);
+        let health = manager
+            .try_acquire(ClientClass::Health)
+            .expect("health lease");
+        assert_eq!(health.deadline(), Duration::from_secs(1));
+        assert_eq!(health.deadline().as_millis(), 1_000);
+        let access = manager.validate_lease(&read).expect("read access");
+        assert_eq!(access.incarnation(), read.incarnation());
+        assert_eq!(access.deadline(), Duration::from_secs(1));
+        // Classes are independent: replacing one class's transport leaves the
+        // other classes' leases current under their own deadlines.
+        manager
+            .bind_incarnation(ClientClass::Write, ClientIncarnation::new(1, 0))
+            .expect("write transport");
+        assert!(read.is_current(&manager));
+        assert!(health.is_current(&manager));
+        assert!(manager.validate_lease(&read).is_ok());
+    }
+
+    // WORK_UNIT_CASE: 1933/6 — a physically replaced generation rejects stale leases in every class.
+    #[test]
+    fn a_replaced_generation_rejects_stale_leases_across_all_classes() {
+        for (class, transport_generation) in [
+            (ClientClass::Read, 1_u64),
+            (ClientClass::Write, 1_u64),
+            (ClientClass::Health, 1_u64),
+        ] {
+            let manager = StoreConnectionManager::new(policies()).expect("manager");
+            let stale = manager.try_acquire(class).expect("stale lease");
+            manager.mark_broken(class);
+            assert!(manager.is_broken(class));
+            let replaced = manager
+                .bind_incarnation(class, ClientIncarnation::new(transport_generation, 7))
+                .expect("newer transport");
+            assert_eq!(replaced, stale.generation() + 1);
+            assert!(!manager.is_broken(class));
+            assert!(!stale.is_current(&manager));
+            assert_eq!(
+                manager
+                    .validate_lease(&stale)
+                    .expect_err("a lease of the replaced incarnation must refuse"),
+                StoreError::Unavailable
+            );
+            drop(stale);
+            let fresh = manager.try_acquire(class).expect("fresh lease");
+            assert!(fresh.is_current(&manager));
+            assert_eq!(fresh.generation(), replaced);
+            assert_eq!(
+                fresh.incarnation(),
+                ClientIncarnation::new(transport_generation, 7)
+            );
+            assert!(manager.validate_lease(&fresh).is_ok());
+        }
     }
 }
