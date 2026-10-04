@@ -6,12 +6,13 @@ pub(super) use readiness_append::{
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
-    EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
-    HostKernelStoreLineage, HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION,
-    JournalBackend, JournalError, JournalManifest, KernelJobBinding,
-    KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
-    PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
+    ActivationState, AppendDisposition, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord,
+    DrainState, EliotActivationRecord, EpochTransition, FailureRecoveryDirective,
+    HostInstallationEpoch, HostKernelStoreLineage, HostState, HostStateJournalService,
+    HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError, JournalManifest,
+    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
+    PreparedAppend, PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, ReconcileOutcome,
+    RecordFence, WakeDisposition, record_checksum,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -22,29 +23,597 @@ use eliot_runtime_contracts::{
     HealthDimension, HealthVector, ServiceProcessRecord, ServiceProcessState,
 };
 
-// F-LOG-HOST-6 (#981) journal-append observation helpers.
+use crate::host_diagnostics::{BoundedField, bound_field};
+
+// F-LOG-HOST-6 (#981) shared observation vocabulary for the nine-file family.
 //
-// Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// One typed value, one disposition enum and one emitter serve all nine
+// instrumented files: journal append, readiness append, epoch reopen,
+// readiness gate, restart state, pending codec, recovery evidence and recovery
+// fence. Every record is emitted through the #889 facade, which owns the one
+// emission spelling surface of this process: `info!` is re-exported by
+// `host_diagnostics`, `HOST_DIAGNOSTICS_TARGET` is its single target, and
+// `note_event_log_sink_status` is the canonical bounded observer for the live
+// Event Log disposition. The `windows_event_log` wrapper stays the only OS
+// seam; no Event Log FFI is acquired here and no sink outcome alters a
+// result, an order, a persistence call or a cleanup step.
 //
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never records,
-// receipts, digests, or arbitrary error text — so bounding limits size, not
-// sensitivity (I15.4). Requested append, durable observed append, and
-// unknown outcome stay distinct (I14.21): possible loss is never promoted
-// into a receipt. These primitives own no terminal: a single terminal per
-// failed journal operation is enforced by the outermost owner boundary in
-// `lib.rs` (#891) or Host composition (#893), while these phases correlate
-// by stage order only. Sink outcome never alters result/order/cleanup.
-fn host_journal_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
-    crate::host_diagnostics::observe_entrypoint_with_detail(
-        crate::host_diagnostics::EntrypointStage::Startup,
-        detail,
+// Two halves, two owners, and only one of them closed. The disposition half is
+// closed: 37 variants, one per decision a semantic owner has already made, and
+// [`HostJournalDisposition::as_str`] is their only spelling. The boundary half
+// is a bare `&'static str` naming one owner's own frozen boundary literal, and
+// this module deliberately declares no closed set for it, so it is not a second
+// vocabulary in disguise: adding a boundary spelling is the tracked family
+// fixture's decision, and every literal below was checked against that fixture
+// rather than invented here.
+//
+// Observation-only contract: every helper projects facts the semantic owner has
+// already produced. Arguments are a frozen boundary spelling plus
+// already-owned nonsecret handles — never records, receipts, record or codec
+// bytes, credentials, environment values or arbitrary error text — so bounding
+// limits size, not sensitivity (I15.4). Requested append, applied commit,
+// exact replay, known noncommit and unknown outcome stay distinct (I14.21):
+// possible loss is never promoted into a receipt, a readable snapshot is never
+// read as a pending reconciliation, and a known noncommit is never rewritten
+// as an unknown one.
+//
+// These primitives own no terminal: the single terminal per failed operation
+// stays with the outermost owner boundary in `lib.rs` (#891) or Host
+// composition (#893). Every site emits exactly one record, so no correlated
+// lower-stage detail is counted twice, and there is no dedup cache.
+
+/// Closed disposition vocabulary of the nine-file #981 observation family.
+///
+/// One variant per disposition a semantic owner has already decided. A variant
+/// names what that owner proved; none is a lifecycle, a recovery directive, a
+/// new authority or a repair step (I14.20), and none is inferred from a record
+/// that was merely readable. An identity the owner does not hold stays
+/// unavailable in its own slot, never replaced by a default or by the order in
+/// which records were emitted (I5.16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HostJournalDisposition {
+    /// The boundary was reached and the owner reported no further outcome.
+    BoundaryReached,
+    /// The journal owner applied this append as a new durable commit.
+    CommitApplied,
+    /// The journal owner returned the exact existing record: readback of the
+    /// original effect, never a second append.
+    CommitReplayed,
+    /// The journal owner proved this exact transaction committed.
+    ReconcileCommitted,
+    /// The journal owner proved no commit exists for this exact transaction.
+    ReconcileNotCommitted,
+    /// The journal owner could not resolve the outcome; it stays unknown and is
+    /// never rewritten into either neighbouring disposition (I14.21).
+    ReconcileStillUnknown,
+    /// The commit is known and this call verified the replay receipt for it.
+    ReconcileReadbackVerified,
+    /// The commit is known and this call's replay readback failed.
+    ReconcileReadbackFailed,
+    /// This call created the durable publication.
+    PublicationCreated,
+    /// This call replayed an exact existing durable publication.
+    PublicationReplayed,
+    /// The durable effect is committed and a later cleanup step did not
+    /// complete: the effect stands and its residue stays observable.
+    CleanupIncomplete,
+    /// The denominator was exactly zero: no pending transaction existed.
+    DenominatorEmpty,
+    /// Every pending transaction of this reopen reconciled as committed.
+    DenominatorReconciled,
+    /// The startup fence is clear: no unresolved Store recovery binding.
+    FenceClear,
+    /// The startup fence holds one or more unresolved Store recovery bindings.
+    FenceUnresolved,
+    /// The retained lease matches this contour and is inside its deadline.
+    LeaseValid,
+    /// The retained lease's deadline has passed.
+    LeaseExpired,
+    /// The retained lease belongs to a moved or foreign contour.
+    LeaseContourMoved,
+    /// The retained lease's contour lacks a complete supervision or store proof.
+    LeaseProofIncomplete,
+    /// No lease was retained for this contour.
+    LeaseAbsent,
+    /// A retry deadline is still pending for this exact contour.
+    RetryPending,
+    /// A fresh probe is due for this exact contour.
+    ProbeDue,
+    /// The gate granted the journaled current contour a lease.
+    ReadinessGranted,
+    /// The gate refused the grant because the contour is not complete.
+    ReadinessRefused,
+    /// Readiness degraded with the exact retained failure kind.
+    ReadinessDegraded,
+    /// The supervised branch degraded without a retained contour.
+    BranchDegraded,
+    /// The requested evidence file is absent: explicit incomplete evidence.
+    EvidenceAbsent,
+    /// The read evidence validated against the requested mutation.
+    EvidenceValidated,
+    /// The read evidence cannot be used: malformed, oversized, or not a file.
+    EvidenceUnusable,
+    /// The read evidence names another mutation, request or inner binding.
+    EvidenceMismatched,
+    /// The named evidence belongs to another durable Host epoch or activation.
+    EvidenceForeign,
+    /// The read evidence is readable but incomplete for the owner's use.
+    EvidenceIncomplete,
+    /// The evidence path could not be inspected at all.
+    EvidenceUnreadable,
+    /// The fence carries exactly this durable binding identity.
+    FenceBound,
+    /// The fence's inner binding has no journal record yet: a recoverable
+    /// unknown, never permission for a fresh contour.
+    FenceInnerUnresolved,
+    /// The owner kept the exact epoch or activation generation it already
+    /// held: this open advances no lineage.
+    OwnerEpochRetained,
+    /// The owner created a fresh direct-child epoch or activation generation
+    /// under a newly minted lineage.
+    OwnerEpochChildCreated,
+}
+
+impl HostJournalDisposition {
+    /// Stable diagnostic name. Every variant maps to a distinct string; the
+    /// name projects the owner's own disposition and is never a lifecycle
+    /// state of its own (I14.20).
+    #[must_use]
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BoundaryReached => "boundary_reached",
+            Self::CommitApplied => "commit_applied",
+            Self::CommitReplayed => "commit_replayed",
+            Self::ReconcileCommitted => "reconcile_committed",
+            Self::ReconcileNotCommitted => "reconcile_not_committed",
+            Self::ReconcileStillUnknown => "reconcile_still_unknown",
+            Self::ReconcileReadbackVerified => "reconcile_readback_verified",
+            Self::ReconcileReadbackFailed => "reconcile_readback_failed",
+            Self::PublicationCreated => "publication_created",
+            Self::PublicationReplayed => "publication_replayed",
+            Self::CleanupIncomplete => "cleanup_incomplete",
+            Self::DenominatorEmpty => "denominator_empty",
+            Self::DenominatorReconciled => "denominator_reconciled",
+            Self::FenceClear => "fence_clear",
+            Self::FenceUnresolved => "fence_unresolved",
+            Self::LeaseValid => "lease_valid",
+            Self::LeaseExpired => "lease_expired",
+            Self::LeaseContourMoved => "lease_contour_moved",
+            Self::LeaseProofIncomplete => "lease_proof_incomplete",
+            Self::LeaseAbsent => "lease_absent",
+            Self::RetryPending => "retry_pending",
+            Self::ProbeDue => "probe_due",
+            Self::ReadinessGranted => "readiness_granted",
+            Self::ReadinessRefused => "readiness_refused",
+            Self::ReadinessDegraded => "readiness_degraded",
+            Self::BranchDegraded => "branch_degraded",
+            Self::EvidenceAbsent => "evidence_absent",
+            Self::EvidenceValidated => "evidence_validated",
+            Self::EvidenceUnusable => "evidence_unusable",
+            Self::EvidenceMismatched => "evidence_mismatched",
+            Self::EvidenceForeign => "evidence_foreign",
+            Self::EvidenceIncomplete => "evidence_incomplete",
+            Self::EvidenceUnreadable => "evidence_unreadable",
+            Self::FenceBound => "fence_bound",
+            Self::FenceInnerUnresolved => "fence_inner_unresolved",
+            Self::OwnerEpochRetained => "owner_epoch_retained",
+            Self::OwnerEpochChildCreated => "owner_epoch_child_created",
+        }
+    }
+}
+
+/// One narrow typed observation of a nine-file #981 boundary.
+///
+/// Every slot holds an identity the semantic owner already produced at the call
+/// site, or `None` when that owner holds no such value. Each slot renders with
+/// its own `<slot>_missing` flag, so an unavailable identity stays explicitly
+/// unavailable instead of being reconstructed from temporal order (I5.16).
+/// Bounded handles are truncated by the facade's `bound_field` before they
+/// reach the record; that bound limits size only, so callers pass
+/// already-owned nonsecret handles and never journal bytes, codec bytes,
+/// credentials, configuration, environment values, user payloads or arbitrary
+/// error text (I15.4, I07.20).
+///
+/// Every slot is private to this module family: a sibling boundary reaches this
+/// value only through [`HostJournalObservation::new`] and the builders below,
+/// so no other file can assemble or mutate a record behind the emitter.
+///
+/// Builder precedence is last write wins, and a later builder silently
+/// discards whatever an earlier builder wrote to the same slot. The slots with
+/// more than one writer are exactly the installation, epoch and activation
+/// triples, plus `operation`, `transaction` and `record_checksum`:
+/// [`Self::with_host`], [`Self::with_record_fence`],
+/// [`Self::with_prepared_append`], [`Self::with_installation`],
+/// [`Self::with_host_epoch`], [`Self::with_activation_generation`],
+/// [`Self::with_operation`], [`Self::with_transaction`],
+/// [`Self::with_record_checksum`] and [`Self::with_receipt`] each name the
+/// slots they overwrite. A chain must therefore call one builder per shared
+/// slot; a chain that would bind both a caller-side and an owner-side contour
+/// has to choose which one the record carries, because binding both silently
+/// keeps only the last.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HostJournalObservation {
+    boundary: &'static str,
+    disposition: HostJournalDisposition,
+    operation: Option<BoundedField>,
+    transaction: Option<BoundedField>,
+    record_checksum: Option<BoundedField>,
+    receipt_sequence: Option<u64>,
+    installation: Option<BoundedField>,
+    host_epoch: Option<u64>,
+    host_lineage: Option<BoundedField>,
+    activation_id: Option<BoundedField>,
+    activation_generation: Option<BoundedField>,
+    activation_epoch: Option<u64>,
+    fence: Option<BoundedField>,
+    mutation: Option<BoundedField>,
+    request_digest: Option<BoundedField>,
+    contour: Option<BoundedField>,
+    lease: Option<BoundedField>,
+    ors_receipt: Option<BoundedField>,
+    watchdog: Option<BoundedField>,
+    recovery: Option<BoundedField>,
+    failure: Option<&'static str>,
+    cardinality: Option<u64>,
+    committed: Option<u64>,
+}
+
+impl HostJournalObservation {
+    /// One boundary observation: the owner's own frozen boundary literal naming the
+    /// boundary it reached, plus the disposition that owner decided there. The
+    /// boundary literal is a bare `&'static str` and this module closes no set over
+    /// it; the tracked family fixture owns which spellings exist. Every identity
+    /// slot starts explicitly unavailable and is filled only by a value the owner
+    /// already holds.
+    #[must_use]
+    pub(super) const fn new(boundary: &'static str, disposition: HostJournalDisposition) -> Self {
+        Self {
+            boundary,
+            disposition,
+            operation: None,
+            transaction: None,
+            record_checksum: None,
+            receipt_sequence: None,
+            installation: None,
+            host_epoch: None,
+            host_lineage: None,
+            activation_id: None,
+            activation_generation: None,
+            activation_epoch: None,
+            fence: None,
+            mutation: None,
+            request_digest: None,
+            contour: None,
+            lease: None,
+            ors_receipt: None,
+            watchdog: None,
+            recovery: None,
+            failure: None,
+            cardinality: None,
+            committed: None,
+        }
+    }
+
+    /// Attaches the owner's own operation or request identity handle. This
+    /// builder writes `operation`, so a later `with_prepared_append` silently
+    /// discards the value this one wrote.
+    #[must_use]
+    pub(super) fn with_operation(mut self, operation: &str) -> Self {
+        self.operation = Some(bound_field(operation));
+        self
+    }
+
+    /// Attaches the journal transaction identity the owner holds for this
+    /// operation. This builder writes `transaction`, so a later `with_receipt`
+    /// or `with_prepared_append` silently discards the value this one wrote.
+    #[must_use]
+    pub(super) fn with_transaction(mut self, handle: &PlatformHandle) -> Self {
+        self.transaction = Some(bound_field(handle.as_str()));
+        self
+    }
+
+    /// Attaches the owner-computed checksum of the exact retained record. This
+    /// builder writes `record_checksum`, so a later `with_prepared_append`
+    /// silently discards the value this one wrote.
+    #[must_use]
+    pub(super) fn with_record_checksum(mut self, checksum: &str) -> Self {
+        self.record_checksum = Some(bound_field(checksum));
+        self
+    }
+
+    /// Attaches the journal owner's own append receipt: its stable transaction
+    /// identity and the sequence the reducer assigned after durable commit or
+    /// exact replay. This builder writes `transaction` and `receipt_sequence`
+    /// only: the receipt's disposition reaches the record as the second argument
+    /// of [`HostJournalObservation::new`], so no field here re-derives it. A
+    /// later `with_transaction` or `with_prepared_append` discards the
+    /// transaction identity this builder just wrote.
+    #[must_use]
+    pub(super) fn with_receipt(mut self, receipt: &AppendReceipt) -> Self {
+        self.transaction = Some(bound_field(receipt.transaction_id().as_str()));
+        self.receipt_sequence = Some(receipt.sequence());
+        self
+    }
+
+    /// Attaches every identity one prepared append already carries: its
+    /// operation identity, journal transaction identity, record checksum and
+    /// the exact Host installation epoch it was prepared under. This builder
+    /// writes `operation`, `transaction`, `record_checksum`, `installation`,
+    /// `host_epoch` and `host_lineage`, so a later `with_operation`,
+    /// `with_transaction`, `with_record_checksum`, `with_host`,
+    /// `with_record_fence`, `with_installation` or `with_host_epoch` silently
+    /// discards the corresponding value this one wrote.
+    #[must_use]
+    pub(super) fn with_prepared_append(mut self, prepared: &PreparedAppend) -> Self {
+        self.operation = Some(bound_field(prepared.operation.operation_id.as_str()));
+        self.transaction = Some(bound_field(prepared.transaction_id.as_str()));
+        self.record_checksum = Some(bound_field(prepared.record_checksum.as_str()));
+        self = self.with_host(&prepared.host);
+        self
+    }
+
+    /// Attaches the exact durable Host installation identity: its installation
+    /// handle plus the current epoch sequence and lineage. This builder writes
+    /// `installation`, `host_epoch` and `host_lineage`, so a later
+    /// `with_record_fence`, `with_prepared_append`, `with_installation` or
+    /// `with_host_epoch` silently discards the corresponding value this one
+    /// wrote.
+    #[must_use]
+    pub(super) fn with_host(mut self, host: &HostInstallationEpoch) -> Self {
+        self.installation = Some(bound_field(host.installation.as_str()));
+        self.host_epoch = Some(host.epoch.current.sequence.get());
+        self.host_lineage = Some(bound_field(host.epoch.current.lineage_id.as_str()));
+        self
+    }
+
+    /// Attaches the exact record fence a durable record is owned by: its Host
+    /// installation epoch, activation identity and activation generation. This
+    /// builder writes `installation`, `host_epoch`, `host_lineage`,
+    /// `activation_id`, `activation_generation` and `activation_epoch`, so a
+    /// later `with_host`, `with_prepared_append`, `with_installation`,
+    /// `with_host_epoch` or `with_activation_generation` silently discards the
+    /// corresponding value this one wrote. Call it once per chain: it is the
+    /// widest contour builder in the vocabulary.
+    #[must_use]
+    pub(super) fn with_record_fence(mut self, fence: &RecordFence) -> Self {
+        self = self.with_host(&fence.host);
+        self.activation_id = Some(bound_field(fence.activation_id.as_str()));
+        self.activation_generation = Some(bound_field(
+            fence.activation_generation.current.lineage_id.as_str(),
+        ));
+        self.activation_epoch = Some(fence.activation_generation.current.sequence.get());
+        self
+    }
+
+    /// Attaches the exact activation generation the owner minted or retained.
+    /// This builder writes `activation_generation` and `activation_epoch`, so a
+    /// later `with_record_fence` or `with_prepared_append` silently discards
+    /// the corresponding value this one wrote.
+    #[must_use]
+    pub(super) fn with_activation_generation(mut self, generation: &EpochTransition) -> Self {
+        self.activation_generation = Some(bound_field(generation.current.lineage_id.as_str()));
+        self.activation_epoch = Some(generation.current.sequence.get());
+        self
+    }
+
+    /// Attaches the exact Host epoch sequence the owner already read. This
+    /// builder writes `host_epoch`, so a later `with_host`, `with_record_fence`
+    /// or `with_prepared_append` silently discards the value this one wrote.
+    #[must_use]
+    pub(super) const fn with_host_epoch(mut self, host_epoch: u64) -> Self {
+        self.host_epoch = Some(host_epoch);
+        self
+    }
+
+    /// Attaches the exact Host epoch lineage the owner already read.
+    #[must_use]
+    pub(super) fn with_host_lineage(mut self, lineage: &str) -> Self {
+        self.host_lineage = Some(bound_field(lineage));
+        self
+    }
+
+    /// Attaches the exact durable installation identity the owner was given
+    /// before it read its own epoch. This builder writes `installation`, so a
+    /// later `with_host`, `with_record_fence` or `with_prepared_append`
+    /// silently discards the value this one wrote.
+    #[must_use]
+    pub(super) fn with_installation(mut self, installation: &str) -> Self {
+        self.installation = Some(bound_field(installation));
+        self
+    }
+
+    /// Attaches the exact supervision lease identity the owner observed.
+    #[must_use]
+    pub(super) fn with_lease(mut self, lease: &str) -> Self {
+        self.lease = Some(bound_field(lease));
+        self
+    }
+
+    /// Attaches the exact `ORS` receipt digest the owner observed.
+    #[must_use]
+    pub(super) fn with_ors_receipt(mut self, receipt: &str) -> Self {
+        self.ors_receipt = Some(bound_field(receipt));
+        self
+    }
+
+    /// Attaches the exact independent-supervision publication digest the owner
+    /// observed.
+    #[must_use]
+    pub(super) fn with_watchdog(mut self, publication: &str) -> Self {
+        self.watchdog = Some(bound_field(publication));
+        self
+    }
+
+    /// Attaches the exact Store or activation fence handle the owner compared
+    /// against.
+    #[must_use]
+    pub(super) fn with_fence(mut self, fence: &str) -> Self {
+        self.fence = Some(bound_field(fence));
+        self
+    }
+
+    /// Attaches the owner-issued contour digest the owner observed for this
+    /// boundary: an identity the owner already holds, never the configuration
+    /// content or any other configuration value it was computed over.
+    #[must_use]
+    pub(super) fn with_contour(mut self, contour: &str) -> Self {
+        self.contour = Some(bound_field(contour));
+        self
+    }
+
+    /// Attaches the owner-issued mutation digest of the exact restart or
+    /// recovery request.
+    #[must_use]
+    pub(super) fn with_mutation(mut self, digest: &str) -> Self {
+        self.mutation = Some(bound_field(digest));
+        self
+    }
+
+    /// Attaches the owner-computed request digest of the exact request.
+    #[must_use]
+    pub(super) fn with_request_digest(mut self, digest: &str) -> Self {
+        self.request_digest = Some(bound_field(digest));
+        self
+    }
+
+    /// Attaches the exact Store recovery binding identity this read or fence
+    /// is about.
+    #[must_use]
+    pub(super) fn with_recovery_binding(mut self, binding: &str) -> Self {
+        self.recovery = Some(bound_field(binding));
+        self
+    }
+
+    /// Attaches the closed readiness failure kind the gate retained. The value
+    /// is the contract's own frozen name, never free text.
+    #[must_use]
+    pub(super) const fn with_failure(mut self, failure: &'static str) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+
+    /// Attaches the exact denominator this boundary actually considered.
+    #[must_use]
+    pub(super) const fn with_cardinality(mut self, cardinality: u64) -> Self {
+        self.cardinality = Some(cardinality);
+        self
+    }
+
+    /// Attaches the exact numerator of that denominator which resolved as
+    /// committed.
+    #[must_use]
+    pub(super) const fn with_committed(mut self, committed: u64) -> Self {
+        self.committed = Some(committed);
+        self
+    }
+}
+
+/// Projects the journal owner's own append disposition onto this family's
+/// closed vocabulary.
+///
+/// The journal owner alone decides whether a call committed a new frame or
+/// returned the exact existing one; this projection only renames that decision
+/// and never re-derives it, so an applied commit and an idempotent replay can
+/// never be reported as the same durable append (I14.20).
+const fn append_disposition(disposition: AppendDisposition) -> HostJournalDisposition {
+    match disposition {
+        AppendDisposition::Applied => HostJournalDisposition::CommitApplied,
+        AppendDisposition::Replayed => HostJournalDisposition::CommitReplayed,
+    }
+}
+
+/// Emits one #981 boundary observation through the #889 facade.
+///
+/// The live Event Log disposition is observed through the facade's canonical
+/// bounded helper rather than a discarded probe, then exactly one `INFO`
+/// subordinate record carries this owner's frozen boundary literal, its
+/// typed disposition, and every identity slot with its own truncation and
+/// absence record. When that sink helper cannot carry a Host record it
+/// writes its own separate, boundary-free `host.event_log_sink_unavailable`
+/// record, so a boundary observation may produce a second record that
+/// describes only the standing sink disposition and no owner effect. All
+/// macro arguments are precomputed bounded values, so a filtered event
+/// evaluates no extra effectful operation. The record is evidence only:
+/// it never changes a result, an order, a persistence call, a gate decision
+/// or a cleanup step, and it is never a terminal emission.
+pub(super) fn observe_host_journal_boundary(observation: &HostJournalObservation) {
+    crate::host_diagnostics::note_event_log_sink_status();
+    let operation = observation.operation.as_ref();
+    let transaction = observation.transaction.as_ref();
+    let record_checksum = observation.record_checksum.as_ref();
+    let installation = observation.installation.as_ref();
+    let host_lineage = observation.host_lineage.as_ref();
+    let activation_id = observation.activation_id.as_ref();
+    let activation_generation = observation.activation_generation.as_ref();
+    let fence = observation.fence.as_ref();
+    let mutation = observation.mutation.as_ref();
+    let request_digest = observation.request_digest.as_ref();
+    let contour = observation.contour.as_ref();
+    let lease = observation.lease.as_ref();
+    let ors_receipt = observation.ors_receipt.as_ref();
+    let watchdog = observation.watchdog.as_ref();
+    let recovery = observation.recovery.as_ref();
+    crate::host_diagnostics::info!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.journal_boundary",
+        stage = crate::host_diagnostics::EntrypointStage::Startup.as_str(),
+        boundary = observation.boundary,
+        disposition = observation.disposition.as_str(),
+        operation = operation.map_or("", BoundedField::text),
+        operation_bytes = operation.map_or(0, BoundedField::original_bytes),
+        operation_truncated = operation.is_some_and(BoundedField::truncated),
+        operation_missing = operation.is_none(),
+        transaction = transaction.map_or("", BoundedField::text),
+        transaction_missing = transaction.is_none(),
+        record_checksum = record_checksum.map_or("", BoundedField::text),
+        record_checksum_missing = record_checksum.is_none(),
+        receipt_sequence = observation.receipt_sequence.unwrap_or(0),
+        receipt_sequence_missing = observation.receipt_sequence.is_none(),
+        installation = installation.map_or("", BoundedField::text),
+        installation_missing = installation.is_none(),
+        host_epoch = observation.host_epoch.unwrap_or(0),
+        host_epoch_missing = observation.host_epoch.is_none(),
+        host_lineage = host_lineage.map_or("", BoundedField::text),
+        host_lineage_missing = host_lineage.is_none(),
+        activation_id = activation_id.map_or("", BoundedField::text),
+        activation_id_missing = activation_id.is_none(),
+        activation_generation = activation_generation.map_or("", BoundedField::text),
+        activation_generation_missing = activation_generation.is_none(),
+        activation_epoch = observation.activation_epoch.unwrap_or(0),
+        activation_epoch_missing = observation.activation_epoch.is_none(),
+        fence = fence.map_or("", BoundedField::text),
+        fence_missing = fence.is_none(),
+        mutation = mutation.map_or("", BoundedField::text),
+        mutation_missing = mutation.is_none(),
+        request_digest = request_digest.map_or("", BoundedField::text),
+        request_digest_missing = request_digest.is_none(),
+        contour = contour.map_or("", BoundedField::text),
+        contour_missing = contour.is_none(),
+        lease = lease.map_or("", BoundedField::text),
+        lease_missing = lease.is_none(),
+        ors_receipt = ors_receipt.map_or("", BoundedField::text),
+        ors_receipt_missing = ors_receipt.is_none(),
+        watchdog = watchdog.map_or("", BoundedField::text),
+        watchdog_missing = watchdog.is_none(),
+        recovery = recovery.map_or("", BoundedField::text),
+        recovery_missing = recovery.is_none(),
+        failure = observation.failure.unwrap_or(""),
+        failure_missing = observation.failure.is_none(),
+        cardinality = observation.cardinality.unwrap_or(0),
+        cardinality_missing = observation.cardinality.is_none(),
+        committed = observation.committed.unwrap_or(0),
+        committed_missing = observation.committed.is_none(),
+        "host journal-family boundary observed"
     );
+}
+
+/// F-LOG-HOST-6 (#981) journal-append observation helper.
+///
+/// The per-file seam of the family's shared vocabulary: it names the journal
+/// append boundary set and delegates to the one shared emitter, so the journal
+/// family cannot grow a second emission surface or a second terminal.
+fn host_journal_observe(observation: &HostJournalObservation) {
+    observe_host_journal_boundary(observation);
 }
 
 /// Checks every identity that the authoritative Job termination observation
@@ -498,11 +1067,36 @@ fn reconcile_unknown_outcome<B: JournalBackend>(
 ) -> Result<bool, HostError> {
     match journal.reconcile(transaction_id)? {
         ReconcileOutcome::Committed => {
-            host_journal_observe("host.journal reconcile committed observed");
+            let observed = HostJournalObservation::new(
+                "host.journal reconcile committed observed",
+                HostJournalDisposition::ReconcileCommitted,
+            )
+            .with_transaction(transaction_id);
+            host_journal_observe(&observed);
             Ok(true)
         }
-        ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
-            host_journal_observe("host.journal reconcile unknown observed");
+        // I14.21: a proven noncommit and an unresolved outcome are different
+        // facts with different recovery behaviour. Both arms stay fail-closed
+        // here because that is this owner's existing policy, but the record
+        // must never report one as the other.
+        ReconcileOutcome::NotCommitted => {
+            let observed = HostJournalObservation::new(
+                "host.journal reconcile not committed observed",
+                HostJournalDisposition::ReconcileNotCommitted,
+            )
+            .with_transaction(transaction_id);
+            host_journal_observe(&observed);
+            Err(HostError::Journal(JournalError::OutcomeUnknown {
+                transaction_id: transaction_id.clone(),
+            }))
+        }
+        ReconcileOutcome::StillUnknown => {
+            let observed = HostJournalObservation::new(
+                "host.journal reconcile unknown observed",
+                HostJournalDisposition::ReconcileStillUnknown,
+            )
+            .with_transaction(transaction_id);
+            host_journal_observe(&observed);
             Err(HostError::Journal(JournalError::OutcomeUnknown {
                 transaction_id: transaction_id.clone(),
             }))
@@ -514,16 +1108,57 @@ pub(super) fn append_reconciled<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     record: HostStateRecord,
 ) -> Result<AppendReceipt, HostError> {
-    host_journal_observe("host.journal append requested");
+    host_journal_observe(&HostJournalObservation::new(
+        "host.journal append requested",
+        HostJournalDisposition::BoundaryReached,
+    ));
     match journal.append(record.clone()) {
         Ok(receipt) => {
-            host_journal_observe("host.journal append durable observed");
+            // The journal owner decides whether this call committed a new frame
+            // or returned the exact existing one; the record names that
+            // disposition instead of labelling both a durable append.
+            let disposition = append_disposition(receipt.disposition());
+            let boundary = match receipt.disposition() {
+                AppendDisposition::Applied => "host.journal append durable observed",
+                AppendDisposition::Replayed => "host.journal append replay observed",
+            };
+            let observed =
+                HostJournalObservation::new(boundary, disposition).with_receipt(&receipt);
+            host_journal_observe(&observed);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
-            host_journal_observe("host.journal append outcome unknown observed");
+            let observed = HostJournalObservation::new(
+                "host.journal append outcome unknown observed",
+                HostJournalDisposition::ReconcileStillUnknown,
+            )
+            .with_transaction(&transaction_id);
+            host_journal_observe(&observed);
             if reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal.append(record).map_err(HostError::Journal)
+                // The commit is known; this call only reads the exact original
+                // transaction back. Both answers are observed separately, so a
+                // failed readback can never read as an unknown commit and never
+                // reads as a second append.
+                match journal.append(record) {
+                    Ok(receipt) => {
+                        let observed = HostJournalObservation::new(
+                            "host.journal reconcile readback observed",
+                            HostJournalDisposition::ReconcileReadbackVerified,
+                        )
+                        .with_receipt(&receipt);
+                        host_journal_observe(&observed);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        let observed = HostJournalObservation::new(
+                            "host.journal reconcile readback failed observed",
+                            HostJournalDisposition::ReconcileReadbackFailed,
+                        )
+                        .with_transaction(&transaction_id);
+                        host_journal_observe(&observed);
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical
@@ -534,7 +1169,10 @@ pub(super) fn append_reconciled<B: JournalBackend>(
             }
         }
         Err(error) => {
-            host_journal_observe("host.journal append rejected observed");
+            host_journal_observe(&HostJournalObservation::new(
+                "host.journal append rejected observed",
+                HostJournalDisposition::BoundaryReached,
+            ));
             Err(HostError::Journal(error))
         }
     }
@@ -547,9 +1185,21 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
     state: StoreRebindState,
     receipt: Option<&StoreRebindReceipt>,
 ) -> Result<(), HostError> {
-    host_journal_observe("host.journal rebind terminal requested");
+    let observed = HostJournalObservation::new(
+        "host.journal rebind terminal requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_operation(record.operation_id.as_str())
+    .with_request_digest(record.request_digest.as_str());
+    host_journal_observe(&observed);
     if record.state == state && state == StoreRebindState::Unknown {
-        host_journal_observe("host.journal rebind unknown noop observed");
+        let observed = HostJournalObservation::new(
+            "host.journal rebind unknown noop observed",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_operation(record.operation_id.as_str())
+        .with_request_digest(record.request_digest.as_str());
+        host_journal_observe(&observed);
         return Ok(());
     }
     match state {
@@ -609,8 +1259,21 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
             StoreRebindState::Pending => unreachable!(),
         }
     ))?;
-    append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
-    host_journal_observe("host.journal rebind terminal appended");
+    // The rebind owner's own request identity is read before the record is moved
+    // into the append. Without it this boundary would carry only the receipt the
+    // shared append already recorded for the very same effect, and the two
+    // records would differ only in their boundary label.
+    let rebind_operation = record.operation_id.clone();
+    let rebind_request_digest = record.request_digest.clone();
+    let receipt = append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
+    let observed = HostJournalObservation::new(
+        "host.journal rebind terminal appended",
+        append_disposition(receipt.disposition()),
+    )
+    .with_operation(rebind_operation.as_str())
+    .with_request_digest(rebind_request_digest.as_str())
+    .with_receipt(&receipt);
+    host_journal_observe(&observed);
     Ok(())
 }
 
@@ -621,7 +1284,13 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     request_digest: &str,
     disposition: StoreRebindState,
 ) -> Result<(), HostError> {
-    host_journal_observe("host.journal rebind disposition requested");
+    let observed = HostJournalObservation::new(
+        "host.journal rebind disposition requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_operation(operation_id.as_str())
+    .with_request_digest(request_digest);
+    host_journal_observe(&observed);
     if !matches!(
         disposition,
         StoreRebindState::Aborted | StoreRebindState::Unknown
@@ -648,7 +1317,13 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
             )
         })?;
     if record.state == StoreRebindState::Unknown && disposition == StoreRebindState::Unknown {
-        host_journal_observe("host.journal rebind unknown noop observed");
+        let observed = HostJournalObservation::new(
+            "host.journal rebind unknown noop observed",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_operation(record.operation_id.as_str())
+        .with_request_digest(record.request_digest.as_str());
+        host_journal_observe(&observed);
         return Ok(());
     }
     let mut terminal = record;
@@ -664,8 +1339,15 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     ))?;
     terminal.receipt_request_digest = None;
     terminal.receipt_store_fence = None;
-    append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
-    host_journal_observe("host.journal rebind disposition appended");
+    let receipt = append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
+    let observed = HostJournalObservation::new(
+        "host.journal rebind disposition appended",
+        append_disposition(receipt.disposition()),
+    )
+    .with_operation(operation_id.as_str())
+    .with_request_digest(request_digest)
+    .with_receipt(&receipt);
+    host_journal_observe(&observed);
     Ok(())
 }
 
@@ -884,7 +1566,13 @@ pub(super) fn append_clean_marker<B: JournalBackend>(
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(), HostError> {
-    host_journal_observe("host.journal clean marker requested");
+    let fence = record_fence(host, activation_id, activation_generation);
+    let observed = HostJournalObservation::new(
+        "host.journal clean marker requested",
+        HostJournalDisposition::BoundaryReached,
+    )
+    .with_record_fence(&fence);
+    host_journal_observe(&observed);
     let snapshot = journal.snapshot()?;
     append_reconciled(
         journal,

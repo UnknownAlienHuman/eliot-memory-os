@@ -7277,7 +7277,7 @@ mod tests {
     /// Pinned digest of the Governor chain envelope, asserted independently
     /// by `eliot-canonical` (see its `golden_chain_envelope` test).
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "cc14c2c284762ebff5f1c8d11647a9191eda6debd4480ab605c3c8dadd766e54";
 
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>

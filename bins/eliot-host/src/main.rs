@@ -2830,7 +2830,36 @@ impl HostIdleDrainSupervisor {
         if now.duration_since(opened) < HOST_DRAIN_PRECOMMIT_WINDOW {
             IdleDrainTick::PreCommitWindowOpen
         } else {
-            IdleDrainTick::CommitDue
+            // Audit 5906086103 D4 / required implementation 5: the I1.5 idle
+            // condition — "Idle drain starts only when no `RuntimeLease`
+            // remains and no valid `SupervisionLease` requires live
+            // sensing/containment" — is re-proved HERE, at the commit
+            // boundary, and not only where the window was opened.
+            // `HOST_LEASE_CENSUS_INTERVAL` is 5 s against a 250 ms
+            // `HOST_DRAIN_PRECOMMIT_WINDOW`, so the window expires while the
+            // cached census is still the one that admitted this attempt, and
+            // the `DrainCommit` that follows is assembled from the Host
+            // journal mirror with no owner read at all. One fresh owner-issued
+            // census at this exact fence therefore decides the commit: a busy,
+            // unavailable or renumbered census leaves the durable pre-commit
+            // window unpublished as committed. Resetting `idle_since` restarts
+            // the idle grace, so this guard is reached again only after that
+            // grace elapses and a fresh window opens — not on the next tick. A
+            // census that stops admitting drain closes the window outright on
+            // the `CensusDeferred` path above, and an authenticated trigger
+            // still cancels the attempt while the window stays open.
+            match host.verify_drain_commit_census_binding() {
+                Ok(()) => IdleDrainTick::CommitDue,
+                Err(error) => {
+                    let reason = host_error_variant(&error);
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: idle drain is blocked and cannot commit at its pre-commit window (reason={reason}): {error}"
+                    );
+                    self.idle_since = None;
+                    IdleDrainTick::DrainBlocked { reason }
+                }
+            }
         }
     }
 }

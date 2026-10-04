@@ -55,14 +55,19 @@ use super::super::host_job_launch::LaunchPhaseCorrelation;
 // bounding limits size, not sensitivity (I15.4).
 //
 // A retained-artifact lease, locator or approved-path handle is a path, and a
-// path is not an identity: `LaunchLease::path`, the `approved` locator handle
-// and `supplied` are never bound into a diagnostic field (case 978/12). This
-// cell holds no `HostLaunchOptions`, so installation and generation are never
-// available here, and it owns no operation id, process-start identity, fence or
-// typed reason; it also observes no process and no readiness. Missing evidence
-// stays explicitly `missing` rather than invented, which is why every
-// locator and lease call site — including the "digest requested" record, which
-// precedes any verification outcome — binds nothing (cases 978/1, 978/4).
+// path is not an identity: `supplied`, the `approved` locator handle and
+// `LaunchLease::path` are never bound into a diagnostic field, each proved
+// against the records the seam that handles it really emitted and never
+// against a locally rendered string: the locator and the approved handle on
+// case 978/12's real `approved_locator` execution, `LaunchLease::path` on case
+// 978/13's real `open_launch_lease` execution, which on this Windows-only cell
+// is the only place that half of the claim is proven. This cell holds no
+// `HostLaunchOptions`, so installation and generation are never available
+// here, and it owns no operation id, process-start identity, fence or typed
+// reason; it also observes no process and no readiness. Missing evidence stays
+// explicitly `missing` rather than invented, which is why every locator and
+// lease call site — including the "digest requested" record, which precedes
+// any verification outcome — binds nothing (cases 978/1, 978/4).
 //
 // Sink outcome never alters result/order/count/handle/cleanup/timeout. There is
 // no mutable global dedup cache and no terminal emission here: the designated
@@ -378,27 +383,79 @@ pub(crate) fn verify_launch_digest(
 }
 
 // F-LOG-HOST-3 (#978) inline proof for this cell's private observation
-// contract. The cases execute the real instrumented functions through their
-// existing seams and read the exact correlation their call sites pass; they
-// never re-implement locator validation, never widen visibility, and never
-// build an expected log record by hand. The cross-file corpus and the
-// digest-verification outcomes that need a real Windows lease stay with the
-// integration fixture owner.
+// contract. Every case below executes the real instrumented functions through
+// their existing seams - `approved_locator`,
+// `approved_phase_b_destination_locator`, `open_launch_lease` and
+// `verify_launch_digest` - and none of them returns early: an unwritable
+// fixture or an unusable handle panics instead of skipping, so a case cannot
+// pass without having driven its seam. The cases that assert on emitted
+// records read them back out of a scoped `tracing` subscriber over the real
+// emission, so no case compares this cell against a string it rendered itself;
+// no case widens visibility and none restates locator or digest validation.
+// The digest decisions of this cell are executed here in-crate on Windows
+// through the same seam the launch owner uses: a real `UserOwnedRootLease`
+// from the existing temporary root, the real `open_launch_lease`, and the
+// real `verify_launch_digest` (cases 978/2, 978/13) — so only the cross-file
+// corpus stays with the integration fixture owner.
 #[cfg(test)]
 mod tests {
     use super::{
-        HostError, LaunchPhaseCorrelation, approved_locator, approved_phase_b_destination_locator,
-        open_launch_lease,
+        HostError, approved_locator, approved_phase_b_destination_locator, open_launch_lease,
+        verify_launch_digest,
     };
     use eliot_installation::InstallationProfile;
     use eliot_platform::PlatformHandle;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
 
     const PROFILE: InstallationProfile = InstallationProfile::PortableDev;
     const RELATIVE_CANARY: &str = "978-canary-relative.bin";
     const RELATIVE_REJECTION: &str = "portable locator must be absolute";
     const MISSING_ROOT_REJECTION: &str = "portable root lease is missing";
     const SUBSTITUTION_REJECTION: &str = "portable locator is not the approved canonical path";
+
+    /// The outcome phase tokens this cell really emits, so a case proves the
+    /// record it asserts on was emitted by the instrumented seam it names.
+    const LOCATOR_REQUESTED_PHASE: &str = "host.launch-artifact locator requested";
+    const LOCATOR_REJECTED_PHASE: &str = "host.launch-artifact locator typed rejection";
+    const LOCATOR_ADMITTED_PHASE: &str = "host.launch-artifact locator admitted";
+    const PHASE_B_REJECTED_PHASE: &str = "host.launch-artifact phase-b destination typed rejection";
+    const LEASE_REQUESTED_PHASE: &str = "host.launch-artifact lease requested";
+    const LEASE_REJECTED_PHASE: &str = "host.launch-artifact lease typed rejection";
+    #[cfg(windows)]
+    const DIGEST_REQUESTED_PHASE: &str = "host.launch-artifact digest requested";
+    #[cfg(windows)]
+    const DIGEST_ADMITTED_PHASE: &str = "host.launch-artifact digest admitted";
+    #[cfg(windows)]
+    const DIGEST_REJECTED_PHASE: &str = "host.launch-artifact digest typed rejection";
+    #[cfg(windows)]
+    const LEASE_ADMITTED_PHASE: &str = "host.launch-artifact lease admitted";
+
+    /// The correlation slots this cell can never prove: it holds no launch
+    /// options, operation id, process identity, fence or reason of its own.
+    const UNPROVEN_SLOTS: [&str; 6] = [
+        "installation",
+        "generation",
+        "operation",
+        "process_start",
+        "fence",
+        "reason",
+    ];
+
+    /// The bare file name of the approved artifact, so a case can prove that
+    /// even a name fragment never reaches a record.
+    const ARTIFACT_FILE_NAME: &str = "978-canary-approved-artifact.bin";
+    /// Known bytes the approved artifact holds: a real digest decision is
+    /// admitted only for content that hashes to the owner's expected digest,
+    /// so the fixture must hold content the owner can name.
+    const ARTIFACT_BYTES: &[u8] = b"978 approved launch artifact bytes";
+    /// Different known bytes: the substituted content a retained artifact is
+    /// proven against while the owner's approved digest stays in hand.
+    const SUBSTITUTED_ARTIFACT_BYTES: &[u8] = b"978 substituted launch artifact bytes";
 
     /// Forwards to the real portable locator request of this cell, so a case
     /// never restates the profile it exercises.
@@ -415,8 +472,252 @@ mod tests {
         }
     }
 
+    /// Field visitor: keeps the names and values an event really wrote, so a
+    /// case asserts on production output and never on its own formatting.
+    #[derive(Default)]
+    struct EmittedFields {
+        entries: Vec<(String, String)>,
+    }
+
+    impl Visit for EmittedFields {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.entries
+                .push((field.name().to_owned(), value.to_owned()));
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.entries
+                .push((field.name().to_owned(), value.to_string()));
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.entries
+                .push((field.name().to_owned(), value.to_string()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.entries
+                .push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
+
+    /// One record exactly as this cell's emission path wrote it.
+    #[derive(Debug)]
+    struct EmittedRecord {
+        target: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl EmittedRecord {
+        /// The bounded structured detail production rendered for one phase.
+        fn detail(&self) -> &str {
+            self.field("detail").unwrap_or_default()
+        }
+
+        /// One emitted field value, by the name production gave it.
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        }
+
+        /// Every emitted value in one haystack, so a canary is proven absent
+        /// from the whole record, not only from its detail.
+        fn values(&self) -> String {
+            let mut values = self.target.clone();
+            for (key, value) in &self.fields {
+                values.push(' ');
+                values.push_str(key);
+                values.push('=');
+                values.push_str(value);
+            }
+            values
+        }
+    }
+
+    /// Records every event the scoped subscriber receives, before any sink
+    /// formatting, so a case reads what production actually wrote.
+    struct RecordingLayer {
+        records: Arc<Mutex<Vec<EmittedRecord>>>,
+    }
+
+    impl<S> Layer<S> for RecordingLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut fields = EmittedFields::default();
+            event.record(&mut fields);
+            self.records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(EmittedRecord {
+                    target: event.metadata().target().to_owned(),
+                    fields: fields.entries,
+                });
+        }
+    }
+
+    /// Runs one production execution under a scoped subscriber and returns its
+    /// own outcome beside the records that execution really emitted.
+    fn recorded<T>(emit: impl FnOnce() -> T) -> (T, Vec<EmittedRecord>) {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(RecordingLayer {
+            records: Arc::clone(&records),
+        });
+        let outcome = tracing::subscriber::with_default(subscriber, emit);
+        let mut captured = records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (outcome, std::mem::take(&mut *captured))
+    }
+
+    /// Every record whose real emission carries one phase token, in order.
+    fn phase_records<'a>(records: &'a [EmittedRecord], phase: &str) -> Vec<&'a EmittedRecord> {
+        records
+            .iter()
+            .filter(|record| record.detail().contains(phase))
+            .collect()
+    }
+
+    /// The one record whose real emission carries one phase token, so no case
+    /// can pass on an outcome the instrumented seam never emitted.
+    fn one_phase_record<'a>(records: &'a [EmittedRecord], phase: &str) -> &'a EmittedRecord {
+        let matched = phase_records(records, phase);
+        assert_eq!(matched.len(), 1, "exactly one record carries {phase}");
+        matched[0]
+    }
+
+    /// The value one correlation slot carries in a real emission, so a case reads
+    /// the field production wrote instead of restating the rendered format.
+    fn slot<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
+        detail.split(' ').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name == key).then_some(value)
+        })
+    }
+
+    /// The distinct path strings this fixture owns, so a canary is proven absent
+    /// even when only part of a path could reach a record.
+    fn path_canaries(artifact: &ApprovedArtifact) -> Vec<String> {
+        let root_name = artifact.root.file_name().unwrap_or_default();
+        vec![
+            artifact.file.to_string_lossy().into_owned(),
+            artifact.root.to_string_lossy().into_owned(),
+            ARTIFACT_FILE_NAME.to_owned(),
+            root_name.to_string_lossy().into_owned(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        ]
+    }
+
+    /// Asserts that no field of any record carries one canary value, so a proof
+    /// covers the whole record and not only its detail.
+    fn assert_no_record_carries(records: &[EmittedRecord], canaries: &[String], label: &str) {
+        for emitted in records {
+            let values = emitted.values();
+            for canary in canaries {
+                assert!(
+                    !values.contains(canary.as_str()),
+                    "{label} must never reach a record: {values}"
+                );
+            }
+        }
+    }
+
+    /// Asserts that no record of one refused execution claims an admission:
+    /// every admission phase token this cell emits ends in `admitted`, so one
+    /// vocabulary check covers the locator, Phase-B destination, lease and
+    /// digest admissions a refused path could wrongly publish.
+    fn assert_admits_nothing(records: &[EmittedRecord]) {
+        for emitted in records {
+            assert!(
+                !emitted.detail().contains("admitted"),
+                "a refused execution emits no admission record: {}",
+                emitted.detail()
+            );
+        }
+    }
+
+    /// Asserts the observation contract of one request record: this cell holds
+    /// no `HostLaunchOptions`, no operation id, no process-start identity, no
+    /// fence and no typed reason, and a request precedes its own outcome, so
+    /// `artifact` and every unproven slot stay the frozen explicit-absence
+    /// marker and the record claims no readiness. `request` is the record the
+    /// request call site itself emitted.
+    fn assert_request_binds_nothing(request: &EmittedRecord) {
+        let detail = request.detail();
+        assert_eq!(
+            slot(detail, "artifact"),
+            Some("missing"),
+            "a request precedes its own outcome, so it binds no artifact identity: {detail}"
+        );
+        for unproven in UNPROVEN_SLOTS {
+            assert_eq!(
+                slot(detail, unproven),
+                Some("missing"),
+                "this cell owns no {unproven} identity, so a request cannot bind it: {detail}"
+            );
+        }
+        assert!(
+            !detail.contains("ready"),
+            "a request claims no readiness: {detail}"
+        );
+    }
+
+    /// Asserts the digest-decision contract against the records a real
+    /// verification emitted: one request per decision that binds no identity,
+    /// exactly one admitted record and one typed rejection, both carrying the
+    /// owner's approved digest and inventing no other identity, and no canary.
+    #[cfg(windows)]
+    fn assert_digest_decisions(
+        records: &[EmittedRecord],
+        approved: &str,
+        canaries: &[String],
+        recomputed: &[String],
+    ) {
+        let requests = phase_records(records, DIGEST_REQUESTED_PHASE);
+        assert_eq!(requests.len(), 2, "each digest decision requests once");
+        for each_request in requests {
+            assert_eq!(
+                slot(each_request.detail(), "artifact"),
+                Some("missing"),
+                "a request precedes its own outcome: {}",
+                each_request.detail()
+            );
+        }
+        let admitted = one_phase_record(records, DIGEST_ADMITTED_PHASE);
+        let rejected = one_phase_record(records, DIGEST_REJECTED_PHASE);
+        for decision in [admitted, rejected] {
+            assert_eq!(
+                slot(decision.detail(), "artifact"),
+                Some(approved),
+                "the retained artifact identity is the owner-supplied approved digest: {}",
+                decision.detail()
+            );
+            for unproven in UNPROVEN_SLOTS {
+                assert_eq!(
+                    slot(decision.detail(), unproven),
+                    Some("missing"),
+                    "this cell owns no {unproven} identity: {}",
+                    decision.detail()
+                );
+            }
+        }
+        for phase in [LEASE_REQUESTED_PHASE, LEASE_ADMITTED_PHASE] {
+            assert_eq!(
+                phase_records(records, phase).len(),
+                1,
+                "exactly one record carries {phase}"
+            );
+        }
+        assert_no_record_carries(records, canaries, "a retained path, root or handle");
+        assert_no_record_carries(records, recomputed, "a recomputed digest");
+    }
+
     /// One temporary approved artifact, so the portable branch runs its real
-    /// `canonicalize` comparison against an existing location.
+    /// `canonicalize` comparison and its real digest decision against an
+    /// existing location.
     struct ApprovedArtifact {
         root: PathBuf,
         file: PathBuf,
@@ -426,8 +727,10 @@ mod tests {
         fn create(label: &str) -> Option<Self> {
             let name = format!("eliot-978-{label}-{}", std::process::id());
             let root = std::env::temp_dir().join(name);
-            let file = root.join("978-canary-approved-artifact.bin");
-            if std::fs::create_dir_all(&root).is_err() || std::fs::write(&file, b"").is_err() {
+            let file = root.join(ARTIFACT_FILE_NAME);
+            if std::fs::create_dir_all(&root).is_err()
+                || std::fs::write(&file, ARTIFACT_BYTES).is_err()
+            {
                 return None;
             }
             Some(Self { root, file })
@@ -455,10 +758,10 @@ mod tests {
     #[test]
     fn portable_locator_admits_the_approved_artifact_unchanged() {
         let Some(artifact) = ApprovedArtifact::create("admitted") else {
-            return; // no writable temporary directory in this environment
+            panic!("the approved artifact fixture must be writable in this environment");
         };
         let Some(approved) = artifact.approved_handle() else {
-            return;
+            panic!("the approved artifact path must be a valid platform handle");
         };
         let Ok(admitted) = portable_locator(&artifact.file, &approved) else {
             panic!("the approved locator must stay admitted");
@@ -476,26 +779,52 @@ mod tests {
             panic!("the approved canary handle must be a valid platform handle");
         };
         let relative = Path::new(RELATIVE_CANARY);
-        let Err(error) = portable_locator(relative, &approved) else {
+        // Both refused executions run inside one scoped subscriber, so the
+        // "admits nothing" half of this case's name is proved against the
+        // records those executions really emitted.
+        let (refusals, records) = recorded(|| {
+            let locator = portable_locator(relative, &approved);
+            let destination =
+                approved_phase_b_destination_locator(relative, &approved, PROFILE, None);
+            (locator, destination)
+        });
+        let (locator, destination) = refusals;
+        let Err(error) = locator else {
             panic!("a relative portable locator must stay rejected");
         };
         assert_eq!(typed_reason(&error), Some(RELATIVE_REJECTION));
-
-        let destination = approved_phase_b_destination_locator(relative, &approved, PROFILE, None);
         let Err(error) = destination else {
             panic!("a Phase-B destination without the portable root must stay rejected");
         };
         assert_eq!(typed_reason(&error), Some(MISSING_ROOT_REJECTION));
+        // Each seam really published its own typed rejection, and neither
+        // refusal carries an artifact identity, so the admission check below
+        // cannot pass on an execution that refused silently or admitted one.
+        let locator_rejected = one_phase_record(&records, LOCATOR_REJECTED_PHASE);
+        assert_eq!(
+            slot(locator_rejected.detail(), "artifact"),
+            Some("missing"),
+            "a refused locator admitted nothing, so it binds no artifact identity: {}",
+            locator_rejected.detail()
+        );
+        let destination_rejected = one_phase_record(&records, PHASE_B_REJECTED_PHASE);
+        assert_eq!(
+            slot(destination_rejected.detail(), "artifact"),
+            Some("missing"),
+            "a refused Phase-B destination admitted nothing, so it binds no artifact identity: {}",
+            destination_rejected.detail()
+        );
+        assert_admits_nothing(&records);
     }
 
     // WORK_UNIT_CASE: 978/3 — substitution keeps the exact typed rejection
     #[test]
     fn substituted_locator_keeps_the_exact_typed_rejection() {
         let Some(artifact) = ApprovedArtifact::create("substituted") else {
-            return;
+            panic!("the substituted artifact fixture must be writable in this environment");
         };
         let Some(approved) = artifact.substituted_handle() else {
-            return;
+            panic!("the substituted artifact root must be a valid platform handle");
         };
         let Err(error) = portable_locator(&artifact.file, &approved) else {
             panic!("a substituted locator must stay rejected");
@@ -506,49 +835,51 @@ mod tests {
     // WORK_UNIT_CASE: 978/4 — a request observes no process and no readiness
     #[test]
     fn a_lease_request_is_not_a_process_start_or_readiness_observation() {
-        let requested = open_launch_lease(PROFILE, None, Path::new(RELATIVE_CANARY));
+        let (requested, records) =
+            recorded(|| open_launch_lease(PROFILE, None, Path::new(RELATIVE_CANARY)));
         let Err(error) = requested else {
             panic!("a lease request without the portable root must stay rejected");
         };
         assert_eq!(typed_reason(&error), Some(MISSING_ROOT_REJECTION));
-        let detail = LaunchPhaseCorrelation::NONE.render("host.launch-artifact lease requested");
-        let missing = detail.contains("process_start=missing");
-        let no_artifact = detail.contains("artifact=missing");
-        assert!(
-            missing && no_artifact,
-            "a request observes nothing: {detail}"
-        );
-        assert!(
-            !detail.contains("ready"),
-            "a request claims no readiness: {detail}"
-        );
+        // The record that request really emitted, not a string this case
+        // rendered itself: every slot this cell can never prove, plus the
+        // artifact it does not hold yet, must read as the frozen explicit
+        // absence marker.
+        assert_request_binds_nothing(one_phase_record(&records, LEASE_REQUESTED_PHASE));
     }
 
     // WORK_UNIT_CASE: 978/12 — no locator, lease or handle value reaches a record
     #[test]
     fn retained_artifact_records_never_carry_a_locator_or_lease_path() {
         let Some(artifact) = ApprovedArtifact::create("no-path") else {
-            return;
+            panic!("the approved artifact fixture must be writable in this environment");
         };
         let Some(approved) = artifact.approved_handle() else {
-            return;
+            panic!("the approved artifact path must be a valid platform handle");
         };
-        let Ok(admitted) = portable_locator(&artifact.file, &approved) else {
+        // Read back from the records that execution really emitted: a retained
+        // lease, a locator and an approved handle are paths, so none of them is
+        // bound into any field of any record.
+        let (admitted, records) = recorded(|| portable_locator(&artifact.file, &approved));
+        let Ok(admitted) = admitted else {
             panic!("the approved locator must stay admitted");
         };
-        // The exact correlation the locator call sites pass: a retained lease,
-        // a locator and an approved handle are paths, so none of them is bound.
-        let detail = LaunchPhaseCorrelation::NONE.render("host.launch-artifact locator admitted");
-        let canaries = [
-            artifact.file.to_string_lossy().into_owned(),
-            artifact.root.to_string_lossy().into_owned(),
-            approved.as_str().to_owned(),
-            admitted.to_string_lossy().into_owned(),
-        ];
-        for canary in canaries {
-            assert!(!detail.contains(canary.as_str()), "no path in {detail}");
-        }
-        assert!(detail.contains("artifact=missing"), "path is not identity");
+        assert_eq!(
+            admitted, artifact.file,
+            "admission returns the retained locator"
+        );
+        let admitted_record = one_phase_record(&records, LOCATOR_ADMITTED_PHASE);
+        assert_eq!(
+            slot(admitted_record.detail(), "artifact"),
+            Some("missing"),
+            "a path is not an identity: {}",
+            admitted_record.detail()
+        );
+        assert_no_record_carries(
+            &records,
+            &path_canaries(&artifact),
+            "a retained locator, root or handle",
+        );
     }
 
     // WORK_UNIT_CASE: 978/4 — a requested artifact that is absent is never admitted
@@ -557,21 +888,57 @@ mod tests {
     #[test]
     fn an_absent_requested_artifact_is_never_admitted_or_retained() {
         let Some(artifact) = ApprovedArtifact::create("absent") else {
-            return;
+            panic!("the absent-artifact fixture must be writable in this environment");
         };
         let Some(approved) = artifact.approved_handle() else {
-            return;
+            panic!("the approved artifact path must be a valid platform handle");
         };
         // Created only by `ApprovedArtifact`; this locator never exists.
         let absent = artifact.root.join("978-canary-absent-artifact.bin");
+        // Both refusals run inside one scoped subscriber, so the typed reason
+        // and the observation records below are the ones these real executions
+        // produced. Neither refusal text is written by this cell: the locator
+        // refuses with the canonicalization error the OS returned for the absent
+        // path, and the lease refuses inside the protected-path contour, so the
+        // exact variant is the part this cell owns and the text is the
+        // producer's.
+        let (refusals, records) = recorded(|| {
+            let locator = portable_locator(&absent, &approved);
+            let lease = open_launch_lease(InstallationProfile::UserMode, None, &absent);
+            (locator, lease)
+        });
+        let (locator, lease) = refusals;
+        let Err(error) = locator else {
+            panic!("an absent artifact must never be admitted as an approved locator");
+        };
         assert!(
-            portable_locator(&absent, &approved).is_err(),
-            "an absent artifact must never be admitted as an approved locator"
+            typed_reason(&error).is_some(),
+            "an absent locator must stay the typed ProcessContour refusal it returns: {error}"
         );
+        let Err(error) = lease else {
+            panic!("an absent artifact must never retain a lease handle");
+        };
         assert!(
-            open_launch_lease(InstallationProfile::UserMode, None, &absent).is_err(),
-            "an absent artifact must never retain a lease handle"
+            typed_reason(&error).is_some(),
+            "an absent lease must stay the typed ProcessContour refusal it returns: {error}"
         );
+        // Each refused seam really emitted its request and its typed rejection,
+        // and a refused execution admits nothing at all.
+        assert_eq!(
+            phase_records(&records, LOCATOR_REJECTED_PHASE).len(),
+            1,
+            "the refused locator publishes exactly one typed rejection"
+        );
+        assert_eq!(
+            phase_records(&records, LEASE_REJECTED_PHASE).len(),
+            1,
+            "the refused lease publishes exactly one typed rejection"
+        );
+        assert_admits_nothing(&records);
+        // The request itself observes nothing: both requests this case drove
+        // bind no identity at all, so the request is not an observation.
+        assert_request_binds_nothing(one_phase_record(&records, LOCATOR_REQUESTED_PHASE));
+        assert_request_binds_nothing(one_phase_record(&records, LEASE_REQUESTED_PHASE));
     }
 
     // WORK_UNIT_CASE: 978/12 — the locator canary reaches neither the typed rejection
@@ -591,10 +958,10 @@ mod tests {
         );
 
         let Some(artifact) = ApprovedArtifact::create("absent-echo") else {
-            return;
+            panic!("the rejected-locator fixture must be writable in this environment");
         };
         let Some(approved) = artifact.approved_handle() else {
-            return;
+            panic!("the approved artifact path must be a valid platform handle");
         };
         let absent = artifact.root.join("978-canary-absent-artifact.bin");
         let Err(error) = portable_locator(&absent, &approved) else {
@@ -603,6 +970,64 @@ mod tests {
         assert!(
             !error.to_string().contains("978-canary"),
             "a typed rejection must not echo the rejected locator: {error}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 978/13 — the digest decisions of this cell are executed,
+    // and both outcomes carry the owner's approved digest and no retained path
+    #[cfg(windows)]
+    #[test]
+    fn digest_outcomes_bind_the_owner_approved_digest_and_no_retained_path() {
+        use eliot_platform_windows::{UserOwnedRootLease, sha256_hex};
+
+        const DIGEST_FIELD: &str = "runtime.kernel_artifact";
+        let Some(artifact) = ApprovedArtifact::create("digest") else {
+            panic!("the approved artifact fixture must be writable in this environment");
+        };
+        let Ok(approved_digest) = PlatformHandle::new(sha256_hex(ARTIFACT_BYTES)) else {
+            panic!("the approved artifact digest must be a valid platform handle");
+        };
+        // The existing owner seam: the same portable root lease the launch
+        // contour retains, so the artifact below is leased and digested by the
+        // real Windows mechanics rather than by anything this case restates.
+        let Ok(portable_root) = UserOwnedRootLease::open_existing(&artifact.root) else {
+            panic!("the approved temporary root must open as a portable root lease");
+        };
+        let (lease_path, records) = recorded(|| {
+            let Ok(lease) = open_launch_lease(PROFILE, Some(&portable_root), &artifact.file) else {
+                panic!("the approved artifact must retain a launch lease");
+            };
+            let retained = lease.path().to_path_buf();
+            let Ok(()) = verify_launch_digest(&lease, &approved_digest, DIGEST_FIELD) else {
+                panic!("the owner-supplied approved digest must be admitted");
+            };
+            // The retained artifact's content is replaced under the live lease,
+            // so the very same owner-supplied approved identity is verified once
+            // more against substituted bytes.
+            assert!(
+                std::fs::write(&artifact.file, SUBSTITUTED_ARTIFACT_BYTES).is_ok(),
+                "the retained artifact must stay writable for a substitution case"
+            );
+            let substituted = verify_launch_digest(&lease, &approved_digest, DIGEST_FIELD);
+            let Err(denial) = substituted else {
+                panic!("a substituted artifact must never be admitted");
+            };
+            assert!(
+                denial.to_string().contains("content digest mismatch"),
+                "the substitution must stay a typed digest rejection: {denial}"
+            );
+            retained
+        });
+        assert_eq!(
+            lease_path, artifact.file,
+            "the lease retains the approved locator"
+        );
+        let recomputed = [sha256_hex(SUBSTITUTED_ARTIFACT_BYTES)];
+        assert_digest_decisions(
+            &records,
+            approved_digest.as_str(),
+            &path_canaries(&artifact),
+            &recomputed,
         );
     }
 }

@@ -1,0 +1,25 @@
+{
+  "command": "backup.restore-test",
+  "status": "blocked",
+  "idempotency_key": "synthetic-idempotency-key-restore-test-0002",
+  "code": "plan_gap",
+  "missing_owner": "destination-key-and-blob-scope-admission (RestorePorts::keys and RestorePorts::blob_scope, #953/#956/#958: no owner channel on this front door issues the admitted wrapped-key manifest or the destination blob scope, so a blob-carrying archive is refused by the restore owner with its own CapabilityMissing)",
+  "reason": "required owner capability absent: blob_key_material",
+  "gates_passed": [
+    "decode",
+    "validate",
+    "shape",
+    "authorization-shape",
+    "provisioning",
+    "isolation",
+    "archive-decode",
+    "plan-compile",
+    "journal-admission"
+  ],
+  "gates_not_admitted": [
+    "destination-manifest-admission",
+    "cutover-qualification",
+    "destination-key-admission",
+    "destination-blob-scope"
+  ]
+}

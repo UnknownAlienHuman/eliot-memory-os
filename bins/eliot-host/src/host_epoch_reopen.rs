@@ -10,7 +10,10 @@ use super::{
     fresh_lineage_id, initial_activation_record, root_epoch,
 };
 use crate::activation_lifecycle::{ActivationTriggerClass, control_contour_capabilities};
-use crate::journal_append::ActivationIngress;
+use crate::journal_append::{
+    ActivationIngress, HostJournalDisposition, HostJournalObservation,
+    observe_host_journal_boundary,
+};
 
 /// Durable `trigger_class` of an activation generation that Host itself opened
 /// without an installer-approved pending transaction.
@@ -62,29 +65,22 @@ fn activation_ingress(
     }
 }
 
-// F-LOG-HOST-6 (#981) epoch-reopen observation helpers.
+// F-LOG-HOST-6 (#981) epoch-reopen observation helper.
 //
-// Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
-//
-// Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never epochs,
-// digests, installation handles, or arbitrary error text — so bounding
-// limits size, not sensitivity (I15.4). These primitives own no terminal: a
-// single terminal per failed open operation is enforced by the outermost
-// `Host::open` boundary in `lib.rs` (#891, `host-open-failed`), while these
-// phases correlate by stage order only. Replayed committed state is observed
-// as readback, never as a second effect. Sink outcome never alters
-// result/order/cleanup.
-fn host_epoch_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
-    crate::host_diagnostics::observe_entrypoint_with_detail(
-        crate::host_diagnostics::EntrypointStage::Startup,
-        detail,
-    );
+// The per-file seam of the family's shared closed vocabulary: it names the epoch
+// reopen boundary set and delegates to the one shared emitter. These primitives
+// own no terminal: the single terminal per failed open operation belongs to the
+// outermost `Host::open` boundary in `lib.rs` (#891, `host-open-failed`), so
+// every record here is a subordinate observation of a fact the epoch owner
+// already decided. The exact owner identities the reopen already holds —
+// installation, Host epoch, lineage, activation generation, and each pending
+// transaction's own identity, record checksum and Host epoch — travel with the
+// record instead of the record relying on stage order alone. Replayed committed
+// state is observed as readback, never as a second effect, and the live Event
+// Log disposition is observed through the facade's canonical bounded helper
+// rather than a discarded probe (I15.4).
+fn host_epoch_observe(observation: &HostJournalObservation) {
+    observe_host_journal_boundary(observation);
 }
 
 /// I14.16 step 6 (issue #1953 W5): verifies the retired Kernel contour left
@@ -120,7 +116,13 @@ fn host_epoch_observe(detail: &str) {
 /// (`ShadowNoAuthority`, `HandoffPrepared`, `NonceIssued`, `Activating`).
 fn require_prior_kernel_released_for_new_epoch(replayed: &HostState) -> Result<(), HostError> {
     if replayed.prior_kernel_unknown {
-        host_epoch_observe("host.epoch prior kernel unknown observed");
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch prior kernel unknown observed",
+                HostJournalDisposition::BoundaryReached,
+            )
+            .with_host(&replayed.host),
+        );
         return Err(HostError::RecoveryRequired(
             "new Host installation epoch requires a known prior-Kernel disposition; unknown observations stop activation but remain queryable".to_owned(),
         ));
@@ -131,7 +133,13 @@ fn require_prior_kernel_released_for_new_epoch(replayed: &HostState) -> Result<(
     match &kernel.prior_kernel_disposition {
         PriorKernelDisposition::NoPriorKernel | PriorKernelDisposition::Terminated(_) => {}
         PriorKernelDisposition::Running(_) | PriorKernelDisposition::Unknown(_) => {
-            host_epoch_observe("host.epoch prior kernel unverified observed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch prior kernel unverified observed",
+                    HostJournalDisposition::BoundaryReached,
+                )
+                .with_record_fence(&kernel.fence),
+            );
             return Err(HostError::RecoveryRequired(
                 "new Host installation epoch requires a terminated prior-Kernel disposition; the retained disposition is still live or unknown".to_owned(),
             ));
@@ -142,7 +150,13 @@ fn require_prior_kernel_released_for_new_epoch(replayed: &HostState) -> Result<(
         | KernelActivationState::HandoffPrepared
         | KernelActivationState::NonceIssued
         | KernelActivationState::Activating => {
-            host_epoch_observe("host.epoch prior kernel unverified observed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch prior kernel retained live observed",
+                    HostJournalDisposition::BoundaryReached,
+                )
+                .with_record_fence(&kernel.fence),
+            );
             Err(HostError::RecoveryRequired(
                 "new Host installation epoch requires prior Kernel termination and exclusive lock release; the retained Kernel never reached OldTerminated".to_owned(),
             ))
@@ -155,6 +169,7 @@ fn require_prior_kernel_released_for_new_epoch(replayed: &HostState) -> Result<(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     current: HostStateJournalService<B>,
     last_host: &HostInstallationEpoch,
@@ -172,25 +187,103 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     ),
     HostError,
 > {
-    host_epoch_observe("host.epoch reopen existing requested");
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch reopen existing requested",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_host(last_host),
+    );
     if last_host.installation != *installation {
-        host_epoch_observe("host.epoch install mismatch observed");
+        // The requested installation is the entire subject of this refusal, so
+        // only that side is bound here. `with_host` writes `installation` as
+        // well and the emitter is last-write-wins, so chaining it would
+        // overwrite the requested value with the retained epoch's matching one
+        // and the mismatch could never be read. The retained side is already
+        // reported by the `host.epoch reopen existing requested` record emitted
+        // immediately above this check, which binds `with_host(last_host)`: one
+        // slot cannot carry both sides and a second installation slot is outside
+        // this issue's vocabulary. The later `host.epoch reopen fence observed`
+        // record binds the same retained value but is unreachable from this arm,
+        // because this refusal returns before the reconciliation and fence loop
+        // that precedes it.
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch install mismatch observed",
+                HostJournalDisposition::BoundaryReached,
+            )
+            .with_installation(installation.as_str()),
+        );
         return Err(HostError::OwnerLeaseRecovery(
             "Host journal installation identity does not match admission".to_owned(),
         ));
     }
-    for pending in current.pending_transactions()? {
-        match current.reconcile(&pending.transaction_id)? {
-            ReconcileOutcome::Committed => {}
-            ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+    // Every prepared append is reconciled under its own transaction identity
+    // before this reopen is allowed to read a snapshot: a readable snapshot is
+    // never read as a pending reconciliation, and each answer carries the exact
+    // operation, transaction, record checksum and Host epoch the journal itself
+    // prepared. Both unresolved answers stay fail-closed here, as before; what
+    // changes is that a proven noncommit can no longer be read as an unknown
+    // outcome (I14.21).
+    let prepared_appends = current.pending_transactions()?;
+    let prepared_total = u64::try_from(prepared_appends.len()).unwrap_or(u64::MAX);
+    let mut committed_total = 0_u64;
+    for prepared in &prepared_appends {
+        match current.reconcile(&prepared.transaction_id)? {
+            ReconcileOutcome::Committed => {
+                committed_total += 1;
+                host_epoch_observe(
+                    &HostJournalObservation::new(
+                        "host.epoch pending transaction reconciled observed",
+                        HostJournalDisposition::ReconcileCommitted,
+                    )
+                    .with_prepared_append(prepared),
+                );
+            }
+            ReconcileOutcome::NotCommitted => {
+                host_epoch_observe(
+                    &HostJournalObservation::new(
+                        "host.epoch pending transaction not committed observed",
+                        HostJournalDisposition::ReconcileNotCommitted,
+                    )
+                    .with_prepared_append(prepared),
+                );
                 return Err(HostError::Journal(JournalError::OutcomeUnknown {
-                    transaction_id: pending.transaction_id,
+                    transaction_id: prepared.transaction_id.clone(),
+                }));
+            }
+            ReconcileOutcome::StillUnknown => {
+                host_epoch_observe(
+                    &HostJournalObservation::new(
+                        "host.epoch pending transaction unknown observed",
+                        HostJournalDisposition::ReconcileStillUnknown,
+                    )
+                    .with_prepared_append(prepared),
+                );
+                return Err(HostError::Journal(JournalError::OutcomeUnknown {
+                    transaction_id: prepared.transaction_id.clone(),
                 }));
             }
         }
     }
     let replayed = current.snapshot()?;
-    host_epoch_observe("host.epoch pending reconcile observed");
+    // Both unresolved reconciliation answers returned above, so reaching this
+    // record with a non-zero denominator means every prepared append of this
+    // reopen reconciled as committed; a zero denominator is never read as a
+    // reconciled pending work and never as a fresh epoch increment.
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch pending reconcile observed",
+            if prepared_total == 0 {
+                HostJournalDisposition::DenominatorEmpty
+            } else {
+                HostJournalDisposition::DenominatorReconciled
+            },
+        )
+        .with_host(last_host)
+        .with_cardinality(prepared_total)
+        .with_committed(committed_total),
+    );
     // An exact unresolved Store recovery contour outranks the shutdown marker:
     // a Host crash can occur between any two durable publications, and a
     // clean marker is never permission to attach a lost kill-on-close Job.
@@ -203,14 +296,31 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     } else {
         StoreRecoveryStartupFence::Clear
     };
-    host_epoch_observe("host.epoch reopen fence observed");
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch reopen fence observed",
+            if store_recovery_startup_fence.is_fenced() {
+                HostJournalDisposition::FenceUnresolved
+            } else {
+                HostJournalDisposition::FenceClear
+            },
+        )
+        .with_host(last_host)
+        .with_cardinality(u64::try_from(store_recovery_fences.len()).unwrap_or(u64::MAX)),
+    );
     let active_phase_b_rebind_recovery = active_phase_b_rebind_recovery_kind(active_phase_b_rebind);
     if pending.is_none()
         && active_phase_b_rebind.is_none()
         && replayed.clean_marker.is_none()
         && !store_recovery_startup_fence.is_fenced()
     {
-        host_epoch_observe("host.epoch unclean observed");
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch unclean observed",
+                HostJournalDisposition::BoundaryReached,
+            )
+            .with_host(last_host),
+        );
         return Err(HostError::OwnerLeaseRecovery(
             "current Host journal epoch is unclean; explicit new-lineage recovery is required"
                 .to_owned(),
@@ -259,9 +369,23 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     if store_recovery_startup_fence.is_fenced()
         || pending.is_some_and(|pending| pending.phase_b_prepared.is_some())
     {
-        host_epoch_observe("host.epoch owner epoch retained");
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch owner epoch retained",
+                HostJournalDisposition::OwnerEpochRetained,
+            )
+            .with_host(&host)
+            .with_activation_generation(&activation_generation),
+        );
     } else {
-        host_epoch_observe("host.epoch owner child epoch observed");
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch owner child epoch observed",
+                HostJournalDisposition::OwnerEpochChildCreated,
+            )
+            .with_host(&host)
+            .with_activation_generation(&activation_generation),
+        );
     }
     let backend = current.into_backend()?;
     Ok((
@@ -273,6 +397,7 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn persist_pending_recovery(
     host_state_root: &Path,
     registry: &mut ApprovedGenerationRegistry,
@@ -280,7 +405,14 @@ pub(super) fn persist_pending_recovery(
     pending: &eliot_installation::PendingActivation,
     reason: &str,
 ) -> Result<(), HostError> {
-    host_epoch_observe("host.epoch pending recovery requested");
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch pending recovery requested",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_recovery_binding(pending.transaction_id.as_str())
+        .with_contour(pending.plan_digest.as_str()),
+    );
     pending
         .manifest
         .runtime_launch
@@ -351,24 +483,67 @@ pub(super) fn persist_pending_recovery(
                 )
         });
     *registry = durable;
-    host_epoch_observe("host.epoch recovery readback observed");
+    // One record per readback outcome. This record is the observation of the
+    // load itself: it says the registry was durably assigned from this
+    // snapshot and it binds only that transaction and its plan-digest contour,
+    // never the comparison verdict. Each arm below then emits exactly one
+    // distinct verdict record, and because the four arms are mutually
+    // exclusive the verdict is reported once and only once. The pending
+    // transaction identity and its contour are bound on every arm as well, so
+    // no record is left without them.
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch recovery readback observed",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_recovery_binding(pending.transaction_id.as_str())
+        .with_contour(pending.plan_digest.as_str()),
+    );
     match outcome {
         Ok(()) if exact_readback => {
-            host_epoch_observe("host.epoch recovery exact readback confirmed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch recovery exact readback confirmed",
+                    HostJournalDisposition::EvidenceValidated,
+                )
+                .with_recovery_binding(pending.transaction_id.as_str())
+                .with_contour(pending.plan_digest.as_str()),
+            );
             Ok(())
         }
         Ok(()) => {
-            host_epoch_observe("host.epoch recovery readback mismatch observed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch recovery readback mismatch observed",
+                    HostJournalDisposition::EvidenceMismatched,
+                )
+                .with_recovery_binding(pending.transaction_id.as_str())
+                .with_contour(pending.plan_digest.as_str()),
+            );
             Err(HostError::RecoveryRequired(format!(
                 "{reason}; recovery disposition succeeded but exact registry readback failed"
             )))
         }
         Err(_error) if exact_readback => {
-            host_epoch_observe("host.epoch recovery exact readback confirmed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch recovery exact readback confirmed",
+                    HostJournalDisposition::EvidenceValidated,
+                )
+                .with_recovery_binding(pending.transaction_id.as_str())
+                .with_contour(pending.plan_digest.as_str()),
+            );
             Ok(())
         }
         Err(error) => {
-            host_epoch_observe("host.epoch recovery disposition failed observed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch recovery disposition failed observed",
+                    HostJournalDisposition::EvidenceUnusable,
+                )
+                .with_recovery_binding(pending.transaction_id.as_str())
+                .with_contour(pending.plan_digest.as_str()),
+            );
             Err(HostError::RecoveryRequired(format!(
                 "{reason}; durable recovery disposition failed and exact readback did not confirm it: {error}"
             )))
@@ -398,7 +573,13 @@ pub(super) fn open_production_epoch(
     ),
     HostError,
 > {
-    host_epoch_observe("host.epoch production open requested");
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch production open requested",
+            HostJournalDisposition::BoundaryReached,
+        )
+        .with_installation(installation.as_str()),
+    );
     let backend = match profile {
         eliot_installation::InstallationProfile::SystemService => {
             if profile_selection.is_some() {
@@ -437,7 +618,10 @@ pub(super) fn open_production_epoch(
         }
     }
     .map_err(JournalError::Backend)?;
-    host_epoch_observe("host.epoch backend open observed");
+    host_epoch_observe(&HostJournalObservation::new(
+        "host.epoch backend open observed",
+        HostJournalDisposition::BoundaryReached,
+    ));
     open_production_epoch_from_backend(
         backend,
         installation,
@@ -447,6 +631,7 @@ pub(super) fn open_production_epoch(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn open_production_epoch_from_backend(
     mut backend: RedbJournalBackend,
     installation: PlatformHandle,
@@ -470,7 +655,19 @@ pub(super) fn open_production_epoch_from_backend(
         .epochs
         .last()
         .map(|epoch| epoch.host.clone());
-    host_epoch_observe("host.epoch last host observed");
+    let last_host_present = last_host.is_some();
+    host_epoch_observe(
+        &HostJournalObservation::new(
+            "host.epoch last host observed",
+            if last_host_present {
+                HostJournalDisposition::BoundaryReached
+            } else {
+                HostJournalDisposition::DenominatorEmpty
+            },
+        )
+        .with_installation(installation.as_str())
+        .with_cardinality(u64::from(last_host_present)),
+    );
 
     let (
         journal,
@@ -510,9 +707,25 @@ pub(super) fn open_production_epoch_from_backend(
             fresh_identity("activation")?
         };
         if store_recovery_startup_fence.is_fenced() {
-            host_epoch_observe("host.epoch activation retained");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch activation retained",
+                    HostJournalDisposition::OwnerEpochRetained,
+                )
+                .with_operation(activation_id.as_str())
+                .with_host(&host)
+                .with_activation_generation(&activation_generation),
+            );
         } else {
-            host_epoch_observe("host.epoch activation fresh observed");
+            host_epoch_observe(
+                &HostJournalObservation::new(
+                    "host.epoch activation fresh observed",
+                    HostJournalDisposition::OwnerEpochChildCreated,
+                )
+                .with_operation(activation_id.as_str())
+                .with_host(&host)
+                .with_activation_generation(&activation_generation),
+            );
         }
         (
             journal,
@@ -523,7 +736,14 @@ pub(super) fn open_production_epoch_from_backend(
             active_phase_b_rebind_recovery,
         )
     } else if !store_recovery_fences.is_empty() {
-        host_epoch_observe("host.epoch fence without prior observed");
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch fence without prior observed",
+                HostJournalDisposition::FenceUnresolved,
+            )
+            .with_installation(installation.as_str())
+            .with_cardinality(u64::try_from(store_recovery_fences.len()).unwrap_or(u64::MAX)),
+        );
         return Err(HostError::RecoveryRequired(
             "Store recovery fence has no prior Host epoch; manual new-lineage recovery is required"
                 .to_owned(),
@@ -540,9 +760,17 @@ pub(super) fn open_production_epoch_from_backend(
         )
     };
     if store_recovery_startup_fence.is_fenced() {
-        host_epoch_observe("host.epoch activation replay observed");
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch activation replay observed",
+                HostJournalDisposition::PublicationReplayed,
+            )
+            .with_operation(activation_id.as_str())
+            .with_host(&host)
+            .with_activation_generation(&activation_generation),
+        );
     } else {
-        append_reconciled(
+        let receipt = append_reconciled(
             &journal,
             HostStateRecord::Activation(initial_activation_record(
                 &host,
@@ -553,7 +781,21 @@ pub(super) fn open_production_epoch_from_backend(
                 &activation_ingress(pending),
             )?),
         )?;
-        host_epoch_observe("host.epoch activation appended");
+        // The applied/replayed disposition of this exact append is the journal
+        // owner's correlated lower-stage detail and is reported there once. This
+        // subordinate record carries only what the epoch owner holds: the
+        // activation identity, the owner-issued Host epoch and generation, and
+        // the journal transaction and sequence this publication produced.
+        host_epoch_observe(
+            &HostJournalObservation::new(
+                "host.epoch activation appended",
+                HostJournalDisposition::BoundaryReached,
+            )
+            .with_operation(activation_id.as_str())
+            .with_host(&host)
+            .with_activation_generation(&activation_generation)
+            .with_receipt(&receipt),
+        );
     }
     Ok((
         journal,
