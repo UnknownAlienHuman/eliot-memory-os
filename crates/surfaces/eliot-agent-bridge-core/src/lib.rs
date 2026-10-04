@@ -5713,6 +5713,7 @@ pub struct ProposeSkillRequest {
     evidence_refs: Vec<String>,
     dependency_versions: Vec<DependencyVersion>,
     scope: SkillScope,
+    policy_revision: String,
 }
 
 #[derive(Deserialize)]
@@ -5724,6 +5725,7 @@ struct RawProposeSkillRequest {
     evidence_refs: Vec<String>,
     dependency_versions: Vec<DependencyVersion>,
     scope: SkillScope,
+    policy_revision: String,
 }
 
 impl<'de> Deserialize<'de> for ProposeSkillRequest {
@@ -5739,6 +5741,7 @@ impl<'de> Deserialize<'de> for ProposeSkillRequest {
             raw.evidence_refs,
             raw.dependency_versions,
             raw.scope,
+            raw.policy_revision,
         )
         .map_err(de::Error::custom)
     }
@@ -5754,6 +5757,7 @@ impl ProposeSkillRequest {
         evidence_refs: Vec<String>,
         dependency_versions: Vec<DependencyVersion>,
         scope: SkillScope,
+        policy_revision: impl Into<String>,
     ) -> Result<Self, SkillError> {
         let request = Self {
             skill_id: skill_id.into(),
@@ -5762,6 +5766,7 @@ impl ProposeSkillRequest {
             evidence_refs,
             dependency_versions,
             scope,
+            policy_revision: policy_revision.into(),
         };
         request.validate()?;
         Ok(request)
@@ -5816,6 +5821,15 @@ impl ProposeSkillRequest {
             }
         }
         self.scope.validate()?;
+        // The policy revision is a mandatory binding term on the wire: the
+        // surface never defaults it, because the owning lifecycle has to bind
+        // the exact revision the submitter decided under.
+        validate_text(&self.policy_revision, "candidate.policy_revision").map_err(|_| {
+            SkillError::InvalidField {
+                field: "candidate.policy_revision",
+                reason: "must be non-blank and contain no control characters",
+            }
+        })?;
         Ok(())
     }
 
@@ -5842,6 +5856,12 @@ impl ProposeSkillRequest {
     /// Returns the pinned dependency versions.
     pub fn dependency_versions(&self) -> &[DependencyVersion] {
         &self.dependency_versions
+    }
+
+    /// Returns the exact governance policy revision the submitter decided
+    /// under. The bridge never substitutes a default for it.
+    pub fn policy_revision(&self) -> &str {
+        &self.policy_revision
     }
 
     /// Returns the candidate scope.

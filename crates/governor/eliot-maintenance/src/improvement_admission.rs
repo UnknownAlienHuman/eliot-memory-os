@@ -1157,8 +1157,31 @@ mod tests {
 
     #[test]
     fn admits_complete_candidate_for_bounded_experiment_only() {
-        let decision = decide(&candidate(), &evidence(), &policy());
-        match decision {
+        // A candidate reaches the experiment only against a retained record that
+        // ESTABLISHES it: a different logical operation carrying its own
+        // discriminator and its own owner-issued evidence, so the current
+        // candidate's evidence is new relative to that record. This is the same
+        // shape the "fresh" leg of
+        // `exact_canonical_repeat_is_no_progress` already builds, and it is the
+        // only admitted route to `AdmitForExperiment`.
+        //
+        // The earlier form of this case decided over `evidence()` alone, whose
+        // `retained_prior_proposal` is `None`. That stopped admitting when the
+        // progress assessment became owner-derived (a record with no retained
+        // comparison is `NoRetainedPrior`, and an unestablished comparison is
+        // not novelty), so the case asserted a disposition the gate has
+        // deliberately refused since. It is repaired here rather than by
+        // weakening the gate, because the gate's rule is the one with a typed
+        // reason, a documented owner and a fail-closed direction.
+        let mut established = evidence();
+        established.retained_prior_proposal = Some(RetainedImprovementProposal {
+            commitment: prior_commitment("commitment-1144-a", "op-1144-a"),
+            discriminator: projection("hypothesis-1144-a", "evidence-1144-a"),
+            material_equality: material("exp-1144-a", "evidence-1144-a"),
+            experiment_plan: plan("exp-1144-a", "scope-1144-a"),
+        });
+        let decision = decide(&candidate(), &established, &policy());
+        match &decision {
             ImprovementAdmissionDecision::AdmitForExperiment {
                 candidate_id,
                 campaign_id,
@@ -1173,6 +1196,22 @@ mod tests {
             }
             other => panic!("complete candidate must admit for experiment, got {other:?}"),
         }
+
+        // And the arm this case used to reach by accident is asserted directly,
+        // so the refusal keeps its own proof rather than being implied by the
+        // absence of a caller that no longer reaches it: a candidate with no
+        // retained record at all is no-progress, never an admitted experiment.
+        assert!(matches!(
+            decide(&candidate(), &evidence(), &policy()),
+            ImprovementAdmissionDecision::NoProgress { reason, .. } if reason.contains(
+                "no-retained-prior-commitment"
+            )
+        ));
+
+        // The admitted decision is a pure function of its inputs, so a repeat of
+        // the same established case returns the same record rather than a
+        // second, differently-shaped admission.
+        assert_eq!(decision, decide(&candidate(), &established, &policy()));
     }
 
     #[test]
