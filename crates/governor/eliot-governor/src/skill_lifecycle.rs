@@ -414,27 +414,19 @@ fn action_str(action: eliot_skill::LifecycleAction) -> &'static str {
     }
 }
 
-fn skill_envelope(
-    identity: &eliot_protocol::RequestIdentity,
-    operation_id: eliot_contracts::OperationId,
+/// Builds the `ApplyLifecyclePolicy` semantic-command parameters.
+///
+/// Every term that distinguishes one promotion from another has to be in the
+/// canonical bytes. `I6.08`: reusing one idempotency key with different
+/// canonical bytes is always `IDENTITY_CONFLICT`, so the gate's independent
+/// route count, shared-or-critical depth marker and reversibility travel here
+/// as first-class parameters rather than only as a count of proof refs. A gate
+/// whose depth changed under one operation identity then conflicts instead of
+/// replaying the earlier final receipt.
+fn skill_parameters(
     candidate: &SkillCandidate,
     gate: &PromotionGate,
-    manifest_digest: OperationManifestDigest,
-) -> Result<CanonicalWriteEnvelope, SkillError> {
-    identity
-        .validate()
-        .map_err(|_| SkillError::IdentityMismatch)?;
-    let fence = &identity.request.metadata.state_fence;
-    if &identity.request.state_fence != fence {
-        return Err(SkillError::FenceMismatch);
-    }
-    if &candidate.state_fence != fence || &gate.state_fence != fence {
-        return Err(SkillError::FenceMismatch);
-    }
-    let scope_id =
-        ScopeId::new("governor").map_err(|error| SkillError::Serialization(error.to_string()))?;
-    let ordering_scope = OrderingScopeId::new("scope:governor")
-        .map_err(|error| SkillError::Serialization(error.to_string()))?;
+) -> BTreeMap<String, serde_json::Value> {
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "action".to_owned(),
@@ -460,6 +452,51 @@ fn skill_envelope(
         "verifier_ref".to_owned(),
         serde_json::Value::String(gate.verifier_ref.clone()),
     );
+    parameters.insert(
+        "gate_independent_route_count".to_owned(),
+        serde_json::Value::from(gate.independent_route_count),
+    );
+    parameters.insert(
+        "gate_is_shared_or_critical".to_owned(),
+        serde_json::Value::Bool(gate.is_shared_or_critical),
+    );
+    parameters.insert(
+        "gate_reversible".to_owned(),
+        serde_json::Value::Bool(gate.reversible),
+    );
+    parameters.insert(
+        "candidate_policy_revision".to_owned(),
+        serde_json::Value::String(candidate.policy_revision.clone()),
+    );
+    parameters.insert(
+        "candidate_operation_identity".to_owned(),
+        serde_json::Value::String(candidate.operation_identity.clone()),
+    );
+    parameters
+}
+
+fn skill_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    operation_id: eliot_contracts::OperationId,
+    candidate: &SkillCandidate,
+    gate: &PromotionGate,
+    manifest_digest: OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, SkillError> {
+    identity
+        .validate()
+        .map_err(|_| SkillError::IdentityMismatch)?;
+    let fence = &identity.request.metadata.state_fence;
+    if &identity.request.state_fence != fence {
+        return Err(SkillError::FenceMismatch);
+    }
+    if &candidate.state_fence != fence || &gate.state_fence != fence {
+        return Err(SkillError::FenceMismatch);
+    }
+    let scope_id =
+        ScopeId::new("governor").map_err(|error| SkillError::Serialization(error.to_string()))?;
+    let ordering_scope = OrderingScopeId::new("scope:governor")
+        .map_err(|error| SkillError::Serialization(error.to_string()))?;
+    let parameters = skill_parameters(candidate, gate);
     let mut proof_refs = BTreeSet::new();
     proof_refs.insert(gate.verifier_ref.clone());
     if let Some(approval) = &gate.human_approval_ref {
@@ -539,11 +576,15 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
         evidence_refs: Vec<String>,
         dependencies: Vec<eliot_skill::DependencyVersion>,
         scope: eliot_skill::SkillScope,
+        policy_revision: String,
     ) -> Result<SkillCandidate, SkillError> {
         ctx.validate().map_err(|_| SkillError::IdentityMismatch)?;
         if &ctx.state_fence != self.canonical.state_fence() {
             return Err(SkillError::FenceMismatch);
         }
+        // The operation identity is the authenticated request identity of this
+        // proposal; it is bound into the candidate so a later promotion of the
+        // same candidate cannot be attributed to a different decision.
         self.skill.propose(
             &skill_id,
             candidate_package_digest,
@@ -551,6 +592,8 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
             evidence_refs,
             dependencies,
             scope,
+            policy_revision,
+            ctx.request_id.as_str().to_owned(),
             ctx.state_fence.clone(),
         )
     }
@@ -965,6 +1008,8 @@ mod tests {
             vec!["evidence-1".to_owned()],
             Vec::new(),
             scope(),
+            "policy-rev-1".to_owned(),
+            "proposal-operation-1".to_owned(),
             fence.clone(),
         )
         .expect("candidate")
@@ -1150,6 +1195,145 @@ mod tests {
             ),
             "stale base was not rejected without promotion: {rejected:?}"
         );
+        assert_eq!(kernel.apply_count(), 0);
+        assert!(kernel.committed.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn changed_gate_terms_under_one_operation_identity_conflict_instead_of_replaying() {
+        // `I6.08`: reusing one idempotency key with different canonical bytes
+        // is always IDENTITY_CONFLICT. `independent_route_count` and
+        // `is_shared_or_critical` are gate terms that do not change the
+        // verifier, the approval or the evidence set, so before they entered
+        // the canonical parameters the store answered a materially different
+        // gate with the earlier final receipt instead of conflicting.
+        let fence = fence();
+        let base = base_view(&fence);
+        let promoted = promoted_view(&fence);
+        let skill = SkillRegistry::from_snapshot([base.clone()]).expect("registry");
+        let canonical = canonical_owner(&fence);
+        let kernel = TestKernel::new();
+        let owner = adapter(&skill, &canonical, &kernel);
+        let candidate_value = candidate(&fence, &base);
+        // A shared/critical-depth gate: two independent routes plus human
+        // approval, so every proof ref stays identical while the route count
+        // itself is the only thing that moves.
+        let mut deep_gate = gate(&fence, &candidate_value);
+        deep_gate.evidence_refs = vec![
+            "evidence-1".to_owned(),
+            "evidence-2".to_owned(),
+            "evidence-3".to_owned(),
+        ];
+        deep_gate.independent_route_count = 2;
+        deep_gate.human_approval_ref = Some("approval-1".to_owned());
+        let mut deeper_gate = deep_gate.clone();
+        deeper_gate.independent_route_count = 3;
+        let mut shared_gate = deep_gate.clone();
+        shared_gate.is_shared_or_critical = true;
+        for changed in [&deeper_gate, &shared_gate] {
+            changed
+                .validate_for(&candidate_value)
+                .expect("changed gate is still an admitted gate");
+            let identity_value = identity(&fence);
+            let operation_id = OperationId::new("op-skill-gate-terms").expect("operation id");
+            let first = block_on(owner.promote(
+                &identity_value,
+                operation_id.clone(),
+                candidate_value.clone(),
+                deep_gate.clone(),
+                promoted.clone(),
+            ))
+            .expect("first admitted promotion");
+            assert_eq!(first.status, WriteReceiptStatus::Committed);
+            let conflicted = block_on(owner.promote(
+                &identity_value,
+                operation_id.clone(),
+                candidate_value.clone(),
+                changed.clone(),
+                promoted.clone(),
+            ));
+            let Err(SkillError::Store(failure)) = conflicted else {
+                panic!("changed gate replayed instead of conflicting: {conflicted:?}");
+            };
+            assert_eq!(
+                failure.disposition,
+                eliot_store_api::StoreFailureDisposition::DeterministicRejection
+            );
+            assert_eq!(
+                failure.mutation_disposition,
+                eliot_store_api::StoreMutationDisposition::NotAttempted
+            );
+            // The committed receipt for that operation is still the first
+            // one: the differing gate never became the stored outcome.
+            let stored = block_on(kernel.receipt(operation_id.clone()))
+                .expect("receipt route")
+                .expect("stored receipt");
+            assert_eq!(stored.canonical_request_hash, first.canonical_request_hash);
+        }
+    }
+
+    #[test]
+    fn proposal_binds_policy_revision_and_operation_identity_into_the_candidate() {
+        let fence = fence();
+        let base = base_view(&fence);
+        let skill = SkillRegistry::from_snapshot([base]).expect("registry");
+        let canonical = canonical_owner(&fence);
+        let kernel = TestKernel::new();
+        let owner = adapter(&skill, &canonical, &kernel);
+        let ctx = identity(&fence).request.metadata.clone();
+        let mut other_ctx = ctx.clone();
+        other_ctx.request_id = RequestId::new("req-skill-2").expect("second request id");
+        let proposed = |metadata: &RequestMetadata, policy: &str| {
+            block_on(owner.propose(
+                metadata,
+                "skill-demo".to_owned(),
+                "b".repeat(64),
+                LifecycleAction::Patch,
+                vec!["evidence-1".to_owned()],
+                Vec::new(),
+                scope(),
+                policy.to_owned(),
+            ))
+            .expect("proposal")
+        };
+
+        let first = proposed(&ctx, "policy-rev-1");
+        assert_eq!(first.policy_revision, "policy-rev-1");
+        assert_eq!(first.operation_identity, ctx.request_id.as_str());
+        // Exact replay of the same decision under the same identity is the
+        // same candidate, not a second one.
+        assert_eq!(proposed(&ctx, "policy-rev-1"), first);
+        // A different policy revision under the same operation identity is a
+        // different decision and must not collapse onto the first digest.
+        let other_policy = proposed(&ctx, "policy-rev-2");
+        assert_eq!(other_policy.operation_identity, first.operation_identity);
+        assert_ne!(other_policy.candidate_digest, first.candidate_digest);
+        // Two distinct operation identities are also distinct candidates even
+        // when the policy revision is unchanged.
+        let other_operation = proposed(&other_ctx, "policy-rev-1");
+        assert_eq!(other_operation.policy_revision, first.policy_revision);
+        assert_ne!(other_operation.operation_identity, first.operation_identity);
+        assert_ne!(other_operation.candidate_digest, first.candidate_digest);
+        // The terms are mandatory, not defaulted: an unbound policy revision
+        // never reaches a candidate digest.
+        assert!(matches!(
+            block_on(owner.propose(
+                &ctx,
+                "skill-demo".to_owned(),
+                "b".repeat(64),
+                LifecycleAction::Patch,
+                vec!["evidence-1".to_owned()],
+                Vec::new(),
+                scope(),
+                "  ".to_owned(),
+            )),
+            Err(SkillError::InvalidField {
+                field: "candidate.policy_revision",
+                ..
+            })
+        ));
+        // A proposal never mutates owner state on its own: promotion, not
+        // proposal, is the transition that commits.
         assert_eq!(kernel.apply_count(), 0);
         assert!(kernel.committed.lock().expect("lock").is_empty());
     }

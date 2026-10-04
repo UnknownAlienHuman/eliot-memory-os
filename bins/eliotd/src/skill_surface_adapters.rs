@@ -89,6 +89,7 @@ impl<T: SkillLifecycleApi> SkillLifecyclePort for GovernorSkillForwarder<T> {
                     request.evidence_refs,
                     request.dependency_versions,
                     request.scope,
+                    request.policy_revision,
                 )
                 .await
         })
@@ -292,6 +293,7 @@ mod tests {
             evidence_refs: Vec<String>,
             dependencies: Vec<eliot_skill::DependencyVersion>,
             scope: SkillScope,
+            policy_revision: String,
         ) -> Result<SkillCandidate, SkillError> {
             SkillCandidate::new(
                 &self.base,
@@ -300,6 +302,8 @@ mod tests {
                 evidence_refs,
                 dependencies,
                 scope,
+                policy_revision,
+                ctx.request_id.as_str().to_owned(),
                 ctx.state_fence.clone(),
             )
         }
@@ -358,10 +362,12 @@ mod tests {
             vec!["evidence-1".to_owned()],
             Vec::new(),
             scope(),
+            "policy-rev-1",
         )
         .expect("proposal");
-        let candidate =
-            block_on(forwarder.propose_skill(&metadata(&fence), proposal)).expect("candidate");
+        let ctx = metadata(&fence);
+        let operation_identity = ctx.request_id.as_str().to_owned();
+        let candidate = block_on(forwarder.propose_skill(&ctx, proposal)).expect("candidate");
         let expected = SkillCandidate::new(
             &base,
             "b".repeat(64),
@@ -369,11 +375,15 @@ mod tests {
             vec!["evidence-1".to_owned()],
             Vec::new(),
             scope(),
+            "policy-rev-1".to_owned(),
+            operation_identity,
             fence,
         )
         .expect("expected candidate");
         assert_eq!(candidate, expected);
         assert_eq!(candidate.candidate_digest, expected.candidate_digest);
+        assert_eq!(candidate.policy_revision, "policy-rev-1");
+        assert_eq!(candidate.operation_identity, expected.operation_identity);
     }
 
     #[test]

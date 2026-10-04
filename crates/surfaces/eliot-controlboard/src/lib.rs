@@ -1293,6 +1293,11 @@ pub struct ProposeSkillRequest {
     pub dependency_versions: Vec<DependencyVersion>,
     /// Candidate scope.
     pub scope: SkillScope,
+    /// Exact governance policy revision the submitter claims to have decided
+    /// under. It travels with the request instead of being defaulted by the
+    /// owner, so the owning lifecycle binds it into the candidate and two
+    /// decisions taken under different policy revisions stay distinguishable.
+    pub policy_revision: String,
 }
 
 impl ProposeSkillRequest {
@@ -1304,6 +1309,7 @@ impl ProposeSkillRequest {
         evidence_refs: Vec<String>,
         dependency_versions: Vec<DependencyVersion>,
         scope: SkillScope,
+        policy_revision: impl Into<String>,
     ) -> Result<Self, ControlBoardError> {
         let request = Self {
             skill_id: skill_id.into(),
@@ -1312,6 +1318,7 @@ impl ProposeSkillRequest {
             evidence_refs,
             dependency_versions,
             scope,
+            policy_revision: policy_revision.into(),
         };
         request.validate()?;
         Ok(request)
@@ -1352,6 +1359,7 @@ impl ProposeSkillRequest {
         self.scope
             .validate()
             .map_err(|_| ControlBoardError::InvalidField("candidate.scope"))?;
+        text(&self.policy_revision, "candidate.policy_revision")?;
         Ok(())
     }
 }
@@ -3281,6 +3289,8 @@ mod tests {
             vec!["evidence-1".to_owned()],
             Vec::new(),
             skill_scope(),
+            "policy-rev-1".to_owned(),
+            "proposal-operation-1".to_owned(),
             fence.clone(),
         )
         .expect("candidate")
@@ -3327,6 +3337,7 @@ mod tests {
             vec!["evidence-1".to_owned()],
             Vec::new(),
             skill_scope(),
+            "policy-rev-1",
         )
         .expect("proposal");
         let returned = block_on(board.propose_skill_candidate(
@@ -3354,6 +3365,7 @@ mod tests {
             vec!["evidence-1".to_owned()],
             Vec::new(),
             skill_scope(),
+            "policy-rev-1",
         )
         .expect("proposal");
         assert_eq!(
