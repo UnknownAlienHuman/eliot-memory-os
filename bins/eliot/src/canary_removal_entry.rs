@@ -34,7 +34,6 @@
 
 use std::path::Path;
 
-use anyhow::Result;
 use eliot_installation::{
     CanaryRemovalPlan, CanaryRemovalPlanEnvelope, CanaryRemovalStage, CanaryRemovalStatus,
     InstallationError, ManagedEnvironmentChangeRequest, PlatformHandle, RedbInstallationRegistry,
@@ -82,11 +81,13 @@ const RECOVER_OPERATION: &str = "RECOVER";
 /// CLI's own installation scope comes from the owner type, so the same bytes
 /// `apply-canary-removal` decodes are exactly the bytes written here.
 ///
-/// The exit code is returned directly rather than wrapped: every step above is a
-/// typed refusal through `refuse`, so this route has no error to propagate and a
-/// `Result` here would be a wrapper around nothing. The three routes that project
-/// a status keep their `Result`, because `print_removal_status` can genuinely
-/// fail to render one.
+/// The exit code is returned directly rather than wrapped, and so is every route
+/// below it. Each step is a typed refusal through `refuse`, including the two
+/// rendering steps: `print_removal_status` returns the OWNER error type for a
+/// projection it cannot serialize, so no route on this surface has an error left
+/// to propagate and a `Result` here would be a wrapper around nothing. That is
+/// what makes "no `anyhow::Error` escapes these routes" true by construction
+/// rather than by inspection.
 pub fn run_plan_canary_removal(
     store_path: &Path,
     host_state_root: &Path,
@@ -146,7 +147,7 @@ pub fn run_plan_canary_removal(
 /// removal, not a refusal: the same explicit `Remove` authorization is
 /// decoded, the owner resolves the frozen plan, and the owner admits and
 /// drives that same plan. The durable disposition the owner returns is
-/// projected by `print_removal_status`, so the exit code follows the projected
+/// projected by `project_removal_status`, so the exit code follows the projected
 /// stage instead of a hardcoded success. The binary deletes nothing itself and
 /// adds no flag vocabulary of its own: both owner calls are the same seams the
 /// `plan-canary-removal` and `apply-canary-removal` commands use.
@@ -167,20 +168,20 @@ pub fn run_remove_canary(
     host_state_root: &Path,
     generation: &str,
     request_path: &Path,
-) -> Result<i32> {
+) -> i32 {
     let (target, request, store, registry) =
         match open_removal_owners(store_path, host_state_root, generation, request_path) {
             Ok(owners) => owners,
-            Err(error) => return Ok(refuse(PLAN_OPERATION, &error)),
+            Err(error) => return refuse(PLAN_OPERATION, &error),
         };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let plan = match coordinator.plan_canary_removal(&registry, &request, &target) {
         Ok(plan) => plan,
-        Err(error) => return Ok(refuse(PLAN_OPERATION, &error)),
+        Err(error) => return refuse(PLAN_OPERATION, &error),
     };
     match coordinator.apply_canary_removal(&registry, &plan) {
-        Ok(status) => print_removal_status(&status),
-        Err(error) => Ok(refuse(APPLY_OPERATION, &error)),
+        Ok(status) => project_removal_status(&status, APPLY_OPERATION),
+        Err(error) => refuse(APPLY_OPERATION, &error),
     }
 }
 
@@ -192,23 +193,23 @@ pub fn run_apply_canary_removal(
     store_path: &Path,
     host_state_root: &Path,
     plan_path: &Path,
-) -> Result<i32> {
+) -> i32 {
     let plan = match load_plan(plan_path) {
         Ok(plan) => plan,
-        Err(error) => return Ok(refuse(APPLY_OPERATION, &error)),
+        Err(error) => return refuse(APPLY_OPERATION, &error),
     };
     let store = match open_existing_store(store_path) {
         Ok(store) => store,
-        Err(error) => return Ok(refuse(APPLY_OPERATION, &error)),
+        Err(error) => return refuse(APPLY_OPERATION, &error),
     };
     let registry = match open_retained_registry_writer(host_state_root) {
         Ok(registry) => registry,
-        Err(error) => return Ok(refuse(APPLY_OPERATION, &error)),
+        Err(error) => return refuse(APPLY_OPERATION, &error),
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     match coordinator.apply_canary_removal(&registry, &plan) {
-        Ok(status) => print_removal_status(&status),
-        Err(error) => Ok(refuse(APPLY_OPERATION, &error)),
+        Ok(status) => project_removal_status(&status, APPLY_OPERATION),
+        Err(error) => refuse(APPLY_OPERATION, &error),
     }
 }
 
@@ -220,19 +221,19 @@ pub fn run_apply_canary_removal(
 /// reads through redb's `ReadOnlyDatabase` — a handle with no write path and no
 /// committing `Drop`. Nothing is created and no durable byte of the store or of
 /// the owner's registry changes. No external owner is touched.
-pub fn run_canary_removal_status(store_path: &Path, raw_removal_id: &str) -> Result<i32> {
+pub fn run_canary_removal_status(store_path: &Path, raw_removal_id: &str) -> i32 {
     let removal_id = match parse_installation_transaction_id(raw_removal_id) {
         Ok(handle) => handle,
-        Err(error) => return Ok(refuse(STATUS_OPERATION, &error)),
+        Err(error) => return refuse(STATUS_OPERATION, &error),
     };
     let store = match open_existing_store(store_path) {
         Ok(store) => store,
-        Err(error) => return Ok(refuse(STATUS_OPERATION, &error)),
+        Err(error) => return refuse(STATUS_OPERATION, &error),
     };
     let coordinator = WindowsInstallationCoordinator::new(store);
     match coordinator.canary_removal_status(&removal_id) {
-        Ok(status) => print_removal_status(&status),
-        Err(error) => Ok(refuse(STATUS_OPERATION, &error)),
+        Ok(status) => project_removal_status(&status, STATUS_OPERATION),
+        Err(error) => refuse(STATUS_OPERATION, &error),
     }
 }
 
@@ -244,23 +245,23 @@ pub fn run_recover_canary_removal(
     store_path: &Path,
     host_state_root: &Path,
     raw_removal_id: &str,
-) -> Result<i32> {
+) -> i32 {
     let removal_id = match parse_installation_transaction_id(raw_removal_id) {
         Ok(handle) => handle,
-        Err(error) => return Ok(refuse(RECOVER_OPERATION, &error)),
+        Err(error) => return refuse(RECOVER_OPERATION, &error),
     };
     let store = match open_existing_store(store_path) {
         Ok(store) => store,
-        Err(error) => return Ok(refuse(RECOVER_OPERATION, &error)),
+        Err(error) => return refuse(RECOVER_OPERATION, &error),
     };
     let registry = match open_retained_registry_writer(host_state_root) {
         Ok(registry) => registry,
-        Err(error) => return Ok(refuse(RECOVER_OPERATION, &error)),
+        Err(error) => return refuse(RECOVER_OPERATION, &error),
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     match coordinator.recover_canary_removal(&registry, &removal_id) {
-        Ok(status) => print_removal_status(&status),
-        Err(error) => Ok(refuse(RECOVER_OPERATION, &error)),
+        Ok(status) => project_removal_status(&status, RECOVER_OPERATION),
+        Err(error) => refuse(RECOVER_OPERATION, &error),
     }
 }
 
@@ -393,24 +394,51 @@ fn open_retained_registry_writer(
     })
 }
 
-/// Prints the stable removal disposition and exits zero only on `Completed`.
+/// Prints the stable removal disposition through `refuse`, exiting zero only on
+/// `Completed`.
 ///
 /// Exit zero alone is never proof: the `removal` object carries the effect
 /// identities, the blocking effect, the retained uncertainty and the next
-/// permitted action.
-fn print_removal_status(status: &CanaryRemovalStatus) -> Result<i32> {
+/// permitted action. A projection that cannot be rendered is a typed refusal on
+/// `operation`, never a bare `serde_json::Error` escaping through `run()`.
+fn project_removal_status(status: &CanaryRemovalStatus, operation: &str) -> i32 {
+    match print_removal_status(status, operation) {
+        Ok(code) => code,
+        Err(error) => refuse(operation, &error),
+    }
+}
+
+/// Renders one status, or names the member that could not be rendered.
+///
+/// It returns the owner error type so an unrenderable projection reaches the
+/// operator as this route's own `INSTALLATION_REMOVE_CANARY_*` code with a named
+/// member, exactly as an unbuildable scope handle does. A bare `serde_json::Error`
+/// here would escape through `run()` as anyhow's `Error: ...` with exit 1 and no
+/// code at all, which is the one escape hatch these routes must not have.
+fn print_removal_status(
+    status: &CanaryRemovalStatus,
+    operation: &str,
+) -> std::result::Result<i32, InstallationError> {
     let completed = status.stage == CanaryRemovalStage::Completed;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "contract": "eliot.kernel.installation",
-            "contract_version": INSTALLATION_CONTRACT_VERSION,
-            "status": serde_json::to_value(status.stage)?,
-            "completed": completed,
-            "scope": INSTALLATION_SCOPE,
-            "removal": serde_json::to_value(status)?,
-        }))?
-    );
+    // Each `to_value` is mapped on its own so the refusal names the member that
+    // could not be rendered, rather than one opaque error for the whole document.
+    let unrenderable = |member: &str, error: serde_json::Error| InstallationError::InvalidField {
+        field: format!("removal.{operation}.{member}"),
+        reason: format!("the CanaryRemovalStatus projection cannot be serialized: {error}"),
+    };
+    let stage =
+        serde_json::to_value(status.stage).map_err(|error| unrenderable("status", error))?;
+    let removal = serde_json::to_value(status).map_err(|error| unrenderable("removal", error))?;
+    let document = serde_json::to_string_pretty(&json!({
+        "contract": "eliot.kernel.installation",
+        "contract_version": INSTALLATION_CONTRACT_VERSION,
+        "status": stage,
+        "completed": completed,
+        "scope": INSTALLATION_SCOPE,
+        "removal": removal,
+    }))
+    .map_err(|error| unrenderable("document", error))?;
+    println!("{document}");
     Ok(if completed { 0 } else { INVALID_REQUEST_EXIT })
 }
 

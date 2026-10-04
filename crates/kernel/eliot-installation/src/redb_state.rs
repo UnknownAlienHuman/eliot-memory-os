@@ -1392,9 +1392,11 @@ impl RedbInstallationTransactionStore {
     ///   A walk-back therefore always raises `open` and lowers `started` only when
     ///   it came from `Removed`, so the pairs a NON-TERMINAL record can be walked
     ///   back into are `Admitted -> Admitted`, `Admitted -> Executing` and
-    ///   `Executing -> Executing`, all three of which the stage floor admits.
-    ///   Only a walk-back out of a terminal record reaches a pair it refuses, and
-    ///   there the refusal is about the stage, not about the row.
+    ///   `Executing -> Executing`, all three of which the stage floor admits. A fourth
+    ///   pair follows from the same premise and is refused TWICE over: a `Remove`
+    ///   row closed as `Resolved { Removed }` counts one `started`, so walking it
+    ///   back to `Pending` yields `Executing -> Admitted`, which
+    ///   `canary_removal_stage_advances` refuses as well as this arm.
     /// * What that re-drive costs is a SECOND visit to an owner that already
     ///   reported this row's postcondition, NOT a second mutating call. For a
     ///   `Remove` row `advance_row` reconciles BEFORE it executes, so a row whose
