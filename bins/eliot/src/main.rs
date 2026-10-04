@@ -345,14 +345,29 @@ enum InstallationCommand {
         #[arg(long, value_parser = absolute_path)]
         staging_root: PathBuf,
     },
-    /// Report the unsupported canary-removal seam without mutating the machine.
+    /// Remove one exact installed canary through the installation owner.
+    ///
+    /// The owner resolves the frozen removal plan from the explicit `Remove`
+    /// authorization and then admits and drives that same plan; the durable
+    /// disposition it returns is printed and the exit code follows the
+    /// projected stage. Foreign, ambiguous, replaced, production and
+    /// last-known-good targets fail with typed errors before any destructive
+    /// path exists. The binary deletes nothing itself.
     RemoveCanary {
-        /// Optional transaction store, accepted only to make the refusal scope explicit.
+        /// Absolute path to an existing transaction redb file. Never created.
         #[arg(long, value_parser = absolute_path)]
-        store: Option<PathBuf>,
-        /// Optional transaction identity, accepted only to make the refusal scope explicit.
+        store: PathBuf,
+        /// Absolute path to the retained per-installation Host state root
+        /// locating the accepted registry.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Exact generation to remove; must equal the request's exact candidate.
         #[arg(long)]
-        transaction_id: Option<String>,
+        generation: String,
+        /// Absolute path to the explicit Remove authorization JSON
+        /// (`ManagedEnvironmentChangeRequest`).
+        #[arg(long, value_parser = absolute_path)]
+        request: PathBuf,
     },
     /// Resolve one exact installed canary into a frozen read-only removal plan.
     ///
@@ -387,7 +402,9 @@ enum InstallationCommand {
         /// locating the accepted registry.
         #[arg(long, value_parser = absolute_path)]
         host_state_root: PathBuf,
-        /// Absolute path to the frozen `CanaryRemovalPlan` JSON.
+        /// Absolute path to the frozen `CanaryRemovalPlanEnvelope` JSON, exactly
+        /// as `plan-canary-removal` printed it. A bare `CanaryRemovalPlan` is
+        /// not accepted: the envelope is the only self-describing document.
         #[arg(long, value_parser = absolute_path)]
         plan: PathBuf,
     },
@@ -2322,23 +2339,11 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
         } => run_installation_runtime_status(&host_state_root, deadline_ms),
         InstallationCommand::RemoveCanary {
             store,
-            transaction_id,
+            host_state_root,
+            generation,
+            request,
         } => {
-            let scope = match (store, transaction_id) {
-                (Some(store), Some(transaction_id)) => {
-                    format!(" for transaction {transaction_id} in {}", store.display())
-                }
-                (Some(store), None) => format!(" for store {}", store.display()),
-                (None, Some(transaction_id)) => format!(" for transaction {transaction_id}"),
-                (None, None) => String::new(),
-            };
-            write_installation_error(
-                "INSTALLATION_REMOVE_CANARY_UNSUPPORTED",
-                &format!(
-                    "remove-canary{scope} is not implemented: no durable canary removal, activation, or generation-retirement API exists; no filesystem or SCM mutation was attempted"
-                ),
-            );
-            Ok(INVALID_REQUEST_EXIT)
+            canary_removal_entry::run_remove_canary(&store, &host_state_root, &generation, &request)
         }
         InstallationCommand::PlanCanaryRemoval {
             store,
