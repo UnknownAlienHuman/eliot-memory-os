@@ -46,7 +46,7 @@
         "note": "recorded so the 5535 draft line count cannot be mistaken for a revision of this file; the evidence that it matches no revision in the 45-commit history of this path is in re_derived.re_derived_against_lib_line_count_status"
       }
     },
-    "staleness_note": "WHAT THIS BLOCK'S COORDINATES ACTUALLY DESCRIBE. Every inventory span, digest, safety_line and safety_distance in this file describes crates/eliot-windows-ipc/src/lib.rs AS OF 73b3be03a1b70e98e0624c98e7087e5609dfae44, the #789 delivery commit: sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f, 231978 bytes, 5578 lines. The coordinates are PINNED TO THAT REF, as files[0] records, and they are not a claim about the bytes present in the tree now. THE 5535 PAIR IS UNATTRIBUTABLE. The pair (5535 lines, sha256 sha256:7b7171822cf1df44dc00dee134adb85dd075e3a30c7cb109d65ebce2fd572869) is retained below as the historical record of what a previous writer claimed for the ref 3c6305dcc6b7, and it describes no bytes that exist in this repository: that digest matches zero of the repository's git objects, and 5535 is the line count of no revision of this path in its 45-commit history. It is not the operative measurement of this block and must not be read as one. It previously appeared here as the operative statement ('re-derived from the worktree bytes ... at HEAD 3c6305dcc6b7 (5535 lines, sha256 sha256:7b717182...)'), which made a staleness acknowledgement double as the carrier of two values that cannot be attributed to any ref. WHAT THE STALENESS CORRECTION ACTUALLY ESTABLISHED. The previously recorded coordinates described an earlier revision and were genuinely stale: 93 of 107 spans no longer contained the token `unsafe` and 107 of 107 digests no longer equalled the sha256 of the bytes at their own stated span, and no stale span was deleted or reworded to force a digest match. That correction is retained. It was not, however, performed against the bytes of 3c6305dcc6b7: at that ref the file is 5066 lines, so 5578-line-file coordinates cannot describe a 5066-line file. MEASUREMENT AGAINST THE PRESENT TREE, performed at this repair. The present file is sha256:8220cd5ea8fc028867916b39fa03fbd03eba1382d8b9735c711dbe48afe3f8ce, 233572 bytes, 5601 lines. Against those bytes the recorded coordinates still resolve: 107 of 107 recorded spans contain the token `unsafe` and 107 of 107 recorded digests recompute exactly, because every recorded span ends at or before line 4211 while the 73b3be03a-to-present diff for this path begins at line 5013. So files[0] is not current, and the inventory array is nevertheless not wholesale stale against the present tree. WHAT IS STILL STALE. files[0] itself is the delivery commit and not the present file: the present tree is +1594 bytes and +23 lines on files[0]. The 107 inventory spans were NOT re-derived against the present tree, and nothing in this file may be read as saying they were. They were also not re-derived at this repair: re-deriving them is a separate job, and inventing coordinates is forbidden. NO RE-DERIVATION WAS PERFORMED BY THIS REPAIR. Every value labelled CURRENT or UNATTRIBUTABLE in this block was measured at this repair with git plumbing only (`git show`, `git rev-parse`, `git rev-list`, `git cat-file --batch-all-objects`) plus one read of this fixture; no build, test or cargo command was run. Re-deriving the 107 spans against the present tree remains outstanding.",
+    "staleness_note": "WHAT THIS BLOCK'S COORDINATES ACTUALLY DESCRIBE. Every inventory span, digest, safety_line and safety_distance in this file was derived from crates/eliot-windows-ipc/src/lib.rs AS OF 73b3be03a1b70e98e0624c98e7087e5609dfae44, the #789 delivery commit: sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f, 231978 bytes, 5578 lines. That ref is where the DERIVATION was performed, and the recipe is unchanged: the #754 oracle's own mask_non_code and PATTERNS[\"unsafe\"] plus the one documented char-literal-versus-lifetime correction, expanded to the maximal balanced unsafe use, with the cfg-gated test item removed. THE COORDINATES HAVE SINCE BEEN RE-DERIVED AGAINST THE PRESENT TREE, and every one of the 107 rows now reproduces there: 107 of 107 recorded digests recompute exactly from the bytes at their own stated span, 107 of 107 spans contain the token `unsafe`, 107 of 107 safety_line values land on a `// SAFETY` comment, and all 107 safety_distance values equal span[0] minus safety_line. WHAT MOVED, AND WHY. The 107 span TEXTS are byte-for-byte unchanged: not one site was split, merged, absorbed, reworded or deleted, and every recorded digest is reproduced from the present file. Only the line COORDINATES moved. 30 sites did not move and 77 did, because the 73b3be03a-to-present diff grows the file by +61 lines through SAFETY-prose insertions at pinned lines 1589, 1659, 2226 and 2854, every one of which sits above the affected sites. A PRIOR CLAIM IN THIS BLOCK WAS REFUTED, AND IT MATTERS BECAUSE IT WAS THE REASON RE-DERIVATION WAS DEFERRED. This block previously argued re-derivation was unnecessary, on the grounds that \"every recorded span ends at or before line 4211 while the 73b3be03a-to-present diff for this path begins at line 5013\". That is false: the diff begins at pinned line 1589, which is 3424 lines above 5013 and above the great majority of the recorded spans. Measured against those stale coordinates, only 30 of 107 recorded digests recomputed, against 107 of 107 at 73b3be03a. The 5013 argument is retained as the record of why the coordinates were wrong, never as a reason they were safe. THE 5535 PAIR IS UNATTRIBUTABLE, AND REMAINS SO. The pair (5535 lines, sha256 sha256:7b7171822cf1df44dc00dee134adb85dd075e3a30c7cb109d65ebce2fd572869) is the historical record of what a previous writer claimed for the ref 3c6305dcc6b7, and it describes no bytes in this repository: that digest matches zero of the repository's git objects, and 5535 is the line count of no revision of this path in its 45-commit history. AN EARLIER STALENESS FINDING WAS REAL AND IS KEPT. An earlier repair measured, at an older base, that 93 of 107 spans no longer contained the token `unsafe` and that 107 of 107 digests no longer equalled the sha256 of the bytes at their own stated span. That was correct for the bytes it was taken against, and no stale span was deleted or reworded to force a digest match then or now. WHAT THIS RE-DERIVATION DID NOT DO. It changed no digest, no span text, no family assignment, no bound and no ADR disposition; it moved coordinates and corrected prose that asserted a refuted measurement. It ran no cargo command and executed no test, so the 42 case bodies remain bound but unexecuted. One measured bound did widen and is stated rather than smoothed: max safety_distance is now 18, not the previously recorded 10, because two SAFETY justification blocks are longer on the present tree (S31 at distance 18, whose comment block now ends at its span's first line, and S65 at distance 12). No justification was lost.",
     "previous_freeze_commit": "a70fd5a3d6c409c798d5d7d80079b1c742e05d54",
     "previous_freeze_validity": "the wave-2 coordinates resolved 105/105 only at a70fd5a3d6c409c798d5d7d80079b1c742e05d54; the issue's own second and later merges shifted them, so every wave-2 line coordinate is stale on the freeze base and is superseded by this inventory",
     "files": [
@@ -62,12 +62,12 @@
         "line_count": 5578,
         "measured_at_describes_ref": "measured at this repair with `git show 73b3be03a:crates/eliot-windows-ipc/src/lib.rs`: sha256:b30d6e9e4afbb12776e771d4ef971f0ad328ed46fa570e0d3120ba45244cd78f, 231978 bytes, 5578 lines, git blob c52650cbb0648c40746f386afcfb67bba9257008. All three values reproduce exactly.",
         "staleness_against_present_tree": {
-          "present_sha256": "sha256:8220cd5ea8fc028867916b39fa03fbd03eba1382d8b9735c711dbe48afe3f8ce",
-          "present_bytes": 233572,
-          "present_line_count": 5601,
-          "measured_delta": "+1594 bytes, +23 lines on this row (233572-231978, 5601-5578)",
-          "coordinates_pinned_to_named_ref": "the 107 inventory span/digest coordinates elsewhere in this file are pinned to this row's describes_ref, 73b3be03a, and were NOT re-derived against the present tree. They were not re-derived at this repair either: re-derivation is a separate job and inventing coordinates is forbidden. Every recorded span ends at or before line 4211 and the 73b3be03a-to-present diff for this path begins at line 5013, so the 107 spans and digests do still resolve on the present bytes, but that is a measured coincidence of where the file grew, not a re-derivation and not a currency claim.",
-          "outstanding_work": "re-deriving the 107 spans against the present tree is outstanding and is deliberately not attempted here"
+          "present_sha256": "sha256:ae078d98bfcd701ef4405eef8c25f06a16f0501a4bfb72083ec08a7424f191ec",
+          "present_bytes": 236494,
+          "present_line_count": 5639,
+          "measured_delta": "+4516 bytes, +61 lines on this row (236494-231978, 5639-5578)",
+          "coordinates_pinned_to_named_ref": "MEASURED on the present tree, refuting the argument this field previously carried: the 73b3be03a-to-present diff for this path does NOT begin at line 5013. It begins at pinned line 1589 (19 hunks before 5013), which is why 77 of the 107 coordinates had gone stale. The 107 span TEXTS are byte-for-byte unchanged -- every recorded digest reproduces from the present file -- so this is a coordinate shift and not a content change; 30 sites did not move and 77 did. All coordinates, digests, safety_line and safety_distance in this file have now been re-derived against the present tree and reproduce 107/107 there.",
+          "outstanding_work": "COMPLETE: the 107 spans, digests, safety_line and safety_distance were re-derived against the present tree and reproduce 107/107 there. The recipe, the owner oracle and the one documented char-literal correction are unchanged; only coordinates moved."
         }
       },
       {
@@ -2707,7 +2707,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Storage/FileSystem/fn.SetFileInformationByHandle.html",
       "family": "notify-move-file",
       "bound": "borrowed live &File handle opened with DELETE access; FILE_DISPOSITION_INFO is a value-initialised local with the exact struct layout and a u32-checked size; zero return fails with last_os_error and leaves the object unretired instead of dropping the handle as a successful cleanup",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:781, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:781, 2 line(s) above the derived span. First line: // SAFETY: this live handle was opened with DELETE access, and the",
       "safety_line": 781,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2749,7 +2749,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Storage/FileSystem/fn.GetFileInformationByHandle.html",
       "family": "pipe-process-identity",
       "bound": "borrowed live &File handle; BY_HANDLE_FILE_INFORMATION is a valid exclusive out-pointer; zero return fails with last_os_error, never a default identity",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:801, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:801, 1 line(s) above the derived span. First line: // SAFETY: the file handle is live and `information` is a valid out pointer.",
       "safety_line": 801,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2788,7 +2788,7 @@
       "signature_source": "reference: Rust Reference, unsafe trait implementations / Send",
       "family": "oplock-async",
       "bound": "moved-never-shared unique ownership of directory File, exactly-once-close event and heap-pinned OVERLAPPED/buffers; Sync deliberately absent; Drop cancels then drains-or-leaks before release",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:873, 10 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:873, 10 line(s) above the derived span. First line: // SAFETY: transfer across threads moves unique ownership of the directory",
       "safety_line": 873,
       "safety_distance": 10,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2827,7 +2827,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.CreateEventW.html",
       "family": "oplock-async",
       "bound": "unnamed event owned here; boxed OVERLAPPED/buffers at stable addresses in the returned guard; only ERROR_IO_PENDING accepted (sync completion or other errors fail closed with no pending request)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:916, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:916, 1 line(s) above the derived span. First line: // SAFETY: null security/name pointers request an unnamed event owned here.",
       "safety_line": 916,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2865,7 +2865,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/IO/fn.DeviceIoControl.html",
       "family": "oplock-async",
       "bound": "unnamed event owned here; boxed OVERLAPPED/buffers at stable addresses in the returned guard; only ERROR_IO_PENDING accepted (sync completion or other errors fail closed with no pending request)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:945, 4 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:945, 4 line(s) above the derived span. First line: // SAFETY: the file/event are live, all buffers are boxed and remain at",
       "safety_line": 945,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2903,7 +2903,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "oplock-async",
       "bound": "event live for the guard lifetime; zero-timeout poll only (OBJECT_0 true, TIMEOUT false); any other code is an error, never silence",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1035, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1035, 2 line(s) above the derived span. First line: // SAFETY: event remains live for the complete guard lifetime.",
       "safety_line": 1035,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2938,7 +2938,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/IO/fn.CancelIoEx.html",
       "family": "oplock-async",
       "bound": "CancelIoEx on the exact handle plus OVERLAPPED, handle close, bounded 5s drain; buffers freed only on WAIT_OBJECT_0, otherwise intentionally leaked (fail-closed against late kernel completion write-after-free)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1089, 3 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1089, 3 line(s) above the derived span. First line: // SAFETY: the pending request belongs to this exact file handle and",
       "safety_line": 1089,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -2978,7 +2978,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "oplock-async",
       "bound": "CancelIoEx on the exact handle plus OVERLAPPED, handle close, bounded 5s drain; buffers freed only on WAIT_OBJECT_0, otherwise intentionally leaked (fail-closed against late kernel completion write-after-free)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1100, 3 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1100, 3 line(s) above the derived span. First line: // SAFETY: the event outlives this body (it is a later struct",
       "safety_line": 1100,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3018,7 +3018,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Pipes/fn.GetNamedPipeClientProcessId.html",
       "family": "pipe-process-identity",
       "bound": "Tokio-owned live server handle; pid out-pointer valid; zero return or pid 0 fails before any identity use",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1180, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1180, 2 line(s) above the derived span. First line: // SAFETY: Tokio owns a live server-end pipe handle and `pid` is a valid out pointer.",
       "safety_line": 1180,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3054,7 +3054,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.CloseHandle.html",
       "family": "pipe-process-identity",
       "bound": "handle returned by OpenProcessToken, closed exactly once here",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1211, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1211, 1 line(s) above the derived span. First line: // SAFETY: the handle came from OpenProcessToken and closes once here.",
       "safety_line": 1211,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3089,7 +3089,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.GetCurrentProcess.html",
       "family": "pipe-process-identity",
       "bound": "current-process pseudo-handle needs no close; token closed exactly once by the local TokenGuard; size probe then bounded (1..=4096) 8-aligned query; TOKEN_USER read at the aligned buffer start",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1218, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1218, 2 line(s) above the derived span. First line: // SAFETY: `token` is a valid out-pointer; the current-process",
       "safety_line": 1218,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3130,7 +3130,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/fn.GetTokenInformation.html",
       "family": "pipe-process-identity",
       "bound": "current-process pseudo-handle needs no close; token closed exactly once by the local TokenGuard; size probe then bounded (1..=4096) 8-aligned query; TOKEN_USER read at the aligned buffer start",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1227, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1227, 2 line(s) above the derived span. First line: // SAFETY: probing the required size with a null buffer; the length",
       "safety_line": 1227,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3171,7 +3171,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/fn.GetTokenInformation.html",
       "family": "pipe-process-identity",
       "bound": "current-process pseudo-handle needs no close; token closed exactly once by the local TokenGuard; size probe then bounded (1..=4096) 8-aligned query; TOKEN_USER read at the aligned buffer start",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1251, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1251, 2 line(s) above the derived span. First line: // SAFETY: the buffer is live for `capacity` bytes; the length",
       "safety_line": 1251,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3212,7 +3212,7 @@
       "signature_source": null,
       "family": "pipe-process-identity",
       "bound": "current-process pseudo-handle needs no close; token closed exactly once by the local TokenGuard; size probe then bounded (1..=4096) 8-aligned query; TOKEN_USER read at the aligned buffer start",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1265, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1265, 2 line(s) above the derived span. First line: // SAFETY: the successful query wrote a TOKEN_USER at the aligned",
       "safety_line": 1265,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3253,7 +3253,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Authorization/fn.ConvertSidToStringSidW.html",
       "family": "pipe-process-identity",
       "bound": "SID live and caller-owned; LocalAlloc string freed exactly once on every path; length bounded (1..512); S- prefix enforced",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1279, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1279, 2 line(s) above the derived span. First line: // SAFETY: `sid` is a live SID owned by the caller; `wide` receives a",
       "safety_line": 1279,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3295,7 +3295,7 @@
       "signature_source": null,
       "family": "pipe-process-identity",
       "bound": "SID live and caller-owned; LocalAlloc string freed exactly once on every path; length bounded (1..512); S- prefix enforced",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1286, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1286, 2 line(s) above the derived span. First line: // SAFETY: `wide` is a live NUL-terminated string; reads stop at",
       "safety_line": 1286,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3337,7 +3337,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.LocalFree.html",
       "family": "pipe-process-identity",
       "bound": "SID live and caller-owned; LocalAlloc string freed exactly once on every path; length bounded (1..512); S- prefix enforced",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1297, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1297, 1 line(s) above the derived span. First line: // SAFETY: `wide` is the live `LocalAlloc` string from the conversion.",
       "safety_line": 1297,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3379,7 +3379,7 @@
       "signature_source": "https://doc.rust-lang.org/std/primitive.slice.html#method.from_raw_parts",
       "family": "pipe-process-identity",
       "bound": "SID live and caller-owned; LocalAlloc string freed exactly once on every path; length bounded (1..512); S- prefix enforced",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1306, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1306, 1 line(s) above the derived span. First line: // SAFETY: `wide` holds `len` live units; freed exactly once below.",
       "safety_line": 1306,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3421,7 +3421,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.LocalFree.html",
       "family": "pipe-process-identity",
       "bound": "SID live and caller-owned; LocalAlloc string freed exactly once on every path; length bounded (1..512); S- prefix enforced",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1309, 2 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1309, 2 line(s) above the derived span. First line: // SAFETY: `wide` is the live `LocalAlloc` string from the conversion",
       "safety_line": 1309,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3463,7 +3463,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.LocalFree.html",
       "family": "pipe-process-identity",
       "bound": "SID live and caller-owned; LocalAlloc string freed exactly once on every path; length bounded (1..512); S- prefix enforced",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1316, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1316, 1 line(s) above the derived span. First line: // SAFETY: `wide` is the live `LocalAlloc` string from the conversion above.",
       "safety_line": 1316,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3505,7 +3505,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.QueryFullProcessImageNameW.html",
       "family": "pipe-process-identity",
       "bound": "retained OwnedHandle live; image buffer owns chars initialized u16 slots; callee retains nothing; length strictly validated (nonzero and below buffer length, else fail-closed)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1346, 6 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1346, 6 line(s) above the derived span. First line: // SAFETY: `process` is a live retained handle (every constructor wraps it",
       "safety_line": 1346,
       "safety_distance": 6,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3549,7 +3549,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.OpenProcess.html",
       "family": "pipe-process-identity",
       "bound": "nonzero PID; OpenProcess handle immediately wrapped in OwnedHandle; image queried through the retained handle; executable pinned against replacement",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1396, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1396, 1 line(s) above the derived span. First line: // SAFETY: `pid` is only used by Windows to resolve a process handle.",
       "safety_line": 1396,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3589,7 +3589,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.OpenProcess.html",
       "family": "pipe-process-identity",
       "bound": "nonzero PID; query plus terminate handle retained; image queried and pinned; PID reuse and executable replacement prevented between verify and terminate",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1439, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1439, 1 line(s) above the derived span. First line: // SAFETY: `pid` is only used by Windows to resolve a process handle.",
       "safety_line": 1439,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3624,7 +3624,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.TerminateProcess.html",
       "family": "pipe-process-identity",
       "bound": "retained handle live for the call; already-verified process only",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1481, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1481, 1 line(s) above the derived span. First line: // SAFETY: the retained process handle is live for the call.",
       "safety_line": 1481,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3658,7 +3658,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "pipe-process-identity",
       "bound": "millis clamped below u32::MAX; retained handle live; OBJECT_0 versus TIMEOUT distinguished, other codes are errors",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1502, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1502, 1 line(s) above the derived span. First line: // SAFETY: the retained process handle is live for the call.",
       "safety_line": 1502,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3693,7 +3693,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.CreateJobObjectW.html",
       "family": "job-iocp-spawn",
       "bound": "unnamed job owned here with both sentinels rejected; exact extended-limit struct; numeric PID opened with quota plus terminate then assigned; every early return drops exactly once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1531, 4 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1531, 4 line(s) above the derived span. First line: // SAFETY: null name and security pointers request an unnamed job owned",
       "safety_line": 1531,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3733,7 +3733,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.SetInformationJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "unnamed job owned here with both sentinels rejected; exact extended-limit struct; numeric PID opened with quota plus terminate then assigned; every early return drops exactly once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1544, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1544, 1 line(s) above the derived span. First line: // SAFETY: `job` is live and `info` has the exact structure required by the selected class.",
       "safety_line": 1544,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3773,7 +3773,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.OpenProcess.html",
       "family": "job-iocp-spawn",
       "bound": "unnamed job owned here with both sentinels rejected; exact extended-limit struct; numeric PID opened with quota plus terminate then assigned; every early return drops exactly once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1556, 3 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1556, 3 line(s) above the derived span. First line: // SAFETY: numeric PID is provided by the freshly spawned child.",
       "safety_line": 1556,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3813,7 +3813,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.AssignProcessToJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "unnamed job owned here with both sentinels rejected; exact extended-limit struct; numeric PID opened with quota plus terminate then assigned; every early return drops exactly once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1562, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1562, 1 line(s) above the derived span. First line: // SAFETY: both handles are live for the duration of the call.",
       "safety_line": 1562,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3853,7 +3853,7 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.TerminateJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "live OwnedHandle job outlives the call",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1577, 1 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1577, 1 line(s) above the derived span. First line: // SAFETY: `self.job` is a live `OwnedHandle` that outlives this call.",
       "safety_line": 1577,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
@@ -3874,8 +3874,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "unsafe impl Send for OwnedHandle {}",
       "span": [
-        1597,
-        1597
+        1606,
+        1606
       ],
       "digest": "sha256:12769abe2c8487e72737bd1d034af06fef7aa1736d3bfee84d9143fcf7bf7467",
       "content_unchanged_in_worktree": true,
@@ -3887,9 +3887,9 @@
       "signature_source": "reference: Rust Reference, unsafe trait implementations / Send",
       "family": "shared-handle-core",
       "bound": "unique HANDLE owner: created only via new (null and INVALID_HANDLE_VALUE rejected), closed exactly once in Drop or moved once into File via into_file plus forget; Sync deliberately absent",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1588, 9 line(s) above the derived span",
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1588, 18 line(s) above the derived span. First line: // SAFETY: a Windows kernel handle value is usable from any thread. This",
       "safety_line": 1588,
-      "safety_distance": 9,
+      "safety_distance": 18,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::unsafe impl Send for OwnedHandle {}",
       "callers": [
@@ -3913,8 +3913,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "OwnedHandle::into_file",
       "span": [
-        1618,
-        1618
+        1627,
+        1627
       ],
       "digest": "sha256:ebc7950c40b7e5673a8508d005d49f8c7e4aeb3e6a22644d67eefee44abc00c1",
       "content_unchanged_in_worktree": true,
@@ -3926,8 +3926,8 @@
       "signature_source": "https://doc.rust-lang.org/std/fs/struct.File.html#method.from_raw_handle",
       "family": "shared-handle-core",
       "bound": "live handle moves into File exactly once; forget prevents a double close",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1617, 1 line(s) above the derived span",
-      "safety_line": 1617,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1626, 1 line(s) above the derived span. First line: // SAFETY: ownership of the live handle moves into File exactly once.",
+      "safety_line": 1626,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::OwnedHandle::into_file",
@@ -3948,8 +3948,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "OwnedHandle::drop",
       "span": [
-        1638,
-        1638
+        1647,
+        1647
       ],
       "digest": "sha256:54281e34ea6cfd0dbcc9df81b825c4604808d42d8b38c7d4f81818dfaf262d6d",
       "content_unchanged_in_worktree": true,
@@ -3961,8 +3961,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.CloseHandle.html",
       "family": "shared-handle-core",
       "bound": "unique owner until Drop; both sentinels re-checked so neither reaches CloseHandle; exactly-once close",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1634, 4 line(s) above the derived span",
-      "safety_line": 1634,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1643, 4 line(s) above the derived span. First line: // SAFETY: the wrapper uniquely owns the handle until this Drop;",
+      "safety_line": 1643,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::OwnedHandle::drop",
@@ -3987,8 +3987,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "create_kill_on_close_job",
       "span": [
-        1658,
-        1658
+        1667,
+        1667
       ],
       "digest": "sha256:a9ebeb1bdb7ec24c7220b50a1008fddefe1b6a38bbc095e32e24928fed96c5c7",
       "content_unchanged_in_worktree": true,
@@ -4000,8 +4000,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.CreateJobObjectW.html",
       "family": "job-iocp-spawn",
       "bound": "NUL-terminated name with live SDDL descriptor and attributes for creation; GetLastError read immediately (AlreadyExists rejects a silent join to an orphaned job); exact limit struct; every path owns-or-drops once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1656, 2 line(s) above the derived span",
-      "safety_line": 1656,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1665, 2 line(s) above the derived span. First line: // SAFETY: the name is NUL-terminated and the security descriptor and",
+      "safety_line": 1665,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::create_kill_on_close_job",
@@ -4023,8 +4023,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "create_kill_on_close_job",
       "span": [
-        1659,
-        1659
+        1677,
+        1677
       ],
       "digest": "sha256:0e3cbaf7744d0deba76ec11695277840c0ff526ca9797fc9069fcdb53857b2ff",
       "content_unchanged_in_worktree": true,
@@ -4036,9 +4036,9 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.GetLastError.html",
       "family": "job-iocp-spawn",
       "bound": "NUL-terminated name with live SDDL descriptor and attributes for creation; GetLastError read immediately (AlreadyExists rejects a silent join to an orphaned job); exact limit struct; every path owns-or-drops once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1656, 3 line(s) above the derived span",
-      "safety_line": 1656,
-      "safety_distance": 3,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1668, 9 line(s) above the derived span. First line: // SAFETY: `GetLastError` is a parameterless accessor: it takes no name, no",
+      "safety_line": 1668,
+      "safety_distance": 9,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::create_kill_on_close_job",
       "callers": [
@@ -4059,8 +4059,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "create_kill_on_close_job",
       "span": [
-        1676,
-        1683
+        1694,
+        1701
       ],
       "digest": "sha256:cde33784174e22ed908f7b10ee2e2e3fd644181edf3b7468707aa34f43d0391f",
       "content_unchanged_in_worktree": true,
@@ -4072,8 +4072,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.SetInformationJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "NUL-terminated name with live SDDL descriptor and attributes for creation; GetLastError read immediately (AlreadyExists rejects a silent join to an orphaned job); exact limit struct; every path owns-or-drops once",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1675, 1 line(s) above the derived span",
-      "safety_line": 1675,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1693, 1 line(s) above the derived span. First line: // SAFETY: job is live and info has the exact selected Job Object layout.",
+      "safety_line": 1693,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::create_kill_on_close_job",
@@ -4095,8 +4095,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "inheritable_pipe",
       "span": [
-        1704,
-        1704
+        1722,
+        1722
       ],
       "digest": "sha256:c7be1fe1746cf5655bc16799740ebe56d40b3cbfc481f9d3b2d8989e67a7037c",
       "content_unchanged_in_worktree": true,
@@ -4108,8 +4108,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Pipes/fn.CreatePipe.html",
       "family": "job-iocp-spawn",
       "bound": "valid out-pointers and attributes; on success both ends wrapped in OwnedHandle (no partial ownership)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1703, 1 line(s) above the derived span",
-      "safety_line": 1703,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1721, 1 line(s) above the derived span. First line: // SAFETY: output pointers and the security-attribute pointer are valid for the call.",
+      "safety_line": 1721,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::inheritable_pipe",
@@ -4130,8 +4130,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "make_non_inheritable",
       "span": [
-        1713,
-        1713
+        1731,
+        1731
       ],
       "digest": "sha256:f9432dea50526f9461ba72990c9c0455eaa3e42cfed31d344124ce0dac1c283f",
       "content_unchanged_in_worktree": true,
@@ -4143,8 +4143,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.SetHandleInformation.html",
       "family": "job-iocp-spawn",
       "bound": "live handle; SetHandleInformation retains nothing",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1712, 1 line(s) above the derived span",
-      "safety_line": 1712,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1730, 1 line(s) above the derived span. First line: // SAFETY: handle is live and SetHandleInformation does not retain it.",
+      "safety_line": 1730,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::make_non_inheritable",
@@ -4164,8 +4164,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "JobProcessObserver::attach",
       "span": [
-        1830,
-        1830
+        1848,
+        1848
       ],
       "digest": "sha256:9dc196d83472d54480e4e9a7c86a546a0f2e11df5ca08ebd353dad7f14dc2d5c",
       "content_unchanged_in_worktree": true,
@@ -4177,8 +4177,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/IO/fn.CreateIoCompletionPort.html",
       "family": "job-iocp-spawn",
       "bound": "INVALID_HANDLE_VALUE plus null creates a standalone owned IOCP; exact association struct; observer thread spawned with the raw port value and joined before the port drops (shutdown posts a deterministic key)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1828, 2 line(s) above the derived span",
-      "safety_line": 1828,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1846, 2 line(s) above the derived span. First line: // SAFETY: INVALID_HANDLE_VALUE plus a null existing port creates a standalone IOCP.",
+      "safety_line": 1846,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::attach",
@@ -4199,8 +4199,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "JobProcessObserver::attach",
       "span": [
-        1844,
-        1851
+        1862,
+        1869
       ],
       "digest": "sha256:29f1b8464133cb170ec7777612c7750a7cfe7a9d1877f2aeca735514fb7ad46e",
       "content_unchanged_in_worktree": true,
@@ -4212,8 +4212,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.SetInformationJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "INVALID_HANDLE_VALUE plus null creates a standalone owned IOCP; exact association struct; observer thread spawned with the raw port value and joined before the port drops (shutdown posts a deterministic key)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1843, 1 line(s) above the derived span",
-      "safety_line": 1843,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1861, 1 line(s) above the derived span. First line: // SAFETY: the job and completion port are live and the association has the exact class shape.",
+      "safety_line": 1861,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::attach",
@@ -4234,8 +4234,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "JobProcessObserver::shutdown",
       "span": [
-        1995,
-        2002
+        2013,
+        2020
       ],
       "digest": "sha256:e410718edfb76e30b5f1adab1de74a72863fc7c8cca4045c9e2c9b2926fcaac8",
       "content_unchanged_in_worktree": true,
@@ -4247,8 +4247,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/IO/fn.PostQueuedCompletionStatus.html",
       "family": "job-iocp-spawn",
       "bound": "port live until the thread is joined; deterministic shutdown key posted, thread taken and joined exactly once; Drop calls shutdown",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:1994, 1 line(s) above the derived span",
-      "safety_line": 1994,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2012, 1 line(s) above the derived span. First line: // SAFETY: the completion port stays live until the observer thread is joined.",
+      "safety_line": 2012,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::shutdown",
@@ -4269,8 +4269,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "job_process_observer_loop",
       "span": [
-        2035,
-        2043
+        2053,
+        2061
       ],
       "digest": "sha256:fa62a11b30fb9a190c92d7760a6807587b8991d3f62a7d5241cbadf07a70ea78",
       "content_unchanged_in_worktree": true,
@@ -4282,8 +4282,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/IO/fn.GetQueuedCompletionStatus.html",
       "family": "job-iocp-spawn",
       "bound": "IOCP owned by the observer; out-pointers live per call; blocking dequeue; shutdown key breaks the loop; foreign keys and messages skipped; PIDs captured via open_process_identity with contained failures",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2034, 1 line(s) above the derived span",
-      "safety_line": 2034,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2052, 1 line(s) above the derived span. First line: // SAFETY: the IOCP is owned by the observer and all out pointers are live for the call.",
+      "safety_line": 2052,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::job_process_observer_loop",
@@ -4305,8 +4305,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "job_process_observer_loop",
       "span": [
-        2047,
-        2047
+        2065,
+        2065
       ],
       "digest": "sha256:4dd45a36fd321684e2575318183368ae20338d38a46685602aa0bec1b1ffbb3e",
       "content_unchanged_in_worktree": true,
@@ -4318,8 +4318,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.GetLastError.html",
       "family": "job-iocp-spawn",
       "bound": "no pointer preconditions; read immediately after GetQueuedCompletionStatus returned zero and before any other call can replace the calling thread's last-error code, so the dequeue failure is classified as WAIT_TIMEOUT versus an abnormal exit without inventing an error",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2045, 2 line(s) above the derived span",
-      "safety_line": 2045,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2063, 2 line(s) above the derived span. First line: // SAFETY: GetLastError has no pointer preconditions.",
+      "safety_line": 2063,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::job_process_observer_loop",
@@ -4343,8 +4343,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "ProcThreadAttributeList::for_inherited_handles",
       "span": [
-        2117,
-        2119
+        2135,
+        2137
       ],
       "digest": "sha256:d5f15910d8587bf78cb5df982b7e0e9ede159920998c657a2d7fc0b061c1b34e",
       "content_unchanged_in_worktree": true,
@@ -4356,8 +4356,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.InitializeProcThreadAttributeList.html",
       "family": "job-iocp-spawn",
       "bound": "empty list rejected before FFI; documented null-list sizing call; pointer-aligned owned storage sized from the probe; exact checked byte size; initialized list deleted on update failure",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2115, 2 line(s) above the derived span",
-      "safety_line": 2115,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2133, 2 line(s) above the derived span. First line: // SAFETY: the documented sizing call uses a null list and writes only",
+      "safety_line": 2133,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::ProcThreadAttributeList::for_inherited_handles",
@@ -4379,8 +4379,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "ProcThreadAttributeList::for_inherited_handles",
       "span": [
-        2128,
-        2128
+        2146,
+        2146
       ],
       "digest": "sha256:11c1383e177664f63e85996f2ebcccf2ac2ed2d3ae0cf3f50ff674cfca912722",
       "content_unchanged_in_worktree": true,
@@ -4392,8 +4392,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.InitializeProcThreadAttributeList.html",
       "family": "job-iocp-spawn",
       "bound": "empty list rejected before FFI; documented null-list sizing call; pointer-aligned owned storage sized from the probe; exact checked byte size; initialized list deleted on update failure",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2126, 2 line(s) above the derived span",
-      "safety_line": 2126,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2144, 2 line(s) above the derived span. First line: // SAFETY: `storage` is pointer-aligned, large enough for the size",
+      "safety_line": 2144,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::ProcThreadAttributeList::for_inherited_handles",
@@ -4415,8 +4415,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "ProcThreadAttributeList::for_inherited_handles",
       "span": [
-        2133,
-        2148
+        2151,
+        2166
       ],
       "digest": "sha256:9dafa7655580229c9d290ee9935c911f6cf23659fc75e369d42adc9773ae2294",
       "content_unchanged_in_worktree": true,
@@ -4428,8 +4428,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.UpdateProcThreadAttribute.html",
       "family": "job-iocp-spawn",
       "bound": "empty list rejected before FFI; documented null-list sizing call; pointer-aligned owned storage sized from the probe; exact checked byte size; initialized list deleted on update failure",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2131, 2 line(s) above the derived span",
-      "safety_line": 2131,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2149, 2 line(s) above the derived span. First line: // SAFETY: the attribute list is initialized, `handles` is non-empty",
+      "safety_line": 2149,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::ProcThreadAttributeList::for_inherited_handles",
@@ -4451,8 +4451,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "ProcThreadAttributeList::for_inherited_handles",
       "span": [
-        2152,
-        2154
+        2170,
+        2172
       ],
       "digest": "sha256:90cd379cfc7ce141e8f7f03fe1f244076150a4fa8cb1061b96bd7e8f0a7d34e4",
       "content_unchanged_in_worktree": true,
@@ -4464,8 +4464,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.DeleteProcThreadAttributeList.html",
       "family": "job-iocp-spawn",
       "bound": "empty list rejected before FFI; documented null-list sizing call; pointer-aligned owned storage sized from the probe; exact checked byte size; initialized list deleted on update failure",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2151, 1 line(s) above the derived span",
-      "safety_line": 2151,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2169, 1 line(s) above the derived span. First line: // SAFETY: the list was initialized successfully above.",
+      "safety_line": 2169,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::ProcThreadAttributeList::for_inherited_handles",
@@ -4487,8 +4487,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "ProcThreadAttributeList::drop",
       "span": [
-        2168,
-        2170
+        2186,
+        2188
       ],
       "digest": "sha256:d13e5d2829b0adf21acc7202e5d63bc6846690073d847e2b7ed72f8f5b8a8ac2",
       "content_unchanged_in_worktree": true,
@@ -4500,8 +4500,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.DeleteProcThreadAttributeList.html",
       "family": "job-iocp-spawn",
       "bound": "initialized list deleted; backing storage live until after Drop completes",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2166, 2 line(s) above the derived span",
-      "safety_line": 2166,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2184, 2 line(s) above the derived span. First line: // SAFETY: the list is initialized and its backing storage remains live",
+      "safety_line": 2184,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::ProcThreadAttributeList::drop",
@@ -4521,8 +4521,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedProcessGuard::new",
       "span": [
-        2196,
-        2200
+        2214,
+        2218
       ],
       "digest": "sha256:eda5d8a18fe2e11c05335174a4d71220fa45a8020b59ba0383ae291a848c6a11",
       "content_unchanged_in_worktree": true,
@@ -4534,8 +4534,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "job-iocp-spawn",
       "bound": "both sentinels rejected on both handles (INVALID_HANDLE_VALUE aliases the current-process pseudo-handle and never reaches TerminateProcess); partial validity terminates and closes the owned side only",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2192, 4 line(s) above the derived span",
-      "safety_line": 2192,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2210, 4 line(s) above the derived span. First line: // SAFETY: `hProcess` was returned by CreateProcessW and is",
+      "safety_line": 2210,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedProcessGuard::new",
@@ -4557,8 +4557,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedProcessGuard::new",
       "span": [
-        2206,
-        2208
+        2224,
+        2226
       ],
       "digest": "sha256:0d4566edc83d473b741ff9ebfbb5e807ad8b6d6f4847038a87d05b15f40ecb78",
       "content_unchanged_in_worktree": true,
@@ -4570,8 +4570,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.CloseHandle.html",
       "family": "job-iocp-spawn",
       "bound": "both sentinels rejected on both handles (INVALID_HANDLE_VALUE aliases the current-process pseudo-handle and never reaches TerminateProcess); partial validity terminates and closes the owned side only",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2203, 3 line(s) above the derived span",
-      "safety_line": 2203,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2221, 3 line(s) above the derived span. First line: // SAFETY: `hThread` was returned by CreateProcessW and is",
+      "safety_line": 2221,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedProcessGuard::new",
@@ -4593,8 +4593,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedProcessGuard::drop",
       "span": [
-        2243,
-        2248
+        2273,
+        2278
       ],
       "digest": "sha256:057a2c66ac66422b93268b73b4ab3401e19416951d7267aec56ffc3b5c55e017",
       "content_unchanged_in_worktree": true,
@@ -4606,8 +4606,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "job-iocp-spawn",
       "bound": "armed-only: the still-suspended contained process is terminated plus bounded wait plus both handles closed; disarmed by the single into_handles transfer",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2239, 4 line(s) above the derived span",
-      "safety_line": 2239,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2269, 4 line(s) above the derived span. First line: // SAFETY: both handles came from one successful CreateProcessW call,",
+      "safety_line": 2269,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedProcessGuard::drop",
@@ -4628,8 +4628,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "RecoverableJobObject::open",
       "span": [
-        2282,
-        2288
+        2312,
+        2318
       ],
       "digest": "sha256:096711d180fd3d8629f629ece5db18439247b294b1b00ac79a7eab334242a0c2",
       "content_unchanged_in_worktree": true,
@@ -4641,8 +4641,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.OpenJobObjectW.html",
       "family": "job-iocp-spawn",
       "bound": "NUL-terminated name; query plus terminate rights; handle wrapped immediately",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2281, 1 line(s) above the derived span",
-      "safety_line": 2281,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2311, 1 line(s) above the derived span. First line: // SAFETY: the name is NUL-terminated and remains live for the call.",
+      "safety_line": 2311,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::RecoverableJobObject::open",
@@ -4662,8 +4662,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "RecoverableJobObject::terminate",
       "span": [
-        2332,
-        2332
+        2362,
+        2362
       ],
       "digest": "sha256:cf1188dfc8f90d24ab8b08b4ed722ed4689f1b2dd0bd26cfe235395977553490",
       "content_unchanged_in_worktree": true,
@@ -4675,8 +4675,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.TerminateJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "reopened handle live for the call",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2331, 1 line(s) above the derived span",
-      "safety_line": 2331,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2361, 1 line(s) above the derived span. First line: // SAFETY: the reopened Job Object handle remains live.",
+      "safety_line": 2361,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::RecoverableJobObject::terminate",
@@ -4696,8 +4696,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::spawn_named",
       "span": [
-        2422,
-        2438
+        2452,
+        2468
       ],
       "digest": "sha256:994ede4c683e3e0488cc2521298b7fb957cda11c98177f5ecaef8385a252d702",
       "content_unchanged_in_worktree": true,
@@ -4709,8 +4709,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.CreateProcessW.html",
       "family": "job-iocp-spawn",
       "bound": "job name 1..=240 UTF-16 units plus AlreadyExists rejection (no silent orphan join); NUL-terminated app, command line, environment and cwd; three inheritable pipes with parent sides uninherited; suspended CreateProcessW; root image queried and pinned while suspended; child pipe ends closed in the parent; assignment precedes resume; guard armed until into_handles",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2418, 4 line(s) above the derived span",
-      "safety_line": 2418,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2448, 4 line(s) above the derived span. First line: // SAFETY: all UTF-16 buffers are NUL-terminated and live for the call;",
+      "safety_line": 2448,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named",
@@ -4735,8 +4735,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::spawn_named",
       "span": [
-        2456,
-        2456
+        2486,
+        2486
       ],
       "digest": "sha256:c359d25dd276cc369ddc1d3beb9eceed9911abbb43df7d8b707c5fad292a1efe",
       "content_unchanged_in_worktree": true,
@@ -4748,8 +4748,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.AssignProcessToJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "job name 1..=240 UTF-16 units plus AlreadyExists rejection (no silent orphan join); NUL-terminated app, command line, environment and cwd; three inheritable pipes with parent sides uninherited; suspended CreateProcessW; root image queried and pinned while suspended; child pipe ends closed in the parent; assignment precedes resume; guard armed until into_handles",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2455, 1 line(s) above the derived span",
-      "safety_line": 2455,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2485, 1 line(s) above the derived span. First line: // SAFETY: the process is still suspended and both handles are live.",
+      "safety_line": 2485,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named",
@@ -4774,8 +4774,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::spawn_named",
       "span": [
-        2460,
-        2460
+        2490,
+        2490
       ],
       "digest": "sha256:3a5c12dcb84bf9161fe6c2b0fc624d77fced00e9266a5eb3f8e928aac9775553",
       "content_unchanged_in_worktree": true,
@@ -4787,8 +4787,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.ResumeThread.html",
       "family": "job-iocp-spawn",
       "bound": "job name 1..=240 UTF-16 units plus AlreadyExists rejection (no silent orphan join); NUL-terminated app, command line, environment and cwd; three inheritable pipes with parent sides uninherited; suspended CreateProcessW; root image queried and pinned while suspended; child pipe ends closed in the parent; assignment precedes resume; guard armed until into_handles",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2459, 1 line(s) above the derived span",
-      "safety_line": 2459,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2489, 1 line(s) above the derived span. First line: // SAFETY: the primary thread is live and suspended exactly once here.",
+      "safety_line": 2489,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named",
@@ -4813,8 +4813,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::try_wait",
       "span": [
-        2640,
-        2640
+        2670,
+        2670
       ],
       "digest": "sha256:6a6916d9c9a745e4109297c53948488daa7f44571eed58a6d2812b977b558aaf",
       "content_unchanged_in_worktree": true,
@@ -4826,8 +4826,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "job-iocp-spawn",
       "bound": "retained handle live; signaled state cross-checked with the exit code (STILL_ACTIVE honored only when unsignaled)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2639, 1 line(s) above the derived span",
-      "safety_line": 2639,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2669, 1 line(s) above the derived span. First line: // SAFETY: process handle remains live for the call.",
+      "safety_line": 2669,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::try_wait",
@@ -4852,8 +4852,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::wait_timeout",
       "span": [
-        2661,
-        2661
+        2691,
+        2691
       ],
       "digest": "sha256:8d0d44bc95a09cfec730859e7f0873f10614b7d8409dd5b2d3ab7e042fa7f982",
       "content_unchanged_in_worktree": true,
@@ -4865,8 +4865,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "job-iocp-spawn",
       "bound": "millis clamped; retained handle live; the timeout path re-queries the exit code without waiting",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2660, 1 line(s) above the derived span",
-      "safety_line": 2660,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2690, 1 line(s) above the derived span. First line: // SAFETY: process handle remains live for the call.",
+      "safety_line": 2690,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::wait_timeout",
@@ -4892,8 +4892,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::terminate",
       "span": [
-        2675,
-        2675
+        2705,
+        2705
       ],
       "digest": "sha256:cf1188dfc8f90d24ab8b08b4ed722ed4689f1b2dd0bd26cfe235395977553490",
       "content_unchanged_in_worktree": true,
@@ -4905,8 +4905,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.TerminateJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "retained job live for the call",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2674, 1 line(s) above the derived span",
-      "safety_line": 2674,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2704, 1 line(s) above the derived span. First line: // SAFETY: job remains live for the call.",
+      "safety_line": 2704,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::terminate",
@@ -4926,8 +4926,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "process_start_ticks",
       "span": [
-        2689,
-        2697
+        2719,
+        2727
       ],
       "digest": "sha256:65729c375efe117f3bac522c7f394f00da5e656a15a1b015e4b0b3502faf0d7b",
       "content_unchanged_in_worktree": true,
@@ -4939,8 +4939,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.GetProcessTimes.html",
       "family": "pipe-process-identity",
       "bound": "live handle (retained, or locally owned and closed by the caller); initialized FILETIME out-pointers; zero fails before use",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2687, 2 line(s) above the derived span",
-      "safety_line": 2687,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2717, 2 line(s) above the derived span. First line: // SAFETY: the process handle is live and all FILETIME output pointers",
+      "safety_line": 2717,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::process_start_ticks",
@@ -4965,8 +4965,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "query_process_exit_code",
       "span": [
-        2707,
-        2707
+        2737,
+        2737
       ],
       "digest": "sha256:dc32871bcaeaf2f16ef3e4743d069f698f149379b75ed6a326c975ea131e025b",
       "content_unchanged_in_worktree": true,
@@ -4978,8 +4978,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.GetExitCodeProcess.html",
       "family": "job-iocp-spawn",
       "bound": "retained live handle; valid out-pointer; STILL_ACTIVE distinguished by the signaled flag, never a blind proof of life",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2706, 1 line(s) above the derived span",
-      "safety_line": 2706,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2736, 1 line(s) above the derived span. First line: // SAFETY: `process` is a retained live handle and `code` is a valid out pointer.",
+      "safety_line": 2736,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::query_process_exit_code",
@@ -4999,8 +4999,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "open_current_process_snapshot",
       "span": [
-        2767,
-        2767
+        2797,
+        2797
       ],
       "digest": "sha256:2f2d621f497c4678ae8cff2f2b49174e85fefbf6baf7cf65c82494e30d79122e",
       "content_unchanged_in_worktree": true,
@@ -5012,8 +5012,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.OpenProcess.html",
       "family": "job-iocp-spawn",
       "bound": "nonzero PID; handle retained through capture of image, ticks and pinned identity; duplicates and PID 0 rejected by the caller double-enumeration check",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2766, 1 line(s) above the derived span",
-      "safety_line": 2766,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2796, 1 line(s) above the derived span. First line: // SAFETY: numeric PID is used only to resolve a process handle.",
+      "safety_line": 2796,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::open_current_process_snapshot",
@@ -5034,8 +5034,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "job_id_slice",
       "span": [
-        2817,
-        2817
+        2847,
+        2847
       ],
       "digest": "sha256:ae9b287f7fec1f5b8ef39f6ff13a035651b1310ed5f0902d9d0ace5829130a54",
       "content_unchanged_in_worktree": true,
@@ -5047,8 +5047,8 @@
       "signature_source": "https://doc.rust-lang.org/std/primitive.slice.html#method.from_raw_parts",
       "family": "job-iocp-spawn",
       "bound": "word-aligned whole-buffer base with an exact bounds check (offset math plus count within capacity proven by the caller); shared slice copied out with no mutable overlap and no trailing-field provenance lending",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2811, 6 line(s) above the derived span",
-      "safety_line": 2811,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2841, 6 line(s) above the derived span. First line: // SAFETY: the caller guarantees `buffer` starts with a kernel-initialized",
+      "safety_line": 2841,
       "safety_distance": 6,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::job_id_slice",
@@ -5070,8 +5070,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "job_process_ids",
       "span": [
-        2845,
-        2853
+        2875,
+        2883
       ],
       "digest": "sha256:1eec730a71b821d915da2273c47a07be10e4c5a9cfbbda1e46d0c6471bf50615",
       "content_unchanged_in_worktree": true,
@@ -5083,8 +5083,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.QueryInformationJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "aligned buffer for the selected class; header always in bounds (capacity starts at 16); MORE_DATA regrows bounded by MAX_JOB_PROCESS_IDS (4096); count above capacity fails; PID 0 filtered; u32-checked",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2844, 1 line(s) above the derived span",
-      "safety_line": 2844,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2874, 1 line(s) above the derived span. First line: // SAFETY: `job` remains live and `buffer` is aligned for the selected Win32 structure.",
+      "safety_line": 2874,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::job_process_ids",
@@ -5105,8 +5105,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "job_process_ids",
       "span": [
-        2858,
-        2858
+        2896,
+        2896
       ],
       "digest": "sha256:48f5b04adb81cce11381dda92c3ab1ed078c2724fc0bbc786a824862d6942c79",
       "content_unchanged_in_worktree": true,
@@ -5118,9 +5118,9 @@
       "signature_source": null,
       "family": "job-iocp-spawn",
       "bound": "aligned buffer for the selected class; header always in bounds (capacity starts at 16); MORE_DATA regrows bounded by MAX_JOB_PROCESS_IDS (4096); count above capacity fails; PID 0 filtered; u32-checked",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2854, 4 line(s) above the derived span",
-      "safety_line": 2854,
-      "safety_distance": 4,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2884, 12 line(s) above the derived span. First line: // SAFETY: `buffer` is `Vec<usize>`, so `buffer.as_ptr()` carries the",
+      "safety_line": 2884,
+      "safety_distance": 12,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::job_process_ids",
       "callers": [
@@ -5140,8 +5140,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SuspendedJobChild::drop",
       "span": [
-        2915,
-        2917
+        2953,
+        2955
       ],
       "digest": "sha256:295175f3f9209d34ef4d4bb9e09d66430d70fc11a8f941137ea5559da532338b",
       "content_unchanged_in_worktree": true,
@@ -5153,8 +5153,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/JobObjects/fn.TerminateJobObject.html",
       "family": "job-iocp-spawn",
       "bound": "TerminateJobObject (kill-on-close is also configured) plus observer shutdown with thread join; no hidden wait beyond the caller deadline",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2913, 2 line(s) above the derived span",
-      "safety_line": 2913,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2951, 2 line(s) above the derived span. First line: // SAFETY: kill-on-close is also configured. Drop requests termination",
+      "safety_line": 2951,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::drop",
@@ -5175,8 +5175,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "DirectoryMutationGuard::watch",
       "span": [
-        2951,
-        2951
+        2989,
+        2989
       ],
       "digest": "sha256:d4ae15a9c1a769398d748e7f05611aeb15f9c7c2df7384d07fd0531992c6c692",
       "content_unchanged_in_worktree": true,
@@ -5188,8 +5188,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Storage/FileSystem/fn.FindFirstChangeNotificationW.html",
       "family": "notify-move-file",
       "bound": "existing directory checked; NUL-terminated path live; both handle sentinels rejected; recursive notify filter",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2950, 1 line(s) above the derived span",
-      "safety_line": 2950,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2988, 1 line(s) above the derived span. First line: // SAFETY: path is NUL-terminated and remains live for the call.",
+      "safety_line": 2988,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::DirectoryMutationGuard::watch",
@@ -5210,8 +5210,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "DirectoryMutationGuard::mutation_detected",
       "span": [
-        2965,
-        2965
+        3003,
+        3003
       ],
       "digest": "sha256:e00d8723e2e4f43f72feb1af113f1efaa18a7ddc0c30d5e794d955cf1ef0ca1a",
       "content_unchanged_in_worktree": true,
@@ -5223,8 +5223,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.WaitForSingleObject.html",
       "family": "notify-move-file",
       "bound": "notification handle live; zero-timeout poll; other codes are errors",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2964, 1 line(s) above the derived span",
-      "safety_line": 2964,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3002, 1 line(s) above the derived span. First line: // SAFETY: notification handle remains live for the call.",
+      "safety_line": 3002,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::DirectoryMutationGuard::mutation_detected",
@@ -5244,8 +5244,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "DirectoryMutationGuard::drop",
       "span": [
-        2976,
-        2976
+        3014,
+        3014
       ],
       "digest": "sha256:4690d9a747830a58f18aac78eb7d41f1188568ce1b23467b26b52a24ce81030c",
       "content_unchanged_in_worktree": true,
@@ -5257,8 +5257,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Storage/FileSystem/fn.FindCloseChangeNotification.html",
       "family": "notify-move-file",
       "bound": "unique ownership; FindCloseChangeNotification exactly once (the correct closer, not CloseHandle)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2975, 1 line(s) above the derived span",
-      "safety_line": 2975,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3013, 1 line(s) above the derived span. First line: // SAFETY: the guard uniquely owns the change-notification handle.",
+      "safety_line": 3013,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::DirectoryMutationGuard::drop",
@@ -5278,8 +5278,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "process_is_alive",
       "span": [
-        2993,
-        2993
+        3031,
+        3031
       ],
       "digest": "sha256:7cae769ebb2f0dc93a571975831fff0ffd607e0eafd9e68df0439ce7b5800b8c",
       "content_unchanged_in_worktree": true,
@@ -5291,8 +5291,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.OpenProcess.html",
       "family": "pipe-process-identity",
       "bound": "numeric PID; NULL and INVALID_HANDLE_VALUE both rejected; INVALID_PARAMETER means dead, other errors propagate; query and close errors both surfaced; STILL_ACTIVE compared exactly",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:2990, 3 line(s) above the derived span",
-      "safety_line": 2990,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3028, 3 line(s) above the derived span. First line: // SAFETY: OpenProcess receives a numeric PID and returns an owned handle.",
+      "safety_line": 3028,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::process_is_alive",
@@ -5317,8 +5317,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "process_is_alive",
       "span": [
-        3003,
-        3003
+        3041,
+        3041
       ],
       "digest": "sha256:f2469de62a9f4ff356b998be6062b21b181d63f5e88a3910fe297c6118689706",
       "content_unchanged_in_worktree": true,
@@ -5330,8 +5330,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.GetExitCodeProcess.html",
       "family": "pipe-process-identity",
       "bound": "numeric PID; NULL and INVALID_HANDLE_VALUE both rejected; INVALID_PARAMETER means dead, other errors propagate; query and close errors both surfaced; STILL_ACTIVE compared exactly",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3002, 1 line(s) above the derived span",
-      "safety_line": 3002,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3040, 1 line(s) above the derived span. First line: // SAFETY: `handle` is live and owned here; `exit_code` is a valid out pointer.",
+      "safety_line": 3040,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::process_is_alive",
@@ -5356,8 +5356,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "process_is_alive",
       "span": [
-        3006,
-        3006
+        3044,
+        3044
       ],
       "digest": "sha256:c116d59724ce2ad728452813d249449d40330ef2c9af06405b004c9c4bbcc6a3",
       "content_unchanged_in_worktree": true,
@@ -5369,8 +5369,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.CloseHandle.html",
       "family": "pipe-process-identity",
       "bound": "numeric PID; NULL and INVALID_HANDLE_VALUE both rejected; INVALID_PARAMETER means dead, other errors propagate; query and close errors both surfaced; STILL_ACTIVE compared exactly",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3005, 1 line(s) above the derived span",
-      "safety_line": 3005,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3043, 1 line(s) above the derived span. First line: // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.",
+      "safety_line": 3043,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::process_is_alive",
@@ -5395,8 +5395,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "process_creation_ticks",
       "span": [
-        3042,
-        3042
+        3080,
+        3080
       ],
       "digest": "sha256:2f2d621f497c4678ae8cff2f2b49174e85fefbf6baf7cf65c82494e30d79122e",
       "content_unchanged_in_worktree": true,
@@ -5408,8 +5408,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.OpenProcess.html",
       "family": "pipe-process-identity",
       "bound": "nonzero PID; locally owned handle closed exactly once with the close error surfaced; zero ticks rejected",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3040, 2 line(s) above the derived span",
-      "safety_line": 3040,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3078, 2 line(s) above the derived span. First line: // SAFETY: the PID is only used by Windows to resolve a process handle.",
+      "safety_line": 3078,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::process_creation_ticks",
@@ -5434,8 +5434,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "process_creation_ticks",
       "span": [
-        3049,
-        3049
+        3087,
+        3087
       ],
       "digest": "sha256:922ab3d87016fdac09c034efe6d33048891fb7e6a451125b15e51b19ac8c5695",
       "content_unchanged_in_worktree": true,
@@ -5447,8 +5447,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.CloseHandle.html",
       "family": "pipe-process-identity",
       "bound": "nonzero PID; locally owned handle closed exactly once with the close error surfaced; zero ticks rejected",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3047, 2 line(s) above the derived span",
-      "safety_line": 3047,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3085, 2 line(s) above the derived span. First line: // SAFETY: the handle was returned by OpenProcess above and is closed",
+      "safety_line": 3085,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::process_creation_ticks",
@@ -5473,8 +5473,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "current_process_creation_ticks",
       "span": [
-        3075,
-        3075
+        3113,
+        3113
       ],
       "digest": "sha256:433ccb86054a49b1da48125c188dfe08cb6b5105ee0b7b561c03cc8068dd0684",
       "content_unchanged_in_worktree": true,
@@ -5486,8 +5486,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/System/Threading/fn.GetCurrentProcess.html",
       "family": "pipe-process-identity",
       "bound": "pseudo-handle needs no close; zero ticks rejected",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3073, 2 line(s) above the derived span",
-      "safety_line": 3073,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3111, 2 line(s) above the derived span. First line: // SAFETY: the current-process pseudo-handle needs no close and stays",
+      "safety_line": 3111,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::current_process_creation_ticks",
@@ -5507,8 +5507,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "restrict_file_to_current_user_and_system",
       "span": [
-        3131,
-        3138
+        3169,
+        3176
       ],
       "digest": "sha256:0d0b1edbbc1849cf89248727bdbfdb3b7152dc44cc7500a0afd7779fa83ad9ca",
       "content_unchanged_in_worktree": true,
@@ -5520,8 +5520,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/fn.GetSecurityDescriptorDacl.html",
       "family": "security-pipe-server-dacl",
       "bound": "token SID queried; SDDL-built descriptor live; DACL extracted (present and non-null) and passed by itself, never the descriptor; path NUL-terminated; PROTECTED flag; nonzero status is an error",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3128, 3 line(s) above the derived span",
-      "safety_line": 3128,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3166, 3 line(s) above the derived span. First line: // SAFETY: the descriptor is live for the extraction; the out-pointers",
+      "safety_line": 3166,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::restrict_file_to_current_user_and_system",
@@ -5546,8 +5546,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "restrict_file_to_current_user_and_system",
       "span": [
-        3152,
-        3162
+        3190,
+        3200
       ],
       "digest": "sha256:e4f77fcd1b8a0d431b0e6874c8edeb989f94569aba315eaba2dd86a65121d724",
       "content_unchanged_in_worktree": true,
@@ -5559,8 +5559,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Authorization/fn.SetNamedSecurityInfoW.html",
       "family": "security-pipe-server-dacl",
       "bound": "token SID queried; SDDL-built descriptor live; DACL extracted (present and non-null) and passed by itself, never the descriptor; path NUL-terminated; PROTECTED flag; nonzero status is an error",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3149, 3 line(s) above the derived span",
-      "safety_line": 3149,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3187, 3 line(s) above the derived span. First line: // SAFETY: the wide path is NUL-terminated and live for the call; the",
+      "safety_line": 3187,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::restrict_file_to_current_user_and_system",
@@ -5585,8 +5585,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_file_owner_and_dacl",
       "span": [
-        3189,
-        3200
+        3227,
+        3238
       ],
       "digest": "sha256:ccd95109684fe0fcc52c514dcca12c22d534f67bef47a1e3c1e1d72fabe9bf0d",
       "content_unchanged_in_worktree": true,
@@ -5598,8 +5598,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Authorization/fn.GetNamedSecurityInfoW.html",
       "family": "security-pipe-server-dacl",
       "bound": "wide path live; three out-pointers live; descriptor owned by the frame and freed exactly once on every path past the status check; verdict computed before the free",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3186, 3 line(s) above the derived span",
-      "safety_line": 3186,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3224, 3 line(s) above the derived span. First line: // SAFETY: the wide path is NUL-terminated and live for the call; the",
+      "safety_line": 3224,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_file_owner_and_dacl",
@@ -5623,8 +5623,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_file_owner_and_dacl",
       "span": [
-        3207,
-        3209
+        3245,
+        3247
       ],
       "digest": "sha256:99cfa4d9a2efecf896edbe9d2965600bf97c0b009831cbe804b767b312d34600",
       "content_unchanged_in_worktree": true,
@@ -5636,8 +5636,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.LocalFree.html",
       "family": "security-pipe-server-dacl",
       "bound": "wide path live; three out-pointers live; descriptor owned by the frame and freed exactly once on every path past the status check; verdict computed before the free",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3205, 2 line(s) above the derived span",
-      "safety_line": 3205,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3243, 2 line(s) above the derived span. First line: // SAFETY: the descriptor was allocated by GetNamedSecurityInfoW above",
+      "safety_line": 3243,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_file_owner_and_dacl",
@@ -5661,8 +5661,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_transport_file_descriptor",
       "span": [
-        3229,
-        3231
+        3267,
+        3269
       ],
       "digest": "sha256:882d6309a7414ee8134b7c7802e9518e586d664d2f5ef1a6055abb98da26904b",
       "content_unchanged_in_worktree": true,
@@ -5674,8 +5674,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/fn.GetSecurityDescriptorOwner.html",
       "family": "security-pipe-server-dacl",
       "bound": "owner SID borrows the live descriptor and is consumed before the free; owner must be token-user, System or Administrators; DACL must be present, non-null, the identical pointer, exactly 2 allow ACEs (type 0, nonzero mask) granting exactly token-user plus System (System-first so a System token satisfies)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3226, 3 line(s) above the derived span",
-      "safety_line": 3226,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3264, 3 line(s) above the derived span. First line: // SAFETY: the descriptor is the live caller-owned descriptor; the",
+      "safety_line": 3264,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_transport_file_descriptor",
@@ -5697,8 +5697,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_transport_file_descriptor",
       "span": [
-        3260,
-        3267
+        3298,
+        3305
       ],
       "digest": "sha256:0371947bfa663d123105eab85947c212b3543a62d0f4c937686b43fcee9620de",
       "content_unchanged_in_worktree": true,
@@ -5710,8 +5710,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/fn.GetSecurityDescriptorDacl.html",
       "family": "security-pipe-server-dacl",
       "bound": "owner SID borrows the live descriptor and is consumed before the free; owner must be token-user, System or Administrators; DACL must be present, non-null, the identical pointer, exactly 2 allow ACEs (type 0, nonzero mask) granting exactly token-user plus System (System-first so a System token satisfies)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3259, 1 line(s) above the derived span",
-      "safety_line": 3259,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3297, 1 line(s) above the derived span. First line: // SAFETY: same live-descriptor contract as the owner query above.",
+      "safety_line": 3297,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_transport_file_descriptor",
@@ -5733,8 +5733,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_transport_file_descriptor",
       "span": [
-        3281,
-        3281
+        3319,
+        3319
       ],
       "digest": "sha256:8f881f3214ea159ee642b241b45e3ce6bc608f79ac31c5b1d6e74faa0202dad8",
       "content_unchanged_in_worktree": true,
@@ -5746,8 +5746,8 @@
       "signature_source": null,
       "family": "security-pipe-server-dacl",
       "bound": "owner SID borrows the live descriptor and is consumed before the free; owner must be token-user, System or Administrators; DACL must be present, non-null, the identical pointer, exactly 2 allow ACEs (type 0, nonzero mask) granting exactly token-user plus System (System-first so a System token satisfies)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3279, 2 line(s) above the derived span",
-      "safety_line": 3279,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3317, 2 line(s) above the derived span. First line: // SAFETY: the ACL is the live non-null DACL inside the caller-owned",
+      "safety_line": 3317,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_transport_file_descriptor",
@@ -5769,8 +5769,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_transport_file_descriptor",
       "span": [
-        3293,
-        3293
+        3331,
+        3331
       ],
       "digest": "sha256:cb64a3c367ed922920192d19c4f357700a54567625e448904db98b96a29a65e7",
       "content_unchanged_in_worktree": true,
@@ -5782,8 +5782,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/fn.GetAce.html",
       "family": "security-pipe-server-dacl",
       "bound": "owner SID borrows the live descriptor and is consumed before the free; owner must be token-user, System or Administrators; DACL must be present, non-null, the identical pointer, exactly 2 allow ACEs (type 0, nonzero mask) granting exactly token-user plus System (System-first so a System token satisfies)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3292, 1 line(s) above the derived span",
-      "safety_line": 3292,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3330, 1 line(s) above the derived span. First line: // SAFETY: the ACL is live and the ACE borrows the descriptor.",
+      "safety_line": 3330,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_transport_file_descriptor",
@@ -5805,8 +5805,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_transport_file_descriptor",
       "span": [
-        3304,
-        3304
+        3342,
+        3342
       ],
       "digest": "sha256:fd2747bff5e8ba44bb715a26887bfa7772d1e8192e4fc650834ac02086166f10",
       "content_unchanged_in_worktree": true,
@@ -5818,8 +5818,8 @@
       "signature_source": null,
       "family": "security-pipe-server-dacl",
       "bound": "owner SID borrows the live descriptor and is consumed before the free; owner must be token-user, System or Administrators; DACL must be present, non-null, the identical pointer, exactly 2 allow ACEs (type 0, nonzero mask) granting exactly token-user plus System (System-first so a System token satisfies)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3303, 1 line(s) above the derived span",
-      "safety_line": 3303,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3341, 1 line(s) above the derived span. First line: // SAFETY: the ACE points at a live ACE header inside the descriptor.",
+      "safety_line": 3341,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_transport_file_descriptor",
@@ -5841,8 +5841,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "verify_transport_file_descriptor",
       "span": [
-        3312,
-        3312
+        3350,
+        3350
       ],
       "digest": "sha256:27d2c2a288c198918bfe4830885e8ca8df16850c441eb0511f3ceaebaedccefe",
       "content_unchanged_in_worktree": true,
@@ -5854,8 +5854,8 @@
       "signature_source": null,
       "family": "security-pipe-server-dacl",
       "bound": "owner SID borrows the live descriptor and is consumed before the free; owner must be token-user, System or Administrators; DACL must be present, non-null, the identical pointer, exactly 2 allow ACEs (type 0, nonzero mask) granting exactly token-user plus System (System-first so a System token satisfies)",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3311, 1 line(s) above the derived span",
-      "safety_line": 3311,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3349, 1 line(s) above the derived span. First line: // SAFETY: an ACCESS_ALLOWED ACE carries a mask plus SidStart.",
+      "safety_line": 3349,
       "safety_distance": 1,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::verify_transport_file_descriptor",
@@ -5877,8 +5877,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "atomic_replace_file",
       "span": [
-        3375,
-        3381
+        3413,
+        3419
       ],
       "digest": "sha256:de0a2c95d5d9e7dc2a57e552b64b457149469540b10fd4ff2b65821f2f779368",
       "content_unchanged_in_worktree": true,
@@ -5890,8 +5890,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Storage/FileSystem/fn.MoveFileExW.html",
       "family": "notify-move-file",
       "bound": "both paths canonicalized (parent only, so a leaf symlink is never followed) plus NUL-terminated; MoveFileExW retains nothing; only ACCESS_DENIED and SHARING_VIOLATION retried, bounded at 41 attempts times 25ms",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3373, 2 line(s) above the derived span",
-      "safety_line": 3373,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3411, 2 line(s) above the derived span. First line: // SAFETY: both buffers are NUL-terminated and remain alive for the complete",
+      "safety_line": 3411,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::atomic_replace_file",
@@ -5913,8 +5913,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "CredentialBuffer::drop",
       "span": [
-        3519,
-        3521
+        3557,
+        3559
       ],
       "digest": "sha256:4083e1502fdcf5ca11edf7830c98b6cb820707c09d69123b2f67b00a90479ef0",
       "content_unchanged_in_worktree": true,
@@ -5926,8 +5926,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredFree.html",
       "family": "credential",
       "bound": "non-null; exact CredReadW allocation with the guard built only on the success path and never copied; Drop runs once with &mut; CredFree is the documented deallocator; address-preserving cast",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3510, 9 line(s) above the derived span",
-      "safety_line": 3510,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3548, 9 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredFree` after",
+      "safety_line": 3548,
       "safety_distance": 9,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::CredentialBuffer::drop",
@@ -5949,8 +5949,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "CredentialArray::drop",
       "span": [
-        3540,
-        3542
+        3578,
+        3580
       ],
       "digest": "sha256:4083e1502fdcf5ca11edf7830c98b6cb820707c09d69123b2f67b00a90479ef0",
       "content_unchanged_in_worktree": true,
@@ -5962,8 +5962,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredFree.html",
       "family": "credential",
       "bound": "non-null; exact CredEnumerateW array with the same once-with-&mut discipline; no live views at free time",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3531, 9 line(s) above the derived span",
-      "safety_line": 3531,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3569, 9 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredFree` after",
+      "safety_line": 3569,
       "safety_distance": 9,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::CredentialArray::drop",
@@ -5985,8 +5985,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_target_name",
       "span": [
-        3565,
-        3569
+        3603,
+        3607
       ],
       "digest": "sha256:7d626ed15883089a87a72ac4497792b38059bbd25fe4624ea82afa0ee74a13db",
       "content_unchanged_in_worktree": true,
@@ -5998,8 +5998,8 @@
       "signature_source": null,
       "family": "credential",
       "bound": "null rejected; base valid for at least 1 u16 in the live guard allocation; at most 512 aligned reads; missing NUL fails closed; slice excludes the terminator with no mutable overlap",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3555, 10 line(s) above the derived span",
-      "safety_line": 3555,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3593, 10 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — bounded NUL scan): `target`",
+      "safety_line": 3593,
       "safety_distance": 10,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_target_name",
@@ -6021,8 +6021,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_target_name",
       "span": [
-        3591,
-        3591
+        3629,
+        3629
       ],
       "digest": "sha256:01eeb5836f3744c8834697cff656ddeeb6716e9ae0c03b8c445fa8a323800da4",
       "content_unchanged_in_worktree": true,
@@ -6034,8 +6034,8 @@
       "signature_source": "https://doc.rust-lang.org/std/primitive.slice.html#method.from_raw_parts",
       "family": "credential",
       "bound": "null rejected; base valid for at least 1 u16 in the live guard allocation; at most 512 aligned reads; missing NUL fails closed; slice excludes the terminator with no mutable overlap",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3584, 7 line(s) above the derived span",
-      "safety_line": 3584,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3622, 7 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the",
+      "safety_line": 3622,
       "safety_distance": 7,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_target_name",
@@ -6057,8 +6057,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_ids_current_user_with_prefix",
       "span": [
-        3625,
-        3625
+        3663,
+        3663
       ],
       "digest": "sha256:4bc0380e692053bb6ab8f477b189627f18a17aa84b9b8640774d91b66415ab97",
       "content_unchanged_in_worktree": true,
@@ -6070,8 +6070,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredEnumerateW.html",
       "family": "credential",
       "bound": "prefix validated as an id plus the 512-unit filter bound; NUL filter borrowed; exclusive out-pointers; NOT_FOUND means empty, other codes error; count via try_from plus the 32768 cap plus an isize byte check before from_raw_parts; entries null-checked; TargetName re-validated; namespace prefix re-checked; sorted and deduplicated",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3616, 9 line(s) above the derived span",
-      "safety_line": 3616,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3654, 9 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredEnumerateW`): `filter`",
+      "safety_line": 3654,
       "safety_distance": 9,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_ids_current_user_with_prefix",
@@ -6099,8 +6099,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_ids_current_user_with_prefix",
       "span": [
-        3631,
-        3631
+        3669,
+        3669
       ],
       "digest": "sha256:fc7b0af9e6aef0f53ef6d23f9a0f2a6ad5c7faae43a9069c0dcbe502f2429d37",
       "content_unchanged_in_worktree": true,
@@ -6112,8 +6112,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.GetLastError.html",
       "family": "credential",
       "bound": "prefix validated as an id plus the 512-unit filter bound; NUL filter borrowed; exclusive out-pointers; NOT_FOUND means empty, other codes error; count via try_from plus the 32768 cap plus an isize byte check before from_raw_parts; entries null-checked; TargetName re-validated; namespace prefix re-checked; sorted and deduplicated",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3627, 4 line(s) above the derived span",
-      "safety_line": 3627,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3665, 4 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called",
+      "safety_line": 3665,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_ids_current_user_with_prefix",
@@ -6141,8 +6141,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_ids_current_user_with_prefix",
       "span": [
-        3666,
-        3666
+        3704,
+        3704
       ],
       "digest": "sha256:63fe80021b083038be6bb9bf7ec6d31acedfde82cc4c7dcb9714d0f3d7ee9d16",
       "content_unchanged_in_worktree": true,
@@ -6154,8 +6154,8 @@
       "signature_source": "https://doc.rust-lang.org/std/primitive.slice.html#method.from_raw_parts",
       "family": "credential",
       "bound": "prefix validated as an id plus the 512-unit filter bound; NUL filter borrowed; exclusive out-pointers; NOT_FOUND means empty, other codes error; count via try_from plus the 32768 cap plus an isize byte check before from_raw_parts; entries null-checked; TargetName re-validated; namespace prefix re-checked; sorted and deduplicated",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3659, 7 line(s) above the derived span",
-      "safety_line": 3659,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3697, 7 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the",
+      "safety_line": 3697,
       "safety_distance": 7,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_ids_current_user_with_prefix",
@@ -6183,8 +6183,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_ids_current_user_with_prefix",
       "span": [
-        3683,
-        3683
+        3721,
+        3721
       ],
       "digest": "sha256:0547b881e9f126ce391ee5465bd8fbaf408b02e3847e0fcc729ff8acc593c4c8",
       "content_unchanged_in_worktree": true,
@@ -6196,8 +6196,8 @@
       "signature_source": null,
       "family": "credential",
       "bound": "prefix validated as an id plus the 512-unit filter bound; NUL filter borrowed; exclusive out-pointers; NOT_FOUND means empty, other codes error; count via try_from plus the 32768 cap plus an isize byte check before from_raw_parts; entries null-checked; TargetName re-validated; namespace prefix re-checked; sorted and deduplicated",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3675, 8 line(s) above the derived span",
-      "safety_line": 3675,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3713, 8 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — entry dereference): each",
+      "safety_line": 3713,
       "safety_distance": 8,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_ids_current_user_with_prefix",
@@ -6225,8 +6225,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_status_current_user",
       "span": [
-        3926,
-        3926
+        3964,
+        3964
       ],
       "digest": "sha256:ff964c668944dd71535ef8b42197452cbd6d0b7c22d55686751b57e117a7f225",
       "content_unchanged_in_worktree": true,
@@ -6238,8 +6238,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredReadW.html",
       "family": "credential",
       "bound": "NUL-terminated validated target borrowed; exclusive out-pointer; NOT_FOUND means absent, other codes error; success plus non-null single CREDENTIALW exclusively owned; shared borrow reads integer fields only",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3919, 7 line(s) above the derived span",
-      "safety_line": 3919,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3957, 7 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredReadW`): `target` is",
+      "safety_line": 3957,
       "safety_distance": 7,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_status_current_user",
@@ -6265,8 +6265,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_status_current_user",
       "span": [
-        3931,
-        3931
+        3969,
+        3969
       ],
       "digest": "sha256:fc7b0af9e6aef0f53ef6d23f9a0f2a6ad5c7faae43a9069c0dcbe502f2429d37",
       "content_unchanged_in_worktree": true,
@@ -6278,8 +6278,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.GetLastError.html",
       "family": "credential",
       "bound": "NUL-terminated validated target borrowed; exclusive out-pointer; NOT_FOUND means absent, other codes error; success plus non-null single CREDENTIALW exclusively owned; shared borrow reads integer fields only",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3928, 3 line(s) above the derived span",
-      "safety_line": 3928,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3966, 3 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called",
+      "safety_line": 3966,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_status_current_user",
@@ -6305,8 +6305,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_status_current_user",
       "span": [
-        3955,
-        3955
+        3993,
+        3993
       ],
       "digest": "sha256:60e077779c0b80ad3ac20686a3c6ebf878d8c970ddff3d040ce2bcbb87253ee8",
       "content_unchanged_in_worktree": true,
@@ -6318,8 +6318,8 @@
       "signature_source": null,
       "family": "credential",
       "bound": "NUL-terminated validated target borrowed; exclusive out-pointer; NOT_FOUND means absent, other codes error; success plus non-null single CREDENTIALW exclusively owned; shared borrow reads integer fields only",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3948, 7 line(s) above the derived span",
-      "safety_line": 3948,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3986, 7 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CREDENTIALW` dereference):",
+      "safety_line": 3986,
       "safety_distance": 7,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_status_current_user",
@@ -6345,8 +6345,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_read_current_user",
       "span": [
-        3979,
-        3979
+        4017,
+        4017
       ],
       "digest": "sha256:ff964c668944dd71535ef8b42197452cbd6d0b7c22d55686751b57e117a7f225",
       "content_unchanged_in_worktree": true,
@@ -6358,8 +6358,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredReadW.html",
       "family": "credential",
       "bound": "same read discipline; blob size via try_from with the CRED_MAX bound and non-null-when-nonzero; bytes inside the live allocation, copied before the guard drops",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3975, 4 line(s) above the derived span",
-      "safety_line": 3975,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4013, 4 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredReadW`): same contract",
+      "safety_line": 4013,
       "safety_distance": 4,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_read_current_user",
@@ -6386,8 +6386,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_read_current_user",
       "span": [
-        3984,
-        3984
+        4022,
+        4022
       ],
       "digest": "sha256:fc7b0af9e6aef0f53ef6d23f9a0f2a6ad5c7faae43a9069c0dcbe502f2429d37",
       "content_unchanged_in_worktree": true,
@@ -6399,8 +6399,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.GetLastError.html",
       "family": "credential",
       "bound": "same read discipline; blob size via try_from with the CRED_MAX bound and non-null-when-nonzero; bytes inside the live allocation, copied before the guard drops",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3981, 3 line(s) above the derived span",
-      "safety_line": 3981,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4019, 3 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called",
+      "safety_line": 4019,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_read_current_user",
@@ -6427,8 +6427,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_read_current_user",
       "span": [
-        4002,
-        4002
+        4040,
+        4040
       ],
       "digest": "sha256:60e077779c0b80ad3ac20686a3c6ebf878d8c970ddff3d040ce2bcbb87253ee8",
       "content_unchanged_in_worktree": true,
@@ -6440,8 +6440,8 @@
       "signature_source": null,
       "family": "credential",
       "bound": "same read discipline; blob size via try_from with the CRED_MAX bound and non-null-when-nonzero; bytes inside the live allocation, copied before the guard drops",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:3997, 5 line(s) above the derived span",
-      "safety_line": 3997,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4035, 5 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CREDENTIALW` dereference):",
+      "safety_line": 4035,
       "safety_distance": 5,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_read_current_user",
@@ -6468,8 +6468,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_read_current_user",
       "span": [
-        4029,
-        4029
+        4067,
+        4067
       ],
       "digest": "sha256:fae170d42160803ac1df3e563904cb517451433bc26a62e882c7b102a5afe45e",
       "content_unchanged_in_worktree": true,
@@ -6481,8 +6481,8 @@
       "signature_source": "https://doc.rust-lang.org/std/primitive.slice.html#method.from_raw_parts",
       "family": "credential",
       "bound": "same read discipline; blob size via try_from with the CRED_MAX bound and non-null-when-nonzero; bytes inside the live allocation, copied before the guard drops",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4022, 7 line(s) above the derived span",
-      "safety_line": 4022,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4060, 7 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — blob `from_raw_parts`):",
+      "safety_line": 4060,
       "safety_distance": 7,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_read_current_user",
@@ -6509,8 +6509,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_write_current_user",
       "span": [
-        4075,
-        4075
+        4113,
+        4113
       ],
       "digest": "sha256:7b06ccec1376b37660d2d701fcec88ab85faf96369952488848b78731cc47a48",
       "content_unchanged_in_worktree": true,
@@ -6522,8 +6522,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredWriteW.html",
       "family": "credential",
       "bound": "NUL-terminated target and username borrowed; blob borrows a non-empty value within CRED_MAX, u32-checked; nulls only with zero counts; valid Type and Persist; stable struct address; callee retains nothing",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4065, 10 line(s) above the derived span",
-      "safety_line": 4065,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4103, 10 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredWriteW`): `target` and",
+      "safety_line": 4103,
       "safety_distance": 10,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_write_current_user",
@@ -6550,8 +6550,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_delete_current_user",
       "span": [
-        4097,
-        4097
+        4135,
+        4135
       ],
       "digest": "sha256:86fec1b6a5b341dbb62f91206a6320ac596b91c7e942271bbde232dcf330c2b7",
       "content_unchanged_in_worktree": true,
@@ -6563,8 +6563,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Credentials/fn.CredDeleteW.html",
       "family": "credential",
       "bound": "NUL-terminated validated target borrowed; callee retains nothing; NOT_FOUND means false, other codes error; GetLastError read immediately after",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4092, 5 line(s) above the derived span",
-      "safety_line": 4092,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4130, 5 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `CredDeleteW`): `target` is",
+      "safety_line": 4130,
       "safety_distance": 5,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_delete_current_user",
@@ -6585,8 +6585,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "credential_delete_current_user",
       "span": [
-        4104,
-        4104
+        4142,
+        4142
       ],
       "digest": "sha256:af33085dfce2a992d19534465b0f078a8fe1bf15d316cce86b78180e3eff3f75",
       "content_unchanged_in_worktree": true,
@@ -6598,8 +6598,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.GetLastError.html",
       "family": "credential",
       "bound": "NUL-terminated validated target borrowed; callee retains nothing; NOT_FOUND means false, other codes error; GetLastError read immediately after",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4101, 3 line(s) above the derived span",
-      "safety_line": 4101,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4139, 3 line(s) above the derived span. First line: // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called",
+      "safety_line": 4139,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::credential_delete_current_user",
@@ -6620,8 +6620,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "create_current_user_server",
       "span": [
-        4141,
-        4146
+        4179,
+        4184
       ],
       "digest": "sha256:44ee23bb8442efd63b49f26451f64910686dd7481e88481031bed99eabc7c6e5",
       "content_unchanged_in_worktree": true,
@@ -6633,8 +6633,8 @@
       "signature_source": "https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/struct.ServerOptions.html",
       "family": "security-pipe-server-dacl",
       "bound": "SID grammar-validated (S- prefix, digits and dashes, at least 5 chars, so SDDL injection is rejected); SDDL descriptor plus attributes live for the call; Tokio copies the descriptor and retains nothing",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4138, 3 line(s) above the derived span",
-      "safety_line": 4138,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4176, 3 line(s) above the derived span. First line: // SAFETY: `attributes` and the descriptor it points to remain alive for the",
+      "safety_line": 4176,
       "safety_distance": 3,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::create_current_user_server",
@@ -6655,8 +6655,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SecurityDescriptor::from_sddl",
       "span": [
-        4178,
-        4185
+        4216,
+        4223
       ],
       "digest": "sha256:ae7a6e3c12ac51e24327b21c779cdeb0ac2449f02ee70b1ed0ed4804a4532a9c",
       "content_unchanged_in_worktree": true,
@@ -6668,8 +6668,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Security/Authorization/fn.ConvertStringSecurityDescriptorToSecurityDescriptorW.html",
       "family": "security-pipe-server-dacl",
       "bound": "embedded NUL and oversize input rejected before conversion (no silent DACL truncation); NUL-terminated input; out-pointer initialized by the API",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4176, 2 line(s) above the derived span",
-      "safety_line": 4176,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4214, 2 line(s) above the derived span. First line: // SAFETY: `wide` is NUL-terminated and valid for the duration of the",
+      "safety_line": 4214,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SecurityDescriptor::from_sddl",
@@ -6694,8 +6694,8 @@
       "path": "crates/eliot-windows-ipc/src/lib.rs",
       "item": "SecurityDescriptor::drop",
       "span": [
-        4209,
-        4211
+        4247,
+        4249
       ],
       "digest": "sha256:50a4c91f2e4aad3f7d63e438376555bf9930e743388d20fb1d90c650d2f66f09",
       "content_unchanged_in_worktree": true,
@@ -6707,8 +6707,8 @@
       "signature_source": "https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Foundation/fn.LocalFree.html",
       "family": "security-pipe-server-dacl",
       "bound": "conversion-API allocation freed exactly once via LocalFree when non-null",
-      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4207, 2 line(s) above the derived span",
-      "safety_line": 4207,
+      "safety": "// SAFETY: comment at crates/eliot-windows-ipc/src/lib.rs:4245, 2 line(s) above the derived span. First line: // SAFETY: the descriptor was allocated by the conversion API and",
+      "safety_line": 4245,
       "safety_distance": 2,
       "adr": "retain-bounded:ADR-0014#row-eliot-windows-ipc",
       "wrapper": "crates/eliot-windows-ipc/src/lib.rs::SecurityDescriptor::drop",
