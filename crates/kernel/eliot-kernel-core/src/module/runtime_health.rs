@@ -245,14 +245,14 @@ mod tests {
     };
 
     use super::{
-        KernelRuntimeHealthEvidence, CURRENT_ARCHITECTURE_SOURCE_DIGEST,
-        CURRENT_IMPLEMENTATION_SOURCE_DIGEST, CURRENT_NORMATIVE_PAIR_KEY,
+        CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+        CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
     };
     use crate::error::{KernelError, KernelResult};
     use crate::module::compatibility_handshake::{
-        admit_handshake, expected_seal_tag, AcceptedCompatibilityEvidence, CompatibilityEnvelope,
-        DurableCompatibilityState, NormativePairReceipt, StateMigrationClass, VersionRange,
-        HANDSHAKE_ENVELOPE_VERSION, NORMATIVE_SEAL_DOMAIN,
+        AcceptedCompatibilityEvidence, CompatibilityEnvelope, DurableCompatibilityState,
+        HANDSHAKE_ENVELOPE_VERSION, NORMATIVE_SEAL_DOMAIN, NormativePairReceipt,
+        StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
     };
     use crate::module::process_health::{
         CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
