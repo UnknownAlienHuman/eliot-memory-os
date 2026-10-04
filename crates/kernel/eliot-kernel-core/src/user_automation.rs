@@ -4733,4 +4733,428 @@ mod tests {
             manual.occurrence_identity()
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Issue #2974 test phase: the V4 gap/fold/legacy occurrence contract.
+    //
+    // The V4 shape landed in PR #3067 with no tests at all, so nothing proved
+    // that the one shared requested/resolved relation, the pinned-zone join, or
+    // the legacy refusal actually holds. These cases drive the real owner path
+    // (`apply_compiled_local_clock_seconds`), read the record it produces, and
+    // then mutate exactly one field of that record to name the refusal. No
+    // expected occurrence text is hand-written: every positive record below is
+    // what the owner emitted, and the constants are the only hand-written part.
+    // ---------------------------------------------------------------------
+
+    /// The nonexistent New York wall clock `2026-03-08T02:30:00`, read as a
+    /// naive civil second count. The zone's spring-forward transition is
+    /// `2026-03-08T07:00:00Z`, so `02:30` never happens on that date.
+    const NEW_YORK_GAP_LOCAL_SECONDS: i64 = 1_772_937_000;
+    /// The ambiguous New York wall clock `2026-11-01T01:30:00`, which happens
+    /// twice on that date.
+    const NEW_YORK_FOLD_LOCAL_SECONDS: i64 = 1_793_496_600;
+    /// The ordinary New York wall clock `2026-09-21T12:00:00`, which happens
+    /// exactly once.
+    const NEW_YORK_UNIQUE_LOCAL_SECONDS: i64 = 1_789_992_000;
+
+    /// An unnormalized owner draft. `next_occurrences` and the receipt are the
+    /// owner's outputs, so both stay empty until the owner fills them.
+    fn owner_draft(
+        expression: &str,
+        dst_fold: DstFoldPolicy,
+        dst_gap: DstGapPolicy,
+    ) -> NormalizedSchedule {
+        NormalizedSchedule {
+            kind: ScheduleKind::OneShot,
+            expression: expression.to_owned(),
+            calendar: "gregorian-local".to_owned(),
+            timezone: "America/New_York".to_owned(),
+            dst_fold,
+            dst_gap,
+            start_at: "2026-01-01T00:00:00Z".to_owned(),
+            end_at: None,
+            next_occurrences: Vec::new(),
+            normalization_receipt: Box::new(ScheduleNormalizationReceipt::default()),
+        }
+    }
+
+    fn gap_draft() -> NormalizedSchedule {
+        owner_draft(
+            "local:2026-03-08T02:30:00",
+            DstFoldPolicy::First,
+            DstGapPolicy::ShiftForward,
+        )
+    }
+
+    /// Runs the real owner encoder for the gap wall clock and returns the
+    /// schedule it produced, already validated by the encoder itself.
+    fn encoded_gap() -> NormalizedSchedule {
+        let mut schedule = gap_draft();
+        schedule
+            .apply_compiled_local_clock_seconds(&[NEW_YORK_GAP_LOCAL_SECONDS])
+            .expect("gap occurrence encodes and validates");
+        schedule
+    }
+
+    fn occurrence_fields(schedule: &NormalizedSchedule) -> Vec<String> {
+        assert_eq!(schedule.next_occurrences.len(), 1);
+        schedule.next_occurrences[0]
+            .split(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Rebuilds a record from tampered fields and asks the contract to decode
+    /// it, returning the refusal verbatim.
+    fn decode_tampered(
+        schedule: &NormalizedSchedule,
+        fields: &[String],
+    ) -> Result<Vec<NormalizedOccurrence>, UserAutomationError> {
+        let mut tampered = schedule.clone();
+        tampered.next_occurrences = vec![fields.join("|")];
+        tampered.validated_occurrences_without_receipt()
+    }
+
+    fn replace(fields: &[String], index: usize, value: &str) -> Vec<String> {
+        let mut fields = fields.to_vec();
+        fields[index] = value.to_owned();
+        fields
+    }
+
+    /// The exact New York spring-forward V4 record this issue requires: the
+    /// requested `02:30` that never happened, the resolved `03:30` it was
+    /// shifted to, the `-05:00 -> -04:00` transition, the applied `-04:00`, and
+    /// the single instant both sides of the relation reach.
+    #[test]
+    fn a_shifted_gap_occurrence_carries_both_local_clocks_and_validates() {
+        let schedule = encoded_gap();
+        let source_digest = schedule.source_digest().expect("source digest");
+        let fields = occurrence_fields(&schedule);
+
+        assert_eq!(
+            fields,
+            vec![
+                NORMALIZED_OCCURRENCE_ENCODING.to_owned(),
+                "America/New_York".to_owned(),
+                user_automation_zones::PINNED_ZONE_DATABASE_RELEASE.to_owned(),
+                "2026-03-08T02:30:00".to_owned(),
+                "2026-03-08T03:30:00".to_owned(),
+                "-04:00".to_owned(),
+                "2026-03-08T07:30:00Z".to_owned(),
+                "-05:00~-04:00".to_owned(),
+                "GAP_SHIFT_FORWARD".to_owned(),
+                source_digest,
+            ]
+        );
+
+        // The record the owner emitted must also survive the independent
+        // decode the compiler performs before it issues a receipt.
+        let decoded = schedule
+            .validated_occurrences_without_receipt()
+            .expect("owner record validates");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].requested_local, "2026-03-08T02:30:00");
+        assert_eq!(decoded[0].resolved_local, "2026-03-08T03:30:00");
+        assert_eq!(decoded[0].offset_minutes, -4 * 60);
+        assert_eq!(decoded[0].instant_seconds, 1_772_955_000);
+        assert_eq!(
+            decoded[0].disposition,
+            OccurrenceDisposition::GapShiftForward
+        );
+        assert_eq!(decoded[0].timezone, "America/New_York");
+    }
+
+    /// The requested clock is the nonexistent one and the resolved clock is the
+    /// valid one. Swapping them is the exact defect the V2 shape could not
+    /// represent, so it must not decode.
+    #[test]
+    fn swapping_the_requested_and_resolved_local_clocks_is_refused() {
+        let schedule = encoded_gap();
+        let mut fields = occurrence_fields(&schedule);
+        fields.swap(3, 4);
+        assert_eq!(
+            decode_tampered(&schedule, &fields),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.resolved_local"
+            ))
+        );
+    }
+
+    /// The V4 record is a closed ten-field shape. Reusing the retired V2
+    /// nine-field count under the current encoding is a shape break, and a V2
+    /// or V3 record is a legacy break, never a shape break.
+    #[test]
+    fn a_wrong_field_count_is_refused_and_a_retired_encoding_is_legacy() {
+        let schedule = encoded_gap();
+        let fields = occurrence_fields(&schedule);
+
+        let mut nine = fields.clone();
+        nine.pop();
+        assert_eq!(
+            decode_tampered(&schedule, &nine),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.shape"
+            ))
+        );
+
+        let mut eleven = fields.clone();
+        eleven.push("extra".to_owned());
+        assert_eq!(
+            decode_tampered(&schedule, &eleven),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.shape"
+            ))
+        );
+
+        // The requested clock alone is not a V4 record.
+        assert_eq!(
+            decode_tampered(&schedule, &["2026-03-08T02:30:00".to_owned()]),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.shape"
+            ))
+        );
+    }
+
+    /// Every load-bearing field of the gap relation is checked against the
+    /// pinned table and the shared arithmetic, so mutating exactly one of them
+    /// is refused. Each case names the refusal it actually produces.
+    #[test]
+    fn each_tampered_gap_field_is_refused() {
+        let schedule = encoded_gap();
+        let fields = occurrence_fields(&schedule);
+
+        // A transition pair that names no real New York spring-forward.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 7, "-05:00~-06:00")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.transition"
+            ))
+        );
+        // The same pair with the direction reversed.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 7, "-04:00~-05:00")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.transition"
+            ))
+        );
+        // An applied offset that is not the post-transition side of the gap.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 5, "-05:00")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.transition"
+            ))
+        );
+        // An instant one minute away from the one the relation reaches.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 6, "2026-03-08T07:31:00Z")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.instant"
+            ))
+        );
+        // A resolved local that is not the requested clock plus the gap width.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 4, "2026-03-08T04:30:00")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.resolved_local"
+            ))
+        );
+        // A zone database revision this build does not carry.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 2, "2025b")),
+            Err(UserAutomationError::ZoneDatabaseRevision(
+                "schedule.occurrence_key.zone_database_revision"
+            ))
+        );
+        // Evidence bound to a different compiled source.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 9, &"0".repeat(64))),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.source_digest"
+            ))
+        );
+        // A disposition the recorded transition cannot support. `Unique` is admitted
+        // by the declared-policy check on its own, so the one shared relation
+        // is what refuses the record: it carries a transition a unique clock
+        // never has.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 8, "UNIQUE")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.transition"
+            ))
+        );
+        // A zone the record was not normalized against.
+        assert_eq!(
+            decode_tampered(&schedule, &replace(&fields, 1, "Europe/Berlin")),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.timezone"
+            ))
+        );
+    }
+
+    /// `Reject` admits no shifted occurrence. The owner refuses to encode one,
+    /// and a record that carries one anyway is refused on decode, so the policy
+    /// cannot be bypassed by supplying the member directly.
+    #[test]
+    fn a_reject_gap_policy_admits_no_shifted_occurrence() {
+        let mut rejecting = owner_draft(
+            "local:2026-03-08T02:30:00",
+            DstFoldPolicy::First,
+            DstGapPolicy::Reject,
+        );
+        assert_eq!(
+            rejecting.apply_compiled_local_clock_seconds(&[NEW_YORK_GAP_LOCAL_SECONDS]),
+            Err(UserAutomationError::Invalid(
+                "schedule.expression.gap_policy_rejected"
+            ))
+        );
+        assert!(rejecting.next_occurrences.is_empty());
+
+        // A caller-supplied shifted member under the rejecting policy is
+        // refused by the declared-disposition check rather than trusted.
+        let gap = encoded_gap();
+        let mut fields = occurrence_fields(&gap);
+        let rejecting_source = rejecting.source_digest().expect("rejecting digest");
+        fields[9] = rejecting_source;
+        assert_eq!(
+            decode_tampered(&rejecting, &fields),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.disposition"
+            ))
+        );
+    }
+
+    /// A unique clock and both sides of a fold keep `requested == resolved`, so
+    /// the second local field adds no second logical occurrence, and the two
+    /// instants of a fold stay distinct and increasing rather than colliding.
+    #[test]
+    fn unique_and_fold_occurrences_keep_equal_local_clocks() {
+        let mut unique = owner_draft(
+            "local:2026-09-21T12:00:00",
+            DstFoldPolicy::First,
+            DstGapPolicy::ShiftForward,
+        );
+        unique
+            .apply_compiled_local_clock_seconds(&[NEW_YORK_UNIQUE_LOCAL_SECONDS])
+            .expect("unique occurrence encodes");
+        let unique_fields = occurrence_fields(&unique);
+        assert_eq!(unique_fields[3], "2026-09-21T12:00:00");
+        assert_eq!(unique_fields[3], unique_fields[4]);
+        assert_eq!(unique_fields[7], "-");
+        assert_eq!(unique_fields[8], "UNIQUE");
+        assert_eq!(unique_fields[6], "2026-09-21T16:00:00Z");
+
+        let mut first = owner_draft(
+            "local:2026-11-01T01:30:00",
+            DstFoldPolicy::First,
+            DstGapPolicy::ShiftForward,
+        );
+        first
+            .apply_compiled_local_clock_seconds(&[NEW_YORK_FOLD_LOCAL_SECONDS])
+            .expect("fold first encodes");
+        let mut second = owner_draft(
+            "local:2026-11-01T01:30:00",
+            DstFoldPolicy::Second,
+            DstGapPolicy::ShiftForward,
+        );
+        second
+            .apply_compiled_local_clock_seconds(&[NEW_YORK_FOLD_LOCAL_SECONDS])
+            .expect("fold second encodes");
+
+        let first_fields = occurrence_fields(&first);
+        let second_fields = occurrence_fields(&second);
+        for fields in [&first_fields, &second_fields] {
+            assert_eq!(fields[3], "2026-11-01T01:30:00");
+            assert_eq!(fields[3], fields[4]);
+            assert_eq!(fields[7], "-04:00~-05:00");
+        }
+        assert_eq!(first_fields[8], "FOLD_FIRST");
+        assert_eq!(second_fields[8], "FOLD_SECOND");
+
+        // The exact first/second instant selection is preserved: the fold keeps
+        // two distinct, increasing instants instead of collapsing to one.
+        let first_decoded = first
+            .validated_occurrences_without_receipt()
+            .expect("fold first validates");
+        let second_decoded = second
+            .validated_occurrences_without_receipt()
+            .expect("fold second validates");
+        assert_eq!(first_decoded[0].instant_seconds, 1_793_511_000);
+        assert_eq!(second_decoded[0].instant_seconds, 1_793_514_600);
+        assert!(second_decoded[0].instant_seconds > first_decoded[0].instant_seconds);
+        assert_eq!(first_decoded[0].offset_minutes, -4 * 60);
+        assert_eq!(second_decoded[0].offset_minutes, -5 * 60);
+        assert_eq!(
+            first_decoded[0].disposition,
+            OccurrenceDisposition::FoldFirst
+        );
+        assert_eq!(
+            second_decoded[0].disposition,
+            OccurrenceDisposition::FoldSecond
+        );
+
+        // A fold member presented under the opposite fold policy is refused. The
+        // record is re-bound to the refusing schedule's own source digest
+        // first, so the refusal is the declared-disposition check rather than
+        // an incidental digest mismatch.
+        let mut under_second = second.clone();
+        let second_source = under_second.source_digest().expect("second digest");
+        under_second.next_occurrences = vec![replace(&first_fields, 9, &second_source).join("|")];
+        assert_eq!(
+            under_second.validated_occurrences_without_receipt(),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.disposition"
+            ))
+        );
+
+        // And the mirror image: the second side under a `First` schedule.
+        let mut under_first = first.clone();
+        let first_source = under_first.source_digest().expect("first digest");
+        under_first.next_occurrences = vec![replace(&second_fields, 9, &first_source).join("|")];
+        assert_eq!(
+            under_first.validated_occurrences_without_receipt(),
+            Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.disposition"
+            ))
+        );
+    }
+
+    /// Retired V2, V3 and shape-only keys are refused as legacy and are never
+    /// silently upgraded or certified under the current versioned contract.
+    #[test]
+    fn retired_occurrence_encodings_are_refused_as_legacy() {
+        let schedule = encoded_gap();
+        let fields = occurrence_fields(&schedule);
+
+        for retired in [
+            LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2,
+            LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3,
+        ] {
+            let mut legacy = fields.clone();
+            legacy[0] = retired.to_owned();
+            legacy.pop();
+            assert_eq!(
+                decode_tampered(&schedule, &legacy),
+                Err(UserAutomationError::LegacyScheduleEncoding(
+                    "schedule.next_occurrences"
+                )),
+                "{retired} must be legacy, never a shape break"
+            );
+        }
+
+        // The retired shape-only record: a local wall clock plus an offset, with
+        // no zone, revision, instant or disposition. Only the two retired byte
+        // lengths are legacy; a bare wall clock is simply a shape break.
+        assert_eq!(
+            decode_tampered(&schedule, &["2026-09-21T12:00:00Z".to_owned()]),
+            Err(UserAutomationError::LegacyScheduleEncoding(
+                "schedule.next_occurrences"
+            ))
+        );
+        assert_eq!(
+            decode_tampered(&schedule, &["2026-09-21T12:00:00-04:00".to_owned()]),
+            Err(UserAutomationError::LegacyScheduleEncoding(
+                "schedule.next_occurrences"
+            ))
+        );
+    }
 }
