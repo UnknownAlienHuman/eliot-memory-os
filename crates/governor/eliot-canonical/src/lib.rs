@@ -589,10 +589,13 @@ impl CanonicalWriteEnvelope {
     ///
     /// This routes through the shared provider-neutral
     /// [`eliot_store_api::canonical_request_hash`] over the
-    /// envelope-equivalent [`CanonicalRequestView`] (issue #63, RECHECK-63
-    /// slice A). The view is field-identical to the envelope, so the emitted
-    /// value is byte-identical to the previous envelope hash; Kernel/store
-    /// rebuild the same view from their transported apply values.
+    /// [`CanonicalRequestView`] built from this envelope (issue #63). The
+    /// view is the envelope plus the two canonical derived fields it adds,
+    /// the semantic source revisions rendered from the expected revision
+    /// heads and the ordering scopes carried from the expected ordering
+    /// heads. Both are derived from envelope data, so Kernel/store rebuild
+    /// the same view from their transported apply values and recompute this
+    /// same digest.
     pub fn canonical_request_hash(&self) -> Result<String, CanonicalError> {
         eliot_store_api::canonical_request_hash(&self.canonical_request_view())
             .map_err(CanonicalError::Store)
@@ -1342,10 +1345,42 @@ mod tests {
         }
     }
 
-    /// Pre-slice envelope hash logic, kept here as the byte-identity oracle:
-    /// canonical JSON of the envelope itself, then SHA-256 hex.
+    /// Envelope-only hash logic, kept here as the byte-identity oracle:
+    /// canonical JSON of the envelope plus the two canonical derived fields
+    /// the shared view adds (the rendered semantic source revisions and the
+    /// carried ordering scopes), then SHA-256 hex.  The envelope wire struct
+    /// itself stays unchanged: the derived values are added to its serialized
+    /// JSON here, so for an envelope whose set-like collections are already in
+    /// canonical order this oracle hashes the same bytes as
+    /// [`eliot_store_api::canonical_request_hash`].
+    ///
+    /// This oracle deliberately does not normalize. The shared owner sorts the
+    /// set-like collections and rejects duplicate ordering scopes before it
+    /// hashes, so the two agree only on canonically-ordered input; the fixtures
+    /// below are built in that order and the byte-identity assertions are what
+    /// prove it, rather than this comment.
     fn legacy_envelope_hash(envelope: &CanonicalWriteEnvelope) -> String {
-        let bytes = canonical_json_bytes(envelope).expect("legacy envelope serializes");
+        let mut value = serde_json::to_value(envelope).expect("legacy envelope serializes");
+        let object = value
+            .as_object_mut()
+            .expect("legacy envelope serializes to a JSON object");
+        object.insert(
+            "semantic_source_revisions".to_owned(),
+            serde_json::json!(render_semantic_source_revisions(
+                &envelope.expected_revision_heads
+            )),
+        );
+        object.insert(
+            "ordering_scopes".to_owned(),
+            serde_json::json!(
+                envelope
+                    .expected_ordering_heads
+                    .iter()
+                    .map(|head| head.scope.clone())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let bytes = canonical_json_bytes(&value).expect("legacy envelope serializes");
         eliot_contracts::sha256_hex(&bytes)
     }
 
@@ -1520,7 +1555,7 @@ mod tests {
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "cc14c2c284762ebff5f1c8d11647a9191eda6debd4480ab605c3c8dadd766e54";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
