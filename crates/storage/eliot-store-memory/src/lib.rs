@@ -6393,7 +6393,8 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "a".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest()?.digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -7971,7 +7972,8 @@ mod tests {
             reason: "user requested deletion".to_owned(),
             requester: "user:test".to_owned(),
             approval_refs: approvals,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: erasure_set_digest()?,
             security: eliot_store_api::SecurityContext::default(),
             event_projection_relation_intents: EventProjectionRelationIntents {
@@ -8245,7 +8247,8 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: class,
             requested_effect_ceiling: effect,
-            admission_contract_set_digest: "a".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
