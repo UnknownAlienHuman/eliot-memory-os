@@ -1,5 +1,5 @@
 // EXPECTED: default=0 form=none helper=0 paired=0 bare-option=0
-// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none keys=(none)
+// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none keys=(none) detail=none
 // Every construct below is a token one of the scanners had to be hardened
 // against. Provoking a site or a raise anywhere in this file is a defect in the
 // oracle, not an expected surprise, so the whole expectation is zeros.

@@ -1,5 +1,5 @@
 // EXPECTED: default=0 form=none helper=0 paired=0 bare-option=0
-// unsupported-macro=1 unresolved=0 manual-visitor=0 raise=none keys=(none)
+// unsupported-macro=1 unresolved=0 manual-visitor=0 raise=none keys=(none) detail=none
 // unsupported-macro-key=unsupported_macro_site.rs:23:derive_serde_wire
 // grade=unknown/BLOCKED/NOT_SAFE kind=unsupported-macro
 // Deserialize is NOT derived here. A serde-like macro generates it, and

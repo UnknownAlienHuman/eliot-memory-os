@@ -1,5 +1,5 @@
 // EXPECTED: default=0 form=none helper=0 paired=0 bare-option=1
-// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none
+// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none detail=none
 // keys=bare_option_site.rs::Fixture.note
 // bare-option-line=bare_option_site.rs:16
 // One bare Option member carrying no serde token at all. serde emits a

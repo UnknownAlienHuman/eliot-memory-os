@@ -1,5 +1,5 @@
 // EXPECTED: default=1 form=helper helper=1 paired=0 bare-option=0
-// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none
+// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none detail=none
 // keys=helper_default_site.rs::Fixture.probe_depth
 // The helper form, recognised by shape and not by name: the tokens default and
 // = must be ADJACENT, which is what separates this from the direct form. The

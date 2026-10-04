@@ -1,5 +1,5 @@
 // EXPECTED: default=0 form=none helper=0 paired=0 bare-option=0
-// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none keys=(none)
+// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none keys=(none) detail=none
 // The most important positive control in this directory: it is what proves the
 // oracle does not invent sites. A struct that declares no defaulted field, no
 // bare Option member and no serde-like macro must yield ZERO sites in every

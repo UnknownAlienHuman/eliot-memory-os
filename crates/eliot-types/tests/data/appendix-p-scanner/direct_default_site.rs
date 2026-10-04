@@ -1,5 +1,5 @@
 // EXPECTED: default=1 form=direct paired=0 helper=0 bare-option=0
-// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none
+// unsupported-macro=0 unresolved=0 manual-visitor=0 raise=none detail=none
 // keys=direct_default_site.rs::Fixture.field_a
 // default= counts every discovered default site; form= splits that one site by
 // its recognised shape. One struct, one plain serde(default) on a String

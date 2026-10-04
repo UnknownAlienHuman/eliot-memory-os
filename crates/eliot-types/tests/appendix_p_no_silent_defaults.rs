@@ -215,11 +215,11 @@ const EXPECTED_DEFAULT_SITE_COUNT: usize = 176;
 ///
 /// Scope is stated so the number is checkable: every named member of every
 /// `struct` item in the nine files, which is the same scope
-/// `discovered_default_sites` reads for the default class. Seven of the 277 are
+/// `discovered_default_sites` reads for the default class. Seven of the 264 are
 /// non-`pub` members of two `pub struct`s that do not derive `Deserialize`
 /// (`ProviderDeclaredBudget`, `ProviderTimeoutProfile`); they are kept because
 /// the class is a statement about the declaration, not about a published wire.
-const EXPECTED_BARE_OPTION_SITE_COUNT: usize = 277;
+const EXPECTED_BARE_OPTION_SITE_COUNT: usize = 264;
 
 /// The frozen `file:line` list behind `EXPECTED_BARE_OPTION_SITE_COUNT`, in
 /// `NINE_FILES` order. A site that moves, appears or disappears changes this
@@ -230,20 +230,10 @@ const EXPECTED_BARE_OPTION_SITE_COUNT: usize = 277;
 #[rustfmt::skip]
 const EXPECTED_BARE_OPTION_SITE_LINES: [(&str, &[usize]); 9] = [
     ("cognition.rs", &[
-        112, 343, 344, 367, 386, 652, 802, 812, 813, 819, 823, 844, 891, 920, 935, 950, 982,
-        984, 1098, 1100, 1124, 1127, 1128, 1149, 1155, 1156, 1171, 1227, 1228, 1229, 1230,
-        1231, 1232, 1233, 1240, 1241, 1244, 1295, 1296, 1317, 1319, 1332, 1333, 1334, 1335,
-        1336, 1357, 1444, 1445, 1546, 1548, 1550, 1566,
+        112, 343, 344, 367, 671, 821, 831, 832, 838, 842, 863, 910, 939, 954, 969, 1001, 1003, 1145, 1148, 1149, 1170, 1176, 1177, 1192, 1248, 1249, 1250, 1251, 1252, 1253, 1254, 1261, 1262, 1265, 1316, 1317, 1338, 1340, 1353, 1354, 1355, 1356, 1357, 1378, 1465, 1466, 1567, 1569, 1571, 1587,
     ]),
     ("memory.rs", &[
-        217, 218, 232, 240, 241, 242, 243, 434, 435, 436, 471, 477, 478, 487, 488, 507, 508,
-        509, 518, 519, 531, 533, 583, 594, 731, 733, 736, 737, 800, 875, 878, 879, 883, 884,
-        903, 929, 1202, 1222, 1224, 1372, 1744, 1832, 1833, 1922, 1923, 1924, 1925, 1926,
-        2052, 2053, 2054, 2055, 2157, 2412, 2413, 2414, 2429, 2437, 2455, 2541, 2591, 2592,
-        2596, 2597, 2598, 2599, 2618, 2620, 2621, 2624, 2733, 2749, 2770, 2771, 2772, 2784,
-        2794, 2795, 2881, 2882, 2889, 2890, 2985, 2994, 3045, 3077, 3107, 3110, 3132, 3133,
-        3139, 3140, 3154, 3156, 3221, 3247, 3259, 3282, 3283, 3337, 3338, 3344, 3350, 3412,
-        3446, 3467, 3478, 3489, 3507, 3520, 3521, 3522, 3523, 3551,
+        237, 238, 261, 262, 263, 264, 455, 456, 457, 501, 510, 511, 530, 531, 544, 556, 558, 608, 619, 756, 758, 761, 762, 825, 900, 903, 904, 908, 909, 928, 954, 1227, 1247, 1249, 1397, 1769, 1857, 1858, 2082, 2083, 2084, 2085, 2187, 2442, 2443, 2444, 2459, 2467, 2485, 2571, 2621, 2622, 2626, 2627, 2628, 2629, 2648, 2650, 2651, 2654, 2763, 2779, 2800, 2801, 2802, 2814, 2824, 2825, 2911, 2912, 2919, 2920, 3015, 3024, 3075, 3107, 3137, 3140, 3162, 3163, 3169, 3170, 3184, 3186, 3251, 3277, 3289, 3312, 3313, 3367, 3368, 3374, 3380, 3442, 3476, 3497, 3508, 3519, 3537, 3550, 3551, 3552, 3553, 3581,
     ]),
     ("delegation.rs", &[
         31, 112, 115, 116, 117, 134, 179, 180, 181, 182, 184, 235, 289, 291,
@@ -407,6 +397,94 @@ const BREAKING_CANDIDATE_OWNER_MAP: &[(&str, &str, &str, &str)] = &[
         "n/a",
         "the plan_hash owner's blake3 digest over the emitted keys: removing a skip_serializing_if changes the sealed bytes",
         "crates/eliot-app/src/cognitive_field_runner.rs",
+    ),
+];
+
+/// The thirteen members this delivery changed to a required-nullable shape, one
+/// row each: the `file::Type.member` key, the `file:line` that declares it in
+/// the current production source, and a SHORT justification that says either
+/// why the member is NOT a breaking candidate or which owner owns it.
+///
+/// This is the row set the deferred owner map does NOT pin. Only the five
+/// `VerificationRun` members have a map row, and that row names no field, so the
+/// other eight could not fail the case-20 completeness check even if nobody had
+/// classified them: both sides of that check are hand-maintained constants in
+/// this file, which is what makes an unclassified breaking candidate
+/// structurally invisible to it.
+///
+/// Every justification below was checked against the producer it names. Where
+/// no producer exists, the row says so instead of claiming compatibility that
+/// was not verified: `CausalCandidate` has no in-tree construction surface at
+/// all, and no in-tree Rust source writes a stored `VerificationRun`. Case 20
+/// asserts that each row carries a justification, that the stated `file:line`
+/// really declares that member with the required-nullable decoder, and that
+/// every repository path a justification names exists on disk with the same
+/// `is_file()` check the map rows use.
+const CHANGED_REQUIRED_NULLABLE_MEMBERS: &[(&str, &str, &str)] = &[
+    (
+        "cognition.rs::CausalCandidate.assigned_check",
+        "cognition.rs:387",
+        "NOT a breaking candidate: CausalCandidate has no in-tree struct literal, no constructor and no producer at all - searching every crate source finds only its own declaration and its own impl - and it publishes no JsonSchema, so no accepted byte set changes.",
+    ),
+    (
+        "cognition.rs::AutonomyRunView.cost_or_tokens_used",
+        "cognition.rs:1118",
+        "NOT a breaking candidate: the one in-tree producer, crates/eliot-app/src/mcp_stdio/autonomy.rs::autonomy_run_projection, builds the whole view at :246 and states this key as Some(...) at :281, so every current projection already carries it.",
+    ),
+    (
+        "cognition.rs::AutonomyRunView.completion_proof",
+        "cognition.rs:1121",
+        "NOT a breaking candidate: the same producer states this key explicitly at crates/eliot-app/src/mcp_stdio/autonomy.rs:286, cloning the recorded graph proof rather than leaving it unset.",
+    ),
+    (
+        "memory.rs::TaskAcceptanceItem.verification_scope_hash",
+        "memory.rs:253",
+        "NOT a breaking candidate: every in-tree TaskAcceptanceItem literal states the key, including crates/eliot-app/src/mcp_stdio/runtime_handlers.rs:428 and the eliot-engine test fixtures, and the struct is deny_unknown_fields with no published schema.",
+    ),
+    (
+        "memory.rs::TaskContractInput.action_provenance",
+        "memory.rs:493",
+        "NOT a breaking candidate: the in-tree write-side producers state it explicitly, at crates/eliot-app/src/mcp_stdio/runtime_handlers.rs:453 and crates/eliot-app/src/mcp_stdio/task.rs:1265, as None or as the resolved provenance set.",
+    ),
+    (
+        "memory.rs::TaskContractInput.completion_proof",
+        "memory.rs:500",
+        "NOT a breaking candidate: the same producers state it explicitly, at crates/eliot-app/src/mcp_stdio/runtime_handlers.rs:458 and crates/eliot-app/src/mcp_stdio/task.rs:1270.",
+    ),
+    (
+        "memory.rs::TaskContract.action_provenance",
+        "memory.rs:533",
+        "NOT a breaking candidate: the durable write path states it on every UPSERT of the stored record, at crates/eliot-store/src/surql/apply_write_envelope.surql:245, so the canonical row always carries the key.",
+    ),
+    (
+        "memory.rs::TaskContract.completion_proof",
+        "memory.rs:543",
+        "NOT a breaking candidate: the same UPSERT states it explicitly at crates/eliot-store/src/surql/apply_write_envelope.surql:250.",
+    ),
+    (
+        "memory.rs::VerificationRun.claim_id",
+        "memory.rs:1948",
+        "OWNED, not verified compatible: the deferred 'VerificationRun historical rows' row of the map above, whose owner is crates/eliot-store/src/canonical_store.rs - no in-tree Rust source writes the record, so a stored row that never carried the binding is that owner's historical-row policy.",
+    ),
+    (
+        "memory.rs::VerificationRun.project_id",
+        "memory.rs:1950",
+        "OWNED, not verified compatible: the same deferred historical-rows row, owned by crates/eliot-store/src/canonical_store.rs, which reads the stored record back and no in-tree Rust source writes.",
+    ),
+    (
+        "memory.rs::VerificationRun.task_id",
+        "memory.rs:1952",
+        "OWNED, not verified compatible: the same deferred historical-rows row, owned by crates/eliot-store/src/canonical_store.rs, which reads the stored record back and no in-tree Rust source writes.",
+    ),
+    (
+        "memory.rs::VerificationRun.write_id",
+        "memory.rs:1954",
+        "OWNED, not verified compatible: the same deferred historical-rows row, owned by crates/eliot-store/src/canonical_store.rs, which reads the stored record back and no in-tree Rust source writes.",
+    ),
+    (
+        "memory.rs::VerificationRun.memory_revision",
+        "memory.rs:1956",
+        "OWNED, not verified compatible: the same deferred historical-rows row, owned by crates/eliot-store/src/canonical_store.rs, which reads the stored record back and no in-tree Rust source writes.",
     ),
 ];
 
@@ -611,6 +689,60 @@ fn nine_file_source(file: &str) -> String {
         .join(file);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("{file} must be readable: {error}"))
+}
+
+/// The nine frozen production files as `(file, source)` pairs, which is the
+/// exact input every scan below walks. Every scan is written against
+/// `(file_name, source_text)` rather than against this list, so pointing one at
+/// a scanner fixture under `tests/data/appendix-p-scanner/` supplies the same
+/// shape and there is exactly one copy of each rule.
+fn nine_file_sources() -> Vec<(&'static str, String)> {
+    NINE_FILES
+        .iter()
+        .map(|file| (*file, nine_file_source(file)))
+        .collect()
+}
+
+/// The `skip_serializing_if` and `serialize_with` attribute NAMES that appear
+/// inside the body of one named `struct`, each with the `file:line` it was read
+/// at, sorted.
+///
+/// This is not a second oracle and it classifies nothing. It reuses `mask_rust`,
+/// which blanks comments and string literals while preserving byte offsets, and
+/// `struct_body_spans`, which already locates every named struct body in that
+/// same masked text. Masking is what makes the answer exact rather than
+/// approximate: a doc comment that names an attribute cannot be mistaken for a
+/// declaration, and neither can a literal inside `with = "..."`. What survives
+/// masking inside one struct body is the attribute name the source really spells
+/// on a member.
+///
+/// Only those two names are looked for, and only inside one struct body. `with`
+/// is deliberately outside this helper's vocabulary: it is a third, older token
+/// this `Serialize` derivation already carried before the change case 12 is
+/// about, and reading it here would turn a statement about this delivery into a
+/// statement about the type's whole history.
+fn serializing_attribute_names_in(file: &str, type_name: &str) -> Vec<(String, usize)> {
+    let raw = nine_file_source(file);
+    let masked = mask_rust(&raw);
+    let (_, start, end) = struct_body_spans(&masked)
+        .into_iter()
+        .find(|(name, ..)| name.as_str() == type_name)
+        .unwrap_or_else(|| panic!("{file} must still declare a struct named {type_name}"));
+    let body = &masked[start..=end];
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for name in ["serialize_with", "skip_serializing_if"] {
+        let mut from = 0usize;
+        while from < body.len() {
+            let Some(at) = body[from..].find(name) else {
+                break;
+            };
+            let at = at + from;
+            found.push((name.to_owned(), line_of(&raw, start + at)));
+            from = at + name.len();
+        }
+    }
+    found.sort();
+    found
 }
 
 /// The one way this oracle refuses source it cannot read. The detail strings
@@ -1064,6 +1196,63 @@ fn enclosing_type_name(masked: &str, before: usize) -> Option<String> {
     found
 }
 
+/// The `#[serde(default)]` sites of ONE source, in `serde_attribute_spans`
+/// order and named with `file` exactly as the nine-file aggregation names them.
+fn default_sites_in(file: &str, raw: &str) -> Vec<DefaultSite> {
+    let mut sites = Vec::new();
+    let masked = mask_rust(raw);
+    assert_eq!(
+        masked.len(),
+        raw.len(),
+        "{file}: masking must preserve byte offsets"
+    );
+    for (start, end) in serde_attribute_spans(&masked) {
+        let body = &raw[start..end];
+        let tokens = serde_tokens(body);
+        if !tokens.contains(&"default") {
+            continue;
+        }
+        let paired = tokens.contains(&"skip_serializing_if");
+        let helper = tokens
+            .windows(2)
+            .any(|pair| pair[0] == "default" && pair[1] == "=");
+        let form = if helper {
+            DefaultForm::Helper
+        } else if paired {
+            DefaultForm::Paired
+        } else {
+            DefaultForm::Direct
+        };
+        let prefix = format!("{file}::");
+        let Some(type_name) = enclosing_type_name(&masked, start) else {
+            sites.push(DefaultSite {
+                key: format!("{prefix}<unresolved-enclosing-type>"),
+                form,
+                paired,
+            });
+            continue;
+        };
+        // A container attribute, or any shape this oracle cannot
+        // resolve, is recorded as unresolved rather than skipped: the
+        // shipped inventory treats the same situation as incomplete
+        // evidence, and case 15 fails closed on it.
+        let Some(field) = field_name_after(&masked, end) else {
+            sites.push(DefaultSite {
+                key: format!("{prefix}{type_name}.<unresolved-member>"),
+                form,
+                paired,
+            });
+            continue;
+        };
+        sites.push(DefaultSite {
+            key: format!("{prefix}{type_name}.{field}"),
+            form,
+            paired,
+        });
+    }
+    sites
+}
+
 /// The `#[serde(default)]` sites in the nine-file domain, computed once per
 /// process. `#[test]` functions run in parallel threads, so the cell has to be
 /// the concurrent one; case 19 asks for this scan once per covered type.
@@ -1071,60 +1260,10 @@ fn discovered_default_sites() -> Vec<DefaultSite> {
     static SITES: OnceLock<Vec<DefaultSite>> = OnceLock::new();
     SITES
         .get_or_init(|| {
-            let mut sites = Vec::new();
-            for file in NINE_FILES {
-                let raw = nine_file_source(file);
-                let masked = mask_rust(&raw);
-                assert_eq!(
-                    masked.len(),
-                    raw.len(),
-                    "{file}: masking must preserve byte offsets"
-                );
-                for (start, end) in serde_attribute_spans(&masked) {
-                    let body = &raw[start..end];
-                    let tokens = serde_tokens(body);
-                    if !tokens.contains(&"default") {
-                        continue;
-                    }
-                    let paired = tokens.contains(&"skip_serializing_if");
-                    let helper = tokens
-                        .windows(2)
-                        .any(|pair| pair[0] == "default" && pair[1] == "=");
-                    let form = if helper {
-                        DefaultForm::Helper
-                    } else if paired {
-                        DefaultForm::Paired
-                    } else {
-                        DefaultForm::Direct
-                    };
-                    let prefix = format!("{file}::");
-                    let Some(type_name) = enclosing_type_name(&masked, start) else {
-                        sites.push(DefaultSite {
-                            key: format!("{prefix}<unresolved-enclosing-type>"),
-                            form,
-                            paired,
-                        });
-                        continue;
-                    };
-                    // A container attribute, or any shape this oracle cannot
-                    // resolve, is recorded as unresolved rather than skipped: the
-                    // shipped inventory treats the same situation as incomplete
-                    // evidence, and case 15 fails closed on it.
-                    let Some(field) = field_name_after(&masked, end) else {
-                        sites.push(DefaultSite {
-                            key: format!("{prefix}{type_name}.<unresolved-member>"),
-                            form,
-                            paired,
-                        });
-                        continue;
-                    };
-                    sites.push(DefaultSite {
-                        key: format!("{prefix}{type_name}.{field}"),
-                        form,
-                        paired,
-                    });
-                }
-            }
+            let mut sites: Vec<DefaultSite> = nine_file_sources()
+                .iter()
+                .flat_map(|source| default_sites_in(source.0, &source.1))
+                .collect();
             sites.sort_by(|left, right| left.key.cmp(&right.key));
             sites
         })
@@ -1455,6 +1594,33 @@ fn line_of(raw: &str, offset: usize) -> usize {
     line
 }
 
+/// The `absent-becomes-none` sites of ONE source, in ascending source order.
+fn bare_option_sites_in(file: &'static str, raw: &str) -> Vec<BareOptionSite> {
+    let mut sites = Vec::new();
+    let masked = mask_rust(raw);
+    assert_eq!(
+        masked.len(),
+        raw.len(),
+        "{file}: masking must preserve byte offsets"
+    );
+    let spans = serde_attribute_spans(&masked);
+    for (type_name, open, close) in struct_body_spans(&masked) {
+        for member in struct_member_declarations(&masked, raw, &spans, (open, close), &type_name) {
+            if !declares_bare_option(&member.declared_type)
+                || suppresses_absent_becomes_none(&member.tokens)
+            {
+                continue;
+            }
+            sites.push(BareOptionSite {
+                key: format!("{}::{}.{}", file, member.type_name, member.field),
+                file,
+                line: line_of(raw, member.offset),
+            });
+        }
+    }
+    sites
+}
+
 /// Every `absent-becomes-none` site in the nine-file domain: a named member of a
 /// `struct` item whose declared type is a bare `Option<...>` and which carries
 /// neither `default` nor `deserialize_with`/`with`. Discovered in the same masked
@@ -1468,34 +1634,10 @@ fn discovered_bare_option_sites() -> Vec<BareOptionSite> {
     static SITES: OnceLock<Vec<BareOptionSite>> = OnceLock::new();
     SITES
         .get_or_init(|| {
-            let mut sites = Vec::new();
-            for file in NINE_FILES {
-                let raw = nine_file_source(file);
-                let masked = mask_rust(&raw);
-                assert_eq!(
-                    masked.len(),
-                    raw.len(),
-                    "{file}: masking must preserve byte offsets"
-                );
-                let spans = serde_attribute_spans(&masked);
-                for (type_name, open, close) in struct_body_spans(&masked) {
-                    for member in
-                        struct_member_declarations(&masked, &raw, &spans, (open, close), &type_name)
-                    {
-                        if !declares_bare_option(&member.declared_type)
-                            || suppresses_absent_becomes_none(&member.tokens)
-                        {
-                            continue;
-                        }
-                        sites.push(BareOptionSite {
-                            key: format!("{}::{}.{}", file, member.type_name, member.field),
-                            file,
-                            line: line_of(&raw, member.offset),
-                        });
-                    }
-                }
-            }
-            sites
+            nine_file_sources()
+                .iter()
+                .flat_map(|source| bare_option_sites_in(source.0, &source.1))
+                .collect()
         })
         .clone()
 }
@@ -1580,14 +1722,27 @@ fn skip_whitespace(bytes: &[u8], at: usize) -> usize {
 /// three substrings and is therefore reachable only through it.
 ///
 /// Sites are deduplicated by name and line, as the script dedups the overlap
-/// between its two patterns (:1244), and are sorted like every other discovered
-/// list in this file.
+/// between its two patterns (:1244). The nine-file read sorts them like every
+/// other discovered list in this file; a single-source read keeps source order,
+/// which for one file is already ascending.
 fn discovered_unsupported_macros() -> Vec<UnsupportedMacroSite> {
+    let sources = nine_file_sources();
+    let mut sites =
+        unsupported_macros_in(sources.iter().map(|source| (source.0, source.1.as_str())));
+    sites.sort_by(|left, right| left.key.cmp(&right.key));
+    sites
+}
+
+/// The `unsupported-macro` sites of the given `(file, source)` pairs, in source
+/// order. The dedup set spans the whole call, so the overlap between the two
+/// patterns is folded once per `(name, line)` exactly as the script folds it.
+fn unsupported_macros_in<'a>(
+    sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<UnsupportedMacroSite> {
     let mut sites = Vec::new();
     let mut seen: Vec<(String, usize)> = Vec::new();
-    for file in NINE_FILES {
-        let raw = nine_file_source(file);
-        let masked = mask_rust(&raw);
+    for (file, raw) in sources {
+        let masked = mask_rust(raw);
         let bytes = masked.as_bytes();
         let mut index = 0usize;
         while index < bytes.len() {
@@ -1621,7 +1776,7 @@ fn discovered_unsupported_macros() -> Vec<UnsupportedMacroSite> {
             if !matches!(bytes.get(cursor).copied(), Some(b'(' | b'[' | b'{')) {
                 continue;
             }
-            let line = line_of(&raw, start);
+            let line = line_of(raw, start);
             let entry = (name, line);
             if seen.contains(&entry) {
                 continue;
@@ -1636,7 +1791,6 @@ fn discovered_unsupported_macros() -> Vec<UnsupportedMacroSite> {
             });
         }
     }
-    sites.sort_by(|left, right| left.key.cmp(&right.key));
     sites
 }
 
@@ -1758,23 +1912,34 @@ fn starts_its_own_line(bytes: &[u8], offset: usize) -> bool {
 /// lifetime tick (`mask_rust`) but blanking and re-deriving the impl header is
 /// not worth a second copy of the masking rules here. The `impl` anchor is kept
 /// for the reason given on `starts_its_own_line`.
-fn manual_decoder_impls() -> Vec<String> {
+/// The hand-written decoders of the given `(file, source)` pairs, in source
+/// order. The nine-file read sorts them; a single-source read is already in
+/// ascending order for one file, so nothing else changes.
+fn manual_decoder_impls_in<'a>(
+    sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<String> {
     let mut found = Vec::new();
-    for file in NINE_FILES {
-        let raw = nine_file_source(file);
+    for (file, raw) in sources {
         let bytes = raw.as_bytes();
         let mut cursor = 0usize;
         while let Some(relative) = raw[cursor..].find("impl") {
             let offset = cursor + relative;
             match manual_deserialize_impl_end(bytes, offset) {
                 Some(end) if starts_its_own_line(bytes, offset) => {
-                    found.push(format!("{file}:{}", line_of(&raw, offset)));
+                    found.push(format!("{file}:{}", line_of(raw, offset)));
                     cursor = end;
                 }
                 _ => cursor = offset + "impl".len(),
             }
         }
     }
+    found
+}
+
+fn manual_decoder_impls() -> Vec<String> {
+    let sources = nine_file_sources();
+    let mut found =
+        manual_decoder_impls_in(sources.iter().map(|source| (source.0, source.1.as_str())));
     found.sort();
     found
 }
@@ -1814,6 +1979,105 @@ fn sorted(values: &[String]) -> Vec<String> {
     let mut owned = values.to_vec();
     owned.sort();
     owned
+}
+
+/// Every one of the thirteen members this delivery changed to a required-nullable
+/// shape is accounted for individually: a deferred owner-map row names its type or
+/// the row carries a stated justification, the `file:line` it states really
+/// declares that member carrying the required-nullable decoder, and every
+/// repository path a justification names exists on disk.
+///
+/// It is a separate function because it proves a different property from the
+/// owner-map checks its leading comment contrasts against - completeness of the
+/// changed members rather than completeness of the map - and `case_20` calls it
+/// directly beneath those checks.
+fn assert_changed_required_nullable_members_are_accounted_for() {
+    // The thirteen members this delivery changed to a required-nullable shape.
+    // The checks above cannot see them: they compare this file's own
+    // hand-maintained constants against each other, and the only map row that
+    // names a changed type at all ("VerificationRun historical rows") names no
+    // field, so a changed member nobody classified could not fail any of them.
+    // Each member below is therefore accounted for explicitly, by a map row or by
+    // a justification that says why it is not a breaking candidate or which owner
+    // owns it.
+    let mut changed_keys: Vec<String> = CHANGED_REQUIRED_NULLABLE_MEMBERS
+        .iter()
+        .map(|(key, ..)| (*key).to_owned())
+        .collect();
+    changed_keys.sort();
+    changed_keys.dedup();
+    assert_eq!(
+        changed_keys.len(),
+        13,
+        "the changed required-nullable members must stay thirteen distinct file::Type.member keys, one per changed member"
+    );
+    for (key, location, justification) in CHANGED_REQUIRED_NULLABLE_MEMBERS {
+        let member = key.rsplit('.').next().unwrap_or_default();
+        let type_name = key.rsplit('.').nth(1).unwrap_or_default();
+        // A map row counts as covering this member when it names the member's
+        // TYPE. Matching on the type rather than on the member name is what keeps
+        // `VerificationRun.task_id` from passing on the unrelated
+        // `RecallL0Request.task_id` row; the row that does cover the five
+        // `VerificationRun` members names the type and no field, which is why the
+        // justification below is required of all thirteen either way.
+        let named_by_a_map_row = BREAKING_CANDIDATE_OWNER_MAP
+            .iter()
+            .any(|(candidate, ..)| candidate.contains(type_name));
+        assert!(
+            named_by_a_map_row || !justification.trim().is_empty(),
+            "{key} is a member this delivery made required-nullable and is named by neither a deferred owner-map row nor a stated justification"
+        );
+        assert!(
+            !justification.trim().is_empty(),
+            "{key} must carry a justification: why it is not a breaking candidate, or which owner owns it"
+        );
+        // The stated declaration has to be real, and it has to be the member the
+        // required-nullable correction was made on. A `file:line` that drifts, or
+        // that names a member which is not carrying the decoder, fails here rather
+        // than leaving the row looking like evidence.
+        let (file, line) = location
+            .split_once(':')
+            .unwrap_or_else(|| panic!("{key} must state its declaration as one file:line"));
+        let declared_line = line
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("{key}: {line} is not a line number: {error}"));
+        assert!(
+            declared_line >= 2,
+            "{key}: the required-nullable attribute sits on the line above its member"
+        );
+        let source = nine_file_source(file);
+        let declared = source
+            .lines()
+            .nth(declared_line - 1)
+            .unwrap_or_else(|| panic!("{file}:{declared_line} must exist for {key}"));
+        assert!(
+            declared.contains(&format!("pub {member}:")),
+            "{key} must be declared at {location}, got: {declared}"
+        );
+        let attribute = source.lines().nth(declared_line - 2).unwrap_or_default();
+        assert!(
+            attribute.contains("deserialize_required_nullable"),
+            "{key} must carry the required-nullable decoder on the line above {location}, got: {attribute}"
+        );
+        // Every repository path a justification names must exist, with the same
+        // on-disk check the map rows above use. A justification that cites a
+        // producer nobody can open is not evidence.
+        for token in justification.split(|character: char| {
+            !(character.is_alphanumeric()
+                || character == '/'
+                || character == '.'
+                || character == '_'
+                || character == '-')
+        }) {
+            if !token.starts_with("crates/") {
+                continue;
+            }
+            assert!(
+                workspace_root().join(token).is_file(),
+                "{key}: the justification names {token}, which must exist on disk"
+            );
+        }
+    }
 }
 /// The field-exact exception table: one row per discovered default site in
 /// the nine-file domain, with the disposition that records why it stays.
@@ -2555,10 +2819,14 @@ fn case_02_omitted_contract_required_changed_field_fails_with_the_named_error() 
     // Case 2: dropping one contract-required key from a valid current golden
     // must fail, and the typed error owner must name that key.
     //
-    // "Contract-required" here means the decoder can refuse the absence, not
-    // that the field is documented as required. Three keys this case used to
-    // include cannot be refused at all; they are handled, and named as the
-    // production gap they are, in the closing arm below.
+    // "Contract-required" here means the decoder really refuses the absence. It
+    // used to be narrower than the arm list: three keys this case included could
+    // not be refused at all, because a bare `Option<T>` decodes an absent key as
+    // `None`, so the case asserted the decode instead. Those three members, and
+    // ten more that carried the same bare shape, now carry
+    // `#[serde(deserialize_with = "deserialize_required_nullable")]`, so the
+    // refusals below are real; the closing block names the shape and all
+    // thirteen `file:line` sites.
     let lease = work_lease_wire();
     let complete: WorkLease =
         serde_json::from_value(lease.clone()).expect("complete work lease wire");
@@ -2697,76 +2965,154 @@ fn case_02_omitted_contract_required_changed_field_fails_with_the_named_error() 
     );
 
     // ---------------------------------------------------------------------
-    // Three rows this case used to assert a refusal for, corrected.
+    // THIRTEEN rows this case asserts a refusal for BEFORE the production
+    // change, and the refusals are now the truth. Six of them were delivered
+    // first and were then described as the complete set; a refutation pass run
+    // AFTER that delivery found SEVEN more members of exactly the same shape,
+    // so the earlier completeness claim was wrong. It is corrected here rather
+    // than left standing: the thirteen sites are all listed below and all
+    // thirteen are asserted in this case. A reader must not take thirteen for
+    // six - the two `file:line` lists that existed before this edit are both
+    // wrong, one for being incomplete and neither for being a bound.
     //
-    // `CausalCandidate.assigned_check` (cognition.rs:386),
-    // `TaskAcceptanceItem.verification_scope_hash` (memory.rs:232) and
-    // `TaskContractInput.action_provenance` (memory.rs:471) are declared as a
-    // bare `Option<...>` with no serde attribute at all. serde's derive emits
-    // `missing_field(name)?` for that shape, and `missing_field` hands back a
-    // `MissingFieldDeserializer` whose `deserialize_option` visits `None`, so
-    // the key is NOT required and each `_missing_` document decodes. Asserting a
-    // refusal here asserted something the decoder can never produce.
+    // All thirteen members were each declared as a bare `Option<...>` with no
+    // serde attribute at all. serde's derive emitted `missing_field(name)?` for
+    // that shape, and `missing_field` hands back a `MissingFieldDeserializer`
+    // whose `deserialize_option` visits `None`, so an ABSENT key silently
+    // decoded as "this record states no such binding" on authority-bearing
+    // fields: an unassigned check, an unbound acceptance item, an
+    // unprovenanced task contract, an unproved completion, an unstated run
+    // cost, and a verification run bound to no claim, no project, no task, no
+    // write and no memory revision.
     //
-    // This is a production gap, and it is NOT owned here: all nine production
-    // files are READ ONLY for this card. The false production claim is recorded
-    // on the field itself - the doc comment at `memory.rs:468-470` says
-    // `action_provenance` "now fails loudly instead of claiming it did not
-    // exist", and a bare `Option` does exactly the opposite. `cognition.rs:381-382`
-    // makes the same claim for `assigned_check` ("Both are now required keys;
-    // absence is a typed missing-field error rather than a manufactured fact").
+    // Each now carries
+    // `#[serde(deserialize_with = "deserialize_required_nullable")]` - the
+    // field-exact attribute, one per member, with the shared decoder body
+    // (`Option::<T>::deserialize(deserializer)`) doing nothing that reintroduces
+    // a default. With `deserialize_with` and no `serde(default)`, serde_derive's
+    // `expr_is_missing` no longer routes the member to `missing_field`, so the
+    // derived visitor hits `missing_field(name)?` FIRST and that is a typed
+    // ERROR; the decoder body is reached only for a key that IS present, where
+    // it keeps handling a stated value and an explicit `null` exactly as before.
+    // The frozen field inventory in `crates/eliot-types/src/lifecycle.rs`
+    // ("#708 FROZEN FIELD INVENTORY") names all thirteen REQUIRED, which is what
+    // makes the refusals correct rather than merely stricter.
     //
-    // So the true current behaviour is stated instead: the document decodes and
-    // the member is `None`. Fixing it needs `deserialize_with` (or a
-    // `Default`-free required wrapper) on the nine frozen files, which is a
-    // different card with a different owner.
+    // The thirteen sites, at their current declarations:
+    //   cognition.rs:387   CausalCandidate.assigned_check
+    //   memory.rs:253      TaskAcceptanceItem.verification_scope_hash
+    //   memory.rs:493      TaskContractInput.action_provenance
+    //   memory.rs:500      TaskContractInput.completion_proof
+    //   memory.rs:533      TaskContract.action_provenance
+    //   memory.rs:543      TaskContract.completion_proof
+    //   cognition.rs:1118  AutonomyRunView.cost_or_tokens_used
+    //   cognition.rs:1121  AutonomyRunView.completion_proof
+    //   memory.rs:1948     VerificationRun.claim_id
+    //   memory.rs:1950     VerificationRun.project_id
+    //   memory.rs:1952     VerificationRun.task_id
+    //   memory.rs:1954     VerificationRun.write_id
+    //   memory.rs:1956     VerificationRun.memory_revision
+    // `Serialize` was not touched and no `skip_serializing_if` was added to any
+    // of the thirteen, so emitted bytes are unchanged and case 12's canonical
+    // round trip still holds; only the ACCEPTED set narrowed, which is the
+    // compatible requiredness correction the thirteen declaration docs already
+    // claim.
+    //
+    // Three of the six FIRST-round documents predate this work -
+    // `causal_candidate_missing_assigned_check.json`,
+    // `task_acceptance_item_missing_verification_scope_hash.json` and
+    // `task_contract_input_missing_action_provenance.json` - and were previously
+    // asserted by this very case to DECODE with the member `None`.
+    // `task_contract_input_missing_completion_proof.json` and
+    // `task_contract_missing_completion_proof.json` arrived with the first
+    // production change, and `task_contract_missing_action_provenance.json` was
+    // written afterwards, because `TaskContract.action_provenance` had no
+    // omission fixture of its own at all. The seven REFUTATION-pass documents
+    // arrived with the second production change; each one is its positive with
+    // exactly that one member removed and every other value unchanged, which is
+    // what lets this case read the refusal as the requiredness change and not as
+    // a fixture defect.
+    //
+    // None of the thirteen is an `absent-becomes-none` site any more: each
+    // carries `deserialize_with`, which `discovered_bare_option_sites` skips by
+    // the same rule that already keeps the `deserialize_with` members of
+    // `ProviderInvocationAttempt` out of the list. So
+    // `EXPECTED_BARE_OPTION_SITE_COUNT` falls from 277 to 264 - the first six
+    // members took it to 271 and the seven the refutation pass found took it the
+    // rest of the way - case 19's tolerated set loses all thirteen keys and
+    // therefore demands their refusal, and the assertion that these keys stay
+    // enumerated absent-becomes-none sites - which this block used to end with -
+    // is deleted rather than inverted.
     // ---------------------------------------------------------------------
-    let unchecked: CausalCandidate = decode_fixture("causal_candidate_missing_assigned_check.json");
-    assert!(
-        unchecked.assigned_check.is_none(),
-        "causal_candidate_missing_assigned_check.json must decode, and absence is None today"
+    assert_refused::<CausalCandidate>(
+        &corpus("causal_candidate_missing_assigned_check.json"),
+        "assigned_check",
+        "causal_candidate_missing_assigned_check.json",
     );
-    let unbound_item: TaskAcceptanceItem =
-        decode_fixture("task_acceptance_item_missing_verification_scope_hash.json");
-    assert!(
-        unbound_item.verification_scope_hash.is_none(),
-        "task_acceptance_item_missing_verification_scope_hash.json must decode, and absence is None today"
+    assert_refused::<TaskAcceptanceItem>(
+        &corpus("task_acceptance_item_missing_verification_scope_hash.json"),
+        "verification_scope_hash",
+        "task_acceptance_item_missing_verification_scope_hash.json",
     );
-    let unprovenanced: TaskContractInput =
-        decode_fixture("task_contract_input_missing_action_provenance.json");
-    assert!(
-        unprovenanced.action_provenance.is_none(),
-        "task_contract_input_missing_action_provenance.json must decode, and absence is None today"
+    assert_refused::<TaskContractInput>(
+        &corpus("task_contract_input_missing_action_provenance.json"),
+        "action_provenance",
+        "task_contract_input_missing_action_provenance.json",
     );
-
-    // The same three members are frozen in the case-15 oracle as
-    // `absent-becomes-none` sites, which is why case 19 tolerates their removal
-    // instead of demanding a refusal.
-    let absent_becomes_none = discovered_bare_option_sites();
-    for (key, file, line) in [
-        (
-            "cognition.rs::CausalCandidate.assigned_check",
-            "cognition.rs",
-            386,
-        ),
-        (
-            "memory.rs::TaskAcceptanceItem.verification_scope_hash",
-            "memory.rs",
-            232,
-        ),
-        (
-            "memory.rs::TaskContractInput.action_provenance",
-            "memory.rs",
-            471,
-        ),
-    ] {
-        assert!(
-            absent_becomes_none
-                .iter()
-                .any(|site| site.key == key && site.file == file && site.line == line),
-            "{key} must stay an enumerated absent-becomes-none site at {file}:{line}"
-        );
-    }
+    assert_refused::<TaskContractInput>(
+        &corpus("task_contract_input_missing_completion_proof.json"),
+        "completion_proof",
+        "task_contract_input_missing_completion_proof.json",
+    );
+    assert_refused::<TaskContract>(
+        &corpus("task_contract_missing_action_provenance.json"),
+        "action_provenance",
+        "task_contract_missing_action_provenance.json",
+    );
+    assert_refused::<TaskContract>(
+        &corpus("task_contract_missing_completion_proof.json"),
+        "completion_proof",
+        "task_contract_missing_completion_proof.json",
+    );
+    // The seven arms the refutation pass added, in the order the closing block
+    // lists them. Each is the same claim as the six above and for the same
+    // reason: the member used to decode an absent key as `None`, and now refuses
+    // it with a typed `missing_field` naming the member.
+    assert_refused::<AutonomyRunView>(
+        &corpus("autonomy_run_view_missing_cost_or_tokens_used.json"),
+        "cost_or_tokens_used",
+        "autonomy_run_view_missing_cost_or_tokens_used.json",
+    );
+    assert_refused::<AutonomyRunView>(
+        &corpus("autonomy_run_view_missing_completion_proof.json"),
+        "completion_proof",
+        "autonomy_run_view_missing_completion_proof.json",
+    );
+    assert_refused::<VerificationRun>(
+        &corpus("verification_run_missing_claim_id.json"),
+        "claim_id",
+        "verification_run_missing_claim_id.json",
+    );
+    assert_refused::<VerificationRun>(
+        &corpus("verification_run_missing_project_id.json"),
+        "project_id",
+        "verification_run_missing_project_id.json",
+    );
+    assert_refused::<VerificationRun>(
+        &corpus("verification_run_missing_task_id.json"),
+        "task_id",
+        "verification_run_missing_task_id.json",
+    );
+    assert_refused::<VerificationRun>(
+        &corpus("verification_run_missing_write_id.json"),
+        "write_id",
+        "verification_run_missing_write_id.json",
+    );
+    assert_refused::<VerificationRun>(
+        &corpus("verification_run_missing_memory_revision.json"),
+        "memory_revision",
+        "verification_run_missing_memory_revision.json",
+    );
 }
 
 // WORK_UNIT_CASE: 708/3
@@ -2815,17 +3161,45 @@ fn case_03_optional_members_keep_absent_null_and_value_distinguishable() {
             panic!("explicit null {field} must decode as a stated absence: {error}")
         });
     }
-    // Four of them keep the valued state distinct from both other states.
+    // Seven of them keep the valued state distinct from both other states.
     for (field, fragment) in [
         ("timeout_class", "\"spawn_timeout\""),
         ("process_timed_out", "true"),
         ("stdout_total_bytes", "7"),
         ("process_worker_error", "\"worker exited\""),
+        // The three falsy and empty valued states. `0`, `false` and `""` are
+        // values, not a fifth spelling of absence: each decodes to the value
+        // itself, which is what the arm below checks against the decoded record.
+        ("stdout_total_bytes", "0"),
+        ("process_timed_out", "false"),
+        ("process_worker_error", "\"\""),
     ] {
         let valued = with_field(&attempt_raw, field, fragment);
         let _: ProviderInvocationAttempt = serde_json::from_str(&valued)
             .unwrap_or_else(|error| panic!("explicit value {field} must decode: {error}"));
     }
+    // The explicitly empty value is a fourth state, distinct from both an absent
+    // key (refused, by the loop above) and an explicit null (`None`, by the loop
+    // above that one), so a reader cannot confuse "zero was measured", "the
+    // process was not timed out" and "a worker error text was recorded but is
+    // empty" with "nothing was ever recorded".
+    //
+    // `RecallL0Request.task_id` cannot carry this arm: it is `Option<TaskId>`, a
+    // uuid newtype, so `""` is refused by the TaskId parser instead of preserved
+    // as an empty value. The empty `String` member used here is
+    // `ProviderInvocationAttempt.process_worker_error`.
+    let zeroed: ProviderInvocationAttempt =
+        serde_json::from_str(&with_field(&attempt_raw, "stdout_total_bytes", "0"))
+            .expect("an explicit zero is a stated measurement, not an absent one");
+    assert_eq!(zeroed.stdout_total_bytes, Some(0));
+    let not_timed_out: ProviderInvocationAttempt =
+        serde_json::from_str(&with_field(&attempt_raw, "process_timed_out", "false"))
+            .expect("an explicit false is a stated outcome, not an absent one");
+    assert_eq!(not_timed_out.process_timed_out, Some(false));
+    let emptied: ProviderInvocationAttempt =
+        serde_json::from_str(&with_field(&attempt_raw, "process_worker_error", "\"\""))
+            .expect("an explicit empty string is a stated value, not an absent one");
+    assert_eq!(emptied.process_worker_error.as_deref(), Some(""));
 
     // The retained paired row: absent and explicit null are one fact, and both
     // differ from a stated value.
@@ -2844,11 +3218,21 @@ fn case_03_optional_members_keep_absent_null_and_value_distinguishable() {
     .expect("stated task_id decodes");
     assert!(stated_value.task_id.is_some());
 
-    // Only `verifier` is required on the verification run's subject/scope block;
-    // the five binding members are bare `Option<...>` (memory.rs:1922-1926), so
-    // their absence is `None` and only an explicit null states the same fact.
+    // The verification run's subject/scope block is six members and not one of
+    // them is absence-tolerant any more. `verifier` is a plain `String`
+    // (memory.rs:1957) and refuses absence outright; the other five -
+    // `claim_id`, `project_id`, `task_id`, `write_id` and `memory_revision` -
+    // are corrected required-nullable members declared at memory.rs:1948-1956,
+    // each carrying `#[serde(deserialize_with = "deserialize_required_nullable")]`,
+    // so their absence is REFUSED with the typed error naming the member, and an
+    // explicit null is what states "bound to nothing".
     // That is what this arm records: the required member refuses absence, and
-    // the bare-`Option` members take a stated null.
+    // the five required-nullable members take a stated null - or a stated value,
+    // which the positive fixture carries for `project_id`. None of the six still
+    // needs a bare-`Option` entry: the five carry `deserialize_with`, which is
+    // the token `discovered_bare_option_sites` skips by the same rule it uses
+    // for every other corrected member, and `verifier` is not an `Option` at
+    // all, so the frozen `memory.rs` slice names none of them.
     assert_refused::<VerificationRun>(
         &corpus("verification_run_missing_verifier.json"),
         "verifier",
@@ -2885,6 +3269,62 @@ fn case_04_empty_is_refused_only_where_the_field_contract_requires_it() {
         empty_candidate.validate_material().is_err(),
         "the contractually nonempty mechanism must stay refused when empty"
     );
+
+    // The second nonempty refusal, on two other members of the same type and not
+    // on the one above, because one refusal cannot tell "this field's contract
+    // requires nonempty" apart from "this decoder refuses empty strings".
+    // `calibration` is named in the A6.5 nonempty set at cognition.rs:467 and a
+    // bounded inquiry's description is refused at :471-475, and the second of
+    // those is the member this delivery made required-nullable. Both refusals are
+    // asserted against the error text, so neither arm can pass on an unrelated
+    // failure, and both decode first: emptiness is refused by the contract, not
+    // by the wire format.
+    let uncalibrated: CausalCandidate = serde_json::from_str(&with_field(
+        &corpus("causal_candidate_positive.json"),
+        "calibration",
+        "\"\"",
+    ))
+    .expect("an empty calibration string still decodes");
+    let calibration_error = uncalibrated
+        .validate_material()
+        .expect_err("a contractually nonempty calibration must stay refused when empty");
+    assert!(
+        calibration_error
+            .to_string()
+            .contains("calibration must be nonblank"),
+        "the refusal must be the calibration contract's own: {calibration_error}"
+    );
+    let empty_inquiry: CausalCandidate = serde_json::from_str(&with_field(
+        &corpus("causal_candidate_positive.json"),
+        "assigned_check",
+        r#"{"kind":"bounded_inquiry","description":""}"#,
+    ))
+    .expect("an empty bounded inquiry still decodes");
+    let inquiry_error = empty_inquiry
+        .validate_material()
+        .expect_err("an assigned bounded inquiry must state what it will check");
+    assert!(
+        inquiry_error
+            .to_string()
+            .contains("empty assigned bounded inquiry"),
+        "the refusal must be the bounded-inquiry contract's own: {inquiry_error}"
+    );
+
+    // The discriminating control for those three refusals: a genuinely optional
+    // `String` accepts `""` and preserves it. `ObserveInput.expected_reuse_note`
+    // is declared optional agent-supplied guidance behind `#[serde(default)]`
+    // (mcp_contract.rs:431-434) and its own module doc states that this member and
+    // `write_id` "are genuinely optional agent choices" (mcp_contract.rs:388-390),
+    // so no nonempty rule applies to it anywhere and its exception row is frozen.
+    // An explicitly empty note is therefore a stated value here, and the absent
+    // key asserted further below is a different fact.
+    let empty_note: ObserveInput = serde_json::from_str(&with_field(
+        &corpus("observe_input_positive.json"),
+        "expected_reuse_note",
+        "\"\"",
+    ))
+    .expect("an explicitly empty optional note decodes");
+    assert_eq!(empty_note.expected_reuse_note.as_deref(), Some(""));
 
     let ledger: ProviderCallLedger = decode_fixture("provider_call_ledger_positive.json");
     assert!(ledger.budgets.is_empty());
@@ -3297,6 +3737,18 @@ fn case_11_smuggling_every_authority_scope_effect_or_privacy_field_fails() {
         "incidents",
         "operator_snapshot_missing_incidents.json",
     );
+    // Receipt. `AntigravityRun.response_protocol_receipt` is a plain
+    // `AntigravityResponseProtocolReceipt` member with no serde attribute
+    // (antigravity.rs:778), so an omitted key is a typed error rather than a
+    // receipt that reads back as "the response protocol proved nothing". This arm
+    // is the receipt-bearing member the smuggling list was missing: every arm
+    // above proves an omitted identity, scope, effect, privacy or completion key
+    // is refused, and none of them proves the same for a proof receipt.
+    assert_refused::<AntigravityRun>(
+        &corpus("antigravity_run_missing_response_protocol_receipt.json"),
+        "response_protocol_receipt",
+        "antigravity_run_missing_response_protocol_receipt.json",
+    );
     // `WorktreeLease.worktree_path` is a bare `PathRef` with no serde attribute,
     // so its absence is a typed error. Case 5 proves the same member refused when
     // the lease is nested inside an operator snapshot; this arm proves it on the
@@ -3335,13 +3787,32 @@ fn case_12_compatible_current_canonical_bytes_are_unchanged() {
         canonical.trim_end(),
         "an accepted current canonical document must re-encode byte-identically"
     );
-    let round_trip: ForgettingPolicy =
-        serde_json::from_slice(&re_encoded).expect("canonical lifecycle bytes decode again");
-    assert_eq!(round_trip.policy_id, policy.policy_id);
-    assert_eq!(
-        round_trip.expected_admission_effect,
-        policy.expected_admission_effect
-    );
+    // The byte comparison above proves round-trip stability of a document this
+    // delivery's own author wrote. What used to follow it - a decoded field
+    // against the value that produced the bytes it was decoded from, twice -
+    // cannot fail once that comparison holds, so both self-comparisons and the
+    // round-trip binding they needed are removed and replaced by a property of
+    // the DECODE, checked against this oracle's own absence classification:
+    // every member `ForgettingPolicy` classifies as absence-tolerant must be
+    // stated in the canonical document, so no retained default manufactured a
+    // value inside the bytes under test, and each stated null must decode to
+    // `None` rather than to a value the decoder invented.
+    let canonical_keys: Vec<String> = serde_json::from_str::<Value>(&canonical)
+        .expect("the canonical lifecycle document parses as a wire document")
+        .as_object()
+        .expect("the canonical lifecycle document must be a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    for key in absence_tolerant_keys_for("ForgettingPolicy") {
+        assert!(
+            canonical_keys.iter().any(|stated| stated == &key),
+            "{key} is absence-tolerant, so the canonical bytes must state it rather than let a default supply it"
+        );
+    }
+    assert!(policy.reactivation_condition.is_none());
+    assert!(policy.rollback_or_tombstone_ref.is_none());
+    assert!(policy.approval_ref.is_none());
 
     // A paired retained member keeps the store-written bytes stable: the emitted
     // document omits it and still reads back through its own type.
@@ -3355,14 +3826,67 @@ fn case_12_compatible_current_canonical_bytes_are_unchanged() {
     assert!(transition_bytes.contains("\"approval_ref\":null"));
     let reread: MemoryStateTransition = serde_json::from_str(&transition_bytes)
         .expect("store-written bytes read back through their own type");
-    assert_eq!(reread.transition_id, transition.transition_id);
     assert!(reread.write_receipt.is_none());
+    // The same replacement as above, for the same reason: the transition's
+    // `transition_id` self-comparison against the value it was produced from
+    // cannot fail once the emitted document is fixed, so it is removed and what is
+    // asserted instead is the emitted KEY SET against the oracle's absence
+    // classification. A member that gains `default` silently joins the tolerated
+    // set, and a member that gains `skip_serializing_if` silently leaves the
+    // emitted keys; both fail here.
+    let emitted_keys: Vec<String> = serde_json::from_str::<Value>(&transition_bytes)
+        .expect("the emitted transition parses as a wire document")
+        .as_object()
+        .expect("the emitted transition must be a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    let tolerated = absence_tolerant_keys_for("MemoryStateTransition");
+    assert_eq!(
+        sorted(&tolerated),
+        vec![
+            "approval_ref".to_owned(),
+            "reactivation_condition".to_owned(),
+            "write_receipt".to_owned(),
+        ],
+        "the transition's absence-tolerant members must stay exactly these three"
+    );
+    for key in &tolerated {
+        assert_eq!(
+            emitted_keys.iter().any(|stated| stated == key),
+            key != "write_receipt",
+            "{key}: a plain `default` member is always emitted; only the paired retained member may be omitted"
+        );
+    }
     assert_refused::<MemoryStateTransition>(
         &corpus("memory_state_transition_missing_expected_admission_effect.json"),
         "expected_admission_effect",
         "memory_state_transition_missing_expected_admission_effect.json",
     );
     let _: ForgettingPolicy = decode_fixture("forgetting_policy_positive.json");
+
+    // Why the emitted bytes did not change: no `Serialize` behaviour was touched
+    // on either type, and that is a fact about the declaration, read out of the
+    // production source rather than out of this file. `ForgettingPolicy` spells
+    // neither attribute on any member, so nothing here can suppress or rewrite
+    // an emitted key.
+    assert_eq!(
+        serializing_attribute_names_in("lifecycle.rs", "ForgettingPolicy"),
+        Vec::new(),
+        "ForgettingPolicy must declare no skip_serializing_if and no serialize_with: a suppression here would change the canonical bytes"
+    );
+    // `MemoryStateTransition` is NOT in that shape and is not pretended into it:
+    // it keeps exactly one retained paired member whose `skip_serializing_if` is
+    // precisely what the store-written bytes above omit. The claim asserted for
+    // it is the exact one - no `serialize_with` anywhere, and exactly one
+    // `skip_serializing_if`, on `write_receipt` at lifecycle.rs:601. A second
+    // suppression on any other member would change which keys this type emits,
+    // so both the count and the line are pinned.
+    assert_eq!(
+        serializing_attribute_names_in("lifecycle.rs", "MemoryStateTransition"),
+        vec![("skip_serializing_if".to_owned(), 601)],
+        "MemoryStateTransition must keep exactly its one retained paired suppression, on write_receipt"
+    );
 }
 
 // WORK_UNIT_CASE: 708/13
@@ -3806,26 +4330,29 @@ fn case_15_the_source_oracle_reuses_the_shipped_inventory_vocabulary() {
     // shipped inventory refuses to classify at all. There are none today, and
     // the first one must fail closed.
     //
-    // Each site is asserted to carry the script's grade, and to be outside the
-    // exception table: a macro site names a position, not a field, so it cannot
-    // become a `DEFAULT_SITE_EXCEPTIONS` row, whose dispositions case 16 holds to
-    // the five the oracle can defend per field.
+    // The rule is that every discovered site carries the script's grade
+    // (`unknown`/`BLOCKED`/`NOT_SAFE`) and names no exception-table row, because a
+    // macro site names a position rather than a field. This arm used to be a loop
+    // over the discovered sites, which could not execute: the frozen denominator
+    // is zero, so the loop body was dead code and neither of its two assertions
+    // could ever fail. What is asserted now is the premise that rule rests on -
+    // the discovered set is empty - which is the only statement about the
+    // nine-file domain that is true today, and which still fails closed the moment
+    // a macro site appears. Because the set is empty, "no site violates the grade
+    // rule" and "no site names an exception row" hold vacuously HERE, not
+    // verified here.
+    //
+    // The rule is not dropped, it is executed against real sites elsewhere in this
+    // file: the scanner-fixture case at the end of this file points this same
+    // scanner at `tests/data/appendix-p-scanner/unsupported_macro_site.rs`, whose
+    // one real site is discovered there and compared against the grade and kind
+    // that site declares. So the grade rule is tested; only its zero-site
+    // statement in this case is stated as the premise instead of faked as a loop.
     let macros = discovered_unsupported_macros();
-    for site in &macros {
-        assert!(
-            site.kind == "unsupported-macro"
-                && site.disposition == "unknown"
-                && site.repair_readiness == "BLOCKED"
-                && site.safety == "NOT_SAFE",
-            "an unsupported macro site carries the shipped grade, never a clean row: {site:?}"
-        );
-        assert!(
-            !DEFAULT_SITE_EXCEPTIONS
-                .iter()
-                .any(|(key, _disposition)| *key == site.key),
-            "an unsupported macro names no field, so it can carry no exception row: {site:?}"
-        );
-    }
+    assert!(
+        macros.is_empty(),
+        "the discovered unsupported-macro set must be empty, because every site in it would carry the shipped grade and no exception row, and no such site exists: {macros:?}"
+    );
     assert_eq!(
         macros.len(),
         EXPECTED_UNSUPPORTED_MACRO_SITE_COUNT,
@@ -3921,6 +4448,39 @@ fn case_16_every_default_site_has_a_field_exact_exception() {
 fn case_17_reviewed_legitimate_internal_defaults_are_retained() {
     // Case 17: the retained rows still decode, with the exact semantics each
     // row declares.
+    //
+    // NOT ASSERTED IN THIS CASE, recorded here so the gap lives in the test and
+    // not only in a report: required item 17 asks that every retained legitimate
+    // internal default be "bounded by caller evidence", and NO case in this file
+    // asserts any caller evidence at all. What the arms below assert is that each
+    // retained row still decodes to its declared value; every citation of a
+    // caller is prose, in this comment block, in the frozen field inventory, or
+    // in a production doc comment, and none of them is checked from source here.
+    // What would be required: a per-row `(field, caller_file, caller_symbol)`
+    // constant naming, for each retained row, the exact current caller that
+    // supplies the default or relies on it, plus a source assertion that each
+    // named caller still exists and still reads that member - so a caller that
+    // moves or drops the read invalidates its own exemption instead of leaving a
+    // stale row behind. That is a second inventory over caller sites rather than
+    // an addition to this one, and it is deliberately not built here: against a
+    // file that already carries thirteen derived constants, a hand-kept caller
+    // table would assert compatibility that nothing re-checks.
+    //
+    // `ObserveInput.hint` keeps the `named-legacy` disposition, and that label
+    // names a boundary that does not exist. The member carries
+    // `#[serde(default, alias = "kind")]`, so the decoder trial-accepts a `"kind"`
+    // spelling, and an evidence pass over the workspace found no named legacy
+    // decoder, versioned migration, provenance record or loss/assumption note
+    // anywhere for that spelling: the only writer of the key emits the canonical
+    // `"hint"` (`crates/eliot-app/src/mcp_stdio/verification.rs:86`), `schemars`
+    // never reads an alias, and the `legacy` mentions in that file concern the
+    // candidate-submit route and the quarantined verifier lane, not this alias. So
+    // the disposition label asserts a compatibility boundary that no owner has
+    // ever named - the W4 defect `mcp_contract.rs:378-384` records. Recorded here
+    // as a comment only: neither the disposition string nor the row is changed
+    // here, because removing the alias is the #706/#831 renaming owner's decision,
+    // not this file's.
+    //
     // Retained breaking candidates: they decode today and their five missing
     // keys take their declared defaults.
     let omitted: MaterialPacketFrame =
@@ -4694,6 +5254,13 @@ fn case_20_the_deferred_owner_map_is_complete_and_outside_this_scope() {
             !candidate.is_empty() && !blocking.is_empty(),
             "every deferred candidate names its candidate and its blocking decision"
         );
+        // This branch is unreachable today: every row's base column reads `n/a`,
+        // because no published base object identity for these candidates is
+        // resolvable in this repository. It is kept, not deleted, because it is
+        // the validator for the next hand-edit: a row that does record a real
+        // base object id must record a full 40-character hex id, and this is the
+        // only place that says so. Stated here so nobody reads the passing run as
+        // evidence that a base id was checked.
         if base != "n/a" {
             assert!(
                 base.len() == 40 && base.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -4710,4 +5277,561 @@ fn case_20_the_deferred_owner_map_is_complete_and_outside_this_scope() {
             "{candidate} must not be deferred back into the frozen nine-file domain"
         );
     }
+    assert_changed_required_nullable_members_are_accounted_for();
+}
+
+// ---------------------------------------------------------------------
+// The scanner fixtures under `crates/eliot-types/tests/data/appendix-p-scanner/`.
+//
+// They are READ SOURCES for the scanners above, never compilation targets.
+// Cargo's integration-test auto-discovery takes only `tests/*.rs` and
+// `tests/*/main.rs`, so five of these thirteen files deliberately do not
+// compile and none of them is ever built; this case reads their bytes and hands
+// them to the same `(file_name, source_text)` entry points the nine frozen
+// production files use. There is no second scanner here and no call into
+// `scripts/serde_boundary_inventory.py`: that script owns the classification
+// vocabulary and the unsupported-syntax handling, and this oracle stays
+// package-local exactly as the file header states.
+//
+// Each fixture's first line(s) are a machine-readable header. The thirteen
+// headers do not carry an identical field set and this code does not invent
+// one: the seven site fixtures state every denominator plus `keys=`, the six
+// negative-source controls state `raise=` and `detail=` and one of them adds
+// `masked=clean`, and the unsupported-macro control adds a key, a kind and a
+// grade. A field a fixture does not state is not compared.
+// ---------------------------------------------------------------------
+
+/// Every `.rs` fixture in that directory. The count is frozen at the thirteen
+/// files the directory holds, and `case_21` asserts the directory against this
+/// list, so a fourteenth fixture cannot sit unread again.
+const SCANNER_FIXTURES: [&str; 13] = [
+    "bare_option_site.rs",
+    "clean_source_no_sites.rs",
+    "decoys_no_false_positives.rs",
+    "direct_default_site.rs",
+    "helper_default_site.rs",
+    "paired_skip_if.rs",
+    "unterminated_block_comment.rs",
+    "unterminated_byte_char.rs",
+    "unterminated_byte_string.rs",
+    "unterminated_char.rs",
+    "unterminated_raw_string.rs",
+    "unterminated_string.rs",
+    "unsupported_macro_site.rs",
+];
+
+/// The fixture directory, resolved through `workspace_root()` the same way
+/// `nine_file_source` resolves the nine frozen production files.
+fn scanner_fixture_dir() -> PathBuf {
+    workspace_root()
+        .join("crates")
+        .join("eliot-types")
+        .join("tests")
+        .join("data")
+        .join("appendix-p-scanner")
+}
+
+fn scanner_fixture(name: &str) -> String {
+    let path = scanner_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("scanner fixture {name} must be readable: {error}"))
+}
+
+/// One scanner fixture's parsed header. A field the fixture does not state is
+/// `None`, and is not compared.
+#[derive(Default)]
+struct ScannerFixtureHeader {
+    default: Option<usize>,
+    form: Option<String>,
+    helper: Option<usize>,
+    paired: Option<usize>,
+    bare_option: Option<usize>,
+    unsupported_macro: Option<usize>,
+    unresolved: Option<usize>,
+    manual_visitor: Option<usize>,
+    raise: Option<String>,
+    detail: Option<String>,
+    masked: Option<String>,
+    keys: Option<Vec<String>>,
+    bare_option_line: Option<String>,
+    unsupported_macro_key: Option<String>,
+    kind: Option<String>,
+    grade: Option<String>,
+}
+
+/// The `name=value` fields of one comment line, or an empty vector when the line
+/// is prose. A line qualifies when its first token opens a `name=value` field
+/// with a non-empty value and every later token either opens another such field
+/// or continues the previous field's value. That is what keeps
+/// `detail=unclosed block comment` one value, and what stops the header exactly
+/// where the prose starts: a prose line whose first word carries no `=` yields
+/// nothing, while a prose token written as `default=` with an empty value is a
+/// rejection rather than a field.
+fn scanner_fixture_header_fields(body: &str) -> Vec<(String, String)> {
+    let is_a_field_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for token in body.split_whitespace() {
+        match token.split_once('=') {
+            Some((key, first)) if is_a_field_name(key) && !first.is_empty() => {
+                fields.push((key.to_owned(), first.to_owned()));
+            }
+            Some(_) => return Vec::new(),
+            None => match fields.last_mut() {
+                Some((_key, value)) => {
+                    value.push(' ');
+                    value.push_str(token);
+                }
+                None => return Vec::new(),
+            },
+        }
+    }
+    fields
+}
+
+fn scanner_fixture_header(name: &str, source: &str) -> ScannerFixtureHeader {
+    let mut header = ScannerFixtureHeader::default();
+    let mut opened = false;
+    for line in source.lines() {
+        let Some(comment) = line.trim().strip_prefix("//") else {
+            continue;
+        };
+        let comment = comment.trim();
+        let fields = if opened {
+            scanner_fixture_header_fields(comment)
+        } else {
+            match comment.strip_prefix("EXPECTED:") {
+                Some(rest) => {
+                    opened = true;
+                    scanner_fixture_header_fields(rest.trim())
+                }
+                None => continue,
+            }
+        };
+        if fields.is_empty() {
+            break;
+        }
+        for (key, value) in fields {
+            let count = || -> usize {
+                value.parse::<usize>().unwrap_or_else(|error| {
+                    panic!("{name}: counter `{key}={value}` must be a count: {error}")
+                })
+            };
+            match key.as_str() {
+                "default" => header.default = Some(count()),
+                "helper" => header.helper = Some(count()),
+                "paired" => header.paired = Some(count()),
+                "bare-option" => header.bare_option = Some(count()),
+                "unsupported-macro" => header.unsupported_macro = Some(count()),
+                "unresolved" => header.unresolved = Some(count()),
+                "manual-visitor" => header.manual_visitor = Some(count()),
+                "form" => header.form = Some(value.clone()),
+                "raise" => header.raise = Some(value.clone()),
+                "detail" => header.detail = Some(value.clone()),
+                "masked" => header.masked = Some(value.clone()),
+                "kind" => header.kind = Some(value.clone()),
+                "grade" => header.grade = Some(value.clone()),
+                "bare-option-line" => header.bare_option_line = Some(value.clone()),
+                "unsupported-macro-key" => header.unsupported_macro_key = Some(value.clone()),
+                "keys" => {
+                    header.keys = Some(if value == "(none)" {
+                        Vec::new()
+                    } else {
+                        value.split(',').map(str::to_owned).collect()
+                    });
+                }
+                other => panic!("{name}: counter `{other}` is not a scanner-fixture header field"),
+            }
+        }
+    }
+    assert!(opened, "{name} must state a `// EXPECTED:` header line");
+    header
+}
+
+/// What `mask_rust` did to one fixture: the masked copy, or the message it failed
+/// closed with. `mask_rust` refuses through `panic!` - it is the scanner, not a
+/// parser over untrusted input - so the refusal is observed here instead of
+/// changing `mask_rust`'s signature and every caller with it. `catch_unwind`
+/// still runs the panic hook, so each of the five refusals prints its message;
+/// that output is the evidence, not noise to suppress.
+fn mask_scanner_fixture(name: &str, source: &str) -> Result<String, String> {
+    match std::panic::catch_unwind(|| mask_rust(source)) {
+        Ok(masked) => Ok(masked),
+        Err(refusal) => {
+            let message = refusal
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    refusal
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_owned())
+                })
+                .unwrap_or_default();
+            assert!(
+                message.contains("malformed-rust-source"),
+                "{name}: masking must fail closed only through `malformed_source`: {message}"
+            );
+            Err(message)
+        }
+    }
+}
+
+/// The `detail` half of a `malformed-rust-source` message, which
+/// `malformed_source` writes as
+/// `malformed-rust-source: {detail} at line {line}, column {column}`.
+fn raise_detail(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once("malformed-rust-source: ")?;
+    Some(
+        rest.split(" at line ")
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// Compares the `raise`, `detail` and `masked` half of one fixture's header
+/// against what `mask_rust` did, and hands back the masked copy when the fixture
+/// masks cleanly. A fixture that fails closed on masking states no counters, so
+/// its comparison IS the refusal and this returns `None` rather than reading a
+/// masked copy it never got.
+fn assert_scanner_fixture_mask(
+    name: &str,
+    source: &str,
+    header: &ScannerFixtureHeader,
+) -> Option<String> {
+    let masked = mask_scanner_fixture(name, source);
+    let raise = header.raise.as_deref().unwrap_or_else(|| {
+        panic!("{name}: counter `raise` must be stated by every fixture header")
+    });
+    let masked = match masked {
+        Err(message) => {
+            assert_eq!(
+                raise, "malformed-rust-source",
+                "{name}: counter `raise` must name the shipped refusal kind"
+            );
+            assert_eq!(
+                raise_detail(&message).as_deref(),
+                header.detail.as_deref(),
+                "{name}: counter `detail` must name the condition `mask_rust` refused on"
+            );
+            return None;
+        }
+        Ok(masked) => masked,
+    };
+    assert_eq!(
+        raise, "none",
+        "{name}: counter `raise` must stay `none` for a source that masks cleanly"
+    );
+    assert_eq!(
+        header.detail.as_deref(),
+        Some("none"),
+        "{name}: counter `detail` must stay `none` for a source that masks cleanly"
+    );
+    if let Some(expected) = header.masked.as_deref() {
+        assert_eq!(
+            expected, "clean",
+            "{name}: counter `masked` may only state `clean`"
+        );
+        assert_eq!(
+            masked.len(),
+            source.len(),
+            "{name}: counter `masked` must preserve byte offsets"
+        );
+        assert_eq!(
+            masked.matches('\'').count(),
+            source.matches('\'').count(),
+            "{name}: counter `masked` must keep every lifetime tick and stray quote verbatim"
+        );
+    }
+    Some(masked)
+}
+
+/// Compares the count and shape counters one fixture's header states against
+/// this file's own scanners run over that fixture's source, including the
+/// `form=` split of the discovered default site and the `keys=` spelling.
+///
+/// `name` is `&'static str` because `BareOptionSite` records it, so every
+/// discovered site is named by a fixture's own file name exactly as the
+/// nine-file aggregation names its sites by their file names.
+fn assert_scanner_fixture_counts(name: &'static str, source: &str, header: &ScannerFixtureHeader) {
+    let defaults = default_sites_in(name, source);
+    let bare = bare_option_sites_in(name, source);
+    let macros = unsupported_macros_in([(name, source)]);
+    let manual = manual_decoder_impls_in([(name, source)]);
+    let unresolved = defaults
+        .iter()
+        .filter(|site| site.key.contains("<unresolved"))
+        .count();
+    let shape = |site: &DefaultSite| match site.form {
+        DefaultForm::Direct => "direct",
+        DefaultForm::Helper => "helper",
+        DefaultForm::Paired => "paired",
+    };
+    for (counter, expected, observed) in [
+        ("default", header.default, defaults.len()),
+        (
+            "helper",
+            header.helper,
+            defaults
+                .iter()
+                .filter(|site| site.form == DefaultForm::Helper)
+                .count(),
+        ),
+        (
+            "paired",
+            header.paired,
+            defaults
+                .iter()
+                .filter(|site| site.form == DefaultForm::Paired)
+                .count(),
+        ),
+        ("bare-option", header.bare_option, bare.len()),
+        ("unsupported-macro", header.unsupported_macro, macros.len()),
+        ("unresolved", header.unresolved, unresolved),
+        ("manual-visitor", header.manual_visitor, manual.len()),
+    ] {
+        if let Some(expected) = expected {
+            assert_eq!(
+                observed, expected,
+                "{name}: counter `{counter}` must equal the header value"
+            );
+        }
+    }
+    if let Some(expected) = header.form.as_deref() {
+        assert_eq!(
+            defaults.first().map_or("none", shape),
+            expected,
+            "{name}: counter `form` must name the shape of the discovered default site"
+        );
+    }
+    if let Some(expected) = &header.keys {
+        let mut discovered: Vec<String> = defaults.iter().map(|site| site.key.clone()).collect();
+        discovered.extend(bare.iter().map(|site| site.key.clone()));
+        assert_eq!(
+            sorted(&discovered),
+            sorted(expected),
+            "{name}: counter `keys` must name each site in the oracle's `<file>::<Type>.<member>` spelling"
+        );
+    }
+}
+
+/// Compares the per-site naming counters: the `file:line` of the one discovered
+/// `absent-becomes-none` site, the key of the one discovered macro site, and the
+/// shipped kind and grade that site carries.
+fn assert_scanner_fixture_site_names(
+    name: &str,
+    header: &ScannerFixtureHeader,
+    bare: &[BareOptionSite],
+    macros: &[UnsupportedMacroSite],
+) {
+    if let Some(expected) = &header.bare_option_line {
+        let discovered: Vec<String> = bare
+            .iter()
+            .map(|site| format!("{}:{}", site.file, site.line))
+            .collect();
+        assert_eq!(
+            discovered,
+            vec![expected.clone()],
+            "{name}: counter `bare-option-line` must name the discovered site at its own file:line"
+        );
+    }
+    if let Some(expected) = &header.unsupported_macro_key {
+        let discovered: Vec<String> = macros.iter().map(|site| site.key.clone()).collect();
+        assert_eq!(
+            discovered,
+            vec![expected.clone()],
+            "{name}: counter `unsupported-macro-key` must name the discovered macro site"
+        );
+    }
+    for site in macros {
+        if let Some(expected) = header.kind.as_deref() {
+            assert_eq!(
+                site.kind, expected,
+                "{name}: counter `kind` must carry the shipped kind of every macro site"
+            );
+        }
+        if let Some(expected) = header.grade.as_deref() {
+            assert_eq!(
+                format!(
+                    "{}/{}/{}",
+                    site.disposition, site.repair_readiness, site.safety
+                ),
+                expected,
+                "{name}: counter `grade` must carry the shipped grade of every macro site"
+            );
+        }
+    }
+}
+
+/// Compares every counter one scanner fixture's header states against this
+/// file's own scanners run over that fixture's source.
+fn assert_scanner_fixture_matches_header(name: &'static str, source: &str) {
+    let header = scanner_fixture_header(name, source);
+    if assert_scanner_fixture_mask(name, source, &header).is_none() {
+        return;
+    }
+    let bare = bare_option_sites_in(name, source);
+    let macros = unsupported_macros_in([(name, source)]);
+    assert_scanner_fixture_counts(name, source, &header);
+    assert_scanner_fixture_site_names(name, &header, &bare, &macros);
+}
+
+/// The six negative-source controls, each of which must do exactly what its own
+/// header declares. Five refuse a source the mask cannot read, each with its OWN
+/// detail: a blanket "anything unterminated raises" would pass those five and is
+/// not what these files are for. The sixth declares the opposite outcome and is
+/// the control that makes the other five specific - a quote that opens no
+/// character literal is a lifetime tick or a stray quote, and the mask keeps it
+/// so the surrounding code stays visible to discovery.
+fn assert_scanner_fixture_negative_controls() {
+    for (name, detail) in [
+        (
+            "unterminated_block_comment.rs",
+            Some("unclosed block comment"),
+        ),
+        (
+            "unterminated_byte_char.rs",
+            Some("unclosed byte-char literal"),
+        ),
+        (
+            "unterminated_byte_string.rs",
+            Some("unclosed byte-string literal"),
+        ),
+        (
+            "unterminated_raw_string.rs",
+            Some("unclosed raw string literal"),
+        ),
+        ("unterminated_string.rs", Some("unclosed string literal")),
+        ("unterminated_char.rs", None),
+    ] {
+        let source = scanner_fixture(name);
+        let observed = mask_scanner_fixture(name, &source)
+            .err()
+            .and_then(|message| raise_detail(&message));
+        assert_eq!(
+            observed.as_deref(),
+            detail,
+            "{name}: counter `detail` must name the condition this control declares"
+        );
+    }
+}
+
+/// The zero control, stated rather than inferred. `clean_source_no_sites.rs`
+/// declares a `#[serde(rename_all = "snake_case")]` container attribute on a
+/// struct whose three members are `String`, `u32` and `bool`. Masking must find
+/// that attribute span and find no `default` token inside it, the bare-`Option`
+/// denominator must stay empty, and no other class may reach a site. This is the
+/// property that proves the oracle invents nothing, and it is the reason the
+/// other twelve fixtures are worth reading at all.
+fn assert_scanner_fixture_clean_control() {
+    let name = "clean_source_no_sites.rs";
+    let source = scanner_fixture(name);
+    let masked = mask_scanner_fixture(name, &source)
+        .expect("clean_source_no_sites.rs: counter `raise` must stay `none`");
+    assert_eq!(
+        serde_attribute_spans(&masked).len(),
+        1,
+        "clean_source_no_sites.rs: counter `default` needs its container attribute span to be found and to carry no default token"
+    );
+    let defaults = default_sites_in(name, &source);
+    let bare = bare_option_sites_in(name, &source);
+    let macros = unsupported_macros_in([(name, source.as_str())]);
+    let manual = manual_decoder_impls_in([(name, source.as_str())]);
+    for (counter, observed) in [
+        ("default", defaults.len()),
+        (
+            "helper",
+            defaults
+                .iter()
+                .filter(|site| site.form == DefaultForm::Helper)
+                .count(),
+        ),
+        (
+            "paired",
+            defaults
+                .iter()
+                .filter(|site| site.form == DefaultForm::Paired)
+                .count(),
+        ),
+        ("bare-option", bare.len()),
+        ("unsupported-macro", macros.len()),
+        (
+            "unresolved",
+            defaults
+                .iter()
+                .filter(|site| site.key.contains("<unresolved"))
+                .count(),
+        ),
+        ("manual-visitor", manual.len()),
+    ] {
+        assert_eq!(
+            observed, 0,
+            "clean_source_no_sites.rs: counter `{counter}` must find no site"
+        );
+    }
+}
+
+/// The fixture files the scanner fixtures directory holds, sorted.
+fn scanner_fixture_names_on_disk() -> Vec<String> {
+    let directory = scanner_fixture_dir();
+    let mut names: Vec<String> = std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the scanner fixture directory {} must be readable: {error}",
+                directory.display()
+            )
+        })
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("a scanner fixture entry must be readable: {error}"))
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn case_21_scanner_fixtures_pin_the_oracle_negative_controls() {
+    // Case 21 is the consumer the issue's requirement "Include positive/negative
+    // scanner fixtures" asks for: before this test the thirteen files under
+    // `tests/data/appendix-p-scanner/` were read by nothing, so their headers
+    // stated an expectation no code checked. Each is now a source this file's own
+    // scanners are pointed at, and each header counter is compared against what
+    // those scanners actually found. The scanner is the same one cases 15, 16 and
+    // 19 use, parameterised by `(file_name, source_text)`; nothing is re-derived
+    // here and `scripts/serde_boundary_inventory.py` is never called at run time,
+    // because that script owns the classification vocabulary and the
+    // unsupported-syntax handling and this oracle is package-local by design.
+    //
+    // No `// WORK_UNIT_CASE` marker sits above this function on purpose: the issue
+    // freezes the denominator at exactly 1..20, so this test is additional
+    // evidence for those cases rather than a twenty-first case.
+    //
+    // First, the directory is exactly the thirteen fixtures read below. Both
+    // directions are asserted, so a fixture added to the directory fails here
+    // instead of becoming unread, and a fixture removed from the directory fails
+    // as a missing file.
+    assert_eq!(
+        scanner_fixture_names_on_disk(),
+        SCANNER_FIXTURES,
+        "every scanner fixture on disk must be read by this case, and this case must read only those"
+    );
+
+    // Every header counter, compared against this file's own scanners.
+    for name in SCANNER_FIXTURES {
+        let source = scanner_fixture(name);
+        assert_scanner_fixture_matches_header(name, &source);
+    }
+
+    // The six negative-source controls, then the zero control: between them they
+    // show that the five refusals are specific and that nothing is invented.
+    assert_scanner_fixture_negative_controls();
+    assert_scanner_fixture_clean_control();
 }

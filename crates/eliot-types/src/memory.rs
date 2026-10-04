@@ -513,12 +513,12 @@ pub struct TaskContractWriteCommand {
 
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 ///
-/// The four `TaskContractInput` bindings above are required here too, for the
+/// The three `TaskContractInput` bindings above are required here too, for the
 /// same reason and with the same producer evidence
 /// (`crates/eliot-app/src/mcp_stdio/task.rs` builds the provenance set and the
 /// grant redemption; `crates/eliot-app/src/mcp_stdio/protocol_tests.rs` (:993)
 /// builds the full literal). `TaskContract` is the canonical stored form, so
-/// the same four silent-negative defects applied to the durable record itself.
+/// the same three silent-negative defects applied to the durable record itself.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskContract {
@@ -952,29 +952,29 @@ pub struct RecallL0Request {
     pub query: String,
     pub consistency: ReadConsistencyMode,
     pub at_least_revision: Option<MemoryRevision>,
-    /// Explicit presence for the five recall-scope/narrowing fields (#708).
+    /// Explicit presence for the four recall-scope/narrowing fields (#708):
+    /// `lifecycle_audit`, `task_class_cues`, `scope_refs`, `concept_refs`.
     ///
     /// `lifecycle_audit` is a *retention/erasure* control: it is the flag that
     /// makes recall return suppressed and archived memory instead of only live
-    /// memory. Defaulting it to `false` meant an omitted key silently narrowed
-    /// the recall to live memory — a privacy/retention-relevant scope
-    /// reduction created by omission, on the surface a caller uses to ask for
-    /// everything. `scope_refs` and `concept_refs` are the retrieval scope
-    /// denominators; a defaulted empty list read as "this query spans no scope
-    /// and no concepts", i.e. an unscoped recall. `task_id` and
-    /// `task_class_cues` are the task-scope narrowing.
+    /// memory, so defaulting it to `false` narrowed the recall to live memory
+    /// by omission — a privacy/retention-relevant scope reduction, on the
+    /// surface a caller uses to ask for everything. `scope_refs` and
+    /// `concept_refs` are the retrieval scope denominators; a defaulted empty
+    /// list read as "this query spans no scope and no concepts", i.e. an
+    /// unscoped recall. `task_class_cues` is the task-scope narrowing; `task_id`
+    /// is deliberately NOT in this group — it keeps its paired `default,
+    /// skip_serializing_if = "Option::is_none"`, so its absence still decodes as
+    /// "no task narrowing" (the frozen RETAINED row).
     ///
     /// Compatibility: `RecallL0Request` is the *only* request shape of
-    /// `CanonicalStore::recall_l0`, and every construction site already writes
-    /// all seven fields explicitly, including `lifecycle_audit: false`:
-    /// `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_query` (:876,
-    /// which itself applies `.unwrap_or(false)` to the caller's parameter and
-    /// therefore already treats "absent" as a caller-level default it owns),
-    /// `crates/eliot-store/src/canonical_store.rs` (:4606, :4833) and the test
-    /// fixtures. `Serialize` is untouched. Compatible requiredness correction;
-    /// the caller-side `.unwrap_or(false)` is deliberately left in place
-    /// because it is a *caller* decision on a free-form parameter bag, not a
-    /// decoder default.
+    /// `CanonicalStore::recall_l0`, and every construction site already writes all
+    /// nine fields explicitly, including `lifecycle_audit`: the
+    /// `RecallL0Request` literal in `crates/eliot-app/src/mcp_stdio/operator.rs`
+    /// (:876) applies `.unwrap_or(false)` to the caller's parameter and so
+    /// already treats "absent" as a caller-level default it owns, and the test
+    /// fixtures (`crates/eliot-store/src/canonical_store.rs` :4794, :5021).
+    /// `Serialize` is untouched. Compatible requiredness correction; the caller-side `.unwrap_or(false)` is deliberately left in place: a *caller* decision on a free-form bag, not a decoder default.
     pub lifecycle_audit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
@@ -1932,22 +1932,27 @@ pub struct VerificationRun {
     ///
     /// Compatibility: `VerificationRun` is the stored canonical verification
     /// record read back by
-    /// `crates/eliot-store/src/canonical_store.rs::verification_run_by_id` (:4012,
-    /// `decode_value(NamedSurqlOp::VerificationRunById, ..)`), and it is built by
-    /// `crates/eliot-engine/src/cognitive_disposition.rs::canonical_disposition_chain`
-    /// from a resolved canonical receipt, and asserted in
-    /// `crates/eliot-app/src/mcp_stdio/protocol_tests.rs` (:502) which sets every
-    /// field including `claim_id: None` and `verification_id: Some(..)`. The
-    /// sibling `VerificationRunInput` (write-side, :738) has the same shape with
-    /// no `default` at all, so the current producer contract already requires
-    /// the key to be stated. Compatible requiredness correction for current
-    /// writes; an existing stored record that never carried the binding now
-    /// fails to decode instead of reading as an unbound pass, and no alias,
-    /// `untagged` or default helper re-accepts it (W4).
+    /// `crates/eliot-store/src/canonical_store.rs::verification_run_by_id` (:4197,
+    /// `decode_value(NamedSurqlOp::VerificationRunById, ..)`). No non-test in-tree
+    /// Rust source builds one of this type: `canonical_disposition_chain` in
+    /// `crates/eliot-engine/src/cognitive_disposition.rs` only reads the stored
+    /// run back and validates it, so the write side of the canonical record
+    /// lives outside this repository's Rust sources. It is asserted in
+    /// `crates/eliot-app/src/mcp_stdio/protocol_tests.rs` (:502), which sets
+    /// every field including `claim_id: None`. The sibling
+    /// `VerificationRunInput` (write-side, :823) carries `claim_id` with no
+    /// `default` at all, so that key was already required on the input side.
+    /// Compatible requiredness correction for current writes; a stored record
+    /// that never carried the binding now fails to decode instead of reading as an unbound pass, and no alias, `untagged` or default helper re-accepts it (W4).
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub claim_id: Option<ClaimId>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub project_id: Option<ProjectId>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub task_id: Option<TaskId>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub write_id: Option<WriteId>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub memory_revision: Option<MemoryRevision>,
     pub verifier: String,
     pub result: VerificationResult,
@@ -2229,7 +2234,7 @@ pub struct UnderstandingProof {
     /// already writes the whole literal —
     /// `crates/eliot-app/src/action_plan.rs` (:288-310, the agent-facing
     /// default-proof builder) is the production path, and the gate-side
-    /// projection in `crates/eliot-engine/src/context.rs` (:2183) reads the
+    /// projection in `crates/eliot-engine/src/context.rs` (:2200) reads the
     /// declared values. `crates/eliot-app/src/mcp_stdio/protocol_support.rs::understanding_proof_schema`
     /// publishes the wire schema from this type, and it is a
     /// `deny_unknown_fields` closed shape with no named legacy layout, so an
@@ -2268,7 +2273,7 @@ pub struct UnderstandingProof {
 /// `code_task` / `codecortex_report_refs` / `files_to_change` /
 /// `files_to_inspect` would let a receipt describe a decision taken on inputs
 /// the receipt itself does not state. Producer:
-/// `crates/eliot-engine/src/context.rs` (:2183) projects the declared values
+/// `crates/eliot-engine/src/context.rs` (:2200) projects the declared values
 /// into the receipt.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
