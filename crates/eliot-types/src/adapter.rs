@@ -268,7 +268,7 @@ pub struct AdapterHealth {
 // identity `policy_id` / `policy_hash_blake3`, declared at
 // `crates/eliot-types/src/provider_invocation.rs:289`) out of
 // `input["provider_route_policy"]` with `serde_json::from_value`, at
-// `crates/eliot-engine/src/adapter.rs:241-248`, and that policy's
+// `crates/eliot-engine/src/adapter.rs:263-270`, and that policy's
 // `timeout_profile()` then steers the adapter's absolute deadline and its
 // cancellation and cleanup grace. That is a measured property of the tree,
 // NOT a sanctioned property of this payload.

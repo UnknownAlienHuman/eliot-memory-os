@@ -2435,7 +2435,13 @@ fn launch_03_retained_identity_on_substitution() {
     let caller = contour["caller"]
         .as_str()
         .expect("the fixture must pin the forwarded-correlation caller");
-    let (caller_path, caller_symbol) = caller.rsplit_once(':').unwrap_or_else(|| {
+    // Split on the FIRST colon, not the last: the caller is spelled
+    // `path:Type::method`, so the path half carries no colon while the symbol
+    // half carries two. R splitting yields `path:Type` and therefore made the
+    // approved-start contour assertion below compare `src/host_job_launch.rs:
+    // HostJobBranches` against `src/host_job_launch.rs` and fail on a caller that
+    // is in fact the one the fixture pins.
+    let (caller_path, caller_symbol) = caller.split_once(':').unwrap_or_else(|| {
         panic!("the forwarded-correlation caller must be path:symbol, got {caller}")
     });
     let caller_leaf = caller_symbol
@@ -2521,7 +2527,10 @@ fn launch_03_retained_identity_on_substitution() {
     let branch_caller = branch["caller"]
         .as_str()
         .expect("the fixture must pin the branch contour's caller");
-    let (branch_path, branch_symbol) = branch_caller.rsplit_once(':').unwrap_or_else(|| {
+    // First colon again, for the same reason as the approved-start caller above:
+    // the pinned spelling is `path:Type::method`, so splitting on the last colon
+    // leaves `path:Type` on the path side.
+    let (branch_path, branch_symbol) = branch_caller.split_once(':').unwrap_or_else(|| {
         panic!("the branch forwarded-correlation caller must be path:symbol, got {branch_caller}")
     });
     let branch_leaf = branch_symbol
@@ -3529,20 +3538,38 @@ fn launch_07_nonce_handshake_auth_activation_distinct() {
 #[test]
 fn launch_08_readiness_needs_owner_evidence() {
     let fixture = launch_fixture();
-    let tokens = fixture_list(&fixture, "sibling_phase_details");
+    let sibling_tokens = fixture_list(&fixture, "sibling_phase_details");
+    let options_tokens = fixture_list(&fixture, "launch_options_details");
     let request = registration_request();
     let options = admitted_launch_options();
 
     // Execute every reachable boundary a readiness claim could have escaped
     // from, then inspect what they actually emitted.
+    //
+    // Each boundary's records are classified against the token list that owns
+    // them, exactly as case 6 does. Classifying the whole set against
+    // `sibling_phase_details` alone cannot work: the parse contour emits
+    // `host.launch-options parse …`, which is frozen under
+    // `launch_options_details`, so every parse record matched no token at all and
+    // the classification panicked instead of reporting the phase names. Carrying
+    // the per-boundary classification also keeps the stronger half of the rule:
+    // every executed record must still carry EXACTLY ONE frozen token, so a
+    // record that smuggles in an unlisted phase cannot pass as "no readiness".
     let mut executed = Vec::new();
+    let mut phase_names = Vec::new();
     let (_parse, records) = execute_launch_parse(&valid_launch_args());
-    executed.extend(detail_records(&records));
+    let parse_records = detail_records(&records);
+    phase_names.extend(phase_tokens(&parse_records, &options_tokens));
+    executed.extend(parse_records);
     let (_bootstrap, records) = execute_scm_bootstrap(&options);
-    executed.extend(detail_records(&records));
+    let bootstrap_records = detail_records(&records);
+    phase_names.extend(phase_tokens(&bootstrap_records, &sibling_tokens));
+    executed.extend(bootstrap_records);
     for inspection in injected_inspection_schedule() {
         let (_cause, records) = execute_scm_classification(&request, &inspection);
-        executed.extend(detail_records(&records));
+        let classified = detail_records(&records);
+        phase_names.extend(phase_tokens(&classified, &sibling_tokens));
+        executed.extend(classified);
     }
     assert!(
         executed.len() >= 10,
@@ -3556,9 +3583,7 @@ fn launch_08_readiness_needs_owner_evidence() {
         );
     }
     assert!(
-        !phase_tokens(&executed, &tokens)
-            .iter()
-            .any(|token| token.contains("ready")),
+        !phase_names.iter().any(|token| token.contains("ready")),
         "no reachable phase may be a readiness phase"
     );
 
@@ -4099,7 +4124,13 @@ fn launch_12_canaries_absent_from_observations() {
         "got: {}",
         first.detail()
     );
-    for key in ["installation", "generation", "process_start", "fence"] {
+    for key in [
+        "installation",
+        "generation",
+        "artifact",
+        "process_start",
+        "fence",
+    ] {
         let value = correlation_slot(first.detail(), key)
             .unwrap_or_else(|| panic!("the pre-parse phase must render {key}="));
         assert!(
@@ -4107,20 +4138,42 @@ fn launch_12_canaries_absent_from_observations() {
             "a pre-parse phase holds no identity, so {key} must not carry one: {}",
             first.detail()
         );
-        // The admitted phase must render every frozen key. This is NOT a
-        // presence check: `correlation_slot(..).is_some()` can never fail for a
-        // record that already passed `assert_frozen_correlation_slots`, which
-        // requires each frozen anchor exactly once. What is actually worth
-        // proving here is that the admitted record renders each key DIFFERENTLY
-        // from the pre-parse record - the pre-parse record carries no identity,
-        // so a slot that still read `missing` on admission would mean the parse
-        // boundary bound nothing.
+    }
+    // Admission binds exactly what the parse boundary provably holds, read from
+    // the options it just admitted: the installation, the transaction-plan
+    // generation and the config-descriptor digest. Each must therefore render
+    // DIFFERENTLY from the pre-parse record - a slot still reading `missing` on
+    // admission would mean the parse boundary bound nothing. This is NOT a
+    // presence check: `correlation_slot(..).is_some()` can never fail for a
+    // record that already passed `assert_frozen_correlation_slots`, which
+    // requires each frozen anchor exactly once.
+    for key in ["installation", "generation", "artifact"] {
         let admitted_value = correlation_slot(admitted_phase.detail(), key)
             .unwrap_or_else(|| panic!("the admitted phase must render {key}="));
+        let pre_parse_value = correlation_slot(first.detail(), key)
+            .unwrap_or_else(|| panic!("the pre-parse phase must render {key}="));
         assert_ne!(
             admitted_value,
-            value,
+            pre_parse_value,
             "the admitted phase must bind an identity where the pre-parse phase binds none: {}",
+            admitted_phase.detail()
+        );
+    }
+    // The other four slots stay absent on BOTH records, and that is the honest
+    // reading rather than a coverage gap. Parsing an argv observes no started
+    // process and no authority epoch, so `HostLaunchOptions` holds no
+    // process-start, fence, operation or reason handle for
+    // `host_launch_options_admitted_correlation` to forward, and it binds only
+    // the three slots above. Requiring these to differ from the pre-parse record
+    // would demand an identity this seam cannot prove, which is exactly the
+    // invention issue #978 forbids ("Missing evidence cannot be invented by
+    // logging") and I15.4 rules out; the admission correlation is asserted to
+    // bind no fourth slot instead.
+    for key in ["operation", "process_start", "fence", "reason"] {
+        assert_eq!(
+            correlation_slot(admitted_phase.detail(), key),
+            correlation_slot(first.detail(), key),
+            "this seam holds no {key} handle, so admission must not invent one: {}",
             admitted_phase.detail()
         );
     }
