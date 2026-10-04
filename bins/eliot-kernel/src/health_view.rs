@@ -215,6 +215,19 @@ impl KernelComposition {
         Ok(state)
     }
 
+    /// Returns exclusive access to the lifecycle owner so an out-of-crate
+    /// harness can publish the same ready receipt `activate_harness_candidate`
+    /// publishes for a composition-owned candidate.
+    ///
+    /// This adds no lifecycle transition and weakens no production gate: every
+    /// mutation it permits is one `KernelService` already exposes publicly, and
+    /// the composition's own arm still refuses any state but `Ready`.
+    pub fn service_mut(&self) -> std::sync::MutexGuard<'_, eliot_kernel_service::KernelService> {
+        self.service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Projects the Kernel's own activation state, generation, governance
     /// posture, active lease state and drain disposition (I1.5 "Expose the
     /// resulting activation state, generation, governance profile, active lease

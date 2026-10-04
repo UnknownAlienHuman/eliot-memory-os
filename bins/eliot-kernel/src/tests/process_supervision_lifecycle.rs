@@ -905,32 +905,41 @@ fn cleanup_and_reap_failure_retain_owner_and_reconciliation_requirement() {
     // `process_operation_context(Some(&op), None, None, None)` and therefore
     // carries the operation but no owner generation); the `unproven` arm's is
     // the composed close's terminal (process_execution.rs:3424-:3427).
-    for (operation, failed_line) in [
+    // `terminal_op` rather than `operation`: this scope already binds
+    // `operation_id`, `registered_operation`, `orphan_operation` and
+    // `unproven_operation`, and a fifth near-identical name trips
+    // clippy::similar_names.
+    for (terminal_op, failed_line) in [
         (orphan_operation, orphan_line),
         (unproven_operation, unproven_line),
     ] {
-        let owned: Vec<&str> = {
+        // `terminal_lines`, not `owned`: this scope binds `owner` at :822, and
+        // `owned` is close enough in name to trip clippy::similar_names.
+        let terminal_lines: Vec<&str> = {
             let terminal_event = "event=\"kernel.terminal_error\"";
-            let needle = format!("operation=\"{operation}\"");
+            let needle = format!("operation=\"{terminal_op}\"");
             logs.lines()
                 .filter(|line| line.contains(terminal_event) && line.contains(&needle))
                 .collect()
         };
         assert_eq!(
-            owned.len(),
+            terminal_lines.len(),
             1,
-            "the failed close of {operation} owns exactly one terminal, bound to ITS OWN operation and not to its neighbour's: {logs}"
+            "the failed close of {terminal_op} owns exactly one terminal, bound to ITS OWN operation and not to its neighbour's: {logs}"
         );
         assert_eq!(
-            span_field(owned[0], "operation").unwrap_or_else(|| {
-                panic!("the terminal of {operation} carries no operation slot: {}", owned[0])
+            span_field(terminal_lines[0], "operation").unwrap_or_else(|| {
+                panic!(
+                    "the terminal of {terminal_op} carries no operation slot: {}",
+                    terminal_lines[0]
+                )
             }),
-            operation,
-            "the terminal of {operation} names the same operation its failure record does, so the single terminal cannot belong to the other close: {logs}"
+            terminal_op,
+            "the terminal of {terminal_op} names the same operation its failure record does, so the single terminal cannot belong to the other close: {logs}"
         );
         assert!(
-            failed_line.contains(&format!("operation=\"{operation}\"")),
-            "the failure record of {operation} really carries its own operation slot, so the terminal binding above is compared against a per-operation record and not against line order: {failed_line}"
+            failed_line.contains(&format!("operation=\"{terminal_op}\"")),
+            "the failure record of {terminal_op} really carries its own operation slot, so the terminal binding above is compared against a per-operation record and not against line order: {failed_line}"
         );
     }
     assert_eq!(
