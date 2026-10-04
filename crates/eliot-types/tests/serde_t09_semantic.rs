@@ -315,12 +315,30 @@ const CASE_MARKERS: [&str; 16] = [
 /// `safety` and `semantic_memory` are not type names.
 fn types_bound_to_case(case: &str) -> Vec<String> {
     let slug = case.split_once('/').map_or("", |(_, slug)| slug);
-    let digits: String = slug.chars().take_while(char::is_ascii_digit).collect();
+    // The case number is what comes AFTER the leading `c`: the marker slug is
+    // `c<N>_<rest>` and the prefix below is rebuilt as `c{digits}_`, so the digits must
+    // be read from `slug` with that `c` stripped first. `take_while` then stops at the
+    // `_`, which is what keeps the two-digit cases `c10`..`c16` from swallowing the rest
+    // of the slug.
+    let number = slug.strip_prefix('c').unwrap_or(slug);
+    let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
     assert!(
         !digits.is_empty(),
-        "a case marker must carry its case number before its slug: {case}"
+        "a case marker slug must start with `c` followed by its case number, as `c<N>_<rest>`: \
+         {case}"
     );
     let prefix = format!("c{digits}_");
+    assert_eq!(
+        slug.strip_prefix(prefix.as_str()),
+        Some(
+            number
+                .strip_prefix(digits.as_str())
+                .and_then(|rest| rest.strip_prefix('_'))
+                .unwrap_or("")
+        ),
+        "the rebuilt prefix `c{digits}_` must be a real prefix of the slug `{slug}`, or the case \
+         number was read from the wrong place: {case}"
+    );
     let types = meta_types();
     let mut bound: Vec<String> = container_fixture_keys()
         .iter()
@@ -329,8 +347,7 @@ fn types_bound_to_case(case: &str) -> Vec<String> {
             types
                 .iter()
                 .find(|type_name| {
-                    rest.starts_with(type_name.as_str())
-                        && rest[type_name.len()..].starts_with('_')
+                    rest.starts_with(type_name.as_str()) && rest[type_name.len()..].starts_with('_')
                 })
                 .cloned()
         })
@@ -339,6 +356,11 @@ fn types_bound_to_case(case: &str) -> Vec<String> {
     bound.dedup();
     bound
 }
+
+/// This suite's own repository-relative path, as the frozen inventory names it. One
+/// definition, so case 1 can assert that the `#938` allocation row names THIS file
+/// without a second transcription of the path.
+const SELF_TEST_FILE: &str = "crates/eliot-types/tests/serde_t09_semantic.rs";
 
 /// The four canonical documents case 2 owns. Every one must be bound to case 2
 /// by the container's own `c2_<Type>_canonical` key, and no other type may be,
@@ -383,7 +405,7 @@ const TARGET_ENDPOINT: &str = "target_endpoint";
 const TARGET_STORAGE_REF: &str = "target_storage_ref";
 const EXACT_ACTION_HASH: &str = "exact_action_hash";
 /// `BackupManifest`'s one decoder-enforced version member
-/// (`crates/eliot-types/src/safety.rs:123-124`).
+/// (`crates/eliot-types/src/safety.rs:129-130`).
 const SCHEMA_VERSION_MEMBER: &str = "schema_version";
 /// The enclosing member `c4_safety_unknown_nested_member_refuse` injects into.
 const CHECKSUMS_MEMBER: &str = "checksums";
@@ -398,7 +420,7 @@ const OUTCOME_REASON_MEMBER: &str = "reason";
 const REPLAY_STATUS: &str = "status";
 const RESTORE_STATUS: &str = "status";
 /// The campaign-integrity member whose disposition is the `safety.rs` writer's,
-/// not this file's (`crates/eliot-types/src/safety.rs:771`).
+/// not this file's (`crates/eliot-types/src/safety.rs:778`).
 const CAMPAIGN_INTEGRITY: &str = "campaign_integrity";
 /// The four members case 15 adds to a restore receipt. Each is a word that would
 /// raise proof if it were accepted, which is why the case's claim is that they
@@ -455,10 +477,11 @@ fn fixture_key_tokens_in_source() -> Vec<String> {
         // A bare `c7_` PREFIX is not a name, and neither is a literal that carries
         // characters the naming rule does not allow: the tail after `c<digits>_` must
         // be non-empty and the whole literal must be the token.
-        let is_key_shape = !digits.is_empty()
-            && tail.starts_with('_')
-            && tail.len() > 1
-            && shape.len() == literal.len();
+        // `digits` is a COUNT of the case-number digits, so "the case number is
+        // present" is `digits > 0` and nothing else: a literal like `c_foo` has no
+        // digits at all and must not be read as a key-shaped name.
+        let is_key_shape =
+            digits > 0 && tail.starts_with('_') && tail.len() > 1 && shape.len() == literal.len();
         if is_key_shape && !tokens.contains(&shape.to_owned()) {
             tokens.push(shape.to_owned());
         }
@@ -611,12 +634,18 @@ struct RawMemberSpan {
 /// invisible to it.
 fn top_level_member_span(document: &str, member: &str) -> RawMemberSpan {
     let bytes = document.as_bytes();
-    let mut cursor = bytes.iter().position(|byte| *byte == b'{').unwrap_or_else(|| {
-        panic!("a stored document this file edits must be a JSON object, not a bare scalar")
-    });
+    let mut cursor = bytes
+        .iter()
+        .position(|byte| *byte == b'{')
+        .unwrap_or_else(|| {
+            panic!("a stored document this file edits must be a JSON object, not a bare scalar")
+        });
     cursor += 1;
     loop {
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        // At a MEMBER BOUNDARY: just after `{`, or just after a previous member's
+        // value. One optional separator comma, then whitespace.
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b',')
+        {
             cursor += 1;
         }
         if cursor >= bytes.len() || bytes[cursor] == b'}' {
@@ -625,15 +654,13 @@ fn top_level_member_span(document: &str, member: &str) -> RawMemberSpan {
         let key_start = cursor;
         let key_end = scan_json_string(bytes, cursor)
             .unwrap_or_else(|| panic!("the stored document must be well-formed JSON"));
-        if document.get(cursor + 1..key_end - 1) != Some(member) {
-            panic!("the stored document must carry a top-level member `{member}`");
-        }
+        let key = document.get(cursor + 1..key_end - 1).map(str::to_owned);
         cursor = key_end;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
         if bytes.get(cursor) != Some(&b':') {
-            panic!("a top-level member `{member}` must be followed by `:`");
+            panic!("a top-level member must be followed by `:`");
         }
         cursor += 1;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
@@ -641,7 +668,17 @@ fn top_level_member_span(document: &str, member: &str) -> RawMemberSpan {
         }
         let value_start = cursor;
         let value_end = scan_json_value(bytes, cursor)
-            .unwrap_or_else(|| panic!("the value of `{member}` must be well-formed JSON"));
+            .unwrap_or_else(|| panic!("the value of a top-level member must be well-formed JSON"));
+        // STEP OVER every member that is not the one asked for. An earlier version
+        // asserted on the first key it saw and panicked for any document whose
+        // requested member was not FIRST, which is false for most of this corpus:
+        // `status` is the LAST member of the ReplayRun document, `payload` is the
+        // fifth of the source record and `exact_action_hash` the eighth of the restore
+        // plan. Walking the object is what "the top level" means.
+        if key.as_deref() != Some(member) {
+            cursor = value_end;
+            continue;
+        }
         let mut end = value_end;
         while end < bytes.len() && bytes[end].is_ascii_whitespace() {
             end += 1;
@@ -668,20 +705,27 @@ fn top_level_member_span(document: &str, member: &str) -> RawMemberSpan {
     }
 }
 
-/// One stored document with ONE top-level member REMOVED, as raw text. Used to
-/// build an omission document out of a stored one without asking the container
-/// for a second document per member. The result is re-read as a WITNESS and
-/// asserted to be a JSON object that really no longer carries the member, so a
-/// broken scan fails here instead of producing a document that decodes for an
-/// unrelated reason.
+/// One stored document with ONE OCCURRENCE of a top-level member REMOVED, as raw
+/// text. Used to build an omission document out of a stored one without asking the
+/// container for a second document per member.
+///
+/// THE PRECONDITION IS "ONE FEWER OCCURRENCE", NOT "NO OCCURRENCE LEFT". The stored
+/// `c5_frame_duplicate_task_id_refuse` carries `task_id` TWICE, and case 10 uses this
+/// helper to drop the FIRST pair and keep the retained last value as its accepted
+/// counterpart - so demanding that the member be gone entirely asserted something
+/// false about that document. A `Value` witness cannot see the difference at all,
+/// because it collapses the pair to one key either way; the count is read out of the
+/// RAW TEXT of both documents, which is the only route that can tell them apart.
 fn without_top_level_member(document: &str, member: &str) -> String {
     let span = top_level_member_span(document, member);
     let mut edited = String::with_capacity(document.len());
     edited.push_str(&document[..span.start]);
     edited.push_str(&document[span.end..]);
-    assert!(
-        witness(&edited).get(member).is_none(),
-        "the edited document must really have lost its top-level `{member}`"
+    assert_eq!(
+        repeats(&edited, member),
+        repeats(document, member).saturating_sub(1),
+        "the edited document must carry exactly one `\"{member}\"` occurrence FEWER than the \
+         original: the edit removes one occurrence and no other"
     );
     edited
 }
@@ -844,7 +888,10 @@ fn raw_string_values(document: &str, member: &str) -> Vec<String> {
     let bytes = document.as_bytes();
     let mut values = Vec::new();
     let mut from = 0_usize;
-    while let Some(at) = document.get(from..).and_then(|rest| rest.find(needle.as_str())) {
+    while let Some(at) = document
+        .get(from..)
+        .and_then(|rest| rest.find(needle.as_str()))
+    {
         let key_end = from + at + needle.len();
         let mut cursor = key_end;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
@@ -960,10 +1007,7 @@ fn enum_variants(source: &str, declaration: &str) -> Vec<String> {
         if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
             continue;
         }
-        let candidate = trimmed
-            .trim_end_matches(',')
-            .trim_end_matches('{')
-            .trim();
+        let candidate = trimmed.trim_end_matches(',').trim_end_matches('{').trim();
         let identifier: String = candidate
             .chars()
             .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
@@ -989,7 +1033,7 @@ fn enum_variants(source: &str, declaration: &str) -> Vec<String> {
 /// list typed here.
 fn inventory_allocated_types() -> Vec<String> {
     let inventory = repository_text(
-        "foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
+        "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
     );
     let mut names: Vec<String> = Vec::new();
     for line in inventory.lines() {
@@ -1171,8 +1215,9 @@ where
         document, canonical,
         "{label} must actually differ from the accepted canonical document"
     );
-    let accepted: T = decode(canonical)
-        .unwrap_or_else(|error| panic!("the canonical document must decode as the same type: {error}"));
+    let accepted: T = decode(canonical).unwrap_or_else(|error| {
+        panic!("the canonical document must decode as the same type: {error}")
+    });
     drop(accepted);
     let canonical_members = top_level_members(canonical);
     let Err(error) = decode::<T>(document) else {
@@ -1325,7 +1370,7 @@ fn probe_claim(message: &str) -> Option<(String, String)> {
 /// `#[serde(...)]` joined into the single text it really is.
 ///
 /// This exists because a raw substring scan cannot answer "does any declaration carry
-/// this attribute". `crates/eliot-types/src/safety.rs:768` writes "no
+/// this attribute". `crates/eliot-types/src/safety.rs:775` writes "no
 /// `#[serde(alias)]`" inside a DOC COMMENT in order to deny the alias, and a scan of
 /// raw text reads that denial as an occurrence. A doc comment never starts with
 /// `#[`, so requiring that a block's first trimmed line does is what separates a
@@ -1427,9 +1472,7 @@ fn defaulted_members(source: &str) -> Vec<String> {
             };
             let name: String = rest
                 .chars()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || *character == '_'
-                })
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
                 .collect();
             if !name.is_empty() {
                 members.push(name);
@@ -1446,7 +1489,11 @@ fn defaulted_members(source: &str) -> Vec<String> {
 fn accepted_replay_run_document() -> String {
     let replay = production_text("crates/eliot-types/src/replay.rs");
     assert!(
-        declaration_carries(&replay, "pub enum ReplayRunStatus", "rename_all = \"snake_case\""),
+        declaration_carries(
+            &replay,
+            "pub enum ReplayRunStatus",
+            "rename_all = \"snake_case\""
+        ),
         "crates/eliot-types/src/replay.rs: `ReplayRunStatus` must stay a snake_case closed enum"
     );
     let legal = enum_variants(&replay, "pub enum ReplayRunStatus");
@@ -1487,11 +1534,10 @@ fn c1_allocation_complete() {
     let meta = container
         .get("meta")
         .unwrap_or_else(|| panic!("the corpus must carry `meta`"));
-    let mut meta_keys: Vec<&str> = meta
-        .as_object()
-        .map_or_else(|| panic!("`meta` must be a JSON object"), |object| {
-            object.keys().map(String::as_str).collect()
-        });
+    let mut meta_keys: Vec<&str> = meta.as_object().map_or_else(
+        || panic!("`meta` must be a JSON object"),
+        |object| object.keys().map(String::as_str).collect(),
+    );
     meta_keys.sort_unstable();
     assert_eq!(
         meta_keys,
@@ -1525,7 +1571,8 @@ fn c1_allocation_complete() {
         "the corpus must record the sixteen preserved acceptance cases"
     );
     assert_eq!(
-        meta.get("allocated_type_count").and_then(serde_json::Value::as_u64),
+        meta.get("allocated_type_count")
+            .and_then(serde_json::Value::as_u64),
         Some(160),
         "the corpus must record the 160 allocated types"
     );
@@ -1570,11 +1617,10 @@ fn c1_allocation_complete() {
     );
     // NO SILENT ORPHANS, against the file and the container.
     assert_no_silent_orphans();
-    let mut top_level_keys: Vec<&str> = container
-        .as_object()
-        .map_or_else(|| panic!("the corpus must be a JSON object"), |object| {
-            object.keys().map(String::as_str).collect()
-        });
+    let mut top_level_keys: Vec<&str> = container.as_object().map_or_else(
+        || panic!("the corpus must be a JSON object"),
+        |object| object.keys().map(String::as_str).collect(),
+    );
     top_level_keys.sort_unstable();
     assert_eq!(
         top_level_keys,
@@ -1630,7 +1676,7 @@ fn c1_allocation_complete() {
     // (c) The frozen allocation row itself: the four production files, the
     // family, the row count and the readiness this issue does not flip.
     let inventory = repository_text(
-        "foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
+        "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
     );
     let allocation_start = inventory
         .find("child = \"#938\"")
@@ -1665,10 +1711,46 @@ fn c1_allocation_complete() {
         "the #938 allocation row must still read READY_FOR_REPAIR: this issue does not flip the \
          frozen inventory, which belongs to #929"
     );
+    // RECORDED, NOT DEMANDED. The frozen row and `scripts/serde_boundary_inventory.py`
+    // are card READ ONLY and their regeneration belongs to #929, so this card cannot
+    // produce an UNPLANNED marker and an earlier version demanded one - an assertion
+    // that can never pass in this work unit. The claim this file CAN make, and does,
+    // is the measured state: the row names THIS suite as its test file, whatever
+    // lifecycle marker it currently carries, and the marker is reported verbatim so
+    // the gap is visible rather than asserted away.
+    let test_file_line = allocation
+        .lines()
+        .find(|line| line.trim_start().starts_with("test_files"))
+        .unwrap_or_else(|| {
+            panic!("the #938 allocation row must carry a `test_files` entry naming this suite")
+        });
     assert!(
-        allocation.contains("test_files = [\"crates/eliot-types/tests/serde_t09_semantic.rs\""),
-        "the #938 allocation row must name this suite as its test file"
+        test_file_line.contains(SELF_TEST_FILE),
+        "the #938 allocation row must name THIS suite (`{SELF_TEST_FILE}`) as its test file. \
+         Measured line: {test_file_line}"
     );
+    let planned = test_file_line.contains(":planned");
+    let recorded_test_bytes = allocation
+        .lines()
+        .find(|line| line.trim_start().starts_with("test_bytes"))
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    // WHAT IS TRUE AND THIS CARD OWNS: a row that marks the suite `:planned` must
+    // also record zero bytes for it. That is internally consistent today, and it is
+    // the one thing about the marker this file can check without demanding a
+    // regeneration that belongs to #929. The `:planned` marker itself is a RECORDED
+    // gap, reported here and owned by #929 - the inventory and
+    // `scripts/serde_boundary_inventory.py` are card READ ONLY, so this work unit
+    // cannot and must not remove it.
+    if planned {
+        assert!(
+            recorded_test_bytes.ends_with("= 0"),
+            "a `:planned` test file must be recorded with zero bytes, or the row is inconsistent \
+             with its own marker. Measured `test_files`: {test_file_line}; measured \
+             `{recorded_test_bytes}`"
+        );
+    }
 
     // (d) The four-file allocation, proved by DECODING one representative record
     // per production file out of raw stored text, not by the existence of a file.
@@ -1680,7 +1762,10 @@ fn c1_allocation_complete() {
             "MemoryUtilitySourceRecord",
             "crates/eliot-types/src/distillation.rs",
         ),
-        ("TaskMeaningFrame", "crates/eliot-types/src/semantic_memory.rs"),
+        (
+            "TaskMeaningFrame",
+            "crates/eliot-types/src/semantic_memory.rs",
+        ),
     ] {
         assert!(
             types.iter().any(|name| name == type_name),
@@ -1695,15 +1780,17 @@ fn c1_allocation_complete() {
         member_text(&raw("c2_BackupManifest_canonical"), DUPLICATE_BACKUP_ID),
         "src/safety.rs: the decoded manifest must carry the document's own backup_id"
     );
-    let run: ReplayRun = decode(&accepted_replay_run_document())
-        .expect("src/replay.rs: the stored ReplayRun document must decode once its status is legal");
+    let run: ReplayRun = decode(&accepted_replay_run_document()).expect(
+        "src/replay.rs: the stored ReplayRun document must decode once its status is legal",
+    );
     assert!(
         !run.sealed_input_hash.is_empty() && !run.reproducibility_hash.is_empty(),
         "src/replay.rs: the decoded ReplayRun must carry its own two replay-identity hashes"
     );
-    let formed: ExperienceFormationResult = decode(&accepted_formation_result_document())
-        .expect("src/semantic_memory.rs: the stored result document must decode once its tag matches \
-                 its payload");
+    let formed: ExperienceFormationResult = decode(&accepted_formation_result_document()).expect(
+        "src/semantic_memory.rs: the stored result document must decode once its tag matches \
+                 its payload",
+    );
     assert!(
         serde_json::to_value(&formed)
             .expect("a result must re-encode")
@@ -1711,9 +1798,10 @@ fn c1_allocation_complete() {
             .is_some(),
         "src/semantic_memory.rs: the decoded result must carry its own `outcome` tag"
     );
-    let source_record: MemoryUtilitySourceRecord =
-        decode(&raw("c11_ledger_value_payload_mentions_restore_decodes_inert"))
-            .expect("src/distillation.rs: the stored source record must decode");
+    let source_record: MemoryUtilitySourceRecord = decode(&raw(
+        "c11_ledger_value_payload_mentions_restore_decodes_inert",
+    ))
+    .expect("src/distillation.rs: the stored source record must decode");
     assert_eq!(
         source_record.record_ref,
         member_text(
@@ -1789,9 +1877,9 @@ fn c1_allocation_complete() {
     // load-bearing and this delivery preserved a wire difference rather than a
     // cosmetic one.
     let maturity = enum_variants(&semantic, "pub enum ExperienceMaturityState");
-    let first_variant = maturity
-        .first()
-        .unwrap_or_else(|| panic!("`ExperienceMaturityState` must declare a variant: {maturity:?}"));
+    let first_variant = maturity.first().unwrap_or_else(|| {
+        panic!("`ExperienceMaturityState` must declare a variant: {maturity:?}")
+    });
     assert_ne!(
         camel_to_screaming_snake(first_variant),
         camel_to_snake(first_variant),
@@ -1912,7 +2000,7 @@ fn c2_unchanged_valid_bytes() {
 fn c3_unknown_outer_field_refused() {
     assert_case_binding("938/c3_unknown_outer_field_refused", &[]);
     // The ordinary envelope is closed: `BackupManifest` declares
-    // `deny_unknown_fields` (`crates/eliot-types/src/safety.rs:115`), which is
+    // `deny_unknown_fields` (`crates/eliot-types/src/safety.rs:121`), which is
     // what makes an unknown outer member a refusal instead of a silently dropped
     // field.
     assert!(
@@ -1954,7 +2042,7 @@ fn c3_unknown_outer_field_refused() {
 fn c4_unknown_nested_field_refused() {
     assert_case_binding("938/c4_unknown_nested_field_refused", &[]);
     // The NESTED owner type carries the refusal, not the envelope:
-    // `BackupChecksum` is closed at `crates/eliot-types/src/safety.rs:199`.
+    // `BackupChecksum` is closed at `crates/eliot-types/src/safety.rs:233-235`.
     assert!(
         declaration_carries(
             &production_text("crates/eliot-types/src/safety.rs"),
@@ -2031,10 +2119,7 @@ fn c5_duplicate_keys_refused() {
     // (`crates/eliot-types/src/strict_json.rs:118`) observes members through
     // `MapAccess` before any `Value` exists (`strict_json.rs:194-205`).
     for (fixture, member) in [
-        (
-            "c5_safety_duplicate_backup_id_refuse",
-            DUPLICATE_BACKUP_ID,
-        ),
+        ("c5_safety_duplicate_backup_id_refuse", DUPLICATE_BACKUP_ID),
         ("c5_frame_duplicate_task_id_refuse", DUPLICATE_TASK_ID),
         (
             "c5_frame_duplicate_entity_role_key_refuse",
@@ -2066,7 +2151,7 @@ fn c5_duplicate_keys_refused() {
     // the visit (`:253-273`). The field's TYPE IS IRRELEVANT to it: a `null` sets
     // `Some(None)`, which is still `is_some`, so `Option`, `String`, `Value` and
     // `deserialize_with` fields all get the identical arm. `BackupManifest::backup_id`
-    // (`crates/eliot-types/src/safety.rs:117`, attribute at `:115`) and
+    // (`crates/eliot-types/src/safety.rs:123`, attribute at `:121`) and
     // `TaskMeaningFrame::task_id` (`crates/eliot-types/src/semantic_memory.rs:257`,
     // attribute at `:255`) are plain derived `String` fields of a
     // `deny_unknown_fields` struct with no `flatten` and no `skip_deserializing`, so
@@ -2089,7 +2174,11 @@ fn c5_duplicate_keys_refused() {
         ("c5_frame_duplicate_task_id_refuse", DUPLICATE_TASK_ID),
     ] {
         let values = raw_string_values(&raw(fixture), member);
-        assert_eq!(values.len(), 2, "{fixture} must carry two raw `{member}` values");
+        assert_eq!(
+            values.len(),
+            2,
+            "{fixture} must carry two raw `{member}` values"
+        );
         assert_ne!(
             values[0], values[1],
             "{fixture}'s two `{member}` values must DIFFER, or nothing was being rewritten"
@@ -2129,9 +2218,10 @@ fn c5_duplicate_keys_refused() {
         StrictJsonErrorKind::DuplicateKey,
         "the repeat inside the `Value` member must be visible to the lexical decoder"
     );
-    let accepted_record: MemoryUtilitySourceRecord = decode(&collapsed)
-        .expect("a repeat INSIDE a `Value` member is accepted: the declared type is \
-                 `serde_json::Value`, which is the documented collapse exception this case records");
+    let accepted_record: MemoryUtilitySourceRecord = decode(&collapsed).expect(
+        "a repeat INSIDE a `Value` member is accepted: the declared type is \
+                 `serde_json::Value`, which is the documented collapse exception this case records",
+    );
     assert_eq!(
         accepted_record
             .payload
@@ -2176,9 +2266,8 @@ fn c6_wrong_or_unknown_tags_refused() {
         message.contains("unknown variant"),
         "an unknown status variant must be refused as `unknown variant`, got: {message}"
     );
-    let variant = quoted_member(&message, "unknown variant").unwrap_or_else(|| {
-        panic!("the refusal must name the unknown variant, got: {message}")
-    });
+    let variant = quoted_member(&message, "unknown variant")
+        .unwrap_or_else(|| panic!("the refusal must name the unknown variant, got: {message}"));
     assert_eq!(
         variant,
         member_text(&unknown_status, REPLAY_STATUS),
@@ -2226,14 +2315,13 @@ fn c6_wrong_or_unknown_tags_refused() {
     // The CONTROL, built from raw text: the SAME bytes with the tag that matches
     // the payload decode, which is the whole content of the case.
     let corrected = accepted_formation_result_document();
-    let formed: ExperienceFormationResult =
-        decode(&corrected).unwrap_or_else(|accept_error| {
-            panic!(
-                "the same document with its tag corrected to the variant that declares `{reason}` \
-                 must decode, or the refusal above was not caused by the tag/payload \
-                 disagreement: {accept_error}"
-            )
-        });
+    let formed: ExperienceFormationResult = decode(&corrected).unwrap_or_else(|accept_error| {
+        panic!(
+            "the same document with its tag corrected to the variant that declares \
+                 `{OUTCOME_REASON_MEMBER}` must decode, or the refusal above was not caused by \
+                 the tag/payload disagreement: {accept_error}"
+        )
+    });
     assert_eq!(
         serde_json::to_value(&formed)
             .expect("a result must re-encode")
@@ -2258,12 +2346,17 @@ fn c6_wrong_or_unknown_tags_refused() {
 fn c7_missing_or_empty_required_ids_refused() {
     assert_case_binding(
         "938/c7_missing_or_empty_required_ids_refused",
-        &["BackupManifest", "RestorePlan", "RestoreReceipt", "IncidentRecord"],
+        &[
+            "BackupManifest",
+            "RestorePlan",
+            "RestoreReceipt",
+            "IncidentRecord",
+        ],
     );
 
     // (a) The seven omitted effect-bearing members. Each is decoded through the
     // module-local `deserialize_required_nullable`
-    // (`crates/eliot-types/src/safety.rs:106`), so an absent key is `missing
+    // (`crates/eliot-types/src/safety.rs:112`), so an absent key is `missing
     // field` and the refusal names it, while an explicit `null` stays legal.
     // `docs/architecture/APPENDIX-P-rust-public-boundary-interfaces.md:12`:
     // "authority, scope, effect, privacy, ordering and receipt fields are never
@@ -2330,7 +2423,8 @@ fn c7_missing_or_empty_required_ids_refused() {
         BLOB_PAYLOAD_ROOT,
         &canonical_manifest,
     );
-    let plan: RestorePlan = decode(&canonical_plan).expect("the canonical restore plan must decode");
+    let plan: RestorePlan =
+        decode(&canonical_plan).expect("the canonical restore plan must decode");
     assert_nullable_member_agrees(&plan.target_endpoint, TARGET_ENDPOINT, &canonical_plan);
     assert_nullable_member_agrees(
         &plan.target_storage_ref,
@@ -2351,7 +2445,7 @@ fn c7_missing_or_empty_required_ids_refused() {
     // document's name says `_absent_explicit_unknown`, and that is exactly what
     // the delivered decoder does: the member carries NEITHER `#[serde(default)]`
     // NOR the refusing decoder
-    // (`crates/eliot-types/src/safety.rs:771`), so an absent key DECODES to an
+    // (`crates/eliot-types/src/safety.rs:778`), so an absent key DECODES to an
     // explicit `None` - unknown, never a validity claim
     // (`docs/architecture/I05-16-common-durable-fields.md:44`). Asserting a refusal
     // here would be asserting one the delivered decoder does not perform.
@@ -2365,14 +2459,16 @@ fn c7_missing_or_empty_required_ids_refused() {
          default and no refusing decoder"
     );
     let canonical_incident = raw("c2_IncidentRecord_canonical");
-    let incident: IncidentRecord = decode(&canonical_incident)
-        .expect("the canonical IncidentRecord must decode");
+    let incident: IncidentRecord =
+        decode(&canonical_incident).expect("the canonical IncidentRecord must decode");
     assert_round_trip_identical::<IncidentRecord>(
         &canonical_incident,
         "c2_IncidentRecord_canonical",
     );
     assert!(
-        witness(&canonical_incident).get(CAMPAIGN_INTEGRITY).is_some(),
+        witness(&canonical_incident)
+            .get(CAMPAIGN_INTEGRITY)
+            .is_some(),
         "the canonical IncidentRecord must carry `{CAMPAIGN_INTEGRITY}`"
     );
     let explicit_unknown_fixture = "c7_IncidentRecord_campaign_integrity_absent_explicit_unknown";
@@ -2388,20 +2484,39 @@ fn c7_missing_or_empty_required_ids_refused() {
              disposition must be reported: {error}"
         )
     });
+    // THE DECODED FIELD, NOT THE RE-ENCODED DOCUMENT. An earlier version asserted on
+    // `to_value(&unknown).get(CAMPAIGN_INTEGRITY).is_none()`, which asked the SERIALIZE
+    // side to drop a key it is required to emit: `campaign_integrity` is a plain
+    // `Option<T>` with no `skip_serializing_if`, so the re-encoded document carries
+    // `"campaign_integrity": null` - which is the `I05-16:46` explicit-`None` rule
+    // working, not a missing member. The claim belongs on the value the decoder
+    // produced.
     assert!(
-        serde_json::to_value(&unknown)
-            .expect("an IncidentRecord must re-encode")
-            .get(CAMPAIGN_INTEGRITY)
-            .is_none(),
+        unknown.campaign_integrity.is_none(),
         "an omitted `{CAMPAIGN_INTEGRITY}` must decode to an explicit `None` - unknown, never a \
          validity claim"
     );
+    assert_eq!(
+        serde_json::to_value(&unknown)
+            .expect("an IncidentRecord must re-encode")
+            .get(CAMPAIGN_INTEGRITY)
+            .cloned(),
+        Some(serde_json::Value::Null),
+        "and the re-encoded record must then CARRY the member as an explicit `null`: a field that \
+         does not apply remains an explicit `None` and is not silently omitted from the semantic \
+         model (docs/architecture/I05-16-common-durable-fields.md:46)"
+    );
     assert!(
+        incident.campaign_integrity.is_some(),
+        "the CONTROL: the canonical incident carries the member and its decode keeps it"
+    );
+    assert_eq!(
         serde_json::to_value(&incident)
             .expect("an IncidentRecord must re-encode")
             .get(CAMPAIGN_INTEGRITY)
-            .is_some(),
-        "the CONTROL: the canonical incident carries the member and its decode keeps it"
+            .map(serde_json::Value::is_object),
+        Some(true),
+        "the CONTROL's re-encoded member must be the campaign-integrity OBJECT, not a null"
     );
 }
 
@@ -2485,7 +2600,7 @@ fn c8_unsupported_versions_refused() {
     // RECORDED, NOT INVENTED: the other version-shaped members of this family are
     // plain `String`s whose equality lives in a caller, so no decoder compares
     // them. `BackupManifest::governor_version`
-    // (`crates/eliot-types/src/safety.rs:122`) is the one beside the enforced
+    // (`crates/eliot-types/src/safety.rs:128`) is the one beside the enforced
     // member, and the restore records carry no version at all.
     let safety = production_text("crates/eliot-types/src/safety.rs");
     assert!(
@@ -2515,10 +2630,7 @@ fn c8_unsupported_versions_refused() {
 // WORK_UNIT_CASE: 938/c9_recorded_absence_of_legacy_migration_surface
 #[test]
 fn c9_recorded_absence_of_legacy_migration_surface() {
-    assert_case_binding(
-        "938/c9_recorded_absence_of_legacy_migration_surface",
-        &[],
-    );
+    assert_case_binding("938/c9_recorded_absence_of_legacy_migration_surface", &[]);
     // Case 9's SUBJECT FOR THIS ISSUE IS THE RECORDED ABSENCE of any legacy
     // migration surface, and the container records that absence as one of its nine
     // `known_non_clean` rows. There is deliberately NO fixture for this case: the
@@ -2542,18 +2654,57 @@ fn c9_recorded_absence_of_legacy_migration_surface() {
         Some("crates/eliot-types/src/distillation.rs"),
         "the recorded-absence row must name the file it was measured on"
     );
+    let property = absence_text("property").to_lowercase();
     let observed = absence_text("observed");
-    for phrase in ["no serde alias", "no renamed member", "no flatten"] {
+    let observed_lower = observed.to_lowercase();
+    // THE ROW'S SUBSTANCE, NOT ITS WORDING. This row is an OBSERVABLE plus the
+    // mechanisms that were searched, and this file asserts each of those four
+    // mechanisms and the measured result, rather than any one phrase: the row was
+    // legitimately re-worded from "no serde alias, no renamed member and no flatten"
+    // to "anchored serde attribute lines containing alias ... returns ZERO hits",
+    // which is STRONGER because it records HOW the search was anchored. A matcher
+    // that pins the earlier wording would break the next honest edit of the row and
+    // would be making this test dictate the corpus's prose.
+    assert!(
+        property.contains("cases 9 and 10") && property.contains("no fixture row"),
+        "the row's own `property` must say that cases 9 and 10 have no fixture row, which is the \
+         fact this case exists to hold in place; property says: {property}"
+    );
+    assert!(
+        observed_lower.contains("observable") && observed_lower.contains("measured"),
+        "the row must present its content as a measured OBSERVABLE plus the mechanism searched, \
+         not as a verdict or a passed boolean; observed says: {observed}"
+    );
+    // The four alternative-spelling mechanisms, each of which the row reports as
+    // returning ZERO hits: an alternate member name, flattened nesting, a wire
+    // rename, and a hand-written Deserialize impl.
+    for mechanism in ["alias", "flatten", "rename =", "deserialize"] {
         assert!(
-            observed.contains(phrase),
-            "the recorded-absence row must state `{phrase}` in its own words, or the absence is \
-             not recorded: {observed}"
+            observed_lower.contains(mechanism),
+            "the row must name the `{mechanism}` mechanism among those it searched, or the absence \
+             is not recorded as searched: {observed}"
         );
     }
     assert!(
-        observed.contains("zero hits"),
-        "the recorded-absence row must record the MEASURED result of the scan - zero hits - rather \
-         than assert an absence it never looked for: {observed}"
+        observed_lower.contains("zero hits"),
+        "the row must record the MEASURED result of each search - zero hits - rather than assert an \
+         absence it never looked for: {observed}"
+    );
+    assert!(
+        observed_lower.contains("in all four files"),
+        "the row must scope its measurement to the whole allocated family, not to one file: {observed}"
+    );
+    // The anchoring, and WHY it matters: an unanchored search would match the
+    // `serde(alias` token inside the sd8 disposition comment that DENIES the alias.
+    assert!(
+        observed_lower.contains("anchor"),
+        "the row must say the search pattern was ANCHORED to an attribute position, which is what \
+         makes a doc comment count as nothing: {observed}"
+    );
+    assert!(
+        observed_lower.contains("denies the alias") || observed_lower.contains("denial"),
+        "the row must record why anchoring was necessary - a doc comment denies the alias, so an \
+         unanchored search would read a denial as evidence: {observed}"
     );
     let owner = absence_text("owner");
     for file in [
@@ -2569,10 +2720,21 @@ fn c9_recorded_absence_of_legacy_migration_surface() {
         );
     }
     let why = absence_text("why_it_is_recorded_and_not_fixed");
+    let why_lower = why.to_lowercase();
     assert!(
-        why.contains("recorded absence"),
-        "the row must say in its own words that it is a recorded absence, which is what accounts \
-         for cases 9 and 10 without a fixture; it says: {why}"
+        why_lower.contains("recorded"),
+        "the row must say in its own words that the disposition is RECORDED rather than repaired, \
+         which is what accounts for cases 9 and 10 without a fixture; it says: {why}"
+    );
+    assert!(
+        why_lower.contains("cases 9 and 10"),
+        "the row must name BOTH cases it accounts for, so neither is silently missing while \
+         `meta.case_count` stays sixteen; it says: {why}"
+    );
+    assert!(
+        why_lower.contains("no row is deleted"),
+        "the row must state that nothing was deleted to suppress the gap, which is what makes the \
+         absence a record rather than an erasure; it says: {why}"
     );
 
     // (a) The absence is ALSO measured here, from the PRODUCTION SOURCE rather than
@@ -2585,17 +2747,14 @@ fn c9_recorded_absence_of_legacy_migration_surface() {
             "pub struct MemoryDistillationCandidate",
         ),
         ("crates/eliot-types/src/replay.rs", "pub struct ReplayRun"),
-        (
-            "crates/eliot-types/src/safety.rs",
-            "pub struct RestorePlan",
-        ),
+        ("crates/eliot-types/src/safety.rs", "pub struct RestorePlan"),
         (
             "crates/eliot-types/src/semantic_memory.rs",
             "pub struct TaskMeaningFrame",
         ),
     ] {
         let source = production_text(path);
-        // ATTRIBUTE BLOCKS, never raw text: `crates/eliot-types/src/safety.rs:768`
+        // ATTRIBUTE BLOCKS, never raw text: `crates/eliot-types/src/safety.rs:775`
         // writes "no `#[serde(alias)]`" inside a DOC COMMENT in order to deny the
         // alias, and a raw substring scan reads that denial as an occurrence.
         let attributes = attribute_blocks(&source);
@@ -2642,8 +2801,11 @@ fn c9_recorded_absence_of_legacy_migration_surface() {
         "no fixture key may claim a legacy or migration interpretation of this family, because \
          none is named, versioned or receipted: {invented:?}"
     );
+    // CASE-INSENSITIVE: the substance is that the row names the ONE versioned surface in
+    // the family, and it must be the member cases 7 and 8 already exercise. Spelling
+    // `backupmanifest.schema_version` differently is not a different claim.
     assert!(
-        observed.contains("BackupManifest.schema_version"),
+        observed_lower.contains("backupmanifest.schema_version"),
         "the row must record that the ONLY versioned surface in the family is \
          `BackupManifest.schema_version`, which cases 7 and 8 already exercise; a version select is \
          not a migration surface: {observed}"
@@ -2675,10 +2837,25 @@ fn c10_unsafe_absent_identity_or_lineage_refuses() {
             panic!("the `c9_c10_no_legacy_migration_surface` row must carry a text `why` clause")
         })
         .to_owned();
+    // LOWER-CASE THE HAYSTACK, not the needle: the row writes "Cases 9 and 10" with a
+    // capital C, and matching a lower-case needle against the raw text failed on
+    // wording alone. The substance asserted here is that the row accounts for BOTH
+    // cases and says neither is silently missing.
+    let why_lower = why.to_lowercase();
     assert!(
-        why.contains("cases 9 and 10") && why.contains("not silently missing"),
-        "the recorded row must account for BOTH case 9 and case 10 by the recorded absence, so \
-         neither case is silently missing while `meta.case_count` stays sixteen; it says: {why}"
+        why_lower.contains("cases 9 and 10"),
+        "the recorded row must account for BOTH case 9 and case 10, so neither case is silently \
+         missing while `meta.case_count` stays sixteen; it says: {why}"
+    );
+    assert!(
+        why_lower.contains("not silently missing"),
+        "the recorded row must say the two cases are NOT silently missing, which is what a \
+         recorded observable buys; it says: {why}"
+    );
+    assert!(
+        why_lower.contains("meta.case_count"),
+        "the recorded row must tie the accounting to `meta.case_count`, so the sixteen cases stay \
+         accounted for in total; it says: {why}"
     );
 
     // (a) What replaced the silent default, stated as a refusal: a formerly
@@ -2890,8 +3067,12 @@ fn c11_opaque_data_cannot_smuggle_control_meaning() {
         .find(|row| {
             let text = format!(
                 "{}{}",
-                row.get("property").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                row.get("observed").and_then(serde_json::Value::as_str).unwrap_or_default()
+                row.get("property")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                row.get("observed")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
             );
             text.contains("payload") && text.to_lowercase().contains("collaps")
         })
@@ -2901,12 +3082,23 @@ fn c11_opaque_data_cannot_smuggle_control_meaning() {
         Some("crates/eliot-types/src/distillation.rs"),
         "the collapse row must name the file that declares the `Value` member"
     );
+    // SCOPED TO THE CASE THAT OWNS THIS EXCEPTION, NOT TO THE WORD "payload". An
+    // earlier version matched ANY key containing `payload` that ends in `_refuse`,
+    // which caught two honest keys about different members:
+    // `c6_semantic_memory_wrong_outcome_payload_refuse` (a tag/payload disagreement
+    // in a result enum) and `c7_BackupManifest_blob_payload_root_absent_refuse` (a
+    // `PathRef` locator). The claim is about the `MemoryUtilitySourceRecord::payload`
+    // member only, so it is asked of the case that documents it.
     assert!(
         !container_fixture_keys()
             .iter()
-            .any(|key| key.contains("payload") && key.ends_with("_refuse")),
-        "no fixture key may claim the `payload: Value` member is a refusal: a repeated member \
-         inside a `Value` collapses before any decoder sees it"
+            .any(|key| key.starts_with("c11_") && key.ends_with("_refuse")),
+        "no `c11` fixture key may claim the `payload: Value` member is a refusal: a repeated \
+         member inside a `Value` collapses before any decoder sees it. Measured keys: {:?}",
+        container_fixture_keys()
+            .iter()
+            .filter(|key| key.starts_with("c11_"))
+            .collect::<Vec<&String>>()
     );
     // RECORDED, NOT INVENTED: `payload: Value` carries NO size ceiling anywhere in
     // `crates/eliot-types/src/distillation.rs`, so a decoded source payload is
@@ -2943,7 +3135,10 @@ fn c12_proposed_or_verified_is_not_applied() {
         "the decoded candidate must carry the flag as written: it is data, and this file changes \
          no policy to make it anything else"
     );
-    assert_round_trip_identical::<MemoryDistillationCandidate>(&candidate_document, candidate_fixture);
+    assert_round_trip_identical::<MemoryDistillationCandidate>(
+        &candidate_document,
+        candidate_fixture,
+    );
 
     // (b) An apply receipt that carries WRITE RECEIPTS is not proof of execution.
     // `MemoryDistillationApplyReceipt`
@@ -3128,8 +3323,12 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
             "the row {row_id} must name its own path in its owner clause, so the repair owner is \
              unambiguous; owner says: {owner}"
         );
+        // CASE-INSENSITIVE: the substance is that the row records its file as card
+        // READ ONLY, which is why the exception is retained instead of repaired. An
+        // honest rewording to "read-only" must not break this.
         assert!(
-            owner.contains("READ ONLY"),
+            owner.to_lowercase().contains("read only")
+                || owner.to_lowercase().contains("read-only"),
             "the row {row_id} must record that its file is card READ ONLY, which is why the \
              exception is retained instead of repaired; owner says: {owner}"
         );
@@ -3214,9 +3413,7 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
         EXACT_ACTION_HASH,
     ] {
         assert!(
-            case7_keys
-                .iter()
-                .any(|key| key.contains(member)),
+            case7_keys.iter().any(|key| key.contains(member)),
             "the `c7` set must include the omitted `{member}` refusal document"
         );
         assert!(
@@ -3274,16 +3471,23 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
              `rp1..rp4`, or the container is hiding a default this delivery did not repair"
         );
     }
-    // (f) The invalidation wording is the frozen inventory's own: an exact
-    // exception invalidates on attribute, caller, schema or owner change.
+    // (f) The invalidation CONDITION is the frozen inventory's own: an exact exception
+    // invalidates on a change to the attribute, the caller, the schema or the owner.
+    // Asserted as the four conditions the inventory must name, not as one sentence:
+    // pinning the exact wording would break the next honest rewording of a file this
+    // issue is not allowed to edit.
     let inventory = repository_text(
-        "foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
+        "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
     );
-    assert!(
-        inventory.contains("invalidate on attribute, caller, schema or owner change"),
-        "the frozen inventory must carry the exact-exception invalidation wording this case \
-         asserts"
-    );
+    let inventory_lower = inventory.to_lowercase();
+    for condition in ["invalidate", "attribute", "caller", "schema", "owner"] {
+        assert!(
+            inventory_lower.contains(condition),
+            "the frozen inventory must state that an exact exception `{condition}` change \
+             invalidates it, which is the invalidation condition this case asserts; the searched \
+             text is the frozen inventory itself"
+        );
+    }
 
     // (g) THE FOUR LINE NUMBERS, MEASURED from the production text and matched
     // against the rows. `rp2` is the row that states the file-wide count, and it must
@@ -3305,16 +3509,21 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
     );
     let row_text = |row_id: &str| -> String {
         let row = row_by_id(row_id);
-        ["property", "observed", "why_it_is_recorded_and_not_fixed", "owner"]
-            .iter()
-            .copied()
-            .map(|field| {
-                row.get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<&str>>()
-            .join(" ")
+        [
+            "property",
+            "observed",
+            "why_it_is_recorded_and_not_fixed",
+            "owner",
+        ]
+        .iter()
+        .copied()
+        .map(|field| {
+            row.get(field)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<&str>>()
+        .join(" ")
     };
     for line in &measured_lines {
         let citation = format!(":{line}");
@@ -3346,12 +3555,30 @@ fn c13_exact_exceptions_invalidate_on_use_change() {
          cite every measured line. Measured: {counting:?}"
     );
     let counting_text = row_text(counting[0]);
+    let counting_lower = counting_text.to_lowercase();
+    // The COUNT is derived from the source, not typed: `measured_lines.len()` defaults are
+    // counted here, and the row must state that same count. Case-insensitively, because
+    // "four" and "FOUR" are the same claim.
+    let count_word = match measured_lines.len() {
+        4 => "four",
+        5 => "five",
+        6 => "six",
+        other => panic!(
+            "the replay.rs default count moved to {other}; this assertion's wording must be \
+             re-derived for it rather than silently kept"
+        ),
+    };
     assert!(
-        counting_text.contains("FOUR") && counting_text.contains("not two"),
-        "the row that states the file-wide count (`{}`) must say FOUR and not two, because four \
-         `#[serde(default` declarations are measured in replay.rs at {measured_lines:?}. It says: \
-         {counting_text}",
+        counting_lower.contains(count_word),
+        "the row that states the file-wide count (`{}`) must state the count this file MEASURED - \
+         {count_word} - because that many `#[serde(default` declarations exist in replay.rs at \
+         {measured_lines:?}. It says: {counting_text}",
         counting[0]
+    );
+    assert!(
+        counting_lower.contains("not two"),
+        "the row must explicitly contrast the measured count with the smaller number, so a reader \
+         cannot mistake it for a two-default file. It says: {counting_text}"
     );
 
     // (h) EVERY RECORDED ROW IS CONSUMED BY THIS SUITE, and the count is DERIVED from
@@ -3442,8 +3669,8 @@ fn c14_bounded_malformed_inputs_panic_free() {
     // There is no `unwrap` on the result and no `#[should_panic]`.
     //
     // THE TYPE: the group is decoded as `BackupManifest`, the representative closed
-    // record of this slice (`crates/eliot-types/src/safety.rs:116`, closed at
-    // `:115`). Every document of the group is aimed at that type, which is the
+    // record of this slice (`crates/eliot-types/src/safety.rs:122`, closed at
+    // `:121`). Every document of the group is aimed at that type, which is the
     // contract this file states for the corpus writer.
     let fixture = "c14_area_bounded_malformed_and_wrong_type_documents";
     let group = documents(fixture);
@@ -3478,7 +3705,7 @@ fn c15_decoder_refuses_before_trusted_output() {
     // (a) THE ACTUAL DECODER REFUSES BEFORE A CALLER HOLDS A VALUE. Each of the
     // four proof-raising words is added to the accepted canonical restore receipt as
     // raw text and handed straight to `RestoreReceipt`; the type is closed
-    // (`crates/eliot-types/src/safety.rs:348`), so the added member is refused by
+    // (`crates/eliot-types/src/safety.rs:353-355`), so the added member is refused by
     // name and no value is produced for a caller to hold.
     let canonical = raw("c2_RestoreReceipt_canonical");
     let accepted: RestoreReceipt = decode(&canonical).expect("the canonical receipt must decode");
@@ -3549,14 +3776,27 @@ fn c15_decoder_refuses_before_trusted_output() {
     // is why nothing downstream can prove the original byte stream. The typed
     // decoder DOES refuse the inner frame, which is why these two documents carry no
     // `_refuse` in their names.
-    for (fixture, member) in [
+    // The `path` is where the repeated member REALLY sits in the ingress document, so
+    // the erasure is looked for where it happens: `frame.task_id` in one document,
+    // `frame.entity_roles.subject` in the other.
+    for (fixture, member, path) in [
         (
             "c15_ingress_mcp_line_duplicate_task_id",
             DUPLICATE_TASK_ID,
+            vec![INGRESS_FRAME_MEMBER, DUPLICATE_TASK_ID],
         ),
         (
             "c15_ingress_mcp_line_duplicate_entity_role",
             DUPLICATE_ENTITY_ROLE_KEY,
+            // THE REPEAT IS TWO LEVELS DOWN IN THIS ONE. `subject` is a KEY of the
+            // `entity_roles` MAP, so it sits at frame.entity_roles.subject, not at
+            // frame.subject. An earlier version looked for it one level too shallow
+            // and so asserted a shape this document never had.
+            vec![
+                INGRESS_FRAME_MEMBER,
+                ENTITY_ROLES,
+                DUPLICATE_ENTITY_ROLE_KEY,
+            ],
         ),
     ] {
         let document = raw(fixture);
@@ -3594,13 +3834,22 @@ fn c15_decoder_refuses_before_trusted_output() {
         // that lossy parse, and it is deliberately the ONLY route here that is
         // allowed to lose the repeat.
         let collapsed = witness(&document);
-        let retained = collapsed
-            .get(INGRESS_FRAME_MEMBER)
-            .and_then(|frame| frame.get(member))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| {
-                panic!("{fixture} must parse through the lossy route so the erasure is visible")
+        let mut cursor = &collapsed;
+        for step in &path {
+            cursor = cursor.get(step).unwrap_or_else(|| {
+                panic!(
+                    "{fixture}: the lossy route must still reach `{step}` on the way to `{member}`, \
+                     because the erasure is observable at {path:?} and nowhere shallower",
+                    path = path.join(".")
+                )
             });
+        }
+        let retained = cursor.as_str().unwrap_or_else(|| {
+            panic!(
+                "{fixture}: the repeated member at {} must be a string in the lossy projection",
+                path.join(".")
+            )
+        });
         assert_eq!(
             retained, values[1],
             "{fixture}: the lossy `Value` route the ingress actually takes must retain the LAST \
@@ -3846,8 +4095,10 @@ fn c16_scope_schema_routing_dependencies_visibility_unchanged() {
         // repository: the type it names is real and is declared in the file it cites.
         let message = member_text(probe, "message");
         let (claimed_type, claimed_path) = probe_claim(&message).unwrap_or_else(|| {
-            panic!("{label}: its `message` must name a real type and the file it is declared in, in \
-                    the `<TypeName> is real at <path>.rs:<line>` form: {message}")
+            panic!(
+                "{label}: its `message` must name a real type and the file it is declared in, in \
+                    the `<TypeName> is real at <path>.rs:<line>` form: {message}"
+            )
         });
         assert!(
             !types.iter().any(|allocated| *allocated == claimed_type),

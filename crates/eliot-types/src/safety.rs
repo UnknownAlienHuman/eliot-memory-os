@@ -896,7 +896,23 @@ mod tests {
         BackupManifest, BackupReport, IncidentRecord, RestorePlan, RestoreReceipt, RestoreReport,
     };
 
-    const TS: &str = "2026-01-02T03:04:05Z";
+    /// The wire text used for every `OffsetDateTime` member in this module.
+    ///
+    /// DERIVED FROM THE TYPE, never hand-written. `safety.rs` declares its
+    /// timestamp members with no serde attribute, so `time`'s default
+    /// `OffsetDateTime` impl applies: with the `serde-human-readable` feature off
+    /// (it is not enabled in this workspace), that impl serializes a 9-field
+    /// tuple and deserializes a 9-field tuple - NOT a string. Round-tripping a
+    /// real value through `serde_json` therefore yields exactly the text these
+    /// fields accept and emit, so this cannot drift from `time`'s behaviour and
+    /// an RFC 3339 literal would be rejected with `invalid type: string`.
+    ///
+    /// It interpolates as a RAW JSON value, with no surrounding quotes, because
+    /// the default impl does not produce a JSON string.
+    fn ts() -> String {
+        serde_json::to_string(&time::OffsetDateTime::UNIX_EPOCH)
+            .expect("OffsetDateTime always serializes")
+    }
 
     /// Canonical `BackupManifest` with all three `sd1`..`sd3` keys present and
     /// populated. `manifest_json` substitutes one key at a time so each row is
@@ -908,7 +924,8 @@ mod tests {
     ) -> String {
         format!(
             concat!(
-                "{{\"backup_id\":\"backup-1\",\"created_at\":\"", "{ts}\",",
+                "{{\"backup_id\":\"backup-1\",\"created_at\":",
+                "{ts},",
                 "\"source_data_root\":\"/src\",\"backup_root\":\"/backup\",",
                 "\"backup_kind\":\"logical_export\",\"governor_version\":\"1\",",
                 "\"schema_version\":\"1\",\"policy_snapshot_refs\":[],\"config_snapshot_refs\":[],",
@@ -919,7 +936,7 @@ mod tests {
                 "\"blob_payload_root\":{payload},\"blob_payloads\":[],\"report_manifest_ref\":null,",
                 "\"checksums\":[],\"copied_live_db_files\":false,\"dry_run\":false,\"warnings\":[]}}"
             ),
-            ts = TS,
+            ts = ts(),
             endpoint = surreal_source_endpoint,
             storage = surreal_source_storage_ref,
             payload = blob_payload_root
@@ -945,12 +962,13 @@ mod tests {
                 "\"backup_manifest_ref\":\"/backup/manifest.json\",\"target_data_root\":\"/target\",",
                 "\"restore_mode\":\"verify_only\",\"target_endpoint\":{endpoint},",
                 "\"target_storage_ref\":{storage},\"exact_action_hash\":{hash},",
-                "\"checks\":[],\"created_at\":\"", "{ts}\"}}"
+                "\"checks\":[],\"created_at\":",
+                "{ts}}}"
             ),
             endpoint = target_endpoint,
             storage = target_storage_ref,
             hash = exact_action_hash,
-            ts = TS
+            ts = ts()
         )
     }
 
@@ -964,27 +982,27 @@ mod tests {
                 "\"status\":\"verified_only\",\"target_data_root\":\"/target\",",
                 "\"verified_manifest\":true,\"verified_checksums\":true,",
                 "\"restored_objects\":0,\"restored_blobs\":0,\"exact_action_hash\":{hash},",
-                "\"dry_run\":true,\"started_at\":\"", "{ts}\",\"finished_at\":\"", "{ts}\",\"errors\":[]}}"
+                "\"dry_run\":true,\"started_at\":",
+                "{ts},\"finished_at\":",
+                "{ts},\"errors\":[]}}"
             ),
             hash = exact_action_hash,
-            ts = TS
+            ts = ts()
         )
     }
-
-    const INCIDENT_TAIL: &str = concat!(
-        ",\"affected_surfaces\":[],\"opened_at\":\"2026-01-02T03:04:05Z\",",
-        "\"acknowledged_at\":null,\"closed_at\":null,\"evidence_refs\":[],",
-        "\"last_known_safe_refs\":[],\"recovery_commands\":[],\"summary\":\"s\""
-    );
 
     fn incident_json(campaign_integrity: &str) -> String {
         format!(
             concat!(
                 "{{\"incident_id\":\"incident-1\",\"severity\":\"critical\",\"status\":\"open\",",
                 "\"kind\":\"campaign_provider_call_budget_exceeded\",\"project_id\":null",
-                "{tail},\"campaign_integrity\":{details}}}"
+                ",\"affected_surfaces\":[],\"opened_at\":",
+                "{ts},",
+                "\"acknowledged_at\":null,\"closed_at\":null,\"evidence_refs\":[],",
+                "\"last_known_safe_refs\":[],\"recovery_commands\":[],\"summary\":\"s\"",
+                ",\"campaign_integrity\":{details}}}"
             ),
-            tail = INCIDENT_TAIL,
+            ts = ts(),
             details = campaign_integrity
         )
     }
@@ -993,10 +1011,8 @@ mod tests {
 
     #[test]
     fn sd1_omitted_surreal_source_endpoint_refuses() {
-        let raw = manifest_json(ENDPOINT_NULL, STORAGE, PAYLOAD).replace(
-            "\"surreal_source_endpoint\":null,",
-            "",
-        );
+        let raw = manifest_json(ENDPOINT_NULL, STORAGE, PAYLOAD)
+            .replace("\"surreal_source_endpoint\":null,", "");
         let error = serde_json::from_str::<BackupManifest>(&raw)
             .expect_err("an omitted sd1 key must refuse");
         assert!(
@@ -1021,21 +1037,19 @@ mod tests {
     fn sd1_populated_surreal_source_endpoint_round_trips_byte_for_byte() {
         let raw = manifest_json(ENDPOINT, STORAGE, PAYLOAD);
         let manifest: BackupManifest = serde_json::from_str(&raw).expect("populated key decodes");
-        assert_eq!(manifest.surreal_source_endpoint.as_deref(), Some("ws://source:8000/rpc"));
         assert_eq!(
-            serde_json::to_string(&manifest).expect("re-serialize"),
-            raw
+            manifest.surreal_source_endpoint.as_deref(),
+            Some("ws://source:8000/rpc")
         );
+        assert_eq!(serde_json::to_string(&manifest).expect("re-serialize"), raw);
     }
 
     // ---- sd2: BackupManifest::surreal_source_storage_ref ----
 
     #[test]
     fn sd2_omitted_surreal_source_storage_ref_refuses() {
-        let raw = manifest_json(ENDPOINT, STORAGE_NULL, PAYLOAD).replace(
-            "\"surreal_source_storage_ref\":null,",
-            "",
-        );
+        let raw = manifest_json(ENDPOINT, STORAGE_NULL, PAYLOAD)
+            .replace("\"surreal_source_storage_ref\":null,", "");
         let error = serde_json::from_str::<BackupManifest>(&raw)
             .expect_err("an omitted sd2 key must refuse");
         assert!(
@@ -1049,21 +1063,18 @@ mod tests {
         let raw = manifest_json(ENDPOINT, STORAGE_NULL, PAYLOAD);
         let manifest: BackupManifest = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(manifest.surreal_source_storage_ref, None);
-        assert_eq!(
-            serde_json::to_string(&manifest).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&manifest).expect("re-serialize"), raw);
     }
 
     #[test]
     fn sd2_populated_surreal_source_storage_ref_round_trips_byte_for_byte() {
         let raw = manifest_json(ENDPOINT, STORAGE, PAYLOAD);
         let manifest: BackupManifest = serde_json::from_str(&raw).expect("populated key decodes");
-        assert_eq!(manifest.surreal_source_storage_ref.as_deref(), Some("/src/storage"));
         assert_eq!(
-            serde_json::to_string(&manifest).expect("re-serialize"),
-            raw
+            manifest.surreal_source_storage_ref.as_deref(),
+            Some("/src/storage")
         );
+        assert_eq!(serde_json::to_string(&manifest).expect("re-serialize"), raw);
     }
 
     // ---- sd3: BackupManifest::blob_payload_root ----
@@ -1087,10 +1098,7 @@ mod tests {
         let raw = manifest_json(ENDPOINT, STORAGE, PAYLOAD_NULL);
         let manifest: BackupManifest = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(manifest.blob_payload_root, None);
-        assert_eq!(
-            serde_json::to_string(&manifest).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&manifest).expect("re-serialize"), raw);
     }
 
     #[test]
@@ -1101,10 +1109,7 @@ mod tests {
             manifest.blob_payload_root.as_deref(),
             Some("/backup/blob-payloads")
         );
-        assert_eq!(
-            serde_json::to_string(&manifest).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&manifest).expect("re-serialize"), raw);
     }
 
     // ---- sd4: RestorePlan::target_endpoint ----
@@ -1112,8 +1117,8 @@ mod tests {
     #[test]
     fn sd4_omitted_target_endpoint_refuses() {
         let raw = plan_json(ENDPOINT_NULL, STORAGE, HASH).replace("\"target_endpoint\":null,", "");
-        let error = serde_json::from_str::<RestorePlan>(&raw)
-            .expect_err("an omitted sd4 key must refuse");
+        let error =
+            serde_json::from_str::<RestorePlan>(&raw).expect_err("an omitted sd4 key must refuse");
         assert!(
             error.to_string().contains("target_endpoint"),
             "error must name the missing key, got: {error}"
@@ -1125,31 +1130,28 @@ mod tests {
         let raw = plan_json(ENDPOINT_NULL, STORAGE, HASH);
         let plan: RestorePlan = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(plan.target_endpoint, None);
-        assert_eq!(
-            serde_json::to_string(&plan).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&plan).expect("re-serialize"), raw);
     }
 
     #[test]
     fn sd4_populated_target_endpoint_round_trips_byte_for_byte() {
         let raw = plan_json(ENDPOINT, STORAGE, HASH);
         let plan: RestorePlan = serde_json::from_str(&raw).expect("populated key decodes");
-        assert_eq!(plan.target_endpoint.as_deref(), Some("ws://source:8000/rpc"));
         assert_eq!(
-            serde_json::to_string(&plan).expect("re-serialize"),
-            raw
+            plan.target_endpoint.as_deref(),
+            Some("ws://source:8000/rpc")
         );
+        assert_eq!(serde_json::to_string(&plan).expect("re-serialize"), raw);
     }
 
     // ---- sd5: RestorePlan::target_storage_ref ----
 
     #[test]
     fn sd5_omitted_target_storage_ref_refuses() {
-        let raw = plan_json(ENDPOINT, STORAGE_NULL, HASH)
-            .replace("\"target_storage_ref\":null,", "");
-        let error = serde_json::from_str::<RestorePlan>(&raw)
-            .expect_err("an omitted sd5 key must refuse");
+        let raw =
+            plan_json(ENDPOINT, STORAGE_NULL, HASH).replace("\"target_storage_ref\":null,", "");
+        let error =
+            serde_json::from_str::<RestorePlan>(&raw).expect_err("an omitted sd5 key must refuse");
         assert!(
             error.to_string().contains("target_storage_ref"),
             "error must name the missing key, got: {error}"
@@ -1161,10 +1163,7 @@ mod tests {
         let raw = plan_json(ENDPOINT, STORAGE_NULL, HASH);
         let plan: RestorePlan = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(plan.target_storage_ref, None);
-        assert_eq!(
-            serde_json::to_string(&plan).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&plan).expect("re-serialize"), raw);
     }
 
     #[test]
@@ -1172,10 +1171,7 @@ mod tests {
         let raw = plan_json(ENDPOINT, STORAGE, HASH);
         let plan: RestorePlan = serde_json::from_str(&raw).expect("populated key decodes");
         assert_eq!(plan.target_storage_ref.as_deref(), Some("/src/storage"));
-        assert_eq!(
-            serde_json::to_string(&plan).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&plan).expect("re-serialize"), raw);
     }
 
     // ---- sd6: RestorePlan::exact_action_hash ----
@@ -1184,8 +1180,8 @@ mod tests {
     fn sd6_omitted_exact_action_hash_refuses() {
         let raw =
             plan_json(ENDPOINT, STORAGE, HASH_NULL).replace("\"exact_action_hash\":null,", "");
-        let error = serde_json::from_str::<RestorePlan>(&raw)
-            .expect_err("an omitted sd6 key must refuse");
+        let error =
+            serde_json::from_str::<RestorePlan>(&raw).expect_err("an omitted sd6 key must refuse");
         assert!(
             error.to_string().contains("exact_action_hash"),
             "error must name the missing key, got: {error}"
@@ -1197,10 +1193,7 @@ mod tests {
         let raw = plan_json(ENDPOINT, STORAGE, HASH_NULL);
         let plan: RestorePlan = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(plan.exact_action_hash, None);
-        assert_eq!(
-            serde_json::to_string(&plan).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&plan).expect("re-serialize"), raw);
     }
 
     #[test]
@@ -1208,10 +1201,7 @@ mod tests {
         let raw = plan_json(ENDPOINT, STORAGE, HASH);
         let plan: RestorePlan = serde_json::from_str(&raw).expect("populated key decodes");
         assert_eq!(plan.exact_action_hash.as_deref(), Some("action-hash-1"));
-        assert_eq!(
-            serde_json::to_string(&plan).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&plan).expect("re-serialize"), raw);
     }
 
     // ---- sd7: RestoreReceipt::exact_action_hash ----
@@ -1234,10 +1224,7 @@ mod tests {
         let raw = receipt_json(HASH_NULL);
         let receipt: RestoreReceipt = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(receipt.exact_action_hash, None);
-        assert_eq!(
-            serde_json::to_string(&receipt).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&receipt).expect("re-serialize"), raw);
     }
 
     #[test]
@@ -1245,10 +1232,7 @@ mod tests {
         let raw = receipt_json(HASH);
         let receipt: RestoreReceipt = serde_json::from_str(&raw).expect("populated key decodes");
         assert_eq!(receipt.exact_action_hash.as_deref(), Some("action-hash-1"));
-        assert_eq!(
-            serde_json::to_string(&receipt).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&receipt).expect("re-serialize"), raw);
     }
 
     // ---- sd8: IncidentRecord::campaign_integrity (DISPOSITION) ----
@@ -1287,10 +1271,7 @@ mod tests {
         let raw = incident_json("null");
         let incident: IncidentRecord = serde_json::from_str(&raw).expect("explicit null is legal");
         assert_eq!(incident.campaign_integrity, None);
-        assert_eq!(
-            serde_json::to_string(&incident).expect("re-serialize"),
-            raw
-        );
+        assert_eq!(serde_json::to_string(&incident).expect("re-serialize"), raw);
     }
 
     // ---- survivors of the existing decoders ----
@@ -1304,7 +1285,9 @@ mod tests {
         let error = serde_json::from_str::<BackupManifest>(&raw)
             .expect_err("a misselected schema_version must refuse");
         assert!(
-            error.to_string().contains("unsupported backup manifest schema_version"),
+            error
+                .to_string()
+                .contains("unsupported backup manifest schema_version"),
             "error must come from the existing pin, got: {error}"
         );
     }
@@ -1318,22 +1301,25 @@ mod tests {
                 "{{\"component\":\"backup\",\"manifest\":{manifest},\"receipt\":",
                 "{{\"backup_id\":\"backup-1\",\"status\":\"succeeded\",",
                 "\"manifest_ref\":\"/backup/manifest.json\",\"bytes_written\":1,",
-                "\"objects_written\":1,\"started_at\":\"", "{ts}\",\"finished_at\":\"", "{ts}\",",
-                "\"errors\":[]}},\"generated_at\":\"", "{ts}\"}}"
+                "\"objects_written\":1,\"started_at\":",
+                "{ts},\"finished_at\":",
+                "{ts},",
+                "\"errors\":[]}},\"generated_at\":",
+                "{ts}}}"
             ),
             manifest = manifest_json(ENDPOINT, STORAGE, PAYLOAD),
-            ts = TS
+            ts = ts()
         );
         let report: BackupReport = serde_json::from_str(&raw).expect("BackupReport decodes");
         assert_eq!(
             report.manifest.surreal_source_endpoint.as_deref(),
             Some("ws://source:8000/rpc")
         );
-        assert_eq!(report.manifest.blob_payload_root.as_deref(), Some("/backup/blob-payloads"));
         assert_eq!(
-            serde_json::to_string(&report).expect("re-serialize"),
-            raw
+            report.manifest.blob_payload_root.as_deref(),
+            Some("/backup/blob-payloads")
         );
+        assert_eq!(serde_json::to_string(&report).expect("re-serialize"), raw);
     }
 
     #[test]
@@ -1341,18 +1327,22 @@ mod tests {
         let raw = format!(
             concat!(
                 "{{\"component\":\"restore\",\"plan\":{plan},\"receipt\":{receipt},",
-                "\"generated_at\":\"", "{ts}\"}}"
+                "\"generated_at\":",
+                "{ts}}}"
             ),
             plan = plan_json(ENDPOINT, STORAGE, HASH),
             receipt = receipt_json(HASH),
-            ts = TS
+            ts = ts()
         );
         let report: RestoreReport = serde_json::from_str(&raw).expect("RestoreReport decodes");
-        assert_eq!(report.plan.exact_action_hash.as_deref(), Some("action-hash-1"));
-        assert_eq!(report.receipt.exact_action_hash.as_deref(), Some("action-hash-1"));
         assert_eq!(
-            serde_json::to_string(&report).expect("re-serialize"),
-            raw
+            report.plan.exact_action_hash.as_deref(),
+            Some("action-hash-1")
         );
+        assert_eq!(
+            report.receipt.exact_action_hash.as_deref(),
+            Some("action-hash-1")
+        );
+        assert_eq!(serde_json::to_string(&report).expect("re-serialize"), raw);
     }
 }
