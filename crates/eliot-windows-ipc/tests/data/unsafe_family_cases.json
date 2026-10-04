@@ -941,7 +941,8 @@
         "concurrent close versus use across threads"
       ],
       "expectation": "exactly-once CloseHandle under unique ownership; Sync is absent so shared use cannot compile; Send transfers the unique owner; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/13` (line 600) binds directly above `shared_handle_core_close_is_exactly_once_under_a_real_close_drop` (line 602), which is this row's `source_test`, so the row names its own case. That test asserts the shared-handle-core family's exactly-once disposition: it reads `impl Drop for OwnedHandle` from crates/eliot-windows-ipc/src/lib.rs and requires exactly one `CloseHandle(` site behind `!self.0.is_null() && self.0 != INVALID_HANDLE_VALUE`, so both failure sentinels are re-checked immediately before the close. The concurrent close/use half of the title is carried by the unique-ownership assertion the test states verbatim: `unsafe impl Sync` is absent from lib.rs entirely, so shared concurrent use cannot compile, while `unsafe impl Send for OwnedHandle {}` transfers the unique owner; and `fn into_file(self)` performs the single transfer via `std::mem::forget(self)` plus `File::from_raw_handle(handle)`. Execution proves the real disposition on a live process: an unarmed real `RecoverableProcess::open` handle is closed with `unresolved_handle_cleanup_count()` unchanged, while an armed `FaultBoundary::Cleanup` run leaves it open and counted unresolved rather than reported as a successful close. The `caller` `SuspendedJobChild::drop` requirement is asserted by `case28_child_drop_joins_observer_before_the_port_handle_drops`."
     },
     {
       "case": 14,
@@ -964,7 +965,8 @@
         "spawn failure after CreateProcessW before assignment"
       ],
       "expectation": "armed guard terminates plus bounded-waits plus closes both handles on every early return; disarmed only by the single into_handles transfer; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/14` (line 678) binds directly above `suspended_process_guard_cleans_up_on_early_return_before_assignment` (line 680), which is this row's `source_test`, so the row names its own case. That test asserts the prepared-but-unsubmitted cleanup: it reads `pub fn spawn_named`, `struct SuspendedProcessGuard` and `impl Drop for SuspendedProcessGuard` and requires the guard to be armed by `let spawned = SuspendedProcessGuard::new(information)?;` immediately after `CreateProcessW`, requires spawn to keep at least three `return Err(` pre-transfer early returns that each unwind through the armed guard, and requires the armed Drop to terminate, bounded-wait `WaitForSingleObject(self.process, 5_000)` and close BOTH handles. It requires the job-name bound (`if job_name.is_empty()` and the 240-unit name bound) to be checked BEFORE `command.get_program()` is ever read, so an unusable name fails closed while no pipe, job, observer or process handle exists and there is nothing to unwind. Execution drives the same production grammar that gives a rejected name no NUL-terminated wide form: `RecoverableJobObject::open(\"\")` returns InvalidInput before any OpenJobObjectW."
     },
     {
       "case": 15,
@@ -987,7 +989,8 @@
         "DeviceIoControl returning nonzero (no durable pending lease)"
       ],
       "expectation": "sync completion fails closed with no pending request and normal box drop; only ERROR_IO_PENDING is accepted; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/15` (line 782) binds directly above `oplock_synchronous_completion_is_rejected_with_no_pending_request` (line 784), which is this row's `source_test`, so the row names its own case. That test drives the production `AsyncIoOutcome::classify_oplock_submit` transition that `DirectoryOplockGuard::acquire` uses to decide whether the kernel owns the request storage: a nonzero DeviceIoControl return classifies as `SynchronousComplete`, which carries no durable pending lease, and `SynchronousComplete` maps to `Some(proven())` from `terminal_storage_release()`, so the guard rejects it outright and constructs no guard. Execution is on a real non-reparse directory: an unarmed `DirectoryOplockGuard::acquire` leaves exactly one pending kernel request (`Pending`), and with `FaultBoundary::Acquisition` armed the acquire fails closed with an error naming the acquisition boundary. The test also records, rather than hides, that a genuine synchronous DeviceIoControl return is only reachable with a fault injected, which is why the classification is driven through the enum's own method."
     },
     {
       "case": 16,
@@ -1010,7 +1013,8 @@
         "oplock event unsignaled then signaled"
       ],
       "expectation": "zero-timeout poll reports pending versus broken without blocking; unexpected codes are errors; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/16` (line 849) binds directly above `oplock_poll_reports_pending_versus_broken_without_blocking` (line 851), which is this row's `source_test`, so the row names its own case. That test asserts the production `AsyncIoOutcome::classify_oplock_poll` poll decision that `mutation_attempted` makes: `WAIT_OBJECT_0` classifies as `ObservedComplete` (a delivered break, so the mutation IS attempted) and `WAIT_TIMEOUT` as `Pending` (still pending, not a delivered break), while any other wait result is a non-empty error rather than a silent 'no mutation' -- and the test requires that no classification arm can return Ok for a code outside those three. Execution is on a real acquired guard: a fresh directory reports no mutation and the stored outcome stays Pending without the zero-timeout poll advancing it, and after a real concurrent write to the guard's directory the signal is observed within a bounded 5s deadline and latches the stored outcome to Complete."
     },
     {
       "case": 17,
@@ -1033,7 +1037,8 @@
         "DeviceIoControl error other than ERROR_IO_PENDING"
       ],
       "expectation": "non-pending submission error returns before any guard exists, so no completion can be outstanding; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/17` (line 922) binds directly above `oplock_unknown_submission_outcome_yields_no_release_proof` (line 924), which is this row's `source_test`, so the row names its own case. That test asserts the production `AsyncIoOutcome::classify_oplock_submit` classification that `acquire` makes when DeviceIoControl fails with something other than ERROR_IO_PENDING: only ERROR_IO_PENDING classifies as `Pending`, while codes 5, 87 and 1117 all classify as `RejectedBeforeSubmit`, so the submission is rejected before the kernel takes ownership and no completion can be outstanding. `AsyncIoOutcome::UnknownSubmit` returns `None` from `terminal_storage_release()` (no completion can be proven finished) and `Err(InvalidData)` from `reconcile_before_retry()`, so it constructs no release proof and refuses a blind retry. Execution arms `FaultBoundary::Submission` on a real directory and observes the typed InvalidData error whose message names the unknown outcome rather than resolving it to a release."
     },
     {
       "case": 18,
@@ -1056,7 +1061,8 @@
         "acquire validation failure before DeviceIoControl"
       ],
       "expectation": "pre-submit failures drop plain boxes with no kernel request outstanding; no cancel path runs; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/18` (line 995) binds directly above `oplock_pre_submit_validation_failure_issues_no_cancel` (line 997), which is this row's `source_test`, so the row names its own case. That test asserts the production cancel path that `DirectoryOplockGuard::acquire`'s early returns and Drop take: `Pending.request_cancel()` is `CancelRequested`, while `SynchronousComplete` cannot be canceled at all (already terminal, no cancel target) and `Prepared` -- nothing issued before a kernel-owned request exists -- resolves to `Unresolved`, so it fails closed; and both `RejectedBeforeSubmit` and `Prepared` reconcile Ok, a pre-submit rejection being terminal rather than needing a cancel reconcile. Execution is the real pre-submit validation failure: `DirectoryOplockGuard::acquire` on a regular file returns InvalidInput, and the test then asserts the path is STILL a regular file, so no cancel path ran and nothing was left open by the rejected acquisition."
     },
     {
       "case": 19,
@@ -1079,7 +1085,8 @@
         "guard drop with a pending oplock request"
       ],
       "expectation": "CancelIoEx targets the exact handle plus OVERLAPPED, then the handle closes to complete cancellation; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/19` (line 1057) binds directly above `oplock_cancel_targets_the_pending_request_then_the_handle_close` (line 1059), which is this row's `source_test`, so the row names its own case. That test asserts the cancel-while-pending property on the production Drop of DirectoryOplockGuard: it reads `impl Drop for DirectoryOplockGuard` and requires the cancel to target the EXACT directory handle plus its request OVERLAPPED (`CancelIoEx(directory.as_raw_handle().cast(), request.as_ref())`) and only then `drop(directory);`, so the handle close is what completes the cancellation. It drives the production state machine: `Pending.request_cancel()` is `CancelRequested`, a drained `WAIT_OBJECT_0` is the terminal `ObservedCancel` carrying the release proof, and the un-drained `CancelRequested` state yields NO release proof, so nothing may be released while the cancel is outstanding. Execution acquires a real pending guard, lets the cancel run on drop, and asserts the directory is afterwards deletable -- which is only possible because the guard released or deterministically retained its request storage at drop."
     },
     {
       "case": 20,
@@ -1102,7 +1109,8 @@
         "CancelIoEx return value ignored for the release verdict"
       ],
       "expectation": "the CancelIoEx return is never read; release follows only the terminal event drain verdict; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/20` (line 1120) binds directly above `oplock_cancel_io_return_alone_never_constructs_a_release_proof` (line 1122), which is this row's `source_test`, so the row names its own case. That test asserts the production `AsyncIoOutcome::note_cancel_io_result` transition that Drop uses to record a CancelIoEx return WITHOUT ever reading it as a release proof: for both cancel returns 0 and 1 the stored state is unchanged (`CancelRequested`), `terminal_storage_release()` stays `None`, and `reconcile_before_retry()` stays an error, so a requested-but-undrained cancel can neither release nor retry blindly. It requires only the drain verdict (`classify_cancel_drain(WAIT_OBJECT_0)`) to make the cancel terminal, and that only after the recorded return is discarded. Execution arms `FaultBoundary::Cancellation` on a real acquired directory and confirms teardown still resolves deterministically and leaves the directory removable."
     },
     {
       "case": 21,
@@ -1125,7 +1133,8 @@
         "kernel completes the canceled request after the drain wait"
       ],
       "expectation": "a non-drained outcome intentionally leaks the three kernel-visible allocations instead of freeing storage a late completion may still write; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/21` (line 1174) binds directly above `oplock_late_completion_leaks_storage_instead_of_freeing_it` (line 1176), which is this row's `source_test`, so the row names its own case. That test asserts the production release gate that Drop applies: only the terminal states `ObservedCancel` and `ObservedComplete` yield `Some(TerminalStorageRelease)` from `terminal_storage_release()`, while `Pending`, `CancelRequested`, `UnknownSubmit` and `Unresolved` all yield `None`, and a `WAIT_TIMEOUT` drain resolves to `Unresolved` rather than to a release. A late completion arriving after teardown started therefore cannot be attributed to the guard's own cancel, so the injected `FaultBoundary::LateCompletion` run takes the same fail-closed path: the three kernel-visible allocations are retained (a bounded, counted leak) instead of freed storage a late kernel write could still land in. Execution re-acquires the same directory afterwards and the request is unaffected, so no write-after-free state is fabricated and the next request still succeeds."
     },
     {
       "case": 22,
@@ -1148,7 +1157,8 @@
         "5s drain wait expiring without the terminal signal"
       ],
       "expectation": "timeout takes the same fail-closed leak path as any unknown outcome; no timeout value proves release; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/22` (line 1240) binds directly above `oplock_drain_timeout_takes_the_same_fail_closed_leak_path` (line 1242), which is this row's `source_test`, so the row names its own case. That test asserts the production drain decision that Drop makes: it requires lib.rs to contain the exact bounded `WaitForSingleObject(self.event.0, 5_000)` terminal-signal window, and requires `classify_cancel_drain(WAIT_TIMEOUT)` to be `Unresolved` with no release proof while `WAIT_FAILED` (the disconnect arm) is `UnknownSubmit` with no release proof either -- both non-terminal, so both take the SAME fail-closed leak path and no timeout value ever proves release. `reconcile_before_retry()` on the timeout refuses a blind retry with InvalidData until the outcome is reconciled. Execution drops a live pending guard whose drain either signals or times out and confirms teardown resolves deterministically, leaving the directory removable -- proving the drain verdict, not any timeout value, decided the release."
     },
     {
       "case": 23,
@@ -1171,7 +1181,8 @@
         "job membership changing between enumerate and capture"
       ],
       "expectation": "double enumeration with PID-0, duplicate and membership-change rejection (WouldBlock); no authoritative snapshot from a raced read; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/23` (line 1305) binds directly above `job_reconciliation_rejects_raced_membership_before_returning_a_snapshot` (line 1308), which is this row's `source_test`, so the row names its own case. That test asserts the exact reconciliation before reuse: it reads `fn current_job_processes(job: HANDLE)` and requires the PID-0 rejection (`if pids.contains(&0)`), the explicit duplicate-PID rejection (`duplicate PID {pid} in Job Object enumeration`) and the WouldBlock classification on a membership change, with the second enumeration (`job_process_ids(job)?`) performed AFTER the capture so a raced read can never produce an authoritative snapshot. It requires the production caller `capture_descendants_at_root_exit` to branch on the exact reconciliation result and to surface a raced capture as an explicit `DescendantsCaptureErrorKind::EnumerationFailed`, never as an empty snapshot. Execution drives the same per-member capture through the public `RecoverableProcess::open`: an unchanged member must reconcile to the identical PID, file identity and start ticks, each member must carry an absolute image and nonzero creation ticks, and PID 0 must be refused with InvalidInput before any identity is formed."
     },
     {
       "case": 24,
@@ -1194,7 +1205,8 @@
         "spawn with a colliding job name"
       ],
       "expectation": "AlreadyExists rejects a silent join to an orphaned job, so a new generation never replays into old membership; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/24` (line 1422) binds directly above `spawn_rejects_a_colliding_job_name_instead_of_joining_it` (line 1424), which is this row's `source_test`, so the row names its own case. That test asserts the exact-replay guard: it reads `fn create_kill_on_close_job(` and requires the collision to be detected unconditionally on `if creation_error == ERROR_ALREADY_EXISTS {` and refused with `io::ErrorKind::AlreadyExists`, so a new generation can never silently JOIN an orphaned job and replay into its membership. Execution is on the real public reopen surface, which needs no child process: a well-formed name that no generation ever claimed is a typed `NotFound` rather than an empty job (so a caller cannot mistake 'no such job' for a job it may join), an empty name is InvalidInput before any OpenJobObjectW, and a name with embedded slashes is typed NotFound. The test records explicitly that the two-generation collision execution itself needs a real child process and stays with the in-crate `#[cfg(test)] mod tests`."
     },
     {
       "case": 25,
@@ -1217,7 +1229,8 @@
         "credential blob of exact size N"
       ],
       "expectation": "blob viewed with the exact converted size and copied before the guard drops; no short view is ever widened; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/25` (line 1488) binds directly above `credential_read_views_the_blob_with_the_exact_converted_size` (line 1490), which is this row's `source_test`, so the row names its own case. That test asserts the remainder accounting: it reads `pub fn credential_read_current_user` and requires the Win32-reported `CredentialBlobSize` to be converted with `usize::try_from` and classified by `classify_credential_blob(blob_size, credential.CredentialBlob.is_null())` BEFORE `std::slice::from_raw_parts(credential.CredentialBlob, blob_size)` forms a view, and requires `Ok(Some(bytes.to_vec()))` to copy the bytes out before the buffer guard drops; it also requires the production caller `crates/kernel/eliot-platform-windows/src/secret_store.rs::credential_read` to consume exactly this API, and requires the exact exported entry point to occur once. Execution writes a 1024-byte credential through the real `credential_write_current_user` and reads it back with exactly 1024 bytes, byte for byte, with the reported size equal to the written size, while the empty blob and an 8192-byte over-limit blob are both refused with InvalidInput, so a remainder is never silently truncated into a stored credential. The probe credential this case created is then deleted and asserted absent."
     },
     {
       "case": 26,
@@ -1240,7 +1253,8 @@
         "signaled versus unsignaled process with STILL_ACTIVE code"
       ],
       "expectation": "STILL_ACTIVE is honored only when unsignaled; signaled state always re-queries the true exit code; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/26` (line 1588) binds directly above `try_wait_honours_still_active_only_while_unsignaled` (line 1590), which is this row's `source_test`, so the row names its own case. That test asserts the exit-code/broken-pipe distinction: it reads `fn query_process_exit_code(` and requires `if !signaled && code == still_active {`, so STILL_ACTIVE (259) is honoured ONLY for an unsignaled process and a signaled process always re-queries the true exit code; and it reads `pub fn try_wait(` to require that cross-check at the decision point (`try_wait` probes `WAIT_TIMEOUT => query_process_exit_code(self.process.0, false)` and `WAIT_OBJECT_0 => query_process_exit_code(self.process.0, true)`), which is exactly what makes a code-only liveness check unambiguous. Execution drives it against THIS live process, whose exit code IS exactly STILL_ACTIVE, proving the ambiguity the cross-check exists to resolve: `process_is_alive` is true, the retained handle resolves the same live root with real start ticks, and `process_is_alive(0)` is false so a zero PID is never reported alive."
     },
     {
       "case": 27,
@@ -1263,7 +1277,8 @@
         "TargetName with terminator at the scan bound"
       ],
       "expectation": "the NUL terminator is observed but excluded from the slice; unterminated data within 512 units fails closed; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/27` (line 1664) binds directly above `credential_target_name_scan_excludes_the_terminator_and_fails_closed` (line 1667), which is this row's `source_test`, so the row names its own case. That test asserts the message/frame boundary preservation: it charges the `EliotGovernor/` namespace at exactly 14 UTF-16 units against the 512-unit bound and asserts that arithmetic itself, reads the private `fn credential_target_name(target: *const u16)` and requires the bounded scan `while length < MAX_CREDENTIAL_TARGET_CHARS && *target.add(length) != 0`, requires `std::slice::from_raw_parts(target, length)` to EXCLUDE the NUL (with the documented bound stating the terminator is excluded from the slice), and requires `classify_bounded_scan(length, MAX_CREDENTIAL_TARGET_CHARS)` so unterminated data within the bound fails closed rather than being widened. It requires the production enumerator to consume that exact scan and to strip the `EliotGovernor/` prefix only because the slice excluded the terminator. Execution writes a stored target, enumerates it back verbatim with no identifier carrying a NUL and every enumerated id a valid logical identifier, and refuses a prefix at the exact 512-unit bound, an over-bound prefix, an overlong prefix and a traversal prefix with InvalidInput."
     },
     {
       "case": 28,
@@ -1286,7 +1301,8 @@
         "child drop with the observer thread blocked in dequeue"
       ],
       "expectation": "deterministic shutdown key posted then the thread joined before the port handle drops; Drop always shuts down; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/28` (line 1916) binds directly above `case28_child_drop_joins_observer_before_the_port_handle_drops` (line 1919), which is this row's `source_test`, so the row names its own case. That test asserts the callback-after-owner-destruction prevention: it reads `fn shutdown(&mut self)` and requires the shutdown flag to be published, then `PostQueuedCompletionStatus` of `JOB_OBSERVER_SHUTDOWN_KEY`, then `thread.join()` -- in that order -- with no `thread::sleep` in the body, so teardown is ordered by a barrier and never by a sleep. It requires the completion port to be an owned `OwnedHandle` field on `struct JobProcessObserver` and `thread: Option<JoinHandle<()>>`, so the port stays owned across the join and no queued callback can observe a destroyed port handle; `impl Drop for JobProcessObserver` must always call `self.shutdown()`; and the observer loop must not resolve identities inline or the join would be unbounded. `impl Drop for SuspendedJobChild` must `TerminateJobObject(self.job.0, 1);` then `self.observer.shutdown();`. Execution releases a real owned handle twice and requires exactly-once close each time with the unresolved counter unchanged."
     },
     {
       "case": 29,
@@ -1309,7 +1325,8 @@
         "handle use across threads"
       ],
       "expectation": "Send transfers unique ownership while Sync is absent, so concurrent shared access cannot compile; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/29` (line 2026) binds directly above `case29_owned_handle_transfers_unique_ownership_and_is_never_shared` (line 2028), which is this row's `source_test`, so the row names its own case. That test asserts the thread-affinity/concurrent-access property on the crate's single handle wrapper: it requires `struct OwnedHandle(HANDLE);` to occur exactly once in lib.rs, `unsafe impl Send for OwnedHandle {}` to be present and `unsafe impl Sync` to be absent ENTIRELY, so shared concurrent use cannot compile while `Send` transfers the unique owner. It requires `OwnedHandle::new` to reject both failure sentinels (`handle.is_null()` and `INVALID_HANDLE_VALUE`) and to build `Ok(Self(handle))` exactly once, and `into_file` to perform the single transfer via `std::mem::forget(self)` plus `File::from_raw_handle(handle)`. Execution moves a real owned handle across a REAL thread boundary and requires the transferred owner to answer the same bound PID, image identity and start ticks, so the unique owner survives the transfer intact."
     },
     {
       "case": 30,
@@ -1332,7 +1349,8 @@
         "the two unsafe impls in lib.rs (OwnedHandle, DirectoryOplockGuard)"
       ],
       "expectation": "exactly two unsafe impls exist, both Send-only with adjacent aliasing, thread, cancellation and destruction witnesses; zero unsafe Sync; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/30` (line 2088) binds directly above `case30_exactly_two_unsafe_send_impls_carry_adjacent_witnesses` (line 2090), which is this row's `source_test`, so the row names its own case. That test asserts the Send/Sync witness denominator exactly: lib.rs carries exactly two `unsafe impl` occurrences, both being `unsafe impl Send for OwnedHandle {}` and `unsafe impl Send for DirectoryOplockGuard {}`, and ZERO `unsafe impl Sync`. For EACH of those two impls it walks the contiguous comment lines immediately above it and requires the adjacent, operation-specific witness to name concrete reasons rather than generic or copied prose -- unique ownership, Sync's absence, exactly-once close, INVALID_HANDLE_VALUE and into_file for OwnedHandle; unique ownership, Sync's absence, OVERLAPPED, LateCompletion and leaks for DirectoryOplockGuard. Execution moves a real acquired guard across a real thread and requires it to carry its kernel-owned Pending state, then tears it down deterministically, so the witness is enforceable rather than decorative."
     },
     {
       "case": 31,
@@ -1355,7 +1373,8 @@
         "pipe client PID resolution failure or pid 0"
       ],
       "expectation": "zero return or pid 0 fails before any identity is built; a connected handle alone never authenticates; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/31` (line 2158) binds directly above `case31_unresolved_client_pid_never_authenticates_a_peer` (line 2161), which is this row's `source_test`, so the row names its own case. That test asserts the unauthorized/ambiguous-peer property: it reads `pub fn named_pipe_client_process(pipe: &NamedPipeServer)` and requires the zero-return branch (`if resolved == 0`) and the pid-0 branch (`if pid == 0`) to BOTH precede identity construction (`Ok(open_process_identity(pid)?`), each returning a typed `io::ErrorKind::InvalidData` or `io::Error::last_os_error()`, with no `unwrap_or_default` and no `unwrap_or(` anywhere, so an unresolved client PID can never degrade into a default identity. It requires the kernel binding to be made at exactly ONE site (`GetNamedPipeClientProcessId(` occurs once), so there is no second unauthenticated way to obtain a peer identity; requires the public signature to return an unverified `io::Result<ProcessImageIdentity>` observation; and requires the documented statement that the returned identity is an unverified kernel observation -- a connected handle alone is not authentication. Execution requires `RecoverableProcess::open(0)` to be refused with InvalidInput before any identity is built."
     },
     {
       "case": 32,
@@ -1378,7 +1397,8 @@
         "file with inherited, null, or broader DACL"
       ],
       "expectation": "non-contour owner or DACL fails with InvalidData; inherited rights are never sufficient; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/32` (line 2226) binds directly above `case32_owner_and_dacl_mismatch_stay_typed_invalid_data` (line 2228), which is this row's `source_test`, so the row names its own case. That test asserts the typed-mismatch property: it reads `fn verify_transport_file_descriptor(` and requires at least eight distinct `io::ErrorKind::InvalidData` refusals -- absent owner, owner outside the transport contour, no explicit DACL, wrong ACE count, an empty ACE, a non-allow ACE, an empty grant mask and a missing transport-peer-class grant -- so every contour deviation stays a typed refusal with no panic, no default and no coerced success, and only a genuine `last_os_error` covers a failed Win32 query. It requires the inherited-rights check `dacl_present == 0 || acl.is_null() || acl != dacl` to run BEFORE the ACE walk, so an inherited, absent or substituted DACL is refused even inside the owner contour, and forbids `unwrap_or_default`/`unwrap_or(`. Execution does the real restrict-then-verify round trip on a temp file: the inherited DACL is refused with typed InvalidData, then `restrict_file_to_current_user_and_system` produces a descriptor that verifies clean."
     },
     {
       "case": 33,
@@ -1401,7 +1421,8 @@
         "spawn error after partial handle acquisition"
       ],
       "expectation": "armed-guard Drop plus OwnedHandle discipline close every acquired handle exactly once on all early returns; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/33` (line 2291) binds directly above `case33_partial_spawn_failure_closes_each_acquired_handle_once` (line 2294), which is this row's `source_test`, so the row names its own case. That test asserts error/panic cleanup preserving ownership: it reads `SuspendedProcessGuard::new` and requires it to reject both failure sentinels for `hProcess` AND `hThread` before any use, then to call `TerminateProcess(information.hProcess, 1)` and `CloseHandle` on each handle EXACTLY once, so a partial acquisition is closed precisely for what was actually acquired. It requires `impl Drop for SuspendedProcessGuard` to open with `if !self.armed {`, so Drop can never double-close, and to terminate plus bounded-wait before closing; it requires `into_handles` to set `self.armed = false;` and transfer each handle into exactly one `OwnedHandle`, making the transfer the single disarming path. It requires the job-name bound to precede `inheritable_pipe()?`, `create_kill_on_close_job(job_name)?` and `JobProcessObserver::attach(job.0)?`, so a rejected spawn fails closed with zero owned handles and nothing to unwind. Execution drops a real unarmed owned handle and requires `unresolved_handle_cleanup_count()` to be unchanged."
     },
     {
       "case": 34,
@@ -1424,7 +1445,8 @@
         "observer shutdown sequencing"
       ],
       "expectation": "a queued shutdown key plus thread join orders teardown deterministically; no sleep proves quiescence; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/34` (line 2392) binds directly above `case34_fault_seam_arms_by_state_and_orders_teardown_without_sleeping` (line 2395), which is this row's `source_test`, so the row names its own case. That test asserts the deterministic-barrier property: it requires `pub fn arm_fault_boundaries` and `pub fn unresolved_handle_cleanup_count` to be public and ungated (arming is a real seam, not a test-only hook), requires arming to be ONE atomic state swap (`ARMED_FAULT_BOUNDARIES.swap(mask, Ordering::AcqRel)`) restored through `impl Drop for ArmedFaultBoundaries`, and requires `FaultBoundary::ALL` to enumerate exactly the seven boundaries, so the seven-boundary vocabulary is the closed denominator rather than an open list. Teardown is required to be barrier-ordered: publish, then `PostQueuedCompletionStatus`, then `thread.join()`, with no `thread::sleep` in the shutdown body. Execution arms `&FaultBoundary::ALL` on a real directory and a real owned handle and observes the armed Acquisition boundary fail closed naming the boundary and the armed Cleanup boundary leave the handle open and counted; after the guard drops, the identical close resolves and the counter stops moving."
     },
     {
       "case": 35,
@@ -1447,7 +1469,8 @@
         "job enumeration regrowth under churn"
       ],
       "expectation": "enumeration regrows only to MAX_JOB_PROCESS_IDS (4096) with exact bounds checks, so any sequence stays bounded; randomized execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/35` (line 2492) binds directly above `case35_job_enumeration_regrowth_stays_bounded_under_churn` (line 2495), which is this row's `source_test`, so the row names its own case. That test asserts the bounded-sequence property on the crate's real public grow-or-fail model: it requires the production bound `const MAX_JOB_PROCESS_IDS` to be exactly 4_096, reads `fn job_process_ids(job: HANDLE)` and requires the `if capacity > MAX_JOB_PROCESS_IDS` check to PRECEDE the \"Job process list exceeds the attestation limit\" refusal, and requires enumeration to start at `let mut capacity = 16_usize;`. It then runs a FIXED-SEED, BOUNDED drive (SEED 0x7e57_1234_9abc_def0, 64 steps; no wall clock, no thread id, no environment) over `TransferOutcome`: an exact report is consumed and never exceeds the supplied buffer, a partial report may only SIZE the regrown buffer (never yield IDs) and clamps to the production cap exactly, so no doubling walk escapes the cap, and a rejected over-cap report can neither be sliced past the buffer nor size a retry. It requires the live enumeration to consume the same `classify_bounded_count(count, capacity)` classifier and to refuse both the truncated and rejected arms."
     },
     {
       "case": 36,
@@ -1470,7 +1493,8 @@
         "guard drop in all drain outcomes"
       ],
       "expectation": "boxed buffers stay pinned in the guard and release only on the drained verdict, else leak fail-closed; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/36` (line 2651) binds directly above `case36_oplock_storage_releases_only_on_terminal_ownership_proof` (line 2654), which is this row's `source_test`, so the row names its own case. That test asserts the terminal-kernel-ownership-proof gate: it reads `pub fn terminal_storage_release(self)` and requires `Self::RejectedBeforeSubmit`, `Self::SynchronousComplete`, `Self::ObservedCancel` and `Self::ObservedComplete` to be the terminal release states while `Self::Prepared`, `Self::Submitted`, `Self::Pending`, `Self::UnknownSubmit`, `Self::CancelRequested` and `Self::Unresolved` are withheld from it, with exactly one `Some(TerminalStorageRelease::proven())` arm. It reads `impl Drop for DirectoryOplockGuard` and requires the release to be gated on the exact predicate `if observed.terminal_storage_release().is_none() {` with all THREE `Box::leak(` sites on that fail-closed branch, so the boxed buffers and the OVERLAPPED stay resident in the guard rather than being freed while outstanding kernel ownership is unproven. Execution acquires a real guard, requires it to store Pending, requires that very state to yield no release proof, requires an unmutated directory to report no break (so no proof is fabricated), and confirms teardown resolves so the directory is removable."
     },
     {
       "case": 37,
@@ -1493,7 +1517,8 @@
         "all OwnedHandle owners"
       ],
       "expectation": "exactly-once CloseHandle with both sentinels rejected at construction and re-checked at close; into_file is the single transfer; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/37` (line 2726) binds directly above `case37_owned_handle_closes_once_or_stays_counted_unresolved` (line 2729), which is this row's `source_test`, so the row names its own case. That test asserts the owned-handle disposition: it reads `impl Drop for OwnedHandle` and requires the close to be gated on `!self.0.is_null() && self.0 != INVALID_HANDLE_VALUE` (both failure sentinels re-checked immediately before the close) with EXACTLY ONE `CloseHandle(self.0)` site, requires `fault_armed(FaultBoundary::Cleanup)` to bypass that close and `UNRESOLVED_HANDLE_CLEANUPS.fetch_add(1` to count it, so an unresolved cleanup is never reported as a successful close; and requires `std::mem::forget(self)` to occur exactly once crate-wide, so `into_file` is the only handle-transferring forget and no handle is closed twice. Execution takes the same process-global fault mutex the armed cases hold and compares the counter EXACTLY across an unarmed open/drop, so an unarmed close must release the handle exactly once and count zero unresolved cleanups, which a `>=` comparison against a monotonic counter could not have shown."
     },
     {
       "case": 38,
@@ -1516,7 +1541,8 @@
         "image length 0, equal to, or above the buffer length"
       ],
       "expectation": "nonzero length strictly below the buffer length is required; truncated or corrupt lengths fail closed instead of exposing trailing NULs; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/38` (line 2791) binds directly above `case38_image_length_must_be_strictly_below_the_buffer_length` (line 2793), which is this row's `source_test`, so the row names its own case. That test asserts partial I/O never becomes complete semantic success: it reads `fn classify_image_chars(chars: u32, capacity: usize)` and requires `if length == 0` to classify as empty (never consumed) and `else if length >= capacity` to classify as truncated (reaching the buffer length leaves no room for the NUL, so it is never consumed), with `TransferOutcome::Complete { units: length }` reachable only for a nonzero length strictly below the buffer length. It requires `pub fn complete_units(self)` to fail closed with \"transfer delivered zero units\", \"transfer was truncated\" and \"transfer count is invalid\" on every non-complete arm, and requires `const MAX_PROCESS_IMAGE_CHARS` to be exactly 32_768. Execution resolves THIS process's real image through the exact production path and requires it to be nonzero, strictly below the recorded bound, an absolute multi-component path, and free of any trailing NUL unit."
     },
     {
       "case": 39,
@@ -1539,7 +1565,8 @@
         "DeviceIoControl error other than ERROR_IO_PENDING"
       ],
       "expectation": "only the pending outcome proceeds; any other submission verdict returns the OS error with no retry; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/39` (line 2858) binds directly above `case39_only_pending_submission_proceeds_and_nothing_retries_blindly` (line 2861), which is this row's `source_test`, so the row names its own case. That test asserts the no-blind-retry property: it reads `pub fn classify_oplock_submit(self, requested, error_code)` and requires the verdict to be classified only from `Submitted` (`if self != Self::Submitted { return Self::Unresolved; }`), so a stale state can never be turned into an acceptance; requires `if requested != 0` to classify as a synchronous completion and every error other than ERROR_IO_PENDING as `RejectedBeforeSubmit`; and requires the ERROR_IO_PENDING code to be DISCOVERED by sweeping 900..=1100 through the classifier rather than assumed, so the drive cannot pass on a wrong constant. It reads `pub fn reconcile_before_retry(self)` and requires `Submitted`, `Pending` and `CancelRequested` all to be refused as still possibly live, with WouldBlock/InvalidData kept typed. A FIXED-SEED, BOUNDED drive (SEED 0x0bad_c0de_5eed_1234, 64 steps) then requires that ONLY the pending outcome proceeds and that any other submission verdict never becomes retryable, including from every start state outside Submitted."
     },
     {
       "case": 40,
@@ -1562,7 +1589,8 @@
         "this wave source delta"
       ],
       "expectation": "this wave adds zero unsafe sites and zero new raw API families (inventory delta empty, ADR-0014 row unchanged); independent review pending in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/40` (line 2990) binds directly above `case40_pipe_server_adds_no_raw_family_and_no_second_authority` (line 2992), which is this row's `source_test`, so the row names its own case. That test asserts no new raw API family or second authority was added: it requires `pub fn create_current_user_server(` to occur EXACTLY once in lib.rs, `ConvertStringSecurityDescriptorToSecurityDescriptorW(` exactly once (one raw descriptor-construction site), `create_with_security_attributes_raw` exactly once (one raw handoff to Tokio) and `SetNamedSecurityInfo(` ZERO times (no broader descriptor-rewrite API). It requires the transport DACL template `D:P(A;;GA;;;SY)(A;;GA;;;{sid})` to grant exactly LocalSystem plus the named SID and nothing broader -- no `WD)`, `BU)` or `AU)` grant -- and requires `validate_sid(allowed_sid)?;` to PRECEDE `SecurityDescriptor::for_current_user`, so the SID is validated before the descriptor or any pipe object is built. Execution requires each malformed SID (\"\", \"x\", \"SID\", \"S-\", \"S-1-5-x\") to fail closed with InvalidInput before the descriptor is ever constructed."
     },
     {
       "case": 41,
@@ -1585,7 +1613,8 @@
         "fmt, test (both feature sets), clippy, doc, diff-check on supported Windows"
       ],
       "expectation": "the 6-command matrix plus applicable Windows fixtures run in TEST-PHASE; this lane ran fmt plus clippy per the owner gate; execution in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/41` (line 3059) binds directly above `case41_package_checks_span_both_feature_sets_and_supported_fixtures` (line 3061), which is this row's `source_test`, so the row names its own case. That test asserts the package-check coverage from inside the package: it requires Cargo.toml to declare `[features]` with BOTH target sets (`default = []` and `test-support = []`), `autobins = false` and both declared targets, and requires the test-support binary to be gated by `required-features = [\"test-support\"]`, so the feature sets exist and the declared binaries sit against the right ones. It requires the test-support fixture guard src/bin/eliot-credential-suite-guard.rs to consume exactly the test-support-only seam `use eliot_windows_ipc::test_support::isolated_operator_cursor_credentials;` and to call `isolated_operator_cursor_credentials()?`, and requires BOTH declared binaries to carry zero `unsafe` tokens, so neither target set adds a raw family to the package denominator. It requires the supported-Windows fixture chain to be real: the guardian must drive the public `SuspendedJobChild::spawn(&child_command)?` seam and must gate its report on the `child.observed_history_complete()` observer-history verdict, refusing to report from an incomplete observer history."
     },
     {
       "case": 42,
@@ -1608,7 +1637,8 @@
         "manifest lints, oracle verdict, family coverage"
       ],
       "expectation": "manifest keeps unsafe_code allow (ADR-0014 exception) with unsafe_op_in_unsafe_fn deny and zero broad allows; #754 oracle hard=0; all 7 families inventoried; independent review pending in TEST-PHASE",
-      "title_mismatch": false
+      "title_mismatch": false,
+      "full_match_justification": "FULL MATCH. The anchored marker `// WORK_UNIT_CASE: 789/42` (line 3135) binds directly above `case42_manifest_keeps_narrow_unsafe_exception_and_every_family` (line 3138), which is this row's `source_test`, so the row names its own case. That test asserts the narrow-exception/no-omitted-family property: Cargo.toml must keep the ADR-0014 `unsafe_code = \"allow\"` exception AND `unsafe_op_in_unsafe_fn = \"deny\"`, while forbidding the broad escapes `unsafe_code = \"forbid\"`, `unsafe_op_in_unsafe_fn = \"allow\"` and `unsafe_op_in_unsafe_fn = \"warn\"`, so the exception is never widened in any direction. It requires the PRODUCTION source (everything outside the in-crate `#[cfg(test)]` block) to carry ZERO `#[allow(` lint escapes, so no SAFETY or authority lint is silenced in product code. It requires all seven bounded families to be inventoried in the fixture (credential, oplock-async, pipe-process-identity, job-iocp-spawn, notify-move-file, security-pipe-server-dacl, shared-handle-core), requires the #754 oracle verdict `\"hard_violations\": 0`, and requires the denominator to stay `\"expected_cases\": 42` and `\"expected_last\": 42`. It then PARSES the registry and this suite's own source on four independent axes: the `cases` array length is exactly 42, its distinct sorted ids are exactly 1..=42 (no gap, no duplicate, no extra), this file holds exactly 42 anchored `// WORK_UNIT_CASE: 789/<n>` markers each bound by the gate's own rule to its own `#[test]` fn with a case id in 1..=42, and the source marker id set equals the registry id set in both directions."
     }
   ],
   "fault_injection_seams": {
