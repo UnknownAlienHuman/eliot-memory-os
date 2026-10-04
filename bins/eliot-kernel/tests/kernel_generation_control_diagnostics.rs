@@ -132,7 +132,7 @@ where
 {
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_writer(FailingWriter)
+        .with_writer(|| FailingWriter)
         .finish();
     tracing::subscriber::with_default(subscriber, f)
 }
@@ -144,7 +144,7 @@ where
 {
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_writer(DiscardWriter)
+        .with_writer(|| DiscardWriter)
         .finish();
     tracing::subscriber::with_default(subscriber, f)
 }
