@@ -1,0 +1,21 @@
+{
+  "missing_class": {
+    "scope_descriptor": "synthetic-scope-descriptor"
+  },
+  "unknown_option": {
+    "scope_descriptor": "synthetic-scope-descriptor",
+    "class": "full_recovery",
+    "output_directory": "C:\\synthetic-fixture\\not-a-real-directory"
+  },
+  "duplicate_scope": [
+    {
+      "scope_descriptor": "synthetic-scope-descriptor-first",
+      "class": "full_recovery"
+    },
+    {
+      "scope_descriptor": "synthetic-scope-descriptor-second",
+      "class": "full_recovery"
+    }
+  ],
+  "oversized_class": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
