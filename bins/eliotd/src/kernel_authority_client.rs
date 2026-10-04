@@ -33,9 +33,9 @@
 use std::sync::Arc;
 
 use eliot_authority::{
-    GrantActivationRequest, GrantRevocationRequest, IntroductionActivationRequest,
-    IntroductionRevocationRequest, P07AuthorityPort, P07PortError, P07RefusalCause,
-    RootTransitionActivationReceipt, RootTransitionActivationRequest, SnapshotId,
+    ACTIVATE_ROOT_TRANSITION_OPERATION, GrantActivationRequest, GrantRevocationRequest,
+    IntroductionActivationRequest, IntroductionRevocationRequest, P07AuthorityPort, P07PortError,
+    P07RefusalCause, RootTransitionActivationReceipt, RootTransitionActivationRequest, SnapshotId,
 };
 use eliot_contracts::StateFence;
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
@@ -52,12 +52,6 @@ const ACTIVATE_GRANT_OPERATION: &str = "activate_grant";
 const REVOKE_GRANT_OPERATION: &str = "revoke_grant";
 const ACTIVATE_INTRODUCTION_OPERATION: &str = "activate_introduction";
 const REVOKE_INTRODUCTION_OPERATION: &str = "revoke_introduction";
-/// Authenticated root-transition route (issue #2962). It is a DISTINCT
-/// Kernel-owned front-door operation, not an `activate_grant` overload: the
-/// payload is the complete typed root-transition operation, and the reply is
-/// the transition-specific activation receipt.
-const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
-
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
 /// Closed Kernel application kind for a decided P-07 refusal.
@@ -259,28 +253,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             return Err(P07PortError::InvalidBinding);
         }
         let record = request.record();
-        let payload = serde_json::json!({
-            "operation_id": record.operation_id,
-            "idempotency_key": record.idempotency_key,
-            "transition_id": record.transition_id,
-            "parent_grant_id": record.parent_grant_id,
-            "child_grant_id": record.child_grant_id,
-            "parent_grant_commitment": record.parent_grant_commitment,
-            "child_grant_commitment": record.child_grant_commitment,
-            "from_authority_root_ref": record.from_authority_root_ref,
-            "to_authority_root_ref": record.to_authority_root_ref,
-            "issuer": record.issuer,
-            "graph_snapshot_id": record.graph_snapshot_id,
-            "predecessor_graph_revision": record.predecessor_graph_revision,
-            "expected_next_graph_revision": record.expected_next_graph_revision,
-            "policy_revision": record.policy_revision,
-            "deadline_unix_ms": record.deadline_unix_ms,
-            "effect_ceiling": record.effect_ceiling,
-            "semantic_decision_ref": record.semantic_decision_ref,
-            "canonical_request_digest": request.canonical_request_digest(),
-            "binding": record.binding,
-            "subject": subject,
-        });
+        let payload = root_transition_activation_payload(request);
         let snapshot_id = transition_snapshot_id(record.graph_snapshot_id.as_str())?;
         let value = self
             .kernel
@@ -301,6 +274,41 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .map_err(|error| map_transition_validation_error(&error))?;
         Ok(receipt)
     }
+}
+
+/// Encodes the exact structural record already bound into the request digest.
+///
+/// Production calls this only after the live session subject has been checked
+/// against `request.subject()`. Keep every record field here, including
+/// `admitted_at_revision`, so transported bytes reconstruct the same
+/// canonical operation rather than a caller-computed successor revision.
+fn root_transition_activation_payload(
+    request: &RootTransitionActivationRequest,
+) -> serde_json::Value {
+    let record = request.record();
+    serde_json::json!({
+        "operation_id": record.operation_id,
+        "idempotency_key": record.idempotency_key,
+        "transition_id": record.transition_id,
+        "parent_grant_id": record.parent_grant_id,
+        "child_grant_id": record.child_grant_id,
+        "parent_grant_commitment": record.parent_grant_commitment,
+        "child_grant_commitment": record.child_grant_commitment,
+        "from_authority_root_ref": record.from_authority_root_ref,
+        "to_authority_root_ref": record.to_authority_root_ref,
+        "issuer": record.issuer,
+        "graph_snapshot_id": record.graph_snapshot_id,
+        "predecessor_graph_revision": record.predecessor_graph_revision,
+        "expected_next_graph_revision": record.expected_next_graph_revision,
+        "admitted_at_revision": record.admitted_at_revision,
+        "policy_revision": record.policy_revision,
+        "deadline_unix_ms": record.deadline_unix_ms,
+        "effect_ceiling": record.effect_ceiling,
+        "semantic_decision_ref": record.semantic_decision_ref,
+        "canonical_request_digest": request.canonical_request_digest(),
+        "binding": record.binding,
+        "subject": request.subject(),
+    })
 }
 
 /// Adapts one transition's graph-snapshot identity to the retention-ledger
@@ -549,7 +557,7 @@ fn decode_revocation_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_authority::{GrantId, GrantStatus, IntroductionStatus};
+    use eliot_authority::{GrantId, GrantStatus, IntroductionStatus, RootTransitionRecord};
     use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_governor::{PresentedAuthorityRequest, RetainedAuthorityRequest};
     use eliot_receipts::{EffectClass, ProofCeiling};
@@ -590,6 +598,76 @@ mod tests {
             snapshot_id: SnapshotId::new("snap-1").expect("snapshot id"),
             binding: test_binding(fence),
         }
+    }
+
+    #[test]
+    fn root_transition_payload_retains_admitted_revision_in_canonical_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence();
+        let request = RootTransitionActivationRequest::new(
+            RootTransitionRecord {
+                transition_id: "transition:revision-test".to_owned(),
+                operation_id: "operation:revision-test".to_owned(),
+                idempotency_key: "idempotency:revision-test".to_owned(),
+                parent_grant_id: "grant:parent".to_owned(),
+                child_grant_id: "grant:child".to_owned(),
+                parent_grant_commitment: "a".repeat(64),
+                child_grant_commitment: "b".repeat(64),
+                from_authority_root_ref: "root:parent".to_owned(),
+                to_authority_root_ref: "root:child".to_owned(),
+                issuer: "principal:parent".to_owned(),
+                graph_snapshot_id: "snapshot:revision-test".to_owned(),
+                predecessor_graph_revision: 6,
+                expected_next_graph_revision: 8,
+                admitted_at_revision: 7,
+                policy_revision: "policy:revision-test".to_owned(),
+                deadline_unix_ms: 1_000,
+                effect_ceiling: EffectClass::Read,
+                semantic_decision_ref: "decision:revision-test".to_owned(),
+                binding: test_binding(&fence),
+            },
+            AuthorityRequestSubject::new(
+                SERVICE_NAME,
+                "session:revision-test",
+                DAEMON_SESSION_CAPABILITY,
+            )?,
+        )?;
+        assert_ne!(
+            request.record().admitted_at_revision,
+            request.record().expected_next_graph_revision
+        );
+
+        // This proves structural encoding and digest preservation only. The
+        // decision reference is data in the request, not a semantic decision
+        // or an activation receipt.
+        let mut payload = root_transition_activation_payload(&request);
+        assert_eq!(payload["admitted_at_revision"], serde_json::json!(7));
+        assert_eq!(
+            payload["expected_next_graph_revision"],
+            serde_json::json!(8)
+        );
+        let fields = payload
+            .as_object_mut()
+            .ok_or_else(|| std::io::Error::other("payload object"))?;
+        let subject: AuthorityRequestSubject = serde_json::from_value(
+            fields
+                .remove("subject")
+                .ok_or_else(|| std::io::Error::other("encoded subject"))?,
+        )?;
+        let encoded_digest = fields
+            .remove("canonical_request_digest")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| std::io::Error::other("encoded canonical digest"))?;
+        let reconstructed: RootTransitionRecord = serde_json::from_value(payload)?;
+        assert_eq!(&reconstructed, request.record());
+
+        let rebuilt = RootTransitionActivationRequest::new(reconstructed, subject)?;
+        assert_eq!(encoded_digest, request.canonical_request_digest());
+        assert_eq!(
+            rebuilt.canonical_request_digest(),
+            request.canonical_request_digest()
+        );
+        Ok(())
     }
 
     fn owner_snapshot(fence: &StateFence) -> eliot_governor::AuthorityOwnerSnapshot {
