@@ -11,7 +11,12 @@
 ;; `TypedExecutionError::LimitDenied("typed-string")`, staged at
 ;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
 ;;
-;; This component is an honest `dreamer-cycle` fixture except for two things.
+;; This component is an honest `dreamer-cycle` fixture except for these
+;; differences, ALL FOUR of them: (1) the hostile lifted length below;
+;; (2) where the `describe` retarea sits; (3) the bump start; and (4) the sixth
+;; `(data ...)` segment this file adds. Stating the count matters, because a
+;; reader who assumes this fixture's allocator behaves as `dreamer-cycle.wat`'s
+;; would be wrong.
 ;; The hostile lifted length: `describe` reports the true frozen descriptor, the
 ;; domain result echoes the admitted `operation-id` and `fence-epoch` and claims
 ;; the lowest proof ceiling, every list leaf is left empty, and only

@@ -5682,10 +5682,16 @@ mod six_world_capsule_drive {
     /// `crate::contour::PINNED_WASMTIME_VERSION` (src/contour.rs:49) — the
     /// package's own I14.19 baseline pin — NOT this file's `ENGINE_VERSION`
     /// (:40), which is a second declaration of the same generation.
-    /// `max_wasm_stack=` is the provider's own
+    /// `max_wasm_stack=` reads the provider's own
     /// `crate::wasmtime_provider::PROVIDER_STACK_SIZE`
-    /// (`src/wasmtime_provider.rs:29`), the same constant the fresh engine is
-    /// actually configured with (:804), NOT this file's copy at :41.
+    /// (`src/wasmtime_provider.rs:29`), the constant the fresh engine is
+    /// actually configured with (:804). PRODUCTION READS A DIFFERENT
+    /// DECLARATION: the bare `PROVIDER_STACK_SIZE` in its own format string
+    /// (:626) resolves to this file's `const PROVIDER_STACK_SIZE: u64` at :41,
+    /// not to the provider's `usize` at `wasmtime_provider.rs:29`. Both hold
+    /// 8192 today, so the assertion passes, but drift in :41 ALONE would not
+    /// fail it - so this is a cross-declaration comparison, not a proof that
+    /// production and this expectation read one owner.
     /// `package=`, `wit=` and `abi_revision=` are the frozen identity owners:
     /// `crate::typed_bindings::TYPED_PACKAGE_ID` (`src/typed_bindings.rs:24`),
     /// `typed_wit_digest` (`src/typed_bindings.rs:193`) and
@@ -5844,9 +5850,11 @@ mod six_world_capsule_drive {
                 world.world_name(),
             );
             // The two artifact slots are the ones production takes from the
-            // presented buffer itself, so they are compared on their own too:
-            // the digest re-hashed at :713-714 and the length measured at :724.
-            assert_eq!(identity.artifact, preflight.digest);
+            // presented buffer itself. Of the two, only the LENGTH assertion can fail:
+            // `identity.artifact` is already forced equal to the re-hash at
+            // :714-718, which returns `Err` before this point, so comparing it
+            // again here would be a check that cannot fail. `identity.artifact_bytes`
+            // is a SEPARATE measurement (:724) and is asserted below.
             assert_eq!(identity.artifact_bytes, preflight.byte_len);
         }
 
@@ -5893,6 +5901,16 @@ mod six_world_capsule_drive {
             )
             .as_bytes(),
         );
+        // HONEST LIMIT ON THE TWO CONTROLS ABOVE. Both build a string that differs
+        // STRUCTURALLY from the production composition - four separators against
+        // five, and two slots transposed - so `assert_ne!` below holds for EVERY
+        // possible production state and CANNOT fail. They are not evidence that
+        // the composition is correct. The evidence is the whole-value
+        // `assert_eq!` against `expected_cache_identity` earlier in this
+        // function: if production really did swap those slots or drop the length
+        // slot, THAT assertion would fail and these two would be irrelevant.
+        // What these controls document is which wrong compositions a reader
+        // should have expected here, and that they were considered.
         assert_ne!(control_identity.digest(), swapped);
         assert_ne!(control_identity.digest(), omitted);
     }
@@ -5998,6 +6016,10 @@ mod six_world_capsule_drive {
     /// reachable through the real engine for one buffer under two worlds, and
     /// that limit is stated rather than papered over.
     fn assert_cache_identity_abi_world_slot_at_the_gate() {
+        // `admitted_record()` is a pure constructor over this module's own
+        // constants, so it is bound here as well: each helper below is a
+        // separate `fn` and shares no locals with its siblings.
+        let admitted = admitted_record();
         // Leg three: the ABI/WORLD slot, ISOLATED at the production
         // revalidation gate. One artifact buffer and one admitted envelope,
         // two worlds, so the world is the only input that changes. This
@@ -6031,14 +6053,23 @@ mod six_world_capsule_drive {
             )
             .map_err(|error| error.to_string()),
         );
+        // Same buffer, so these two are NOT assertions about production: both
+        // identities were built from `shared_artifact`, and comparing them
+        // proves only that the gate is deterministic. They are kept as the
+        // control that isolates the ABI slot, and are labelled as such rather
+        // than counted as evidence.
         assert_eq!(admission_identity.artifact, cycle_identity.artifact);
         assert_eq!(
             admission_identity.artifact_bytes,
             cycle_identity.artifact_bytes
         );
         assert_ne!(admission_identity.digest(), cycle_identity.digest());
-        // Which slot separates them, from the independent re-derivation: the
-        // engine and policy slots are identical and only the ABI slot moves.
+        // Which slot separates them, FROM THE TEST'S OWN RE-DERIVATION. This
+        // compares `expected_cache_identity_slots` against itself, so it cannot
+        // detect production putting the world name into the engine or policy
+        // slot. Its value is documentary: it records that the re-derived
+        // composition attributes the difference to the ABI slot, which is the
+        // claim :6049 above actually tests against production.
         let (admission_engine, admission_abi, admission_policy) =
             expected_cache_identity_slots(TypedWorld::ContextAdmission, &shared_world_limits);
         let (cycle_engine, cycle_abi, cycle_policy) =
@@ -6069,7 +6100,29 @@ mod six_world_capsule_drive {
             .map_err(|error| error.to_string()),
         );
         assert_eq!(cycle_receipt.world, cycle_world.world_name());
-        assert_ne!(cycle_receipt.cache_identity, honest_receipt.cache_identity);
+        // The second receipt is produced HERE rather than borrowed from the
+        // sibling helper above: separate `fn` items share no locals, and a
+        // receipt minted in this function is what makes the comparison a
+        // statement about two worlds rather than about two code paths.
+        let admission_world = TypedWorld::ContextAdmission;
+        let admission_kit = world_kit(admission_world, &shared_artifact);
+        let admission_capsule =
+            world_capsule(admission_world, &admission_kit, &shared_world_limits);
+        let (admission_receipt, _, _) = must(
+            execute_capsule_domain_experimental(
+                &admission_kit,
+                &admission_capsule,
+                &shared_artifact,
+                &shared_world_limits,
+                &world_request(admission_world, &admitted),
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        assert_ne!(
+            cycle_receipt.cache_identity,
+            admission_receipt.cache_identity
+        );
         assert_eq!(
             cycle_receipt.cache_identity,
             expected_cache_identity(

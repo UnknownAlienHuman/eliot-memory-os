@@ -482,8 +482,16 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
     // body in the template is unchanged: the one difference between this
     // fixture and the cooperative one is the count the engine is asked to
     // honour.
+    // TWO tables, not one, and the reason is arithmetic rather than taste. The
+    // base template declares exactly one memory at `(memory (export "memory") 1)`
+    // and NO table at all, so injecting a single extra table would leave the
+    // module declaring ONE table - equal to `MAX_TYPED_TABLES = 1`, and
+    // `bump(&mut table_count, 1, 1, "table")` computes `1 > 1` as false, so
+    // nothing would bail and the count ceiling would never be exercised. The
+    // memory leg works precisely because its base declaration exists. Two
+    // injected tables make the module declare 2 against a maximum of 1.
     let extra_table = if options.extra_core_table {
-        "    (table $extra-table 1 funcref)\n"
+        "    (table $extra-table-a 1 funcref)\n    (table $extra-table-b 1 funcref)\n"
     } else {
         ""
     };
@@ -1905,8 +1913,9 @@ fn table_instance_and_resource_bounds_are_enforced() {
     // (`src/typed_execution.rs:52-54`), forwarded to the engine's Store as
     // `StoreLimitsBuilder::tables` (`src/typed_execution.rs:1408`) and read back
     // through `StoreState::tables` (`src/typed_execution.rs:1484-1486`). This
-    // component declares a SECOND core table in the same core module, so the
-    // engine really is asked to honour a count of two, and the count really is
+    // component declares TWO core tables in the same core module, and the base
+    // template declares none, so the engine really is asked to honour a count
+    // of two against `MAX_TYPED_TABLES = 1`, and the count really is
     // checked: `Store::limiter` snapshots the limiter's `tables()` into
     // `StoreOpaque::table_limit` (wasmtime-47.0.4 `src/runtime/store.rs:936-943`,
     // assignment at `:942`), `StoreOpaque::bump_resource_counts` compares the

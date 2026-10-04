@@ -9,17 +9,21 @@
 ;; `TypedExecutionError::LimitDenied("typed-list")`, staged at
 ;; `TypedStage::Output` by `execute_domain_lane` (:2113-2114).
 ;;
-;; This component is an honest `dreamer-cycle` fixture except for two things.
+;; This component is an honest `dreamer-cycle` fixture except for THREE things.
 ;; The hostile lifted length: `describe` reports the true frozen descriptor, the
 ;; domain result echoes the admitted `operation-id` and `fence-epoch` and
 ;; claims the lowest proof ceiling, and only `state.pending` carries 300
 ;; elements. And where the `describe` retarea sits: base 0x0c00 here, its eleven
 ;; core words ending 0x0c2b, against `dreamer-cycle.wat`'s 0x0600 -- the same
-;; eleven values, so nothing about the reported descriptor changes. The type
-;; surface, the `$copy` helper, `realloc`, the `(global $bump (mut i32) (i32.const
-;; 45056))` bump start, the echo copies and all five `(data ...)` segments are
-;; otherwise identical to that sibling. Every earlier check therefore passes and
-;; the list item ceiling is provably the denial.
+;; eleven values, so nothing about the reported descriptor changes. And the bump
+;; start: `(global $bump (mut i32) (i32.const 45056))` here against
+;; `dreamer-cycle.wat:117`'s 5120. That one is NOT cosmetic - 45056 is what keeps
+;; `realloc` out of the hostile 300-element `state.pending` region (see the
+;; region note below), so a reader must not assume this fixture's allocator
+;; behaves as its sibling's. The type surface, the `$copy` helper, `realloc`'s
+;; body, the echo copies and all five `(data ...)` segments are otherwise
+;; identical to that sibling. Every earlier check therefore passes and the list
+;; item ceiling is provably the denial.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
 ;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo

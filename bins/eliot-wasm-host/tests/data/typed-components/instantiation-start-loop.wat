@@ -196,11 +196,10 @@
     ;; `dreamer-cycle.wat`'s `describe`: that one returns 1536 (0x600) and
     ;; writes the eleven-word record at 1536..1580, this one returns 3072
     ;; (0x0c00) and writes the same eleven values at 3072..3116. The store and
-    ;; the single returned
-    ;; pointer are still written here, because the obligation this file proves
-    ;; is that component INITIALIZATION is terminated by the fuel/epoch policy,
-    ;; and `$init` -- not this body -- is what runs. Nothing below weakens or
-    ;; shortens the start loop.
+    ;; the single returned pointer are still written here, because the
+    ;; obligation this file proves is that component INITIALIZATION is
+    ;; terminated by the fuel/epoch policy, and `$init` -- not this body --
+    ;; is what runs. Nothing below weakens or shortens the start loop.
     ;;
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
