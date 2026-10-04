@@ -16,15 +16,17 @@ use time::OffsetDateTime;
 
 use crate::EngineError;
 use crate::runtime_supervision::AdapterExecutionContext;
+use eliot_store::BlobStore;
 use eliot_types::{
     AdapterCapability, AdapterClass, AdapterHealth, AdapterLimits, AdapterRequest, AdapterResult,
     AdapterResultStatus, CapabilityManifest,
 };
 
 use super::adapter_rejected;
-use super::{Adapter, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture};
 use super::{
-    HealthAdapter, TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter,
+    Adapter, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture, HealthAdapter,
+    ProcessAdapter, ProcessAdapterConfig, ProcessDispatchPort, TestEchoAdapter, TestFailingAdapter,
+    TestLargeOutputAdapter, TestSlowAdapter,
 };
 use super::{healthy, manifest, rejected_result};
 
@@ -48,6 +50,24 @@ impl AdapterRegistry {
         registry.register(TestSlowAdapter::new())?;
         registry.register(TestLargeOutputAdapter::new())?;
         registry.register(TestNoResultsAdapter::new())?;
+        Ok(registry)
+    }
+
+    /// `builtin()` plus one registered deterministic process adapter.
+    ///
+    /// This is the registration path issue #1819 A1 names. It is separate from
+    /// [`Self::builtin`] on purpose: `builtin()` has no Blob Store and no Kernel
+    /// process dispatch port, and inventing a default executable for it would be
+    /// inventing a contract. The two are supplied here, by the owner that has
+    /// them, and the adapter is then registered like every other adapter, so it
+    /// receives its own queue, concurrency budget, circuit and output limits.
+    pub fn builtin_with_process(
+        config: ProcessAdapterConfig,
+        dispatch: Arc<dyn ProcessDispatchPort>,
+        blob_store: Arc<BlobStore>,
+    ) -> Result<Self, EngineError> {
+        let mut registry = Self::builtin()?;
+        registry.register(ProcessAdapter::new(config, dispatch, blob_store))?;
         Ok(registry)
     }
 

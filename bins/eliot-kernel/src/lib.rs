@@ -3954,12 +3954,17 @@ impl KernelComposition {
     /// staged ticket when one is already staged, i.e. reconcile-by-identity).
     /// A failed commit latches reconciliation-pending and propagates, so an
     /// unknown durable outcome never mints a second successor. Non-renewing
-    /// decisions return the unchanged head with their complete receipt and no
-    /// commit. On `Renewed` the receipt is `None` by construction: the caller
-    /// completes it with the committed successor receipt digest plus the
-    /// published live-receipt digest via `daemon_renewal_receipt_for_decision`
-    /// after live-receipt publication, so a renewal can never ship without
-    /// its publication evidence.
+    /// decisions return the unchanged head with their receipt and no commit.
+    /// An exact replay of a recorded renewal is non-renewing here: it commits
+    /// nothing and creates no successor, so it returns the unchanged head (which
+    /// is already that renewal's successor) and a receipt that admits no
+    /// successor and carries no digest; the echoed `predecessor -> successor`
+    /// transition travels in the decision, built from the retained original
+    /// predecessor rather than from this head (I14-15 line 17). On `Renewed` the
+    /// receipt is `None` by construction: the caller completes it with the
+    /// committed successor receipt digest plus the published live-receipt digest
+    /// via `daemon_renewal_receipt_for_decision` after live-receipt publication,
+    /// so a renewal can never ship without its publication evidence.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_arguments,
@@ -4024,6 +4029,17 @@ impl KernelComposition {
             request, &current, progress, policy, now_ms, context,
         )?;
         if decision.outcome != DaemonSupervisionRenewalOutcome::Renewed {
+            // Issue #88 A2, step 3. A REPLAY OF A COMMITTED RENEWAL
+            // (`ExactReplay`) and a GENUINE NO-SUCCESSOR DECISION (`NotDue`,
+            // `DegradedNoRenewal`, `ReconciliationRequired`) are distinguished
+            // inside `daemon_renewal_receipt_for_decision`: the replay echoes
+            // the recorded transition in its decision, but this tick created
+            // nothing, so its receipt admits no successor and carries neither
+            // the committed successor's ORS digest nor a live-receipt digest.
+            // `current_snapshot` is that committed successor — the successor is
+            // never re-derived from it, and no digest is invented for a
+            // publication this tick did not perform. Both outcomes commit
+            // nothing and return the unchanged head.
             let receipt = daemon_renewal_receipt_for_decision(&decision, None, None)?;
             return Ok((current_snapshot, decision, Some(receipt)));
         }
