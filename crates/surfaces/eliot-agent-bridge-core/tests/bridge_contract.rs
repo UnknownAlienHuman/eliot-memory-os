@@ -1291,6 +1291,7 @@ fn skill_proposal() -> Result<ProposeSkillRequest, Box<dyn std::error::Error>> {
         vec!["evidence-1".to_owned()],
         Vec::new(),
         skill_scope(),
+        "policy-rev-1",
     )?)
 }
 
@@ -1303,6 +1304,8 @@ fn skill_candidate(fence: &StateFence) -> Result<SkillCandidate, Box<dyn std::er
         vec!["evidence-1".to_owned()],
         Vec::new(),
         skill_scope(),
+        "policy-rev-1".to_owned(),
+        "proposal-operation-1".to_owned(),
         fence.clone(),
     )?)
 }
