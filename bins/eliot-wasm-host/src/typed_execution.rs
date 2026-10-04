@@ -4975,8 +4975,8 @@ mod six_world_capsule_drive {
         // What production does verify about this leaf is real and is not lost
         // with it: the field is shape-validated — non-empty, bounded by
         // `MAX_DESCRIPTOR_STRING_BYTES`, and free of control characters
-        // (`TypedDomainAdmission::validate`, :174-192, where `policy_id` is the
-        // fifth checked leaf at :180) — and it is folded into the request's
+        // (`TypedDomainAdmission::validate`, :167-185, where `policy_id` is the
+        // fifth checked leaf at :173) — and it is folded into the request's
         // input digest (`input_digest`, :2387), so changing it changes the
         // measured input binding.
         assert_eq!(receipt.policy_id.as_deref(), Some(POLICY_ID));
@@ -5321,7 +5321,7 @@ mod six_world_capsule_drive {
     /// host REFUSES the result with its own typed denial at the stage the call
     /// reached. The list leg proves the item ceiling; this leg proves the
     /// per-string ceiling next to it, which is a distinct production value
-    /// (`MAX_TYPED_STRING_BYTES`, :46) refusing through a distinct production
+    /// (`MAX_TYPED_STRING_BYTES`, :50) refusing through a distinct production
     /// branch (`TypedBound::text`, :845-853).
     ///
     /// Only in-crate code can observe this, for the same reachability reason as
@@ -5702,9 +5702,9 @@ mod six_world_capsule_drive {
     /// `max_wasm_stack=` reads the provider's own
     /// `crate::wasmtime_provider::PROVIDER_STACK_SIZE`
     /// (`src/wasmtime_provider.rs:29`), the constant the fresh engine is
-    /// actually configured with (:819). PRODUCTION READS A DIFFERENT
-    /// DECLARATION: the bare `PROVIDER_STACK_SIZE` in its own format string
-    /// (:641) resolves to this file's `const PROVIDER_STACK_SIZE: u64` at :41,
+    /// actually configured with (`src/wasmtime_provider.rs:804`). PRODUCTION
+    /// READS A DIFFERENT DECLARATION: the bare `PROVIDER_STACK_SIZE` in its own
+    /// format string (:641) resolves to this file's `const PROVIDER_STACK_SIZE: u64` at :41,
     /// not to the provider's `usize` at `wasmtime_provider.rs:29`. Both hold
     /// 8192 today, so the assertion passes, but drift in :41 ALONE would not
     /// fail it - so this is a cross-declaration comparison, not a proof that
@@ -5836,11 +5836,12 @@ mod six_world_capsule_drive {
         assert_cache_identity_abi_world_slot_at_the_gate();
     }
 
-    /// Leg one and the two negative controls that make this more than a
-    /// differential: for EVERY frozen world, over its own checked-in real
-    /// component, the identity production's own revalidation gate builds is
-    /// equal to the value re-derived here from the documented composition, and
-    /// two compositions production COULD have produced are rejected.
+    /// Leg one, and the two wrong compositions this leg is checked AGAINST
+    /// rather than merely next to: for EVERY frozen world, over its own
+    /// checked-in real component, the identity production's own revalidation
+    /// gate builds is equal to the value re-derived here from the documented
+    /// composition, which is the whole of what distinguishes a CORRECT fold
+    /// from any other function of the same five inputs that also changes.
     fn assert_cache_identity_over_every_frozen_world() {
         // Leg one: for EVERY frozen world, over its own checked-in real
         // component, the identity production's own revalidation gate builds is
@@ -5877,65 +5878,35 @@ mod six_world_capsule_drive {
 
         // The comparison above can tell a correct composition from a wrong one,
         // which the differential `assert_ne!` legs in the acceptance file
-        // cannot. The two controls below are the wrong compositions a reader
-        // should have expected to see rejected here — the ABI and policy slots
-        // swapped, and the artifact-LENGTH slot omitted — but they are built in
-        // THIS module, not produced by production: they differ STRUCTURALLY
-        // from the composition production folds, so the `assert_ne!` pair at the
-        // end of this function holds for every possible production state and
-        // CANNOT fail. The retraction below them is the accurate half of this
-        // comment and is what stands; the whole-value `assert_eq!` against
-        // `expected_cache_identity` in the loop above is the evidence.
-        let control_world = TypedWorld::ContextAdmission;
-        let control_artifact = load_fixture(control_world);
-        let control_preflight = must(preflight_bytes(&control_artifact));
-        let control_limits = default_experimental_limits(control_preflight.digest.clone());
-        let control_identity = must(
-            check_cache_identity(
-                control_world,
-                &control_artifact,
-                &control_preflight.digest,
-                &control_limits,
-            )
-            .map_err(|error| error.to_string()),
-        );
-        let (control_engine, control_abi, control_policy) =
-            expected_cache_identity_slots(control_world, &control_limits);
-        // Control A: the ABI and policy slots SWAPPED.
-        let swapped = Sha256Digest::of_bytes(
-            format!(
-                "758-typed-cache-identity|{}|{}|{}|{}|{}",
-                control_preflight.digest.as_str(),
-                control_preflight.byte_len,
-                control_engine.as_str(),
-                control_policy.as_str(),
-                control_abi.as_str(),
-            )
-            .as_bytes(),
-        );
-        // Control B: the artifact-LENGTH slot OMITTED.
-        let omitted = Sha256Digest::of_bytes(
-            format!(
-                "758-typed-cache-identity|{}|{}|{}|{}",
-                control_preflight.digest.as_str(),
-                control_engine.as_str(),
-                control_abi.as_str(),
-                control_policy.as_str(),
-            )
-            .as_bytes(),
-        );
-        // HONEST LIMIT ON THE TWO CONTROLS ABOVE. Both build a string that differs
-        // STRUCTURALLY from the production composition - four separators against
-        // five, and two slots transposed - so `assert_ne!` below holds for EVERY
-        // possible production state and CANNOT fail. They are not evidence that
-        // the composition is correct. The evidence is the whole-value
-        // `assert_eq!` against `expected_cache_identity` earlier in this
-        // function: if production really did swap those slots or drop the length
-        // slot, THAT assertion would fail and these two would be irrelevant.
-        // What these controls document is which wrong compositions a reader
-        // should have expected here, and that they were considered.
-        assert_ne!(control_identity.digest(), swapped);
-        assert_ne!(control_identity.digest(), omitted);
+        // cannot. The two wrong compositions a reader should have expected to
+        // see rejected here are the ABI and policy slots SWAPPED, and the
+        // artifact-LENGTH slot OMITTED. Each is built in THIS module rather
+        // than produced by production, and each differs STRUCTURALLY from the
+        // composition production folds — four separators against five, and two
+        // slots transposed — so an inequality between such a value and a
+        // production identity holds for EVERY possible production state and
+        // CANNOT fail. Production folds its own five slots in
+        // `impl TypedCacheIdentity { fn digest }`, so a composition that really
+        // did swap those slots or drop the length slot folds a different
+        // digest, fails the whole-value `assert_eq!` against
+        // `expected_cache_identity` in the loop above, and makes either
+        // inequality a corollary of that failure rather than evidence for it.
+        // The pair of `assert_ne!` that stood here is therefore REMOVED rather
+        // than relabelled, for the same reason the pairwise receipt comparison
+        // in `assert_cache_identity_abi_world_slot_at_the_gate` was: a
+        // comparison that follows from another comparison can only ever repeat
+        // it. The `swapped` and `omitted` values go with it, because a value
+        // built only as an operand of an assertion that cannot fail carries no
+        // evidence of its own and would only be dead weight here.
+        //
+        // WHAT CARRIES THE OBLIGATION. The whole-value `assert_eq!` in the loop
+        // above, for EVERY frozen world and over production's own gate output.
+        // `TypedWorld::ContextAdmission` is the first of the six in
+        // `TypedWorld::all()`, so the world these two compositions were built
+        // over is already bound there to a value re-derived from the documented
+        // five-slot composition. What the two wrong compositions now document
+        // is which folds a reader should have expected here, and that they
+        // were considered.
     }
 
     /// Leg two, kept as its own function so each leg's proof ceiling is legible
@@ -6143,15 +6114,17 @@ mod six_world_capsule_drive {
         assert_eq!(cycle_receipt.world, cycle_world.world_name());
         // The second receipt is executed HERE rather than borrowed from the
         // sibling helper above, because separate `fn` items share no locals.
-        // What the pair of receipts below actually shows is that two executed
-        // calls bound two different cache identities — NOT that the world moved
-        // the ABI slot: they are two DIFFERENT fixtures (`cycle_artifact` and
-        // the admission fixture above) under two DIFFERENT limit envelopes, so
-        // the artifact digest, the artifact length and the policy slot already
-        // differ before any world is considered. This leg is therefore not
-        // evidence for the abi/world slot and cannot fail on account of the
-        // world. The load-bearing assertion for that slot is the whole-value
-        // `assert_eq!` below, against `expected_cache_identity(cycle_world, ...)`.
+        // What the pair of receipts below carries is TWO SEPARATE EXECUTED
+        // identities, each bound to its own re-derived whole value — NOT a
+        // pairwise inequality between them: they are two DIFFERENT fixtures
+        // (`cycle_artifact` and the admission fixture above) under two DIFFERENT
+        // limit envelopes, so the artifact digest, the artifact length and the
+        // policy slot already differ before any world is considered. Comparing
+        // the two receipts to each other therefore cannot fail on account of the
+        // world. The load-bearing assertions for that slot are the two whole-value
+        // `assert_eq!` at the end of this function, one per executed receipt,
+        // against `expected_cache_identity(cycle_world, ...)` and
+        // `expected_cache_identity(admission_world, ...)`.
         let admission_world = TypedWorld::ContextAdmission;
         let admission_kit = world_kit(admission_world, &shared_artifact);
         let admission_capsule =
@@ -6167,15 +6140,27 @@ mod six_world_capsule_drive {
             )
             .map_err(|error| error.to_string()),
         );
-        // Same labelling rule as the two legs above, applied honestly: these two
-        // receipts were built from DIFFERENT fixtures under DIFFERENT limits, so
-        // the artifact digest, the artifact length and the policy slot differ
-        // before any world is considered. The inequality below therefore cannot
-        // fail and is NOT evidence for the abi/world slot.
-        assert_ne!(
-            cycle_receipt.cache_identity,
-            admission_receipt.cache_identity
-        );
+        // Same labelling rule as the two legs above, applied to the pair of
+        // EXECUTED receipts: they were built from DIFFERENT fixtures under
+        // DIFFERENT limits, so the artifact digest, the artifact length and the
+        // policy slot differ before any world is considered. An `assert_ne!`
+        // between the two identities therefore holds for every possible
+        // production state: it is a COROLLARY of the two whole-value `assert_eq!`
+        // below and not evidence for the abi/world slot. It is REMOVED rather
+        // than relabelled, because a comparison that follows from two other
+        // comparisons can only ever repeat them.
+        //
+        // What each executed receipt is instead bound to, on this reachable
+        // seam, is its OWN whole value re-derived here from the documented
+        // five-slot composition: this buffer's measured digest and length, the
+        // three derived slots, and THIS world's abi slot. Both assertions can
+        // fail. Production folds its own five slots in `impl TypedCacheIdentity
+        // { fn digest }`, so a composition that put the world name in the engine
+        // or policy slot, dropped the world, dropped the artifact-LENGTH slot or
+        // transposed two slots would fold a different digest into the executed
+        // receipt and fail the comparison here. The world therefore reaches the
+        // receipt only through the abi slot, on the receipt the REAL engine
+        // produced, with no fabricated flag, switch or test-only export.
         assert_eq!(
             cycle_receipt.cache_identity,
             expected_cache_identity(
@@ -6183,6 +6168,15 @@ mod six_world_capsule_drive {
                 &cycle_preflight.digest,
                 cycle_preflight.byte_len,
                 &cycle_limits,
+            )
+        );
+        assert_eq!(
+            admission_receipt.cache_identity,
+            expected_cache_identity(
+                admission_world,
+                &shared_preflight.digest,
+                shared_preflight.byte_len,
+                &shared_world_limits,
             )
         );
     }
