@@ -321,8 +321,14 @@ fn default_instance_bootstrap_is_stable_and_outside_the_repository() -> TestResu
         .join("governor.toml");
     let config = fs::read_to_string(&config_path)?;
     assert!(!config.to_ascii_lowercase().contains("onedrive"));
-    assert!(local_app_data.join("Eliot/resources/surql").is_dir());
-    assert!(local_app_data.join("Eliot/resources/migrations").is_dir());
+    assert!(
+        !local_app_data.join("Eliot/resources/surql").exists(),
+        "issue #1221 W4/A2: init-default must not stage a legacy migration root into the installed runtime"
+    );
+    assert!(
+        !local_app_data.join("Eliot/resources/migrations").exists(),
+        "issue #1221 W4/A2: init-default must not stage a legacy migration root into the installed runtime"
+    );
     assert!(config.contains("instance_id = \"default\""));
     Ok(())
 }
@@ -1083,8 +1089,6 @@ fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResul
         format!("%LOCALAPPDATA%/Eliot/tests/{run_id}/secrets/surreal_root_password.txt");
     let wal = slash(&runtime.join("control").join("control.redb"));
     let blobs = slash(&runtime.join("blobs"));
-    let repo = repository_root()?;
-    let surql = slash(&repo.join("crates/eliot-store/src/surql"));
     let config = format!(
         r#"schema_version = "1"
 
@@ -1125,9 +1129,6 @@ path = "{wal}"
 
 [blob_store]
 root = "{blobs}"
-
-[store]
-surql_dir = "{surql}"
 "#
     );
     fs::write(config_path, config)?;

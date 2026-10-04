@@ -40,7 +40,7 @@ use eliot_context::campaign_publication::{
 use eliot_context_admission::check_campaign_view_for_admission;
 use eliot_context_candidates::{CandidateRequest, check_campaign_learning_state_view};
 use eliot_context_contracts::{
-    ContextError, ContextRecipe, ProjectedCitation, SessionDeliverySnapshot,
+    ContextError, ContextRecipe, ProjectedCitation, SafetyFloorIdentity, SessionDeliverySnapshot,
 };
 use eliot_contracts::{
     ArtifactId, RequestId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
@@ -195,9 +195,10 @@ enum CampaignPacketGapCode {
     /// carries no per-material `FusedRankTrace` and no rank-trace handle.
     ///
     /// The traced join this packet's material would be accounted by is
-    /// `eliot_context_admission::admit_context_traced`, reached from the
-    /// composition through
-    /// `KernelContextReadClient::compile_context_packet`. That composition
+    /// `eliot_context_admission::admit_context_traced`, which is reachable only
+    /// through `KernelContextReadClient::compile_context_packet`. That
+    /// composition has NO production caller anywhere in this tree, and the
+    /// account below is why: what is missing is owner supply, not a wire. It
     /// closes its owner-minted pieces through the one validating builder
     /// `PacketAdmissionBundle::build`, and the per-identity account of what this
     /// tree can and cannot supply today is:
@@ -258,20 +259,47 @@ enum CampaignPacketGapCode {
     ///   same owner record before any byte is rendered, but its route identity,
     ///   model identity and route byte ceiling still have no owner on this
     ///   route, so the policy itself has zero production construction sites.
-    /// - the twelve-dimension `QualityScorecard`, the seven-role
-    ///   `SevenRoleInputs`, the `CandidatePolicy` and the measurement callback —
-    ///   ABSENT. `CandidatePolicy::serializer` is now bound to the same owner
-    ///   record too, but the policy's own bounds have no producer here, and the
-    ///   card still needs owner evidence (per-dimension rule revision and
-    ///   observed evidence) that has no producer on this route.
+    /// - `ResolvedContextRecipe` — ABSENT. The Context owner row this route
+    ///   already reads does carry the catalogue the resolved revision comes
+    ///   from, and `ApprovedRecipeCatalogue::resolve` is a public owner method,
+    ///   but every `eliot_context::campaign_publication` entry point resolves,
+    ///   authorizes AND requires executability inside one private closure and
+    ///   returns only the floor or the digest. Calling `catalogue.resolve()`
+    ///   directly from a composition root would be a second, weaker authority
+    ///   path that skips the owner's own `authorize` and `require_executable`,
+    ///   so it is not done here.
+    /// - the twelve-dimension `QualityScorecard` — ABSENT. Every construction
+    ///   site in this tree is a test fixture or a prototype's own card, and the
+    ///   card needs owner evidence — per-dimension rule revision and observed
+    ///   evidence — that has no producer on this route.
+    /// - `CandidatePolicy` — ABSENT. Its `serializer` half is owner-issued by
+    ///   `eliot_context_contracts::canonical_render_serializer`, and its
+    ///   `bounds` half is not: the Context owner row declares no per-route
+    ///   candidate bound, and the only constructor for those bounds,
+    ///   `CandidateBounds::generous`, is documented by its own owner as the
+    ///   profile for "tests and callers without a tighter route profile".
+    ///   Adopting it here would be a default standing in for a measurement.
+    /// - `SevenRoleInputs` — ABSENT as a packet-route value. Its production
+    ///   producer is `KernelContextReadClient::reconstruct_context_inputs`,
+    ///   reached today only from the `context_reconstruction` route, which
+    ///   resolves an owner session and an observed dependency head first. This
+    ///   route holds the admitted envelope and the authenticated Kernel client,
+    ///   but it opens no owner session and reads no per-role projection, so
+    ///   there is no role set to hand over.
+    /// - `DownstreamHeadroomRequest`, with its `DownstreamHeadroomResult`,
+    ///   `HeadroomAllocationLedger` and `PacketHeadroomJoin` — ABSENT. The
+    ///   request is built per demanded `HeadroomDimension`, and every
+    ///   construction site for either it or a `HeadroomDemand` in this tree is
+    ///   a crate test. The join additionally needs a live resource owner to
+    ///   issue one permit per demand, which this composition does not hold and
+    ///   must not stand up.
     ///
-    /// The composition's own shape is no longer part of the obstacle:
-    /// `KernelContextReadClient::compile_context_packet` now takes the
-    /// atom-keyed admission pieces and the quality card as owner suppliers
-    /// invoked after the candidate and admission stages that produce what they
-    /// are keyed by, so it is callable in principle rather than uncallable by
-    /// construction. What remains absent is the owner supply above, which no
-    /// amount of reshaping can substitute for.
+    /// The composition's own shape is therefore NOT what keeps the edge closed:
+    /// `KernelContextReadClient::compile_context_packet` takes the atom-keyed
+    /// admission pieces and the quality card as owner suppliers invoked after
+    /// the stages that produce what they are keyed by, so its signature no longer
+    /// demands a value that does not exist yet. What remains absent is the owner
+    /// supply above, which no amount of reshaping substitutes for.
     ///
     /// The candidate stage is reached today only as far as
     /// `eliot_context_candidates::check_campaign_learning_state_view`, which
@@ -281,11 +309,12 @@ enum CampaignPacketGapCode {
     /// owner. The admission cell reaches its own join from this route through
     /// `eliot_context_admission::check_campaign_view_for_admission`, which
     /// re-derives the join from the binding admission decides under rather than
-    /// inheriting the candidate cell's verdict. The assembly cell's join is
-    /// reached from `KernelContextReadClient::compile_context_packet`, which is
-    /// the only place an actual `AdmittedContextSet` exists to join against;
-    /// this route produces none because `admit_context` has no callable
-    /// argument set. Both full decisions stay unreachable for that same reason.
+    /// inheriting the candidate cell's verdict. The assembly cell's join is NOT
+    /// reached at all: `check_campaign_view_for_assembly` would be called from
+    /// `KernelContextReadClient::compile_context_packet`, the only place an
+    /// actual `AdmittedContextSet` exists to join against, and this route
+    /// produces none because `admit_context` has no callable argument set here.
+    /// Both full decisions stay unreachable for that same reason.
     ///
     /// Minting any of the absent pieces here from a constant, a CLI flag, an env
     /// var, or a caller-supplied string would fabricate the exact selection
@@ -293,6 +322,19 @@ enum CampaignPacketGapCode {
     /// the refusal instead. Reporting it is what keeps the withheld rank trace
     /// from being read as support: the absence of a handle is a named, delivered
     /// gap, not a silent omission and not a claim that nothing was withheld.
+    ///
+    /// #1728: the reported set is DERIVED at runtime, not asserted here.
+    /// `unbound_admission_closure_identities` returns the identities this
+    /// attempt still holds no owner-minted value for, computed from the values
+    /// actually in scope, and this gap is pushed only when that set is
+    /// non-empty. So an identity stops being named the moment it is bound — the
+    /// Decision Safety Floor is resolved above through the Context owner's own
+    /// publication and is therefore never named as missing — and the exact
+    /// remaining set is logged in full at the refusal. The wire gap code is
+    /// deliberately unchanged: `CampaignPacketGapCode` is a shared contract type
+    /// and this response shape may not grow a field to carry the inventory, so a
+    /// consumer still reads one coarse code while the exact names stay in the
+    /// log and in this record.
     AdmissionClosureUnbound,
     /// The current learning-state owner refused the view for this attempt:
     /// stale, missing, invalidated, or partial across a load-bearing slot,
@@ -575,7 +617,11 @@ pub fn validate_campaign_packet_pair(
 /// Binds the admitted packet to the current compiler's request identity.
 ///
 /// Validation by construction for the #2564 packet-compile edge
-/// (`KernelContextReadClient::compile_context_packet`): the owner recipe is
+/// (`KernelContextReadClient::compile_context_packet`) — an edge this route does
+/// not yet reach, because the other owners that compile edge requires have no
+/// production supply here; see
+/// [`CampaignPacketGapCode::AdmissionClosureUnbound`]. What this function does
+/// own is real and complete: the owner recipe is
 /// re-validated and its task/scope/fence binding is compared against the
 /// Kernel-admitted binding field by field, so a substituted recipe fails
 /// closed here instead of supporting a compiled packet. The request identity
@@ -606,10 +652,13 @@ pub fn validate_campaign_packet_pair(
 /// the failing join. The request is not yet handed to
 /// `construct_context_candidates` because the seven role projections have no
 /// production owner; that composition is reported as
-/// `AdmissionClosureUnbound` rather than faked. The compile edge itself is no
-/// longer the obstacle: `compile_context_packet` now takes the atom-keyed
+/// `AdmissionClosureUnbound` rather than faked. The compile edge's own signature
+/// is not the obstacle either: `compile_context_packet` takes the atom-keyed
 /// admission pieces and the quality card as suppliers invoked after the stages
-/// that produce what they are keyed by.
+/// that produce what they are keyed by. What still blocks it is owner supply —
+/// #1728, and every identity named under `AdmissionClosureUnbound`, has to land
+/// before this function's result can be handed to that edge, and no reshaping of
+/// this route substitutes for one of them.
 fn candidate_request_for_packet(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
@@ -648,6 +697,59 @@ fn candidate_request_for_packet(
             _ => CampaignPacketError::UnboundContextRecipe,
         })?;
     Ok(request)
+}
+
+/// Names the admission-closure identities this attempt still cannot bind from an
+/// owner-minted source (#1728).
+///
+/// The answer is a function of the values this route actually holds, not an
+/// assertion about them, so it can tell "the Decision Safety Floor is missing"
+/// apart from "some other identity is missing":
+///
+/// - `floor` is the [`SafetyFloorIdentity`] this attempt obtained from the
+///   Context owner's own publication
+///   (`eliot_context::campaign_publication::context_safety_floor_identity`), or
+///   `None` if that resolution did not yield one;
+/// - `candidate_request` is the [`CandidateRequest`] the candidate cell accepted
+///   for this packet, or `None` if this route holds no such request.
+///
+/// Everything else the traced admission join needs is named unconditionally,
+/// because there is nothing to test: this route holds no value for it at all.
+/// Each of those has a written reason under
+/// [`CampaignPacketGapCode::AdmissionClosureUnbound`], and the single reason this
+/// function exists rather than a hard-coded `push` is that a supplier landing
+/// later replaces one push with a test of the value it actually obtained, and the
+/// name stops appearing. Nothing here invents a value to shorten the list: an
+/// absent owner piece stays absent, which is the only thing keeping the selection
+/// record this packet reports true.
+fn unbound_admission_closure_identities(
+    floor: Option<&SafetyFloorIdentity>,
+    candidate_request: Option<&CandidateRequest>,
+) -> Vec<&'static str> {
+    let mut unbound = Vec::new();
+    if floor.is_none() {
+        unbound.push("SafetyFloorIdentity");
+    }
+    if candidate_request.is_none() {
+        unbound.push("CandidateRequest");
+    }
+    // No candidate atom exists on this route yet, so the per-atom measurement
+    // set and the quality card and the measurement callback that would key off
+    // one cannot exist either. Every name below is kept apart rather than
+    // collapsed into one entry: these are eleven separate owner supplies, and one
+    // of them landing says nothing about the other ten.
+    unbound.push("SevenRoleInputs");
+    unbound.push("CandidatePolicy");
+    unbound.push("AssemblyPolicy");
+    unbound.push("ResolvedContextRecipe");
+    unbound.push("PriorityPolicyIdentity");
+    unbound.push("AdmissionRuleIdentity");
+    unbound.push("MeasurementCompositionProfile");
+    unbound.push("DownstreamHeadroomRequest");
+    unbound.push("QualityScorecard");
+    unbound.push("AdmissionMeasurement");
+    unbound.push("SerializedContextMeasurement");
+    unbound
 }
 
 /// Resolves one admitted packet into an immutable view and compiles its
@@ -1241,7 +1343,11 @@ async fn resolve_compile_and_bind_result(
     // than supporting a compiled packet. The candidate cell then owns the
     // campaign-view join itself and a refusal there takes the typed
     // `CampaignViewNotCurrent` gap, never a compiled packet.
-    if let Err(refusal) = candidate_request_for_packet(
+    // #1728: the candidate request is kept as a value here rather than dropped
+    // at the end of an `if let Err(...)`. It is the request identity this
+    // packet's admission would be made under, so the closure account below names
+    // it from the value actually held instead of from a claim that one exists.
+    let candidate_request = match candidate_request_for_packet(
         envelope,
         attempt,
         &context_recipe_body.recipe,
@@ -1249,27 +1355,30 @@ async fn resolve_compile_and_bind_result(
         &publication.view,
         &context_recipe_record_digest,
     ) {
-        let (gap, role) = match refusal {
-            CampaignPacketError::CampaignViewNotCurrent => {
-                (CampaignPacketGapCode::CampaignViewNotCurrent, None)
-            }
-            _ => (
-                CampaignPacketGapCode::ContextRecipeUnavailable,
-                Some(CampaignSourceRole::ContextRecipe),
-            ),
-        };
-        return campaign_packet_result_body(
-            envelope,
-            attempt,
-            context_blocked_response(
-                publication,
-                gap,
-                role,
-                &resolved.resolutions,
-                prior.is_some() && !prior_is_current,
-            ),
-        );
-    }
+        Ok(request) => request,
+        Err(refusal) => {
+            let (gap, role) = match refusal {
+                CampaignPacketError::CampaignViewNotCurrent => {
+                    (CampaignPacketGapCode::CampaignViewNotCurrent, None)
+                }
+                _ => (
+                    CampaignPacketGapCode::ContextRecipeUnavailable,
+                    Some(CampaignSourceRole::ContextRecipe),
+                ),
+            };
+            return campaign_packet_result_body(
+                envelope,
+                attempt,
+                context_blocked_response(
+                    publication,
+                    gap,
+                    role,
+                    &resolved.resolutions,
+                    prior.is_some() && !prior_is_current,
+                ),
+            );
+        }
+    };
     // #1862: the ADMISSION cell now reaches its own campaign-view join on this
     // route, and it does not inherit the candidate cell's verdict.
     //
@@ -1312,13 +1421,15 @@ async fn resolve_compile_and_bind_result(
         }
     };
     //
-    // The full `admit_context` decision stays unreachable on this route: the
-    // remaining owner-minted admission-closure pieces have zero production
-    // construction sites (`AdmissionClosureUnbound` above, which now names the
-    // floor as the one piece this route does hold). The join is the load-bearing
-    // revision, State Fence and Decision Safety Floor check the audit names; the
-    // decision it would feed is separately absent and is reported as absent
-    // rather than fabricated.
+    // The full `admit_context` decision stays unreachable on this route. The
+    // floor resolved above is the ONE closure identity this route holds, and
+    // `unbound_admission_closure_identities` is what keeps the reported gap
+    // honest about that: it derives the still-unbound set from the values
+    // actually held, so the floor is never named as missing and every identity
+    // that IS missing is. The join below is the load-bearing revision, State
+    // Fence and Decision Safety Floor check the audit names; the decision it
+    // would feed is separately absent and is reported as absent rather than
+    // fabricated.
     //
     // #1862: the admission owner's typed refusal crosses this boundary intact.
     // It used to be discarded by `.is_err()`, which flattened five distinct
@@ -1396,10 +1507,32 @@ async fn resolve_compile_and_bind_result(
     // reported as unbound beside it rather than left silently absent.
     let material_account = account_delivered_materials(&publication.view)?;
     let mut gaps = source_gaps(&resolved.resolutions);
-    gaps.push(CampaignPacketGap {
-        code: CampaignPacketGapCode::AdmissionClosureUnbound,
-        role: None,
-    });
+    // #1728: the admission-closure gap is now DERIVED from the owner identities
+    // this attempt actually holds rather than pushed on every `Compiled`
+    // response. The Decision Safety Floor was resolved above through the Context
+    // owner's own publication, so it is not named; every identity this route
+    // still cannot bind from an owner-minted source is, in full, in the log line
+    // below. The wire gap code is deliberately unchanged: `CampaignPacketGapCode`
+    // is a shared contract type and this response shape may not grow a field to
+    // carry the inventory, so a consumer reads one coarse code while the exact
+    // names stay in the log and in the gap code's own contract.
+    //
+    // Pushing the gap only while the set is non-empty is what keeps it
+    // discriminating: the day the last identity below is bound, the code stops
+    // being emitted on this route instead of continuing to assert a closure that
+    // by then exists.
+    let unbound =
+        unbound_admission_closure_identities(Some(&admission_floor), Some(&candidate_request));
+    if !unbound.is_empty() {
+        tracing::warn!(
+            unbound_identities = ?unbound,
+            "campaign packet admission closure is unbound; no traced join was made"
+        );
+        gaps.push(CampaignPacketGap {
+            code: CampaignPacketGapCode::AdmissionClosureUnbound,
+            role: None,
+        });
+    }
     campaign_packet_result_body(
         envelope,
         attempt,

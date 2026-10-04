@@ -2689,6 +2689,87 @@ define_recovery_inventory_page!(
     WriteIdempotencyRecoveryEntry
 );
 
+/// Bounded restart cursor over the open unknown-commit family.
+///
+/// This cursor is deliberately independent of [`RecoveryInventorySnapshot`].
+/// The unknown-commit family carries its own owner-issued durable revision, so
+/// it can be paged without a sixth [`RecoveryInventorySource`] member, without
+/// a change to the snapshot digest preimage, and without a new
+/// `RECOVERY_INVENTORY_REVISION_SCHEMA` migration for stores already opened at
+/// version `1`. `source_revision` is the family revision this cursor is bound
+/// to; every page served under it re-reads that revision and refuses to answer
+/// if the family moved underneath the scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnknownCommitRecoveryCursor {
+    /// Exclusive continuation key: the next page starts strictly after it.
+    pub(crate) after: Option<OpaqueLabel>,
+    /// Owner-issued family revision this cursor is bound to.
+    pub(crate) source_revision: u64,
+    /// Hard page ceiling for one page, at most [`MAX_RECOVERY_PAGE`].
+    pub(crate) limit: u16,
+}
+
+impl UnknownCommitRecoveryCursor {
+    /// Starts a cursor over the family at `source_revision`.
+    pub fn start(source_revision: u64, limit: u16) -> Result<Self, OrsError> {
+        let value = Self {
+            after: None,
+            source_revision,
+            limit,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Returns the exclusive continuation of this cursor after one key.
+    pub(crate) fn continue_after(&self, after: OpaqueLabel) -> Self {
+        Self {
+            after: Some(after),
+            source_revision: self.source_revision,
+            limit: self.limit,
+        }
+    }
+
+    /// Validates the cursor before any table is opened.
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        if self.limit == 0 || self.limit > MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        Ok(())
+    }
+
+    /// Returns the owner-issued family revision this cursor is bound to.
+    #[must_use]
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    /// Returns the hard page ceiling this cursor was built with.
+    #[must_use]
+    pub const fn limit(&self) -> u16 {
+        self.limit
+    }
+}
+
+/// One bounded page of the open unknown-commit family.
+///
+/// `complete` is the coverage statement, and it is never inferred from a row
+/// count: it is true only when the page proved it reached the end of the
+/// family. A page that stopped at its ceiling carries `complete: false` and a
+/// `next_cursor`, and a caller that cannot continue has learned nothing about
+/// the records it did not reach.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnknownCommitRecoveryPage {
+    /// Owner-issued family revision this page was served under.
+    pub source_revision: u64,
+    /// Every still-open record this page reached, in durable key order.
+    pub records: Vec<UnknownCommitRecord>,
+    /// Exclusive continuation, present exactly when `complete` is false.
+    pub next_cursor: Option<UnknownCommitRecoveryCursor>,
+    /// Whether this page proved it covered the whole open family.
+    pub complete: bool,
+}
+
 /// Canonical head observation supplied alongside a receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalScopeObservation {
