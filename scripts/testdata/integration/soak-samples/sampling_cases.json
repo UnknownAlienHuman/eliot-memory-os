@@ -1,0 +1,61 @@
+{
+  "fixture_version": 1,
+  "provenance": "synthetic",
+  "counters_ok": [
+    {
+      "name": "working_set_bytes",
+      "value": 4096,
+      "unit": "bytes",
+      "status": "ok"
+    },
+    {
+      "name": "private_commit_bytes",
+      "value": 8192,
+      "unit": "bytes",
+      "status": "ok"
+    },
+    {
+      "name": "handle_count",
+      "value": 3,
+      "unit": "count",
+      "status": "ok"
+    }
+  ],
+  "counter_unknown": {
+    "name": "working_set_bytes",
+    "value": null,
+    "unit": "bytes",
+    "status": "unknown",
+    "reason": "access_denied",
+    "api_error": 5
+  },
+  "clock": {
+    "slots": [0, 1, 2, 3, 4, 5],
+    "monotonic_ms": [0, 100, 200, 300, 400, 500],
+    "wall_time_ms": [600, 500, 400, 300, 200, 100]
+  },
+  "missed_exit": {
+    "missed_slot": 2,
+    "lateness_ms": 1,
+    "exit_slot": 3,
+    "exit_code": 0,
+    "expected": {
+      "accepted_sample_slots": [0, 1],
+      "accepted_gap_slots": [2],
+      "accepted_exit_lifecycle_slots": [3],
+      "missing_obligation_slots": [4, 5],
+      "expected_slots": 6
+    }
+  },
+  "partial_write": {
+    "acceptedBytes": 7,
+    "following_write_attempts": 0,
+    "expected_valid_prefix_frozen": true,
+    "expected_in_band_terminal": false,
+    "expected_complete": false
+  },
+  "privacy_canary": {
+    "diagnostic_test_input": "CS1_SOAK_SYNTHETIC_SECRET_CANARY_942",
+    "expected_portable_occurrences": []
+  }
+}
