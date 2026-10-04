@@ -245,6 +245,175 @@ mod runtime_identity_diagnostics_tests {
         .expect("epoch")
     }
 
+    #[cfg(windows)]
+    fn test_launch_descriptor() -> EliotdLaunchDescriptor {
+        let executable = PlatformHandle::new(r"C:\ProgramData\Eliot\runtime\eliotd.exe")
+            .expect("executable handle");
+        let config = PlatformHandle::new(r"C:\ProgramData\Eliot\config\eliotd.json")
+            .expect("config handle");
+        let working_directory =
+            PlatformHandle::new(r"C:\ProgramData\Eliot\runtime").expect("working directory");
+        let executable_sha256 = "a".repeat(64);
+        let config_sha256 = "b".repeat(64);
+        let nonce = PlatformHandle::new("eliotd:0123456789abcdef0123456789abcdef")
+            .expect("launch nonce");
+        EliotdLaunchDescriptor {
+            wire_id: "eliot.kernel.eliotd-launch".to_owned(),
+            wire_version: EliotdLaunchDescriptor::CONTRACT_VERSION,
+            executable,
+            executable_sha256: executable_sha256.clone(),
+            arguments: vec![
+                PlatformHandle::new("--config-descriptor").expect("argv one"),
+                config.clone(),
+                PlatformHandle::new("--config-descriptor-sha256").expect("argv three"),
+                PlatformHandle::new(config_sha256.as_str()).expect("argv four"),
+                PlatformHandle::new("--launch-nonce").expect("argv five"),
+                nonce.clone(),
+                PlatformHandle::new("--executable-sha256").expect("argv seven"),
+                PlatformHandle::new(executable_sha256.as_str()).expect("argv eight"),
+            ],
+            working_directory,
+            config_descriptor: config,
+            config_descriptor_sha256: config_sha256,
+            protected_snapshot_digest: "c".repeat(64),
+            launch_nonce: nonce,
+            authority_epoch: test_epoch(),
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+            restart_policy: None,
+            job_object_limits: None,
+            health_readiness_contract_ref: None,
+            descriptor_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("canonical launch descriptor digest")
+    }
+
+    #[cfg(windows)]
+    fn assert_observation_sequence(record: &str, expected: &[(&str, &str)]) {
+        let records = record.lines().collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            expected.len(),
+            "each reached identity boundary emits exactly one record: {record}"
+        );
+        for (record, &(event, outcome)) in records.into_iter().zip(expected) {
+            assert_single_observation(record, event, outcome);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn launch_attempt_identity_projects_the_exact_digest_and_never_a_refusal() {
+        let launch = test_launch_descriptor();
+        let launch_before = launch.clone();
+        let image_path = r"C:\ProgramData\Eliot\runtime\eliotd.exe";
+        // Exact serde_json struct-order bytes: AttemptBinding declares
+        // authority_epoch, generation, launch_nonce, kernel_process_id,
+        // kernel_start_time_100ns, kernel_image_path; EpochId serializes its
+        // transparent lineage string then its numeric NonZeroU64 sequence.
+        const EXPECTED_ATTEMPT_BINDING_JSON: &str = concat!(
+            r#"{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":3},"#,
+            r#""generation":1,"launch_nonce":"eliotd:0123456789abcdef0123456789abcdef","#,
+            r#""kernel_process_id":4242,"kernel_start_time_100ns":987654321,"#,
+            r#""kernel_image_path":"C:\\ProgramData\\Eliot\\runtime\\eliotd.exe"}"#
+        );
+        let mut derived = None;
+        let record = capture(|| {
+            derived = Some(eliotd_launch_attempt_identity(
+                &launch, 4242, 987_654_321, image_path,
+            ));
+        });
+        let identity = derived.expect("launch-attempt identity result").unwrap_or_else(|error| {
+            panic!("serializable launch identity inputs must derive successfully: {error:?}")
+        });
+
+        // The fixed AttemptBinding is composed only of EpochId, u64, &str,
+        // u32, u64, and &str. Each is infallibly serializable by serde_json;
+        // this success leg therefore also proves the serialization-refusal
+        // event is absent without manufacturing an impossible serializer.
+        assert_eq!(
+            identity,
+            "891ca56b6cf5aba5434de399828a2d62a6521e8957cb32e2bbdd95430ffd6a2d",
+            "the launch-attempt digest binds the exact typed serialization"
+        );
+        assert_eq!(
+            identity,
+            sha256_hex(EXPECTED_ATTEMPT_BINDING_JSON.as_bytes()),
+            "the golden digest is SHA-256 of the exact fixed AttemptBinding bytes"
+        );
+        assert_observation_sequence(
+            &record,
+            &[("kernel.identity.launch_attempt_derived", "success")],
+        );
+        assert!(
+            !record.contains("kernel.identity.launch_attempt_failed"),
+            "fixed serializable AttemptBinding fields cannot reach the serde refusal arm: {record}"
+        );
+        assert!(
+            !record.contains("ProgramData") && !record.contains("0123456789abcdef"),
+            "the launch image path and nonce must not enter the diagnostic surface: {record}"
+        );
+        assert_eq!(launch, launch_before, "identity derivation is read-only");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn launch_descriptor_refresh_records_requested_then_refreshed_and_preserves_input() {
+        let previous = test_launch_descriptor();
+        let previous_before = previous.clone();
+        let mut refreshed = None;
+        let record = capture(|| {
+            refreshed = Some(fresh_eliotd_launch_descriptor(&previous, 7));
+        });
+        let refreshed = refreshed
+            .expect("refresh result")
+            .unwrap_or_else(|error| panic!("a validated launch descriptor refreshes: {error:?}"));
+
+        assert_observation_sequence(
+            &record,
+            &[
+                ("kernel.identity.launch_refresh_requested", "attempt"),
+                ("kernel.identity.launch_descriptor_refreshed", "success"),
+            ],
+        );
+        assert!(refreshed.validate().is_ok(), "the refreshed descriptor validates");
+        assert_ne!(refreshed.launch_nonce, previous.launch_nonce);
+        assert_eq!(refreshed.arguments[5], refreshed.launch_nonce);
+        assert_ne!(refreshed.descriptor_sha256, previous.descriptor_sha256);
+        assert_eq!(previous, previous_before, "refresh must not mutate its input");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn invalid_launch_descriptor_refresh_keeps_the_typed_refusal_and_event_order() {
+        let mut invalid = test_launch_descriptor();
+        invalid.launch_nonce = PlatformHandle::new("eliotd:fedcba9876543210fedcba9876543210")
+            .expect("test nonce handle");
+        let invalid_before = invalid.clone();
+        let validation_error = invalid
+            .validate()
+            .expect_err("changing the nonce without matching argv invalidates the descriptor")
+            .to_string();
+        let mut refreshed = None;
+        let record = capture(|| {
+            refreshed = Some(fresh_eliotd_launch_descriptor(&invalid, 8));
+        });
+        let result = refreshed.expect("refresh result");
+        let Err(KernelBuildError::Service(reason)) = result else {
+            panic!("invalid launch descriptors remain typed Service refusals");
+        };
+
+        assert_eq!(reason, validation_error);
+        assert_observation_sequence(
+            &record,
+            &[
+                ("kernel.identity.launch_refresh_requested", "attempt"),
+                ("kernel.identity.launch_refresh_failed", "rejected"),
+            ],
+        );
+        assert_eq!(invalid, invalid_before, "a refused refresh is read-only");
+    }
+
     #[test]
     fn identity_digest_derivation_is_stable_and_secret_free() {
         // The real derivation runs through the existing caller path: same

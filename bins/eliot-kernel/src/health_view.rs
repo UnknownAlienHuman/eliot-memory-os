@@ -691,6 +691,45 @@ mod health_view_diagnostics_tests {
         pairs
     }
 
+    fn captured_health_field_keys(record: &str) -> Vec<String> {
+        let bytes = record.as_bytes();
+        let mut keys = Vec::new();
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != b'=' || index == 0 {
+                continue;
+            }
+            let mut start = index;
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+            {
+                start -= 1;
+            }
+            if start < index {
+                keys.push(record[start..index].to_owned());
+            }
+        }
+        keys
+    }
+
+    fn assert_health_observation_sequence(text: &str, expected: &[(&str, &str)]) {
+        let expected = expected
+            .iter()
+            .map(|(event, outcome)| ((*event).to_owned(), (*outcome).to_owned()))
+            .collect::<Vec<_>>();
+        for record in text.lines() {
+            assert_eq!(
+                captured_health_field_keys(record),
+                vec!["event".to_owned(), "outcome".to_owned()],
+                "a health observation carries exactly event and outcome fields: {record}"
+            );
+        }
+        assert_eq!(
+            captured_event_outcome_pairs(text),
+            expected,
+            "the production health call sites must emit exactly these ordered event/outcome pairs: {text}"
+        );
+    }
+
     /// Scans the WHOLE captured surface and requires that no readiness word
     /// reaches it, so an observation can never add a claim the returned view does
     /// not itself make (map row 25's noninterference claim). Of the three words,
@@ -1054,6 +1093,37 @@ mod health_view_diagnostics_tests {
         );
     }
 
+    /// Leaves this fixture's production snapshot-policy owner poisoned so
+    /// `daemon_snapshot` reaches its real unreadable-lock refusal branch.
+    fn poison_front_door_policy_owner(kernel: &KernelComposition) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = kernel
+                .front_door_policy
+                .lock()
+                .expect("front-door policy owner guard");
+            panic!("poison the front-door policy owner for snapshot omission proof");
+        }));
+        assert!(
+            outcome.is_err(),
+            "the fixture must leave the front-door policy owner guard poisoned"
+        );
+    }
+
+    #[cfg(windows)]
+    fn poison_canonical_store_gateway_owner(kernel: &KernelComposition) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = kernel
+                .canonical_store_gateway
+                .lock()
+                .expect("canonical Store gateway owner guard");
+            panic!("poison the canonical Store gateway owner for health refusal proof");
+        }));
+        assert!(
+            outcome.is_err(),
+            "the fixture must leave the canonical Store gateway guard poisoned"
+        );
+    }
+
     /// Leaves the production host-request connection index guard poisoned so the
     /// unreadable leg of `daemon_route_metrics_projection` is reached through the
     /// real refusal path at `health_view.rs:327`-`:330` rather than through a
@@ -1106,10 +1176,12 @@ mod health_view_diagnostics_tests {
             policy.config_snapshot["protected_snapshot_digest"],
             serde_json::Value::String(launch.protected_snapshot_digest.clone())
         );
-        let snapshot = fixture
-            .kernel
-            .daemon_snapshot()
-            .expect("assembled snapshot");
+        let (captured, result) = capture_with(|| fixture.kernel.daemon_snapshot());
+        let snapshot = result.expect("assembled snapshot");
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.snapshot_projected", "success")],
+        );
         assert_eq!(
             snapshot["artifact_digest"],
             policy.config_snapshot["artifact_digest"]
@@ -1152,6 +1224,10 @@ mod health_view_diagnostics_tests {
         readable_snapshot.expect("a fully populated policy snapshot must project");
         let readable_events = captured_field_values(&readable_text, "event");
         let readable_outcomes = captured_field_values(&readable_text, "outcome");
+        assert_health_observation_sequence(
+            &readable_text,
+            &[("kernel.health.snapshot_projected", "success")],
+        );
         assert_eq!(
             readable_outcomes,
             vec!["success".to_owned()],
@@ -1166,6 +1242,10 @@ mod health_view_diagnostics_tests {
             missing_artifact,
             Err(TransportError::SessionFenced)
         ));
+        assert_health_observation_sequence(
+            &missing_artifact_text,
+            &[("kernel.health.snapshot_omitted", "missing_artifact")],
+        );
         assert_no_readable_reading(
             &missing_artifact_text,
             &readable_events,
@@ -1191,6 +1271,10 @@ mod health_view_diagnostics_tests {
             invalid_protected,
             Err(TransportError::SessionFenced)
         ));
+        assert_health_observation_sequence(
+            &invalid_protected_text,
+            &[("kernel.health.snapshot_omitted", "invalid_protected")],
+        );
         assert_no_readable_reading(
             &invalid_protected_text,
             &readable_events,
@@ -1209,6 +1293,10 @@ mod health_view_diagnostics_tests {
             missing_protected,
             Err(TransportError::SessionFenced)
         ));
+        assert_health_observation_sequence(
+            &missing_protected_text,
+            &[("kernel.health.snapshot_omitted", "missing_protected")],
+        );
         assert_no_readable_reading(
             &missing_protected_text,
             &readable_events,
@@ -1265,6 +1353,10 @@ mod health_view_diagnostics_tests {
         );
         let (readable_text, _) = capture_with(|| fixture.kernel.daemon_snapshot());
         let readable_outcomes = captured_field_values(&readable_text, "outcome");
+        assert_health_observation_sequence(
+            &readable_text,
+            &[("kernel.health.snapshot_projected", "success")],
+        );
         assert_eq!(
             readable_outcomes,
             vec!["success".to_owned()],
@@ -1273,6 +1365,10 @@ mod health_view_diagnostics_tests {
 
         clear_policy_field(&fixture.kernel, "protected_snapshot_digest");
         let (benign_text, benign_snapshot) = capture_with(|| fixture.kernel.daemon_snapshot());
+        assert_health_observation_sequence(
+            &benign_text,
+            &[("kernel.health.snapshot_projected", "success")],
+        );
         let benign_snapshot =
             benign_snapshot.expect("an absent protected digest without a launch stays projectable");
         assert_eq!(
@@ -1338,6 +1434,44 @@ mod health_view_diagnostics_tests {
         assert_snapshot_byte_identical(
             &launched.kernel,
             "absent protected digest under an admitted launch",
+        );
+    }
+
+    #[test]
+    fn unreadable_front_door_policy_records_fenced_snapshot_omission() {
+        let fixture = plain_composition("snapshot-policy-omission");
+        set_policy_field(
+            &fixture.kernel,
+            "protected_snapshot_digest",
+            serde_json::Value::String("f".repeat(64)),
+        );
+        let (readable_text, readable) = capture_with(|| fixture.kernel.daemon_snapshot());
+        assert!(readable.is_ok(), "the live policy owner starts readable");
+        assert_health_observation_sequence(
+            &readable_text,
+            &[("kernel.health.snapshot_projected", "success")],
+        );
+
+        poison_front_door_policy_owner(&fixture.kernel);
+
+        let (captured, omitted) = capture_with(|| fixture.kernel.daemon_snapshot());
+        assert!(
+            matches!(omitted.as_ref(), Err(TransportError::SessionFenced)),
+            "an unreadable policy owner must keep the typed snapshot refusal: {omitted:?}"
+        );
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.snapshot_omitted", "fenced")],
+        );
+        let unobserved = fixture.kernel.daemon_snapshot();
+        assert!(matches!(
+            unobserved.as_ref(),
+            Err(TransportError::SessionFenced)
+        ));
+        assert_eq!(
+            snapshot_result_bytes(&omitted),
+            snapshot_result_bytes(&unobserved),
+            "the observation must not alter the unreadable owner's typed snapshot result"
         );
     }
 
@@ -1490,9 +1624,17 @@ mod health_view_diagnostics_tests {
         poison_lifecycle_owner(&fixture.kernel);
 
         let (omitted_capture, omitted_lifecycle) = capture_with(|| fixture.kernel.service_state());
-        assert!(
-            matches!(omitted_lifecycle, Err(KernelServiceError::Platform(_))),
-            "an unreadable lifecycle owner must stay a typed refusal, got: {omitted_lifecycle:?}"
+        assert_health_observation_sequence(
+            &omitted_capture,
+            &[(SERVICE_STATE_OMITTED_EVENT, "fenced")],
+        );
+        let omitted_reason = match &omitted_lifecycle {
+            Err(KernelServiceError::Platform(reason)) => reason.as_str(),
+            other => panic!("an unreadable lifecycle owner must stay a typed refusal: {other:?}"),
+        };
+        assert_eq!(
+            omitted_reason, "service lock poisoned",
+            "the exact owner-lock refusal is part of the typed result"
         );
         let omitted_outcomes = captured_field_values(&omitted_capture, "outcome");
         assert_eq!(
@@ -1511,6 +1653,16 @@ mod health_view_diagnostics_tests {
                 "an omitted lifecycle input must not reuse the readable outcome {outcome}, got: {omitted_capture}"
             );
         }
+        let unobserved_lifecycle = fixture.kernel.service_state();
+        let unobserved_reason = match unobserved_lifecycle {
+            Err(KernelServiceError::Platform(reason)) => reason,
+            other => panic!("the poisoned owner remains a typed refusal: {other:?}"),
+        };
+        assert_eq!(
+            omitted_reason,
+            unobserved_reason.as_str(),
+            "the observation must not alter the unreadable owner's service-state result"
+        );
 
         let (total_text, total) = capture_with(|| fixture.kernel.activation_operational_view());
         assert_eq!(
@@ -1893,6 +2045,10 @@ mod health_view_diagnostics_tests {
             vec!["unknown".to_owned()],
             "an unobserved Store health reading must be recorded as unknown, got: {captured}"
         );
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.store_absent", "unknown")],
+        );
         assert_eq!(
             captured_field_values(&captured, "event").len(),
             1,
@@ -1908,6 +2064,164 @@ mod health_view_diagnostics_tests {
             health_result_bytes(&result),
             health_result_bytes(&unobserved),
             "the diagnostic observation must change no returned byte of the Store health result"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unreadable_store_gateway_records_fenced_typed_health_refusal() {
+        let fixture = plain_composition("store-gateway-fenced");
+        assert!(
+            fixture
+                .kernel
+                .canonical_store_gateway
+                .lock()
+                .expect("fixture Store gateway owner guard")
+                .is_none(),
+            "the fresh composition has no admitted Store gateway"
+        );
+        poison_canonical_store_gateway_owner(&fixture.kernel);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("single-threaded test runtime");
+        let (captured, observed) =
+            capture_with(|| runtime.block_on(fixture.kernel.daemon_health()));
+        let observed_reason = match &observed {
+            Err(KernelServiceError::Platform(reason)) => reason.as_str(),
+            other => panic!("an unreadable Store gateway must stay a typed refusal: {other:?}"),
+        };
+        assert_eq!(observed_reason, "store gateway lock poisoned");
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.store_unavailable", "fenced")],
+        );
+
+        let unobserved = runtime.block_on(fixture.kernel.daemon_health());
+        let unobserved_reason = match &unobserved {
+            Err(KernelServiceError::Platform(reason)) => reason.as_str(),
+            other => panic!("the poisoned Store gateway remains a typed refusal: {other:?}"),
+        };
+        assert_eq!(
+            observed_reason,
+            unobserved_reason,
+            "the observation must not alter the unreadable Store owner's result"
+        );
+        assert_eq!(
+            health_result_bytes(&observed),
+            health_result_bytes(&unobserved),
+            "the observed and repeated typed Store failures must remain byte-equivalent"
+        );
+    }
+
+    #[test]
+    fn health_response_projects_the_typed_store_value_and_records_known() {
+        let health = StoreHealth {
+            status: StoreHealthStatus::Degraded,
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            manifest_digest: eliot_store_api::OperationManifestDigest::new("a".repeat(64))
+                .expect("manifest digest"),
+        };
+        let health_value = serde_json::to_value(&health).expect("typed health serializes");
+        let expected = serde_json::json!({
+            "status": "known",
+            "value": {"kind": "health", "value": health_value},
+            "recovery": null,
+        });
+
+        let (captured, response) =
+            capture_with(|| KernelComposition::daemon_health_response(&health));
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.response_projected", "known")],
+        );
+        assert_eq!(response, expected);
+        assert_eq!(
+            response,
+            KernelComposition::daemon_health_response(&health),
+            "the diagnostic observation must not alter the projected response"
+        );
+        assert_eq!(
+            serde_json::to_value(&health).expect("typed health remains serializable"),
+            expected["value"]["value"],
+            "projection must not mutate the owner-supplied Store health"
+        );
+    }
+
+    #[test]
+    fn missing_diagnostic_brief_projects_unknown_and_records_unknown() {
+        let fixture = plain_composition("brief-unknown");
+        assert!(
+            fixture.kernel.retained_diagnostic_brief().is_none(),
+            "a fresh composition owns no retained brief to project"
+        );
+
+        let (captured, projection) =
+            capture_with(|| fixture.kernel.diagnostic_brief_projection());
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.diagnostic_brief_projected", "unknown")],
+        );
+        assert_eq!(projection, serde_json::json!({"status": "unknown"}));
+        assert_eq!(
+            projection,
+            fixture.kernel.diagnostic_brief_projection(),
+            "the observation must not alter the missing-brief projection"
+        );
+    }
+
+    #[test]
+    fn recovery_view_response_projects_only_its_four_fields_and_records_known() {
+        let view = RecoveryView::new(
+            serde_json::json!({"artifact_digest": "a".repeat(64)}),
+            serde_json::json!({"generation": 3, "authority_epoch": "epoch-canary"}),
+            serde_json::json!({"status": "degraded"}),
+            serde_json::json!({"status": "unknown"}),
+        );
+        let before = view.clone();
+        let expected = serde_json::json!({
+            "build": {"artifact_digest": "a".repeat(64)},
+            "generation": {"generation": 3, "authority_epoch": "epoch-canary"},
+            "ors": {"status": "degraded"},
+            "incident": {"status": "unknown"},
+        });
+
+        let (captured, response) =
+            capture_with(|| KernelComposition::recovery_view_response(&view));
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.recovery_view_projected", "known")],
+        );
+        assert_eq!(response, expected);
+        assert_eq!(view, before, "view projection is read-only");
+        assert_eq!(
+            response,
+            KernelComposition::recovery_view_response(&view),
+            "the observation must not alter the restricted recovery projection"
+        );
+    }
+
+    #[test]
+    fn semantic_recovery_deferral_records_the_composition_owned_unavailability() {
+        let fixture = plain_composition("semantic-recovery-deferred");
+        let availability = fixture.kernel.observed_kernel_availability();
+        assert_eq!(
+            availability,
+            KernelAvailability::Unavailable,
+            "the fresh composition's own cold service provides the unavailable reading"
+        );
+
+        let (captured, deferral) = capture_with(|| {
+            KernelComposition::deferred_semantic_recovery(availability)
+        });
+        assert_health_observation_sequence(
+            &captured,
+            &[("kernel.health.semantic_recovery_deferred", "known")],
+        );
+        assert_eq!(deferral, semantic_task_recovery_deferral());
+        assert_eq!(
+            deferral.reason,
+            "semantic task recovery deferred pending canonical access"
         );
     }
 
