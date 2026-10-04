@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn route_returns_the_pipeline_disposition_and_handoff_for_a_joined_group() {
-        let group = joined_group("a");
+        let mut group = joined_group("a");
         let routed = route_result(&group);
         let direct = pipeline_result(&group);
         // Both sides are the same `Result<ImprovementTerminalDisposition,
@@ -1032,6 +1032,26 @@ mod tests {
             routed_handoff.proposal_material_equality.domain,
             IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN
         );
+
+        // The equality at the top of this test cannot on its own tell a
+        // forwarder from a wrapper that returned one constant built from the
+        // same request: both sides would then be that constant, and the
+        // comparison would still pass. What separates the two is that the
+        // result is DERIVED FROM THE RECORDS, so exactly one field of exactly
+        // one borrowed record is mutated here and both results must move
+        // together, to the refusal production itself produces for that record.
+        // `check_evaluation_shape` admits exactly `Executed` and returns
+        // `EvidenceNotExecuted` for every other status, so the mutated group is
+        // refused before any later join is reached and a wrapper that returned
+        // a fixed admitted handoff could not produce this value.
+        group.evidence.execution = ImprovementEvidenceExecution::NotExecuted;
+        let mutated_direct = pipeline_result(&group);
+        let mutated_routed = route_result(&group);
+        let not_executed = PipelineError::EvidenceNotExecuted {
+            status: ImprovementEvidenceExecution::NotExecuted.label(),
+        };
+        assert_eq!(mutated_direct, Err(not_executed.clone()));
+        assert_eq!(mutated_routed, Err(not_executed));
     }
 
     #[test]
@@ -1047,11 +1067,20 @@ mod tests {
                 assert_eq!(handoff.campaign_id, group_b.proposal.campaign_id);
                 assert_eq!(handoff.experiment_scope_ref, "admitted-scope-2702-b");
                 assert_eq!(handoff.rollback_owner_id, ROLLBACK_OWNER);
+                // This arm reads an ADMITTED handoff, so it is bound by the same
+                // rule the module doc states for every admitted handoff: the
+                // advisory record is not an execution permit. The daemon wrapper
+                // never turns it into one, and the card requires this assertion
+                // on every admitted handoff, not only the joined-group one.
+                assert!(
+                    !handoff.execution_authorized,
+                    "the group B admitted handoff must not authorize execution"
+                );
             }
             other => panic!("group B must admit on its own, got {other:?}"),
         }
 
-        let mixed = mixed_groups(&group_a, &group_b);
+        let mut mixed = mixed_groups(&group_a, &group_b);
         let routed = route_result(&mixed);
         let direct = pipeline_result(&mixed);
         assert_eq!(routed, direct);
@@ -1066,6 +1095,21 @@ mod tests {
             }
             other => panic!("the mixed pair must be an unbound relation, got {other:?}"),
         }
+
+        // The refusal equivalence is proved the same way the admitted
+        // equivalence is: one field of one borrowed record is re-bound so the
+        // FIRST relation the proposal/candidate join compares now agrees, and
+        // the NEXT relation it compares is the one that refuses. Both paths must
+        // follow the records to that different relation, which neither could
+        // have produced from the mixed pair as it stood above.
+        mixed.candidate.candidate_id = group_a.candidate.candidate_id.clone();
+        let repaired_direct = pipeline_result(&mixed);
+        let repaired_routed = route_result(&mixed);
+        let next_relation = PipelineError::UnboundRelation {
+            relation: "proposal-candidate: campaign-identity-mismatch",
+        };
+        assert_eq!(repaired_direct, Err(next_relation.clone()));
+        assert_eq!(repaired_routed, Err(next_relation));
     }
 
     #[test]
