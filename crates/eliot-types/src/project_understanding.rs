@@ -129,9 +129,39 @@ pub struct ProjectUnderstandingEvidence {
     pub non_goals: Vec<String>,
 }
 
+/// Decodes a project-understanding `schema_version` and refuses anything but
+/// the single supported version, at the byte boundary.
+///
+/// Issue #935 Implementation 3: `validate_schema_version` was the record's only
+/// admission check, and a deserialized model could carry any `String` until some
+/// caller remembered to call it. This makes the refusal structural - an
+/// unsupported or misselected version cannot be decoded into a model at all, so
+/// it cannot reach an admission, comparison or continuity decision as
+/// current-shaped data.
+fn deserialize_project_understanding_schema_version<'de, D>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let found = String::deserialize(deserializer)?;
+    if found == PROJECT_UNDERSTANDING_SCHEMA_VERSION {
+        Ok(found)
+    } else {
+        Err(serde::de::Error::custom(
+            ProjectUnderstandingSchemaVersionError {
+                record: "ProjectUnderstandingModel",
+                found,
+                supported: PROJECT_UNDERSTANDING_SCHEMA_VERSION,
+            }
+            .to_string(),
+        ))
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectUnderstandingModel {
+    #[serde(deserialize_with = "deserialize_project_understanding_schema_version")]
     pub schema_version: String,
     pub project_id: ProjectId,
     pub task_id: String,
