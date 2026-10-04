@@ -359,10 +359,11 @@ fn open_existing_store(
 /// The handle is a writer, not a reader, and that is a property of the owner
 /// seam rather than of this call: `plan_canary_removal` takes the owner's
 /// `&RedbInstallationRegistry`, and every constructor of that type holds a redb
-/// `Database`. The only read-only registry entry point the installation crate
-/// publishes, `RedbInstallationRegistry::inspect_existing_at`, returns an
-/// `ApprovedGenerationRegistry` value and cannot be passed to that seam, so
-/// `run_plan_canary_removal` cannot reach it.
+/// `Database`. Neither read-only registry entry point the installation crate
+/// publishes — `RedbInstallationRegistry::inspect_existing` and
+/// `RedbInstallationRegistry::inspect_existing_at` — can be passed to that
+/// seam: both return an `ApprovedGenerationRegistry` value rather than the
+/// registry handle, so `run_plan_canary_removal` cannot reach either.
 ///
 /// The measured consequence is that opening this handle WRITES to the owner's
 /// registry file even when the caller only reads: redb commits a quick-repair
