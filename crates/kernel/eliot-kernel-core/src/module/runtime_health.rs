@@ -945,24 +945,157 @@ mod tests {
         ),
     ];
 
-    /// Returns the text before the first test module or `#[cfg(test)]` item.
+    /// Returns whether the line at `index` OPENS this file's test region.
     ///
-    /// Used only to separate production from test text. It matches WHOLE
+    /// Split out of `production_prefix` so the rule is stated once, without the
+    /// byte-offset arithmetic wrapped around it.
+    ///
+    /// `#[cfg(test)]` annotates a single item at least as often as it opens a
+    /// module, so it is a boundary only when the item it annotates is itself a
+    /// `mod`. Blank lines and further attributes may sit between the attribute
+    /// and its item, so the item is the first following line that is neither.
+    fn opens_test_region(lines: &[&str], index: usize) -> bool {
+        let trimmed = lines[index].trim();
+        if trimmed.starts_with("#[cfg(test)]") {
+            return lines[index + 1..]
+                .iter()
+                .map(|line| line.trim())
+                .find(|candidate| !candidate.is_empty() && !candidate.starts_with('#'))
+                .is_some_and(|item| item.starts_with("mod "));
+        }
+        // A bare `mod tests` / `mod <name>_tests` with no attribute above it.
+        trimmed
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.split([' ', '{', '(', ';']).next())
+            .is_some_and(|name| name == "tests" || name.ends_with("_tests"))
+    }
+
+    /// Returns the text before the line that opens this file's test region.
+    ///
+    /// Used only to separate production from test text, and it matches WHOLE
     /// LINES, not a bare substring: a doc comment or string literal that merely
     /// mentions `#[cfg(test)]` earlier in the file must not truncate the
     /// production prefix, or a real production consumer would be silently
     /// reclassified as test-only.
+    ///
+    /// The boundary is the first line that opens a test MODULE, not the first
+    /// line carrying a test annotation. Those are different things, and
+    /// treating the annotation as the boundary measurably reclassifies a real
+    /// production consumer: `bins/eliot-kernel/src/composition_bootstrap.rs:41`
+    /// puts `#[cfg(test)]` on a lone test-only `use super::{...}` import, so an
+    /// annotation-shaped boundary lands at `:41` and drops that file's actual
+    /// production literal - the `"pair_key"` in the generated registry
+    /// projection at `:76` - out of the production prefix. Under this rule the
+    /// same file has no test region at all, so it is classified whole and
+    /// `:76` stays in production, which is the measured truth.
+    ///
+    /// A file with no test region yields its whole text. That is the correct
+    /// answer for such a file rather than a fallback.
     fn production_prefix(source: &str) -> &str {
-        let boundary = source
-            .lines()
-            .position(|line| {
-                let trimmed = line.trim();
-                trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("mod tests")
-            })
+        let lines: Vec<&str> = source.lines().collect();
+        let boundary = (0..lines.len())
+            .find(|index| opens_test_region(&lines, *index))
             .map_or(source.len(), |index| {
+                // Every line contributes its own bytes plus the newline that
+                // `lines` removed, hence the `+ index`.
                 source.lines().take(index).map(str::len).sum::<usize>() + index
             });
         &source[..boundary]
+    }
+
+    /// The measured scan set: every consumer source this guard reads, keyed by
+    /// its full repository-relative path.
+    ///
+    /// This array and `EXPECTED_PRODUCTION_CONSUMERS` are TWO SEPARATE
+    /// LITERALS, and they must stay separate. The independence is the entire
+    /// point of the guard: the strings below are the bytes the scan actually
+    /// measured, while the table is what a human declares that measurement
+    /// should have been, so a source added to one and not the other fails the
+    /// length assertion and the per-row identity assertion instead of silently
+    /// reconciling with itself. Collapsing them into one array would make every
+    /// comparison below tautological.
+    ///
+    /// The identity form matches the table's for the same reason. Short
+    /// basenames are ambiguous across this set - `capability_cell.rs`,
+    /// `capability_cell_registry.rs` and `capability_cell_readback.rs` are three
+    /// different consumers, and `lib.rs` alone appears twice - so a per-row
+    /// `assert_eq!` over basenames compares spelling rather than identity, and
+    /// its result depends on the two lists happening to be in the same order
+    /// for reasons no reader can check.
+    fn scanned_sources() -> [(&'static str, &'static str); 14] {
+        [
+            (
+                "crates/kernel/eliot-kernel-core/src/module/runtime_health.rs",
+                OWNER_SOURCE,
+            ),
+            (
+                "crates/kernel/eliot-kernel-core/src/module/compatibility_handshake.rs",
+                HANDSHAKE_SOURCE,
+            ),
+            (
+                "crates/kernel/eliot-kernel-core/src/lib.rs",
+                KERNEL_CORE_LIB_SOURCE,
+            ),
+            (
+                "bins/eliot-kernel/src/frame_dispatch.rs",
+                FRAME_DISPATCH_SOURCE,
+            ),
+            (
+                "bins/eliot-kernel/src/generation_recovery.rs",
+                GENERATION_RECOVERY_SOURCE,
+            ),
+            (
+                "crates/foundation/eliot-bootstrap/src/capture.rs",
+                BOOTSTRAP_CAPTURE_SOURCE,
+            ),
+            (
+                "crates/foundation/eliot-bootstrap/src/normative.rs",
+                BOOTSTRAP_NORMATIVE_SOURCE,
+            ),
+            (
+                "workspace/tools/eliot-runtime-compiler/src/lib.rs",
+                RUNTIME_COMPILER_SOURCE,
+            ),
+            ("bins/eliot/src/bootstrap_draft.rs", BOOTSTRAP_DRAFT_SOURCE),
+            (
+                "crates/instrument/eliot-instrument-runner/src/testd_registry.rs",
+                TESTD_REGISTRY_SOURCE,
+            ),
+            (
+                "crates/foundation/eliot-contracts/src/capability_cell_registry.rs",
+                CAPABILITY_CELL_REGISTRY_SOURCE,
+            ),
+            (
+                "bins/eliot-kernel/src/composition_bootstrap.rs",
+                COMPOSITION_BOOTSTRAP_SOURCE,
+            ),
+            (
+                "bins/eliot-mod-research/src/capability_cell.rs",
+                RESEARCH_CAPABILITY_CELL_SOURCE,
+            ),
+            (
+                "crates/meta/eliot-runtime-status/src/capability_cell_readback.rs",
+                CAPABILITY_CELL_READBACK_SOURCE,
+            ),
+        ]
+    }
+
+    /// Returns whether `binding` reaches the current identity through the owner
+    /// or the accepted receipt, rather than restating it locally.
+    ///
+    /// The enumeration's counting half and the closed-debt half partition the
+    /// same population, so they must not each carry their own private copy of
+    /// the split: the first asserts `owner_bound + declared == total`, the
+    /// second asserts the complement is exactly the declared debt. One shared
+    /// predicate keeps the halves complementary by construction instead of by
+    /// two lists that happen to agree today.
+    fn binds_through_owner_or_receipt(binding: PairBinding) -> bool {
+        matches!(
+            binding,
+            PairBinding::OwnerDeclaration
+                | PairBinding::OwnerConstant
+                | PairBinding::ReceiptDerived
+        )
     }
 
     /// Enumerates every measured production current-pair consumer and checks
@@ -973,28 +1106,7 @@ mod tests {
     /// declared for it in `EXPECTED_PRODUCTION_CONSUMERS`.
     #[test]
     fn every_production_current_pair_consumer_is_enumerated() {
-        let sources = [
-            ("runtime_health.rs", OWNER_SOURCE),
-            ("compatibility_handshake.rs", HANDSHAKE_SOURCE),
-            ("eliot-kernel-core/src/lib.rs", KERNEL_CORE_LIB_SOURCE),
-            ("capture.rs", BOOTSTRAP_CAPTURE_SOURCE),
-            ("normative.rs", BOOTSTRAP_NORMATIVE_SOURCE),
-            ("eliot-runtime-compiler/src/lib.rs", RUNTIME_COMPILER_SOURCE),
-            ("bootstrap_draft.rs", BOOTSTRAP_DRAFT_SOURCE),
-            ("testd_registry.rs", TESTD_REGISTRY_SOURCE),
-            ("frame_dispatch.rs", FRAME_DISPATCH_SOURCE),
-            ("generation_recovery.rs", GENERATION_RECOVERY_SOURCE),
-            (
-                "capability_cell_registry.rs",
-                CAPABILITY_CELL_REGISTRY_SOURCE,
-            ),
-            (
-                "capability_cell_readback.rs",
-                CAPABILITY_CELL_READBACK_SOURCE,
-            ),
-            ("composition_bootstrap.rs", COMPOSITION_BOOTSTRAP_SOURCE),
-            ("capability_cell.rs", RESEARCH_CAPABILITY_CELL_SOURCE),
-        ];
+        let sources = scanned_sources();
 
         // The scan set and the hand-declared set must be the same size and
         // agree on identity. Without this a source could be added to one list
@@ -1023,18 +1135,17 @@ mod tests {
                 "{file} no longer contains its declared touchpoint {needle:?} outside \
                  its test module, so this enumeration's expectation is out of date"
             );
-            let actual = classify_pair_binding(source);
+            // Classified on the PRODUCTION PREFIX, not on the whole file: a
+            // source whose only binding sits inside its test region does not
+            // bind the production identity at all, and scoring it from test
+            // text would credit production with a consumer it does not have.
+            let actual = classify_pair_binding(production_prefix(source));
             assert_eq!(
                 actual, *expected_binding,
                 "{file} ({needle}) no longer binds the current pair the way this \
                  enumeration declares it does"
             );
-            if matches!(
-                actual,
-                PairBinding::OwnerDeclaration
-                    | PairBinding::OwnerConstant
-                    | PairBinding::ReceiptDerived
-            ) {
+            if binds_through_owner_or_receipt(actual) {
                 owner_bound += 1;
             }
         }
@@ -1059,33 +1170,44 @@ mod tests {
     /// the owner fails this guard.
     ///
     /// This is the property the card asks for - "so a new current-pair literal
-    /// outside the owner fails it" - expressed as a closed set. Each measured
-    /// non-owner binding must be one the enumeration already declares; a
-    /// source binding outside the owner that is not in
+    /// outside the owner fails it" (`cards/1067.md:17`) - expressed as a closed
+    /// set. Each measured non-owner binding must be one the enumeration already
+    /// declares; a source binding outside the owner that is not in
     /// `DECLARED_BINDINGS_OUTSIDE_OWNER` is undeclared debt and fails here.
+    ///
+    /// The input is MEASURED, not copied from the expectation. Filtering
+    /// `EXPECTED_PRODUCTION_CONSUMERS` here would make the assertion a copy of
+    /// the table it polices: it could only ever re-derive the declaration, and a
+    /// scanned source that genuinely changed its binding could not fail it.
+    /// Classification therefore runs over each scanned source's own production
+    /// prefix here, which is what gives the check teeth; the table it is checked
+    /// against stays the independent literal.
     #[test]
     fn a_current_pair_binding_outside_the_owner_must_be_declared() {
-        let outside_owner: Vec<(&str, PairBinding)> = EXPECTED_PRODUCTION_CONSUMERS
+        // Negative control: a genuinely NEW current-pair literal owner, which is
+        // the condition `cards/1067.md:17` requires this guard to catch. It is
+        // paired with the measured scan rather than added to it, because a file
+        // that does not exist cannot be embedded by `include_str!`.
+        const NEW_LITERAL_OWNER: &str =
+            "crates/meta/eliot-runtime-status/src/capability_cell_projection.rs";
+        const NEW_LITERAL_OWNER_SOURCE: &str = r#"
+            const EXPECTED_NORMATIVE_PAIR_KEY: &str =
+                "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1";
+        "#;
+        let measured: Vec<(&str, PairBinding)> = scanned_sources()
             .iter()
-            .filter(|(_, _, binding)| {
-                *binding != PairBinding::OwnerDeclaration
-                    && *binding != PairBinding::OwnerConstant
-                    && *binding != PairBinding::ReceiptDerived
-            })
-            .map(|(file, _, binding)| (*file, *binding))
+            .map(|(file, source)| (*file, classify_pair_binding(production_prefix(source))))
+            .filter(|(_, binding)| !binds_through_owner_or_receipt(*binding))
             .collect();
 
         assert_eq!(
-            outside_owner.len(),
+            measured.len(),
             DECLARED_BINDINGS_OUTSIDE_OWNER.len(),
             "every production binding outside the owner must be declared in \
              DECLARED_BINDINGS_OUTSIDE_OWNER; undeclared: {:?}",
-            outside_owner
-                .iter()
-                .map(|(file, _)| *file)
-                .collect::<Vec<_>>()
+            measured.iter().map(|(file, _)| *file).collect::<Vec<_>>()
         );
-        for (file, binding) in &outside_owner {
+        for (file, binding) in &measured {
             // Matched BY PATH, not by binding kind: kind-only matching would let
             // one declared RestatedLiteral stand in for any other, so a new
             // literal owner could appear while this loop stayed green.
@@ -1094,6 +1216,42 @@ mod tests {
                 "{file} binds the current pair outside the owner as {binding:?}, which is not declared"
             );
         }
+
+        // Positive control on the predicate the loop above uses: a MEASURED row
+        // must be found by it. Without this the negative control below could
+        // pass merely because the predicate rejects everything.
+        let Some(first_measured) = measured.first().copied() else {
+            panic!("a measured non-owner binding must exist for this guard to have teeth");
+        };
+        assert!(
+            DECLARED_BINDINGS_OUTSIDE_OWNER.contains(&first_measured),
+            "a measured debt row must be found by the same predicate the negative \
+             control fails, or that control is vacuous"
+        );
+
+        assert_eq!(
+            classify_pair_binding(NEW_LITERAL_OWNER_SOURCE),
+            PairBinding::RestatedLiteral,
+            "a new source carrying its own pair-key literal must classify as RestatedLiteral"
+        );
+        assert!(
+            !binds_through_owner_or_receipt(classify_pair_binding(NEW_LITERAL_OWNER_SOURCE)),
+            "a new literal owner binds outside the owner, so the closed-set \
+             predicate must apply to it"
+        );
+        assert!(
+            !DECLARED_BINDINGS_OUTSIDE_OWNER
+                .iter()
+                .any(|(file, _)| *file == NEW_LITERAL_OWNER),
+            "the negative control's path must not already be declared, or the \
+             control would prove nothing"
+        );
+        assert!(
+            !DECLARED_BINDINGS_OUTSIDE_OWNER
+                .contains(&(NEW_LITERAL_OWNER, PairBinding::RestatedLiteral)),
+            "a new current-pair literal outside the owner matches no declared row, \
+             which is why adding one to a scanned source fails this guard"
+        );
     }
 
     /// Refusal: a literal-bearing source is detected, and name matching on the
@@ -1194,10 +1352,10 @@ mod tests {
                  boundary to mean anything"
             );
             assert!(
-                production_prefix(source).contains("CURRENT_NORMATIVE_PAIR_KEY"),
-                "{file} reads the owner constant outside its test module, so it \
-                 is a production consumer after all and this enumeration's \
-                 expected set is out of date"
+                !production_prefix(source).contains("CURRENT_NORMATIVE_PAIR_KEY"),
+                "{file} reads the owner constant outside its test module, so it IS a \
+                 production consumer after all and this enumeration's expected set is \
+                 out of date"
             );
         }
     }
