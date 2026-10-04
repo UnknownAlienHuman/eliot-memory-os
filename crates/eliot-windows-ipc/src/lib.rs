@@ -1586,14 +1586,23 @@ impl ProcessTreeGuard {
 struct OwnedHandle(HANDLE);
 
 // SAFETY: a Windows kernel handle value is usable from any thread. This
-// wrapper keeps unique ownership of its single `HANDLE` field: it is created
-// only via `new` (both failure sentinels, null and `INVALID_HANDLE_VALUE`,
-// rejected), closed exactly once in `Drop` (or, under an armed
-// `FaultBoundary::Cleanup` fault, deliberately left open exactly once and
-// counted as unresolved), or moved exactly once into `File` via `into_file`
-// (`mem::forget` prevents a double close). `Send` therefore transfers only
-// the unique owner. `Sync` is deliberately not implemented: concurrent
-// shared access is not established.
+// wrapper keeps unique ownership of its single `HANDLE` field. Uniqueness does
+// NOT rest on `new` being the only construction path: the private field is
+// module-scoped, so the same module also builds the type directly as a tuple
+// struct at `SuspendedProcessGuard::into_handles` (lib.rs:2230), bypassing
+// `new` and its sentinel rejection. That call is sound only because
+// `SuspendedProcessGuard::new` already performed the dual-sentinel rejection
+// (null and `INVALID_HANDLE_VALUE`, lib.rs:2186-2190) on the very same
+// `PROCESS_INFORMATION` fields, and the `debug_assert!` pair at
+// lib.rs:2224-2225 re-checks both sentinels -- those compile to nothing in a
+// release build, so the release-mode guarantee is entirely the earlier
+// rejection in `new`. Every other construction site goes through `new`, whose
+// own check at lib.rs:1607 rejects both failure sentinels. The value is then
+// closed exactly once in `Drop` (or, under an armed `FaultBoundary::Cleanup`
+// fault, deliberately left open exactly once and counted as unresolved), or
+// moved exactly once into `File` via `into_file` (`mem::forget` prevents a
+// double close). `Send` therefore transfers only the unique owner. `Sync` is
+// deliberately not implemented: concurrent shared access is not established.
 unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
@@ -1656,6 +1665,15 @@ fn create_kill_on_close_job(name: &str) -> io::Result<OwnedHandle> {
     // SAFETY: the name is NUL-terminated and the security descriptor and
     // attributes remain live for the complete creation call.
     let raw_job = unsafe { CreateJobObjectW(&raw const attributes, name.as_ptr()) };
+    // SAFETY: `GetLastError` is a parameterless accessor: it takes no name, no
+    // security descriptor and no attributes, so the pointer-liveness conditions
+    // documented on the `CreateJobObjectW` call above cannot be violated here.
+    // Reading the thread's last-error value immediately after that call is
+    // sound because `CreateJobObjectW` sets last-error before it returns on
+    // every path, so this always observes that call's own error state rather
+    // than an unrelated stale value. The read is only acted on once `new` has
+    // accepted the handle, so the value is consumed solely in the
+    // `ERROR_ALREADY_EXISTS` case and never drives an unsound operation.
     let creation_error = unsafe { GetLastError() };
     let job = OwnedHandle::new(raw_job)?;
     if creation_error == ERROR_ALREADY_EXISTS {
@@ -2223,10 +2241,22 @@ impl SuspendedProcessGuard {
         self.armed = false;
         debug_assert!(!self.process.is_null() && self.process != INVALID_HANDLE_VALUE);
         debug_assert!(!self.thread.is_null() && self.thread != INVALID_HANDLE_VALUE);
-        // SAFETY: both handles were proven live by `new`'s dual-sentinel
-        // rejection; the fields are private and never mutated before this
+        // The two `debug_assert!`s above compile to nothing in a release
+        // build, so they are not what makes the transfer below sound: the
+        // release-mode guarantee is the dual-sentinel rejection that
+        // `SuspendedProcessGuard::new` already applied to these same
+        // `PROCESS_INFORMATION` fields before constructing this guard.
+        // SAFETY: the two `OwnedHandle`s built on the next line are direct
+        // tuple-struct constructions that bypass `OwnedHandle::new` and
+        // therefore run no sentinel check of their own. They are sound only
+        // because both handles were proven live -- neither null nor
+        // `INVALID_HANDLE_VALUE` -- by `new`'s earlier dual-sentinel
+        // rejection on the very fields consumed here; the `debug_assert!`s
+        // above re-check that but are compiled out in release. The `process`
+        // and `thread` fields are private and never mutated before this
         // single transfer, and `armed = false` disables the Drop cleanup, so
-        // ownership moves into the two `OwnedHandle`s exactly once.
+        // ownership moves into the two `OwnedHandle`s exactly once and no
+        // sentinel can reach `CloseHandle`.
         (OwnedHandle(self.process), OwnedHandle(self.thread))
     }
 }
@@ -2851,10 +2881,18 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
                 &raw mut returned,
             )
         };
-        // SAFETY: `buffer` is `Vec<usize>` (pointer-aligned) and always holds
-        // at least the fixed header: capacity starts at 16 entries and only
-        // grows, so this header read stays in bounds on both paths and
-        // overlaps no live mutable borrow.
+        // SAFETY: `buffer` is `Vec<usize>`, so `buffer.as_ptr()` carries the
+        // word alignment `align_of::<usize>()`; the Win32
+        // `JOBOBJECT_BASIC_PROCESS_ID_LIST` is `#[repr(C)] { u32, u32, [usize; 1] }`,
+        // whose alignment is the maximum of its fields -- `align_of::<usize>()`
+        // -- so `align_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() ==
+        // align_of::<usize>()` and the base pointer satisfies the reference's
+        // alignment requirement exactly. The cast only reinterprets that
+        // already-aligned storage. The buffer always holds at least the fixed
+        // 16-byte header: capacity starts at 16 entries and only grows, so
+        // `words` is never below the header size and this header read stays in
+        // bounds on both the success and the `ERROR_MORE_DATA` path. The read
+        // borrows `buffer` immutably and overlaps no live mutable borrow.
         let header = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
         if queried != 0 {
             let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
