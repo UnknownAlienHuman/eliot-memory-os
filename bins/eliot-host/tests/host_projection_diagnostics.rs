@@ -135,9 +135,30 @@ fn projection_02_redaction_noninterference_rollback() {
     });
     assert!(t.contains("unknown retained") && !t.contains("restored verified"));
     assert_eq!(count(&t, "host.terminal_error"), 1, "got: {t}");
+    // #984's safe port answers `Ok` wherever it is live and keeps the typed
+    // `EventLogUnavailable` off Windows; that is exactly what
+    // `windows_event_log::event_log_sink_status`'s own contract states
+    // ("Answers `Ok` where #984's safe port is live (Windows) ... Off Windows the
+    // port stays `EventLogUnavailable`"). This assertion demanded the OFF-Windows
+    // answer unconditionally, so it failed on every normal Windows host - the one
+    // platform where the port is available by definition - and could only be
+    // satisfied by a sink that reported itself broken. The obligation worth
+    // keeping is the documented one: availability is REPORTED as a typed result
+    // and never faked, and the redaction and single-terminal records above are
+    // identical either way, which the preceding arms already prove.
+    #[cfg(windows)]
     assert_eq!(
         eliot_host::windows_event_log::event_log_sink_status(),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
+        Ok(()),
+        "on Windows #984's safe port is live, so the typed sink status must report it available \
+         rather than refuse"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        eliot_host::windows_event_log::event_log_sink_status(),
+        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable),
+        "off Windows the port stays typed-unavailable: absence stays missing, never a faked \
+         delivery"
     );
     for c in &can {
         assert!(!t.contains(c.as_str()), "canary {c:?} in capture");
