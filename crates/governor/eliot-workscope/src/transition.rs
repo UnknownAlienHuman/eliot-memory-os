@@ -335,6 +335,29 @@ impl ScopeTransitionReceipt {
             if outcome.step != expected || usize::from(outcome.step.number()) != index + 1 {
                 return Err(WorkScopeError::BindingReceiptMismatch);
             }
+            // CONTIGUITY, which the loop above cannot see: it proves the outcomes
+            // are steps 1..=k in order, not that they form the contiguous
+            // completed prefix this type's own doc describes ("a partial receipt
+            // carries the contiguous completed prefix plus the failed step's
+            // outcome"). Without this, a partial carrying [1 ok, 2 ok, 3 FAILED,
+            // 4 ok] validated: the step NUMBERS were right and the committed arm
+            // below is skipped for a partial, so a receipt could claim a later
+            // step completed after an earlier one had failed — a saga shape that
+            // never occurs, because `run_step` stops at the first failure and
+            // `resume_transition` mints a new revision rather than appending to
+            // the failed one.
+            //
+            // The rule is the doc's rule for a PARTIAL: every outcome before the
+            // last is completed and the last is not. It deliberately does not
+            // apply to a committed receipt, whose eight outcomes are ALL completed
+            // including the last — that is the other half of the same doc sentence
+            // and is enforced by the `self.committed` arm below.
+            if !self.committed {
+                let is_last = index + 1 == self.step_outcomes.len();
+                if outcome.completed == is_last {
+                    return Err(WorkScopeError::BindingReceiptMismatch);
+                }
+            }
         }
         if self.committed {
             if self.step_outcomes.len() != TRANSITION_STEP_COUNT as usize
@@ -1512,6 +1535,60 @@ mod tests {
         };
         assert_eq!(observation.completed_steps, 1);
         assert!(!observation.committed);
+    }
+
+    /// A partial whose outcomes are the right STEPS but the wrong COMPLETION
+    /// shape is refused: this type's own doc says a partial carries the
+    /// contiguous completed prefix plus the failed step's outcome, so a receipt
+    /// claiming step 4 completed after step 3 failed is not a partial this
+    /// procedure can produce.
+    ///
+    /// The counterexample is the shape the step-number check alone accepts: steps
+    /// `1..=4` in order, with the third failed and the fourth marked completed.
+    #[test]
+    fn a_partial_claiming_completion_after_a_failed_step_is_refused() {
+        // Build the refused shape by hand from a real partial, so the only
+        // difference from a producible receipt is the contiguity violation.
+        let (proposal, outcome) = propose_move();
+        let mut bad = evidence();
+        bad.affected_record_refs = vec!["record:other".into()];
+        let Err(failure) = execute_transition(&proposal, &outcome, "receipt:two", &bad) else {
+            panic!("mismatched records must fail the transition");
+        };
+        let mut partial = failure.partial;
+        assert_eq!(partial.step_outcomes.len(), 2);
+        // Append a fourth step marked completed, behind the failed second step.
+        partial.step_outcomes.push(TransitionStepOutcome {
+            step: ScopeTransitionStep::PreserveOldScope,
+            completed: true,
+            evidence_refs: vec!["evidence:later".into()],
+            note: "claimed after a failed step".into(),
+        });
+        partial.step_outcomes.push(TransitionStepOutcome {
+            step: ScopeTransitionStep::StageCandidates,
+            completed: true,
+            evidence_refs: vec!["evidence:later-2".into()],
+            note: "claimed after a failed step".into(),
+        });
+        assert!(
+            partial
+                .step_outcomes
+                .iter()
+                .map(|o| o.step)
+                .collect::<Vec<_>>()
+                == vec![
+                    ScopeTransitionStep::Propose,
+                    ScopeTransitionStep::IdentifyAffected,
+                    ScopeTransitionStep::PreserveOldScope,
+                    ScopeTransitionStep::StageCandidates,
+                ],
+            "the step NUMBERS are a valid 1..=4 prefix, so only contiguity can refuse this"
+        );
+        assert_eq!(
+            partial.validate(),
+            Err(WorkScopeError::BindingReceiptMismatch),
+            "a partial may not claim a step completed after an earlier step failed"
+        );
     }
 
     #[test]
