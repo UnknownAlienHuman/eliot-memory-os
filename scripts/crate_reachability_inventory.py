@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol
 
 SCHEMA: Final = "eliot.crate-reachability-inventory.v1"
-TOOL_VERSION: Final = "0.2.1"
+TOOL_VERSION: Final = "0.2.2"
 OUTPUT_ROOT: Final = ".eliot"
 
 # Issue #1720 extends the #1133 inventory with a checked CrateExtractionDecision
@@ -1921,6 +1921,7 @@ def _package_rows(
         forward_edges[edge["from_package"]].append(edge)
 
     production_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    source_reference_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     non_production_consumers: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
     doc_only_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     source_by_package: dict[str, list[SourceFileEvidence]] = defaultdict(list)
@@ -1943,6 +1944,7 @@ def _package_rows(
                 doc_only_consumers[identifier].add((key, file.scope))
             if file.scope == SourceScope.PRODUCTION.value:
                 production_refs = _source_dependency_references(file.production_source)
+                production_constructions = _source_dependency_constructions(file.production_source)
                 for edge in forward_edges.get(key, []):
                     if edge["kind"] != "normal":
                         continue
@@ -1951,7 +1953,9 @@ def _package_rows(
                         target = package_by_key.get(edge["to_package"])
                         if target is not None:
                             identifier = str(target.get("name", "")).replace("-", "_")
-                            production_consumers[identifier].add((key, file.scope))
+                            source_reference_consumers[identifier].add((key, file.scope))
+                            if alias in production_constructions:
+                                production_consumers[identifier].add((key, file.scope))
                 test_refs = _source_dependency_references(file.test_source)
                 for edge in forward_edges.get(key, []):
                     if edge["kind"] not in {"normal", "dev"}:
@@ -1964,6 +1968,7 @@ def _package_rows(
                             non_production_consumers[identifier].add((key, file.scope, "CFG_TEST"))
             elif file.scope == SourceScope.BUILD.value:
                 build_refs = _source_dependency_references(file.production_source)
+                build_constructions = _source_dependency_constructions(file.production_source)
                 for edge in forward_edges.get(key, []):
                     if edge["kind"] != "build":
                         continue
@@ -1972,7 +1977,9 @@ def _package_rows(
                         target = package_by_key.get(edge["to_package"])
                         if target is not None:
                             identifier = str(target.get("name", "")).replace("-", "_")
-                            production_consumers[identifier].add((key, file.scope))
+                            source_reference_consumers[identifier].add((key, file.scope))
+                            if alias in build_constructions:
+                                production_consumers[identifier].add((key, file.scope))
             elif file.scope in {
                 SourceScope.TEST.value,
                 SourceScope.EXAMPLE.value,
@@ -1995,8 +2002,18 @@ def _package_rows(
         package_name = str(package.get("name", ""))
         crate_identifier = package_name.replace("-", "_")
         source_consumers: list[dict[str, str]] = []
+        source_reference_rows: list[dict[str, str]] = []
         test_only_source_consumers: list[dict[str, str]] = []
         documentation_only_consumers: list[dict[str, str]] = []
+        for consumer_key, scope in sorted(source_reference_consumers.get(crate_identifier, set())):
+            if consumer_key == key:
+                continue
+            source_reference_rows.append({"package_key": consumer_key, "scope": scope})
+            if len(source_reference_rows) > BOUNDS.max_source_consumers_per_package:
+                raise InventoryError(
+                    "SOURCE_CONSUMER_LIMIT",
+                    f"source reference count exceeds {BOUNDS.max_source_consumers_per_package}: {package_name}",
+                )
         for consumer_key, scope in sorted(production_consumers.get(crate_identifier, set())):
             if consumer_key == key:
                 continue
@@ -2197,9 +2214,16 @@ def _package_rows(
             ),
             "reverse_dependency_edges": rev,
             "source_consumers": source_consumers,
+            "source_reference_consumers": source_reference_rows,
             "test_only_source_consumers": test_only_source_consumers,
             "documentation_only_consumers": documentation_only_consumers,
             "consumer_summary": {
+                "production_source_references": sum(
+                    item["scope"] == SourceScope.PRODUCTION.value for item in source_reference_rows
+                ),
+                "build_source_references": sum(
+                    item["scope"] == SourceScope.BUILD.value for item in source_reference_rows
+                ),
                 "production_source_consumers": len(source_prod_consumers),
                 "build_source_consumers": len(source_build_consumers),
                 "test_or_example_source_consumers": len(test_only_source_consumers),
@@ -2230,9 +2254,10 @@ def _package_rows(
                 ),
             },
             "capability_construction": (
-                # A source reference resolved through an incoming package's declared
-                # Cargo alias is the construction signal. A bare dependency edge
-                # never reaches this state.
+                # Only call/construct syntax resolved through the declared Cargo
+                # alias qualifies. Type and function-item references are retained
+                # separately; neither those nor a bare dependency edge qualifies.
+                # This is source evidence, never proof of runtime execution.
                 "PRODUCTION_CONSTRUCTED"
                 if source_prod_consumers
                 else (
@@ -2930,6 +2955,85 @@ def _scoped_source_dependency_references(source: str) -> set[str]:
         _, function_code = _imports_and_code(function_source)
         references.update(_dependency_references_from_code(function_code, aliases_by_root))
     return references
+
+
+_CONSTRUCTION_PATH_RE: Final = re.compile(
+    r"(?P<path>[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)"
+    r"(?:\s*::\s*<[^;{}]{0,500}>)?\s*(?P<delimiter>\(|\{)"
+)
+
+
+def _construction_dependency_roots(
+    code: str,
+    aliases_by_root: Mapping[str, set[str]],
+    *,
+    expression_start: int = 0,
+) -> set[str]:
+    """Select unambiguous expression calls/literals, preserving namespace checks.
+
+    A function signature, type declaration or uncalled function-item reference
+    is not construction evidence. Ambiguous indirect/generic syntax remains
+    separately recorded reference evidence rather than gaining a stronger claim.
+    This observes syntax only: it establishes neither execution nor support.
+    """
+    allowed = _dependency_references_from_code(code, aliases_by_root)
+    chars = list(code)
+    for index in range(expression_start):
+        if chars[index] not in "\r\n":
+            chars[index] = " "
+    expression_code = "".join(chars)
+    # Declaration-only tuple/trait syntax can also contain parentheses. Methods
+    # inside these items are visited independently by the function-scope pass.
+    for declaration in re.finditer(
+        r"(?<![\w#])\b(?:type|struct|enum|union|trait|impl|mod)\b", expression_code
+    ):
+        end = _rust_item_end(expression_code, declaration.start())
+        if end is None:
+            continue
+        for index in range(declaration.start(), end):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+    expression_code = "".join(chars)
+    constructions: set[str] = set()
+    for match in _CONSTRUCTION_PATH_RE.finditer(expression_code):
+        prefix = expression_code[: match.start()].rstrip()
+        if prefix.endswith("."):
+            # A method name alone does not resolve its receiver to a dependency.
+            continue
+        if match.group("delimiter") == "{":
+            statement_prefix = re.split(r"[;{}]", prefix)[-1]
+            if re.search(r"\b(?:if|while|match|for)\b", statement_prefix):
+                # A control-flow block after a constant/path is not a struct literal.
+                continue
+        constructions.update(
+            _dependency_references_from_code(match.group("path"), aliases_by_root) & allowed
+        )
+    return constructions
+
+
+def _source_dependency_constructions(source: str) -> set[str]:
+    """Resolve source call/construct occurrences without promoting references."""
+    constructions: set[str] = set()
+    for import_source, code_source in _module_scope_parts(source):
+        aliases_by_root, _ = _imports_and_code(import_source)
+        constructions.update(_construction_dependency_roots(code_source, aliases_by_root))
+    for match in re.finditer(r"\bfn\s+([A-Za-z_]\w*)\b", source):
+        end = _rust_item_end(source, match.start())
+        if end is None:
+            continue
+        span = (match.start(), end)
+        function_source = _function_reference_source(source[span[0] : span[1]])
+        body_open = _function_body_open(function_source, 0, len(function_source))
+        if body_open is None:
+            continue
+        aliases_by_root, _ = _imports_and_code(_module_import_source(source, span))
+        _, function_code = _imports_and_code(function_source)
+        constructions.update(
+            _construction_dependency_roots(
+                function_code, aliases_by_root, expression_start=body_open + 1
+            )
+        )
+    return constructions
 
 
 _LOCAL_VALUE_SHADOW_RE: Final = re.compile(
