@@ -1089,12 +1089,19 @@ fn bind_declared_startup_capabilities(
             // belongs to instead of reading as current for every epoch this
             // process ever lived through. The values are not parsed out of the
             // binding string and never invented.
+            //
+            // #2560 item 4: the epoch is the contract's own `EpochId` — the full
+            // `(lineage_id, sequence)` tuple read through the owner identity's
+            // own accessor, not `authority_epoch_sequence()`. The sequence alone
+            // is not an identity: two lineages issue unrelated sequences at the
+            // same value, and a proof admitted under `(lineage-A, 1)` must not
+            // read as current after the owner rebound to `(lineage-B, 1)`.
             let owner_state = eliotd::startup_readiness::observe_core_owner_state(composition);
             let retained = RetainedStartupBinding::OwnerSession {
                 session_binding: facts.session_binding().to_owned(),
                 connection_id: facts.connection_id().to_owned(),
                 generation: owner_state.generation(),
-                authority_epoch: owner_state.authority_epoch(),
+                authority_epoch: owner_state.identity.authority_epoch().clone(),
             };
             composition.note_owner_session_binding(facts);
             Ok(retained)
@@ -3486,7 +3493,7 @@ fn observe_readiness_transition(
                 session_binding: facts.session_binding().to_owned(),
                 connection_id: facts.connection_id().to_owned(),
                 generation: observed.generation(),
-                authority_epoch: observed.authority_epoch(),
+                authority_epoch: observed.identity.authority_epoch().clone(),
             }),
             StartupRefreshReason::OwnerRevisionAdvanced,
         ),
