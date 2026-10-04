@@ -11,9 +11,15 @@
 ;;
 ;; This component is otherwise an honest `dreamer-cycle` fixture: `describe`
 ;; reports the true frozen descriptor and `step` echoes the admitted
-;; `operation-id` and `fence-epoch` from the lowered request. Only the claimed
-;; ceiling is raised to the top of the enum. A guest cannot buy a higher proof,
-;; authority or effect ceiling by returning a higher number.
+;; `operation-id` and `fence-epoch` from the lowered request. Two executable
+;; differences from `dreamer-cycle.wat` and nothing else: the `describe`
+;; retarea sits at base 0x0c00 here (its eleven core words ending 0x0c2b)
+;; instead of 0x0600 there, carrying the same eleven values; and `step` adds
+;; one store, `(i32.store (i32.const 2152) (i32.const 7))`, which raises the
+;; claimed ceiling to the top of the enum. The type surface, the `$copy`
+;; helper, `realloc`, the echo copies, all five `(data ...)` segments and the
+;; export set are identical to that sibling. A guest cannot buy a higher
+;; proof, authority or effect ceiling by returning a higher number.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
 ;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo scratch
