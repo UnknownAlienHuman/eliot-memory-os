@@ -7277,7 +7277,7 @@ mod tests {
     /// Pinned digest of the Governor chain envelope, asserted independently
     /// by `eliot-canonical` (see its `golden_chain_envelope` test).
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "cc14c2c284762ebff5f1c8d11647a9191eda6debd4480ab605c3c8dadd766e54";
+        "8914234dc11ebe11fceea995149accadf22a51e1cb8ac242a39e676873fe9f71";
 
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
@@ -7321,7 +7321,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest.digest.clone(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
@@ -7332,7 +7333,7 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: vec![EventId::new("event-golden-chain-1")?],
-                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                projection_kinds: vec!["CurrentEpistemicPosition".to_owned()],
                 relation_kinds: vec!["relation-golden-chain-1".to_owned()],
             },
             security: eliot_store_api::SecurityContext::default(),
