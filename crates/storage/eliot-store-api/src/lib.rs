@@ -609,6 +609,67 @@ impl StoreRecoverySnapshot {
         }
         validate_recovery_packet_size(self)
     }
+
+    /// Re-verifies one committed selection chain under this recovery readback
+    /// (issue #1728 step 6, residual A6).
+    ///
+    /// What this gate enforces: the complete recovery observation is validated
+    /// first — a chain is never verified against an observation that itself does
+    /// not hold — and the chain is then bound to three exact things: the fence
+    /// this snapshot observed, the committed chain head the readback is handed,
+    /// and the exact bytes and expansion handles the recovering consumer is about
+    /// to act on.
+    ///
+    /// What this gate does NOT yet enforce, stated plainly rather than implied:
+    /// it has NO PRODUCTION CALLER. Every call site in the tree is this file's
+    /// own `#[cfg(test)] mod tests`. The real selection-chain commit path builds
+    /// a `CanonicalWriteEnvelope` and reaches `composition.commit_canonical` ->
+    /// `Request::Apply` (`bins/eliot-store-surreal/src/request_dispatch.rs`), and
+    /// that path never constructs a [`StoreTransaction`] — so it reaches neither
+    /// this method, nor [`verify_selection_chain_readback`], nor
+    /// [`StoreTransaction::admit_selection_chain_append`]. This method is `pub`
+    /// so the eventual recovery caller can reach it; until one exists, a
+    /// selection chain seal is compared with delivered content only from this
+    /// crate's tests. [`verify_selection_chain_seal`] was already `pub` before
+    /// this issue, so nothing here makes it newly reachable.
+    ///
+    /// A lost acknowledgement is meant to be reconciled through this gate: the
+    /// chain is read back and re-proved against the committed head, never
+    /// re-appended (see [`StoreTransaction::admit_selection_chain_append`]).
+    /// That reconciliation is a caller obligation today, not something this
+    /// crate performs on any path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal [`StoreRecoverySnapshot::validate`] names for an
+    /// incoherent snapshot, [`StoreError::FenceMismatch`] when the chain was
+    /// recorded under another fence than this observation, and otherwise the
+    /// refusal [`verify_selection_chain_readback`] names.
+    pub fn verify_selection_chain_readback(
+        &self,
+        security: &SecurityContext,
+        committed_head: &SelectionChainHead,
+        delivered_packet_bytes: &[u8],
+        delivered_expansion_handle_ids: &[String],
+    ) -> Result<(), StoreError> {
+        self.validate()?;
+        let receipt = security
+            .selection_integrity
+            .as_ref()
+            .ok_or(StoreError::InvalidField {
+                field: "security.selection_integrity",
+                reason: "no selection chain is carried by this transition",
+            })?;
+        if receipt.state_fence != self.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        verify_selection_chain_readback(
+            committed_head,
+            security,
+            delivered_packet_bytes,
+            delivered_expansion_handle_ids,
+        )
+    }
 }
 
 /// Atomic all-absent genesis seed request. The seed must contain at least one
@@ -4582,7 +4643,18 @@ impl SecurityContext {
             // that produced it. The seal's shape is checked here; the seal's
             // content is compared with this chain by
             // `verify_selection_chain_seal`, which also takes the delivered
-            // bytes.
+            // bytes, and a readback of that delivered output is bound to this
+            // chain's own committed head by `verify_selection_chain_readback`
+            // (residual A6). A shape check alone is not the binding: this
+            // `SecurityContext` carries no delivered bytes, so the seal's
+            // content can only be proven at a readback edge, never here.
+            //
+            // Both of those gates are reachable today only from this crate's own
+            // tests, not from the canonical write path (see
+            // `StoreRecoverySnapshot::verify_selection_chain_readback`). This
+            // `SecurityContext::validate` call therefore remains the only
+            // selection-chain check the production commit path performs, and it
+            // is a shape check only.
             if let Some(seal) = &self.selection_chain_seal {
                 seal.validate().map_err(StoreError::Security)?;
             }
@@ -4632,6 +4704,349 @@ pub fn verify_selection_chain_seal(
         delivered_expansion_handle_ids,
     )
     .map_err(StoreError::Security)
+}
+
+/// Outcome of the Store's append-only selection-chain compare-and-set
+/// (issue #1728 step 4, residual Step4 and A4).
+///
+/// This is a statement about the chain head the caller declares the Store
+/// already committed, never a judgement about whether the recorded history may
+/// be relied on. I12.13 `Selection integrity` makes an unknown untrusted
+/// influence "admissible and itself a finding", so a chain that records it
+/// commits exactly like any other: refusing an append would discard an auditable
+/// history rather than decide it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionChainAppendDisposition {
+    /// There is no selection chain to compare-and-set.
+    ///
+    /// Stated exactly as [`StoreTransaction::admit_selection_chain_append`]
+    /// behaves: this is returned whenever `security.selection_integrity` is
+    /// `None`, and NOTHING ELSE is consulted first. In particular a transition
+    /// that carries a `selection_chain_head` (or a `selection_chain_seal`) with
+    /// no receipt ALSO reports `NoSelectionChain`, because the append gate does
+    /// not call [`SecurityContext::validate`] — the only thing in this crate
+    /// that refuses a head without its chain. Such a transition is still refused
+    /// at the transition itself, naming
+    /// `security.selection_integrity`, by `SecurityContext::validate` on the
+    /// canonical write path; it is simply not this gate's job to notice.
+    ///
+    /// The name is kept, deliberately: it names the disposition (no chain
+    /// appends, so the compare-and-set is vacuous and the append is not a
+    /// second committed effect) rather than asserting that the transition is
+    /// otherwise valid. Whether a head-without-chain transition deserves a
+    /// distinct disposition is a design question, raised and escalated rather
+    /// than decided here.
+    NoSelectionChain,
+    /// The append extends exactly the declared committed head and is the next
+    /// committed effect of this one linear chain.
+    Appended,
+    /// The append IS the declared committed head. A lost acknowledgement that
+    /// re-submits the same identity and the same head is resolved here as a
+    /// readback of that commit: never a second committed effect, and never a new
+    /// fork beside it.
+    ReplayedCommittedHead,
+}
+
+/// Refuses one selection-chain append that does not extend exactly the head the
+/// caller declares the Store already committed (issue #1728 step 4, residual
+/// Step4 and A4).
+///
+/// `committed_head` is a CALLER-SUPPLIED parameter, not a value this crate
+/// looks up. Nothing in this crate or anywhere in the tree reads it back from
+/// storage, and nothing makes a `None` honest for a chain that has already
+/// committed heads: `None` selects the genesis branch below and disarms every
+/// progression rule (see the note at that branch; ESCALATED, not fixed here).
+/// `incoming_head` is the head this transition carries. No stage is interpreted
+/// here: the only authority used is the chain's own domain-separated prefix
+/// digest, recomputed from the immutable stage list exactly as
+/// [`SelectionIntegrityReceipt::verify_chain_head`] does, so the Store appends
+/// and receipts without deciding anything about membership.
+///
+/// The rules, in order:
+///
+/// - the recorded chain and the incoming head are validated first, so a refusal
+///   is about this chain rather than about a fresh checksum over substituted
+///   stages;
+/// - an `incoming_head` equal to `committed_head` is
+///   [`SelectionChainAppendDisposition::ReplayedCommittedHead`], checked before
+///   any progression rule so a re-submitted identity is a readback;
+/// - a head naming another chain is
+///   [`eliot_security_contracts::SecurityContractError::SelectionChainHeadIdentity`];
+/// - a head whose prior committed prefix does not recompute from this chain is
+///   [`eliot_security_contracts::SecurityContractError::SelectionChainHeadDigest`].
+///   This is the append-only rule: reordering, dropping, or re-recording content
+///   under an existing stage identity cannot be committed as the next head,
+///   because the committed head's own prefix digest is recomputed here;
+/// - a head that does not advance the stage ordinal is
+///   [`eliot_security_contracts::SecurityContractError::SelectionChainHeadOrdinal`];
+/// - a head that does not advance the chain revision by exactly one is
+///   [`StoreError::RevisionConflict`], the same compare-and-set refusal this
+///   crate's other fenced revision rows use. Two concurrent appends of one chain
+///   cannot both pass THIS rule, but only for a caller that supplies the real
+///   committed head; with `None` they both reach the genesis branch instead;
+/// - with no committed head at all, the append must start the chain at its
+///   first chain revision, matching the non-zero revision floor
+///   [`RevisionHead`] and [`RevisionHeadExpectation`] already enforce.
+///
+/// What the prefix digest does NOT cover, recorded here because this function
+/// treats that digest as the whole append authority (ESCALATED, in another
+/// crate): the digest input `ChainHeadPrefix`
+/// (`crates/foundation/eliot-security-contracts/src/validation.rs`) carries only
+/// `selection_id`, `schema`, `contract_version`, `root_context_ref`,
+/// `recipe_revision`, `chain_head_ordinal` and the stages. It carries NONE of the
+/// receipt's admission partition — `admitted_candidate_refs`,
+/// `rejected_candidate_refs`, `initial_candidate_members`, `final_output_refs`,
+/// `chain_untrusted_influence`, `state_fence`. So an append that leaves every
+/// stage byte-identical but rewrites `admitted_candidate_refs` to re-admit a
+/// member a committed stage removed is admitted as
+/// [`SelectionChainAppendDisposition::Appended`] here. Fixing that means
+/// changing the digest input in the security-contracts crate, which is not this
+/// file's to change.
+///
+/// # Errors
+///
+/// Returns [`StoreError::RevisionConflict`] when the chain revision does not
+/// advance the committed head by exactly one, [`StoreError::InvalidField`] on
+/// revision overflow, and otherwise the typed security error naming the exact
+/// failed head binding.
+fn admit_selection_chain_head(
+    receipt: &SelectionIntegrityReceipt,
+    committed_head: Option<&SelectionChainHead>,
+    incoming_head: &SelectionChainHead,
+) -> Result<SelectionChainAppendDisposition, StoreError> {
+    use eliot_security_contracts::SecurityContractError;
+
+    receipt.validate().map_err(StoreError::Security)?;
+    receipt
+        .verify_chain_head(incoming_head)
+        .map_err(StoreError::Security)?;
+    let Some(committed) = committed_head else {
+        // KNOWN HOLE, ESCALATED — recorded, deliberately not fixed here.
+        //
+        // `committed_head` is a caller parameter and nothing in this crate
+        // resolves it from storage, so a caller that passes `None` for a chain
+        // that has already committed heads reaches this branch and is checked
+        // ONLY for `chain_revision == 1`. The identity rule, the committed-prefix
+        // digest rule, the ordinal rule and the exact-increment revision rule are
+        // all disarmed, and
+        // `validate_selection_chain_expectation` returns `Ok(())` immediately
+        // for the same `None` — so ONE `None` disarms both the declared-revision
+        // check and this progression check together. Closing it needs the
+        // committed head to come from a store-held commitment rather than from
+        // the caller, which is a transport/authority change and not a doc or test
+        // change. Do not read the rules above as unconditional.
+        if incoming_head.chain_revision != 1 {
+            return Err(StoreError::RevisionConflict);
+        }
+        return Ok(SelectionChainAppendDisposition::Appended);
+    };
+    if committed.selection_id != incoming_head.selection_id {
+        return Err(StoreError::Security(
+            SecurityContractError::SelectionChainHeadIdentity,
+        ));
+    }
+    if committed == incoming_head {
+        return Ok(SelectionChainAppendDisposition::ReplayedCommittedHead);
+    }
+    // The prior committed prefix must still be present, unchanged, in the chain
+    // this append carries. Recomputing the committed head's own prefix digest
+    // out of the incoming chain is what proves the extension instead of
+    // asserting it.
+    let committed_prefix = eliot_security_contracts::selection_chain_head_digest(
+        receipt,
+        committed.chain_head_ordinal,
+    )
+    .map_err(StoreError::Security)?;
+    if committed_prefix != committed.chain_head_digest {
+        return Err(StoreError::Security(
+            SecurityContractError::SelectionChainHeadDigest,
+        ));
+    }
+    if incoming_head.chain_head_ordinal <= committed.chain_head_ordinal {
+        // `expected` names the next ordinal an extending head must reach and
+        // `observed` the ordinal this append actually reached, matching how the
+        // security contract reports a requested-versus-available ordinal.
+        return Err(StoreError::Security(
+            SecurityContractError::SelectionChainHeadOrdinal {
+                expected: committed.chain_head_ordinal.saturating_add(1),
+                observed: incoming_head.chain_head_ordinal,
+            },
+        ));
+    }
+    let next_revision =
+        committed
+            .chain_revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField {
+                field: "security.selection_chain_head.chain_revision",
+                reason: "chain revision overflow",
+            })?;
+    if incoming_head.chain_revision != next_revision {
+        return Err(StoreError::RevisionConflict);
+    }
+    Ok(SelectionChainAppendDisposition::Appended)
+}
+
+/// Requires a chain-carrying transaction to declare the committed chain
+/// revision it observed as a revision-head expectation (issue #1728 step 4).
+///
+/// `SecurityContext::selection_chain_head` documents `chain_revision` as "the
+/// compare-and-swap expectation for the head this append advances". This
+/// function checks only that SOME declared [`RevisionHeadExpectation`] carries
+/// that revision number, and its exact limits are recorded here rather than
+/// glossed:
+///
+/// - it matches on `expected_revision` ONLY. It never reads
+///   [`RevisionHeadExpectation::key`], so an expectation declared against a
+///   completely unrelated revision row satisfies it. It is therefore NOT the
+///   keyed, per-row arbitration mechanism every other fenced revision row uses,
+///   and it does not bind this append to any particular stored row;
+/// - the revision NUMBER it looks for is not chain-scoped. The one production
+///   writer of a selection-chain expectation uses a single global row,
+///   `SELECTION_CHAIN_REVISION_KEY = "owner/selection-chain"`
+///   (`crates/governor/eliot-governor/src/selection_chain.rs`), so
+///   `chain_revision` values collide across chains by construction;
+/// - it returns `Ok(())` immediately for a `None` `committed_head`, which
+///   together with the same `None` branch in `admit_selection_chain_head` means
+///   one `None` disarms both this check and the progression check (ESCALATED —
+///   see the note there);
+/// - it has no production caller: the canonical selection-chain commit path
+///   builds a `CanonicalWriteEnvelope` and never constructs a
+///   [`StoreTransaction`] (see
+///   `StoreRecoverySnapshot::verify_selection_chain_readback`), so today only
+///   this crate's tests run it.
+///
+/// What it does buy, stated no more strongly than that: a chain-carrying
+/// transaction that declares no expectation at all naming the committed chain
+/// revision is refused here rather than admitted silently.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidField`] when no declared expectation carries the
+/// committed chain revision.
+fn validate_selection_chain_expectation(
+    security: &SecurityContext,
+    expectations: &[RevisionHeadExpectation],
+    committed_head: Option<&SelectionChainHead>,
+) -> Result<(), StoreError> {
+    let Some(committed) = committed_head else {
+        // The first append of a chain arbitrates no prior revision: there is no
+        // committed head to declare. Note that this branch is also what a caller
+        // that passes `None` for an already-committed chain reaches — see the
+        // ESCALATED note in `admit_selection_chain_head`.
+        return Ok(());
+    };
+    if security.selection_chain_head.is_none() {
+        // Nothing is being appended, so nothing is arbitrated. The only caller
+        // reaches this function after it has already established that a head is
+        // present, so this branch is defensive.
+        return Ok(());
+    }
+    // Deliberately `expected_revision` only — `expectation.key` is never read.
+    // See the doc comment above for what that does and does not arbitrate.
+    if !expectations
+        .iter()
+        .any(|expectation| expectation.expected_revision == committed.chain_revision)
+    {
+        return Err(StoreError::InvalidField {
+            field: "expected_revision_heads",
+            reason: "a selection chain append declares the committed chain revision it observed",
+        });
+    }
+    Ok(())
+}
+
+/// Binds one readback of a committed selection chain to the chain it was
+/// produced from (issue #1728 step 6, residual A6).
+///
+/// [`verify_selection_chain_seal`] proves that a seal belongs to the chain it
+/// travels beside. It does not prove that the CHAIN HEAD a readback is handed is
+/// that chain's head: `SelectionChainSeal::verify_against` compares the seal
+/// with the chain's last stage, and
+/// [`SelectionIntegrityReceipt::verify_chain_head`] accepts a head naming any
+/// real stage prefix of the chain. So a seal taken over one chain passes its own
+/// verification while the consumer is handed a different chain, a fork, a stale
+/// head, or a head naming only a prefix of the sealed chain. This gate closes
+/// exactly those four cases and adds nothing else:
+///
+/// - `committed_head` must be the head the committed transition carried
+///   (`security.selection_chain_head`), so a readback of one chain is never
+///   presented as the readback of another chain, of a fork, or of a superseded
+///   head;
+/// - after the seal verifies against the chain, the seal's own
+///   `chain_head_digest` must be the digest of `committed_head`, so the seal is
+///   taken over the head this readback names and not over a shorter prefix of
+///   the same chain.
+///
+/// The seal check itself is [`verify_selection_chain_seal`], which was already
+/// `pub` before this issue — nothing here makes it newly reachable, and it is
+/// NOT "the one production gate". It has no production caller either: this
+/// function's only caller is
+/// [`StoreRecoverySnapshot::verify_selection_chain_readback`], whose own only
+/// callers are this file's tests, and the canonical selection-chain commit path
+/// (`CanonicalWriteEnvelope` -> `composition.commit_canonical` ->
+/// `Request::Apply`) never constructs a [`StoreTransaction`] and so reaches
+/// neither this function nor [`StoreTransaction::admit_selection_chain_append`].
+/// A selection chain seal is therefore compared with delivered content today
+/// only from this crate's tests.
+///
+/// The documented absent-chain and absent-seal policies are unchanged and are
+/// the ones [`verify_selection_chain_seal`] states: no chain carried, or a
+/// delivered output without its chain seal, is [`StoreError::InvalidField`]
+/// naming the missing field. Nothing here decides whether the recorded history
+/// may be relied on, so a chain recording unknown untrusted influence stays
+/// auditable exactly as it is today.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidField`] when no chain is carried, when the
+/// readback is handed a head that is not the chain's committed head, or when a
+/// delivered output carries no chain seal; the typed security error naming the
+/// exact failed binding otherwise.
+pub fn verify_selection_chain_readback(
+    committed_head: &SelectionChainHead,
+    security: &SecurityContext,
+    delivered_packet_bytes: &[u8],
+    delivered_expansion_handle_ids: &[String],
+) -> Result<(), StoreError> {
+    if security.selection_integrity.is_none() {
+        return Err(StoreError::InvalidField {
+            field: "security.selection_integrity",
+            reason: "no selection chain is carried by this transition",
+        });
+    }
+    // Residual A6: bind the readback to the chain head it was produced from
+    // before anything is compared against delivered content, so another
+    // chain's head, a fork, or a superseded head is refused rather than
+    // verified.
+    if security.selection_chain_head.as_ref() != Some(committed_head) {
+        return Err(StoreError::InvalidField {
+            field: "security.selection_chain_head",
+            reason: "a readback must bind the committed chain head it was produced from",
+        });
+    }
+    verify_selection_chain_seal(
+        security,
+        delivered_packet_bytes,
+        delivered_expansion_handle_ids,
+    )?;
+    let Some(seal) = &security.selection_chain_seal else {
+        // Unreachable: `verify_selection_chain_seal` refuses an absent seal
+        // first. Kept as the same documented refusal rather than an `unwrap`.
+        return Err(StoreError::InvalidField {
+            field: "security.selection_chain_seal",
+            reason: "a delivered selection output requires its chain seal",
+        });
+    };
+    if seal.chain_head_digest != committed_head.chain_head_digest {
+        return Err(StoreError::Security(
+            eliot_security_contracts::SecurityContractError::SelectionSealChainSubstituted {
+                expected: seal.chain_head_digest.clone(),
+                observed: committed_head.chain_head_digest.clone(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Atomic event/projection/relation intent carried by one transaction.
@@ -6235,6 +6650,44 @@ impl StoreTransaction {
             head.validate()?;
             ensure_same_fence(&self.transition.state_fence, &head.state_fence)?;
         }
+        // Issue #1728 step 4: a carried selection chain must DECLARE an
+        // expectation at all on both axes — at least one
+        // `expected_revision_heads` row and at least one
+        // `expected_ordering_heads` row. A chain head with neither arbitrates
+        // nothing at the commit.
+        //
+        // Stated exactly as enforced, and no more strongly: this checks
+        // `is_empty()` on each list and NOTHING about their contents. It does
+        // not require the ordering head's `scope` to be one of
+        // `self.transition.ordering_scopes`, and it does not require the
+        // revision head's `key` to be the selection-chain row. So a transaction
+        // with
+        // `expected_ordering_heads = [{ scope: "scope:unrelated", .. }]` while
+        // `ordering_scopes == ["scope:selection-chain"]` PASSES. The appends are
+        // therefore NOT in fact serialized on the chain's scope by this rule;
+        // what it guarantees is only that an ordering scope and a revision
+        // expectation were declared at all. Tightening it to compare scopes and
+        // keys is a behaviour change with its own caller blast radius, and it is
+        // deliberately NOT made here.
+        //
+        // Every transition that carries no chain head is unaffected. This check
+        // also runs only inside `StoreTransaction::validate`, and the canonical
+        // selection-chain commit path never builds a `StoreTransaction` — see
+        // `StoreRecoverySnapshot::verify_selection_chain_readback`.
+        if self.transition.security.selection_chain_head.is_some() {
+            if self.expected_revision_heads.is_empty() {
+                return Err(StoreError::InvalidField {
+                    field: "expected_revision_heads",
+                    reason: "a selection chain append declares a revision expectation",
+                });
+            }
+            if self.expected_ordering_heads.is_empty() {
+                return Err(StoreError::InvalidField {
+                    field: "expected_ordering_heads",
+                    reason: "a selection chain append declares an ordering expectation",
+                });
+            }
+        }
         for projection in &self.projections {
             projection.validate()?;
             ensure_same_fence(&self.transition.state_fence, &projection.state_fence)?;
@@ -6244,6 +6697,80 @@ impl StoreTransaction {
             ensure_same_fence(&self.transition.state_fence, &outbox.state_fence)?;
         }
         Ok(())
+    }
+
+    /// Append-only compare-and-set for the selection chain this transaction
+    /// carries (issue #1728 step 4, residual Step4 and A4).
+    ///
+    /// `committed_head` is a CALLER-SUPPLIED parameter — the head the caller
+    /// says the Store already committed — or `None`. Nothing in this crate or
+    /// the tree resolves it from storage, so `None` is not made honest by
+    /// anything: it selects the genesis branch in
+    /// `admit_selection_chain_head` and the early return in
+    /// `validate_selection_chain_expectation`, disarming every progression rule
+    /// at once (ESCALATED — see the notes at both sites; not fixed here).
+    ///
+    /// A transaction that carries no chain receipt reports
+    /// [`SelectionChainAppendDisposition::NoSelectionChain`] — including one that
+    /// carries a head or seal without its receipt, because this method does not
+    /// run [`SecurityContext::validate`] (see that variant's docs); one that
+    /// re-presents the committed head itself reports
+    /// [`SelectionChainAppendDisposition::ReplayedCommittedHead`], which is how
+    /// a lost acknowledgement is resolved without a second committed effect; any
+    /// other head must extend exactly that committed head and reports
+    /// [`SelectionChainAppendDisposition::Appended`].
+    ///
+    /// The declared [`RevisionHeadExpectation`] and
+    /// [`OrderingHeadExpectation`] are required by [`StoreTransaction::validate`]
+    /// but are NOT used to arbitrate anything here: this method's only
+    /// compare-and-set is the `chain_revision` progression rule, whose refusal is
+    /// [`StoreError::RevisionConflict`], and which is only as trustworthy as the
+    /// caller-supplied `committed_head`. No new lock, ledger or commit path is
+    /// introduced, and the Store decides nothing about membership: a chain whose
+    /// stages record unknown untrusted influence commits exactly like any other.
+    ///
+    /// This method has NO PRODUCTION CALLER: every call site in the tree is this
+    /// file's own tests. The canonical selection-chain commit path builds a
+    /// `CanonicalWriteEnvelope` and reaches `composition.commit_canonical` ->
+    /// `Request::Apply` (`bins/eliot-store-surreal/src/request_dispatch.rs`),
+    /// which never constructs a [`StoreTransaction`], so this compare-and-set is
+    /// not on the path that actually commits selection-chain appends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidField`] when the transaction declares no
+    /// expectation for the committed chain revision or carries a chain with no
+    /// head at all, [`StoreError::RevisionConflict`] when the head does not
+    /// advance the committed chain revision by exactly one, and otherwise the
+    /// typed security error naming the exact failed head binding.
+    pub fn admit_selection_chain_append(
+        &self,
+        committed_head: Option<&SelectionChainHead>,
+    ) -> Result<SelectionChainAppendDisposition, StoreError> {
+        let security = &self.transition.security;
+        let Some(receipt) = &security.selection_integrity else {
+            // Reached for ANY transition with no receipt, including one that
+            // carries a `selection_chain_head` or `selection_chain_seal`. This
+            // method does not run `SecurityContext::validate`, which is the only
+            // thing in this crate that refuses a head without its chain, so the
+            // disposition here is "no chain to compare-and-set" and nothing more.
+            return Ok(SelectionChainAppendDisposition::NoSelectionChain);
+        };
+        let Some(incoming) = &security.selection_chain_head else {
+            // Defence in depth for a caller that has not run
+            // `PreparedTransition::validate` / `SecurityContext::validate`,
+            // which refuses this exact shape first on the canonical write path.
+            return Err(StoreError::InvalidField {
+                field: "security.selection_chain_head",
+                reason: "a selection chain requires its append head",
+            });
+        };
+        validate_selection_chain_expectation(
+            security,
+            &self.expected_revision_heads,
+            committed_head,
+        )?;
+        admit_selection_chain_head(receipt, committed_head, incoming)
     }
 }
 
@@ -7603,6 +8130,942 @@ mod tests {
         let mut conflicted = request.clone();
         conflicted.identity.canonical_request_hash = "f".repeat(64);
         assert_eq!(conflicted.validate(), Err(StoreError::IdentityConflict));
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #1728 residuals: append-only selection-chain compare-and-set and
+    // a readback bound to the chain it was produced from.
+    // ---------------------------------------------------------------------
+
+    use eliot_security_contracts::{
+        SELECTION_INTEGRITY_SCHEMA, SecurityContractError, SelectionInfluenceState,
+        SelectionMember, SelectionMemberDisposition, SelectionMemberDispositionKind,
+        SelectionStage, SelectionStageKind, SelectionStageLink, selection_chain_head_digest,
+        selection_member_digest,
+    };
+
+    fn selection_member(reference: &str) -> SelectionMember {
+        SelectionMember {
+            member_ref: reference.to_owned(),
+            member_revision: format!("{reference}@revision-1"),
+            representation_ref: format!("{reference}#representation-1"),
+        }
+    }
+
+    fn selection_retained(reference: &str) -> SelectionMemberDisposition {
+        SelectionMemberDisposition {
+            member_ref: reference.to_owned(),
+            disposition: SelectionMemberDispositionKind::Retained,
+            reason: None,
+            derived_output_ref: None,
+            source_evidence_ref: None,
+        }
+    }
+
+    fn selection_removed(reference: &str) -> SelectionMemberDisposition {
+        SelectionMemberDisposition {
+            member_ref: reference.to_owned(),
+            disposition: SelectionMemberDispositionKind::Removed,
+            reason: Some(format!(
+                "policy: {reference} was displaced by the delivered packet"
+            )),
+            derived_output_ref: None,
+            source_evidence_ref: None,
+        }
+    }
+
+    fn selection_stage(
+        stage_id: &str,
+        ordinal: usize,
+        stage: SelectionStageKind,
+        input_link: Option<SelectionStageLink>,
+        input_members: Vec<SelectionMember>,
+        output_members: Vec<SelectionMember>,
+        member_dispositions: Vec<SelectionMemberDisposition>,
+    ) -> SelectionStage {
+        // The suppressed-counterevidence list is derived from the dispositions
+        // the same stage authored, so a removed rival is never dropped from the
+        // stage that removed it.
+        let suppressed = member_dispositions
+            .iter()
+            .filter(|row| row.disposition == SelectionMemberDispositionKind::Removed)
+            .map(|row| row.member_ref.clone())
+            .collect();
+        let transformer = format!("a17a.test-transformer.v1:{stage_id}");
+        let input_digest = selection_member_digest(&input_members).expect("input digest");
+        let output_digest = selection_member_digest(&output_members).expect("output digest");
+        SelectionStage {
+            stage_id: stage_id.to_owned(),
+            ordinal,
+            input_link,
+            stage,
+            transformer_identity_and_config_revision: transformer,
+            input_digest,
+            input_members,
+            output_digest,
+            output_members,
+            member_dispositions,
+            suppressed_counterevidence_refs: suppressed,
+            budget_or_policy_omission_refs: Vec::new(),
+            untrusted_input_influenced_membership: SelectionInfluenceState::Absent,
+            influence_evidence_refs: Vec::new(),
+            disclosure_closure_ref: "closure-recipe-1728".to_owned(),
+            state_fence: fence(),
+        }
+    }
+
+    /// A prune-then-derive chain: the initial candidate set, a prune stage that
+    /// removes the rival candidate with its own reason, and — when `compile` is
+    /// set — a compilation stage whose output is the delivered membership.
+    ///
+    /// Every value is computed from the members the stage actually emitted, so
+    /// the receipt is a product of the production validators rather than a
+    /// hand-written literal that happens to satisfy them.
+    fn selection_chain(compile: bool) -> Result<SelectionIntegrityReceipt, StoreError> {
+        let initial = vec![
+            selection_member("candidate-a"),
+            selection_member("candidate-b"),
+        ];
+        let admitted = vec![selection_member("candidate-a")];
+
+        let mut stages = Vec::new();
+        stages.push(selection_stage(
+            "stage-initial",
+            0,
+            SelectionStageKind::Rerank,
+            None,
+            initial.clone(),
+            initial.clone(),
+            vec![
+                selection_retained("candidate-a"),
+                selection_retained("candidate-b"),
+            ],
+        ));
+        stages.push(selection_stage(
+            "stage-prune",
+            1,
+            SelectionStageKind::Prune,
+            Some(SelectionStageLink::FromPredecessor {
+                predecessor_stage_id: "stage-initial".to_owned(),
+            }),
+            initial.clone(),
+            admitted.clone(),
+            vec![
+                selection_retained("candidate-a"),
+                selection_removed("candidate-b"),
+            ],
+        ));
+        if compile {
+            stages.push(selection_stage(
+                "stage-compile",
+                2,
+                SelectionStageKind::ContextCompile,
+                Some(SelectionStageLink::FromPredecessor {
+                    predecessor_stage_id: "stage-prune".to_owned(),
+                }),
+                admitted.clone(),
+                admitted,
+                vec![selection_retained("candidate-a")],
+            ));
+        }
+        let final_output_refs = stages
+            .last()
+            .expect("at least one stage")
+            .output_members
+            .iter()
+            .map(|member| member.member_ref.clone())
+            .collect();
+        let receipt = SelectionIntegrityReceipt {
+            schema: SELECTION_INTEGRITY_SCHEMA.to_owned(),
+            contract_version: eliot_security_contracts::CONTRACT_VERSION,
+            selection_id: "selection-1728-chain".to_owned(),
+            root_context_ref: "root-context-1728".to_owned(),
+            recipe_revision: "recipe-revision-1728.v1".to_owned(),
+            initial_candidate_digest: selection_member_digest(&initial)
+                .map_err(StoreError::Security)?,
+            initial_candidate_members: initial,
+            admitted_candidate_refs: vec!["candidate-a".to_owned()],
+            rejected_candidate_refs: vec!["candidate-b".to_owned()],
+            transformation_stages: stages,
+            final_output_refs,
+            chain_untrusted_influence: SelectionInfluenceState::Absent,
+            state_fence: fence(),
+            revision: 1,
+        };
+        receipt.validate().map_err(StoreError::Security)?;
+        Ok(receipt)
+    }
+
+    fn selection_head_at(
+        receipt: &SelectionIntegrityReceipt,
+        ordinal: usize,
+        chain_revision: u64,
+        append_idempotency_key: &str,
+    ) -> Result<SelectionChainHead, StoreError> {
+        Ok(SelectionChainHead {
+            selection_id: receipt.selection_id.clone(),
+            chain_head_ordinal: ordinal,
+            chain_head_digest: selection_chain_head_digest(receipt, ordinal)
+                .map_err(StoreError::Security)?,
+            chain_revision,
+            append_idempotency_key: append_idempotency_key.to_owned(),
+        })
+    }
+
+    fn selection_seal(
+        receipt: &SelectionIntegrityReceipt,
+        packet: &[u8],
+        handles: &[String],
+    ) -> Result<SelectionChainSeal, StoreError> {
+        let last_ordinal = receipt.transformation_stages.len() - 1;
+        let final_output_members = receipt.transformation_stages[last_ordinal]
+            .output_members
+            .clone();
+        let seal = SelectionChainSeal {
+            selection_id: receipt.selection_id.clone(),
+            chain_head_digest: selection_chain_head_digest(receipt, last_ordinal)
+                .map_err(StoreError::Security)?,
+            recipe_revision: receipt.recipe_revision.clone(),
+            final_output_refs: receipt.final_output_refs.clone(),
+            final_output_digest: selection_member_digest(&final_output_members)
+                .map_err(StoreError::Security)?,
+            final_output_members,
+            packet_bytes_digest: sha256_hex(packet),
+            expansion_handle_ids: handles.to_vec(),
+            membership_page_refs: Vec::new(),
+        };
+        seal.verify_against(receipt, packet, handles)
+            .map_err(StoreError::Security)?;
+        Ok(seal)
+    }
+
+    fn selection_security(
+        receipt: &SelectionIntegrityReceipt,
+        packet: &[u8],
+        handles: &[String],
+        head: &SelectionChainHead,
+    ) -> Result<SecurityContext, StoreError> {
+        Ok(SecurityContext {
+            source_assurance: Vec::new(),
+            disclosure_closure: None,
+            transformation_lineage: Vec::new(),
+            influence_closure: None,
+            purge_entry: None,
+            selection_integrity: Some(receipt.clone()),
+            selection_chain_head: Some(head.clone()),
+            selection_chain_seal: Some(selection_seal(receipt, packet, handles)?),
+        })
+    }
+
+    fn selection_transaction(
+        receipt: &SelectionIntegrityReceipt,
+        security: SecurityContext,
+        operation_id: &str,
+        expected_chain_revision: u64,
+        expected_ordering_sequence: u64,
+    ) -> Result<StoreTransaction, StoreError> {
+        let chain_head_digest = security
+            .selection_chain_head
+            .as_ref()
+            .expect("a chain append carries its head")
+            .chain_head_digest
+            .clone();
+        let packet_bytes_digest = security
+            .selection_chain_seal
+            .as_ref()
+            .expect("a delivered append carries its seal")
+            .packet_bytes_digest
+            .clone();
+        let mut transition = PreparedTransition {
+            contract_version: crate::CONTRACT_VERSION,
+            identity: OperationIdentity {
+                operation_id: id(operation_id)?,
+                idempotency_key: format!("{operation_id}-retry-1"),
+                canonical_request_hash: "0".repeat(64),
+            },
+            state_fence: fence(),
+            scope_id: ScopeId::new("governor")?,
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope:selection-chain")?],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: supported_admission_contract_set_digest()?,
+            operation_manifest_digest: OperationManifestDigest::new("manifest-selection-chain")?,
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::AppendAuditEvent,
+                parameters: BTreeMap::from([
+                    (
+                        "selection_id".to_owned(),
+                        Value::String(receipt.selection_id.clone()),
+                    ),
+                    (
+                        "chain_head_digest".to_owned(),
+                        Value::String(chain_head_digest),
+                    ),
+                    (
+                        "packet_bytes_digest".to_owned(),
+                        Value::String(packet_bytes_digest),
+                    ),
+                ]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security,
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        bind_issue18_digests(&mut transition)?;
+        transition.validate()?;
+        Ok(StoreTransaction {
+            transition,
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("owner/selection-chain")?,
+                expected_revision: expected_chain_revision,
+                state_fence: fence(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope:selection-chain")?,
+                expected_sequence: expected_ordering_sequence,
+                state_fence: fence(),
+            }],
+            projections: Vec::new(),
+            outbox: Vec::new(),
+        })
+    }
+
+    /// The one mutable writer of the committed chain in these proofs. It advances
+    /// only on [`SelectionChainAppendDisposition::Appended`], so a refused fork
+    /// and a replayed acknowledgement are both observable as an unchanged
+    /// committed chain rather than as an assumed one.
+    struct CommittedSelectionChain {
+        receipt: SelectionIntegrityReceipt,
+        head: Option<SelectionChainHead>,
+    }
+
+    impl CommittedSelectionChain {
+        fn admit(
+            &mut self,
+            transaction: &StoreTransaction,
+        ) -> Result<SelectionChainAppendDisposition, StoreError> {
+            let disposition = transaction.admit_selection_chain_append(self.head.as_ref())?;
+            if disposition == SelectionChainAppendDisposition::Appended {
+                let security = &transaction.transition.security;
+                self.receipt = security
+                    .selection_integrity
+                    .clone()
+                    .expect("an appended transaction carries its chain");
+                self.head = security.selection_chain_head.clone();
+            }
+            Ok(disposition)
+        }
+    }
+
+    #[test]
+    fn selection_chain_readback_accepts_a_matching_committed_head()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles = vec!["expansion:one".to_owned()];
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let snapshot = recovery_snapshot(vec![recovery_record("selection-chain", packet)]);
+
+        // The head handed to the readback is the head the committed transition
+        // carried, so the seal, the chain and the delivered bytes all agree.
+        assert_eq!(
+            snapshot.verify_selection_chain_readback(&security, &head, packet, &handles),
+            Ok(())
+        );
+        // And the seal gate this reaches is the same one, so a changed packet is
+        // still refused with the seal's own typed error.
+        assert_eq!(
+            verify_selection_chain_seal(&security, b"another-packet", &handles),
+            Err(StoreError::Security(
+                SecurityContractError::SelectionSealPacketBytes
+            ))
+        );
+
+        // The acceptance above is only worth something if this gate refuses
+        // wrong delivered content. Both refusals below are delivered through
+        // `verify_selection_chain_readback` itself, so this test fails if that
+        // method were ever replaced by a bare `Ok(())`.
+        //
+        // Wrong bytes: same chain, same committed head, same seal shape — only
+        // the packet the consumer is about to act on differs.
+        assert_eq!(
+            snapshot.verify_selection_chain_readback(&security, &head, b"another-packet", &handles),
+            Err(StoreError::Security(
+                SecurityContractError::SelectionSealPacketBytes
+            ))
+        );
+        // Wrong expansion handles: the delivered set is rebound, not trusted.
+        let other_handles = vec!["expansion:two".to_owned()];
+        assert_eq!(
+            snapshot.verify_selection_chain_readback(&security, &head, packet, &other_handles),
+            Err(StoreError::Security(
+                SecurityContractError::SelectionSealExpansionHandles
+            ))
+        );
+        Ok(())
+    }
+
+    /// The readback is refused when the chain was recorded under a fence other
+    /// than the one this recovery observation actually observed.
+    ///
+    /// This arm is only reachable with a snapshot whose own fence differs from
+    /// the receipt's, so the observation is first moved wholesale onto another
+    /// fence and re-validated: the refusal below is unambiguously the chain
+    /// fence mismatch, not an incoherent snapshot.
+    #[test]
+    fn selection_chain_readback_refuses_a_chain_recorded_under_another_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles = vec!["expansion:one".to_owned()];
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+
+        let other_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
+        let mut snapshot = recovery_snapshot(vec![recovery_record("selection-chain", packet)]);
+        snapshot.state_fence = other_fence.clone();
+        snapshot.canonical_scope.state_fence = other_fence.clone();
+        for record in &mut snapshot.owner_records {
+            record.state_fence = other_fence.clone();
+        }
+        // The observation itself is coherent; only the chain disagrees with it.
+        snapshot.validate()?;
+
+        assert_eq!(
+            snapshot.verify_selection_chain_readback(&security, &head, packet, &handles),
+            Err(StoreError::FenceMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_readback_refuses_a_head_the_chain_was_not_produced_from()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles = vec!["expansion:one".to_owned()];
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let snapshot = recovery_snapshot(vec![recovery_record("selection-chain", packet)]);
+
+        // A stale head of the same chain: it verifies against the chain's own
+        // stages, so only the readback binding can refuse it.
+        let stale = selection_head_at(&receipt, 0, 1, "selection-chain-append:stale")?;
+        receipt
+            .verify_chain_head(&stale)
+            .map_err(StoreError::Security)?;
+        assert!(matches!(
+            snapshot.verify_selection_chain_readback(&security, &stale, packet, &handles),
+            Err(StoreError::InvalidField {
+                field: "security.selection_chain_head",
+                ..
+            })
+        ));
+
+        // A head that names another chain is refused the same way.
+        let foreign = SelectionChainHead {
+            selection_id: "selection-1728-other-chain".to_owned(),
+            ..head.clone()
+        };
+        assert!(matches!(
+            snapshot.verify_selection_chain_readback(&security, &foreign, packet, &handles),
+            Err(StoreError::InvalidField {
+                field: "security.selection_chain_head",
+                ..
+            })
+        ));
+
+        // A head that names only a prefix of the sealed chain is refused by the
+        // seal binding, because the seal was taken over the whole chain: the
+        // head-identity check alone would have accepted it.
+        let prefix_security = selection_security(&receipt, packet, &handles, &stale)?;
+        let prefix_readback =
+            snapshot.verify_selection_chain_readback(&prefix_security, &stale, packet, &handles);
+        match prefix_readback {
+            Err(StoreError::Security(SecurityContractError::SelectionSealChainSubstituted {
+                expected,
+                observed,
+            })) => {
+                let sealed = prefix_security
+                    .selection_chain_seal
+                    .as_ref()
+                    .expect("a delivered append carries its seal");
+                assert_eq!(expected, sealed.chain_head_digest);
+                assert_eq!(observed, stale.chain_head_digest);
+            }
+            other => panic!("expected a substituted chain-head seal refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_readback_keeps_the_documented_absent_seal_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let mut security = selection_security(&receipt, packet, &handles, &head)?;
+        let snapshot = recovery_snapshot(vec![recovery_record("selection-chain", packet)]);
+
+        // A delivered output whose transition carries no seal keeps the policy
+        // `verify_selection_chain_seal` already documents: it is refused, never
+        // read back as an unsealed packet.
+        security.selection_chain_seal = None;
+        assert!(matches!(
+            snapshot.verify_selection_chain_readback(&security, &head, packet, &handles),
+            Err(StoreError::InvalidField {
+                field: "security.selection_chain_seal",
+                ..
+            })
+        ));
+
+        // A transition that carries no chain at all is refused before any head
+        // is compared, naming the missing chain.
+        assert!(matches!(
+            snapshot.verify_selection_chain_readback(
+                &SecurityContext::default(),
+                &head,
+                packet,
+                &handles,
+            ),
+            Err(StoreError::InvalidField {
+                field: "security.selection_integrity",
+                ..
+            })
+        ));
+
+        // The same absent-chain refusal is what the seal gate itself states, so
+        // the readback adds no second policy.
+        assert!(matches!(
+            verify_selection_chain_seal(&SecurityContext::default(), packet, &handles),
+            Err(StoreError::InvalidField {
+                field: "security.selection_integrity",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_refuses_a_fork_and_replays_as_a_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first_packet = b"selection-packet-1728-stage-one";
+        let next_packet = b"selection-packet-1728-stage-two";
+        let handles: Vec<String> = Vec::new();
+
+        let first = selection_chain(false)?;
+        let first_head = selection_head_at(&first, 1, 1, "selection-chain-append:one")?;
+        let first_security = selection_security(&first, first_packet, &handles, &first_head)?;
+        let first_transaction = selection_transaction(
+            &first,
+            first_security.clone(),
+            "selection-chain-op-one",
+            1,
+            1,
+        )?;
+
+        let mut committed = CommittedSelectionChain {
+            receipt: first.clone(),
+            head: None,
+        };
+        assert_eq!(
+            committed.admit(&first_transaction)?,
+            SelectionChainAppendDisposition::Appended
+        );
+        let head_after_first = committed.head.clone().expect("committed head");
+        assert_eq!(head_after_first.chain_revision, first_head.chain_revision);
+
+        // A concurrent append under the same chain identity that re-records the
+        // already committed prune stage advances the revision and the ordinal
+        // correctly, so only the committed prefix digest refuses it.
+        let mut forked = selection_chain(true)?;
+        forked.transformation_stages[1].transformer_identity_and_config_revision =
+            "a17a.test-transformer.v1:stage-prune-forked".to_owned();
+        forked.validate().map_err(StoreError::Security)?;
+        let forked_head = selection_head_at(&forked, 2, 2, "selection-chain-append:two")?;
+        let forked_security = selection_security(&forked, next_packet, &handles, &forked_head)?;
+        let forked_transaction = selection_transaction(
+            &forked,
+            forked_security.clone(),
+            "selection-chain-op-fork",
+            head_after_first.chain_revision,
+            2,
+        )?;
+        // The fork attempt goes through `CommittedSelectionChain::admit`, the one
+        // and only writer of `committed.head` / `committed.receipt`. Calling
+        // `admit_selection_chain_append` directly here would leave those fields
+        // untouched by construction, and the "unchanged" assertions below would
+        // be tautologies rather than evidence.
+        assert_eq!(
+            committed.admit(&forked_transaction),
+            Err(StoreError::Security(
+                SecurityContractError::SelectionChainHeadDigest
+            ))
+        );
+
+        // The previously committed chain is unchanged: read it back through the
+        // readback gate and compare the committed head and receipt.
+        assert_eq!(committed.head.as_ref(), Some(&head_after_first));
+        assert_eq!(committed.receipt, first);
+        let snapshot = recovery_snapshot(vec![recovery_record("selection-chain", first_packet)]);
+        assert_eq!(
+            snapshot.verify_selection_chain_readback(
+                &first_security,
+                &head_after_first,
+                first_packet,
+                &handles,
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            snapshot.verify_selection_chain_readback(
+                &forked_security,
+                &forked_head,
+                next_packet,
+                &handles,
+            ),
+            Err(StoreError::InvalidField {
+                field: "security.selection_chain_head",
+                ..
+            })
+        ));
+
+        // The replayed acknowledgement of the already committed append is a
+        // readback of that commit, not a second committed effect.
+        assert_eq!(
+            committed.admit(&first_transaction)?,
+            SelectionChainAppendDisposition::ReplayedCommittedHead
+        );
+        assert_eq!(committed.head.as_ref(), Some(&head_after_first));
+        assert_eq!(committed.receipt, first);
+
+        // An append that does extend the committed head advances it.
+        let extended = selection_chain(true)?;
+        let extended_head = selection_head_at(&extended, 2, 2, "selection-chain-append:two")?;
+        let extended_security =
+            selection_security(&extended, next_packet, &handles, &extended_head)?;
+        let extended_transaction = selection_transaction(
+            &extended,
+            extended_security,
+            "selection-chain-op-two",
+            head_after_first.chain_revision,
+            2,
+        )?;
+        assert_eq!(
+            committed.admit(&extended_transaction)?,
+            SelectionChainAppendDisposition::Appended
+        );
+        assert_eq!(committed.head, Some(extended_head));
+        assert_eq!(committed.receipt, extended);
+        assert_ne!(committed.head.as_ref(), Some(&head_after_first));
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_requires_a_revision_and_ordering_expectation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let transaction =
+            selection_transaction(&receipt, security, "selection-chain-op-expect", 1, 1)?;
+        transaction.validate()?;
+
+        // A chain head that arbitrates no revision is refused by the transaction
+        // validation the named commit path already runs.
+        let mut no_revision = transaction.clone();
+        no_revision.expected_revision_heads.clear();
+        assert!(matches!(
+            no_revision.validate(),
+            Err(StoreError::InvalidField {
+                field: "expected_revision_heads",
+                ..
+            })
+        ));
+
+        // A chain head that declares no ordering expectation at all is refused
+        // too. Note what this proves and what it does not: it proves an ordering
+        // expectation must be DECLARED, not that the declared scope is the chain's
+        // scope —
+        // `selection_chain_append_declaration_requires_no_specific_scope_or_key`
+        // pins that limit.
+        let mut no_ordering = transaction.clone();
+        no_ordering.expected_ordering_heads.clear();
+        assert!(matches!(
+            no_ordering.validate(),
+            Err(StoreError::InvalidField {
+                field: "expected_ordering_heads",
+                ..
+            })
+        ));
+
+        // A transaction that carries no chain appends nothing and is unaffected.
+        let mut plain = transaction.clone();
+        plain.transition.security.selection_integrity = None;
+        plain.transition.security.selection_chain_head = None;
+        plain.transition.security.selection_chain_seal = None;
+        plain.expected_revision_heads.clear();
+        plain.expected_ordering_heads.clear();
+        bind_issue18_digests(&mut plain.transition)?;
+        plain.validate()?;
+        assert_eq!(
+            plain.admit_selection_chain_append(None)?,
+            SelectionChainAppendDisposition::NoSelectionChain
+        );
+
+        // A committed head the transaction does not declare as its expectation
+        // is refused rather than silently arbitrated.
+        let divergent = selection_chain(true)?;
+        let divergent_head = selection_head_at(&divergent, 2, 7, "selection-chain-append:seven")?;
+        assert!(matches!(
+            transaction.admit_selection_chain_append(Some(&divergent_head)),
+            Err(StoreError::InvalidField {
+                field: "expected_revision_heads",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // One focused test per remaining refusal arm. Each asserts the SPECIFIC
+    // error variant, so deleting its arm turns exactly one of these red.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn selection_chain_append_refuses_a_genesis_head_off_the_first_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let receipt = selection_chain(false)?;
+        // A well-formed head of this chain that claims to be the SECOND revision
+        // while the caller declares no committed head at all.
+        let head = selection_head_at(&receipt, 1, 2, "selection-chain-append:second")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let transaction =
+            selection_transaction(&receipt, security, "selection-chain-op-genesis", 1, 1)?;
+        transaction.validate()?;
+
+        assert_eq!(
+            transaction.admit_selection_chain_append(None),
+            Err(StoreError::RevisionConflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_refuses_a_head_that_skips_a_chain_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let next_packet = b"selection-packet-1728-stage-two";
+        let handles: Vec<String> = Vec::new();
+        let extended = selection_chain(true)?;
+        let committed = selection_head_at(&extended, 1, 1, "selection-chain-append:one")?;
+        // Advances the stage ordinal correctly but jumps the chain revision by
+        // two, so only the exact-increment compare-and-set can refuse it.
+        let skipping = selection_head_at(&extended, 2, 3, "selection-chain-append:three")?;
+        let security = selection_security(&extended, next_packet, &handles, &skipping)?;
+        let transaction = selection_transaction(
+            &extended,
+            security,
+            "selection-chain-op-skip",
+            committed.chain_revision,
+            2,
+        )?;
+        transaction.validate()?;
+
+        assert_eq!(
+            transaction.admit_selection_chain_append(Some(&committed)),
+            Err(StoreError::RevisionConflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_refuses_a_head_that_does_not_advance_the_ordinal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let extended = selection_chain(true)?;
+        let committed = selection_head_at(&extended, 1, 1, "selection-chain-append:one")?;
+        // A different append identity at the SAME ordinal with the correct next
+        // chain revision. The committed prefix still recomputes out of this very
+        // chain, so the digest rule is satisfied and the ordinal rule is the only
+        // one left that can refuse this append.
+        let stalled = selection_head_at(&extended, 1, 2, "selection-chain-append:stalled")?;
+        assert_eq!(
+            selection_chain_head_digest(&extended, committed.chain_head_ordinal)
+                .map_err(StoreError::Security)?,
+            committed.chain_head_digest
+        );
+        let security = selection_security(&extended, packet, &handles, &stalled)?;
+        let transaction = selection_transaction(
+            &extended,
+            security,
+            "selection-chain-op-stalled",
+            committed.chain_revision,
+            2,
+        )?;
+        transaction.validate()?;
+
+        match transaction.admit_selection_chain_append(Some(&committed)) {
+            Err(StoreError::Security(SecurityContractError::SelectionChainHeadOrdinal {
+                expected,
+                observed,
+            })) => {
+                assert_eq!(expected, committed.chain_head_ordinal + 1);
+                assert_eq!(observed, stalled.chain_head_ordinal);
+            }
+            other => panic!("expected a chain-head ordinal refusal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_refuses_a_committed_head_naming_another_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let transaction =
+            selection_transaction(&receipt, security, "selection-chain-op-identity", 3, 1)?;
+        transaction.validate()?;
+
+        // The committed head the caller declares belongs to a DIFFERENT chain, so
+        // the revision this append carries cannot be a continuation of it. The
+        // expectation it declares matches the foreign revision, so only the
+        // chain-identity rule refuses it.
+        let foreign = SelectionChainHead {
+            selection_id: "selection-1728-other-chain".to_owned(),
+            chain_head_digest: selection_chain_head_digest(&receipt, 1)
+                .map_err(StoreError::Security)?,
+            chain_head_ordinal: 1,
+            chain_revision: 3,
+            append_idempotency_key: "selection-chain-append:foreign".to_owned(),
+        };
+        assert_eq!(
+            transaction.admit_selection_chain_append(Some(&foreign)),
+            Err(StoreError::Security(
+                SecurityContractError::SelectionChainHeadIdentity
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_refuses_a_chain_with_no_head()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let mut transaction =
+            selection_transaction(&receipt, security, "selection-chain-op-headless", 1, 1)?;
+
+        // A receipt whose head is dropped. `PreparedTransition::validate` /
+        // `SecurityContext::validate` refuses this shape first on the canonical
+        // write path; `admit_selection_chain_append` is `pub` and does not run
+        // them, so it carries its own refusal for that gap.
+        transaction.transition.security.selection_chain_head = None;
+        bind_issue18_digests(&mut transaction.transition)?;
+
+        assert!(matches!(
+            transaction.admit_selection_chain_append(None),
+            Err(StoreError::InvalidField {
+                field: "security.selection_chain_head",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn selection_chain_append_declaration_requires_no_specific_scope_or_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let packet = b"selection-packet-1728";
+        let handles: Vec<String> = Vec::new();
+        let receipt = selection_chain(false)?;
+        let head = selection_head_at(&receipt, 1, 1, "selection-chain-append:genesis")?;
+        let security = selection_security(&receipt, packet, &handles, &head)?;
+        let transaction =
+            selection_transaction(&receipt, security, "selection-chain-op-scopes", 1, 1)?;
+
+        // `StoreTransaction::validate` requires only that an expectation be
+        // DECLARED on each axis. It compares neither the ordering scope against
+        // `transition.ordering_scopes` nor the revision key against the
+        // selection-chain row, so an unrelated scope and an unrelated key both
+        // pass. This test pins that limit deliberately: it is the documented
+        // behaviour of the present rule, not an endorsement of it, and the rule
+        // is deliberately NOT tightened here.
+        let mut unrelated_scope = transaction.clone();
+        unrelated_scope.expected_ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope:unrelated")?,
+            expected_sequence: 1,
+            state_fence: fence(),
+        }];
+        unrelated_scope.validate()?;
+        assert_eq!(
+            unrelated_scope.transition.ordering_scopes,
+            vec![OrderingScopeId::new("scope:selection-chain")?]
+        );
+
+        let mut unrelated_key = transaction.clone();
+        unrelated_key.expected_revision_heads = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("owner/some-other-row")?,
+            expected_revision: 1,
+            state_fence: fence(),
+        }];
+        unrelated_key.validate()?;
+
+        // The consequence of both limits, stated as observed behaviour rather
+        // than as a claim that the appends are serialized:
+        // `validate_selection_chain_expectation` matches on `expected_revision`
+        // alone, so that unrelated key satisfies it and the append proceeds.
+        assert!(matches!(
+            unrelated_key.admit_selection_chain_append(None),
+            Ok(SelectionChainAppendDisposition::Appended)
+        ));
+
+        // And the one thing the present expectation rule actually buys: the same
+        // call, with a committed head actually named, is refused when no declared
+        // expectation carries that committed revision.
+        let committed = selection_head_at(&receipt, 1, 1, "selection-chain-append:one")?;
+        let mut no_expectation = transaction.clone();
+        no_expectation.expected_revision_heads.clear();
+        assert!(matches!(
+            no_expectation.admit_selection_chain_append(Some(&committed)),
+            Err(StoreError::InvalidField {
+                field: "expected_revision_heads",
+                ..
+            })
+        ));
+
+        // The escalated hole this crate does NOT close, pinned here so it cannot
+        // be forgotten: the very transaction refused on the line above is
+        // ADMITTED when the caller simply declines to name a committed head,
+        // because one `None` short-circuits both the declared-revision check and
+        // the progression check. See the ESCALATED notes in
+        // `validate_selection_chain_expectation` and
+        // `admit_selection_chain_head`.
+        assert!(matches!(
+            no_expectation.admit_selection_chain_append(None),
+            Ok(SelectionChainAppendDisposition::Appended)
+        ));
         Ok(())
     }
 }
