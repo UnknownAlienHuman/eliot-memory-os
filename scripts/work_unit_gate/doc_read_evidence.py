@@ -2930,10 +2930,15 @@ PLACEHOLDER_DISCUSSING_TOPIC = "Reject placeholder evidence in metadata"
 # ``topic`` sits inside the hashed route core (``docs_router_core.route_payload``)
 # and the read receipt id is derived from the route id, so a topic-only mutation
 # applied to a body computed for ANOTHER topic cannot yield its own valid
-# receipts: it yields ROUTE_RECEIPT_MISMATCH, never a PASS. The honest way to run
-# a topic mutation that must pass is to compute a genuinely valid envelope FOR
-# that topic and mutate that; run_acceptance does exactly this for the mutation
-# names listed here and counts those rows in the reported total.
+# receipts: it yields ROUTE_RECEIPT_MISMATCH, never a PASS. The only body a
+# topic mutation can validly start from is one whose receipts were computed for
+# that same topic, and on such a body the mutation is a no-op. So these names
+# select the INPUT for an expectation row rather than adding a case:
+# ``run_acceptance`` builds a genuinely valid envelope for the listed topic and
+# runs the row against it. The row still exercises the descriptive predicate -
+# ``verify`` applies ``_text`` to the topic before recomputing any receipt - so
+# the row is not vacuous; only the card's "runtime topic mutation" framing is
+# unattainable, and the acceptance row above carries the failing direction.
 _TOPIC_SCOPED_MUTATIONS = ("placeholder_discussing_topic",)
 
 ACCEPTANCE_CASES: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
@@ -3031,8 +3036,9 @@ def run_acceptance(_live_root: Path) -> int:
     Prints the exact typed failure code (or PASS) per case. Exits nonzero only
     when a case did not behave as the issue requires. ``cases=N`` counts every
     executed case: the committed body fixtures, the runtime mutation
-    expectations, the concurrent-movement cases and the topic-scoped bodies
-    computed for the topic mutations named in ``_TOPIC_SCOPED_MUTATIONS``.
+    expectations and the concurrent-movement cases. A topic-scoped body is not
+    an extra case: it selects the input for one expectation row, which is
+    already counted in ``expectations``.
     """
     del _live_root
     root, base, candidate, _ = _build_acceptance_repo()
