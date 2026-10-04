@@ -847,10 +847,12 @@ fn case_1_frozen_boundary_table_matches_fixture_and_propagated_exclusions() {
         "the frozen vocabulary must travel through the #889 facade target"
     );
 
-    // Owner pass risks, all three named: `lib.rs` runs a process-global
-    // backup-dispatch registration before the observation, `HostOwnerLease::acquire`
-    // is a real Windows named mutex, and the guarded region is entered
-    // unconditionally, so the captured evidence is identical on every machine.
+    // Owner pass risks, all three named: `lib.rs` runs a wiring self-check over
+    // a by-value backup-dispatch table before the observation and registers no
+    // process-global, `HostOwnerLease::acquire` is a real `Global\` named mutex,
+    // and the guarded region is entered unconditionally, so the captured
+    // evidence is identical on every machine whichever fallible step fails
+    // first.
     let owner_emitted = capture_emit(|| {
         let _ = eliot_host::HostComposition::open(
             eliot_host::HostLaunchOptions::parse(case21_launch_argv())
@@ -7424,10 +7426,12 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         "no mutable global dedup cache may suppress a second emission: {repeated}"
     );
 
-    // Owner pass risks, all three named: `lib.rs` runs a process-global
-    // backup-dispatch registration before the observation, `HostOwnerLease::acquire`
-    // is a real Windows named mutex, and the guarded region is entered
-    // unconditionally, so the captured evidence is identical on every machine.
+    // Owner pass risks, all three named: `lib.rs` runs a wiring self-check over
+    // a by-value backup-dispatch table before the observation and registers no
+    // process-global, `HostOwnerLease::acquire` is a real `Global\` named mutex,
+    // and the guarded region is entered unconditionally, so the captured
+    // evidence is identical on every machine whichever fallible step fails
+    // first.
     // The declared `test` column of the `open.terminal` row is `891/case-14`, so
     // case 22 only OBSERVES these rows and does not own them.
     let owner_first = capture_emit(|| {
