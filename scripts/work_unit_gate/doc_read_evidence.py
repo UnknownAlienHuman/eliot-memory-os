@@ -117,10 +117,27 @@ BLOCK_END = "<!-- eliot-doc-read-evidence:v2:end -->"
 # identity, repository path or digest can never legitimately contain them.
 # Identities, hashes, changed paths and the final-candidate comparison stay
 # strict by type and recomputation (exact digests, closed schemas,
-# final-tree/path/route comparison); only the prose reading of a value is
-# scoped to whole-value evasion. There is one validator (_text), not two, and
-# no blanket text exemption: a descriptive field that IS the placeholder still
-# fails with the same typed code.
+# final-tree/path/route comparison).
+#
+# There is one validator (_text) with two arms and NO second validator and no
+# blanket text exemption:
+#
+# * the MACHINE arm (_is_placeholder) refuses every whole-value evasion and any
+#   angle slot or ellipsis at all, because a machine identity or repository
+#   path can carry none of them. Its fixed whole-value list is the whole of its
+#   substitution rule and is NOT relaxed;
+# * the DESCRIPTIVE arm (_is_placeholder_prose) additionally judges MEANING: a
+#   value that names an evasion token or a slot reference but whose remaining
+#   words are only filler, pointer words or the token itself carries no
+#   informational content of its own and is refused, while prose that discusses
+#   placeholders, generics or defects next to real subject matter is accepted.
+#   "see receipts for details", "TBD pending review",
+#   "placeholder text pending review" and "the <topic> is recorded above" are
+#   refused; "Implement typed fallback response",
+#   "Handle Vec<T> in the response conversion" and
+#   "Reject placeholder evidence in metadata" are accepted. That tolerance lives
+#   only in the descriptive arm, so the machine arm keeps the strict behaviour
+#   its callers already rely on.
 _PLACEHOLDER_TOKENS = (
     "see receipt",
     "as listed above",
@@ -136,10 +153,44 @@ _PLACEHOLDER_TOKENS = (
 _SENTINEL_TOKENS = ("<path>", "<sha>", "<digest>", "<issue title>", "<topic>")
 # Whole-value evasions: the value IS the placeholder instead of the evidence.
 # The plural "see receipts" is the punctuated whole-value form that the
-# singular substring token alone would miss under whole-value comparison.
+# singular substring token alone would miss under whole-value comparison. This
+# list is the MACHINE arm's whole substitution rule and is deliberately not
+# relaxed; the descriptive arm's meaning-based test lives in _is_placeholder_prose.
 _WHOLE_VALUE_EVASIONS = _PLACEHOLDER_TOKENS + ("see receipts",)
 _TRAILING_EVASION_PUNCTUATION = ".!?:;,"
 _WHOLE_SLOT_RE = re.compile(r"\A<[^<>]*>\Z")
+# Descriptive arm only: any evasion token or slot reference NAMED anywhere in the
+# value, longest alternative first so "see receipts" is consumed before its
+# singular prefix.
+_EVASION_PROSE_RE = re.compile(
+    "|".join(re.escape(token) for token in sorted(_WHOLE_VALUE_EVASIONS, key=len, reverse=True))
+)
+_SLOT_REFERENCE_RE = re.compile(r"<[^<>]{0,64}>")
+_PROSE_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# Words that carry no subject matter of their own: function words, procedural
+# filler ("pending review", "for details") and pointer words that send the
+# reader to another artifact instead of stating the property. A value whose
+# residue is empty once the evasion token and slot references are removed is
+# an evasion plus filler, not content.
+_PROSE_FILLER_WORDS = frozenset({
+    "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and",
+    "any", "are", "around", "as", "at", "attachment", "be", "because", "been",
+    "before", "below", "besides", "both", "but", "by", "can", "comment", "comments", "could",
+    "detail", "details", "did", "diff", "do", "does", "for", "from", "had", "has", "have", "having", "he",
+    "her", "here", "hers", "him", "his", "how", "i", "if", "in", "info", "information",
+    "into", "is", "it", "its", "itself", "just", "later", "link", "links", "listed", "may",
+    "me", "might", "more", "most", "must", "my", "need", "needed", "needs", "no",
+    "nor", "not", "note", "notes", "now", "of", "on", "once", "only",
+    "or", "other", "otherwise", "our", "ours", "out", "over", "own", "pending", "per",
+    "please", "previous", "previously", "prior", "pr", "pull", "record", "recorded",
+    "records", "refer", "reference", "referenced", "regarding", "review",
+    "reviewed", "reviewing", "same", "see", "shall", "should", "so", "some", "specified",
+    "stated", "still", "such", "than", "text", "that", "the", "their", "theirs", "them", "then",
+    "there", "these", "they", "thing", "things", "this", "those", "thread", "through", "to",
+    "too", "under", "until", "update", "updated", "upon", "us", "via", "was", "we", "were",
+    "what", "when", "where", "whether", "which", "while", "who", "will", "with", "within",
+    "would", "yet", "you", "your",
+})
 _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 _SHA256_PREFIXED = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _FULL_COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -241,7 +292,12 @@ def _folded_whole_value(text: str) -> str:
 
 
 def _is_whole_value_evasion(text: str) -> bool:
-    """True when the value, taken as a whole, offers no content of its own."""
+    """True when the value, taken as a whole, offers no content of its own.
+
+    This fixed whole-value comparison is the MACHINE arm's complete substitution
+    rule and is shared unchanged by both arms of :func:`_text`; it is not the
+    descriptive arm's rule (see :func:`_is_placeholder_prose`).
+    """
     core = _folded_whole_value(text)
     if not core or core in ("...", "…"):
         return True
@@ -260,6 +316,9 @@ def _is_placeholder(text: str) -> bool:
     machine identity or repository path, so any occurrence refuses. Bare token
     *substrings* no longer refuse on their own: a genuine path may mention a
     placeholder, and set membership plus digest recomputation decides it.
+
+    This arm is deliberately NOT relaxed for issue #2965: the filler tolerance
+    the descriptive arm needs lives only in :func:`_is_placeholder_prose`.
     """
     if _is_whole_value_evasion(text):
         return True
@@ -268,15 +327,41 @@ def _is_placeholder(text: str) -> bool:
     return False
 
 
+def _is_evasion_plus_filler(text: str) -> bool:
+    """True when a value names an evasion but says nothing beyond it.
+
+    The whole-value list cannot be the descriptive rule, because a real evasion
+    is not obliged to equal a listed literal: "see receipts for details",
+    "TBD pending review", "placeholder text pending review" and
+    "the <topic> is recorded above" all evade while carrying filler or slot
+    references. So the value is read for MEANING: remove every evasion token
+    and every slot reference it names, and if no remaining word is content of
+    its own, the entire informational content of the value was the evasion.
+
+    Prose that keeps real subject matter next to the evasion is accepted, which
+    is what keeps "Handle Vec<T> in the response conversion" and "Reject
+    placeholder evidence in metadata" legitimate.
+    """
+    core = _folded_whole_value(text)
+    if _EVASION_PROSE_RE.search(core) is None and _SLOT_REFERENCE_RE.search(core) is None:
+        return False
+    residue = _EVASION_PROSE_RE.sub(" ", core)
+    residue = _SLOT_REFERENCE_RE.sub(" ", residue)
+    words = _PROSE_WORD_RE.findall(residue)
+    return not any(word not in _PROSE_FILLER_WORDS for word in words)
+
+
 def _is_placeholder_prose(text: str) -> bool:
     """Predicate for descriptive fields (topic, attestation statement, reason).
 
-    Only a whole-value evasion refuses: the recorded causal property,
-    attestation or reason IS the placeholder instead of the real text. Longer
-    prose that merely discusses placeholders, generics ("Vec<T>") or defects
-    passes; blank values are still rejected by _text before this runs.
+    Two tests, both meaning-based rather than literal: the recorded causal
+    property, attestation or reason may not BE a whole-value evasion, and it may
+    not be an evasion padded into a sentence whose only other content is filler
+    or a slot reference (:func:`_is_evasion_plus_filler`). Longer prose that
+    discusses placeholders, generics ("Vec<T>") or defects keeps passing; blank
+    values are still rejected by :func:`_text` before this runs.
     """
-    return _is_whole_value_evasion(text)
+    return _is_whole_value_evasion(text) or _is_evasion_plus_filler(text)
 
 
 def _text(value: Any, field: str, code: EvidenceFailure, *, allow_empty: bool = False,
@@ -2836,6 +2921,26 @@ def _run_concurrent_acceptance(surprising: list[str]) -> tuple[Path, int]:
 
 ACCEPTANCE_TOPIC = "seed source and seed generated acceptance routing"
 
+# An evasion that is deliberately NOT one of the fixed whole-value literals: an
+# evasion token plus filler. It must refuse.
+OFF_LITERAL_PLACEHOLDER_TOPIC = "see receipts for details"
+# Legitimate prose that discusses placeholders. It must pass.
+PLACEHOLDER_DISCUSSING_TOPIC = "Reject placeholder evidence in metadata"
+
+# ``topic`` sits inside the hashed route core (``docs_router_core.route_payload``)
+# and the read receipt id is derived from the route id, so a topic-only mutation
+# applied to a body computed for ANOTHER topic cannot yield its own valid
+# receipts: it yields ROUTE_RECEIPT_MISMATCH, never a PASS. The only body a
+# topic mutation can validly start from is one whose receipts were computed for
+# that same topic, and on such a body the mutation is a no-op. So these names
+# select the INPUT for an expectation row rather than adding a case:
+# ``run_acceptance`` builds a genuinely valid envelope for the listed topic and
+# runs the row against it. The row still exercises the descriptive predicate -
+# ``verify`` applies ``_text`` to the topic before recomputing any receipt - so
+# the row is not vacuous; only the card's "runtime topic mutation" framing is
+# unattainable, and the acceptance row above carries the failing direction.
+_TOPIC_SCOPED_MUTATIONS = ("placeholder_discussing_topic",)
+
 ACCEPTANCE_CASES: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
     ("empty", "pr_2963_empty.md", EvidenceFailure.EMPTY_DOCUMENTATION_EVIDENCE,
      "the exact #2963 free-text block plus its prose attestation cannot pass"),
@@ -2898,6 +3003,15 @@ def _apply_mutation(valid_body: str, mutation: str) -> str:
         mutated["optional_expansions"] = "none"
     elif mutation == "unknown_field":
         mutated["reviewer_note"] = "an unknown field must be rejected"
+    elif mutation == "off_literal_placeholder_topic":
+        # Issue #2965 W6/A7: an evasion padded past every fixed whole-value
+        # literal. It must refuse on the DESCRIPTIVE arm's meaning test, not by
+        # literal membership.
+        mutated["topic"] = OFF_LITERAL_PLACEHOLDER_TOPIC
+    elif mutation == "placeholder_discussing_topic":
+        # Issue #2965 audit 5919739325 defect 1: legitimate prose that names a
+        # placeholder must not be refused (see _TOPIC_SCOPED_MUTATIONS).
+        mutated["topic"] = PLACEHOLDER_DISCUSSING_TOPIC
     else:  # pragma: no cover - the mutation table is closed
         _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"unknown acceptance mutation: {mutation}")
     payload = json.dumps(mutated, indent=2, sort_keys=True)
@@ -2920,13 +3034,27 @@ def run_acceptance(_live_root: Path) -> int:
     retained in the signature so the controller can pass its own root.
 
     Prints the exact typed failure code (or PASS) per case. Exits nonzero only
-    when a case did not behave as the issue requires.
+    when a case did not behave as the issue requires. ``cases=N`` counts every
+    executed case: the committed body fixtures, the runtime mutation
+    expectations and the concurrent-movement cases. A topic-scoped body is not
+    an extra case: it selects the input for one expectation row, which is
+    already counted in ``expectations``.
     """
     del _live_root
     root, base, candidate, _ = _build_acceptance_repo()
     concurrent_root: Path | None = None
     try:
         valid_body = _valid_envelope(root, base, candidate, ACCEPTANCE_TOPIC)
+        # A topic mutation that must PASS cannot run against ``valid_body``:
+        # ``topic`` is inside the hashed route core, so the receipts it implies
+        # differ and the row would observe ROUTE_RECEIPT_MISMATCH. Each such row
+        # therefore runs against an envelope genuinely computed for its own
+        # topic, and the mutation is then applied to that envelope, which is
+        # what the row actually demonstrates.
+        topic_valid_bodies = {
+            mutation: _valid_envelope(root, base, candidate, PLACEHOLDER_DISCUSSING_TOPIC)
+            for mutation in _TOPIC_SCOPED_MUTATIONS
+        }
         expectations: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
             ("valid-multi-route", "valid", None,
              "a valid multi-route envelope with every required item and exact current digest passes"),
@@ -2962,6 +3090,12 @@ def run_acceptance(_live_root: Path) -> int:
              "optional 'none' is valid when routing offered optional material the author did not open"),
             ("unknown-field", "unknown_field", EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
              "an unknown envelope field is rejected"),
+            ("off-literal-placeholder-topic", "off_literal_placeholder_topic",
+             EvidenceFailure.ROUTER_INPUT_MISMATCH,
+             "placeholder prose padded past every fixed whole-value literal still fails on meaning, "
+             "not on literal membership"),
+            ("placeholder-discussing-topic", "placeholder_discussing_topic", None,
+             "legitimate prose that discusses placeholders is accepted and the envelope passes"),
         )
         surprising: list[str] = []
         # The three committed free-text/body-parser samples are verified verbatim.
@@ -2978,7 +3112,8 @@ def run_acceptance(_live_root: Path) -> int:
                 surprising.append(f"{name}: unexpectedly passed")
                 print(f"  {name}: UNEXPECTED-PASS ({note})")
         for name, mutation, expect, note in expectations:
-            code, result = _verify_mutation(root, base, candidate, valid_body, mutation)
+            source_body = topic_valid_bodies.get(mutation, valid_body)
+            code, result = _verify_mutation(root, base, candidate, source_body, mutation)
             if expect is None:
                 if code is None and result is not None:
                     print(
