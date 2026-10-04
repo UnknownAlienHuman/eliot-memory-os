@@ -479,9 +479,22 @@ fn assert_activation_transport_contract(client: &str, kernel: &str, protocol: &s
     assert_ordered(
         reconcile,
         &[
-            "query.validate()",
+            // #839: the production source renders the call as `query` then
+            // `.validate()` on the next line with twelve leading spaces, and
+            // `assert_ordered` is a literal `str::find` with no whitespace
+            // tolerance, so the marker is that exact two-line shape. It binds
+            // the receiver to `query`: a call on any other receiver fails here.
+            // The `NotAttempted` arm after it and the transport call after that
+            // pin validate-before-transport: a query validated only after the
+            // exchange, or a validation failure reported as already sent, fails
+            // this order.
+            "query\n            .validate()",
+            "ActivationReconcileError::NotAttempted {",
+            ".transact_async(",
             "\"agent_activation_reconcile\"",
             "serde_json::json!({ \"reconcile\": query })",
+            // a transport failure is `Unknown`, never `NotAttempted`.
+            "ActivationReconcileError::Unknown {",
             "response.ack.validate()",
             "response.ack.replay_key() != (query.ticket_id.as_str(), query.result_sha256.as_str())",
             "Ok(response.ack)",
@@ -836,7 +849,7 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
     assert_fixture_case(28, "required activation functions have production callers")?;
     let projection = source("src/activation_projection.rs")?;
     let projection_production = projection
-        .split("\n#[cfg(test)]\nmod tests")
+        .split("\n#[cfg(test)]\nmod projection_tests")
         .next()
         .ok_or("activation projection test boundary is missing")?;
     for marker in [
@@ -857,9 +870,9 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
         .ok_or("daemon library test boundary is missing")?;
     for marker in [
         "activation_projection::map_governor_outcome_to_protocol(",
-        "activation_projection::stale_fence_for_resolved_mismatch(",
-        "activation_projection::failed_internal_for_unready_governor(",
-        "activation_projection::failed_internal_for_mapping_failure(",
+        "activation_projection::stale_fence_for_resolved_mismatch_with_observation(",
+        "activation_projection::failed_internal_for_unready_governor_with_observation(",
+        "activation_projection::failed_internal_for_mapping_failure_with_observation(",
         "DaemonComposition::resolve_agent_activation_v2(self, ticket, now)",
     ] {
         assert!(
@@ -915,7 +928,7 @@ fn activation_source_excludes_unowned_effects_and_duplicate_paths() -> TestResul
     )?;
     let projection = source("src/activation_projection.rs")?;
     let projection_production = projection
-        .split("\n#[cfg(test)]\nmod tests")
+        .split("\n#[cfg(test)]\nmod projection_tests")
         .next()
         .ok_or("activation projection test boundary is missing")?;
     assert_source_excludes(

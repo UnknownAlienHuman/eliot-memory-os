@@ -12,15 +12,23 @@
 ;; surface, the `$copy` helper, `realloc`, the whole `step` body, the other
 ;; four `(data ...)` segments and the export set are identical to that sibling.
 ;;
-;; `validate_descriptor` (typed_execution.rs:527-579) compares the reported
-;; world against the selected world FIRST, at :532, and returns
+;; `validate_descriptor` (`bins/eliot-wasm-host/src/typed_execution.rs`,
+;; fn `validate_descriptor`, lines 538-590) compares the reported
+;; world against the selected world FIRST, at same-file line 543,
+;; `if descriptor.world_name != world.world_name() {`, and returns
 ;; `TypedExecutionError::OutputViolation("world-name")`. Because that is the
 ;; first field checked, no later rule runs: not `bounded_descriptor_string`
-;; (:517-524), not the aggregate output bound (:552-563), and not
-;; `validate_descriptor_abi_digest` (:797-804). A descriptor selects nothing.
+;; (same file, lines 528-535), not the aggregate output bound (same-file
+;; lines 563-574), and not
+;; `validate_descriptor_abi_digest` (same file, fn
+;; `validate_descriptor_abi_digest`, lines 812-819).
+;; A descriptor selects nothing.
 ;;
-;; Staged `Output` by `execute_describe_experimental` (:1017-1019) and
-;; staged `Descriptor` by `execute_domain_lane` (:2106-2108).
+;; Staged `Output` by `execute_describe_experimental` (same file, fn
+;; `execute_describe_experimental`, lines
+;; 1034-1036) and
+;; staged `Descriptor` by `execute_domain_lane` (same file, fn
+;; `execute_domain_lane`, lines 2123-2125).
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
 ;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo scratch
@@ -153,10 +161,10 @@
     ;; `canon lift` flattens `abi-descriptor` to ELEVEN core values (five
     ;; `string` fields as (ptr, len) plus `abi-revision: u32`), but a lifted
     ;; RESULT that does not fit `MAX_FLAT_FUNC_RESULTS` (1) lowers to a SINGLE
-    ;; pointer to guest-owned memory: wasmparser-0.256.0
-    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; pointer to guest-owned memory: wasmparser-0.252.0
+    ;; `validator/component_types.rs`:36 and :1261-1276 clear the flat results
     ;; and push exactly one pointer for `Abi::Lift`, and
-    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;; `validator/component.rs`:1328/:1350 require that one-pointer signature.
     ;; The returned pointer is 0x0c00; the eleven words occupy 0x0c00..0x0c2b.
     ;; Occupied: 0x0400..0x0477 the descriptor strings, 0x0800..0x0878 the
     ;; `step` result tuple, 0x1000 and 0x1200 the two echo scratch blocks, 0x1400 the
@@ -192,10 +200,10 @@
       (call $copy (i32.const 4096) (i32.load (i32.add (local.get $req) (i32.const 4))) (local.get $n))
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
-      ;; echo "state.fence-epoch" back out of the lowered request
+      ;; echo the lowered request's OWN "fence-epoch" (record offset 28/32);
       ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
       ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
-      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
+      ;; POINTER_PAIR (wasmtime-environ-47.0.4/src/component/types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))

@@ -1603,9 +1603,13 @@ fn require_install_dir(install_dir: &std::path::Path) -> Result<(), WasmDispatch
 
 /// Flushes one staged file so its bytes are durable before any rename
 /// names them (the repository's sealed-body contour: durable body
-/// before the row that names it).
+/// before the row that names it). The handle is opened for writing:
+/// Windows `FlushFileBuffers` refuses a read-only handle with
+/// `PermissionDenied`, which would fail every publication closed.
 fn sync_file(path: &std::path::Path) -> Result<(), WasmDispatchError> {
-    std::fs::File::open(path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|_| invalid("delivery-io"))
 }

@@ -144,8 +144,8 @@
     ;; the frozen ABI revision, in WIT field order. A lifted export flattens
     ;; its result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the
     ;; core function returns ONE pointer into exported linear memory
-    ;; (wasmparser-0.256.0 src/validator/component_types.rs:35, :129 and
-    ;; :1279-1292, enforced at src/validator/component.rs:1343 and :1365).
+    ;; (wasmparser-0.252.0 src/validator/component_types.rs:36, :130 and
+    ;; :1261-1274, enforced at src/validator/component.rs:1328 and :1350).
     ;; Retptr base 0x600: past the last descriptor byte at 0x47e and below
     ;; the 0x800 result tuple, so it collides with nothing in this memory.
     (func (export "describe") (result i32)

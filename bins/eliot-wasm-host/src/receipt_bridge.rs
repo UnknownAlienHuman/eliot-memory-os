@@ -19,16 +19,30 @@
 //! `digest`, a canonical digest over every kit field — package, world, ABI,
 //! artifact digest AND length, interface digest, declared imports/exports,
 //! state contract digest, proof ceiling and the `governed` flag,
-//! `capsule.rs:49-63` and `:99-101`), and `proof_ceiling` is the
-//! admitted ceiling — on the kit lane `ModuleContractKit::proof_ceiling`, which
+//! `crates/modules/eliot-wasm-runtime/src/capsule.rs:49-63` and `:99-101`;
+//! the crate path is spelled out because
+//! `crates/eliot-engine/src/ul/capsule.rs` is an unrelated file of the same
+//! name), and `proof_ceiling` is the admitted ceiling — on the kit lane
+//! `ModuleContractKit::proof_ceiling`, which
 //! the call site admits only after proving it equal to the
 //! `TypedDomainAdmission::proof_ceiling` that call actually enforces (a kit
 //! claiming a higher ceiling fails closed instead of being projected, because
 //! kit validation does not bound it to the envelope). Kit-less lanes (the
 //! describe-only path and
 //! the unbound domain path) have no honest `kit_digest` source and must not
-//! call this projection until a kit owner binds one; they report `None` for
-//! the shared receipt instead of synthesizing either value.
+//! call this projection until a kit owner binds one, and neither synthesizes
+//! either value. Their honest answer differs: the unbound domain path reports
+//! `None` as the third element of the result tuple its domain entry returns —
+//! the `Option<eliot_wasm_runtime::TypedReceipt>` arm of
+//! `execute_domain_experimental`, whose kit-less arm ends
+//! `return Ok((receipt, result, None))` (its body ends instead in the
+//! kit-forwarding `execute_capsule_domain_experimental(...)` tail) — while
+//! the describe-only entry,
+//! `execute_describe_experimental`, carries NO shared-receipt element at all:
+//! its signature is `Result<(TypedReceipt, TypedDescriptor),
+//! TypedExecutionError>`, so there is no `None` for a caller to observe there
+//! either. Cited by symbol and by quoted return value rather than by line
+//! number, because the executor is edited underneath this comment.
 //!
 //! The projected receipt is validated by the shared `validate` before it is
 //! returned (`crates/modules/eliot-wasm-runtime/src/types.rs:922-937`): exact
@@ -142,8 +156,10 @@ pub fn project_shared_receipt(
 /// Each host stage names the proof its completion would support; parity has
 /// no host counterpart and is never produced here. A host receipt exists only
 /// on success and both typed lanes stamp it `TypedStage::Cleanup`
-/// (`typed_execution.rs:1049`, `:2150`), so a projection built from a
-/// production receipt always carries `ProofStage::Receipt`. The other five
+/// (`src/typed_execution.rs:1066`, `:2167`; `tests/typed_execution.rs` is a
+/// different file of the same name and is never cited here), so a
+/// projection built from a production receipt always carries
+/// `ProofStage::Receipt`. The other five
 /// arms keep the closed host vocabulary mapped rather than silently
 /// collapsed, and an unrecognized code is denied by the `else` arm instead of
 /// being mapped to a neighbouring proof.
@@ -241,7 +257,8 @@ const fn proof_ceiling_code(ceiling: ProofCeiling) -> &'static str {
 /// Bounds an unparsable host world for a typed denial: identity only, never
 /// payload, path, or secret. 96 characters, matching the host's own
 /// bounded-identity bound on the typed path
-/// (`typed_execution.rs:1078`), and tighter than the shared contract's 128.
+/// (`src/typed_execution.rs:1095`), and tighter than the shared contract's
+/// 128.
 fn bounded_identity(value: &str) -> String {
     value.chars().take(96).collect()
 }

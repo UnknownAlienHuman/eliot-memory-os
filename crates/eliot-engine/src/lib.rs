@@ -52,8 +52,8 @@ pub use action::{ActionLeaseEvaluation, ActionLeaseService};
 pub use adapter::{
     Adapter, AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport,
     AdapterRegistry, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture, HealthAdapter,
-    TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter,
-    normalize_result_to_observation, test_request,
+    TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestNoResultsAdapter,
+    TestSlowAdapter, normalize_result_to_observation, test_request,
 };
 pub use admission::WriteAdmissionService;
 pub use antigravity::{
