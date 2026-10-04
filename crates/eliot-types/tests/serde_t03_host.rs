@@ -749,6 +749,50 @@ fn c6_unknown_tag_or_payload_refused() {
     );
 }
 
+/// Decode the empty-`role_lease_id` fixture and pin the refusal it must produce,
+/// returning the refusal message so the caller can assert against it.
+///
+/// Every assertion lives here rather than inline so the case body stays a
+/// readable sequence of what is refused and why. The three properties are not
+/// interchangeable: the CLASS says it refused at the decoder rather than
+/// somewhere later and coincidentally, the MEMBER NAME is what makes the refusal
+/// attributable, and the SHARED WORDING is what proves there is one emptiness
+/// check in the crate rather than a per-field spelling.
+fn refuse_empty_lease_identity() -> String {
+    let refusal = decode_host::<TaskRoleLease>(&raw("w2_task_role_lease_empty_role_lease_id"))
+        .expect_err(
+            "TaskRoleLease.role_lease_id is the lease's own authority handle, so an empty value \
+             must be refused, never admitted as a current lease key",
+        );
+    assert_eq!(
+        refusal.classify(),
+        serde_json::error::Category::Data,
+        "an empty `role_lease_id` must be refused as a data error, never accepted as a lease \
+         identity, got: {refusal}"
+    );
+    let message = refusal.to_string();
+    // serde_derive adds no field-name context for a member run through a
+    // `deserialize_with` hook, so what the message carries is the shared refusal
+    // class plus the member name the hook was given.
+    assert!(
+        message.contains("empty protected identifier: role_lease_id"),
+        "the refusal must name the empty protected identifier and the member it refused, got: \
+         {message}"
+    );
+    assert!(
+        !message.contains("missing field"),
+        "an empty `role_lease_id` must not be reported as an absent member, got: {message}"
+    );
+    // The same class and wording as the control-wal and exchange envelopes
+    // already in this crate (`runtime.rs` / `runtime_supervision.rs`).
+    assert!(
+        message.contains("empty protected identifier:"),
+        "the refusal must reuse the crate's shared empty-protected-identifier wording, got: \
+         {message}"
+    );
+    message
+}
+
 // WORK_UNIT_CASE: 932/c7_missing_or_empty_identity_refused
 #[test]
 fn c7_missing_or_empty_identity_refused() {
@@ -807,21 +851,24 @@ fn c7_missing_or_empty_identity_refused() {
         "the missing-field refusal must name `epoch`, got: {missing_epoch}"
     );
 
-    // (d) `role_lease_id` present but EMPTY STRING. This member is a plain
-    // `String` with no validator, so the decoder honestly ACCEPTS it and yields
-    // "". That is the boundary, stated as a property: an empty protected
-    // identity is NOT refused by this decoder, so no such claim is made here.
-    // Non-emptiness for `role_lease_id` is a caller-layer rule this type cannot
-    // enforce, and asserting a refusal would assert something untrue.
-    let empty_lease_id: TaskRoleLease = decode_host(&raw("w2_task_role_lease_empty_role_lease_id"))
-        .expect(
-            "TaskRoleLease.role_lease_id is a plain String with no validator, so an empty value \
-             decodes; asserting a refusal here would assert something the type cannot do",
-        );
+    // (d) `role_lease_id` present but EMPTY STRING. This member is the lease's
+    // own authority handle -- `bind_launch_scope` compares it against a grant
+    // and `AgentSessionHostBinding::task_role_lease_refs` is a membership set
+    // probed with it -- so an empty value is an ABSENT handle, not a weaker one,
+    // and it must refuse at the decoder rather than satisfy an empty member of
+    // that membership set.
+    refuse_empty_lease_identity();
+    // The refusal must be the EMPTY spelling only, not a rejection of the member:
+    // the same fixture with a real handle still decodes, so the case cannot be
+    // satisfied by refusing every lease.
+    let counterpart: TaskRoleLease = decode_host(&raw("w2_task_role_lease_state_active")).expect(
+        "the same TaskRoleLease fixture with a non-empty role_lease_id must still decode; \
+             the refusal is the empty spelling alone",
+    );
     assert_eq!(
-        empty_lease_id.role_lease_id, "",
-        "an empty `role_lease_id` must decode to the empty string, never to a fabricated lease \
-         handle; a plain String carries no non-empty rule of its own"
+        counterpart.role_lease_id, "lease-1",
+        "the accepted counterpart must keep its own lease handle from the wire, never a \
+         substituted one"
     );
 
     // (e) `agent_session_id` present but EMPTY STRING. `AgentSessionId` is a
