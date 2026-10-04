@@ -3,22 +3,24 @@
 ;;
 ;; A guest that burns wall time without burning fuel and without touching memory
 ;; can only be stopped by the injected epoch/wall deadline. This component's
-;; `describe` is exactly that: a bounded (20000 x 20000) counted integer spin
-;; on locals, with no memory traffic, no host call and no ambient capability, so
-;; the resource and output ceilings are silent and the admitted fuel budget is
-;; not even installed when the cancellation policy is `EpochInterruption`.
+;; `describe` is exactly that: an unbounded counted integer spin on locals -- an
+;; inner counter bounded at 20000 per outer turn, inside an outer loop whose
+;; back-edge never exits -- with no memory traffic, no host call and no ambient
+;; capability, so the resource and output ceilings are silent and the admitted
+;; fuel budget is not even installed when the cancellation policy is
+;; `EpochInterruption`.
 ;;
 ;; The result is `wasmtime::Trap::Interrupt`, mapped by `map_call_error`
-;; (typed_execution.rs:1267-1269) to `EngineTermination::EpochDeadline` and
+;; (typed_execution.rs:1287-1303) to `EngineTermination::EpochDeadline` and
 ;; reported as `TypedExecutionError::Engine("EpochDeadline")` staged at
 ;; `TypedStage::Descriptor`. The deadline comes from the host-driven epoch pump
-;; (`EpochDriver::spawn`, :1474-1506), which forces the epoch once
+;; (`EpochDriver::spawn`, :1508-1539), which forces the epoch once
 ;; `wall_deadline_ms` expires: a real supported interruption, not a dropped
 ;; caller future and not a claimed synchronous compile cancellation.
 ;;
 ;; Memory map: 0x0000-0x03ff reserved, 0x0400 descriptor strings,
-;; 0x0800 the lowered `step` result tuple, 0x1000 echo scratch, 0x1400 the bump
-;; region the host `realloc` hands out while lowering the request.
+;; 0x0800 the lowered `step` result tuple, 0x1000 and 0x1200 the two echo scratch
+;; blocks, 0x1400 the bump region the host `realloc` hands out while lowering the request.
 (component
   (type $abi_descriptor (record
     (field "world-name" string)
@@ -121,7 +123,7 @@
     (case "internal" $cycle_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome $cycle_error))))
+  (type $f-domain (func (param "input" $cycle_step_input) (result (result $cycle_outcome (error $cycle_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 5120))
@@ -140,33 +142,37 @@
                  (i32.xor (local.get $align) (i32.const -1))))
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
-    ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, flattened in WIT field order.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
+    ;; `describe`: the frozen WIT abi-descriptor shape. The signature is the
+    ;; single `i32` retptr that `canon lift` of a record flattening to more than
+    ;; `MAX_FLAT_FUNC_RESULTS` (1) core values demands: wasmparser-0.256.0
+    ;; `validator/component_types.rs`:35 and :1276-1296 clear the flat results
+    ;; and push exactly one pointer for `Abi::Lift`, and
+    ;; `validator/component.rs`:1343/:1365 require that one-pointer signature.
+    ;;
+    ;; The spin below is the whole obligation of this file: with
+    ;; `CancellationPolicy::EpochInterruption` the store carries NO fuel at all
+    ;; (`typed_fuel_budget`, typed_execution.rs:1390-1395 returns None at :1393 and
+    ;; `new_store` at :1397-1426 never calls `set_fuel`, which is only reached at
+    ;; :1419-1422), so the only thing that
+    ;; can end this call is the injected epoch/wall deadline
+    ;; (`EpochDriver::spawn`, :1508-1539; `Trap::Interrupt` maps to
+    ;; `EngineTermination::EpochDeadline` at :1280). No retptr region is written
+    ;; and no descriptor value is produced, because adding a store or a return
+    ;; here would destroy exactly the obligation this file exists to prove.
+    (func (export "describe") (result i32)
       (local $outer i32)
       (local $inner i32)
       (local $acc i64)
-      (i32.const 1024)
-      (i32.const 13)
-      (i32.const 1037)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1056)
-      (i32.const 19)
-      (i32.const 1075)
-      (i32.const 5)
-      (i32.const 1080)
-      (i32.const 64)
-      ;; Bounded, counted and completely silent: this spin touches locals only.
-      ;; It loads nothing, stores nothing, grows nothing and calls nothing, so no
-      ;; memory, table or output ceiling can account for stopping it. With
-      ;; `CancellationPolicy::EpochInterruption` the store carries NO fuel at all
-      ;; (`typed_fuel_budget`, typed_execution.rs:1357-1362 returns None and
-      ;; `new_store` at :1386-1390 never calls `set_fuel`), so the only thing
-      ;; that can end this call is the injected epoch/wall deadline
-      ;; (`EpochDriver::spawn`, :1474-1506; `Trap::Interrupt` maps to
-      ;; `EngineTermination::EpochDeadline` at :1269). The descriptor values
-      ;; pushed above are returned by no path.
+      ;; Counted and completely silent: this spin touches locals only. The inner
+      ;; counter is bounded at 20000 per outer turn, but the OUTER back-edge is an
+      ;; UNCONDITIONAL `(br $ol)`, so control never leaves the outer loop: the
+      ;; declared `(result i32)` is validated by an unreachable frame rather than
+      ;; by a terminal value, which is why there is no return constant here and
+      ;; why the descriptor is produced by no path. It loads nothing, stores
+      ;; nothing, grows nothing and calls nothing, so no memory, table or output
+      ;; ceiling can account for stopping it; with the admitted
+      ;; `CancellationPolicy::EpochInterruption` there is no fuel installed, so
+      ;; the injected epoch/wall deadline is the only terminator.
       (loop $ol
         (local.set $inner (i32.const 0))
         (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
@@ -176,7 +182,7 @@
           (local.set $inner (i32.add (local.get $inner) (i32.const 1)))
           (br_if $il (i32.lt_u (local.get $inner) (i32.const 20000))))
         (local.set $outer (i32.add (local.get $outer) (i32.const 1)))
-        (br_if $ol (i32.lt_u (local.get $outer) (i32.const 20000))))
+        (br $ol)))
     )
     ;; `step`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
@@ -195,11 +201,14 @@
       (i32.store (i32.const 2064) (i32.const 4096))
       (i32.store (i32.const 2068) (local.get $n))
       ;; echo "state.fence-epoch" back out of the lowered request
+      ;; canonical-ABI: `state.fence-epoch` is dreamer-state record offset 36
+      ;; (next_field32, wasmtime-environ-47.0.4/src/component/types.rs:756) as a
+      ;; POINTER_PAIR (types.rs:707) -> 2080 + 36 = 2116 (ptr) and 2120 (len).
       (local.set $n (i32.load (i32.add (local.get $req) (i32.const 32))))
       (if (i32.gt_u (local.get $n) (i32.const 512)) (then (local.set $n (i32.const 512))))
       (call $copy (i32.const 4608) (i32.load (i32.add (local.get $req) (i32.const 28))) (local.get $n))
-      (i32.store (i32.const 2124) (i32.const 4608))
-      (i32.store (i32.const 2128) (local.get $n))
+      (i32.store (i32.const 2116) (i32.const 4608))
+      (i32.store (i32.const 2120) (local.get $n))
       (i32.const 2048))
     (export "realloc" (func $realloc))
     (data (i32.const 1024) "dreamer-cycle")
