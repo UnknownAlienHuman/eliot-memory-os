@@ -82,9 +82,11 @@ Finalize one verified runtime-canary bundle without rebuilding, installing, or
 registering services. Every value below is explicit: the SignTool path, the
 certificate store and exact thumbprint, and the approved RFC3161 endpoint. The
 certificate must have `HasPrivateKey=true` and the Code Signing EKU. The
-finalizer signs the twelve materializer executable roles plus the install-authoritative
-`runtime/eliot.exe` CLI trust role, requests SHA-256 file and
-timestamp digests, performs independent `Get-AuthenticodeSignature`/WinTrust
+finalizer signs the thirteen fixed runtime roles - the twelve materializer
+executable roles plus the install-authoritative `runtime/eliot.exe` CLI trust
+role - and the source-bound Operator, Governor, Codex-plugin Governor, and
+bundle-root Bridge roles, requests SHA-256 file and timestamp digests,
+performs independent `Get-AuthenticodeSignature`/WinTrust
 readback plus exact-exit-zero `signtool verify /pa /all /v /tw` for every role,
 and parses the embedded RFC3161 CMS token. The token must use the Microsoft
 RFC3161 unauthenticated attribute, carry a SHA-256 TSTInfo messageImprint over
@@ -201,7 +203,7 @@ signing contract without touching the input. `-VerifyBundle` independently
 rechecks the signed manifests, exact signer/timestamp evidence, all sizes and
 hashes, and the signature of every role in the reconstructed source-bound signing
 inventory (the 13 fixed runtime roles plus the source-bound Operator, Governor,
-Codex-plugin Governor, Codex-plugin Bridge, and bundle-root Bridge roles).
+Codex-plugin Governor, and bundle-root Bridge roles).
 Verification requires the unsigned source
 bundle and the same external SignTool/store/thumbprint/timestamp policy; signed
 JSON is never allowed to attest its own signer policy. Signing requires the
@@ -240,7 +242,7 @@ through a consumer handoff. Consequently the finalizer has no success terminal.
 The exact source inventory is read back after copy and before commit. Only the
 PE certificate-table changes limited to exactly the reconstructed signing roles
 (the 13 fixed runtime roles plus the source-bound Operator, Governor,
-Codex-plugin Governor, Codex-plugin Bridge, and bundle-root Bridge roles),
+Codex-plugin Governor, and bundle-root Bridge roles),
 the three manifest rewrites, and the exact
 `SIGNING_REQUIRED.txt` to `SIGNING_VERIFIED.json` marker transition are allowed;
 all non-role paths, hashes, and sizes remain byte-identical. Each PE normalized
