@@ -1571,7 +1571,7 @@ fn activation_request_is_not_an_observed_activation() {
     assert_present(&text, &[requested.as_str()]);
     assert_absent(&text, &["kernel.control.transition_committed"]);
     // The owner's own lifecycle state is untouched by the request.
-    let (state_text, state) = capture_with(|| kernel.service_state());
+    let (_state_text, state) = capture_with(|| kernel.service_state());
     assert!(
         matches!(state, Ok(KernelServiceState::Cold)),
         "a requested transition must not move the owner's lifecycle state, got {state:?}"
