@@ -485,6 +485,15 @@ const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
 const CANONICAL_STORE_ROUTE_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_canonical_store_route_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+/// Refusal [`RedbRecoveryStore::retire_host_request_logical_key`] returns when
+/// the key carries no staged link at all.
+///
+/// Named once so the producer of this refusal and its only production caller,
+/// the terminal transition in [`RedbRecoveryStore::advance_host_request`], test
+/// the same value instead of two literals that can drift apart. A row that never
+/// claimed a logical key has nothing to retire, which is a normal outcome of the
+/// terminal route and not a failed retirement.
+const HOST_REQUEST_LOGICAL_LINK_UNSTAGED: &str = "no logical link is staged under this key";
 /// Durable evaluated tool-exposure receipts, one per completed host-request
 /// operation (issue #1945, I7.24).
 ///
@@ -7944,7 +7953,7 @@ impl RedbRecoveryStore {
                 let Some(guard) = links.get(logical_key).map_err(storage)? else {
                     return Err(OrsError::InvalidField {
                         field: "host_request_logical_key",
-                        reason: "no logical link is staged under this key",
+                        reason: HOST_REQUEST_LOGICAL_LINK_UNSTAGED,
                     });
                 };
                 match Self::decode_host_request_logical_link(guard.value()) {
@@ -10228,6 +10237,33 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        // The replay horizon is terminal-state-driven, so the route that drives a
+        // host request to its exact terminal state is also the route that retires
+        // its logical key (#2571 W6/AUD2). Retirement swaps the link for a
+        // tombstone under the same key instead of deleting it, so a retired key
+        // can never be reused as a new effect and a later authenticated
+        // continuation of the same logical occurrence answers the typed recovery
+        // limitation instead of absence. Without this call no tombstone could ever
+        // be written and every consumer built for one stayed unreachable.
+        //
+        // Retirement requires the exact-terminal proof this transition has just
+        // made durable, which is why it runs after the commit above and not
+        // inside the same transaction. Any real retirement failure is propagated
+        // rather than swallowed; a key that carries no staged link is the normal
+        // "nothing to retire" outcome and leaves the terminal record untouched.
+        let retirement_key =
+            if next != existing && target.is_terminal() && next.result_digest.is_some() {
+                Self::host_request_logical_key_for_record(&next)?
+            } else {
+                None
+            };
+        if let Some(logical_key) = retirement_key.as_deref() {
+            match self.retire_host_request_logical_key(logical_key) {
+                Err(OrsError::InvalidField { reason, .. })
+                    if reason == HOST_REQUEST_LOGICAL_LINK_UNSTAGED => {}
+                outcome => outcome?,
+            }
+        }
         Ok(Some(next))
     }
 
