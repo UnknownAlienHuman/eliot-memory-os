@@ -235,8 +235,63 @@ fn fixture(name: &str) -> String {
 /// Decode a fixture through the ordinary typed path. Every call site in this
 /// file goes through `from_str` on the fixture's own text, so no repeated
 /// member is ever collapsed by a `Value` intermediate.
-fn decode<T: serde::de::DeserializeOwned>(document: &str) -> Result<T, serde_json::Error> {
-    serde_json::from_str(document)
+/// A decode refusal whose `Display` is the raised message WITHOUT
+/// `serde_json`'s trailing decode-position annotation.
+///
+/// `serde_json::from_str` appends ` at line <n> column <n>` to every error it
+/// raises, and the column depends only on how long the fixture text happens
+/// to be. That annotation records WHERE the refusal was detected, not WHICH
+/// refusal it was, so carrying it into an exact-message assertion would fail
+/// for a reason unrelated to the contract under test, and would fail
+/// differently for the same refusal reached through a longer document. Every
+/// pinned string below is therefore compared against the refusal class alone.
+/// This does not weaken any assertion: the whole remaining message is still
+/// compared verbatim, so a changed refusal class, a changed offending key
+/// name, or a changed declared field set still fails exactly as before, and
+/// the determinism rows still compare two real refusals against each other.
+struct Refusal(serde_json::Error);
+
+impl std::fmt::Debug for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Refusal")
+            .field(&refusal_text(&self.0))
+            .finish()
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&refusal_text(&self.0))
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// The refusal text with `serde_json`'s trailing decode-position annotation
+/// removed. A message that carries no such annotation is returned unchanged.
+fn refusal_text(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    let Some(index) = text.rfind(" at line ") else {
+        return text;
+    };
+    let (message, position) = text.split_at(index);
+    let fields: Vec<&str> = position.split_whitespace().collect();
+    let is_position = fields.len() >= 5
+        && fields[0] == "at"
+        && fields[1] == "line"
+        && fields[2].parse::<u64>().is_ok()
+        && fields[3] == "column"
+        && fields[4].parse::<u64>().is_ok();
+    if is_position {
+        message.to_owned()
+    } else {
+        text
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(document: &str) -> Result<T, Refusal> {
+    serde_json::from_str(document).map_err(Refusal)
 }
 
 // ===========================================================================
@@ -2825,14 +2880,26 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_bounded_decode
 // `serde_json::Error`'s `Display`:
 //   * `serde`'s `de::Error::unknown_field` / `unknown_variant` /
 //     `missing_field` / `duplicate_field` build their message with
-//     `format_args!` and never append a position, so
-//     `serde_json::error::make_error`'s `parse_line_col` finds no
-//     `" at line N column M"` suffix, leaves `line == 0`, and `Display` then
-//     writes the message BARE (serde_json-1.0.151 `error.rs`,
-//     `impl Display for ErrorImpl`);
+//     `format_args!` and never append a position themselves, so the position
+//     these rows used to strip by hand is added on serde_json's side;
 //   * serde's `OneOf` Display renders 2 names as "`a` or `b`" and 3+ as
 //     "one of `a`, `b`, `c`" (serde-1.0.229 `core/de/mod.rs`), which is what
 //     makes the expected-field tail below a literal and not a paraphrase.
+//
+// CORRECTION (this suite was executed for the first time on this change).
+// An earlier revision of this comment asserted that
+// `serde_json::error::make_error`'s `parse_line_col` "finds no
+// `" at line N column M"` suffix, leaves `line == 0`, and `Display` then
+// writes the message BARE". That premise is FALSE for every error reached
+// through `decode(..)`, i.e. through `from_str`: serde_json appends
+// `" at line N column M"` to all of them, and the column tracks the fixture
+// text's own length. Five cases (c11, c12, c13, c15, c16) therefore failed on
+// unmodified main for a reason that had nothing to do with the contract: the
+// same refusal raised through a longer document produced a different string.
+// Rather than pin a column that changes with every fixture edit, `decode(..)`
+// now returns `Refusal`, whose `Display` is the raised message with that one
+// decode-location annotation removed; see `Refusal` for why this keeps the
+// assertion exact. The second fact above is unchanged and still verified.
 //
 // Each pinned string is asserted with `assert_eq!` on the WHOLE message, so a
 // paraphrase that happened to contain the field name would not pass.
