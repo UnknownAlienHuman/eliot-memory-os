@@ -811,10 +811,17 @@ fn validate_descriptor_abi_digest(descriptor: &TypedDescriptor) -> Result<(), Ty
 /// API offers for a not-yet-lifted result. Accumulation itself is saturating:
 /// a hostile sequence of individually bounded leaves saturates into the typed
 /// `finish` denial instead of overflowing the counter.
+///
+/// Only `bytes` is accumulated. An earlier revision also carried an `items`
+/// counter, incremented once per visited leaf and once per list element; it was
+/// read by nothing — no receipt field, no digest, no denial string and no limit
+/// consults it, because the per-leaf and per-list ceilings compare the leaf's
+/// own length at `text` and `list` instead. Deleting it changed no observable
+/// behaviour, and it survived review only because a self-accumulation reads its
+/// own previous value, which rustc's `dead_code` pass counts as a use.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TypedBound {
     bytes: u64,
-    items: u64,
 }
 
 impl TypedBound {
@@ -825,7 +832,6 @@ impl TypedBound {
         self.bytes = self
             .bytes
             .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
-        self.items = self.items.saturating_add(1);
         Ok(())
     }
 
@@ -838,7 +844,6 @@ impl TypedBound {
         self.bytes = self
             .bytes
             .saturating_add(count.saturating_mul(TYPED_ITEM_LIFT_BYTES));
-        self.items = self.items.saturating_add(count);
         Ok(())
     }
 
@@ -4059,18 +4064,19 @@ fn call_dreamer_cycle(
 mod six_world_capsule_drive {
     use super::{
         ExecutionMode, ModuleContractKit, ModuleTestCapsule, ProofCeiling, Sha256Digest,
-        TypedDomainAdmission, TypedDomainOutcome, TypedDomainRequest, TypedDomainResult,
-        TypedExecutionError, TypedReceipt, TypedStage, TypedWorld, default_experimental_limits,
-        execute_capsule_domain_experimental, execute_describe_experimental,
-        execute_domain_experimental, preflight_bytes, typed_wit_digest,
+        TypedDomainAdmission, TypedDomainError, TypedDomainOutcome, TypedDomainRequest,
+        TypedDomainResult, TypedExecutionError, TypedReceipt, TypedStage, TypedWorld,
+        default_experimental_limits, execute_capsule_domain_experimental,
+        execute_describe_experimental, execute_domain_experimental, preflight_bytes,
+        typed_wit_digest,
     };
-    use crate::typed_bindings::TYPED_PACKAGE_ID;
     use crate::typed_bindings::context_admission::exports::eliot::current::admission as admission_wit;
     use crate::typed_bindings::context_assembly::exports::eliot::current::assembly as assembly_wit;
     use crate::typed_bindings::cue_activation::exports::eliot::current::activation as activation_wit;
     use crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle as cycle_wit;
     use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler as handler_wit;
     use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen as screen_wit;
+    use crate::typed_bindings::{TYPED_PACKAGE_ID, export_matches_interface};
     use eliot_wasm_runtime::component_contract::{AbiDescriptor, TypedWorld as NeutralWorld};
     use eliot_wasm_runtime::{CapabilityId, InvocationLimits, ProofStage};
 
@@ -4130,13 +4136,23 @@ mod six_world_capsule_drive {
         }
     }
 
-    /// Checked-in per-world component fixture for this world.
-    fn load_fixture(world: TypedWorld) -> Vec<u8> {
-        let path = format!("tests/data/typed-components/{}.wat", world.world_name());
+    /// Checked-in component fixture under this crate's typed fixture directory,
+    /// named by its file stem. `load_fixture` selects one by world name; the
+    /// inputs that are deliberately NOT a world's success fixture are named
+    /// here.
+    fn load_fixture_file(name: &str) -> Vec<u8> {
+        let path = format!("tests/data/typed-components/{name}.wat");
         match wat::parse_file(&path) {
             Ok(bytes) => bytes,
-            Err(error) => panic!("#758/3 fixture {path} must be a parseable component: {error}"),
+            Err(error) => {
+                panic!("#758 typed fixture {path} must be a parseable component: {error}")
+            }
         }
+    }
+
+    /// Checked-in per-world component fixture for this world.
+    fn load_fixture(world: TypedWorld) -> Vec<u8> {
+        load_fixture_file(world.world_name())
     }
 
     /// The exact frozen WIT bytes that declare this world's exported
@@ -4561,6 +4577,36 @@ mod six_world_capsule_drive {
         )
     }
 
+    /// The same world-binding question for the OTHER terminal, asked of a guest's
+    /// OWN typed error. `is_world_outcome` above deliberately refuses it: a
+    /// `GuestError` is a completed call only in the sense that the guest
+    /// returned a typed `Err`, and the host must never read one as an outcome.
+    /// This sibling says which world's error it is, so a caller can tell "this
+    /// world's guest refused" from "a foreign world's value arrived here".
+    fn is_world_guest_error(world: TypedWorld, result: &TypedDomainResult) -> bool {
+        let TypedDomainResult::GuestError(error) = result else {
+            return false;
+        };
+        matches!(
+            (world, error.as_ref()),
+            (TypedWorld::ContextAdmission, TypedDomainError::Admission(_))
+                | (TypedWorld::ContextAssembly, TypedDomainError::Assembly(_))
+                | (
+                    TypedWorld::CueActivation,
+                    TypedDomainError::CueActivation(_)
+                )
+                | (
+                    TypedWorld::DreamerHandler,
+                    TypedDomainError::DreamerHandler(_)
+                )
+                | (
+                    TypedWorld::MemoryCurationScreen,
+                    TypedDomainError::MemoryCurationScreen(_)
+                )
+                | (TypedWorld::DreamerCycle, TypedDomainError::DreamerCycle(_))
+        )
+    }
+
     /// Everything one world's drive binds, so every assertion helper below sees
     /// the exact measured values this world's own fixture produced rather than
     /// a hand-copied subset of them.
@@ -4624,29 +4670,50 @@ mod six_world_capsule_drive {
 
     /// The host receipt the one real typed invocation actually produced, bound
     /// to this world's own artifact, ABI and admitted identity.
-    fn assert_host_receipt(drive: &WorldDrive, receipt: &TypedReceipt, result: &TypedDomainResult) {
+    ///
+    /// The terminal result is deliberately NOT a parameter: the receipt's
+    /// `terminal` is assigned from `result.terminal()` inside the production
+    /// entry, so comparing the two here would compare a value with the
+    /// expression it was assigned from. `receipt.terminal == "Completed"`
+    /// stands on its own instead — a `GuestError` call reaching this helper
+    /// fails it.
+    fn assert_host_receipt(drive: &WorldDrive, receipt: &TypedReceipt) {
         assert_eq!(receipt.world, drive.world.world_name());
         assert_eq!(receipt.package_id, TYPED_PACKAGE_ID);
         assert_eq!(receipt.proof, ExecutionMode::LocalExperimental.proof());
         assert_eq!(receipt.artifact_digest, drive.digest);
         assert_eq!(receipt.artifact_bytes, drive.byte_len);
-        assert_eq!(receipt.engine_version, super::ENGINE_VERSION);
+        // `receipt.engine_version` is deliberately NOT asserted here: it is
+        // assigned `ENGINE_VERSION.to_owned()` at both receipt construction
+        // sites (:1032 and :2133), so comparing it against that same constant
+        // is a self-comparison that no production change can fail.
+        // `tests/typed_execution.rs` asserts the receipt's engine version
+        // against independent sources instead, which is the only form that can.
         assert_eq!(receipt.wit_digest, typed_wit_digest());
         assert!(receipt.actual_imports.is_empty());
-        assert_eq!(
-            receipt.actual_exports,
-            vec![format!(
-                "{TYPED_PACKAGE_ID}/{}",
-                drive.world.interface_name()
-            )]
+        // `actual_exports` is the component's REAL export name, copied
+        // unmodified by `preflight_component_type` (this file, :1131) into the
+        // receipt (:2137), and the admission gate accepts BOTH frozen spellings
+        // through the owner `export_matches_interface`
+        // (`src/typed_bindings.rs:181-187`). Every checked-in fixture exports
+        // `eliot:current/<interface>@0.1.0` (e.g.
+        // `tests/data/typed-components/dreamer-cycle.wat:217`), so this binds
+        // through that same owner instead of hardcoding one spelling — the
+        // rule `tests/typed_execution.rs:81-89` (`accepted_export_spellings`)
+        // already applies. Strength is unchanged: exactly one export, and it
+        // must name THIS world's interface in a spelling the host accepts. A
+        // bare interface or a foreign package still fails.
+        assert_eq!(receipt.actual_exports.len(), 1);
+        assert!(
+            export_matches_interface(&receipt.actual_exports[0], drive.world.interface_name()),
+            "unexpected export spelling: {:?}",
+            receipt.actual_exports[0]
         );
         assert_eq!(receipt.instances, 1);
-        assert_eq!(receipt.stage, TypedStage::Cleanup.as_str());
         assert_eq!(receipt.operation_id.as_deref(), Some(OPERATION_ID));
         assert_eq!(receipt.task_id.as_deref(), Some(TASK_ID));
         assert_eq!(receipt.fence_epoch.as_deref(), Some(FENCE_EPOCH));
         assert_eq!(receipt.policy_id.as_deref(), Some(POLICY_ID));
-        assert_eq!(receipt.terminal, result.terminal());
         assert_eq!(receipt.terminal, "Completed");
         assert!(receipt.input_bytes > 0);
         assert!(receipt.output_bytes > 0);
@@ -4730,7 +4797,7 @@ mod six_world_capsule_drive {
             .map_err(|error| error.to_string()),
         );
 
-        assert_host_receipt(&drive, &receipt, &result);
+        assert_host_receipt(&drive, &receipt);
         // The retained terminal result is this world's own typed outcome.
         assert!(is_world_outcome(world, &result));
 
@@ -4759,6 +4826,342 @@ mod six_world_capsule_drive {
         assert_raised_ceiling_denial(&drive);
     }
 
+    /// #758 marker 17, the half an integration test cannot reach (`mod
+    /// typed_bindings` is private outside this crate, so only in-crate code can
+    /// build the generated request records and actually invoke the domain
+    /// export): the REAL engine runs a guest that RETURNS its own typed `Err`
+    /// on the domain leg, and the EXECUTED outcome alone tells that apart from
+    /// a guest the engine TERMINATES. Nothing here reads the source text of any
+    /// file to decide which branch ran.
+    fn assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap() {
+        // Branch one, the guest's OWN typed error: this world's real request,
+        // the same admitted envelope, kit and capsule the six-world drive binds,
+        // and the checked-in `guest-typed-error` component, whose `screen`
+        // export returns the `err` arm of the world's own
+        // `result<screen-outcome, screen-error>` carrying a real
+        // `screen-error`. It does not trap.
+        let world = TypedWorld::MemoryCurationScreen;
+        let artifact = load_fixture_file("guest-typed-error");
+        let preflight = must(preflight_bytes(&artifact));
+        let limits = default_experimental_limits(preflight.digest.clone());
+        let kit = world_kit(world, &artifact);
+        let capsule = world_capsule(world, &kit, &limits);
+        let admitted = admitted_record();
+        let request = world_request(world, &admitted);
+
+        let (_receipt, result, _) = must(
+            execute_capsule_domain_experimental(
+                &kit, &capsule, &artifact, &limits, &request, &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+
+        // EXECUTED VALUE ONE: the retained terminal result is a `GuestError`
+        // carrying THIS world's own `screen-error`, in the very case the guest
+        // itself returned. A trap can produce neither, because a trap never
+        // returns a terminal result at all.
+        let TypedDomainResult::GuestError(guest_error) = &result else {
+            panic!("#758/17 the guest's own typed error must be the retained result");
+        };
+        let TypedDomainError::MemoryCurationScreen(screen_error) = guest_error.as_ref() else {
+            panic!("#758/17 the retained guest error must be this world's screen-error");
+        };
+        // The PAYLOAD, not just the case. The fixture plants the `human-detail`
+        // itself — `guest-typed-error.wat` stores ptr 2304 / len 1 and lays the
+        // byte down at 2304 — and `wit/typed/memory-curation-screen.wit` declares
+        // `record screen-cancelled { human-detail: string }`. Matching the case
+        // with a wildcard would prove only that the guest-chosen discriminant
+        // round-tripped: a host that decoded the variant correctly and then
+        // zeroed or substituted the detail would still pass. So the retained
+        // value is compared against the byte the guest actually wrote, which is
+        // what "retained verbatim" in that fixture's header claims.
+        let screen_wit::ScreenError::CancelledScreen(cancelled) = screen_error.as_ref() else {
+            panic!("#758/17 the retained guest error must be the cancelled-screen case");
+        };
+        assert_eq!(
+            cancelled.human_detail, "x",
+            "#758/17 the guest's own error payload must survive the lift"
+        );
+        // The world-binding predicate gets BOTH cases, because either alone can
+        // be satisfied by a broken predicate: a hardcoded `false` passes the
+        // refusal case, and a predicate that ignored its `world` argument passes
+        // nothing else. The positive case is falsifiable by DELETING an arm from
+        // `is_world_guest_error`'s own `matches!` list - the destructures above
+        // fix the argument, not what the function answers - and the refusal case
+        // is falsifiable by a predicate that dropped its world comparison. That
+        // is also why `assert!(!is_world_outcome(world, &result))` is NOT here:
+        // `is_world_outcome` returns false on the wrong variant by its own guard,
+        // so that line was a check that could not fail.
+        assert!(
+            is_world_guest_error(world, &result),
+            "#758/17 this world's own guest error must read as this world's"
+        );
+        assert!(
+            !is_world_guest_error(TypedWorld::DreamerCycle, &result),
+            "#758/17 the guest-error predicate must bind the world it names"
+        );
+
+        // Branch two, the trap: the same kit-owned entry and the same admitted
+        // envelope, on a checked-in component whose `describe` has no exit. The
+        // engine really terminates it.
+        let spinner = load_fixture_file("looping-describe");
+        let spinner_preflight = must(preflight_bytes(&spinner));
+        let spinner_limits = default_experimental_limits(spinner_preflight.digest.clone());
+        // Which typed cause is expected is decided by the admitted policy, not
+        // forced by this test: the default experimental envelope selects
+        // `EpochAndFuel`, so the store is fuel-metered and the endless loop
+        // raises the engine's own out-of-fuel trap.
+        assert_eq!(
+            spinner_limits.epoch.cancellation,
+            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel
+        );
+        let spinner_kit = world_kit(TypedWorld::DreamerCycle, &spinner);
+        let spinner_capsule =
+            world_capsule(TypedWorld::DreamerCycle, &spinner_kit, &spinner_limits);
+        let Err(denial) = execute_capsule_domain_experimental(
+            &spinner_kit,
+            &spinner_capsule,
+            &spinner,
+            &spinner_limits,
+            &world_request(TypedWorld::DreamerCycle, &admitted),
+            &admitted,
+        ) else {
+            panic!("#758/17 a terminated guest must not produce a terminal result");
+        };
+
+        // EXECUTED VALUE TWO: a staged typed denial naming the engine
+        // termination that actually happened, at the stage it reached. It is
+        // not a `GuestError`, and there is no terminal result to read as one.
+        let TypedExecutionError::Staged { stage, cause } = &denial else {
+            panic!("#758/17 the trap denial must be staged, got {denial}");
+        };
+        assert_eq!(*stage, TypedStage::Descriptor);
+        assert_eq!(
+            **cause,
+            TypedExecutionError::Engine(format!(
+                "{:?}",
+                eliot_wasm_runtime::EngineTermination::FuelExhausted
+            ))
+        );
+        assert_eq!(denial.to_string(), "STAGE:descriptor:ENGINE:FuelExhausted");
+        // The two branches are told apart by the EXECUTED VALUE alone, and the
+        // thing that separates them is the SHAPE of what came back, not a string
+        // comparison: the first branch had to destructure a retained
+        // `GuestError` terminal result or panic, and this one had to destructure
+        // a staged denial or panic. An earlier draft also asserted
+        // `denial.to_string() != receipt.terminal` here; that was dead, because a
+        // staged-denial rendering can never equal a terminal code, so it was
+        // removed rather than left in as a check that cannot fail.
+    }
+
+    /// #758 case 16's host-lifting half, and P7.3 (a host-lifted result is
+    /// length-bounded by the host's own ceiling, not accepted because it
+    /// lifted): the REAL engine runs a checked-in component whose domain result
+    /// carries MORE list items than the host admits, and the host REFUSES the
+    /// result with its own typed denial at the stage the call reached.
+    ///
+    /// Only in-crate code can observe this, and for the same reachability
+    /// reason as the marker-17 helper above: the ceilings live in the private
+    /// `TypedBound`, which `execute_domain_lane` is the only caller of, and
+    /// `mod typed_bindings` is private in `src/lib.rs`, so no `tests/` target
+    /// can build the `TypedDomainRequest` those entries take. Nothing here
+    /// reads any file's source text to decide which branch ran.
+    fn assert_host_lifted_list_ceiling_denies_the_real_result() {
+        // The checked-in hostile `dreamer-cycle` component: an honest fixture
+        // except that its `step` export returns a 300-element `state.pending`.
+        // Every earlier check passes — `describe` reports the frozen
+        // descriptor, the result echoes the admitted operation id and fence
+        // epoch, and the reported proof ceiling is the lowest — so the list
+        // item ceiling is provably the denial and not a substitute for it.
+        let world = TypedWorld::DreamerCycle;
+        let artifact = load_fixture_file("host-lifting-list");
+        let preflight = must(preflight_bytes(&artifact));
+        let limits = default_experimental_limits(preflight.digest.clone());
+        let kit = world_kit(world, &artifact);
+        let capsule = world_capsule(world, &kit, &limits);
+        let admitted = admitted_record();
+
+        // A returned result is a failure here: an over-long lifted list must be
+        // refused, never handed back as a terminal result.
+        let Err(denial) = execute_capsule_domain_experimental(
+            &kit,
+            &capsule,
+            &artifact,
+            &limits,
+            &world_request(world, &admitted),
+            &admitted,
+        ) else {
+            panic!("#758/16 a lifted list above the item ceiling must be denied");
+        };
+
+        // EXECUTED VALUE: the host's own item ceiling, at the stage this one
+        // call reached. `TypedBound::list` refuses `count > MAX_TYPED_LIST_ITEMS`
+        // with `LimitDenied("typed-list")`, and `execute_domain_lane` stages it
+        // at `Output`. The destructure below is what proves this is the host's
+        // own ceiling and not an engine or resource termination: only a
+        // `Staged` denial can reach these assertions at all, and the cause is
+        // then compared against the exact production value. An earlier draft
+        // also asserted `!matches!(&denial, Engine(_))` here; that was dead,
+        // because the narrowing had already happened, so it was removed rather
+        // than left in as a check that can never fail.
+        let TypedExecutionError::Staged { stage, cause } = &denial else {
+            panic!("#758/16 the lifted-list denial must be staged, got {denial}");
+        };
+        assert_eq!(*stage, TypedStage::Output);
+        assert_eq!(
+            **cause,
+            TypedExecutionError::LimitDenied("typed-list".to_owned())
+        );
+        assert_eq!(denial.to_string(), "STAGE:output:LIMIT_DENIED:typed-list");
+
+        // POSITIVE CONTROL, so the assertion above cannot pass for the wrong
+        // reason: the same world, the same kit-owned entry, the same admitted
+        // envelope and the same ceiling over that world's honest checked-in
+        // fixture. Its `step` result leaves `state.pending` unwritten, so the
+        // very same `TypedBound::list` accepts it and the one call completes.
+        let honest = load_fixture(world);
+        let honest_preflight = must(preflight_bytes(&honest));
+        let honest_limits = default_experimental_limits(honest_preflight.digest.clone());
+        let honest_kit = world_kit(world, &honest);
+        let honest_capsule = world_capsule(world, &honest_kit, &honest_limits);
+        let (_receipt, result, _) = must(
+            execute_capsule_domain_experimental(
+                &honest_kit,
+                &honest_capsule,
+                &honest,
+                &honest_limits,
+                &world_request(world, &admitted),
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+
+        let TypedDomainResult::Outcome(outcome) = &result else {
+            panic!("#758/16 an in-ceiling lifted list must be the retained outcome");
+        };
+        let TypedDomainOutcome::DreamerCycle(outcome) = outcome.as_ref() else {
+            panic!("#758/16 the retained outcome must be this world's cycle outcome");
+        };
+        let cycle_wit::CycleOutcome::Stepped(stepped) = &**outcome;
+        // The control's EXECUTED item count: empty, so inside the same ceiling
+        // the denial above turns on. Read from the retained result, not from
+        // the fixture text.
+        assert!(stepped.state.pending.is_empty());
+    }
+
+    /// #758 item 9 / P6.2's string half, the sibling of the lifted-list leg
+    /// above: the REAL engine runs a checked-in component whose domain result
+    /// carries a lifted string LONGER than the host admits per string, and the
+    /// host REFUSES the result with its own typed denial at the stage the call
+    /// reached. The list leg proves the item ceiling; this leg proves the
+    /// per-string ceiling next to it, which is a distinct production value
+    /// (`MAX_TYPED_STRING_BYTES`, :46) refusing through a distinct production
+    /// branch (`TypedBound::text`, :828-836).
+    ///
+    /// Only in-crate code can observe this, for the same reachability reason as
+    /// the leg above: both ceilings live in the private `TypedBound`, whose
+    /// only caller is `execute_domain_lane` (:2068), and `mod typed_bindings` is
+    /// private in `src/lib.rs`, so no `tests/` target can build the
+    /// `TypedDomainRequest` those entries take. Nothing here reads any file's
+    /// source text to decide which branch ran.
+    fn assert_host_lifted_string_ceiling_denies_the_real_result() {
+        // The checked-in hostile `dreamer-cycle` component: an honest fixture
+        // except that its `step` export returns a 4097-byte
+        // `state.state-digest`, exactly one byte above the host's per-string
+        // ceiling. Every earlier check passes — `describe` reports the frozen
+        // descriptor, the result echoes the admitted operation id and fence
+        // epoch, the reported proof ceiling is the lowest, and every list leaf
+        // is empty — so within `check_cycle_result` (:3605-3632) the only
+        // charge before the string is the two-byte echoed `operation-id`, and
+        // the per-string ceiling is provably the denial and not a substitute
+        // for it.
+        let world = TypedWorld::DreamerCycle;
+        let artifact = load_fixture_file("host-lifting-string");
+        let preflight = must(preflight_bytes(&artifact));
+        let limits = default_experimental_limits(preflight.digest.clone());
+        let kit = world_kit(world, &artifact);
+        let capsule = world_capsule(world, &kit, &limits);
+        let admitted = admitted_record();
+
+        // A returned result is a failure here: an over-long lifted string must
+        // be refused, never handed back as a terminal result.
+        let Err(denial) = execute_capsule_domain_experimental(
+            &kit,
+            &capsule,
+            &artifact,
+            &limits,
+            &world_request(world, &admitted),
+            &admitted,
+        ) else {
+            panic!("#758/9 a lifted string above the string ceiling must be denied");
+        };
+
+        // EXECUTED VALUE: the host's own per-string ceiling, at the stage this
+        // one call reached. `TypedBound::text` refuses
+        // `value.len() > MAX_TYPED_STRING_BYTES` with
+        // `LimitDenied("typed-string")`, and `execute_domain_lane` stages the
+        // `check_result` failure at `Output`. The destructure below is what
+        // proves this is the host's own per-string ceiling rather than the
+        // adjacent list-item ceiling above or an engine termination: only a
+        // `Staged` denial reaches these assertions at all, the stage pins
+        // where it was refused, and the cause is then compared against the
+        // exact production value.
+        let TypedExecutionError::Staged { stage, cause } = &denial else {
+            panic!("#758/9 the lifted-string denial must be staged, got {denial}");
+        };
+        assert_eq!(*stage, TypedStage::Output);
+        assert_eq!(
+            **cause,
+            TypedExecutionError::LimitDenied("typed-string".to_owned())
+        );
+        // The exact rendered denial. It is compared whole, so it already proves this
+        // is not the adjacent lifted-list ceiling's `typed-list` rendering; no
+        // second assertion against that string is added here, because this
+        // equality can never leave it able to fail.
+        let rendered = denial.to_string();
+        assert_eq!(rendered, "STAGE:output:LIMIT_DENIED:typed-string");
+
+        // POSITIVE CONTROL, so the assertion above cannot pass for the wrong
+        // reason: the same world, the same kit-owned entry, the same admitted
+        // envelope and the same ceiling over that world's honest checked-in
+        // fixture. Its `step` result leaves `state.state-digest` short, so the
+        // very same `TypedBound::text` accepts it and the one call completes.
+        let honest = load_fixture(world);
+        let honest_preflight = must(preflight_bytes(&honest));
+        let honest_limits = default_experimental_limits(honest_preflight.digest.clone());
+        let honest_kit = world_kit(world, &honest);
+        let honest_capsule = world_capsule(world, &honest_kit, &honest_limits);
+        let (_receipt, result, _) = must(
+            execute_capsule_domain_experimental(
+                &honest_kit,
+                &honest_capsule,
+                &honest,
+                &honest_limits,
+                &world_request(world, &admitted),
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+
+        let TypedDomainResult::Outcome(outcome) = &result else {
+            panic!("#758/9 an in-ceiling lifted string must be the retained outcome");
+        };
+        let TypedDomainOutcome::DreamerCycle(outcome) = outcome.as_ref() else {
+            panic!("#758/9 the retained outcome must be this world's outcome");
+        };
+        let cycle_wit::CycleOutcome::Stepped(stepped) = &**outcome;
+        // The control's EXECUTED string length: this world's honest fixture
+        // leaves `state.state-digest` unwritten, so the lifted value is empty
+        // and inside the very same ceiling the denial above turns on. Read
+        // from the retained result, not from the fixture text.
+        assert!(stepped.state.state_digest.is_empty());
+        // Every other charged string leaf of this world is echoed from the
+        // admitted envelope, so the control's whole charged string set is
+        // inside the ceiling the denial above exceeded.
+        assert_eq!(stepped.operation_id.as_str(), OPERATION_ID);
+        assert_eq!(stepped.state.fence_epoch.as_str(), FENCE_EPOCH);
+    }
+
     // No `WORK_UNIT_CASE` marker here on purpose: case 3 of #758 is marked once,
     // in the acceptance file `tests/typed_execution.rs`, so the declared
     // denominator stays exactly 1..26 with one marker per case. This in-crate
@@ -4780,6 +5183,27 @@ mod six_world_capsule_drive {
         // entry. No world is skipped, retried on another world, or served from
         // a cached compilation.
         assert_eq!(driven, worlds.map(TypedWorld::world_name).to_vec());
+
+        // #758/17, in this same real-engine test because only in-crate code can
+        // build the generated request records: a guest's own typed `Err` is an
+        // EXECUTED outcome and a trap is a typed denial, told apart by the
+        // executed value alone. The one marker for case 17 stays in
+        // `tests/typed_execution.rs`.
+        assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap();
+        // #758/16's host-lifting half and P7.3, in this same real-engine test
+        // for the same reachability reason as the call above: only in-crate
+        // code can build the generated request record that reaches the
+        // host-lifting list ceiling, so both the lifted-list denial and its
+        // in-ceiling positive control are executed here. The one marker for
+        // case 16 stays in `tests/typed_execution.rs`.
+        assert_host_lifted_list_ceiling_denies_the_real_result();
+        // #758 item 9 / P6.2's per-string half, beside the call above for the
+        // same reachability reason: only in-crate code can build the generated
+        // request record that reaches the host-lifting per-string ceiling, so
+        // both the lifted-string denial and its in-ceiling positive control
+        // are executed here, next to the lifted-item denial they are distinct
+        // from. No `WORK_UNIT_CASE` marker is added by this leg.
+        assert_host_lifted_string_ceiling_denies_the_real_result();
     }
 
     /// Real engine, real CHECKED-IN input: `instantiation-start-loop.wat` is a

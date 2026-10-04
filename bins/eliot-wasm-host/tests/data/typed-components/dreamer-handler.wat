@@ -292,7 +292,7 @@
     (case "internal" $handler_internal)
   ))
   (type $f-describe (func (result $abi_descriptor)))
-  (type $f-domain (func (param "candidate" $validated_candidate) (result (result $handler_outcome $handler_error))))
+  (type $f-domain (func (param "candidate" $validated_candidate) (result (result $handler_outcome (error $handler_error)))))
   (core module $guest
     (memory (export "memory") 1 1)
     (global $bump (mut i32) (i32.const 5120))
@@ -312,20 +312,32 @@
       (global.set $bump (i32.add (local.get $ptr) (local.get $new_size)))
       (local.get $ptr))
     ;; `describe`: the frozen WIT abi-descriptor, five static strings and
-    ;; the frozen ABI revision, flattened in WIT field order.
-    (func (export "describe") (result i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-      (i32.const 1024)
-      (i32.const 15)
-      (i32.const 1039)
-      (i32.const 19)
-      (i32.const 1)
-      (i32.const 1058)
-      (i32.const 23)
-      (i32.const 1081)
-      (i32.const 5)
-      (i32.const 1086)
-      (i32.const 64)
-    )
+    ;; the frozen ABI revision, in WIT field order. A lifted export flattens
+    ;; its result to at most MAX_FLAT_FUNC_RESULTS = 1 core value, so the
+    ;; core function returns ONE pointer into exported linear memory
+    ;; (wasmparser-0.256.0 src/validator/component_types.rs:35, :129 and
+    ;; :1279-1292, enforced at src/validator/component.rs:1343 and :1365).
+    ;; Retptr base 0x600: past the last descriptor byte at 0x47e and below
+    ;; the 0x800 result tuple, so it collides with nothing in this memory.
+    (func (export "describe") (result i32)
+      ;; world-name
+      (i32.store (i32.const 1536) (i32.const 1024))
+      (i32.store (i32.const 1540) (i32.const 15))
+      ;; package-id
+      (i32.store (i32.const 1544) (i32.const 1039))
+      (i32.store (i32.const 1548) (i32.const 19))
+      ;; abi-revision
+      (i32.store (i32.const 1552) (i32.const 1))
+      ;; native-contract
+      (i32.store (i32.const 1556) (i32.const 1058))
+      (i32.store (i32.const 1560) (i32.const 23))
+      ;; native-revision
+      (i32.store (i32.const 1564) (i32.const 1081))
+      (i32.store (i32.const 1568) (i32.const 5))
+      ;; abi-digest
+      (i32.store (i32.const 1572) (i32.const 1086))
+      (i32.store (i32.const 1576) (i32.const 64))
+      (i32.const 1536))
     ;; `handle`: the admitted typed request arrives already lowered into guest
     ;; memory. The closed WIT result tuple is written in full and every
     ;; identity field is copied back out of the request, so the host echo

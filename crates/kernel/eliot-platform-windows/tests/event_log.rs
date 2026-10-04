@@ -1,23 +1,27 @@
 //! Focused port proofs for issue #984.
 //!
 //! Fourteen marker-bound cases cover the safe local Windows Event Log port: the
-//! typed caller-visible surface, the closed local-only source profile, the
-//! admitted event/severity mapping and its frozen fixture, the pre-FFI byte and
-//! UTF-16 bounds, NUL and protected-marker refusal without content, the
-//! wide-buffer and count-guard source proof, the acquisition-failure and
-//! report-failure shapes, the exactly-once deregistration owner, the fail-closed
-//! platform gate, the never-substituted availability state, the published
-//! blocking and non-delivery disclaimers, the isolated write/readback
-//! correlation attempt, and the single-FFI-island and unsafe-block review. The
-//! scope/diff half of case 14 is NOT observable from frozen text and is
-//! discharged in the #984 work-unit report; case 14 says so at its own site.
+//! two-variant severity surface with its private `u16` report-type mapping and
+//! the admitted source name and bounds constants, the closed local-only source
+//! profile, the admitted HOST event/severity mapping with both admitted variant
+//! lists and its frozen fixture, the pre-FFI byte and UTF-16 bounds, NUL and
+//! protected-marker refusal without content, the wide-buffer and count-guard
+//! source proof, the acquisition-failure and report-failure shapes, the
+//! exactly-once deregistration owner, the fail-closed platform gate, the
+//! never-substituted availability state, the published blocking and non-delivery
+//! disclaimers, the isolated write/readback correlation attempt, and the
+//! single-FFI-island and unsafe-block review. The scope/diff half of case 14 is
+//! NOT observable from frozen text and is discharged in the #984 work-unit
+//! report; case 14 says so at its own site.
 //!
-//! `mod event_log` is private and its reexport list is closed, so the leaf
-//! items (`encode_wide_nul`, `report_validated`, `submit_validated`,
-//! `RegisteredEventSource`, `AdmittedLocalEventLogEvent`) cannot be named from
-//! an integration test. Cases 2, 6, 7, 8, 9, 10, 11, 12, 13 and 14 therefore
-//! prove against the frozen leaf, facade and manifest text. Host queue
-//! consumption belongs to #889, not this file.
+//! `mod event_log` is private and its reexport list publishes none of the leaf's
+//! private items (`encode_wide_nul`, `report_validated`, `submit_validated`,
+//! `RegisteredEventSource`, `AdmittedLocalEventLogEvent`), so none of them can be
+//! named from an integration test. CLOSURE of that list is NOT proved: case 14
+//! pins 25 names PRESENT and refuses nine name FRAGMENTS, so a new export whose
+//! name avoids those fragments satisfies every pin. Cases 1, 2, 3, 5, 6, 7, 8, 9,
+//! 10, 11, 12, 13 and 14 therefore prove against the frozen leaf, facade and
+//! manifest text. Host queue consumption belongs to #889, not this file.
 //!
 //! Where a TEXT search would accept a spelling that never runs, the claim is
 //! stated structurally instead: `brace_depth_of` requires a pinned submission to
@@ -30,7 +34,12 @@
 //! Every ordered and counted search over frozen text reads `code_text`, the
 //! single comment-free rendering built on `code_lines`: a guard, call site or
 //! conversion deleted from the leaf and left behind as a `//` comment satisfies
-//! no step and no count. The two obligations that ARE prose - the published
+//! no step and no count. Three censuses are named EXCEPTIONS rather than
+//! instances of that rule: they read the RAW leaf or facade text on purpose,
+//! because a commented-out public function head, a commented-out marker entry
+//! and a commented-out reexport are exactly what they exist to refuse - case 2's
+//! public-function census, `admitted_protected_markers` and
+//! `event_log_reexport_names`. The two obligations that ARE prose - the published
 //! limitations and the `// SAFETY:` annotations - are proved deliberately over
 //! the raw text by `preceding_doc` and `check_safety_comment_precedes`.
 //!
@@ -41,9 +50,9 @@
 //! carries it. The marker itself is spelled out only by the fourteen markers
 //! below, so that a plain marker count over this file returns exactly 14.
 //!
-//! Denominator history: `main` carried 4 unnamed tests; this delivery makes the
-//! 14 declared cases. The number itself did not change in this delivery, and no
-//! case was merged, dropped or renumbered.
+//! Denominator history: `main` carried 4 unmarked tests; this delivery makes the
+//! 14 declared cases, so 4 to 14 IS the change the delivery makes. No case was
+//! merged, dropped or renumbered in this delivery.
 //!
 //! Execution status: nothing in this file has been executed, because the
 //! writing lane runs no `cargo test`, so no case is claimed to pass. The source
@@ -69,10 +78,14 @@ use eliot_platform_windows::{
 /// Frozen admitted-profile fixture (issue #984).
 const FIXTURE: &str = include_str!("data/event-log/admitted-profile.json");
 
-/// Frozen platform leaf text; the source of truth for cases 6-9 and 11-14.
+/// Frozen platform leaf text; the source of truth for cases 1-3 and 5-14.
 const LEAF: &str = include_str!("../src/event_log.rs");
 
-/// Frozen crate facade text; the source of truth for the closed reexport list.
+/// Frozen crate facade text; the source of truth for the reexport list.
+///
+/// What is proved about that list is stated exactly: the 25 pinned names are all
+/// PRESENT, and nine name FRAGMENTS are refused. Closure is NOT proved, because a
+/// new export whose name avoids those fragments satisfies both.
 const LIB_RS: &str = include_str!("../src/lib.rs");
 
 /// Frozen manifest text; the source of truth for the single Event Log feature.
@@ -81,8 +94,11 @@ const MANIFEST: &str = include_str!("../Cargo.toml");
 /// Occurrence count of `needle` over the comment-free lines of `haystack`.
 ///
 /// Comment-blind by construction: a commented-out call site is not a call site,
-/// so it cannot satisfy a count. `code_lines` is the only comment filter in
-/// this file, so this counts exactly the text every other proof reads.
+/// so it cannot satisfy a count. `code_lines` is the only comment filter used
+/// here, so this counts exactly the text the ordered and counted proofs read. The
+/// three RAW-text censuses named in the module doc - case 2's public-function
+/// census, `admitted_protected_markers` and `event_log_reexport_names` - are not
+/// routed through this filter and are not counted here.
 fn occurrence_count(haystack: &str, needle: &str) -> usize {
     code_text(haystack).matches(needle).count()
 }
@@ -256,7 +272,9 @@ fn check_no_code_token(source: &str, token: &str) -> Result<(), String> {
 ///
 /// Each of the nine arguments is pinned as a whole statement, in order, and the
 /// call's own closing parenthesis is pinned as the last step, so no argument can
-/// be reordered, dropped, or appended after the ninth. The card body names both
+/// be reordered or dropped. An ADDITIONAL argument would NOT be seen here:
+/// `check_step_order` is a SEARCH and not adjacency, so a tenth argument appended
+/// after the ninth is still followed by the `)` step. The card body names both
 /// properties this exists for: "the one insertion pointer array has a checked
 /// `u16` count" and "SID and raw data are null with zero lengths" - the pointer
 /// array could otherwise be handed over as `std::ptr::null()` and the raw-data
@@ -621,6 +639,9 @@ fn check_member_type_is_not_generic(
 /// - a named `pub` field of a `pub union`, whose overlapping storage can reinterpret
 ///   the bytes of whichever field a caller sets, so its field list is classified
 ///   exactly like a struct's rather than skipped;
+/// - a named `pub` member declared inside an `enum` block, which the `enum`
+///   branch reads with the same `item_block` matcher a struct's is read with, so
+///   a member sitting beside the variants is classified rather than skipped;
 /// - a tuple struct's parenthesised payload, read from the declaration line
 ///   itself because such a declaration opens no brace and the brace matcher
 ///   would otherwise read a LATER item's block;
@@ -796,7 +817,14 @@ fn check_fail_closed_probe(
     Ok(())
 }
 
-/// Case 11: the only declared Event Log source names are the two fixed ones.
+/// Case 11: the only declared constant whose name ENDS IN `_SOURCE` is one of the
+/// two fixed ones.
+///
+/// This is the suffix half only, and it says so rather than claiming every
+/// declared source name in the leaf: the scan collects constants whose name ends
+/// in `_SOURCE`, so a differently named constant would not be collected here. The
+/// string-VALUED published-constant census and the forbidden
+/// SERVER/HOST/UNC/LOG_NAME/SECURITY name scan are case 2's, not this one's.
 fn check_known_source_constants_are_the_only_sources() -> Result<(), String> {
     let mut declared = Vec::new();
     for line in code_lines(LEAF) {
@@ -998,8 +1026,11 @@ fn local_only_profile_has_no_remote_or_log_selector() -> Result<(), String> {
     // excludes, reached through a member or an alias instead of a parameter, so
     // the member surface is closed on its own terms. The frozen leaf publishes
     // no public member at all, so this is the empty census today and turns red
-    // the moment one is added, whichever of the five shapes carries it, and
-    // whether it is typed directly or by a generic parameter.
+    // the moment a public member of a REFUSED TYPE is added, whichever of the
+    // five shapes carries it, and whether it is typed directly or by a generic
+    // parameter. A public member whose type mentions no refused spelling is
+    // collected and is not refused, so this refusal is narrower than "no public
+    // member".
     let caller_selected_types = [
         "str", "String", "Path", "OsStr", "OsString", "CStr", "CString", "PCWSTR", "HANDLE",
         "NonNull", "*",
@@ -1153,6 +1184,10 @@ fn check_rejected_before_ffi(label: &str, insertion: &str) -> Result<(), String>
     Ok(())
 }
 
+// NAME, disclosed: the name is the card's own START sentence verbatim, so the
+// redaction half of that sentence is NOT proved here; case 5 proves it, under the
+// same START sentence. The name is not renamed, because a card requirement names
+// it.
 // WORK_UNIT_CASE: 984/4
 #[test]
 fn bounds_and_redaction_rejected_before_ffi() -> Result<(), String> {
@@ -1294,8 +1329,13 @@ fn nul_and_protected_markers_refused_without_content() -> Result<(), String> {
 // WORK_UNIT_CASE: 984/6
 #[test]
 fn wide_buffers_and_count_guard_are_source_proved() -> Result<(), String> {
-    // The terminator is appended only after both guards, so the buffer handed
-    // to Win32 is exactly one NUL-terminated UTF-16 payload.
+    // The terminator is appended after both guard HEADS, so the buffer handed to
+    // Win32 is one NUL-terminated UTF-16 payload. That is an ORDER property and
+    // nothing more: the two guards are pinned by HEAD only, so emptying either
+    // guard body leaves every step, the `wide.push(0)` count and the
+    // after-terminator census below green. Their refusals are therefore NOT
+    // nesting-proved here, exactly as the count guard's refusal IS nesting-proved
+    // later in this same case.
     let encode = item_block(LEAF, "fn encode_wide_nul")?;
     check_step_order(
         &encode,
@@ -1474,7 +1514,9 @@ fn acquisition_failure_yields_no_receipt() -> Result<(), String> {
     if null_branch.contains("Ok(") {
         return Err("a null handle must never yield a source owner".to_string());
     }
-    // Source proof: the public function propagates before building a receipt.
+    // Source proof: the public function returns a fallible receipt. That it
+    // propagates before building one is pinned by the two ordered steps further
+    // below, not by the assertion this comment sits above.
     if !code_text(LEAF).contains(") -> Result<EventLogReceipt, EventLogError> {") {
         return Err("the public report function must return a fallible receipt".to_string());
     }
@@ -1525,11 +1567,12 @@ fn acquisition_failure_yields_no_receipt() -> Result<(), String> {
     // The unique declaration is also READ, not merely counted, because a decoy
     // that RENAMES the real callee and hands the pinned call site to a
     // permissive item still leaves exactly one declaration of that name. The
-    // declared body is pinned to the two steps that make this item the port's
-    // only path to `submit_validated` - pre-FFI validation, then the
-    // submission - so the item the pinned call sites reach cannot return
-    // `Ok(())` without doing the work. Both steps hold on the frozen leaf
-    // (src/event_log.rs 599-600).
+    // declared body is pinned to the two steps the two pinned call sites reach -
+    // pre-FFI validation, then the submission - so the item the pinned call sites
+    // reach cannot return `Ok(())` without doing the work. Uniqueness of that path
+    // is NOT censused: nothing here counts `submit_validated` call sites, so a
+    // second route to the submission would satisfy every pin. Both steps hold on
+    // the frozen leaf (src/event_log.rs 599-600).
     let admitted = item_block(LEAF, "fn report_admitted_local_event")?;
     let admitted_code = code_text(&admitted);
     let submitted = "submit_validated(event, insertion)";
@@ -1612,8 +1655,12 @@ fn report_failure_keeps_only_the_numeric_code() -> Result<(), String> {
     if fields != ["code: u32,"] {
         return Err(format!("report failure fields drifted: {fields:?}"));
     }
-    // Source proof: only the accepted branch returns success, and the refused
-    // branch reads the OS code immediately after the failed call.
+    // Source proof, stated exactly as far as the assertion reaches: the refused
+    // branch carries no `Ok(`, an `Ok(())` exists somewhere at or after
+    // `} else {`, and `GetLastError()` appears inside the refused branch.
+    // "Immediately after the failed call" is NOT pinned: the search is a
+    // substring search over the branch, so an intervening statement between them
+    // would be invisible here.
     let report = item_block(LEAF, "fn report_validated")?;
     let branch_start = report
         .find("if accepted == 0 {")
@@ -1682,12 +1729,13 @@ fn handle_deregisters_exactly_once_and_is_private() -> Result<(), String> {
     // guard is even reached, and three such suppressions satisfy every
     // assertion above: a bare `return;` placed above the guard; the handle
     // zeroed (`self.handle = std::ptr::null_mut();`) and an early `return;`
-    // above the guard, which makes the deregistration provably dead; and a
-    // `return` left behind in the same position as a comment. Each one keeps
-    // all fourteen cases green today, because the pinned steps, the counts, the
-    // safety-comment adjacency and the "never outside the guard" count are all
-    // unaffected by a statement that runs before the slice they read. So the
-    // whole block from `fn drop` up to the guard is refused any `return` word,
+    // above the guard, which makes the deregistration provably dead. Each of the
+    // two keeps all fourteen cases green today, because the pinned steps, the
+    // counts, the safety-comment adjacency and the "never outside the guard" count
+    // are all unaffected by a statement that runs before the slice they read. A
+    // `return` left behind as a `//` comment is deliberately NOT in that
+    // enumeration: the scan below is comment-blind and cannot see one at all. So
+    // the whole block from `fn drop` up to the guard is refused any `return` word,
     // comment-blind like every other search here, so this - and only this - is
     // what makes "nothing can leave `drop` before the deregistration runs" true.
     if code_text(&release[..guard_at]).contains("return") {
@@ -1927,9 +1975,13 @@ fn isolated_windows_write_by_run_correlation_reports_its_disposition() -> Result
     // succeed is invented here; what is required is that the outcome is one of
     // these typed values rather than something unexamined, and that an accepted
     // receipt carries the admitted mapping. Each refusal arm NAMES its typed
-    // value so a reader of the executed run sees which disposition occurred; the
-    // package lint forbids printing here (`print_stdout` is denied), so the
-    // disposition is carried by the arm that ran rather than by a log line.
+    // value so the disposition is explicit in the source rather than silently
+    // absorbed into an accepted outcome; the arm itself is empty, so a passing
+    // run reveals nothing about which disposition occurred. The package lints are
+    // only `warn` (`print_stdout`, `print_stderr`, `dbg_macro`: Cargo.toml
+    // 55-62), so it is the workspace `-D warnings` clippy gate that makes a print
+    // here a failure, and the disposition is carried by the arm that ran rather
+    // than by a log line.
     match report_local_event(AdmittedEventLogEvent::ServiceStart, probe.as_str()) {
         Ok(receipt) => {
             if receipt.event_id() != 100 || receipt.source() != EVENT_LOG_SOURCE {
@@ -1952,6 +2004,11 @@ fn isolated_windows_write_by_run_correlation_reports_its_disposition() -> Result
     check_readback_half_is_unreachable()
 }
 
+// NAME, disclosed: the name carries both halves of the card sentence, but this
+// case proves only the FFI-island and unsafe-block half; the "no authority
+// change" half is not observable from frozen text and is discharged in the #984
+// work-unit report. The name is not renamed, because the checklist evidence and
+// the accepted filing reference it.
 // WORK_UNIT_CASE: 984/14
 #[test]
 fn port_keeps_single_ffi_island_and_no_authority_change() -> Result<(), String> {
