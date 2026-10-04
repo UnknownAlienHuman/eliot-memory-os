@@ -209,14 +209,32 @@ enum ClassFailure<T> {
 /// bounds the whole class operation — pool checkout, session connect and the
 /// request itself — so a saturated or wedged class sheds on its own admitted
 /// budget instead of occupying a slot indefinitely.
-async fn within_class_deadline<T>(
+async fn within_class_deadline<T, E>(
     lease: &ClientLease,
-    future: impl Future<Output = Result<T, StoreError>>,
-) -> Result<T, ClassFailure<StoreError>> {
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, ClassFailure<E>> {
     match tokio::time::timeout(lease.deadline(), future).await {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(error)) => Err(ClassFailure::Store(error)),
         Err(_elapsed) => Err(ClassFailure::Deadline),
+    }
+}
+
+/// Maps one deadline-bounded class outcome onto the composition's error shape.
+///
+/// A deadline elapsing is the class's own admitted budget expiring. It shares the
+/// documented retryable contract ceiling with transport loss — `StoreError` has
+/// no `Deadline` variant — so it surfaces as `Unavailable`, which is also what
+/// makes broken-generation recovery fire for a wedged class rather than letting
+/// it occupy its slot indefinitely. A provider-reported typed failure passes
+/// through unchanged and is never reclassified as a deadline.
+fn deadline_bounded<T>(
+    outcome: Result<T, ClassFailure<StoreCompositionError>>,
+) -> Result<T, StoreCompositionError> {
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(ClassFailure::Store(error)) => Err(error),
+        Err(ClassFailure::Deadline) => Err(StoreCompositionError::Store(StoreError::Unavailable)),
     }
 }
 
@@ -978,9 +996,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = CanonicalSnapshotPort::begin_snapshot(&self.store, context, request)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                CanonicalSnapshotPort::begin_snapshot(&self.store, context, request)
+                    .await
+                    .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1017,10 +1040,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Read)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome =
-            CanonicalSnapshotPort::read_snapshot_page(&self.store, context, handle, cursor)
-                .await
-                .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                CanonicalSnapshotPort::read_snapshot_page(&self.store, context, handle, cursor)
+                    .await
+                    .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1054,9 +1081,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = CanonicalSnapshotPort::end_snapshot(&self.store, context, handle)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                CanonicalSnapshotPort::end_snapshot(&self.store, context, handle)
+                    .await
+                    .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1098,14 +1130,19 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = IsolatedRestorePort::prepare_isolated_destination(
-            &self.store,
-            context,
-            destination,
-            operation,
-        )
-        .await
-        .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                IsolatedRestorePort::prepare_isolated_destination(
+                    &self.store,
+                    context,
+                    destination,
+                    operation,
+                )
+                .await
+                .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1139,9 +1176,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = IsolatedRestorePort::restore_canonical_batch(&self.store, context, batch)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                IsolatedRestorePort::restore_canonical_batch(&self.store, context, batch)
+                    .await
+                    .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1175,9 +1217,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Read)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = IsolatedRestorePort::validate_restore(&self.store, context, batch)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                IsolatedRestorePort::validate_restore(&self.store, context, batch)
+                    .await
+                    .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1209,11 +1256,15 @@ impl StoreComposition {
             .try_acquire(ClientClass::Read)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = self
-            .store
-            .reconcile(operation_id.clone())
-            .await
-            .map_err(map_adapter_error);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                self.store
+                    .reconcile(operation_id.clone())
+                    .await
+                    .map_err(map_adapter_error)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1255,9 +1306,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = IsolatedRestorePort::reconcile_operation(&self.store, first, second)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = deadline_bounded(
+            within_class_deadline(&lease, async {
+                IsolatedRestorePort::reconcile_operation(&self.store, first, second)
+                    .await
+                    .map_err(StoreCompositionError::Store)
+            })
+            .await,
+        );
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
