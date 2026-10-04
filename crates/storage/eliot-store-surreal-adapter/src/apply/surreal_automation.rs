@@ -31,18 +31,21 @@
 //! fields, so no reader ever parses the address.
 
 use eliot_store_api::{
-    AutomationContinuationBinding, AutomationContinuationDirection, AutomationContinuationFailure,
-    AutomationContinuationOrder, AutomationContinuationOrderKey, AutomationContinuationQuery,
-    AutomationContinuationReadBinding, AutomationContinuationRef, DecodedAutomationMutation,
-    NamedMutationOperation, NamedReadOperation, ReceiptEnvelope, StateFence, StoreError,
-    TransitionClass, decode_automation_mutation, verify_automation_continuation,
+    AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES, AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS,
+    AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES,
+    AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES, AutomationContinuationBinding,
+    AutomationContinuationDirection, AutomationContinuationFailure, AutomationContinuationOrder,
+    AutomationContinuationOrderKey, AutomationContinuationQuery, AutomationContinuationReadBinding,
+    AutomationContinuationRef, DecodedAutomationMutation, NamedMutationOperation,
+    NamedReadOperation, ReceiptEnvelope, StateFence, StoreError, TransitionClass,
+    decode_automation_mutation, verify_automation_continuation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fmt::Write as _;
 
 use crate::SurrealAdapterConfig;
-use crate::client::{self, RpcTransport};
+use crate::client::{self, ResponseCeiling, RpcTransport};
 use crate::error::AdapterError;
 use crate::schema;
 
@@ -263,6 +266,69 @@ const CONTINUATION_TERMINAL_KIND: &str = "terminal";
 const CONTINUATION_EXPIRY_REASON: &str = "expired";
 const CONTINUATION_GUARD_CONFLICT: &str = "automation_continuation_guard_conflict";
 const CONTINUATION_PARENT_CONFLICT: &str = "automation_continuation_parent_conflict";
+
+/// Declared owner-state denominator of one continuation inventory: the guard
+/// row plus every admissible active and terminal record.
+///
+/// This is the row count the owner is allowed to hold, taken from the same
+/// owner-issued constants its quota guard is planned against. The inventory
+/// read asks the provider for exactly one row more than this and refuses the
+/// over-one answer immediately, so a retained table that is already over quota
+/// — corrupt, restored from an incompatible generation, or written by an
+/// older owner — costs one bounded round trip instead of an unbounded
+/// `SELECT *` that is only inspected after the whole response was decoded.
+const CONTINUATION_INVENTORY_MAX_ROWS: usize = AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS
+    + AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES
+    + 1;
+
+/// Byte budget one bounded continuation inventory capture is admitted under.
+///
+/// The declared metadata ceilings of both record classes, so the transport
+/// bound and the row charge are the owner-issued capacity rather than a
+/// constant chosen here. `ResponseCeiling` adds its own documented protocol
+/// envelope on top of this and charges every decoded row against it before the
+/// response is materialised.
+const CONTINUATION_INVENTORY_MAX_BYTES: u64 = (AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES
+    + AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES)
+    as u64;
+
+/// True when one bounded inventory capture returned more rows than the owner
+/// may hold.
+///
+/// The provider is asked for the denominator plus one, so the only answer this
+/// can observe is the over-one case: the retained table already exceeds the
+/// declared capacity. It is refused as an over-budget payload rather than
+/// decoded, so a corrupt or over-quota owner table costs one bounded round
+/// trip instead of an unbounded inventory.
+fn inventory_exceeds_row_denominator(rows: usize) -> bool {
+    rows > CONTINUATION_INVENTORY_MAX_ROWS
+}
+
+/// True when a self-consistent owner state is still above the contract's
+/// declared capacity.
+///
+/// The guard counters and the observed totals are checked against every
+/// declared maximum, on both the persisted counters and the rows actually
+/// read. A guard that agrees with its own rows is not sufficient evidence that
+/// the state is admissible: an owner that has somehow exceeded its declared
+/// count or byte ceiling is refused before issuance is planned, instead of
+/// being adopted and allowed to define the ceiling it then exceeds.
+fn continuation_owner_state_over_limit(
+    guard: &AutomationContinuationGuard,
+    active_records: usize,
+    active_metadata_bytes: usize,
+    terminal_records: usize,
+    terminal_metadata_bytes: usize,
+) -> bool {
+    guard.active_records > AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS
+        || guard.terminal_records > AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES
+        || guard.active_metadata_bytes > AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES
+        || guard.terminal_metadata_bytes > AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES
+        || active_records > AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS
+        || terminal_records > AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES
+        || active_metadata_bytes > AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES
+        || terminal_metadata_bytes > AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES
+}
 
 /// Owner metadata retained behind one opaque V2 reference. The row boundary
 /// exists only here; callers can submit only the record identifier.
@@ -544,20 +610,37 @@ async fn ensure_continuation_guard(
 
 /// Reads the bounded continuation inventory and verifies that the persisted
 /// quota counters still describe it exactly before planning any mutation.
+///
+/// The read is bounded on both axes before anything is planned. The provider
+/// is asked for at most the declared owner-state denominator plus one, and the
+/// over-one answer is refused rather than decoded; the transport charges every
+/// decoded row against the declared metadata ceiling, so decode work and
+/// response size stay inside the owner-issued capacity even when the retained
+/// table is corrupt or already over quota. Counters and observed totals above
+/// every declared maximum are refused before issuance is planned, so a
+/// self-consistent but contract-invalid owner state cannot be accepted merely
+/// because its own guard agrees with it.
 async fn read_continuation_inventory(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
 ) -> Result<AutomationContinuationInventory, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "continuation_limit".to_owned(),
+        json!(CONTINUATION_INVENTORY_MAX_ROWS + 1),
+    );
     let sql = format!(
-        "SELECT * FROM {} ORDER BY identifier;",
+        "SELECT * FROM {} ORDER BY identifier LIMIT $continuation_limit;",
         schema::table::AUTOMATION_CONTINUATION
     );
-    let mut response = client::query(
+    let ceiling = ResponseCeiling::for_admitted_capture(CONTINUATION_INVENTORY_MAX_BYTES)?;
+    let mut response = client::query_bounded(
         db,
         config,
         "automation.continuation.inventory",
         &sql,
-        Map::new(),
+        bindings,
+        ceiling,
     )
     .await?;
     let errors = response.take_errors();
@@ -565,6 +648,11 @@ async fn read_continuation_inventory(
         return Err(AdapterError::PartialOutcome);
     }
     let values: Vec<Value> = response.take(0)?;
+    // The over-one answer: more rows than the owner may ever hold. Refused
+    // here, before any row is parsed into an owner record.
+    if inventory_exceeds_row_denominator(values.len()) {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
     let mut guard = None;
     let mut active = Vec::new();
     let mut terminal = Vec::new();
@@ -617,6 +705,19 @@ async fn read_continuation_inventory(
         || guard.terminal_metadata_bytes != terminal_bytes
     {
         return Err(AdapterError::PartialOutcome);
+    }
+    // A self-consistent owner state is still refused when it exceeds the
+    // contract's declared capacity, so an over-quota retained table is
+    // rejected rather than trimmed, adopted, or allowed to define the ceiling
+    // it then exceeds.
+    if continuation_owner_state_over_limit(
+        &guard,
+        active.len(),
+        active_bytes,
+        terminal.len(),
+        terminal_bytes,
+    ) {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
     Ok(AutomationContinuationInventory {
         guard,
@@ -2941,6 +3042,68 @@ mod template_tests {
             Some(&json!("auto-1")),
             "pointer create leg keys the automation index"
         );
+    }
+
+    #[test]
+    fn inventory_read_is_bounded_and_over_quota_owner_state_is_refused() {
+        // The inventory read is bounded by the owner-issued denominator, so the
+        // provider is asked for at most one row more than the owner may hold
+        // and that over-one answer is refused without decoding a row.
+        assert_eq!(
+            CONTINUATION_INVENTORY_MAX_ROWS,
+            AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS
+                + AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES
+                + 1
+        );
+        assert_eq!(
+            CONTINUATION_INVENTORY_MAX_BYTES,
+            (AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES
+                + AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES) as u64
+        );
+        assert!(!inventory_exceeds_row_denominator(
+            CONTINUATION_INVENTORY_MAX_ROWS
+        ));
+        assert!(inventory_exceeds_row_denominator(
+            CONTINUATION_INVENTORY_MAX_ROWS + 1
+        ));
+
+        // A self-consistent guard is refused when it is above a declared
+        // maximum, on the persisted counters and on the observed totals alike.
+        let at_limit = AutomationContinuationGuard {
+            record_kind: CONTINUATION_GUARD_KIND.to_owned(),
+            identifier: CONTINUATION_GUARD_ID.to_owned(),
+            sequence: 1,
+            active_records: AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS,
+            active_metadata_bytes: AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES,
+            terminal_records: AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES,
+            terminal_metadata_bytes: AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES,
+        };
+        assert!(!continuation_owner_state_over_limit(
+            &at_limit,
+            AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS,
+            AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES,
+            AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES,
+            AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES,
+        ));
+        assert!(continuation_owner_state_over_limit(
+            &at_limit,
+            AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS + 1,
+            AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES,
+            AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES,
+            AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES,
+        ));
+        let over_byte_counters = AutomationContinuationGuard {
+            active_records: at_limit.active_records,
+            active_metadata_bytes: AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES + 1,
+            ..at_limit
+        };
+        assert!(continuation_owner_state_over_limit(
+            &over_byte_counters,
+            over_byte_counters.active_records,
+            over_byte_counters.active_metadata_bytes,
+            over_byte_counters.terminal_records,
+            over_byte_counters.terminal_metadata_bytes,
+        ));
     }
 
     #[test]

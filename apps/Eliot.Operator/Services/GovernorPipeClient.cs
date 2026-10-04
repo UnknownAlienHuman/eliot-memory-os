@@ -1056,6 +1056,37 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             }
             if (soleHolder) _requestGate.Dispose();
         }
+        else
+        {
+            // The gate could NOT be acquired inside the teardown allowance, so
+            // none of the holder discipline above applies - but that is a
+            // statement about the REQUEST GATE, not about the transport. Before
+            // this fix the non-acquired path fell straight through to
+            // `LifecycleDisposed` with `_connection` still published: the client
+            // declared itself fully disposed while a live pipe it owned was never
+            // invalidated, aborted or observed. Nothing would ever close that
+            // pipe, its nonce stayed un-invalidated, and any still-unwinding
+            // operation kept a destination the session had already disclaimed.
+            //
+            // `AbortConnectionAsync` is safe to call here without the gate: it
+            // detaches only the connection object this call captured (a
+            // `CompareExchange`, so a replacement established later is a
+            // different object and is never touched), aborts the pipe so pending
+            // operations unwind, bounds its own stream disposal by
+            // `TeardownAllowanceSeconds`, roots any still-pending completion
+            // instead of abandoning it, records its own cleanup limitation, and
+            // never throws - so it cannot replace the incompleteness already
+            // recorded above with a secondary failure.
+            //
+            // This runs BEFORE the broker binding is released below and before
+            // `LifecycleDisposed` is published, preserving the documented
+            // ordering: Governor pipe closed first, broker binding second.
+            var abandoned = Interlocked.Exchange(ref _connection, null);
+            if (abandoned is not null)
+            {
+                await AbortConnectionAsync(abandoned, OperatorHandoffInvalidation.ReconnectRequired, OperatorExchangeStages.Dispose).ConfigureAwait(false);
+            }
+        }
         // The retained broker binding ends HERE, and this is the only site that
         // ends it. Disposal is the one deterministic end of this session: the
         // process that holds the bound pipe is going away, the same closing

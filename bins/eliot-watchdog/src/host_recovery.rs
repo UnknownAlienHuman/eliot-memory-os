@@ -1898,3 +1898,962 @@ mod recovery_boundary_tests {
         Ok(())
     }
 }
+
+/// Decision-pass proofs: the durable budget gate, the independence of the two
+/// audit streams, the substitution refusal the existing SCM adapter forces, and
+/// the installed-recipe sibling scope (#1757 W2, W3, W6, W10, W11).
+#[cfg(test)]
+mod recovery_decision_tests {
+    use super::*;
+    use crate::host_identity_observation::MAX_CHALLENGE_WAIT_SECS;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A private journal file for one test. Two tests never share one, and a test
+    /// that simulates a Watchdog restart reopens the SAME file after dropping the
+    /// handle, so "survives a restart" is measured and not asserted.
+    fn temp_journal(label: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let index = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "eliot-watchdog-decision-{label}-{}-{index}",
+            std::process::id()
+        );
+        std::env::temp_dir().join(name)
+    }
+
+    fn coordination(character: char) -> Fallible<PlatformHandle> {
+        Ok(PlatformHandle::new(character.to_string().repeat(32))?)
+    }
+
+    fn process(process_id: u32, start_time_100ns: u64) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id,
+            start_time_100ns,
+            image_path: "C:\\Program Files\\Eliot\\eliot-host.exe".to_owned(),
+        }
+    }
+
+    fn fenced_target() -> Fallible<RecoveryTarget> {
+        RecoveryTarget::bind(
+            coordination('a')?,
+            coordination('b')?,
+            coordination('c')?,
+            coordination('d')?,
+            &process(4_200, 1_000_000),
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+    }
+
+    fn reproduces_target(target: &RecoveryTarget) -> BoundaryEvidence {
+        BoundaryEvidence {
+            observed_registration: Some(target.registration.clone()),
+            identity_digest: Some(target.identity_digest.clone()),
+            generation: Some(target.generation.clone()),
+        }
+    }
+
+    /// One fully-populated fence, so a case can vary exactly one input and see
+    /// which check it moves.
+    fn fence<'a>(
+        approved: &'a ApprovedRecoveryPolicy,
+        target: &'a RecoveryTarget,
+        excluding: ScmAdapterGuarantee,
+        budget: &'a RecoveryBudget,
+        audit: &'a DualAuditRecord,
+    ) -> RecoveryFence<'a> {
+        RecoveryFence {
+            policy: approved,
+            target,
+            evidence: reproduces_target(target),
+            guarantee: excluding,
+            open_operation: None,
+            budget,
+            audit,
+            now_ms: 0,
+        }
+    }
+
+    /// One operation identity across every reconciled phase.
+    ///
+    /// `apply` advances the row revision once per applied step — that is the
+    /// optimistic-concurrency guard `commit_recovery_step` compares against, not a
+    /// second operation — so the revision is pinned to its exact per-step sequence
+    /// while the operation identity, correlation, fenced target, challenge outcome
+    /// and budget decision must never change.
+    fn assert_stable_operation_identity(
+        opened: &RecoveryOperation,
+        rows: &[(&RecoveryOperation, u64)],
+    ) {
+        for (row, expected_revision) in rows {
+            assert_eq!(
+                row.correlation().operation_id,
+                opened.correlation().operation_id
+            );
+            assert_eq!(row.correlation(), opened.correlation());
+            assert_eq!(row.target(), opened.target());
+            assert_eq!(
+                row.revision(),
+                *expected_revision,
+                "each applied step advances the row revision exactly once"
+            );
+            assert_eq!(row.challenge_outcome(), opened.challenge_outcome());
+            assert_eq!(row.budget_decision(), opened.budget_decision());
+        }
+    }
+
+    fn installed_scope() -> Fallible<RecoveryScope> {
+        RecoveryScope::new(vec![
+            SiblingBranchDisposition {
+                branch: SiblingBranch::HostKernelLineage,
+                disposition: SiblingDisposition::ClosedWithHostJobObject,
+            },
+            SiblingBranchDisposition {
+                branch: SiblingBranch::CanonicalStoreBranch,
+                disposition: SiblingDisposition::PreservedUnderExistingPolicy,
+            },
+            SiblingBranchDisposition {
+                branch: SiblingBranch::WatchdogService,
+                disposition: SiblingDisposition::IndependentSiblingService,
+            },
+        ])
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+    }
+
+    /// The installation-approved policy every case here decides under. Only the
+    /// budget-relevant fields vary per case, and they are named so a reader can
+    /// see which rule is under test rather than inferring it from a literal.
+    fn policy(max_attempts: u32, budget_window_secs: u64) -> Fallible<ApprovedRecoveryPolicy> {
+        Ok(ApprovedRecoveryPolicy {
+            installation: coordination('1')?,
+            service: coordination('2')?,
+            owner_epoch_digest: coordination('b')?,
+            recipe_digest: coordination('c')?,
+            failure_threshold: 1,
+            max_attempts,
+            budget_window_secs,
+            cooldown_secs: 0,
+            exclusive_attempt: true,
+            audit_failure_refuses_effects: false,
+        })
+    }
+
+    /// An exhausted durable budget admits no SCM effect and is still exhausted
+    /// after the journal handle is dropped and reopened. A fresh Watchdog process
+    /// reads the SAME row, so exhaustion cannot be reset by restarting.
+    #[test]
+    fn exhausted_budget_admits_no_effect_and_survives_a_watchdog_restart() -> TestResult {
+        let journal = temp_journal("exhausted-budget");
+        let approved = policy(2, 3_600)?;
+        let attempt_ms = 1_000_000_u64;
+
+        {
+            let database = Database::create(&journal)?;
+            // A fresh journal has no row: read_recovery_budget returns an explicit
+            // empty row rather than inventing attempts, and a live unresponsive
+            // Host is admitted with the exact remainder.
+            let fresh = read_recovery_budget(&database)?;
+            assert_eq!(fresh.used_attempts(attempt_ms, &approved), 0);
+            assert_eq!(fresh.consecutive_failures(), 0);
+            assert_eq!(fresh.last_attempt_ms(), None);
+            assert_eq!(
+                fresh.decide(HostResponsiveness::AliveUnresponsive, attempt_ms, &approved),
+                RecoveryBudgetDecision::Admitted {
+                    remaining_attempts: 2
+                }
+            );
+
+            // One fenced stop/start pair is ONE consumed attempt, recorded
+            // together with the failure this pass classified.
+            record_recovery_budget(&database, true, Some(attempt_ms), &approved)?;
+            let after_one = read_recovery_budget(&database)?;
+            assert_eq!(after_one.used_attempts(attempt_ms, &approved), 1);
+            assert_eq!(after_one.consecutive_failures(), 1);
+            assert_eq!(
+                after_one.decide(HostResponsiveness::AliveUnresponsive, attempt_ms, &approved),
+                RecoveryBudgetDecision::Admitted {
+                    remaining_attempts: 1
+                }
+            );
+
+            // The second attempt exhausts the window.
+            record_recovery_budget(&database, false, Some(attempt_ms + 1), &approved)?;
+        }
+
+        // The Watchdog restarts: the same file, a brand new handle. The count is
+        // read back from the durable row, never from a constant.
+        {
+            let database = Database::open(&journal)?;
+            let budget = read_recovery_budget(&database)?;
+            assert_eq!(budget.used_attempts(attempt_ms + 1, &approved), 2);
+            let decision = budget.decide(
+                HostResponsiveness::AliveUnresponsive,
+                attempt_ms + 1,
+                &approved,
+            );
+            assert_eq!(decision, RecoveryBudgetDecision::Exhausted);
+            assert!(
+                !decision.admits_effect(),
+                "an exhausted budget must admit no SCM effect"
+            );
+        }
+
+        // A zero-attempt policy admits nothing even with an untouched budget: the
+        // policy, not a constant, is what refuses.
+        {
+            let database = Database::open(&journal)?;
+            let zero = policy(0, 3_600)?;
+            let budget = read_recovery_budget(&database)?;
+            let decision = budget.decide(HostResponsiveness::AliveUnresponsive, attempt_ms, &zero);
+            assert_eq!(decision, RecoveryBudgetDecision::Exhausted);
+            assert!(!decision.admits_effect());
+        }
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// An attempt that has aged out of the policy's budget window stops counting,
+    /// and the remainder is read from the durable row rather than recomputed from
+    /// a lifetime total. Uncertainty never admits an effect at any count.
+    #[test]
+    fn the_budget_window_bounds_the_count_and_uncertainty_never_admits() -> TestResult {
+        let journal = temp_journal("budget-window");
+        let database = Database::create(&journal)?;
+        let approved = policy(3, 60)?;
+        let first_ms = 1_000_000_u64;
+        let inside_window_ms = first_ms + 30_000;
+        let past_window_ms = first_ms + 60_001;
+
+        record_recovery_budget(&database, true, Some(first_ms), &approved)?;
+        let budget = read_recovery_budget(&database)?;
+        assert_eq!(budget.last_attempt_ms(), Some(first_ms));
+        assert_eq!(budget.used_attempts(inside_window_ms, &approved), 1);
+        assert_eq!(budget.used_attempts(past_window_ms, &approved), 0);
+
+        // Inside the window the exact remainder is reported; outside it, the
+        // full policy budget is available again.
+        assert_eq!(
+            budget.decide(
+                HostResponsiveness::AliveUnresponsive,
+                inside_window_ms,
+                &approved
+            ),
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 2
+            }
+        );
+        assert_eq!(
+            budget.decide(
+                HostResponsiveness::AliveUnresponsive,
+                past_window_ms,
+                &approved
+            ),
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 3
+            }
+        );
+
+        // An unresolved challenge is never restart eligibility, however much
+        // budget is left.
+        let uncertain = HostResponsiveness::Uncertain(ChallengeUncertainty::TargetChanged);
+        let decision = budget.decide(uncertain, inside_window_ms, &approved);
+        assert_eq!(decision, RecoveryBudgetDecision::ChallengeUnresolved);
+        assert!(!decision.admits_effect());
+
+        // And a responsive Host needs no recovery at all.
+        assert_eq!(
+            budget.decide(HostResponsiveness::Responsive, inside_window_ms, &approved),
+            RecoveryBudgetDecision::NoRecoveryRequired
+        );
+        assert!(!RecoveryBudgetDecision::NoRecoveryRequired.admits_effect());
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// The two audit streams are independent facts. A durable spool row is not
+    /// Event Log visibility: the readback reports the exact stored sequence and
+    /// re-derives the Event Log leg from the installed source/event contract,
+    /// which admits no Watchdog audit record, so nothing can claim it is
+    /// readable back. No SCM effect is requested, retried, or replayed here.
+    #[test]
+    fn spool_persistence_and_event_log_delivery_stay_independent_facts() -> TestResult {
+        let journal = temp_journal("dual-audit");
+        let database = Database::create(&journal)?;
+        let target = fenced_target()?;
+        let correlation = AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?;
+
+        // A fresh journal has no rows, and the window bounds are refused rather
+        // than silently clamped.
+        assert!(read_recovery_audit(&database, 8)?.is_empty());
+        assert_eq!(
+            read_recovery_audit(&database, 0).err(),
+            Some(RecoveryError::Invalid(
+                "recovery audit window is outside its bounded range".to_owned()
+            ))
+        );
+        assert_eq!(
+            read_recovery_audit(
+                &database,
+                usize::try_from(MAX_RETAINED_RECOVERY_AUDIT_ROWS)
+                    .map_err(|_| "the retained-row bound does not fit a usize")?
+                    + 1
+            )
+            .err(),
+            Some(RecoveryError::Invalid(
+                "recovery audit window is outside its bounded range".to_owned()
+            ))
+        );
+
+        // An audit record starts with NEITHER stream claimed.
+        let unproven = DualAuditRecord::new(correlation.clone(), AuditEventKind::ChallengeTimeout);
+        assert!(!unproven.spool_persisted());
+        assert!(!unproven.event_log.readable_back());
+
+        let mut sequences = Vec::new();
+        for kind in [
+            AuditEventKind::ChallengeTimeout,
+            AuditEventKind::BudgetExhausted,
+            AuditEventKind::ScmRequest,
+            AuditEventKind::ScmReadback,
+        ] {
+            let recorded =
+                record_recovery_audit(&database, &DualAuditRecord::new(correlation.clone(), kind))?;
+            assert!(
+                recorded.spool_persisted(),
+                "the durable append is the spool fact"
+            );
+            sequences.push(match recorded.spool {
+                SpoolDelivery::Persisted { sequence } => sequence,
+                SpoolDelivery::Unavailable => panic!("the append reported no sequence"),
+            });
+        }
+        // Sequences are dense and strictly increasing: one append, one sequence.
+        assert_eq!(sequences, vec![1, 2, 3, 4]);
+
+        // The bounded readback preserves correlation, kind and order, and reports
+        // the stored sequence rather than an assumed one.
+        let rows = read_recovery_audit(&database, 8)?;
+        assert_eq!(rows.len(), 4);
+        for (row, kind) in rows.iter().zip([
+            AuditEventKind::ChallengeTimeout,
+            AuditEventKind::BudgetExhausted,
+            AuditEventKind::ScmRequest,
+            AuditEventKind::ScmReadback,
+        ]) {
+            assert_eq!(row.kind, kind);
+            assert_eq!(row.correlation, correlation);
+            assert!(row.spool_persisted());
+            assert!(!row.event_log.readable_back());
+        }
+        let read_sequences: Vec<u64> = rows
+            .iter()
+            .map(|row| match row.spool {
+                SpoolDelivery::Persisted { sequence } => sequence,
+                SpoolDelivery::Unavailable => panic!("a stored row cannot be unavailable"),
+            })
+            .collect();
+        assert_eq!(read_sequences, sequences);
+
+        // A bounded window reads the OLDEST rows first and never concatenates a
+        // second history.
+        assert_eq!(read_recovery_audit(&database, 2)?.len(), 2);
+        assert_eq!(
+            read_recovery_audit(&database, 2)?[0].kind,
+            AuditEventKind::ChallengeTimeout
+        );
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// The failure threshold is a durable count, not a constant. A fresh budget row
+    /// has no journaled failure, so the fence stops at the threshold and never
+    /// reaches the checks after it.
+    #[test]
+    fn the_failure_threshold_refuses_until_a_failure_is_journaled() -> TestResult {
+        let journal = temp_journal("failure-threshold");
+        let database = Database::create(&journal)?;
+        let target = fenced_target()?;
+        let audit = DualAuditRecord::new(
+            AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?,
+            AuditEventKind::ChallengeTimeout,
+        );
+        let excluding = ScmAdapterGuarantee {
+            effect_addresses_service_name_only: false,
+            readback_is_a_separate_query: false,
+            post_boundary_ambiguity_preserved: true,
+        };
+        let approved = ApprovedRecoveryPolicy {
+            installation: coordination('1')?,
+            service: coordination('2')?,
+            owner_epoch_digest: target.owner_epoch.clone(),
+            recipe_digest: target.recipe_digest.clone(),
+            failure_threshold: 1,
+            max_attempts: 3,
+            budget_window_secs: 3_600,
+            cooldown_secs: 0,
+            exclusive_attempt: true,
+            audit_failure_refuses_effects: false,
+        };
+        let unfailed = read_recovery_budget(&database)?;
+        assert_eq!(unfailed.consecutive_failures(), 0);
+        assert_eq!(
+            fence_recovery(&fence(&approved, &target, excluding, &unfailed, &audit)).err(),
+            Some(BoundaryRefusal::FailureThresholdNotReached)
+        );
+
+        record_recovery_budget(&database, true, None, &approved)?;
+        let failed = read_recovery_budget(&database)?;
+        assert_eq!(failed.consecutive_failures(), 1);
+        assert_ne!(
+            fence_recovery(&fence(&approved, &target, excluding, &failed, &audit)).err(),
+            Some(BoundaryRefusal::FailureThresholdNotReached),
+            "a journaled failure moves the fence past the threshold"
+        );
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// A sink failure stays visible and causes no duplicate restart. The existing
+    /// SCM adapter addresses its effect by service name and reads back with a
+    /// separate query, so it cannot exclude a generation substitution across its
+    /// own effect boundary. The fence therefore REFUSES instead of claiming an
+    /// atomic generation fence, and the policy's audit-failure rule is honoured
+    /// independently of that structural refusal.
+    #[test]
+    fn an_unexcludable_substitution_and_a_failed_sink_both_refuse_effects() -> TestResult {
+        let journal = temp_journal("sink-and-substitution");
+        let database = Database::create(&journal)?;
+        let target = fenced_target()?;
+        let audit = DualAuditRecord::new(
+            AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?,
+            AuditEventKind::ChallengeTimeout,
+        )
+        .with_spool_persisted(1);
+
+        // The adapter's own recorded guarantees, pinned as one exact value rather than
+        // three trivially-true field assertions.
+        assert_eq!(
+            EXISTING_SCM_ADAPTER_GUARANTEE,
+            ScmAdapterGuarantee {
+                effect_addresses_service_name_only: true,
+                readback_is_a_separate_query: true,
+                post_boundary_ambiguity_preserved: true,
+            },
+            "the recorded guarantee is the one this cell is built against"
+        );
+        assert!(
+            !EXISTING_SCM_ADAPTER_GUARANTEE.excludes_generation_substitution(),
+            "the installed adapter cannot exclude a generation substitution"
+        );
+
+        let approved = ApprovedRecoveryPolicy {
+            installation: coordination('1')?,
+            service: coordination('2')?,
+            owner_epoch_digest: target.owner_epoch.clone(),
+            recipe_digest: target.recipe_digest.clone(),
+            failure_threshold: 1,
+            max_attempts: 3,
+            budget_window_secs: 3_600,
+            cooldown_secs: 0,
+            exclusive_attempt: true,
+            audit_failure_refuses_effects: false,
+        };
+
+        // An adapter that CAN exclude the substitution passes that check, which
+        // is what makes the structural refusal below a real limit rather than a
+        // blanket denial.
+        let excluding = ScmAdapterGuarantee {
+            effect_addresses_service_name_only: false,
+            readback_is_a_separate_query: false,
+            post_boundary_ambiguity_preserved: true,
+        };
+        assert!(excluding.excludes_generation_substitution());
+
+        // The policy's failure threshold is a durable count, so the fence only
+        // reaches its later checks after this pass has journaled a real failure.
+        record_recovery_budget(&database, true, None, &approved)?;
+        let budget = read_recovery_budget(&database)?;
+        assert_eq!(budget.consecutive_failures(), 1);
+
+        // Even with the approved unchanged registration reproduced exactly and no
+        // competing attempt, the structural refusal is the one that surfaces.
+        let fence = RecoveryFence {
+            policy: &approved,
+            target: &target,
+            evidence: reproduces_target(&target),
+            guarantee: EXISTING_SCM_ADAPTER_GUARANTEE,
+            open_operation: None,
+            budget: &budget,
+            audit: &audit,
+            now_ms: 0,
+        };
+        assert_eq!(
+            fence_recovery(&fence).err(),
+            Some(BoundaryRefusal::GenerationSubstitutionNotExcluded)
+        );
+
+        // An adapter that CAN exclude the substitution passes that check, which
+        // is what makes the refusal above a real structural limit rather than a
+        // blanket denial.
+        let admitted = RecoveryFence {
+            policy: &approved,
+            target: &target,
+            evidence: reproduces_target(&target),
+            guarantee: excluding,
+            open_operation: None,
+            budget: &budget,
+            audit: &audit,
+            now_ms: 0,
+        };
+        let intent = fence_recovery(&admitted)
+            .map_err(|error| format!("an excluding adapter must admit: {error:?}"))?;
+        assert_eq!(intent.operation_id, audit.correlation.operation_id);
+        assert_eq!(intent.target.identity_digest, target.identity_digest);
+
+        // The audit-failure disposition is the policy's own rule and is checked
+        // BEFORE the structural limit: when the policy refuses effects on a failed
+        // audit, the unadmitted Event Log leg is what surfaces.
+        let audit_refusing = ApprovedRecoveryPolicy {
+            audit_failure_refuses_effects: true,
+            ..approved.clone()
+        };
+        let refused_on_sink = RecoveryFence {
+            policy: &audit_refusing,
+            target: &target,
+            evidence: reproduces_target(&target),
+            guarantee: excluding,
+            open_operation: None,
+            budget: &budget,
+            audit: &audit,
+            now_ms: 0,
+        };
+        assert_eq!(
+            fence_recovery(&refused_on_sink).err(),
+            Some(BoundaryRefusal::AuditFailureRefusesEffects)
+        );
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// One stable operation survives stop/start uncertainty. A requested stop is
+    /// not an observed termination, an unknown outcome keeps its own phase, and
+    /// the operation identity never changes across phases, so a retry cannot
+    /// become a second operation.
+    #[test]
+    fn one_stable_operation_survives_stop_and_start_uncertainty() -> TestResult {
+        let journal = temp_journal("stable-operation");
+        let database = Database::create(&journal)?;
+        let target = fenced_target()?;
+        let correlation = AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?;
+        let intent = RecoveryOperation::begin(
+            correlation,
+            target.clone(),
+            HostResponsiveness::AliveUnresponsive,
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 1,
+            },
+            installed_scope()?,
+        )?;
+
+        let opened = begin_recovery_operation(&database, None, &intent)?;
+        assert_eq!(opened.phase(), RecoveryPhase::StopIntentCommitted);
+        assert_eq!(opened.revision(), 1);
+
+        // A start cannot be requested while the stop is only an intent: the
+        // reconciliation order is enforced, not assumed.
+        assert_eq!(
+            commit_recovery_step(
+                &database,
+                &opened,
+                &RecoveryStep::StartRequested,
+                &reproduces_target(&target),
+            )
+            .err(),
+            Some(RecoveryError::IllegalPhase),
+            "a start before an observed stop must not be accepted"
+        );
+        assert_eq!(
+            read_recovery_operation(&database)?.map(|row| row.phase()),
+            Some(RecoveryPhase::StopIntentCommitted),
+            "the refused step leaves the durable row where the refusal left it"
+        );
+
+        // An unreadable termination is preserved as its own phase, never assumed.
+        let unknown_stop = commit_recovery_step(
+            &database,
+            &opened,
+            &RecoveryStep::StopOutcomeUnknown,
+            &BoundaryEvidence {
+                observed_registration: None,
+                identity_digest: None,
+                generation: None,
+            },
+        )?;
+        // The start path needs an OBSERVED stop, and it runs in its own journal so
+        // the two reconciliations never overwrite each other's durable row.
+        let start_journal = temp_journal("stable-operation-start");
+        let start_database = Database::create(&start_journal)?;
+        assert_eq!(
+            read_recovery_operation(&start_database)?,
+            None,
+            "a second journal holds no operation of its own"
+        );
+        let start_opened = begin_recovery_operation(&start_database, None, &intent)?;
+        assert_eq!(start_opened.phase(), RecoveryPhase::StopIntentCommitted);
+        let observed_stop = commit_recovery_step(
+            &start_database,
+            &start_opened,
+            &RecoveryStep::StopObserved,
+            &BoundaryEvidence {
+                observed_registration: None,
+                identity_digest: None,
+                generation: None,
+            },
+        )?;
+        let requested = commit_recovery_step(
+            &start_database,
+            &observed_stop,
+            &RecoveryStep::StartRequested,
+            &reproduces_target(&target),
+        )?;
+        assert_eq!(requested.phase(), RecoveryPhase::StartIntentCommitted);
+        let unknown_start = commit_recovery_step(
+            &start_database,
+            &requested,
+            &RecoveryStep::StartOutcomeUnknown,
+            &reproduces_target(&target),
+        )?;
+        assert_eq!(unknown_start.phase(), RecoveryPhase::StartOutcomeUnknown);
+
+        // One identity throughout: the same stable operation identity, the same
+        // correlation and the same fenced target in every phase. The revision is
+        // NOT stable — `apply` advances it once per applied step, which is the
+        // optimistic-concurrency guard `commit_recovery_step` compares against —
+        // so the exact per-step sequence is asserted instead, and what must never
+        // change is the operation identity inside the correlation.
+        assert_stable_operation_identity(
+            &opened,
+            &[(&unknown_stop, 2), (&requested, 3), (&unknown_start, 4)],
+        );
+        // The durable row is the phase the last committed step left, never a
+        // second operation opened under a new identity.
+        assert_eq!(
+            read_recovery_operation(&start_database)?,
+            Some(unknown_start.clone())
+        );
+        assert_eq!(
+            read_recovery_operation(&database)?,
+            Some(unknown_stop.clone())
+        );
+
+        let _ = std::fs::remove_file(&journal);
+        let _ = std::fs::remove_file(&start_journal);
+        Ok(())
+    }
+
+    /// A replacement challenge establishes its observed responsiveness and
+    /// nothing else. There is deliberately no resolved variant: the underlying
+    /// Problem is resolved by the Governor's canonical transition, never by a
+    /// restart.
+    #[test]
+    fn a_replacement_challenge_establishes_observed_responsiveness_only() {
+        assert_eq!(
+            replacement_challenge_scope(HostResponsiveness::Responsive),
+            ReplacementChallengeScope::ObservedResponsivenessOnly
+        );
+        assert_eq!(
+            replacement_challenge_scope(HostResponsiveness::AliveUnresponsive),
+            ReplacementChallengeScope::Unresolved
+        );
+        for uncertain in [
+            ChallengeUncertainty::TargetNotLive,
+            ChallengeUncertainty::TargetChanged,
+            ChallengeUncertainty::InadequateCoverage,
+        ] {
+            assert_eq!(
+                replacement_challenge_scope(HostResponsiveness::Uncertain(uncertain)),
+                ReplacementChallengeScope::Unresolved,
+                "an uncertain replacement challenge establishes nothing"
+            );
+        }
+    }
+
+    /// An unknown outcome is its own preserved phase, never a completed step. It is
+    /// terminal for the operation: it cannot be walked forward into a start, and
+    /// it cannot be re-observed as a fresh `StopObserved`.
+    #[test]
+    fn an_unknown_stop_outcome_is_preserved_and_admits_no_start() -> TestResult {
+        let journal = temp_journal("unknown-stop");
+        let database = Database::create(&journal)?;
+        let target = fenced_target()?;
+        let intent = RecoveryOperation::begin(
+            AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?,
+            target.clone(),
+            HostResponsiveness::AliveUnresponsive,
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 1,
+            },
+            installed_scope()?,
+        )?;
+        let opened = begin_recovery_operation(&database, None, &intent)?;
+        let unknown_stop = commit_recovery_step(
+            &database,
+            &opened,
+            &RecoveryStep::StopOutcomeUnknown,
+            &BoundaryEvidence {
+                observed_registration: None,
+                identity_digest: None,
+                generation: None,
+            },
+        )?;
+        assert_eq!(unknown_stop.phase(), RecoveryPhase::StopOutcomeUnknown);
+
+        let mut candidate = unknown_stop.clone();
+        assert_eq!(
+            RecoveryOperation::apply(&mut candidate, &RecoveryStep::StopObserved).err(),
+            Some(RecoveryError::IllegalPhase),
+            "an unknown stop outcome is not re-observed as a fresh step"
+        );
+        assert_eq!(
+            RecoveryOperation::apply(&mut candidate, &RecoveryStep::StartRequested).err(),
+            Some(RecoveryError::IllegalPhase),
+            "an unknown stop outcome admits no start"
+        );
+        assert_eq!(
+            candidate, unknown_stop,
+            "a refused step never leaves the operation half-advanced"
+        );
+        assert_eq!(
+            read_recovery_operation(&database)?,
+            Some(unknown_stop),
+            "the durable row keeps the unknown phase"
+        );
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// A competing attempt is excluded by a durable row, not by a lock the hung
+    /// Host holds, and a recovery scope must name every supervised sibling
+    /// exactly once under its installed disposition.
+    #[test]
+    fn competing_attempts_are_excluded_durably_and_the_scope_is_complete() -> TestResult {
+        let journal = temp_journal("exclusion-and-scope");
+        let database = Database::create(&journal)?;
+        let target = fenced_target()?;
+        let audit = DualAuditRecord::new(
+            AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?,
+            AuditEventKind::ChallengeTimeout,
+        );
+        let excluding = ScmAdapterGuarantee {
+            effect_addresses_service_name_only: false,
+            readback_is_a_separate_query: false,
+            post_boundary_ambiguity_preserved: true,
+        };
+        let approved = ApprovedRecoveryPolicy {
+            installation: coordination('1')?,
+            service: coordination('2')?,
+            owner_epoch_digest: target.owner_epoch.clone(),
+            recipe_digest: target.recipe_digest.clone(),
+            failure_threshold: 1,
+            max_attempts: 3,
+            budget_window_secs: 3_600,
+            cooldown_secs: 0,
+            exclusive_attempt: true,
+            audit_failure_refuses_effects: false,
+        };
+
+        // The policy's failure threshold is a durable count: without a journaled
+        // failure the fence stops at the threshold and never reaches the
+        // competing-attempt exclusion, so the failure is recorded first.
+        record_recovery_budget(&database, true, None, &approved)?;
+        let budget = read_recovery_budget(&database)?;
+        assert_eq!(budget.consecutive_failures(), 1);
+
+        // The scope names every branch of the supervision tree exactly once. The
+        // completeness rule compares against RECOVERY_SIBLING_BRANCHES itself, so
+        // an omitted or duplicated branch is refused.
+        let complete = installed_scope()?;
+        assert_eq!(complete.siblings.len(), RECOVERY_SIBLING_BRANCHES.len());
+        for branch in RECOVERY_SIBLING_BRANCHES {
+            assert_eq!(
+                complete
+                    .siblings
+                    .iter()
+                    .filter(|entry| entry.branch == branch)
+                    .count(),
+                1,
+                "every supervised sibling needs exactly one disposition"
+            );
+        }
+        let mut omitted = complete.siblings.clone();
+        omitted.pop();
+        assert_eq!(
+            RecoveryScope::new(omitted).err(),
+            Some(RecoveryError::IncompleteScope)
+        );
+        let mut duplicated = complete.siblings.clone();
+        duplicated.push(duplicated[0]);
+        assert_eq!(
+            RecoveryScope::new(duplicated).err(),
+            Some(RecoveryError::IncompleteScope)
+        );
+
+        // Open one operation, then prove a second one is excluded by the durable
+        // row rather than by anything the process is holding.
+        let intent = RecoveryOperation::begin(
+            audit.correlation.clone(),
+            target.clone(),
+            HostResponsiveness::AliveUnresponsive,
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 1,
+            },
+            complete,
+        )?;
+        let opened = begin_recovery_operation(&database, None, &intent)?;
+        let competing = RecoveryOperation::begin(
+            audit.correlation.clone(),
+            target.clone(),
+            HostResponsiveness::AliveUnresponsive,
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 1,
+            },
+            installed_scope()?,
+        )?;
+        assert_eq!(
+            begin_recovery_operation(&database, None, &competing).err(),
+            Some(RecoveryError::OperationOpen)
+        );
+
+        // And the fence refuses the competing attempt under the same rule.
+        let fence = RecoveryFence {
+            policy: &approved,
+            target: &target,
+            evidence: reproduces_target(&target),
+            guarantee: excluding,
+            open_operation: Some(&opened),
+            budget: &budget,
+            audit: &audit,
+            now_ms: 0,
+        };
+        assert_eq!(
+            fence_recovery(&fence).err(),
+            Some(BoundaryRefusal::ConcurrentAttempt)
+        );
+
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// The bounded observation rechecks target identity around the interval. A
+    /// competently attempted challenge against a live target is
+    /// `ALIVE_UNRESPONSIVE` only while the same retained process identity is still
+    /// observed at the end of the interval; a target that changed, lost its
+    /// identity, or stopped stays an explicit uncertainty and is never
+    /// authenticated health.
+    #[test]
+    fn the_bounded_interval_rechecks_the_target_before_reporting_unresponsive() -> TestResult {
+        let live = ProcessIdentityHolder::of(process(4_200, 1_000_000));
+        let before = HostObservation {
+            state: HostObservationState::Running,
+            identity: Some(live.identity.clone()),
+        };
+        let Some(wait) = BoundedChallengeWait::new(MAX_CHALLENGE_WAIT_SECS) else {
+            panic!("the published bound must be constructible");
+        };
+        let timeout = ChallengeAttemptOutcome::CompetentTimeout;
+
+        // The stalled control loop: live, competently challenged, bound expired.
+        assert_eq!(
+            bounded_responsiveness(&before, &wait, &timeout, &before),
+            HostResponsiveness::AliveUnresponsive
+        );
+        assert_eq!(
+            before.responsiveness(&wait, &timeout),
+            HostResponsiveness::AliveUnresponsive
+        );
+
+        // A substituted target across the interval is never health.
+        let substituted = HostObservation {
+            state: HostObservationState::Running,
+            identity: Some(process(4_299, 1_000_000)),
+        };
+        assert_eq!(
+            bounded_responsiveness(&before, &wait, &timeout, &substituted),
+            HostResponsiveness::Uncertain(ChallengeUncertainty::TargetChanged)
+        );
+
+        // A target that lost its retained identity is inadequate coverage, not
+        // agreement.
+        let unidentified = HostObservation {
+            state: HostObservationState::Running,
+            identity: None,
+        };
+        assert_eq!(
+            bounded_responsiveness(&before, &wait, &timeout, &unidentified),
+            HostResponsiveness::Uncertain(ChallengeUncertainty::InadequateCoverage)
+        );
+
+        // A target that stopped inside the interval is not a live unresponsive
+        // Host at all.
+        let stopped = HostObservation {
+            state: HostObservationState::AbsentOrStopped,
+            identity: Some(live.identity.clone()),
+        };
+        assert_eq!(
+            bounded_responsiveness(&before, &wait, &timeout, &stopped),
+            HostResponsiveness::Uncertain(ChallengeUncertainty::TargetNotLive)
+        );
+
+        // An incompetent attempt keeps its own named uncertainty, and a cancelled
+        // wait never produces a verdict.
+        assert_eq!(
+            before.responsiveness(
+                &wait,
+                &ChallengeAttemptOutcome::Uncertain(ChallengeUncertainty::TargetNotLive)
+            ),
+            HostResponsiveness::Uncertain(ChallengeUncertainty::TargetNotLive)
+        );
+        assert_eq!(
+            before.responsiveness(
+                &wait,
+                &ChallengeAttemptOutcome::Uncertain(ChallengeUncertainty::InadequateCoverage)
+            ),
+            HostResponsiveness::Uncertain(ChallengeUncertainty::InadequateCoverage)
+        );
+        let mut cancelled = BoundedChallengeWait::new(MAX_CHALLENGE_WAIT_SECS)
+            .ok_or("the published bound must be constructible")?;
+        cancelled.cancel();
+        assert!(cancelled.is_cancelled());
+        assert_eq!(
+            before.responsiveness(&cancelled, &timeout),
+            HostResponsiveness::Uncertain(ChallengeUncertainty::InadequateCoverage)
+        );
+
+        // An unbounded or zero interval cannot be constructed at all.
+        assert!(BoundedChallengeWait::new(0).is_none());
+        assert!(BoundedChallengeWait::new(MAX_CHALLENGE_WAIT_SECS + 1).is_none());
+
+        Ok(())
+    }
+
+    /// Keeps the one retained identity in one place so the interval cases above
+    /// compare content, never a copied literal.
+    struct ProcessIdentityHolder {
+        identity: ProcessIdentity,
+    }
+
+    impl ProcessIdentityHolder {
+        fn of(identity: ProcessIdentity) -> Self {
+            Self { identity }
+        }
+    }
+}
