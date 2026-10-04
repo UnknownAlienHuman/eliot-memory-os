@@ -671,7 +671,16 @@ impl ImprovementProposal {
         text(&self.target_capability, "target_capability")?;
         text(&self.target_generation, "target_generation")?;
         text(&self.expected_delta, "expected_delta")?;
-        text(&self.risk_ceiling, "risk_ceiling")?;
+        // A blank risk qualifier is UNSUPPORTED, not absent. `risk_ceiling` names a
+        // closed typed policy value with exactly one admitted member, so a value
+        // that carries no qualifier at all is the same closed-set violation as
+        // `unbounded` and must not be reported as a missing field. Checked here,
+        // before the input profile, so no later field check can relabel it.
+        if self.risk_ceiling.trim().is_empty() {
+            return Err(PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            });
+        }
         text(&self.effect_ceiling, "effect_ceiling")?;
         text(&self.budget_ref, "budget_ref")?;
         text(&self.deadline_ref, "deadline_ref")?;
@@ -4509,14 +4518,12 @@ fn bounded_text(value: &str, field: &'static str, limit: usize) -> Result<(), Pi
 ///    unrelated run references. Asserting a refusal here would assert a check
 ///    that does not exist, so the case below states the presence and the ceiling
 ///    the code really enforces and nothing more.
-/// 2. A BLANK `risk_ceiling` refused with `PipelineError::UnsupportedRiskCeiling`.
-///    `ImprovementProposal::validate` runs the required-field check
-///    (`text(&self.risk_ceiling, "risk_ceiling")`, line 674) BEFORE the
-///    exact-equality check (`self.risk_ceiling != IMPROVEMENT_RISK_CEILING_BOUNDED`,
-///    line 713), so a blank or whitespace-only qualifier is absent rather than
-///    unsupported and refuses with `PipelineError::MissingField("risk_ceiling")`.
-///    Only `unbounded` and other NONBLANK wrong values reach
-///    `UnsupportedRiskCeiling`, and only those are asserted as that error.
+///
+/// A BLANK `risk_ceiling` is no longer such a case: `risk_ceiling` is a closed
+/// typed policy value whose only member is `IMPROVEMENT_RISK_CEILING_BOUNDED`,
+/// so a blank or whitespace-only qualifier is unsupported rather than absent and
+/// refuses with `PipelineError::UnsupportedRiskCeiling`, the same typed failure
+/// `unbounded` and every other nonblank wrong value produce.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5671,13 +5678,37 @@ mod tests {
             }
         );
 
-        // The blank qualifier is NOT one of the cases above: `validate` runs the
-        // required-field check before the exact-equality check, so it is absent
-        // rather than unsupported and never yields
-        // `UnsupportedRiskCeiling`. Stated here so the gap is on the record.
+        // The blank qualifier refuses with the SAME typed failure as `unbounded`:
+        // `risk_ceiling` is a closed typed policy value with one admitted member,
+        // so a value carrying no qualifier at all is unsupported, not absent, and
+        // is never reported as a missing field.
         let mut group = fixture("a");
         group.proposal.risk_ceiling = "   ".to_string();
-        assert_eq!(group.refusal(), PipelineError::MissingField("risk_ceiling"));
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = String::new();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        // A tab/CR/LF-only qualifier is the same blank case, refused the same way.
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "\t\r\n".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
     }
 
     #[test]
