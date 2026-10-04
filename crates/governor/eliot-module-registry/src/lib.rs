@@ -94,6 +94,10 @@ pub enum ModuleError {
     NotFound,
     #[error("module generation admission receipt has not been read back from its owner")]
     AdmissionReceiptUnverified,
+    /// The admitted Catalog row carries no source-owned execution policy, so
+    /// no complete execution projection can be prepared from it.
+    #[error("module catalog generation admission is missing its execution policy")]
+    MissingExecutionPolicy,
     /// No canonical receipt is recorded for the offered operation identity.
     #[error("module catalog recorded no admission receipt for this operation identity")]
     AdmissionReceiptNotIssued,
@@ -477,6 +481,169 @@ impl GenerationExecutionPolicy {
             return Err(ModuleError::InvalidField {
                 field: "execution_policy.allowed_route_scopes",
                 reason: "effect-capable generations require an admitted route scope",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Source-derived technical projection prepared before a Catalog admission
+/// receipt is available.
+///
+/// This is preparation only. It carries no admission receipt, no accepted
+/// manifest digest and no activation authority, so it cannot become ORS
+/// authority until an owner-issued receipt is read back.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedKernelExecutionProjection {
+    pub artifact_digest: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub command_ref: String,
+    pub dependency_order: Vec<ModuleDependency>,
+    pub health_contract_ref: String,
+    pub effect_ceiling: EffectCeiling,
+    pub restart_authorization: RestartAuthorization,
+    pub execution_policy: GenerationExecutionPolicy,
+}
+
+/// Governor Catalog join ready for the later receipt/readback owner.
+///
+/// The value binds one exact candidate to the current Catalog row, Catalog
+/// revision and State Fence. Every projected field must equal the admitted
+/// source row: a projection that restates the manifest rather than deriving
+/// from it is refused.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedGenerationExecution {
+    pub candidate: GenerationCandidateReceipt,
+    pub catalog_revision: u64,
+    pub state_fence: StateFence,
+    pub source_catalog_digest: String,
+    pub source_manifest: ModuleManifest,
+    pub source_manifest_digest: String,
+    pub projection: PreparedKernelExecutionProjection,
+}
+
+impl PreparedGenerationExecution {
+    /// Validates that the projection is the admitted source row, not a
+    /// restatement of it.
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        self.candidate.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        if self.catalog_revision == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "prepared_execution.catalog_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        digest(
+            &self.source_catalog_digest,
+            "prepared_execution.source_catalog_digest",
+        )?;
+        digest(
+            &self.source_manifest_digest,
+            "prepared_execution.source_manifest_digest",
+        )?;
+        self.source_manifest
+            .validate_for_module(&self.candidate.module_id)?;
+        if self.source_manifest.manifest_digest != self.source_manifest_digest {
+            return Err(ModuleError::IdentityConflict);
+        }
+        let source_policy = self
+            .source_manifest
+            .execution_policy
+            .as_ref()
+            .ok_or(ModuleError::MissingExecutionPolicy)?;
+        let mut source_dependencies = self.source_manifest.dependencies.clone();
+        source_dependencies.sort_by_key(|dependency| dependency.startup_order);
+        if self.projection.artifact_digest != self.source_manifest.artifact_digest
+            || self.projection.config_digest != self.source_manifest.config_digest
+            || self.projection.protocol_digest != self.source_manifest.protocol_digest
+            || self.projection.command_ref != self.source_manifest.command_ref
+            || self.projection.dependency_order != source_dependencies
+            || self.projection.health_contract_ref != self.source_manifest.health_contract_ref
+            || self.projection.effect_ceiling != self.source_manifest.effect_ceiling
+            || self.projection.restart_authorization != self.source_manifest.restart_authorization
+            || &self.projection.execution_policy != source_policy
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        digest(
+            &self.projection.artifact_digest,
+            "prepared_execution.artifact_digest",
+        )?;
+        digest(
+            &self.projection.config_digest,
+            "prepared_execution.config_digest",
+        )?;
+        digest(
+            &self.projection.protocol_digest,
+            "prepared_execution.protocol_digest",
+        )?;
+        text(
+            &self.projection.command_ref,
+            "prepared_execution.command_ref",
+        )?;
+        text(
+            &self.projection.health_contract_ref,
+            "prepared_execution.health_contract_ref",
+        )?;
+        unique(
+            self.projection
+                .dependency_order
+                .iter()
+                .map(|dependency| dependency.module_id.clone()),
+            "prepared_execution.dependency_order.module_id",
+        )?;
+        unique(
+            self.projection
+                .dependency_order
+                .iter()
+                .map(|dependency| dependency.startup_order),
+            "prepared_execution.dependency_order.startup_order",
+        )?;
+        for dependency in &self.projection.dependency_order {
+            dependency.validate()?;
+        }
+        self.projection.execution_policy.validate()?;
+        if self.candidate.artifact_digest != self.projection.artifact_digest
+            || self.candidate.config_digest != self.projection.config_digest
+            || self.candidate.protocol_digest != self.projection.protocol_digest
+            || self
+                .projection
+                .execution_policy
+                .allowed_route_scopes
+                .iter()
+                .any(|scope| scope.module_id != self.candidate.module_id)
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Exact owner inputs for preparing, but not yet accepting, one generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationPreparationRequest {
+    pub candidate: GenerationCandidateReceipt,
+    pub expected_catalog_revision: u64,
+    pub state_fence: StateFence,
+}
+
+impl GenerationPreparationRequest {
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        self.candidate.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        if self.expected_catalog_revision == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "expected_catalog_revision",
+                reason: "must be greater than zero",
             });
         }
         Ok(())
@@ -1837,6 +2004,77 @@ impl ModuleCatalog {
         self.entries.get(module_id)
     }
 
+    /// Joins one candidate to the exact enabled Catalog row and derives a
+    /// complete technical execution projection from it.
+    ///
+    /// This is preparation only. No Catalog row is marked accepted, no ORS
+    /// manifest is issued and no activation authority is granted: the returned
+    /// value deliberately carries no admission receipt and no accepted
+    /// manifest digest, so it cannot become runtime authority until an
+    /// owner-issued receipt is read back through the normal admission path.
+    ///
+    /// Stale catalog revisions and stale fences are refused here rather than
+    /// projected, so a worker generation can never be prepared against a
+    /// Catalog row the caller did not observe.
+    pub fn prepare_generation_execution(
+        &self,
+        request: &GenerationPreparationRequest,
+    ) -> Result<PreparedGenerationExecution, ModuleError> {
+        request.validate()?;
+        if request.state_fence != self.state_fence {
+            return Err(ModuleError::FenceMismatch);
+        }
+        if request.expected_catalog_revision != self.revision {
+            return Err(ModuleError::RevisionConflict);
+        }
+        let source_catalog = self.snapshot()?;
+        let entry = self
+            .entries
+            .get(&request.candidate.module_id)
+            .ok_or(ModuleError::NotFound)?;
+        if entry.desired_state != DesiredModuleState::Enabled {
+            return Err(ModuleError::InvalidField {
+                field: "desired_state",
+                reason: "only enabled modules can prepare a generation",
+            });
+        }
+        if request.candidate.artifact_digest != entry.manifest.artifact_digest
+            || request.candidate.config_digest != entry.manifest.config_digest
+            || request.candidate.protocol_digest != entry.manifest.protocol_digest
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        let execution_policy = entry
+            .manifest
+            .execution_policy
+            .clone()
+            .ok_or(ModuleError::MissingExecutionPolicy)?;
+        execution_policy.validate_for_module(&entry.module_id, &entry.manifest)?;
+        let mut dependency_order = entry.manifest.dependencies.clone();
+        dependency_order.sort_by_key(|dependency| dependency.startup_order);
+        let prepared = PreparedGenerationExecution {
+            candidate: request.candidate.clone(),
+            catalog_revision: self.revision,
+            state_fence: self.state_fence.clone(),
+            source_catalog_digest: source_catalog.catalog_digest,
+            source_manifest: entry.manifest.clone(),
+            source_manifest_digest: entry.manifest.manifest_digest.clone(),
+            projection: PreparedKernelExecutionProjection {
+                artifact_digest: entry.manifest.artifact_digest.clone(),
+                config_digest: entry.manifest.config_digest.clone(),
+                protocol_digest: entry.manifest.protocol_digest.clone(),
+                command_ref: entry.manifest.command_ref.clone(),
+                dependency_order,
+                health_contract_ref: entry.manifest.health_contract_ref.clone(),
+                effect_ceiling: entry.manifest.effect_ceiling,
+                restart_authorization: entry.manifest.restart_authorization,
+                execution_policy,
+            },
+        };
+        prepared.validate()?;
+        Ok(prepared)
+    }
+
     pub fn snapshot(&self) -> Result<ModuleCatalogSnapshot, ModuleError> {
         let snapshot = ModuleCatalogSnapshot {
             catalog_revision: self.revision,
@@ -2270,4 +2508,285 @@ pub trait ModuleCatalogApi: Send + Sync {
         &self,
         request: ModuleCatalogSnapshotRequest,
     ) -> Result<ModuleCatalogSnapshot, ModuleError>;
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod preparation_tests {
+    use super::*;
+
+    const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        StateFence {
+            authority_epoch: epoch(1),
+            resource_generation: ResourceGeneration::new(1).expect("generation"),
+            task_revision: None,
+            policy_revision: None,
+            integration_revision: None,
+        }
+    }
+
+    fn epoch(sequence: u64) -> eliot_contracts::EpochId {
+        eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new(LINEAGE).expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
+    }
+
+    fn sha(seed: &str) -> String {
+        sha256_hex(seed.as_bytes())
+    }
+
+    fn capability_intent(effect_ceiling: EffectCeiling) -> CapabilityIntent {
+        CapabilityIntent {
+            capability_id: CapabilityId::new("facet.execute").expect("capability id"),
+            effect_ceiling,
+            allowed_scopes: vec!["route-1".to_owned()],
+            privacy_classes: vec!["private".to_owned()],
+        }
+    }
+
+    fn module_id() -> ModuleId {
+        ModuleId::new("native-worker").expect("module id")
+    }
+
+    fn manifest() -> ModuleManifest {
+        let intent = capability_intent(EffectCeiling::EffectExactLease);
+        ModuleManifest::new(
+            sha("artifact"),
+            sha("config"),
+            sha("protocol"),
+            "command-1".to_owned(),
+            "health-1".to_owned(),
+            vec![ModuleDependency {
+                module_id: ModuleId::new("provider").expect("provider"),
+                required_protocol_digest: sha("provider-protocol"),
+                startup_order: 1,
+                kind: RestartDependencyKind::Required,
+                invalidation_triggers: Vec::new(),
+            }],
+            vec![intent],
+            EffectCeiling::EffectExactLease,
+            RestartAuthorization::EffectExactLease,
+            None,
+            vec!["scope-1".to_owned()],
+        )
+        .expect("manifest")
+        .with_execution_policy(execution_policy())
+        .expect("manifest with policy")
+    }
+
+    fn execution_policy() -> GenerationExecutionPolicy {
+        GenerationExecutionPolicy {
+            policy_revision: 7,
+            allowed_route_scopes: vec![
+                ModuleCapabilityRouteScope::declare(
+                    module_id(),
+                    CapabilityId::new("facet.execute").expect("capability id"),
+                    "route-1",
+                    "effect-domain-1",
+                )
+                .expect("route scope"),
+            ],
+            resource_limits: ModuleResourceLimits {
+                job_object_policy: "kill-on-close".to_owned(),
+                max_processes: 1,
+                max_working_set_bytes: 64 * 1024 * 1024,
+                cpu_rate_control_percent: 50,
+            },
+            restart_budget: ModuleRestartBudget {
+                max_restarts: 2,
+                quarantine_rule: "quarantine after the bounded budget".to_owned(),
+            },
+            state_class_behavior: ModuleStateClassBehavior::CheckpointTransfer,
+        }
+    }
+
+    fn entry(manifest: &ModuleManifest) -> ModuleCatalogEntry {
+        ModuleCatalogEntry {
+            module_id: module_id(),
+            desired_state: DesiredModuleState::Enabled,
+            manifest: manifest.clone(),
+            restart_policy_disposition: dispose_restart_policy(manifest.restart_policy.as_ref())
+                .expect("derived restart disposition"),
+            catalog_revision: 1,
+            state_fence: fence(),
+            accepted_generation: None,
+            removal_reason: None,
+        }
+    }
+
+    fn catalog(manifest: &ModuleManifest) -> ModuleCatalog {
+        let entry = entry(manifest);
+        let mut catalog = ModuleCatalog::new(fence()).expect("catalog");
+        catalog.entries.insert(module_id(), entry);
+        catalog
+    }
+
+    fn candidate() -> GenerationCandidateReceipt {
+        GenerationCandidateReceipt::new(
+            GenerationId::new("generation-1").expect("generation id"),
+            module_id(),
+            sha("artifact"),
+            sha("config"),
+            sha("protocol"),
+            sha("build-provenance"),
+            sha("capability-profile"),
+            sha("source-fence"),
+        )
+        .expect("candidate")
+    }
+
+    fn request() -> GenerationPreparationRequest {
+        GenerationPreparationRequest {
+            candidate: candidate(),
+            expected_catalog_revision: 1,
+            state_fence: fence(),
+        }
+    }
+
+    #[test]
+    fn preparation_derives_the_projection_from_the_admitted_row() {
+        let catalog = catalog(&manifest());
+        let prepared = catalog
+            .prepare_generation_execution(&request())
+            .expect("preparation joins the admitted row");
+        prepared
+            .validate()
+            .expect("prepared execution is self-consistent");
+
+        // Every projected field is the admitted source row, not a restatement.
+        assert_eq!(prepared.catalog_revision, catalog.revision);
+        assert_eq!(prepared.state_fence, *catalog.state_fence());
+        assert_eq!(
+            prepared.source_manifest_digest,
+            catalog
+                .desired(&module_id())
+                .expect("row")
+                .manifest
+                .manifest_digest
+        );
+        assert_eq!(
+            prepared.projection.artifact_digest,
+            catalog
+                .desired(&module_id())
+                .expect("row")
+                .manifest
+                .artifact_digest
+        );
+        assert_eq!(
+            prepared.projection.execution_policy.policy_revision, 7,
+            "the source-owned policy revision is carried, not defaulted"
+        );
+        // Preparation grants no admission: there is no receipt and no accepted
+        // generation on the prepared value or on the catalog it came from.
+        assert!(
+            catalog
+                .desired(&module_id())
+                .expect("row")
+                .accepted_generation
+                .is_none(),
+            "preparation must not mark a generation accepted"
+        );
+    }
+
+    #[test]
+    fn preparation_refuses_a_stale_revision_or_fence() {
+        let catalog = catalog(&manifest());
+        let mut stale_revision = request();
+        stale_revision.expected_catalog_revision = 2;
+        assert!(matches!(
+            catalog.prepare_generation_execution(&stale_revision),
+            Err(ModuleError::RevisionConflict)
+        ));
+
+        let mut stale_fence = request();
+        stale_fence.state_fence.authority_epoch = epoch(2);
+        assert!(matches!(
+            catalog.prepare_generation_execution(&stale_fence),
+            Err(ModuleError::FenceMismatch)
+        ));
+    }
+
+    #[test]
+    fn preparation_refuses_a_candidate_that_is_not_this_artifact() {
+        let catalog = catalog(&manifest());
+        let mut substituted = request();
+        substituted.candidate = GenerationCandidateReceipt::new(
+            GenerationId::new("generation-1").expect("generation id"),
+            module_id(),
+            sha("substituted-artifact"),
+            sha("config"),
+            sha("protocol"),
+            sha("build-provenance"),
+            sha("capability-profile"),
+            sha("source-fence"),
+        )
+        .expect("substituted candidate");
+        assert!(matches!(
+            catalog.prepare_generation_execution(&substituted),
+            Err(ModuleError::IdentityConflict)
+        ));
+    }
+
+    #[test]
+    fn preparation_refuses_a_row_with_no_execution_policy() {
+        // A row admitted before the source owner supplied an execution policy
+        // cannot produce a complete projection, and the gap is named instead
+        // of selecting runtime defaults.
+        let without_policy = ModuleManifest::new(
+            sha("artifact"),
+            sha("config"),
+            sha("protocol"),
+            "command-1".to_owned(),
+            "health-1".to_owned(),
+            Vec::new(),
+            vec![capability_intent(EffectCeiling::ReadRebuild)],
+            EffectCeiling::ReadRebuild,
+            RestartAuthorization::EffectExactLease,
+            None,
+            vec!["scope-1".to_owned()],
+        )
+        .expect("manifest");
+        let catalog = catalog(&without_policy);
+        assert!(matches!(
+            catalog.prepare_generation_execution(&request()),
+            Err(ModuleError::MissingExecutionPolicy)
+        ));
+    }
+
+    #[test]
+    fn a_projection_that_restates_the_manifest_is_refused() {
+        let catalog = catalog(&manifest());
+        let mut prepared = catalog
+            .prepare_generation_execution(&request())
+            .expect("preparation");
+        // The projection must be derived from the admitted row: a widened
+        // effect ceiling with the same manifest digest is refused.
+        prepared.projection.effect_ceiling = EffectCeiling::CandidateOnly;
+        assert!(matches!(
+            prepared.validate(),
+            Err(ModuleError::IdentityConflict)
+        ));
+        // So is a substituted command reference.
+        let mut restated = catalog
+            .prepare_generation_execution(&request())
+            .expect("preparation");
+        restated.projection.command_ref = "command-other".to_owned();
+        assert!(matches!(
+            restated.validate(),
+            Err(ModuleError::IdentityConflict)
+        ));
+        // And a policy revision the source row never declared.
+        let mut repolicy = catalog
+            .prepare_generation_execution(&request())
+            .expect("preparation");
+        repolicy.projection.execution_policy.policy_revision = 8;
+        assert!(matches!(
+            repolicy.validate(),
+            Err(ModuleError::IdentityConflict)
+        ));
+    }
 }
