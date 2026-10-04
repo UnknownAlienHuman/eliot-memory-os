@@ -3258,19 +3258,151 @@ fn case42_manifest_keeps_narrow_unsafe_exception_and_every_family() {
     // regex-shaped marker line; the same underlying source-text access is used
     // instead, which is the only part of `w1b_count` that matters here.
     let suite_source = w1b_read_package_file("tests/unsafe_family_boundaries.rs");
-    let mut suite_marker_ids: Vec<u64> = suite_source
+    // The marker must match the work-unit gate's own ANCHORED regex (below);
+    // a marker that does not match it is reported, not counted.
+    let marker_prefix = "// WORK_UNIT_CASE:";
+    // `_RUST_MARKER_RE = ^\s*//\s*WORK_UNIT_CASE:\s*(\d+)/(\d+)\s*$`, the
+    // anchored regex in scripts/work_unit_gate/case_binding.py:31, decomposes
+    // into: strip indentation, strip `//`, skip spaces (that is the gate's `\s*`
+    // between `//` and `WORK_UNIT_CASE:`), require the literal
+    // `WORK_UNIT_CASE:`, skip spaces, then the issue number, a `/`, and the
+    // case number running to the end of the line with nothing after it.
+    // `trim_end` is the gate's trailing `\s*$`, and requiring the tail to be
+    // digits is `(\d+)/(\d+)`: a marker with trailing prose (`789/12 (note)`)
+    // or a non-digit tail (`789/12x`, `789/-1`) is therefore NOT counted,
+    // exactly as the gate's `$` anchor decides.
+    let marker_candidates: Vec<(usize, Option<u64>)> = suite_source
         .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            let rest = trimmed.strip_prefix("//")?.trim_start();
-            rest.strip_prefix("WORK_UNIT_CASE:")?
-                .trim()
-                .strip_prefix("789/")?
-                .trim()
-                .parse::<u64>()
-                .ok()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with(marker_prefix))
+        .map(|(offset, line)| {
+            let issue = line
+                .trim_start()
+                .strip_prefix("//")
+                .map(str::trim_start)
+                .and_then(|after_slashes| after_slashes.strip_prefix("WORK_UNIT_CASE:"))
+                .map(str::trim);
+            let Some(tail) = issue.and_then(|tail| tail.strip_prefix("789/")) else {
+                return (offset, None);
+            };
+            let tail = tail.trim_end();
+            let digits_only = !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit());
+            (
+                offset,
+                digits_only.then(|| tail.parse::<u64>().ok()).flatten(),
+            )
         })
         .collect();
+    // The gate's binding rule, ported to this file's own source
+    // (case_binding.py:316-375): walk FORWARD from the marker; a blank line
+    // detaches it (:331-334), a `//` or `/*` comment detaches it (:336-339),
+    // an attribute line is skipped (any `#[...]`, with `#[test]` or
+    // `#[tokio::test]` counted as the test attribute, :341-354), and any other
+    // line must declare a function (:356-367, else MARKER_BEFORE_NON_TEST); the
+    // marker must reach that function WITHOUT `#[ignore]` (:377-379) and that
+    // function must carry a test attribute (:373-375).
+    // Only a marker passing every one of those checks is counted, so a marker
+    // sitting above no test at all can no longer raise the count above 42.
+    let suite_lines: Vec<&str> = suite_source.lines().collect();
+    let mut suite_marker_ids: Vec<u64> = Vec::with_capacity(42);
+    let mut suite_marker_defects: Vec<String> = Vec::new();
+    for (offset, marker_id) in marker_candidates {
+        let marker_line = offset + 1;
+        let Some(marker_id) = marker_id else {
+            suite_marker_defects.push(format!(
+                "line {marker_line}: `{}` is not an anchored `// WORK_UNIT_CASE: 789/<n>` marker of \
+                 this work unit (the gate requires exactly `{marker_prefix} <digits>/<digits>` to the \
+                 end of the line), so its case id cannot be bound to a test",
+                suite_lines[offset].trim()
+            ));
+            continue;
+        };
+        if !(1..=42).contains(&marker_id) {
+            suite_marker_defects.push(format!(
+                "line {marker_line}: `// WORK_UNIT_CASE: 789/{marker_id}` is OUT OF RANGE, every case \
+                 id must be in 1..=42"
+            ));
+            continue;
+        }
+        let mut walk = offset + 1;
+        let mut has_test_attr = false;
+        let mut fn_name: Option<String> = None;
+        let mut reason: Option<String> = None;
+        while walk < suite_lines.len() {
+            let stripped = suite_lines[walk].trim();
+            let next_line = walk + 1;
+            if stripped.is_empty() {
+                reason = Some(format!(
+                    "line {marker_line}: DETACHED BY A BLANK LINE (line {next_line}), \
+                     the gate stops at a blank line before it reaches a function"
+                ));
+                break;
+            }
+            if stripped.starts_with("//") || stripped.starts_with("/*") {
+                reason = Some(format!(
+                    "line {marker_line}: DETACHED BY AN INTERVENING COMMENT (line {next_line}: \
+                     `{stripped}`), the gate stops at a comment before it reaches a function"
+                ));
+                break;
+            }
+            if stripped.starts_with("#[") {
+                if stripped.contains("ignore") {
+                    reason = Some(format!(
+                        "line {marker_line}: NOT ATTACHED TO AN EXECUTED `#[test]` FN, the marker \
+                         reaches an `#[ignore]` attribute on line {next_line} before the function"
+                    ));
+                    break;
+                }
+                has_test_attr |=
+                    stripped.contains("#[test]") || stripped.contains("#[tokio::test]");
+                walk += 1;
+                continue;
+            }
+            if let Some(name) = stripped
+                .split("fn ")
+                .nth(1)
+                .map(|after_fn| {
+                    after_fn
+                        .trim_start()
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                        .collect::<String>()
+                })
+                .filter(|name| !name.is_empty())
+            {
+                fn_name = Some(name);
+                break;
+            }
+            reason = Some(format!(
+                "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, line {next_line} is neither an \
+                 attribute nor a function declaration (`{stripped}`)"
+            ));
+            break;
+        }
+        match (fn_name, reason) {
+            (Some(_), None) if has_test_attr => suite_marker_ids.push(marker_id),
+            (Some(name), _) => {
+                suite_marker_defects.push(format!(
+                    "line {marker_line}: NOT ATTACHED TO A `#[test]` FN, the function `{name}` it \
+                     binds carries no test attribute"
+                ));
+            }
+            (None, Some(why)) => suite_marker_defects.push(why),
+            (None, None) => suite_marker_defects.push(format!(
+                "line {marker_line}: DETACHED, no attribute or function declaration follows it \
+                 before the end of the file"
+            )),
+        }
+    }
+    assert!(
+        suite_marker_defects.is_empty(),
+        "W7 DENOMINATOR (source marker binding): every anchored `// WORK_UNIT_CASE: 789/<n>` marker in \
+         this source must be bound to its own `#[test]` fn, exactly as \
+         `scripts/work_unit_gate/case_binding.py` requires, and carry a case id in 1..=42; \
+         {} marker(s) are not bound: {}",
+        suite_marker_defects.len(),
+        suite_marker_defects.join(" | ")
+    );
     let suite_marker_count = suite_marker_ids.len();
     assert_eq!(
         suite_marker_count, 42,
