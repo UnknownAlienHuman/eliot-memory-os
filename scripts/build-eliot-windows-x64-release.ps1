@@ -2290,11 +2290,21 @@ function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
         # root workspace's closure; root-lock membership is refused outright.
         throw "retained excluded-disposition gate receipt carries $($lockedStandalonePackages.Count) inventoried package(s) in the root Cargo.lock"
     }
+    # Issue #1811 (item A4): the digest is shaped-checked here for the same
+    # reason the Operator build receipt is (`^[0-9a-f]{64}$` at the release
+    # binding): the manifest publishes this value, and a consumer that trusts it
+    # as a SHA-256 must not be handed an empty or truncated string. The staged
+    # copy is re-hashed below and compared, so the published digest describes
+    # bytes the bundle actually contains.
+    $dispositionReceiptSha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($dispositionReceiptSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'retained excluded-disposition gate receipt digest is not a lowercase 64-hex SHA-256'
+    }
     [ordered]@{
         schema = [string]$receipt.schema
         gate = 'scripts/verify-excluded-dispositions-1811.py'
-        receipt_path = '.eliot/excluded-dispositions/gate-receipt.json'
-        receipt_sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        receipt_path = 'excluded_dispositions/GATE_RECEIPT.json'
+        receipt_sha256 = $dispositionReceiptSha256
         denominator_packages = @($decisionProjection.denominator_packages)
         denied_packages = @($decisionProjection.denied_packages)
         trust_class = [string]$receipt.trust_class
@@ -5177,6 +5187,26 @@ This bundle is intentionally unsigned. Before public distribution:
 '@ | Set-Content -LiteralPath (Join-Path $bundle 'SIGNING_REQUIRED.txt') -Encoding utf8
 
     Assert-NoReleaseSecrets $bundle
+    # Issue #1811 (item A4): the retained gate receipt is a build output, not a
+    # tracked source file, so it lives under the repository's ignored evidence
+    # root and was previously named there in the manifest. That made
+    # `excluded_dispositions.receipt_path` a dangling reference for any consumer
+    # holding only the bundle: the manifest published a SHA-256 of a file the
+    # bundle did not contain and could not resolve. The receipt is staged here
+    # -- before the payload hash sweep, so it is covered by SHA256SUMS.json
+    # like every other entry -- and the staged bytes are re-hashed and compared
+    # against the digest the manifest publishes, so the published digest always
+    # describes bytes the consumer can actually read.
+    $stagedDispositionDirectory = Join-Path $bundle 'excluded_dispositions'
+    if (-not (Test-Path -LiteralPath $stagedDispositionDirectory)) {
+        New-Item -ItemType Directory -Path $stagedDispositionDirectory -Force | Out-Null
+    }
+    $stagedDispositionReceipt = Join-Path $stagedDispositionDirectory 'GATE_RECEIPT.json'
+    Copy-Item -LiteralPath (Get-ExcludedDispositionReceiptPath $repo) -Destination $stagedDispositionReceipt -Force
+    $stagedDispositionSha256 = (Get-FileHash -LiteralPath $stagedDispositionReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($stagedDispositionSha256 -cne [string]$dispositionReceipt.receipt_sha256) {
+        throw 'staged excluded-disposition gate receipt differs from the digest the release manifest publishes'
+    }
     $hashes = Get-ChildItem -LiteralPath $bundle -File -Recurse |
         Sort-Object FullName |
         ForEach-Object {

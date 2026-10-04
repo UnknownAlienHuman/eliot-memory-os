@@ -65,6 +65,7 @@
 //! and provider prose have no constructor here and cannot reach any sink,
 //! including the `Display` fallback rendering (T22).
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::collections::vec_deque::Iter;
 use std::fmt;
@@ -1319,6 +1320,137 @@ pub fn startup_subscriber_installed() -> bool {
     STARTUP_SUBSCRIBER.get().is_some()
 }
 
+/// How a scoped sink window answers each rendered line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SinkDisposition {
+    /// Retain every rendered line for the caller to inspect.
+    Retain,
+    /// Refuse every write, exactly as a closed or saturated sink does.
+    RefuseEveryWrite,
+}
+
+/// What one scoped sink window observed.
+///
+/// A window records only rendered lines and refused writes. It never records
+/// a caller-supplied value that the projection did not already emit, so
+/// inspecting a window cannot reveal a protected payload either.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CapturedSink {
+    lines: Vec<String>,
+    refused_writes: u64,
+    delivered: u64,
+}
+
+impl CapturedSink {
+    /// The exact rendered lines the window retained, in emission order.
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Every retained line joined by one newline, the same bytes the
+    /// standard-error sink would have received.
+    #[must_use]
+    pub fn rendered(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// How many rendered lines this window refused or dropped.
+    #[must_use]
+    pub fn refused_writes(&self) -> u64 {
+        self.refused_writes
+    }
+
+    /// How many rendered lines the window was asked to deliver in total.
+    #[must_use]
+    pub fn delivered(&self) -> u64 {
+        self.delivered
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SinkState {
+    disposition: SinkDisposition,
+    lines: Vec<String>,
+    refused_writes: u64,
+    delivered: u64,
+}
+
+thread_local! {
+    /// Scoped sink of the current thread only.
+    ///
+    /// Thread-local scoping is what keeps capture race-free: two tests on two
+    /// threads never observe each other's window, and no window survives the
+    /// call that opened it.
+    static SCOPED_SINK: RefCell<Option<SinkState>> = const { RefCell::new(None) };
+}
+
+/// Runs `body` with a scoped sink installed on the current thread.
+///
+/// The window observes the real [`report_events`] deliveries of the production
+/// call sites inside `body`; it does not construct, reorder or replace any
+/// event. Nested windows are refused rather than stacked, because two owners
+/// for one thread's sink would make the retained lines ambiguous.
+pub fn with_scoped_sink<R>(
+    disposition: SinkDisposition,
+    body: impl FnOnce() -> R,
+) -> (R, CapturedSink) {
+    let previous = SCOPED_SINK.with(|slot| slot.borrow_mut().take());
+    SCOPED_SINK.with(|slot| {
+        *slot.borrow_mut() = Some(SinkState {
+            disposition,
+            lines: Vec::new(),
+            refused_writes: 0,
+            delivered: 0,
+        });
+    });
+    let outcome = body();
+    let observed = SCOPED_SINK.with(|slot| slot.borrow_mut().take());
+    SCOPED_SINK.with(|slot| *slot.borrow_mut() = previous);
+    let captured = observed.map_or_else(CapturedSink::default, |state| {
+        if state.disposition == SinkDisposition::RefuseEveryWrite {
+            return CapturedSink {
+                lines: Vec::new(),
+                refused_writes: state.delivered,
+                delivered: state.delivered,
+            };
+        }
+        CapturedSink {
+            refused_writes: state.refused_writes,
+            delivered: state.delivered,
+            lines: state.lines,
+        }
+    });
+    (outcome, captured)
+}
+
+/// Delivers one already-rendered line to the scoped sink, if one is open.
+///
+/// Returns `true` when a scoped sink consumed the line. The delivery is
+/// bounded, performs no retry and never re-enters [`report_events`], so a sink
+/// that refuses every write cannot recurse or stall.
+fn deliver_to_scoped_sink(line: String) -> bool {
+    SCOPED_SINK.with(|slot| {
+        let Ok(mut state) = slot.try_borrow_mut() else {
+            return true;
+        };
+        let Some(state) = state.as_mut() else {
+            return false;
+        };
+        state.delivered = state.delivered.saturating_add(1);
+        if state.disposition == SinkDisposition::RefuseEveryWrite {
+            state.refused_writes = state.refused_writes.saturating_add(1);
+            return true;
+        }
+        if state.lines.len() < MAX_DIAGNOSTIC_EVENTS {
+            state.lines.push(line);
+        } else {
+            state.refused_writes = state.refused_writes.saturating_add(1);
+        }
+        true
+    })
+}
+
 /// Reports every retained scoped event to the installed startup sink.
 ///
 /// Each event renders as one bounded line on the process standard-error
@@ -1328,14 +1460,25 @@ pub fn startup_subscriber_installed() -> bool {
 /// errors, so a failed sink can neither recurse, stall, nor fabricate a
 /// receipt. When the startup subscriber is not installed (reusable
 /// compositions, tests) the call drops every event silently and changes no
-/// behavior.
+/// behavior, unless a [`with_scoped_sink`] window is open on this thread: that
+/// window is then the sink under observation, which is how a test reads the
+/// real owner delivery without installing a second subscriber.
 pub fn report_events(log: &BoundedEventLog) {
-    if !startup_subscriber_installed() {
+    if !startup_subscriber_installed() && !scoped_sink_open() {
         return;
     }
     for event in log {
-        let _ = writeln!(std::io::stderr(), "{SERVICE_NAME}: {event}");
+        let line = format!("{SERVICE_NAME}: {event}");
+        if deliver_to_scoped_sink(line.clone()) {
+            continue;
+        }
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
+}
+
+/// Reports whether this thread currently has a scoped sink window open.
+fn scoped_sink_open() -> bool {
+    SCOPED_SINK.with(|slot| slot.borrow().is_some())
 }
 
 /// Closed vocabulary and order of the snapshot budget's accounted
@@ -1919,7 +2062,7 @@ mod bridge_boundary_partition_tests {
         StoreFailure {
             contract_revision: STORE_FAILURE_CONTRACT_REVISION.to_owned(),
             disposition,
-            reason_code: StoreReasonCode::new("bridge.failure.observed").expect("reason code"),
+            reason_code: StoreReasonCode::new("BRIDGE_FAILURE_OBSERVED").expect("reason code"),
             request_id: Some(RequestId::new("request-742-failure").expect("request id")),
             operation_id: Some(OperationId::new("operation-742-failure").expect("operation id")),
             idempotency_key_ref_or_digest: Some("idempotency-742-failure".to_owned()),
@@ -2026,7 +2169,7 @@ mod bridge_boundary_partition_tests {
             .with_operation(&OperationId::new("operation-742-17").expect("operation id"))
             .with_idempotency_ref("idempotency-742-17")
             .with_generation("generation-742-17");
-        let reason = StoreReasonCode::new("bridge.boundary.observed").expect("reason code");
+        let reason = StoreReasonCode::new("BRIDGE_BOUNDARY_OBSERVED").expect("reason code");
 
         let mut log = BoundedEventLog::new();
         assert!(log.is_empty(), "a fresh bounded log retains nothing");
@@ -2179,7 +2322,7 @@ mod bridge_boundary_partition_tests {
         );
         assert_eq!(
             log.dropped(),
-            u64::try_from(baseline).expect("baseline event count fits in u64"),
+            u64::try_from(expected).expect("pre-overflow event count fits in u64"),
             "every event pushed past the bound is counted as dropped exactly once"
         );
         let retained: Vec<usize> = log
@@ -2384,7 +2527,7 @@ mod bridge_boundary_partition_tests {
         let identity = BridgeIdentity::new()
             .with_operation(&OperationId::new("operation-742-23").expect("operation id"))
             .with_idempotency_ref("idempotency-742-23");
-        let reason = StoreReasonCode::new("bridge.partition.observed").expect("reason code");
+        let reason = StoreReasonCode::new("BRIDGE_PARTITION_OBSERVED").expect("reason code");
         let mut log = BoundedEventLog::new();
         emit_received(
             &mut log,

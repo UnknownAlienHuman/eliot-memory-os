@@ -23,8 +23,9 @@ use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
 use eliot_instrument_api::EvidenceAxes;
 use eliot_lsp_bridge::{
     AnalyzerConfig, Coverage, FailureDisposition, Freshness, LspBridge, LspCommand,
-    NormalizedResult, RUST_ANALYZER_EXECUTABLE, ScipIndexerProvenance, ScipProjectionCache,
-    SemanticOperation, SourceCandidate, finalize_diagnostics, finalize_scip, rename_candidate,
+    NormalizedResult, ObservationReceipt, RUST_ANALYZER_EXECUTABLE, RenameCandidate,
+    ScipIndexerProvenance, ScipProjectionCache, SemanticOperation, SourceCandidate,
+    finalize_diagnostics, finalize_scip, rename_candidate,
 };
 use eliot_platform::ClockObservation;
 use eliot_process::{
@@ -591,6 +592,148 @@ fn proof_setup() -> (AnalyzerConfig, SourceCandidate, SemanticOperation, Vec<u8>
         symbol: "test-symbol".to_owned(),
     };
     (config, owner, operation, scripted_scip_index())
+}
+
+fn rename_parts_mut(
+    result: &mut NormalizedResult,
+) -> Option<(&mut RenameCandidate, &mut ObservationReceipt)> {
+    match result {
+        NormalizedResult::Rename { candidate, receipt } => Some((candidate, receipt)),
+        _ => None,
+    }
+}
+
+fn with_modified_receipt(
+    result: &NormalizedResult,
+    modify: impl FnOnce(&mut ObservationReceipt),
+) -> NormalizedResult {
+    let mut changed = (*result).clone();
+    let (_, receipt) = rename_parts_mut(&mut changed).expect("finalized result is a rename");
+    modify(receipt);
+    changed
+}
+
+fn assert_adoption_rejected(
+    result: NormalizedResult,
+    operation: &SemanticOperation,
+    expected_result: &NormalizedResult,
+) {
+    assert!(result.adopt_received(operation, expected_result).is_err());
+}
+
+fn assert_renamed_result_binding_rejections(
+    original: &NormalizedResult,
+    operation: &SemanticOperation,
+) {
+    // A copied receipt from another tool, source, or config is not this run.
+    let foreign_executable = with_modified_receipt(original, |receipt| {
+        receipt.executable.push_str("-foreign");
+    });
+    assert_adoption_rejected(foreign_executable, operation, original);
+    let foreign_source = with_modified_receipt(original, |receipt| {
+        receipt.candidate.push_str("|other-source");
+    });
+    assert_adoption_rejected(foreign_source, operation, original);
+    let foreign_config = with_modified_receipt(original, |receipt| {
+        receipt.config_hash.push('0');
+    });
+    assert_adoption_rejected(foreign_config, operation, original);
+
+    let wrong_kind = SemanticOperation::Definitions {
+        symbol: "test-symbol".to_owned(),
+    };
+    let wrong_symbol = SemanticOperation::Rename {
+        symbol: "other-symbol".to_owned(),
+        new_name: "renamed_symbol".to_owned(),
+    };
+    let wrong_name = SemanticOperation::Rename {
+        symbol: "test-symbol".to_owned(),
+        new_name: "other_name".to_owned(),
+    };
+    assert_adoption_rejected((*original).clone(), &wrong_kind, original);
+    assert_adoption_rejected((*original).clone(), &wrong_symbol, original);
+    assert_adoption_rejected((*original).clone(), &wrong_name, original);
+}
+
+#[test]
+fn received_rename_adoption_accepts_only_the_exact_unapplied_result() -> TestResult {
+    // This binds received bytes to the owner's retained result; it does not
+    // make the path-based candidate string a source-content commitment or an
+    // executable name a supply-chain admission proof.
+    let (config, owner, _, index_bytes) = proof_setup();
+    let operation = SemanticOperation::Rename {
+        symbol: "test-symbol".to_owned(),
+        new_name: "renamed_symbol".to_owned(),
+    };
+    let generated = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS,
+        None,
+    );
+    assert_eq!(generated.receipt().disposition, FailureDisposition::Success);
+    assert!(matches!(
+        &generated,
+        NormalizedResult::Rename { candidate, .. } if !candidate.edits.is_empty()
+    ));
+    let encoded = serde_json::to_vec(&generated)?;
+    let received: NormalizedResult = serde_json::from_slice(&encoded)?;
+
+    // The valid wire round-trip is adopted against the exact original run.
+    let adopted = received.clone().adopt_received(&operation, &generated)?;
+    assert_eq!(adopted.result(), &generated);
+    assert_eq!(adopted.receipt(), generated.receipt());
+
+    // Unknown schema metadata is not part of the closed received-result shape.
+    let mut unknown_schema = serde_json::to_value(&generated)?;
+    unknown_schema["RENAME"]["schema_revision"] = serde_json::json!("future");
+    assert!(serde_json::from_value::<NormalizedResult>(unknown_schema).is_err());
+
+    // A wire-forged applied edit is rejected during deserialization.
+    let mut applied_wire = serde_json::to_value(&generated)?;
+    applied_wire["RENAME"]["candidate"]["applied"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<NormalizedResult>(applied_wire).is_err());
+
+    // Public fields can still be mutated after construction; adoption rechecks.
+    let mut applied_after_decode: NormalizedResult = serde_json::from_slice(&encoded)?;
+    rename_parts_mut(&mut applied_after_decode)
+        .expect("finalized result is a rename")
+        .0
+        .applied = true;
+    assert_adoption_rejected(applied_after_decode, &operation, &generated);
+
+    assert_renamed_result_binding_rejections(&received, &operation);
+
+    // The retained original catches altered path/anchor bytes even when the
+    // candidate remains structurally valid and the receipt is unchanged.
+    let mut changed_path = received.clone();
+    rename_parts_mut(&mut changed_path)
+        .expect("finalized result is a rename")
+        .0
+        .edits[0]
+        .path = "src/other.rs".to_owned();
+    assert_adoption_rejected(changed_path, &operation, &generated);
+
+    let mut changed_range = received.clone();
+    let (candidate, _) =
+        rename_parts_mut(&mut changed_range).expect("finalized result is a rename");
+    let edit = candidate
+        .edits
+        .first_mut()
+        .expect("SCIP fixture has an occurrence");
+    edit.line += 1;
+    edit.end_line += 1;
+    assert_adoption_rejected(changed_range, &operation, &generated);
+
+    let mut changed_replacement = received;
+    let (candidate, _) =
+        rename_parts_mut(&mut changed_replacement).expect("finalized result is a rename");
+    candidate.edits[0].replacement = "forged_name".to_owned();
+    assert_adoption_rejected(changed_replacement, &operation, &generated);
+    Ok(())
 }
 
 #[test]
