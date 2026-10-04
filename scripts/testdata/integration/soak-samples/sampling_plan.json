@@ -1,0 +1,48 @@
+{
+  "schema": "eliot.soak_samples/v2",
+  "plan_id": "synthetic-plan-942",
+  "run_ref": "synthetic-run-942",
+  "source_ref": "synthetic-source-942",
+  "artifact_ref": "synthetic-artifact-942",
+  "workload_ref": "synthetic-run-workload",
+  "profile_ref": "synthetic-profile-942",
+  "phases": [
+    {
+      "phase_id": "synthetic-phase-a",
+      "workload_ref": "synthetic-workload-a",
+      "first_slot": 0,
+      "last_slot": 2
+    },
+    {
+      "phase_id": "synthetic-phase-b",
+      "workload_ref": "synthetic-workload-b",
+      "first_slot": 3,
+      "last_slot": 5
+    }
+  ],
+  "cadence_ms": 100,
+  "expected_slots": 6,
+  "bindings": [
+    {
+      "owner_ref": "synthetic-owner-942",
+      "component": "synthetic-component",
+      "pid": 942,
+      "creation_identity": "0000000000000942",
+      "image_identity": "synthetic-approved-image-942",
+      "generation": "synthetic-generation-1"
+    }
+  ],
+  "permitted_lifecycle_updates": [],
+  "optional_counters": [],
+  "limits": {
+    "max_processes": 4,
+    "max_samples_total": 24,
+    "max_total_bytes": 65536,
+    "max_record_bytes": 4096,
+    "max_elapsed_ms": 2000,
+    "slot_lateness_ms": 0,
+    "terminal_reserve_records": 2,
+    "max_lifecycle_updates": 0
+  },
+  "hard_deadline_required": false
+}
