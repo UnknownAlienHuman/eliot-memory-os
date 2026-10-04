@@ -506,10 +506,11 @@ fn case_01_exact_accounting_of_the_ten_allocated_ul_files() {
     //
     // TOTALS over the ten files: 54 `pub struct`, 20 `pub enum`, 52
     // `#[serde(deny_unknown_fields)]` attributes and 5 hand-written
-    // `Deserialize` impls. The allocation row's `types` list for this child
-    // names 74 entries plus the `<inferred>` slot, so 54 + 20 = 74 named types
-    // is the COMPLETE denominator, and `mod.rs` contributes the zero-decoder,
-    // zero-candidate row on top of the nine allocated files.
+    // `Deserialize` impls. The allocation row's `types` list names 75 entries:
+    // those 74 public types plus the private `StrictObservedCueInput` wrapper.
+    // The executable denominator below proves 54 + 20 public types and the
+    // single private helper separately; `mod.rs` is the tenth assigned file
+    // and contributes the zero-decoder, zero-candidate row.
     //
     // The three "manual-decoder" entries in `injection.rs` are two public
     // types (`ObservedCue`, `MemoryInfluenceAckInput`) plus one private
@@ -751,6 +752,23 @@ fn case_01_exact_accounting_of_the_ten_allocated_ul_files() {
         (total_structs, total_enums, total_closed),
         (54, 20, 52),
         "the ten-file totals must be 54 structs, 20 enums and 52 `deny_unknown_fields` decoders"
+    );
+    let injection_source = read_ul_source("injection.rs");
+    let strict_helper_count = injection_source
+        .matches("struct StrictObservedCueInput")
+        .count();
+    assert_eq!(
+        strict_helper_count, 1,
+        "the allocated type list includes one private StrictObservedCueInput helper"
+    );
+    assert!(
+        !injection_source.contains("pub struct StrictObservedCueInput"),
+        "StrictObservedCueInput is a private decoder helper, not a public boundary type"
+    );
+    assert_eq!(
+        total_structs + total_enums + strict_helper_count,
+        75,
+        "the #941 allocation has 75 listed type entries: 74 public types and one private helper"
     );
 }
 
@@ -1525,12 +1543,13 @@ fn c11_erasure_capable_constructs_neither_erase_input_nor_promote_candidates() {
     //        construct that can both
     //        ERASE input and silently default a member, and sections (B)-(D)
     //        below state exactly what it does and does not give.
-    //   (E2) `serde_json::Value` FIELDS — five in this allocation:
+    //   (E2) `serde_json::Value` FIELDS — four in this allocation:
     //        `PendingInjectionItem.payload` (`ul/injection.rs:136`),
     //        `UlFiredItem.payload` (`ul/injection.rs:163`),
-    //        `CueRecordSource.payload` (`ul/cue.rs:583`),
     //        `UlReasoningRequest.output_schema` (`ul/exam.rs:98`), and the
     //        `ObservabilityWriteEnvelope.payload` (`observability.rs:96`).
+    //        `CueRecordSource.payload` belongs to the separate #940 allocation
+    //        and is not included in this #941 count.
     //        A `Value` field CANNOT erase input: it stores every member it was
     //        given. Section (A) proves that.
     //   (E3) A CUSTOM VISITOR — `UlPredictionVisitor`
@@ -2059,13 +2078,11 @@ fn c11_erasure_capable_constructs_neither_erase_input_nor_promote_candidates() {
         allocation_sources.matches("#[serde(flatten").count()
     );
     // The `Value`-field count is asserted too, so the section-(A) claim about
-    // "five `Value` fields" is a number the source can disprove.
+    // four in-scope `Value` fields is a number the source can disprove. The
+    // #940-owned `cue.rs::CueRecordSource.payload` is outside this allocation.
     assert_eq!(
         [
             read_ul_source("injection.rs")
-                .matches("pub payload: Option<Value>")
-                .count(),
-            read_ul_source("cue.rs")
                 .matches("pub payload: Option<Value>")
                 .count(),
             read_ul_source("exam.rs")
@@ -2073,10 +2090,10 @@ fn c11_erasure_capable_constructs_neither_erase_input_nor_promote_candidates() {
                 .count(),
             observability_source.matches("pub payload: Value").count(),
         ],
-        [2, 1, 1, 1],
-        "the allocation declares exactly five opaque `serde_json::Value` fields: \
-         PendingInjectionItem.payload, UlFiredItem.payload, CueRecordSource.payload, \
-         UlReasoningRequest.output_schema and ObservabilityWriteEnvelope.payload"
+        [2, 1, 1],
+        "the #941 allocation declares exactly four opaque `serde_json::Value` fields: \
+         PendingInjectionItem.payload, UlFiredItem.payload, UlReasoningRequest.output_schema \
+         and ObservabilityWriteEnvelope.payload; cue.rs::CueRecordSource.payload is #940-owned"
     );
     // And `observability.rs` declares NO `#[serde(default)]` at all: the
     // envelope's ten members are all `required(...)`
@@ -2138,7 +2155,7 @@ const T12_W3_C12_REQUEST_DUPLICATE_IDEMPOTENCY_KEY: &str = r#"{"idempotency_key"
 // WORK_UNIT_CASE: 941/12
 #[test]
 #[allow(clippy::too_many_lines)]
-fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller() {
+fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_bounded_decoder_match() {
     // GOVERNING DOCS, verbatim:
     // * docs/architecture/I15-06-instructiondata-separation.md:6 — "model output
     //   remains candidate;"
@@ -2153,15 +2170,21 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
     // THE ROW. `UlReasoningRequest` (crates/eliot-types/src/ul/exam.rs:88-102)
     // is recorded here as a REVIEWED ZERO-CANDIDATE ROW: it derives
     // `Deserialize` (`ul/exam.rs:88`) and has ONE `#[serde(default)]` member
-    // (`ul/exam.rs:95`), and it has ZERO decoding callers anywhere in the
-    // repository. The row is therefore closed by REVIEW, not by a refusal, and
+    // (`ul/exam.rs:95`). The bounded detector in section (B) currently finds no
+    // matching decoder call in non-test Rust sources under `crates/`, `bins/`,
+    // or `workspace/`. It recognizes only the four method spellings
+    // `from_str`, `from_value`, `from_slice`, and `from_reader` in the lexical
+    // forms documented there; this is not a type-checked claim about every
+    // possible decoder spelling or alias. The row is therefore closed by
+    // REVIEW within that stated scope, not by a refusal, and
     // `decoder_calls = "[]"` is the exact text of that review.
     //
     // THE SEARCH, AND ITS EVIDENCE. `UlReasoningRequest` was located with
-    // `git grep -n UlReasoningRequest` over the whole repository. It names EIGHT
-    // files and every one of the twenty-six hits is either the DECLARATION, a
-    // re-export, a struct-literal CONSTRUCTION, or a BORROWED PARAMETER. No hit
-    // is a decode:
+    // a text search scoped to the source roots `crates/`, `bins/`, and
+    // `workspace/`. The listed hits are DECLARATIONS, IMPORTS or re-exports,
+    // struct-literal CONSTRUCTIONS, and BORROWED PARAMETERS. This type-name
+    // search describes those reviewed references; section (B) supplies the
+    // separately bounded decoder-call predicate and its supported forms:
     //
     //   crates/eliot-types/src/ul/exam.rs:90        the declaration
     //   crates/eliot-types/src/lib.rs:462           `pub use ul::exam::{...}`
@@ -2177,30 +2200,37 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
     //   crates/eliot-app/src/host_runtime/tests.rs:41,122       import + literal (test)
     //   crates/eliot-engine/tests/ul_exam.rs:7,131               import + borrowed param (test)
     //
-    // A SECOND, INDEPENDENT SEARCH for a decode of the type found nothing:
+    // A SECOND BOUNDED TEXT SEARCH under those same roots looked for these four
+    // entry-point names adjacent to the type name. No text matched this
+    // particular pattern there; this pattern is review context, not a complete
+    // Rust decoder detector:
     //
     //   git grep -nE
     //     'from_(str|value|slice|reader)[^;]{0,60}UlReasoningRequest
     //     |UlReasoningRequest[^;]{0,60}from_(str|value|slice|reader)'
     //
-    // → NO MATCHES, on any file. A THIRD search for the type in a DECODING
-    // POSITION — `: UlReasoningRequest`, `Option<UlReasoningRequest>`,
-    // `Vec<UlReasoningRequest>`, `Result<UlReasoningRequest` — matched exactly
-    // ONE line, `crates/eliot-engine/src/ul/refinement.rs:171`, which is the
+    // → NO MATCHES in those roots for that pattern. A THIRD BOUNDED TEXT CHECK
+    // under `crates/`, `bins/`, and `workspace/` for these type-position
+    // spellings — `: UlReasoningRequest`, `Option<UlReasoningRequest>`,
+    // `Vec<UlReasoningRequest>`, `Result<UlReasoningRequest` — observed one
+    // line in the reviewed source set, `crates/eliot-engine/src/ul/refinement.rs:171`,
+    // which is the
     // RETURN TYPE of the BUILDER
     // `build_refinement_request(..) -> Result<UlReasoningRequest, EngineError>`,
     // not a decode: the body ends `Ok(UlReasoningRequest { .. })` at
     // `refinement.rs:219-244`, a struct LITERAL.
     //
-    // SO NO CALLER IS INVENTED HERE. The three `UlReasoningRequest` shapes in the
+    // SO NO CALLER IS INFERRED FROM THESE OBSERVED SHAPES. The three
+    // `UlReasoningRequest` shapes in the
     // engine — the exam builder (`ul/exam.rs:508-531`), the refinement builder
     // (`ul/refinement.rs:219-244`) and the two app literals
     // (`ul_cross_agent_runner.rs:400`, `:664`) — all CONSTRUCT the value and hand
-    // it to a runner; none READS one back from bytes. Citing a "caller that never
-    // decodes it" would be exactly the invented caller this row exists to avoid,
-    // so the row is recorded as zero-candidate and the absence is proved by the
-    // searches above AND re-derived at runtime from the repository's own bytes
-    // in section (B).
+    // it to a runner; those listed sites CONSTRUCT or BORROW the value rather
+    // than reading it back from bytes. Citing a "caller that never decodes it"
+    // would infer a caller this row exists to avoid, so the row is recorded as
+    // zero-candidate within the stated scan scope. Section (B) re-derives its
+    // bounded no-match result from source bytes using the predicate documented
+    // there; it does not prove absence of unrecognized aliases or syntax.
     // -------------------------------------------------------------------------
 
     // ---- (A) THE REVIEWED ROW'S OWN SHAPE, ASSERTED AGAINST ITS DECODER ----
@@ -2468,23 +2498,66 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
         "the well-formed reasoning request must pass the shared lexical ingress"
     );
 
-    // ---- (B) THE ZERO-CANDIDATE ROW, PROVED FROM THE REPOSITORY'S OWN BYTES
-    // ---- so a caller added later fails this case instead of silently making
-    // ---- the zero-candidate claim a false one.
+    // ---- (B) THE BOUNDED ZERO-CANDIDATE ROW CHECK, DERIVED FROM SOURCE BYTES.
+    // ---- A matching call in the covered roots and spellings fails this case;
+    // ---- unrecognized aliases or syntax are outside this lexical predicate.
     //
     // `CARGO_MANIFEST_DIR` is `crates/eliot-types`; the repository root is two
-    // levels up. The walk is bounded by construction: it descends only
-    // directories that can hold Rust source, and the assertion below fires on
-    // the FIRST decode it finds, so a decode anywhere under the root ends this
-    // walk immediately with a failure.
+    // levels up. The walk starts only at `crates/`, `bins/`, and `workspace/`
+    // and considers Rust source files beneath them, skipping `target/` and
+    // `.git/`. It is a lexical scan, not Rust name or type resolution. Any call
+    // matching the supported predicate in an eligible non-test source file is
+    // recorded and makes the empty-row assertions fail after the walk.
     let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
     // `decoder_calls` is NOT a literal written here: it is BUILT FROM the scan
-    // below (`format!("[{}]", sites.join(", "))`), so this assertion can fail the
-    // moment a caller appears. `"[]"` is the EXPECTED value, never the input.
+    // below (`format!("[{}]", sites.join(", "))`), so a call matching the
+    // supported predicate in the covered roots makes this assertion fail.
+    // `"[]"` is the EXPECTED value, never the input.
     let decoder_entry_points: [&str; 4] = ["from_str", "from_value", "from_slice", "from_reader"];
     let target: &str = "UlReasoningRequest";
+    // This is a deliberately bounded lexical check, not Rust type inference:
+    // normalize whitespace and recognize an explicit `UlReasoningRequest`
+    // binding immediately initialized by one of the four reviewed serde_json
+    // method names. Supported typed-binding spellings are `serde_json::from_*`
+    // and `::serde_json::from_*`, or a direct `use serde_json::from_*;` / `use
+    // serde_json::{from_*};` followed by `from_*(...)`. Renamed imports,
+    // re-exports, aliases, macros, and inferred data flow are not resolved.
+    let compact_source = |source: &str| {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    };
+    let typed_binding_decoder_call = |source: &str, entry_point: &str| {
+        let compact = compact_source(source);
+        let binding = format!(":{target}=");
+        let qualified = format!("{binding}serde_json::{entry_point}(");
+        let rooted_qualified = format!("{binding}::serde_json::{entry_point}(");
+        if compact.contains(&qualified) || compact.contains(&rooted_qualified) {
+            return true;
+        }
+        let directly_imported = compact.contains(&format!("useserde_json::{entry_point};"))
+            || compact.contains(&format!("useserde_json::{{{entry_point}}};"));
+        directly_imported && compact.contains(&format!("{binding}{entry_point}("))
+    };
+    let qualified_binding_probe = "let request: UlReasoningRequest = serde_json::from_str(input)?;";
+    assert!(
+        typed_binding_decoder_call(qualified_binding_probe, "from_str"),
+        "the bounded source predicate must detect an explicitly typed qualified decode"
+    );
+    let imported_binding_probe =
+        "use serde_json::from_str; let request: UlReasoningRequest = from_str(input)?;";
+    assert!(
+        typed_binding_decoder_call(imported_binding_probe, "from_str"),
+        "the bounded source predicate must detect a direct imported entrypoint"
+    );
+    let unrelated_binding_probe = "let request: OtherRequest = serde_json::from_str(input)?;";
+    assert!(
+        !typed_binding_decoder_call(unrelated_binding_probe, "from_str"),
+        "the bounded source predicate must remain specific to UlReasoningRequest"
+    );
     let mut rust_source_files = 0_usize;
     let mut production_source_files = 0_usize;
     let mut bytes_scanned = 0_usize;
@@ -2525,13 +2598,13 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
                 })
                 .to_string_lossy()
                 .replace('\\', "/");
-            // TEST FILES ARE EXCLUDED, AND THAT IS THE POINT OF THIS ROW. The
-            // claim being tested is "NO PRODUCTION CODE decodes
-            // `UlReasoningRequest`", and the only decodes of it in the
-            // repository are this case's own — under `tests/`. Including test
-            // sources would make the row vacuously fail on its own evidence, and
-            // excluding them is legitimate precisely because a test decoding a
-            // type is not a production ingress for it. Files in a `tests/`
+            // TEST FILES ARE EXCLUDED, AND THAT IS THE POINT OF THIS ROW. This
+            // row checks for matching calls in non-test production source under
+            // the three roots above; this test itself decodes the type in
+            // section (A), so including test sources would match its own
+            // evidence. Excluding tests scopes the claim to production source;
+            // it says nothing about decoder calls in tests or source outside
+            // those roots. Files in a `tests/`
             // directory, a `tests.rs` module, or a `*_test.rs`/`*_tests.rs`
             // sibling are therefore counted but never scanned for call sites.
             let is_test_source = relative.split('/').any(|segment| segment == "tests")
@@ -2543,13 +2616,15 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
             }
             production_source_files += 1;
             for entry_point in decoder_entry_points {
-                // The decode-SHAPED form only: the entry point, the turbofish
-                // naming the target, and the OPENING PARENTHESIS. The bare
-                // `from_str::<UlReasoningRequest` is NOT enough — prose and this
-                // file's own text would satisfy it.
+                // For each of the four method names, the generic text check is
+                // the exact `from_*::<UlReasoningRequest>(` spelling, including
+                // its opening parenthesis; it does not resolve the method's
+                // module. The bounded typed-binding predicate above additionally
+                // covers the listed qualified/direct-import annotation forms
+                // without a turbofish.
                 let needle = format!("{entry_point}::<{target}>(");
-                if source.contains(&needle) {
-                    decoding_call_sites.push(format!("{relative}: {needle}"));
+                if source.contains(&needle) || typed_binding_decoder_call(&source, entry_point) {
+                    decoding_call_sites.push(format!("{relative}: {entry_point} -> {target}"));
                 }
             }
         }
@@ -2558,27 +2633,29 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
     let decoder_calls = format!("[{}]", decoding_call_sites.join(", "));
     assert_eq!(
         decoder_calls, "[]",
-        "the reviewed row's decoder_calls value is the empty JSON array, because no PRODUCTION \
-         source decodes this type anywhere in the repository (test sources are excluded by the \
-         claim's own terms: a test decode is not a production ingress)"
+        "the reviewed row's decoder_calls value is the empty JSON array: no call site matched \
+         this bounded lexical predicate in non-test Rust sources under crates/, bins/, or \
+         workspace/. It checks the four named method spellings using the documented turbofish \
+         and typed-binding/direct-import forms; it does not resolve aliases or infer Rust types"
     );
     assert!(
         decoding_call_sites.is_empty(),
-        "the row records decoder_calls = {decoder_calls}; a decode of `{target}` was found at \
-         {decoding_call_sites:?}, so this row is NO LONGER a zero-candidate row and the \
-         recorded evidence is stale"
+        "the bounded scan matched `{target}` at {decoding_call_sites:?} within its covered roots, \
+         source files, and method spellings, so the scoped zero-candidate row must be reviewed"
     );
-    // The walk itself must not be vacuous: it must have read real files, it must
-    // have read a large PRODUCTION corpus after the test-source exclusion, and
-    // it must have read the very source that DECLARES the type. Without those
-    // facts an empty result would prove nothing.
+    // The walk itself must not be vacuous: it must have read real Rust files
+    // under the three configured roots, counted a substantial non-test source
+    // set, and included the file that DECLARES the type. `bytes_scanned` is the
+    // total across Rust files read in those roots, including test files before
+    // their call-site exclusion; these thresholds do not describe the whole
+    // repository.
     assert!(
         production_source_files > 500
             && bytes_scanned > 10_000_000
             && production_source_files < rust_source_files,
-        "the zero-candidate scan must have read the repository, not skipped it: it read \
-         {rust_source_files} Rust files, {production_source_files} of them non-test, and \
-         {bytes_scanned} bytes"
+        "the bounded scan must have read its configured roots, not skipped them: it read \
+         {rust_source_files} Rust files in crates/, bins/, and workspace/, {production_source_files} \
+         of them eligible non-test sources, and {bytes_scanned} total bytes across those Rust files"
     );
     assert_eq!(
         std::fs::read_to_string(repo_root.join("crates/eliot-types/src/ul/exam.rs"))
@@ -2586,20 +2663,21 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
             .matches(&format!("pub struct {target}"))
             .count(),
         1,
-        "the scan must have read the very file that declares `{target}`, or the absence is \
-         unproven"
+        "the bounded scan roots must include the declaration file for `{target}`, or this scoped \
+         no-match result is unproven"
     );
 
-    // (B1) THE DECODER EXISTS AND IS REACHABLE — the row is zero-CALLER, not
-    // zero-DECODER. The refusals and the acceptance in section (A) already
-    // exercised `UlReasoningRequest`'s own `Deserialize` through
-    // `serde_json::from_str`, so the decoder is demonstrably live. What is
-    // missing is a CALLER, and that is what makes this a reviewed row rather
-    // than an untested one.
+    // (B1) THE DECODER EXISTS AND IS REACHABLE — the row is zero-OBSERVED-CALL
+    // within the scan's coverage, not zero-DECODER. The refusals and acceptance
+    // in section (A) already exercised `UlReasoningRequest`'s own
+    // `Deserialize` through `serde_json::from_str`, so the decoder is
+    // demonstrably live. The scoped source check observes no matching call
+    // site, which makes this a reviewed row rather than an untested one within
+    // the stated detector boundary.
     //
-    // (B2) THE ONE `-> UlReasoningRequest` IN THE REPOSITORY IS A BUILDER, NOT
-    // A DECODE. Its body constructs the value. This is asserted from the
-    // production bytes so it cannot silently become a decode.
+    // (B2) THE REVIEWED RETURN TYPE IN THIS FILE IS A BUILDER, NOT A DECODE.
+    // Its body constructs the value. These checks are limited to the selected
+    // `refinement.rs` source and the spellings stated below.
     let refinement_source =
         std::fs::read_to_string(repo_root.join("crates/eliot-engine/src/ul/refinement.rs"))
             .unwrap_or_else(|error| {
@@ -2610,7 +2688,7 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
             .matches("-> Result<UlReasoningRequest, EngineError>")
             .count(),
         1,
-        "ul/refinement.rs:171 is the ONLY `-> UlReasoningRequest` in the repository"
+        "the selected refinement source contains one `-> Result<UlReasoningRequest, EngineError>` spelling"
     );
     assert_eq!(
         refinement_source.matches("Ok(UlReasoningRequest {").count(),
@@ -2621,10 +2699,12 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
     assert!(
         !refinement_source.contains(&format!("from_str::<{target}>("))
             && !refinement_source.contains(&format!("from_value::<{target}>(")),
-        "the builder must not decode the request it builds"
+        "in this file, the builder source must not contain either checked turbofish spelling: \
+         from_str::<UlReasoningRequest>( or from_value::<UlReasoningRequest>(; other entrypoint \
+         forms are covered only by the bounded workspace scan above"
     );
-    // (B3) THE SAME FOR THE EXAM BUILDER, the only other construction site in
-    // `eliot-engine`.
+    // (B3) THE EXAM BUILDER IN ITS NAMED SOURCE FILE. The assertion below
+    // counts the reviewed literal spelling in this file only.
     let engine_exam_source =
         std::fs::read_to_string(repo_root.join("crates/eliot-engine/src/ul/exam.rs"))
             .unwrap_or_else(|error| {
@@ -2643,9 +2723,9 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
         "eliot-engine/src/ul/exam.rs:513 must leave `model` at the type's own None, which is what \
          `#[serde(default)]` at ul/exam.rs:95 produces on the decode side"
     );
-    // (B4) AND THE APP PRODUCERS. `ul_cross_agent_runner.rs:400` and `:664` are
-    // the only two `UlReasoningRequest` literals outside `eliot-types` and
-    // `eliot-engine`, and both are literals.
+    // (B4) THE TWO REVIEWED APP PRODUCER LITERALS IN THE NAMED FILE. This
+    // file-local count does not claim that these are the only occurrences
+    // outside `eliot-types` and `eliot-engine`.
     let runner_source =
         std::fs::read_to_string(repo_root.join("crates/eliot-app/src/ul_cross_agent_runner.rs"))
             .unwrap_or_else(|error| {
@@ -2656,15 +2736,17 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
             .matches("let request = UlReasoningRequest {")
             .count(),
         2,
-        "eliot-app/src/ul_cross_agent_runner.rs:400 and :664 must be struct literals, never decodes"
+        "ul_cross_agent_runner.rs must currently contain two matching `let request = \
+         UlReasoningRequest` struct-literal constructions"
     );
-    // (B5) NO OBSERVABILITY ENVELOPE BINDS IT. `bind_observability_payload`
-    // (`observability.rs:231-255`) routes each of the SIX kinds to its owner
-    // record type, and none of them is `UlReasoningRequest` — the six are
+    // (B5) THE ENUMERATED OWNER FORMS IN THE REVIEWED OBSERVABILITY FILE.
+    // `bind_observability_payload` (`observability.rs:231-255`) routes each of
+    // the SIX listed kinds to its owner record type; this file-local check does
+    // not establish that every ingress path in the workspace is covered. The six are
     // `MemoryGrantOfferRecord`, `InjectionReceipt`, `MemoryInfluenceTrace`,
-    // `ActivationTrace`, `PredictionRecord` and `UlExamRecord`. So the durable
-    // non-truth ingress cannot acquire a reasoning request either, which is the
-    // second reason the row is zero-candidate.
+    // `ActivationTrace`, `PredictionRecord` and `UlExamRecord`. These enumerated
+    // owner forms are contextual source evidence, not a second global
+    // zero-candidate proof.
     let observability_source =
         std::fs::read_to_string(repo_root.join("crates/eliot-types/src/observability.rs"))
             .unwrap_or_else(|error| {
@@ -2683,14 +2765,14 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
                 .matches(&format!("from_value::<{owner_arm}>"))
                 .count(),
             1,
-            "observability.rs:231-255 must bind exactly one owner decoder for `{owner_arm}`"
+            "the reviewed observability source must contain exactly one `from_value::<{owner_arm}>` form"
         );
     }
     assert_eq!(
         observability_source.matches("from_value::<").count(),
         6,
-        "observability.rs:231-255 binds exactly SIX owner decoders and none of them is \
-         UlReasoningRequest, so the durable non-truth ingress cannot acquire one"
+        "the reviewed observability source contains exactly six `from_value::<...>` owner forms; \
+         this file-local count is not a claim about other roots, entrypoints, or aliases"
     );
 
     // ---- (C) WHY THE ROW IS REVIEWED RATHER THAN REFUSED. ------------------
@@ -2700,21 +2782,27 @@ fn c12_reasoning_request_is_a_reviewed_zero_candidate_row_with_no_decoder_caller
     // (`eliot-engine/src/ul/exam.rs:501-548`,
     // `eliot-engine/src/ul/refinement.rs:166-245`) and handed to a runner by
     // borrow (`UlReasoningRunner::run(&self, request: &UlReasoningRequest)`,
-    // `eliot-engine/src/ul/exam.rs:39-41`). The value never enters a
-    // non-truth observability write, so nothing about it is recorded as an
-    // observation and nothing about it can be mistaken for one.
+    // `eliot-engine/src/ul/exam.rs:39-41`). The reviewed builder/runner sites
+    // pass the request by borrow, and the enumerated owner forms in the checked
+    // observability source do not name it. Those observations do not cover
+    // unrecognized ingress forms or source outside the stated roots.
     //
-    // THE CONSEQUENCE, STATED ONCE: with `decoder_calls = "[]"`, the only path
-    // by which any PRODUCTION bytes could reach `UlReasoningRequest` in this
-    // repository is the decoder this case exercises, and every one of its
-    // refusals is asserted in section (A). If a production caller ever appears,
-    // section (B)'s scan fails and the recorded evidence must be re-reviewed
-    // rather than inherited.
+    // THE CONSEQUENCE, STATED ONCE: with `decoder_calls = "[]"`, no call site
+    // matched the documented lexical predicate in eligible non-test Rust
+    // sources under `crates/`, `bins/`, and `workspace/`. The predicate covers
+    // the four listed method names, generic turbofish text, and the supported
+    // qualified/direct-import typed bindings; it does not prove universal
+    // absence across aliases, macros, other entrypoints, or unscanned roots.
+    // The decoder refusals exercised in section (A) describe the owner type's
+    // behavior if called. A newly matching call in the covered scope makes the
+    // bounded row fail and its evidence must be re-reviewed.
     assert_eq!(
         decoder_calls, "[]",
-        "the reviewed row for `UlReasoningRequest` is: decoder_calls = \"[]\" — no PRODUCTION source \
-         decodes this type anywhere in the repository. This value is BUILT FROM the scan above, \
-         not written here, so it changes the moment a production caller appears."
+        "the reviewed row for `UlReasoningRequest` is: decoder_calls = \"[]\" — no call sites \
+         matched the bounded lexical predicate in eligible non-test Rust sources under crates/, \
+         bins/, or workspace/. It checks the four listed method names using the documented \
+         turbofish and qualified/direct-import typed-binding forms; aliases and other syntax are \
+         outside its coverage. This value is built from those matches, not written here."
     );
 }
 
@@ -4537,11 +4625,12 @@ fn c15_the_real_ingress_decoders_refuse_before_any_value_is_returned() {
 //         .ok()
 //         .map(|ack| ack.memory_handle)
 // `.ok()` converts the refusal into `None`, so the inner serde message NEVER
-// REACHES the caller. That is precisely why a canary here is a real proof: if
-// any injected authority-shaped material could reach the ledger's count, the
-// count would move, and nothing in the code could report why. Where a path
-// instead returns serde's OWN message, this case asserts the FIELD-NAME
-// BEHAVIOUR instead of a canary, as instructed.
+// REACHES this helper's caller. This case proves only which handle candidate
+// the decoder returns (or refuses) and the static source conditions around the
+// real increment. It does not instantiate the ledger or claim that `Some(handle)`
+// alone changes a count: production also requires same-task delivery and a new
+// insertion into the session's acknowledged set. Where a path instead returns
+// serde's OWN message, this case asserts the FIELD-NAME BEHAVIOUR.
 //
 // WHAT IS LITERAL AND WHAT IS ASSEMBLED. The canary member NAMES are assembled
 // AT RUNTIME by joining runtime fragments, so no literal in this file spells an
@@ -4585,9 +4674,9 @@ fn read_engine_source(relative: &str) -> String {
 /// silently diverge from production.
 ///
 /// The `.ok()` between the decode and the read is the whole point: the refusal
-/// is DISCARDED, so a caller of this function sees only `Some(handle)` for a
-/// decode that succeeded and `None` for everything else — including every
-/// refusal whose message it is not allowed to read.
+/// is DISCARDED, so this helper returns `Some(handle)` for a successful decode
+/// and `None` for a refusal. It rechecks only the decoder result; it does not
+/// execute the ledger's separate delivery/task/deduplication accounting gates.
 fn ledger_acknowledged_handle(arguments: &serde_json::Value) -> Option<String> {
     serde_json::from_value::<MemoryInfluenceAckInput>(arguments.clone())
         .ok()
@@ -4610,9 +4699,10 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     // The ledger caller is `acknowledged_handle` at
     // crates/eliot-engine/src/ul/ledger.rs:410-414, gated on
     // `measurement.tool_name == "eliot_memory_influence_trace"` at
-    // crates/eliot-engine/src/ul/ledger.rs:110-112, whose ONLY effect is
-    // `delta.acknowledged_items = delta.acknowledged_items.saturating_add(1)`
-    // at :118. That file is read, never written.
+    // crates/eliot-engine/src/ul/ledger.rs:110-112. The increment at :118 is
+    // reached only after same-task delivery and a first insertion into
+    // `session.acknowledged`; this case asserts those source guards but does not
+    // run the ledger or claim a runtime count. That file is read, never written.
 
     // ---- (A) THE CALLER IS THE REAL ONE, READ FROM ITS OWN BYTES. --------
     // Everything below about the caller is re-derived from the production file
@@ -4627,15 +4717,30 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     // file contains unrelated code (`unwrap_or_default` at ledger.rs:220
     // computes a control-arm baseline, far from any acknowledgement), so a
     // whole-file absence would be a claim about the file rather than about the
-    // caller under proof. The slice runs from the declaration to the closing
-    // brace at column zero, which is where this file ends any other function.
+    // caller under proof. The slice begins at the declaration itself and ends
+    // at its closing brace; it never includes the unrelated prefix.
     let acknowledged_handle_slice = ledger.split_once("fn acknowledged_handle").map_or_else(
         || panic!("crates/eliot-engine/src/ul/ledger.rs must still declare `acknowledged_handle`"),
-        |(before, after)| {
+        |(_, after)| {
             let body = after.find("\n}").map_or(after.len(), |close| close + 2);
-            format!("{before}{}", &after[..body])
+            format!("fn acknowledged_handle{}", &after[..body])
         },
     );
+    let record_with_assignment_slice = ledger
+        .split_once("pub fn record_with_assignment(")
+        .map_or_else(
+            || panic!("crates/eliot-engine/src/ul/ledger.rs must still declare `record_with_assignment`"),
+            |(_, after)| {
+                let next_function = after
+                    .find("\n    fn restore(")
+                    .unwrap_or(after.len());
+                format!("pub fn record_with_assignment({}", &after[..next_function])
+            },
+        );
+    let record_with_assignment_compact = record_with_assignment_slice
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
 
     // The decode target is the REAL decoder of this allocation, named as the
     // owner type in the production source.
@@ -4664,35 +4769,55 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
          value when the decode is refused; this claim is scoped to that slice because \
          ledger.rs:220 uses unwrap_or_default for an unrelated control-arm baseline"
     );
-    // The ONLY thing a successful decode can hand the ledger is the handle, and
-    // the ONLY thing the ledger does with it is count one acknowledgement.
+    // The helper exposes only the decoded handle. The production method has a
+    // separate path from that candidate to the count, and its exact guards are
+    // asserted below from a slice of the owning method.
     assert!(
-        ledger.contains("delta.acknowledged_items = delta.acknowledged_items.saturating_add(1);"),
-        "crates/eliot-engine/src/ul/ledger.rs:118 must be the sole effect of an acknowledgement"
+        record_with_assignment_slice
+            .contains("delta.acknowledged_items = delta.acknowledged_items.saturating_add(1);"),
+        "record_with_assignment must retain the acknowledged-item counter increment"
     );
     // The gate is the tool name, NOT anything carried in the arguments.
     assert!(
-        ledger.contains("if measurement.tool_name == \"eliot_memory_influence_trace\""),
-        "crates/eliot-engine/src/ul/ledger.rs:110 must gate the acknowledgement on the tool name"
+        record_with_assignment_slice
+            .contains("if measurement.tool_name == \"eliot_memory_influence_trace\""),
+        "record_with_assignment must gate acknowledgement handling on the tool name"
     );
-    // There is no path from the acknowledgement arguments to any authority,
-    // permission or proof field: the caller reads exactly one field out of the
-    // decoded value, and this allocation's ledger delta carries no such field.
+    // The decoder helper reads exactly one field from the decoded value.
     assert_eq!(
-        ledger.matches("ack.memory_handle").count(),
+        acknowledged_handle_slice
+            .matches("ack.memory_handle")
+            .count(),
         1,
-        "crates/eliot-engine/src/ul/ledger.rs must read exactly ONE field from the decoded \
-         acknowledgement; a second read would be an unread path this case cannot prove"
+        "acknowledged_handle must read exactly ONE field from the decoded acknowledgement"
     );
     // The re-run helper's own premise, checked against the production bytes:
     // the helper is only meaningful if the production call it re-runs is
     // EXACTLY the expression asserted above, so the two together cannot drift.
     assert_eq!(
-        ledger
+        acknowledged_handle_slice
             .matches("serde_json::from_value::<MemoryInfluenceAckInput>(arguments.clone())")
             .count(),
         1,
-        "the ledger must decode the acknowledgement exactly once, through the owner decoder"
+        "acknowledged_handle must decode exactly once, through the owner decoder"
+    );
+    let record_compact = record_with_assignment_compact.as_str();
+    assert!(
+        record_compact.contains(
+            "ifmeasurement.tool_name==\"eliot_memory_influence_trace\"&&letSome(handle)=acknowledged_handle(&measurement.arguments){"
+        ),
+        "the production acknowledgement branch must consume the bounded decoder helper's handle"
+    );
+    assert!(
+        record_compact.contains(
+            "letdelivered=session.delivered.get(&handle).is_some_and(|item|item.task_id==Some(measurement.task_id));"
+        ),
+        "the production method must require a delivered handle belonging to the same task"
+    );
+    let guarded_increment = "ifdelivered&&session.acknowledged.insert(handle){delta.acknowledged_items=delta.acknowledged_items.saturating_add(1);}";
+    assert!(
+        record_compact.contains(guarded_increment),
+        "the increment must remain inside the delivery-and-unique-acknowledgement block"
     );
 
     // ---- (B) THE RUNTIME-ASSEMBLED CANARIES. ------------------------------
@@ -4728,9 +4853,10 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
          count, and nothing else"
     );
     // A CONTROL canary key that the acknowledgement DOES declare, carrying a
-    // runtime canary value. It decodes — and the ledger still only counts,
-    // because counting is all the caller ever does. This is what shows the
-    // refusal rows below are about CLOSURE, not about the canary being poison.
+    // runtime canary value. It decodes to the same handle candidate, showing
+    // that the refusal rows below are about CLOSURE, not about the canary being
+    // poison. The actual ledger count still has the delivery/task/deduplication
+    // guards asserted from production source above.
     let control_value: String = canary_char.repeat(canary_repeats + 1);
     let mut control_arguments = decode::<serde_json::Value>(T12_W3_C16_LEDGER_ARGS_BASE)
         .expect("the control arguments must be valid JSON");
@@ -4745,8 +4871,8 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     // The ledger's decoding step is `ledger_acknowledged_handle`, the
     // module-level helper above, which re-runs the production body exactly.
 
-    // (B1) THE CONTROL: the acknowledged-shape arguments decode and the caller
-    // yields a handle. Nothing else moves.
+    // (B1) THE CONTROL: the acknowledged-shape arguments decode and the helper
+    // yields a handle candidate. This test does not execute ledger accounting.
     let control_handle = ledger_acknowledged_handle(&control_arguments);
     assert_eq!(
         control_handle,
@@ -4756,10 +4882,10 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     );
 
     // (B2) THE CANARY ROWS. For each authority-shaped family, the arguments are
-    // the control arguments PLUS the canary member. The caller's return value is
-    // the ONLY thing the ledger can act on, so `None` here is a proof: the
-    // canary cannot reach the ledger as a value at all, and therefore cannot
-    // raise `acknowledged_items`.
+    // the control arguments PLUS the canary member. The helper's `None` proves
+    // that this decode path yields no handle candidate. The source checks above
+    // show that production cannot enter the acknowledgement branch without a
+    // decoded handle, same-task delivery, and a unique set insertion.
     let canary_cases: [(&str, String, String); 3] = [
         ("permission", permission_key.clone(), canary_value.clone()),
         ("exam", exam_key.clone(), canary_value.clone()),
@@ -4785,36 +4911,32 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
             ),
             "the {family} canary must be refused against the owner's declared field set"
         );
-        // AND THE CANARY-VALIDITY ROW: through the ledger's own
-        // error-discarding entry point, the SAME arguments yield NOTHING. The
-        // inner message is never surfaced, so a canary can only be detected by
-        // the value the caller receives — and that value is absent.
+        // AND THE CANARY-VALIDITY ROW: through the same decode-and-discard
+        // helper as production, the SAME arguments yield no handle candidate.
+        // The inner message is never surfaced to that helper.
         assert_eq!(
             ledger_acknowledged_handle(&arguments),
             None::<String>,
-            "the {family} canary must not reach the ledger as a value, so it cannot raise \
-             acknowledged_items"
+            "the {family} canary must be refused by the helper, which yields no handle candidate"
         );
     }
 
-    // ---- (C) THE CANARIES CANNOT RAISE THE COUNT, AT ANY SHAPE. -----------
-    // The production increment is `saturating_add(1)` and its ONLY precondition
-    // is a `Some` handle, so the count is raised by exactly one thing: a decode
-    // that SUCCEEDS. The rows below cover every position an injected authority
-    // value could plausibly take through the acknowledgement wire, and each one
-    // is asserted at what production ACTUALLY does with it. Nothing here claims a
-    // refusal that does not happen. "At any shape" is earned by each row being a
-    // DISTINCT position: (C1) a declared optional member, (C2) the closed enum,
-    // (C3) standing in for the absent handle, (C4) the handle's own value, (C5) a
-    // non-string in a declared optional member. No two rows build the same
-    // document.
+    // ---- (C) THE CANARIES AT EACH DECODE SHAPE. ---------------------------
+    // `Some(handle)` is only the decoder's output, not proof of a counter
+    // increment. The source slice above separately verifies that production
+    // requires same-task delivery and a first insertion into the acknowledged
+    // set before incrementing. These rows cover distinct positions in the
+    // acknowledgement wire: (C1) a declared optional member, (C2) the closed
+    // enum, (C3) standing in for the absent handle, (C4) the handle's own value,
+    // and (C5) a non-string in a declared optional member.
     for (family, key, value) in &canary_cases {
         // (C1) The canary riding a DECLARED OPTIONAL member. `project_id`,
         // `write_id` and `downstream_outcome_ref` are declared `Option<String>`
         // (`ul/injection.rs:187-199`), so a string canary in any of them DECODES
-        // — and the caller still yields the PROTECTED handle, unchanged. This is
-        // the honest result: a canary in a declared opaque string is DATA, and
-        // the caller cannot act on it because it reads exactly one field.
+        // — and the helper still yields the PROTECTED handle, unchanged. This
+        // is the honest result: a canary in a declared opaque string is DATA.
+        // Whether production increments remains controlled by the independent
+        // delivery/task/deduplication guard asserted above.
         for placement in ["project_id", "write_id", "downstream_outcome_ref"] {
             let mut arguments = control_arguments.clone();
             arguments
@@ -4828,8 +4950,7 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
                 ledger_acknowledged_handle(&arguments),
                 Some(control_value.clone()),
                 "the {family} canary in the declared optional member `{placement}` is DATA: the \
-                 decode succeeds and the caller still yields the protected handle, so the canary \
-                 still raises the count by nothing but the one ordinary acknowledgement"
+                 decode succeeds and the helper still yields the same protected handle candidate"
             );
         }
         // (C2) The canary masquerading as the closed `influence_class` value: an
@@ -4846,8 +4967,7 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
         assert_eq!(
             ledger_acknowledged_handle(&arguments),
             None::<String>,
-            "the {family} canary carried as an unknown influence_class must be refused, so it \
-             raises no count"
+            "the {family} canary carried as an unknown influence_class must be refused by the helper"
         );
         // (C3) The canary trying to SUBSTITUTE for the protected handle. The
         // protected member is absent, so the only candidate handle present is the
@@ -4870,10 +4990,10 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
         // member is gone. This shape is distinct from (B2), which leaves the
         // handle intact and adds a sibling member, and distinct from (C3), which
         // removes the handle entirely. `memory_handle` is declared `String`, not
-        // an opaque handle type, so the substituted string DECODES — and the
-        // ledger's only effect is still `saturating_add(1)`. The asserted fact is
-        // therefore that the count does not move, which is what this row was
-        // always supposed to prove about a canary that becomes the handle.
+        // an opaque handle type, so the substituted string DECODES. This row
+        // proves only that the helper yields the substituted handle candidate;
+        // production still requires that exact handle to have been delivered
+        // for the same task and to be newly acknowledged.
         let mut arguments = control_arguments.clone();
         arguments
             .as_object_mut()
@@ -4885,9 +5005,8 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
         assert_eq!(
             ledger_acknowledged_handle(&arguments),
             Some(value.clone()),
-            "the {family} canary REPLACING the protected handle's value must still raise exactly \
-             one ordinary acknowledgement and nothing else: the caller reads one field and the \
-             ledger only counts"
+            "the {family} canary REPLACING the protected handle's value is returned as the \
+             decoder's handle candidate; this assertion makes no ledger-count claim"
         );
         assert_eq!(
             decode::<MemoryInfluenceAckInput>(&arguments.to_string()).map_or_else(
@@ -4896,9 +5015,8 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
             ),
             value.clone(),
             "the {family} canary carried AS the protected handle's value is accepted as DATA: the \
-             handle is declared `String`, so nothing in the decode path can tell a substituted \
-             handle from a real one — which is exactly why the ledger counts it and reads nothing \
-             else from it"
+             handle is declared `String`, so the decoder returns it as a candidate; the separate \
+             production delivery/task/deduplication guard controls any counter effect"
         );
         // (C5) The canary as a NON-STRING value in a declared optional member:
         // `Option<String>` refuses a number/object there, so the decode is
@@ -4921,7 +5039,7 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
             );
         }
     }
-    // ---- (C6) THE LEDGER'S OWN UNDECODABLE ARGUMENTS, AT THE REAL BOUNDARY.
+    // ---- (C6) THE LEDGER DECODER'S OWN UNDECODABLE ARGUMENTS. -------------
     // `T12_C16_LEDGER_ACK_UNDECODABLE_ARGUMENTS` is a full acknowledgement-shaped
     // tool-argument object: it carries BOTH of the decoder's optional members
     // (`project_id`, `write_id`), BOTH of its required members (`memory_handle`,
@@ -4939,8 +5057,8 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     //   * `ledger_acknowledged_handle` — the ledger's OWN
     //     `serde_json::from_value::<MemoryInfluenceAckInput>(arguments.clone())
     //     .ok().map(|ack| ack.memory_handle)` (ledger.rs:410-414), which DISCARDS
-    //     the message. Its `None` is the fact the ledger acts on: no handle, no
-    //     `saturating_add(1)`, no count raised.
+    //     the message. Its `None` means this path yields no handle candidate for
+    //     the production `if let Some(handle)` branch.
     //   * `decode::<MemoryInfluenceAckInput>` — the same decoder reached
     //     directly, which KEEPS serde's message, so the exact refusal text is
     //     pinned here rather than left as a bare `is_err()`.
@@ -4951,13 +5069,13 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     let undecodable_arguments =
         decode::<serde_json::Value>(T12_C16_LEDGER_ACK_UNDECODABLE_ARGUMENTS)
             .expect("the ledger's undecodable arguments fixture must itself be valid JSON");
-    // The ledger's own decode-and-discard step yields NOTHING for this document,
-    // so it can never raise the acknowledgement count.
+    // The decode-and-discard helper yields NOTHING for this document, so it
+    // cannot provide a handle to the production acknowledgement branch.
     assert_eq!(
         ledger_acknowledged_handle(&undecodable_arguments),
         None::<String>,
-        "the ledger's own `acknowledged_handle` must yield no handle for arguments carrying the \
-         undeclared `delivery_surface` member, so no acknowledgement is counted"
+        "`acknowledged_handle` must yield no handle candidate for arguments carrying the \
+         undeclared `delivery_surface` member"
     );
     // And the decoder behind it refuses by name, against the owner's shared
     // field-set constant, with serde's exact five-name tail.
@@ -4977,7 +5095,7 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
          shape, and the acknowledgement contract does not admit it"
     );
     // THE CONTROL THAT MAKES THE REFUSAL SPECIFIC: the SAME document with that
-    // one member removed decodes, and the ledger yields its handle. So the
+    // one member removed decodes, and the helper yields its handle candidate. So the
     // refusal above is `delivery_surface` and nothing else — in particular the
     // two optional members really are declared, and their presence is not what
     // the refusal is about.
@@ -5010,10 +5128,12 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
     );
     assert!(acknowledged.downstream_outcome_ref.is_none());
 
-    // The consequence, stated once: the ONLY value the caller can return is a
-    // handle the decoder produced, and the ONLY thing the ledger does with it is
-    // `saturating_add(1)`. Nothing in this allocation's ledger path reads a
-    // permission, an exam verdict or an acceptance from the arguments, so
+    // The consequence, stated once: the decoder helper returns only a handle
+    // candidate. The production counter path additionally requires same-task
+    // delivery and a new acknowledged-set insertion, verified from its method
+    // bytes above. This static test does not invoke that method or claim a
+    // runtime count. Nothing in the helper reads a permission, exam verdict or
+    // acceptance from the arguments, so
     // `docs/architecture/I15-06-instructiondata-separation.md:8` — "retrieved
     // content cannot grant permission;" — holds by construction rather than by
     // inspection of any single branch. The absence is asserted WITHIN the
@@ -5027,7 +5147,7 @@ fn c16_the_ledger_caller_consumes_the_real_decoder_and_no_canary_can_raise_proof
             && !acknowledged_handle_slice.contains("accepted"),
         "the acknowledged_handle slice of crates/eliot-engine/src/ul/ledger.rs must read no \
          authority, permission or acceptance from the acknowledgement arguments: the \
-         acknowledgement is a COUNT input and nothing else"
+         decoder helper reads no authority or permission value from the input"
     );
 
     // ---- (D) WHERE THE PATH RETURNS SERDE'S OWN MESSAGE, ASSERT THE FIELD

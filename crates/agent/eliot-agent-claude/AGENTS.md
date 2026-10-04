@@ -28,9 +28,9 @@ permission. See [`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs
 
 Owning issue: [#1112 — governed Claude Agent SDK sidecar adapter](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1112).
 
-Current source base: `main@8ebf8b41847391c340393d56aeb14dd4f2b5e37b`.
+The package contains a production Claude sidecar execution path in `src/execution.rs`: `prepare` prepares the bound attempt, and `ClaudeSidecarFactory::launch` consumes the sealed `ProcessRequest` through the shared governed `ProcessExecutor` trait and checks the executor start receipt. `ingest_line`, `complete_terminal` and `translate_candidate_result` enforce binding checks and preserve raw evidence lineage; cancellation and unknown outcomes retain same-operation reconciliation semantics. Provider output remains candidate-only and cannot write canonical state, issue authority, self-promote or decide Task Finish.
 
-The package currently supplies only the Wave-1 bounded NDJSON contract and native skeleton. It explicitly excludes supervised launch, credentials, SDK execution, normalized events, cancellation, cleanup, reconciliation, route admission and Product proof. `CLAUDE_SIDECAR_ADAPTER_ID` has no production composition caller. Issue #874 is the downstream native-worker factory/registry owner; it does not own repairing this package.
+The production native-worker factory function `bins/eliot-native-worker/src/adapter_registry.rs::invoke_claude_factory` constructs the real factory and validates the inert launch request. `bins/eliot-native-worker/src/main.rs::run` does not yet drive that seam; its drive/composition integration remains within the #874 owner boundary. The construction seam does not establish approved live provider execution or Product Proof.
 
 ## Mandatory documentation
 
