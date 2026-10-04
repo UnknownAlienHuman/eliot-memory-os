@@ -15,26 +15,52 @@ product bounded/leak-free claim. Unresolved rows remain launch/release blockers
 until the coordinator links each to a concrete bounded implementation issue.
 The scanner proposes rows and successor scopes only; it creates no GitHub tasks.
 
-Closed classifications (exactly one per candidate row):
+Closed classification vocabulary (exactly one per candidate row):
   request-local/stack-bounded | immutable DTO | test-only |
   long-lived hard-bounded | versioned-policy-bounded | lifecycle-removal |
   TTL/lease with scheduled bounded cleanup | external compaction |
   append-only durable segmented retention | unbounded long-lived candidate |
   ownership/lifetime unknown | unrelated false positive
 
-Classification rules (RULE_REVISION 885.1, first match wins, evidence kept):
+The vocabulary is closed and stable, but RULE_REVISION 885.2 can no longer
+produce `long-lived hard-bounded`, `versioned-policy-bounded`,
+`lifecycle-removal` or `immutable DTO`: no discovery-only signal establishes a
+bound, so those four are reserved vocabulary values. `unrelated false
+positive` is the fail-closed default; the three scanned candidate kinds
+(static/field/local) are each claimed by an earlier rule, so it is a defensive
+default rather than a reachable outcome.
+
+Classification rules (RULE_REVISION 885.2, first match wins, evidence kept):
   1. test-only signals (tests/ path, test file name, cfg(test)) -> test-only
   2. function-local `let` binding (grown or not) -> request-local
-  3. TTL/lease/expiry signal + production scheduled bounded cleanup owner -> TTL/lease
-  4. append/segment/rotation signal + production retention evidence -> append-only retention
-  5. production compaction callsite outside the declaring file -> external compaction
-  6. versioned policy/config bound evidence -> versioned-policy-bounded
-  7. literal with_capacity bound + production same-slice removal -> long-lived hard-bounded
-  8. production same-slice removal/retain/clear/drain without hard bound -> lifecycle-removal
-  9. static/global item with growth -> unbounded long-lived candidate
-  10. long-lived struct field with growth, no bound/removal -> unbounded candidate
-  11. collection-typed field with no observable owner/growth -> ownership unknown
-  12. otherwise -> unrelated false positive (with evidence, never silent)
+  3. TTL/lease/expiry signal + receiver-attributed scheduled retention (never a
+     whole-collection `clear()`) -> TTL/lease
+  4. append/segment/rotation signal + receiver-attributed production
+     retention/eviction -> append-only retention
+  5. receiver-attributed production compaction/eviction callsite outside the
+     declaring file -> external compaction
+  6. preallocation (`with_capacity`), policy-like names, and mere
+     removal-method presence are DISCOVERY EVIDENCE ONLY: none of them, alone
+     or combined with a name signal, may yield `hard`/`configured` bound status
+     or a `none-required` repair. `Vec::with_capacity(n)` PREALLOCATES and is
+     not a maximum length; an unscheduled `cleanup` that only calls `clear()`
+     proves no scheduling and no cardinality limit.
+  7. any long-lived growth not already claimed by rules 3-5 -> unbounded
+     long-lived candidate, counted in unresolved_count
+  8. collection-typed field/static with no receiver-attributed growth ->
+     ownership/lifetime unknown, counted in unresolved_count
+  9. otherwise -> unrelated false positive (with evidence, never silent)
+
+Evidence attribution: growth, removal, and preallocation evidence is credited
+only to `ident.method(` where `ident` is the actual receiver (a bare identifier
+or `self.ident`). A field reached through an unresolved expression
+(`other.items.clear()`), a coincidental same-line method call, a cross-owner
+signal, and test-only or cfg-gated removal never establish a bound: the detail
+is retained in the row evidence and the row stays explicitly unresolved.
+Unresolved rows stay counted in `unresolved_count`, keep `safety_disposition =
+FINDINGS_REMAIN_BLOCKING`, and hand off through `repair_owner/repair_issue =
+UNRESOLVED`; scan coverage completeness is independent of findings and may be
+COMPLETE while findings remain blocking.
 
 Test-only removal proves no production bound; cfg-gated removal has unknown
 production reachability and stays unknown (matrix-14/15). Unbounded/unknown
@@ -61,7 +87,7 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.long-lived-collection-inventory.v1"
-RULE_REVISION = "885.1"
+RULE_REVISION = "885.2"
 TOOL_VERSION = "0.1.0"
 OWNED_TOML = Path(".github/work-units/long-lived-collection-inventory.toml")
 PROOF_CEILING = "STATIC_SOURCE_CLASSIFICATION_ONLY"
@@ -165,6 +191,14 @@ REMOVAL_METHODS = (
     "compact",
     "rotate",
     "truncate",
+)
+# Removal methods that drop or discard entries one by one (or drop a suffix)
+# instead of discarding the whole collection. `clear`/`drain` return a value
+# and leave the collection empty; treating their mere presence as boundedness
+# is exactly the audit-5885377544 defect, so a cleanup that only clears a
+# collection establishes no cardinality limit.
+RETAINING_REMOVAL_METHODS = tuple(
+    method for method in REMOVAL_METHODS if method not in ("clear", "drain")
 )
 
 _CHAR_RE = re.compile(
@@ -418,19 +452,32 @@ def _toml_str_list(values: list[str]) -> str:
     return "[" + ", ".join(_toml_string(item) for item in values) + "]"
 
 
-def _callsites_for(
-    masked_lines: list[str], ident: str, methods: tuple[str, ...], rel: str
-) -> list[str]:
-    """Associate `ident.method(` callsites on lines mentioning the identifier."""
-    ident_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(ident) + r"(?![A-Za-z0-9_])")
-    found: list[str] = []
-    for lineno, line in enumerate(masked_lines, start=1):
-        if not ident_re.search(line):
-            continue
-        for method in methods:
-            if re.search(r"\.\s*" + re.escape(method) + r"\s*(?:::|<|\()", line):
-                found.append(f"{rel}:{lineno}:{method}")
-    # Preserve first-seen order, drop exact duplicates.
+def _receiver_re(ident: str, methods: tuple[str, ...]) -> re.Pattern[str]:
+    """Build the `ident.method(` receiver regex for the given methods.
+
+    Longer names are tried first so `pop_back` never matches as `pop`. `ident`
+    must be the call receiver: an optional explicit `self.` prefix is allowed
+    (so `self.items.push(` and `self . items . clear()` match), the character
+    before the whole match may not be an identifier character or `.`, and the
+    identifier must be immediately followed by `.` and one of the methods. That
+    admits `items.push(...)` and `self.items.push(...)` while refusing
+    `other.items.push(...)`, `cache.items.clear()` and `xitems.clear()`,
+    because the engine can only start the match at `self` or at a bare
+    identifier, never mid-path.
+    """
+    ordered = sorted(methods, key=len, reverse=True)
+    return re.compile(
+        r"(?<![A-Za-z0-9_.])"
+        r"(?:self\s*\.\s*)?"
+        + re.escape(ident)
+        + r"\s*\.\s*("
+        + "|".join(re.escape(method) for method in ordered)
+        + r")\s*(?:::|<|\()"
+    )
+
+
+def _unique_in_order(found: list[str]) -> list[str]:
+    """Preserve first-seen order, drop exact duplicates."""
     seen: set[str] = set()
     ordered: list[str] = []
     for item in found:
@@ -438,6 +485,76 @@ def _callsites_for(
             seen.add(item)
             ordered.append(item)
     return ordered
+
+
+def _callsites_for(
+    masked_lines: list[str], ident: str, methods: tuple[str, ...], rel: str
+) -> list[str]:
+    """Associate `ident.method(` callsites where `ident` is the call receiver.
+
+    A callsite counts only when the identifier is the direct receiver of the
+    method call (``ident.method(``, allowing whitespace and `Vec::method(` /
+    `Vec<method>(` generic paths), not when the identifier and a
+    growth/removal method merely share a line. Same-line coincidence,
+    other-owner receivers (`other.items.clear()`), and unattributed file-wide
+    signals are not attributed here; downstream classification keeps such rows
+    explicitly unresolved while retaining the observed details in row evidence
+    and owner-level removal inventory.
+    """
+    call_re = _receiver_re(ident, methods)
+    found: list[str] = []
+    for lineno, line in enumerate(masked_lines, start=1):
+        # Same-line coincidence without an ident.receiver match is ignored here.
+        for match in call_re.finditer(line):
+            found.append(f"{rel}:{lineno}:{match.group(1)}")
+    return _unique_in_order(found)
+
+
+def _field_preallocations(
+    masked_lines: list[str], field_name: str, struct_name: str, rel: str
+) -> list[str]:
+    """Attribute `Vec::with_capacity(n)` to the field/owner it initializes.
+
+    Preallocation is recorded as *owner-level* discovery evidence: the call is
+    credited when the field identifier and `with_capacity` share a line
+    (optionally through an `=` initializer or a `Struct { field: .. }` literal)
+    and no other owner/field identifier appears as the nearest preceding
+    receiver. That keeps `Vec::with_capacity(4)` inside an unrelated struct out
+    of this row while never claiming the number is a maximum length, because
+    attribution can establish initialization, not boundedness.
+    """
+    call_re = re.compile(
+        r"\b(?:" + re.escape("Vec") + r"|" + re.escape(field_name) + r")"
+        r"\s*(?:::|<|\.)with_capacity\s*\(\s*(\d+)\s*\)"
+    )
+    ident_re = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])")
+    struct_token = str(struct_name)
+    tokens = set(ident_re.findall(field_name + " " + struct_token))
+    found: list[str] = []
+    for lineno, line in enumerate(masked_lines, start=1):
+        for match in call_re.finditer(line):
+            prefix = line[: match.start()]
+            receivers = ident_re.findall(prefix)
+            nearest = receivers[-1] if receivers else ""
+            # `Vec::with_capacity(4)` inside `impl Holder {` belongs to the
+            # enclosing owner; `Other::new(..)` names a different owner.
+            owner_ok = not nearest or nearest in tokens or (
+                nearest.startswith("impl") and struct_token in tokens
+            )
+            if owner_ok:
+                found.append(f"{rel}:{lineno}:with_capacity({match.group(1)})")
+    return _unique_in_order(found)
+
+
+def _preallocation_note(preallocations: list[str]) -> str:
+    """Discovery-only disclosure for observed preallocation."""
+    if not preallocations:
+        return ""
+    return (
+        f"; observed preallocation {preallocations} attributed to this field/owner"
+        " slice is discovery evidence only: with_capacity(n) preallocates and is"
+        " not a maximum length"
+    )
 
 
 def _partition_removal(
@@ -548,6 +665,9 @@ def _scan_file(root: Path, rel: str) -> tuple[dict[str, object], list[dict[str, 
                 "lifetime": lifetime,
                 "growth_callsites": growth,
                 "removal_callsites": removal,
+                "preallocations": _field_preallocations(
+                    masked_lines, field_name, struct_name, rel
+                ),
                 "production_removal": production_removal,
                 "removal_test_only": test_only_removal,
                 "removal_cfg_unknown": cfg_unknown_removal,
@@ -636,14 +756,35 @@ def _scan_file(root: Path, rel: str) -> tuple[dict[str, object], list[dict[str, 
     return file_record, candidates
 
 
-def _has_scheduled_cleanup(masked_lines: list[str]) -> str | None:
+def _scheduled_retention_evidence(masked_lines: list[str], ident: str) -> str | None:
+    """Find a scheduling marker on a receiver-attributed per-entry retention call.
+
+    Scheduled lifecycle boundedness is only claimed when the scheduling marker
+    (interval/schedule/cron/cleanup/compact/retain/reap/sweep) and the per-entry
+    retention call are the *same* line and `ident` is that call's receiver. This
+    replaces the pre-885.2 helper that paired any marker with any removal call
+    on a line, which let `fn cleanup(&mut self) { self.items.clear(); }` read as
+    a scheduled bounded-cleanup owner: no marker beside the receiver call proves
+    neither scheduling nor a cardinality limit (audit 5885377544).
+    """
     sched_re = re.compile(r"\b(interval|schedule|cron|cleanup|compact|retain|reap|sweep)\b")
+    retain_re = _receiver_re(ident, RETAINING_REMOVAL_METHODS)
     for lineno, line in enumerate(masked_lines, start=1):
-        if sched_re.search(line) and re.search(
-            r"\.\s*(retain|clear|drain|remove|evict|compact|truncate)\s*\(", line
-        ):
-            return f"line {lineno}: {line.strip()[:160]}"
+        match = retain_re.search(line)
+        if match is not None and sched_re.search(line):
+            return f"line {lineno}: {line.strip()[:160]} ({match.group(1)})"
     return None
+
+
+def _unbounded_lifetime_detail(item: dict[str, object]) -> str:
+    """Lifetime detail for a row proven unbounded from static source."""
+    if item["kind"] == "static":
+        return "process-global; restart amplification unknown from this slice"
+    return (
+        "persisted/restart-amplified (serde derive signal in slice)"
+        if item["serde_signal"]
+        else "in-memory-only unless cross-slice persistence exists"
+    )
 
 
 def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
@@ -654,10 +795,12 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
     assert isinstance(masked_lines, list)
     growth = item["growth_callsites"]
     removal = item["removal_callsites"]
+    preallocations = item["preallocations"]
     production = item["production_removal"]
     test_only_removal = item["removal_test_only"]
     cfg_unknown_removal = item["removal_cfg_unknown"]
     assert isinstance(growth, list) and isinstance(removal, list)
+    assert isinstance(preallocations, list)
     assert isinstance(production, list)
     assert isinstance(test_only_removal, list) and isinstance(cfg_unknown_removal, list)
     test_lines = item["test_lines"]
@@ -681,8 +824,25 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
     policy_signal = bool(
         re.search(r"\b(policy|policies|config|quota|budget|versioned)\b", lowered)
     )
-    with_cap = re.search(r"with_capacity\s*\(\s*(\d+)\s*\)", "\n".join(masked_lines))
-    scheduled = _has_scheduled_cleanup(prod_lines)
+    prealloc_note = _preallocation_note([str(call) for call in preallocations])
+    # Bounded classifications below are gated on receiver-attributed evidence:
+    # production removal is required, and the two lifecycle rules additionally
+    # require a scheduling marker on a per-entry retention call owned by this
+    # exact receiver. Preallocation, policy-like names and mere removal-method
+    # presence stay discovery evidence and never upgrade a bound status or a
+    # repair to none-required (audit 5885377544).
+    scheduled_retention = _scheduled_retention_evidence(prod_lines, field_name)
+    retention_production = [
+        str(call) for call in production if str(call).rsplit(":", 1)[-1] in RETAINING_REMOVAL_METHODS
+    ]
+    cross_file_compaction = [
+        str(call)
+        for call in production
+        if "(cross-file)" in str(call)
+        and str(call).rsplit(":", 1)[-1].split(" ")[0] in RETAINING_REMOVAL_METHODS
+    ]
+    cross_file = [str(call) for call in production if "(cross-file)" in str(call)]
+    detail = _unbounded_lifetime_detail(item)
 
     if bool(item["test_signal"]):
         return (
@@ -714,102 +874,90 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "function-local binding with no growth observed; frame-bounded regardless",
         )
 
-    if ttl_signal and scheduled and production:
+    if (
+        ttl_signal
+        and scheduled_retention
+        and retention_production
+        and item["kind"] in ("field", "static")
+    ):
         return (
             "TTL/lease with scheduled bounded cleanup",
-            "scheduled cleanup: " + scheduled,
+            "scheduled retention: " + scheduled_retention,
             "configured",
             "in-memory-only unless persistence signal present",
             "none-required",
-            f"ttl/lease signal with production scheduled bounded cleanup owner ({scheduled})"
-            f" and production removal {production}" + excluded_note,
+            f"ttl/lease signal with a receiver-attributed scheduled retention owner"
+            f" ({scheduled_retention}) and receiver-attributed production removal"
+            f" {retention_production}; whole-collection clear/drain is not retention"
+            + excluded_note
+            + prealloc_note,
         )
 
-    if append_signal and production:
+    if append_signal and retention_production and item["kind"] in ("field", "static"):
         return (
             "append-only durable segmented retention",
             "retention/rotation evidence in slice",
             "configured",
             "durable segments; restart replays retained segments",
             "none-required",
-            f"append/segment signal with production retention callsites {production}"
-            + excluded_note,
+            f"append/segment signal with receiver-attributed production retention"
+            f" callsites {retention_production}; whole-collection clear/drain is not"
+            f" retention" + excluded_note + prealloc_note,
         )
 
-    if production and any("(cross-file)" in call for call in production):
+    if growth and cross_file_compaction:
         return (
             "external compaction",
             "compaction owned outside declaring file",
             "configured",
             "owner-slice dependent",
             "none-required",
-            f"production removal/compaction callsites outside declaring file: {production}"
-            + excluded_note,
+            f"receiver-attributed production compaction/eviction callsites outside the"
+            f" declaring file on a growing collection: {cross_file_compaction}"
+            f" (all cross-file removal: {cross_file})" + excluded_note + prealloc_note,
         )
 
-    if policy_signal and (growth or production):
-        return (
-            "versioned-policy-bounded",
-            "policy/config bound reference in slice",
-            "configured",
-            "policy-defined",
-            "none-required",
-            "versioned policy/config bound signal; empirical status preserved, not proven here",
+    # Rule 6 (audit 5885377544): policy-like names, preallocation and bare
+    # removal-method presence are DISCOVERY EVIDENCE ONLY. None of them, alone
+    # or combined, yields a configured/hard bound or a none-required repair, so
+    # there is deliberately no versioned-policy-bounded and no
+    # long-lived hard-bounded branch here. Every candidate kind reaches one of
+    # the branches below, which all resolve to unresolved or a frame-bound
+    # local.
+    discovery: list[str] = []
+    if policy_signal:
+        discovery.append(
+            "policy-like name signal without an enforced limit: discovery evidence"
+            " only, not a configured bound"
         )
-
-    if with_cap and production:
-        return (
-            "long-lived hard-bounded",
-            f"with_capacity({with_cap.group(1)})",
-            "hard",
-            "in-memory-only (no persistence signal in slice)"
-            if not item["serde_signal"]
-            else "persisted/restart-amplified (serde derive signal in slice)",
-            "none-required",
-            f"literal with_capacity({with_cap.group(1)}) with production same-slice removal"
-            f" {production}" + excluded_note,
+    if preallocations:
+        discovery.append(
+            f"observed preallocation {[str(call) for call in preallocations]}"
+            " preallocates and is not a maximum length: discovery evidence only"
         )
-
-    if production and growth:
-        return (
-            "lifecycle-removal",
-            "none-observed",
-            "none",
-            "in-memory-only (no persistence signal in slice)"
-            if not item["serde_signal"]
-            else "persisted/restart-amplified (serde derive signal in slice)",
-            "none-required",
-            f"production same-slice removal/retain/clear/drain {production} bounds growth"
-            f" {growth}" + excluded_note,
+    if production:
+        discovery.append(
+            f"observed receiver-attributed production removal {production} establishes"
+            " no guard/eviction/cleanup obligation on every growth path: discovery"
+            " evidence only"
         )
-
-    if item["kind"] == "static" and growth:
-        return (
-            "unbounded long-lived candidate",
-            "none-observed",
-            "none",
-            "process-global; restart amplification unknown from this slice",
-            "UNRESOLVED",
-            f"static/global growth {growth} with no production bound or removal in scanned slice"
-            + excluded_note
-            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
+    if cross_file:
+        discovery.append(
+            f"cross-file removal {cross_file} is whole-collection or otherwise"
+            " non-retention: discovery evidence only"
         )
+    discovery_note = ("; " + "; ".join(discovery)) if discovery else ""
 
     if growth:
-        detail = (
-            "persisted/restart-amplified (serde derive signal in slice)"
-            if item["serde_signal"]
-            else "in-memory-only unless cross-slice persistence exists"
-        )
         return (
             "unbounded long-lived candidate",
             "none-observed",
             "none",
             detail,
             "UNRESOLVED",
-            f"long-lived growth {growth} with no production bound, removal, TTL, compaction,"
-            " or policy evidence in scanned slice"
-            + excluded_note
+            f"{item['kind']} growth {growth} with no proven guard/eviction/cleanup"
+            " obligation on every growth path in the scanned slice; static source"
+            " cannot prove boundedness" + excluded_note + discovery_note
             + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
@@ -820,9 +968,9 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "unknown",
             "unknown from this slice",
             "UNRESOLVED",
-            "collection-typed owner with no growth callsite in scanned slice; "
-            "cross-impl/cross-module growth possible; static uncertainty stays explicit"
-            + excluded_note
+            "collection-typed owner with no receiver-attributed growth callsite in the"
+            " scanned slice; cross-impl/cross-module growth possible; static"
+            " uncertainty stays explicit" + excluded_note + discovery_note
             + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
@@ -863,12 +1011,15 @@ def _cross_file_removal(
     """Conservatively associate removal callsites from other scanned files.
 
     A cross-file callsite binds to a field/static only when one masked line
-    mentions the owner name (struct or static ident), the field ident, and a
-    removal method call together. Function-local bindings never associate
-    across files. The rule favors precision over recall; unassociated
-    cross-module activity stays explicit in row evidence via the unknown
-    classifications and successor scopes. Cross-file hits bucket by the owning
-    file's test/cfg line sets: only production hits may prove a bound.
+    mentions the owner name (struct or static ident), and `field.receiver` is
+    the actual receiver of the removal method call on that same line. The
+    receiver requirement matters: `owner.field` and `other.field.clear()` on one
+    line establish no receiver relationship and are no longer associated.
+    Function-local bindings never associate across files. The rule favors
+    precision over recall; unassociated cross-module activity stays explicit in
+    row evidence via the unknown classifications and successor scopes. Cross-file
+    hits bucket by the owning file's test/cfg line sets: only production hits may
+    prove a bound.
     """
     by_path: dict[str, list[str]] = {}
     test_by_path: dict[str, frozenset[int]] = {}
@@ -896,6 +1047,7 @@ def _cross_file_removal(
             continue
         owner_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(owner_token) + r"(?![A-Za-z0-9_])")
         field_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(field_token) + r"(?![A-Za-z0-9_])")
+        cross_re = _receiver_re(field_token, REMOVAL_METHODS)
         hits = item["removal_callsites"]
         assert isinstance(hits, list)
         prod = item["production_removal"]
@@ -910,19 +1062,19 @@ def _cross_file_removal(
             for lineno, line in enumerate(other_lines, start=1):
                 if not owner_re.search(line) or not field_re.search(line):
                     continue
-                for method in REMOVAL_METHODS:
-                    if re.search(r"\.\s*" + re.escape(method) + r"\s*(?:::|<|\()", line):
-                        hit = f"{other}:{lineno}:{method} (cross-file)"
-                        if hit not in hits:
-                            hits.append(hit)
-                        if lineno in test_by_path[other]:
-                            bucket = test_only
-                        elif lineno in cfg_by_path[other]:
-                            bucket = cfg_only
-                        else:
-                            bucket = prod
-                        if hit not in bucket:
-                            bucket.append(hit)
+                for match in cross_re.finditer(line):
+                    method = match.group(1)
+                    hit = f"{other}:{lineno}:{method} (cross-file)"
+                    if hit not in hits:
+                        hits.append(hit)
+                    if lineno in test_by_path[other]:
+                        bucket = test_only
+                    elif lineno in cfg_by_path[other]:
+                        bucket = cfg_only
+                    else:
+                        bucket = prod
+                    if hit not in bucket:
+                        bucket.append(hit)
 
 
 def _build_rows(
@@ -953,8 +1105,18 @@ def _build_rows(
         package = str(item["package"])
         unresolved = classification in UNRESOLVED_CLASSIFICATIONS
         if unresolved:
+            # Every uncertain row keeps the blocking unresolved-owner handoff,
+            # stays counted in unresolved_count and keeps FINDINGS_REMAIN_BLOCKING
+            # set. Coverage completeness is tracked independently.
             repair_owner = "UNRESOLVED"
             repair_issue = "UNRESOLVED"
+            assert bound_status in ("none", "unknown"), (
+                "unresolved row must not claim a proven bound status: "
+                f"{repair_issue}/{bound_status}"
+            )
+            assert repair == "UNRESOLVED", (
+                f"unresolved row must not claim a closed repair: {repair!r}"
+            )
             driver = _cardinality_key(str(item["field_type"]))
             successor = (
                 f"bounded successor scope: give {item['struct_name'] or item['owner']}."
