@@ -61,8 +61,11 @@ fn emit_error(code: &str, detail: &str) {
     let _ = stderr.flush();
 }
 
-/// Emits one bounded JSON receipt line on `stdout` from ordered key/value
-/// pairs, using the same serializer the loop result uses.
+/// Emits one bounded JSON receipt line on `stdout` from key/value pairs,
+/// using the same serializer the loop result uses. The pairs go into a
+/// `serde_json::Map`, so the emitted key order is that map's own order —
+/// lexicographic, because no crate in this workspace enables serde_json's
+/// `preserve_order` — and not the order of this argument.
 fn emit_receipt(fields: &[(&str, &str)]) {
     let mut object = serde_json::Map::new();
     for (key, value) in fields {
@@ -165,9 +168,10 @@ fn main() {
 
     // The live governed path: an owner-admitted delivery set is bound, the
     // authenticated grant resolves into a local admitted port set, and the
-    // bounded request loop serves it to one correlated owner-backed receipt.
-    // No fallback to the experimental describe path or the guest-child
-    // protocol exists here: a refusal stays a refusal.
+    // bounded request loop serves it to one correlated owner-backed terminal
+    // frame, emitted as the versioned result-event stream below rather than
+    // as one receipt object. No fallback to the experimental describe path or
+    // the guest-child protocol exists here: a refusal stays a refusal.
     match run_ordinary_request_loop() {
         // The ordinary result publisher already emitted the versioned
         // result-event stream on stdout; this branch emits no second
@@ -230,9 +234,34 @@ fn main() {
 /// gate. No Kernel admission channel is bound in this host, so no digest is
 /// bound and no admission record exists: the gate denies before any artifact
 /// acquisition, compilation, or instantiation, and the caller-supplied path
-/// marks this as an arbitrary-path attempt on the governed lane. The typed
-/// denial propagates with the governed lane's stable code. This mode is
-/// separate from the experimental lane and never stands in for it.
+/// marks this as an arbitrary-path attempt on the governed lane (the gate
+/// refuses that path at `typed_execution.rs:431-433`, before it reads any
+/// admission record). The typed denial propagates with the governed lane's
+/// stable code. This mode is separate from the experimental lane and never
+/// stands in for it.
+///
+/// The `Err(error)` branch's refusal is one stderr line and the
+/// `ADMISSION_REQUIRED_EXIT` status (1). The propagated denial renders as its
+/// own code (`typed_execution.rs:299`), so `detail` repeats
+/// `KERNEL_ADMISSION_REQUIRED` instead of adding prose, and that line is
+/// exactly
+/// `{"detail":"KERNEL_ADMISSION_REQUIRED","error":"KERNEL_ADMISSION_REQUIRED"}`
+/// (key order is `serde_json::Map`'s lexicographic order — no crate in this
+/// workspace enables `preserve_order`). Both fields carry the one exact cause,
+/// so a reader never has to interpret a generic internal-error sentence to
+/// learn why the attempt was refused.
+///
+/// That describes the `Err(error)` arm only, not the whole function. The
+/// sibling `Ok(())` arm passes the fixed detail `"governed admission is
+/// required"`, so its line would be
+/// `{"detail":"governed admission is required","error":"KERNEL_ADMISSION_REQUIRED"}`
+/// — same code, different detail. That arm is unreachable in this tree, and
+/// not merely because its own comment says so: `check_governed_admission`
+/// ends in an unconditional `Err(TypedExecutionError::GovernedAdmissionRequired)`
+/// (`typed_execution.rs:447`) and every earlier exit in that body is also an
+/// `Err` or a `?` (`:431-446`), so the gate has no success path today. If a
+/// future gate ever admitted, the `Ok(())` detail is what a reader would see,
+/// and it is the fail-closed branch by design rather than a mapped cause.
 fn run_governed_typed_denial(component_path: &Path, world_name: &str) -> ! {
     let Some(world) = TypedWorld::parse(world_name) else {
         emit_error("UNKNOWN_WORLD", "world is unknown");
@@ -255,11 +284,14 @@ fn run_governed_typed_denial(component_path: &Path, world_name: &str) -> ! {
     }
 }
 
-/// Runs the experimental typed describe mode: preflight, prototype contour
-/// admission, describe, then the full two-phase contour admission over the
-/// actually observed imports. A manifest using an undeclared import is
-/// rejected before any success receipt is emitted. This mode is separate
-/// from the governed lane and never stands in for it.
+/// Runs the experimental typed describe mode: the absolute-path requirement,
+/// then bounded artifact preflight, prototype contour admission, describe,
+/// then the full two-phase contour admission over the actually observed
+/// imports. A manifest using an undeclared import is rejected before any
+/// success receipt is emitted: phase two calls `check_activation_imports`
+/// (`contour.rs:663`, `:531-538`) over `receipt.actual_imports` before this
+/// function reaches `emit_receipt`. This mode is separate from the governed
+/// lane and never stands in for it.
 fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
     let Some(world) = TypedWorld::parse(world_name) else {
         emit_error("UNKNOWN_WORLD", "world is unknown");
@@ -267,7 +299,14 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
     };
     // The experimental lane takes only an explicit absolute local artifact:
     // a relative spelling is denied here so acquisition never resolves it
-    // against the process working directory.
+    // against the process working directory. The gate has to live HERE:
+    // `read_bounded_artifact` itself resolves a relative path against
+    // `current_dir` (`artifact_preflight.rs:130`, `:191-199`) and rejects
+    // only `://` sources itself (`:184-189`). The denial is one stderr line
+    // carrying the exact preflight cause as `detail` — `PREFLIGHT_NOT_ABSOLUTE`
+    // for this gate (`artifact_preflight.rs:71`, returned by `:116-122`) —
+    // with `PREFLIGHT_DENIED` as the code, and the `ADMISSION_REQUIRED_EXIT`
+    // status.
     if let Err(error) = require_absolute_artifact_path(component_path) {
         emit_error("PREFLIGHT_DENIED", &error.to_string());
         std::process::exit(ADMISSION_REQUIRED_EXIT);
