@@ -131,14 +131,21 @@
 ;;   crate::typed_bindings::LEGACY_EXPORT || *name == "run"` rejects the legacy
 ;;   `run` export; `export_matches_interface(name, world.interface_name())` --
 ;;   `TypedWorld::interface_name` (src/typed_bindings.rs:133) -> "cycle", i.e.
-;;   "eliot:current/cycle@0.1.0" — the frozen export SPELLING the admission gate
-;;   accepts, formed as `format!("{TYPED_PACKAGE_ID}/{interface}")` at
-;;   src/typed_bindings.rs:185, where `TYPED_PACKAGE_ID` is
-;;   "eliot:current@0.1.0" (src/typed_bindings.rs:24).
-;;   CAREFUL: THIS FILE DOES NOT EXPORT THAT SPELLING. It deliberately plants the
-;;   bare `eliot:current@0.1.0` at its package-id field, which is this fixture
-;;   family's lie and the reason a sibling fixture exists at all. An earlier
-;;   version of this comment said "which is what this file exports" and
+;;   "eliot:current/cycle@0.1.0" — one of TWO export SPELLINGS the admission
+;;   gate accepts. `export_matches_interface` (src/typed_bindings.rs:181) admits
+;;   the first alternative, `format!("{TYPED_PACKAGE_ID}/{interface}")` at
+;;   src/typed_bindings.rs:185, which yields `eliot:current@0.1.0/cycle` because
+;;   `TYPED_PACKAGE_ID` is "eliot:current@0.1.0" (src/typed_bindings.rs:24); and
+;;   the second alternative,
+;;   `format!("eliot:current/{interface}@{TYPED_WIT_VERSION}")` at
+;;   src/typed_bindings.rs:186, which yields `eliot:current/cycle@0.1.0` because
+;;   `TYPED_WIT_VERSION` is "0.1.0" (src/typed_bindings.rs:26). The string named
+;;   on the line above is the SECOND one, not the first.
+;;   CAREFUL: OF THOSE TWO SPELLINGS, THIS FILE EXPORTS ONLY THE SECOND. What it
+;;   plants as the lie is the bare `eliot:current@0.1.0` in the abi-descriptor's
+;;   "package-id" field (`describe` below; data segment at 1037, length 19), which
+;;   is this fixture family's lie and the reason a sibling fixture exists at all.
+;;   An earlier version of this comment said "which is what this file exports" and
 ;;   contradicted its own fixture body.
 ;;   `ComponentItem::ComponentInstance` requires the export to be a component
 ;;   instance; the `for (name, item) in interface_type.exports(engine)` loop
@@ -150,10 +157,13 @@
 ;;      `(wit::CycleStepInput,), (Result<wit::CycleOutcome, wit::CycleError>,)`.
 ;;      That is the check that requires the DECLARED TYPES ABOVE to equal the
 ;;      frozen WIT records -- record for record, field for field, in WIT order --
-;;      and it is the check a WIT-absent record field fails: a mismatch is
-;;      returned as TypedExecutionError::ExportTypeMismatch("step"), before
-;;      `step` is dispatched at all. Nothing below is reached if it fails, so
-;;      this file's type declarations are load-bearing for this fixture, not
+;;      and it is the check a WIT-absent record field fails: inside `fn
+;;      typecheck_world_signatures`, the TypedWorld::DreamerCycle arm carries the
+;;      verbatim statement
+;;      `.map_err(|_| TypedExecutionError::ExportTypeMismatch("step".to_owned()))?;`
+;;      (leading indentation trimmed), so the mismatch is denied before `step`
+;;      is dispatched at all. Nothing below is reached if it fails, so this
+;;      file's type declarations are load-bearing for this fixture, not
 ;;      decoration.
 ;;   `validate_descriptor(world, &descriptor, limits.max_output_bytes)` -- inside
 ;;   `fn validate_descriptor`: `if descriptor.world_name != world.world_name()`
