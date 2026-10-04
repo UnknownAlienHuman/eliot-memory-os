@@ -6,7 +6,9 @@ use eliot_store_api::{
     StoreConflictObservation, StoreError, StoreEvidenceHandles, StoreFailure,
     StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
     StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreResponse,
-    StoreRetryDirective, decode_legacy_store_failure_v1, decode_response_frame, response_frame,
+    StoreRetryDirective, V1CompatWindow, V1DispositionStatus, V1Interpretation, V1RemovalBlocker,
+    bridge_v1_within_window, decode_legacy_store_failure_v1, decode_response_frame, response_frame,
+    v1_compat_window, v1_decoder_removal_gate, v1_failure_use_inventory, v1_migration_disposition,
 };
 
 fn context() -> StoreFailureIdentityContext {
@@ -136,6 +138,84 @@ fn legacy_unknown_and_error_remain_compatible_without_text_parsing() {
         unavailable.disposition,
         StoreFailureDisposition::Unavailable
     );
+}
+
+#[test]
+fn v1_failure_stays_retrievable_with_exact_raw_while_decoder_removal_is_blocked() {
+    let window = v1_compat_window(&v1_failure_use_inventory()).unwrap();
+
+    let unknown_value = serde_json::json!({
+        "status": "unknown",
+        "operation_id": "legacy-operation",
+        "reason": "provider response was interrupted"
+    });
+    let unknown = bridge_v1_within_window(&unknown_value, &context(), &window).unwrap();
+    assert_eq!(unknown.raw(), &unknown_value);
+    assert_eq!(unknown.interpretation(), V1Interpretation::TypedExact);
+    let unknown_again = bridge_v1_within_window(&unknown_value, &context(), &window).unwrap();
+    assert_eq!(unknown_again.raw_sha256(), unknown.raw_sha256());
+    assert_eq!(
+        unknown.typed().disposition,
+        StoreFailureDisposition::UnknownOutcome
+    );
+    assert_eq!(
+        unknown.typed().operation_id,
+        Some(OperationId::new("legacy-operation").unwrap())
+    );
+
+    let error_value = serde_json::json!({
+        "status": "error",
+        "error": "provider is unavailable but this is only human detail"
+    });
+    let error = bridge_v1_within_window(&error_value, &context(), &window).unwrap();
+    assert_eq!(error.raw(), &error_value);
+    assert_eq!(error.interpretation(), V1Interpretation::WeakLegacy);
+    let error_again = bridge_v1_within_window(&error_value, &context(), &window).unwrap();
+    assert_eq!(error_again.raw_sha256(), error.raw_sha256());
+    assert_ne!(error.raw_sha256(), unknown.raw_sha256());
+    assert_eq!(
+        error.typed().human_detail.as_deref(),
+        Some("provider is unavailable but this is only human detail")
+    );
+
+    // The `error` control fields come from the transport observation, never
+    // from the prose: a reworded string keeps the same typed failure.
+    let reworded_value = serde_json::json!({
+        "status": "error",
+        "error": "internal defect"
+    });
+    let reworded = bridge_v1_within_window(&reworded_value, &context(), &window).unwrap();
+    assert_ne!(reworded.raw_sha256(), error.raw_sha256());
+    assert_eq!(
+        error.typed().disposition,
+        StoreFailureDisposition::InternalDefect
+    );
+    assert_eq!(error.typed().reason_code.as_str(), "INTERNAL_STORE_FAILURE");
+    assert_eq!(
+        reworded.typed().semantic_digest().unwrap(),
+        error.typed().semantic_digest().unwrap()
+    );
+
+    assert_eq!(
+        v1_decoder_removal_gate(),
+        Err(V1RemovalBlocker::ActiveDecodeRoute {
+            site: "crates/kernel/eliot-kernel-service/src/store_exchange.rs::decode_legacy_compat",
+        })
+    );
+    let disposition = v1_migration_disposition().unwrap();
+    assert_eq!(disposition.disposition, V1DispositionStatus::Unresolved);
+    assert_eq!(disposition.canonical_cutover_receipt, None);
+
+    let stale_window = V1CompatWindow {
+        inventory_digest: "0".repeat(64),
+    };
+    assert!(matches!(
+        bridge_v1_within_window(&unknown_value, &context(), &stale_window),
+        Err(StoreFailureContractError::Invalid {
+            field: "compat_window",
+            ..
+        })
+    ));
 }
 
 #[test]
