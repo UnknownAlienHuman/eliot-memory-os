@@ -2249,7 +2249,31 @@ mod tests {
         let first = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         let second = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         assert_eq!(first, second);
-        assert_eq!(first.records[0].key, "source.head");
+        // Sortedness is asserted over the WHOLE record vector, because the
+        // position of any single key is not a property this compiler promises.
+        // The previous expectation of `"source.head"` at index 0 was stale:
+        // `ensure_product_identity_coverage` inserts the `identity.*` product
+        // coverage rows ahead of the supplied record, and `identity.*` sorts
+        // before `source.head`, so a positional literal asserted a fact about
+        // the coverage key set rather than about determinism or ordering.
+        let keys: Vec<&str> = first
+            .records
+            .iter()
+            .map(|record| record.key.as_str())
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort_unstable();
+        assert_eq!(keys, sorted_keys, "compiled records are not sorted");
+        // The supplied record must still survive compilation; this is the part
+        // of the original expectation that was genuinely about the fixture, so
+        // it is kept - as presence rather than as a position.
+        assert!(
+            first
+                .records
+                .iter()
+                .any(|record| record.key == "source.head"),
+            "the supplied evidence record must survive compilation"
+        );
         first.validate()?;
         Ok(())
     }
@@ -2810,10 +2834,29 @@ mod tests {
                 .all(|row| row.state == SupportObservationState::Unknown)
         );
         assert!(snapshot.support_rows.is_empty());
-        assert_eq!(
-            snapshot.records[0].evaluation,
-            EvidenceEvaluation::VerifierBacked
-        );
+        // `compile_legacy_flat_partial` promises the legacy record label is
+        // "preserved byte-identically on its record". That promise is about the
+        // RECORD NAMED `source.head`, not about a vector position: the
+        // `identity.*` product-coverage rows sort ahead of it, so indexing
+        // position 0 observes a synthesised `Unknown` row instead. The label is
+        // therefore looked up by key, which is what the doc comment commits to,
+        // and the synthesised coverage rows are asserted to stay `Unknown` so
+        // the lookup cannot pass by reading one of them.
+        let legacy_record = snapshot
+            .records
+            .iter()
+            .find(|record| record.key == "source.head")
+            .ok_or("the legacy source.head record must survive the import")?;
+        assert_eq!(legacy_record.evaluation, EvidenceEvaluation::VerifierBacked);
+        for record in &snapshot.records {
+            if record.key != "source.head" {
+                assert_eq!(
+                    record.evaluation,
+                    EvidenceEvaluation::Unknown,
+                    "an unobserved product-identity coverage row must stay UNKNOWN, not inherit the legacy label"
+                );
+            }
+        }
         assert!(
             !snapshot
                 .domain_coverage
