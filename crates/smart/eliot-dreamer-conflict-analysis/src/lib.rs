@@ -2163,23 +2163,36 @@ impl CanonicalComparisonPair {
             commitment.profile_digest()
         );
         for entry in &self.dimensions {
-            let value = match &entry.outcome {
-                CanonicalDimensionOutcome::Equal { value } => value.clone(),
+            // The outcome VARIANT is part of the identity, not decoration.
+            // Without it this spelling committed only `dimension:value`, so an
+            // `Equal { value: "x" }`, an `Unnormalizable { reason: "x" }` and a
+            // `Differing` whose value for THIS position is "x" all produced the
+            // same bytes for the same source: an encoding collision that let one
+            // canonical key name three different declarations. The tag is
+            // length-prefixed like every other field so it cannot be confused
+            // with the dimension name that follows it.
+            let (variant, value) = match &entry.outcome {
+                CanonicalDimensionOutcome::Equal { value } => ("equal", value.clone()),
                 CanonicalDimensionOutcome::Differing {
                     first_value,
                     second_value,
-                } => {
+                } => (
+                    "differing",
                     if position == 0 {
                         first_value.clone()
                     } else {
                         second_value.clone()
-                    }
+                    },
+                ),
+                CanonicalDimensionOutcome::Unnormalizable { reason } => {
+                    ("unnormalizable", reason.clone())
                 }
-                CanonicalDimensionOutcome::Unnormalizable { reason } => reason.clone(),
             };
             let _ = write!(
                 key,
-                "|{}:{}:{}:{}",
+                "|{}:{}|{}:{}|{}:{}",
+                variant.len(),
+                variant,
                 entry.dimension.as_str().len(),
                 entry.dimension.as_str(),
                 value.len(),
@@ -5821,6 +5834,50 @@ fn rival_denominator_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> 
     parts
 }
 
+/// Commits one position's EMITTED typed compatibility mapping.
+///
+/// `PositionCompatibility` is what the candidate actually serializes, so it is
+/// what the candidate identity must bind. Each entry contributes its derived
+/// relation, its supplement ceiling, its coverage, its three derived dimension
+/// sets, its bounded derivation note, and every dimension outcome in the exact
+/// spelling the digest already uses elsewhere
+/// ([`dimension_outcome_spelling`]), which is length-prefixed and, for a
+/// differing pair, order-independent. An absent comparison contributes nothing
+/// and is never read as an equal condition.
+fn compatibility_digest_parts(position: &PositionAnalysis) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for entry in &position.compatibility {
+        let peer = format!("{}:{}", position.position_index, entry.other_source);
+        parts.push(format!(
+            "compatibility:{peer}:{}:{}:{}",
+            entry.relation.as_str(),
+            entry.supplement_version.as_str(),
+            coverage_spelling(entry.coverage),
+        ));
+        parts.push(format!(
+            "differing:{peer}:{}",
+            spell_dimensions(&entry.differing_dimensions)
+        ));
+        parts.push(format!(
+            "unnormalizable:{peer}:{}",
+            spell_dimensions(&entry.unnormalizable_dimensions)
+        ));
+        parts.push(format!(
+            "unsupported:{peer}:{}",
+            spell_dimensions(&entry.unsupported_dimensions)
+        ));
+        parts.push(format!("derivation:{peer}:{}", entry.derivation_note));
+        for outcome in &entry.outcomes {
+            parts.push(format!(
+                "outcome:{peer}:{}:{}",
+                outcome.dimension.as_str(),
+                dimension_outcome_spelling(&outcome.outcome)
+            ));
+        }
+    }
+    parts
+}
+
 /// Computes the deterministic digest binding the analyzed inputs.
 pub fn compute_candidate_digest(
     conflict_set: &ConflictSet,
@@ -5866,6 +5923,16 @@ pub fn compute_candidate_digest(
             for class in classes {
                 parts.push(format!("class:{}:{class}", position.position_index));
             }
+            // The EMITTED typed mapping, not just its prose note.
+            //
+            // `compatibility_note` is a rendered sentence; it was the only
+            // comparison projection this digest committed, so two candidates
+            // whose emitted `PositionCompatibility` differed - a different
+            // derived relation, a different coverage, a different differing or
+            // unnormalizable set, a different supplement ceiling - could share
+            // one digest. That is the defect this issue is named for: one
+            // candidate digest must name exactly one serialized output.
+            parts.extend(compatibility_digest_parts(position));
         }
         index = index.saturating_add(1);
     }
@@ -12371,6 +12438,237 @@ mod tests {
             blocked.recommended_probes.is_empty(),
             "a cancelled request is handed an empty probe list: {}",
             blocked.recommended_probes.len()
+        );
+    }
+
+    /// Returns a legacy declaration whose eight canonical dimensions carry the
+    /// supplied outcome for the named dimension and `Equal` elsewhere.
+    fn test_supplied_comparison_with(
+        left: &str,
+        right: &str,
+        dimension: ComparisonDimension,
+        outcome: &DimensionOutcome,
+    ) -> SuppliedComparison {
+        let dimensions: Vec<DimensionComparison> = COMPARISON_DIMENSIONS
+            .iter()
+            .map(|entry| DimensionComparison {
+                dimension: *entry,
+                outcome: if *entry == dimension {
+                    outcome.clone()
+                } else {
+                    DimensionOutcome::Equal {
+                        value: format!("shared-{}", entry.as_str()),
+                    }
+                },
+            })
+            .collect();
+        SuppliedComparison {
+            left_source: left.to_owned(),
+            right_source: right.to_owned(),
+            dimensions,
+        }
+    }
+
+    /// Returns a commitment bound to one source handle for pair identity tests.
+    fn test_pair_commitment(source: &str) -> SourceRecordCommitment {
+        let profile = test_owner_profile();
+        SourceRecordCommitment::new(
+            source,
+            &test_member_digest(source),
+            &profile.profile_id,
+            &profile.definition_digest,
+        )
+        .expect("valid pair commitment")
+    }
+
+    /// AUDIT-DEFECT-2 (#2870): `canonical_position_key` committed the
+    /// dimension and the position's own value but NOT the outcome variant, so
+    /// three different declarations of the same dimension spelled the same key
+    /// for the same source. That is an encoding collision in the pair identity,
+    /// not a cryptographic collision, and it lets one canonical key name two
+    /// different comparison pairs.
+    #[test]
+    fn case_69_canonical_pair_key_separates_the_outcome_variants() {
+        let left = "source-a";
+        let right = "source-b";
+        let dimension = ComparisonDimension::ScopePopulationEnvironment;
+
+        let equal = CanonicalComparisonPair::from_supplied(
+            &test_supplied_comparison_with(
+                left,
+                right,
+                dimension,
+                &DimensionOutcome::Equal {
+                    value: "same-scope".to_owned(),
+                },
+            ),
+            &test_pair_commitment(left),
+            &test_pair_commitment(right),
+        )
+        .expect("an equal declaration is a valid canonical pair");
+
+        let unnormalizable = CanonicalComparisonPair::from_supplied(
+            &test_supplied_comparison_with(
+                left,
+                right,
+                dimension,
+                &DimensionOutcome::Unnormalizable {
+                    reason: "same-scope".to_owned(),
+                },
+            ),
+            &test_pair_commitment(left),
+            &test_pair_commitment(right),
+        )
+        .expect("an unnormalizable declaration is a valid canonical pair");
+
+        let differing = CanonicalComparisonPair::from_supplied(
+            &test_supplied_comparison_with(
+                left,
+                right,
+                dimension,
+                &DimensionOutcome::Differing {
+                    left: "same-scope".to_owned(),
+                    right: "other-scope".to_owned(),
+                },
+            ),
+            &test_pair_commitment(left),
+            &test_pair_commitment(right),
+        )
+        .expect("a differing declaration is a valid canonical pair");
+
+        assert_ne!(
+            equal.canonical_key(),
+            unnormalizable.canonical_key(),
+            "an equal value and an unnormalizable reason must not share one canonical key"
+        );
+        assert_ne!(
+            equal.canonical_key(),
+            differing.canonical_key(),
+            "a value that differs for the other position must not share one canonical key"
+        );
+        assert_ne!(
+            unnormalizable.canonical_key(),
+            differing.canonical_key(),
+            "an unnormalizable reason and a differing value must not share one canonical key"
+        );
+
+        // The declared property still holds: the mirrored declaration of the
+        // SAME pair normalizes to the same key, so the fix separates variants
+        // without making the key orientation-sensitive.
+        let mirrored = CanonicalComparisonPair::from_supplied(
+            &test_supplied_comparison_with(
+                right,
+                left,
+                dimension,
+                &DimensionOutcome::Differing {
+                    left: "other-scope".to_owned(),
+                    right: "same-scope".to_owned(),
+                },
+            ),
+            &test_pair_commitment(right),
+            &test_pair_commitment(left),
+        )
+        .expect("the mirrored declaration is one valid canonical pair");
+        assert_eq!(
+            differing.canonical_key(),
+            mirrored.canonical_key(),
+            "the mirrored declaration of one pair must keep one canonical key"
+        );
+    }
+
+    /// AUDIT-DEFECT-1 (#2870): `compute_candidate_digest` committed
+    /// `position.compatibility_note` (prose) but never the typed
+    /// `position.compatibility` mapping the candidate actually emits. Two
+    /// candidates whose emitted mapping differs therefore shared one digest,
+    /// which is exactly "one candidate digest names more than one output".
+    ///
+    /// This row drives the digest function directly, so it cannot pass by
+    /// accident on a fixture that happens to be refused upstream: the ONLY
+    /// difference between the two inputs is the emitted typed mapping.
+    #[test]
+    fn case_70_candidate_digest_commits_the_emitted_compatibility_mapping() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let mut supplements = test_supplements();
+        // The default fixture declares no comparison at all, so it emits no
+        // typed mapping; an owner-issued comparison is what produces one.
+        supplements.owner_records =
+            test_owner_records(Some(ComparisonDimension::ScopePopulationEnvironment));
+        let policy = test_policy();
+
+        let candidate =
+            analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy)
+                .expect("the baseline analysis must succeed");
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .any(|position| !position.compatibility.is_empty()),
+            "the baseline analysis must emit a typed compatibility mapping to prove anything"
+        );
+
+        let base_digest = compute_candidate_digest(
+            &conflict,
+            &supplements,
+            &policy,
+            &candidate.positions,
+            &candidate.recommended_probes,
+            &candidate.recommended_owner,
+            candidate.outcome.as_str(),
+        )
+        .expect("the baseline digest must compute");
+        assert_eq!(
+            base_digest, candidate.candidate_digest,
+            "the recomputed digest must equal the one the candidate carries"
+        );
+
+        // Change ONLY the emitted typed mapping of one position. Every other
+        // committed input, including the prose `compatibility_note`, is
+        // untouched.
+        let mut tampered_positions = candidate.positions.clone();
+        let target = tampered_positions
+            .iter_mut()
+            .find(|position| !position.compatibility.is_empty())
+            .expect("a position carrying a mapping must exist");
+        let note_before = target.compatibility_note.clone();
+        let relation_before = target.compatibility[0].relation;
+        target.compatibility[0].relation = match relation_before {
+            CompatibilityRelation::TypedDifference => CompatibilityRelation::EqualConditions,
+            CompatibilityRelation::EqualConditions => CompatibilityRelation::TypedDifference,
+            // `Ambiguous` has no distinct counterpart to flip to, so the
+            // coverage cell below carries the change instead. Naming the
+            // variant rather than binding a wildcard keeps a future fourth
+            // relation from silently passing through untampered.
+            relation @ CompatibilityRelation::Ambiguous => relation,
+        };
+        if target.compatibility[0].relation == relation_before {
+            target.compatibility[0].coverage = EvidenceCoverage::Unknown;
+        }
+        assert_eq!(
+            target.compatibility_note, note_before,
+            "this row must change the typed mapping only, never the prose note"
+        );
+        assert!(
+            target.compatibility[0].relation != relation_before
+                || target.compatibility[0].coverage != EvidenceCoverage::Unknown,
+            "the fixture must actually change the emitted mapping"
+        );
+
+        let tampered_digest = compute_candidate_digest(
+            &conflict,
+            &supplements,
+            &policy,
+            &tampered_positions,
+            &candidate.recommended_probes,
+            &candidate.recommended_owner,
+            candidate.outcome.as_str(),
+        )
+        .expect("the tampered digest must compute");
+        assert_ne!(
+            base_digest, tampered_digest,
+            "a changed emitted compatibility mapping must move the candidate digest"
         );
     }
 }
