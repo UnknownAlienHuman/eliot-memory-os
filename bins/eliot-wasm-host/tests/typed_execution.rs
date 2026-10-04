@@ -20,11 +20,12 @@
 //!   `ModuleTestCapsule` run for real; those guarantees are defined to deny
 //!   BEFORE any engine, filesystem or provider work, so proving them needs no
 //!   engine.
-//! - **source guard**: only where the guarantee is a property of the
-//!   read-only owner files that no public API can observe. Case 26 is the
-//!   declared source-guard case; the two smaller guards (the typed leaf
-//!   walkers and the "no synchronous compile-cancellation claim") are marked
-//!   inline at their use site.
+//! - **source guard**: only where the guarantee is a property of an owner
+//!   file's text that no public API can observe. Case 26 is the declared
+//!   whole-file source-guard case; every other case that needs one marks its
+//!   own narrower guard inline at its use site (the typed leaf walkers in
+//!   case 9, the "no synchronous compile-cancellation claim" in case 14, the
+//!   cache-identity composition in case 22, and the rest).
 //!
 //! INTEGRATION-TEST BOUNDARY: the capsule-domain entry
 //! `execute_capsule_domain_experimental` takes a `&TypedDomainRequest`, whose
@@ -33,9 +34,9 @@
 //! `src/lib.rs`), so this external test cannot construct that request. The
 //! in-crate `six_world_capsule_drive::every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
 //! test constructs the requests and drives both domain entries for all six
-//! worlds through the real engine. Case 3 below separately binds each
-//! checked-in fixture to its neutral kit/capsule and executes its real
-//! `describe` export in this integration-test binary.
+//! worlds through the real engine. Case 3 below separately binds each frozen
+//! world's checked-in fixture to its neutral kit/capsule and executes that
+//! fixture's real `describe` export in this integration-test binary.
 
 use std::path::Path;
 
@@ -55,9 +56,12 @@ use eliot_wasm_runtime::{
     CancellationPolicy, CapabilityId, InvocationLimits, ProofStage, Sha256Digest,
 };
 
-// Read-only owner files inspected by the declared source-guard case 26 and by
-// the two inline source guards. `include_str!` reads them at build time; none
-// of them is mutated by this lane.
+// Owner files this file's source guards inspect. `include_str!` reads them at
+// build time, and each guard pins an exact source string, so a guard moves when
+// its owner file moves. `typed_execution.rs` and `receipt_bridge.rs` are this
+// lane's own #758 edit targets; `wasmtime_provider.rs`,
+// `artifact_preflight.rs`, `typed_bindings.rs`, both manifests and
+// `capsule.rs` are read only here.
 const TYPED_EXECUTION_SOURCE: &str = include_str!("../src/typed_execution.rs");
 const TYPED_BINDINGS_SOURCE: &str = include_str!("../src/typed_bindings.rs");
 const ARTIFACT_PREFLIGHT_SOURCE: &str = include_str!("../src/artifact_preflight.rs");
@@ -115,8 +119,9 @@ fn parse_component(text: &str) -> Vec<u8> {
     }
 }
 
-/// Checked-in fixture path. One file per `TypedWorld`, plus the checked-in
-/// NEGATIVE fixtures the same directory carries.
+/// Checked-in fixture path. One file per `TypedWorld`, plus the other
+/// checked-in fixtures the same directory carries (the hostile and
+/// over-reporting ones).
 fn fixture_file(name: &str) -> String {
     format!("tests/data/typed-components/{name}.wat")
 }
@@ -266,8 +271,8 @@ fn cooperative_cue_artifact() -> Vec<u8> {
     cue_activation_artifact(&cooperative_guest(), &CueOptions::default())
 }
 
-/// The real checked-in `dreamer-cycle` fixture: the honest world component the
-/// negative fixtures in the same directory are derived from.
+/// The real checked-in `dreamer-cycle` fixture: the honest world component most
+/// of the negative fixtures in the same directory are derived from.
 fn real_cycle_fixture() -> Vec<u8> {
     load_fixture(TypedWorld::DreamerCycle)
 }
@@ -314,8 +319,9 @@ const DEFAULT_DOMAIN_DECL: &str = "(func $activate (type $ca-activate)\n    \
 ///   `realloc_offset` is the end of the last segment and is exactly the single
 ///   pointer `$realloc` hands out, so nothing is ever allocated above it;
 /// - measured over every descriptor this file builds, `realloc_offset` is at
-///   most 193 bytes (the longest field set is case 24's planted secret), so a
-///   block at `[1024, 1068)` clears the data segments by 831 bytes and stays
+///   most 190 bytes (the longest field set is case 24's planted secret: 16
+///   + 14 + 19 + 54 + 23 + 64), so a
+///   block at `[1024, 1068)` clears the data segments by 834 bytes and stays
 ///   inside the single declared page (65536 bytes).
 ///
 /// `cue_activation_artifact` asserts that measured invariant, so a future
@@ -447,8 +453,8 @@ fn cue_activation_artifact(fields: &TypedDescriptor, options: &CueOptions) -> Ve
     // A SECOND defined memory in the SAME core module. Multi-memory is
     // compiled on by default in the pinned engine (`Config::wasm_multi_memory`
     // is documented `true` by default at wasmtime-47.0.4 `src/config.rs:1186`
-    // and `build_engine` at `src/wasmtime_provider.rs:800-805` never disables
-    // it), so this component is VALID and reaches instantiation; only the
+    // and `configured_engine` at `src/wasmtime_provider.rs:792-806` never
+    // disables it), so this component is VALID and reaches instantiation; only the
     // Store's memory COUNT can refuse it. The extra memory is unreferenced and
     // unexported, so every alias, export and body in the template is unchanged:
     // the one difference between this fixture and the cooperative one is the
@@ -1639,9 +1645,10 @@ fn memory_growth_and_memory_count_bounds_are_enforced() {
     // ceiling by this Host; and `map_instantiate_error`
     // (`src/typed_execution.rs:1305-1338`, `fn map_instantiate_error`) cannot
     // classify it either --
-    // `is_instance_limit_error` needs "instance" in the message
-    // (`src/wasmtime_provider.rs:767-770`) and a `bail!` message is not a
-    // `wasmtime::Trap`, so `trap_termination` returns `None` and the message
+    // `is_instance_limit_error` requires "instance" in the message
+    // (`src/wasmtime_provider.rs:767-770`) and the memory-count bail spells
+    // "memory count too high", so the check misses; a `bail!` message is not a
+    // `wasmtime::Trap`, so `trap_termination` returns `None`; and the message
     // matches none of "import"/"export"/"missing"/"type".
     //
     // So the real, observable denial is the staged GENERIC component-error
@@ -1763,8 +1770,8 @@ fn a_guest_typed_error_is_distinct_from_a_trap() {
     // `six_world_capsule_drive::assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap`,
     // called from
     // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
-    // (`src/typed_execution.rs:5192`,
-    // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
+    // (`src/typed_execution.rs:5656-5657` declares the test, `:5676` is the
+    // call: `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`
     // -> `assert_guest_typed_error_is_a_distinct_executed_outcome_from_a_trap`).
     // It cannot live in any `tests/` target,
     // and that is a reachability fact rather than a preference: the domain
@@ -1774,7 +1781,7 @@ fn a_guest_typed_error_is_distinct_from_a_trap() {
     // and cannot reach either domain entry at all (the crate states this in the
     // comment above
     // `every_frozen_world_executes_its_real_domain_export_through_the_neutral_capsule`,
-    // `src/typed_execution.rs:5165-5171`, line 5168: "`mod typed_bindings`
+    // `src/typed_execution.rs:5649-5655`, line 5652: "`mod typed_bindings`
     // is private in `src/lib.rs`"). That helper decides the typed-`Err`
     // branch from executed values only — the retained terminal result and the
     // terminal a terminated guest never produces. None of that is restated or

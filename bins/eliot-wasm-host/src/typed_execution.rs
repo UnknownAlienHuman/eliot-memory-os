@@ -4070,6 +4070,7 @@ mod six_world_capsule_drive {
         execute_describe_experimental, execute_domain_experimental, preflight_bytes,
         typed_wit_digest,
     };
+    use crate::contour::PINNED_WASMTIME_VERSION;
     use crate::typed_bindings::context_admission::exports::eliot::current::admission as admission_wit;
     use crate::typed_bindings::context_assembly::exports::eliot::current::assembly as assembly_wit;
     use crate::typed_bindings::cue_activation::exports::eliot::current::activation as activation_wit;
@@ -4077,7 +4078,9 @@ mod six_world_capsule_drive {
     use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler as handler_wit;
     use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen as screen_wit;
     use crate::typed_bindings::{TYPED_PACKAGE_ID, export_matches_interface};
-    use eliot_wasm_runtime::component_contract::{AbiDescriptor, TypedWorld as NeutralWorld};
+    use eliot_wasm_runtime::component_contract::{
+        AbiDescriptor, TYPED_ENGINE_VERSION, TypedWorld as NeutralWorld,
+    };
     use eliot_wasm_runtime::{CapabilityId, InvocationLimits, ProofStage};
 
     /// Admitted identity leaves. Two printable bytes each; every request record
@@ -4668,6 +4671,115 @@ mod six_world_capsule_drive {
         assert_eq!(drive.admitted.proof_ceiling, drive.kit.proof_ceiling);
     }
 
+    /// The identity leaves one world's returned record carries. `None` means that
+    /// world's frozen WIT result record declares no such leaf, so there is
+    /// nothing to read back and nothing is asserted for it.
+    struct GuestEcho<'a> {
+        operation_id: Option<&'a str>,
+        task_id: Option<&'a str>,
+        fence_epoch: Option<&'a str>,
+    }
+
+    impl GuestEcho<'_> {
+        const fn none() -> Self {
+            Self {
+                operation_id: None,
+                task_id: None,
+                fence_epoch: None,
+            }
+        }
+    }
+
+    /// The identity leaves the GUEST itself returned in its result record, read
+    /// back out of the retained typed outcome.
+    ///
+    /// This is deliberately NOT this module's `OPERATION_ID`/`TASK_ID`/
+    /// `FENCE_EPOCH` constants. Those old comparisons were not unfalsifiable; a
+    /// production edit at the receipt-construction lines would have failed them.
+    /// But each reduced to a COPY check: the receipt's identity fields are
+    /// assigned from the admitted record at :2146-2149, and the admitted record is
+    /// built from those same constants at :4261-4270, so the expected side was a
+    /// constant the host already shared with the value under test. Reading the
+    /// value back out of the guest's own returned record makes the expected side an
+    /// OBSERVED value with a second origin: the bytes the guest wrote into its own
+    /// linear memory, which production lifts in `check_result` (`check_echo`,
+    /// :890-899). The comparison can then distinguish "the receipt carries what the
+    /// guest returned" from "the receipt carries a value that happens to equal our
+    /// own constant".
+    ///
+    /// Each leaf is an `Option` because the six frozen WIT result records do
+    /// not declare the same fields: the activation world spells its echoed
+    /// operation identity `request-id` (`activation-result-body`,
+    /// wit/typed/cue-activation.wit:105) and declares no task or fence leaf at
+    /// all (:104-114); `handler-result-body`
+    /// (wit/typed/dreamer-handler.wit:466-475) declares only `operation-id`
+    /// among the three; and `cycle-step-result`
+    /// (wit/typed/dreamer-cycle.wit:133-144) carries `fence-epoch` only inside
+    /// its `state` record (:124), not at the top level. `admission-result`'s
+    /// `incomplete` case (`wit/typed/context-admission.wit:538`) declares no
+    /// identity leaf either, so a world returning that case reads back as all
+    /// `None` rather than inventing a value; the caller's guard is what turns
+    /// that into the honest failure "this world returned no identity record"
+    /// instead of a `Some`-versus-`None` mismatch against the host's own copy.
+    fn guest_echo(world: TypedWorld, result: &TypedDomainResult) -> GuestEcho<'_> {
+        let TypedDomainResult::Outcome(outcome) = result else {
+            panic!("#758/3 only a retained outcome carries a guest-returned identity");
+        };
+        match (world, outcome.as_ref()) {
+            (TypedWorld::ContextAdmission, TypedDomainOutcome::Admission(value)) => {
+                match value.as_ref() {
+                    admission_wit::AdmissionResult::Admitted(set) => GuestEcho {
+                        operation_id: Some(set.operation_id.as_str()),
+                        task_id: Some(set.task_id.as_str()),
+                        fence_epoch: Some(set.fence_epoch.as_str()),
+                    },
+                    admission_wit::AdmissionResult::Incomplete(_) => GuestEcho::none(),
+                }
+            }
+            (TypedWorld::ContextAssembly, TypedDomainOutcome::Assembly(value)) => {
+                let assembly_wit::AssemblyResult::Assembled(view) = value.as_ref();
+                GuestEcho {
+                    operation_id: Some(view.operation_id.as_str()),
+                    task_id: Some(view.task_id.as_str()),
+                    fence_epoch: Some(view.fence_epoch.as_str()),
+                }
+            }
+            (TypedWorld::CueActivation, TypedDomainOutcome::CueActivation(value)) => {
+                let activation_wit::ActivationOutcome::Activated(body) = value.as_ref();
+                GuestEcho {
+                    operation_id: Some(body.request_id.as_str()),
+                    task_id: None,
+                    fence_epoch: None,
+                }
+            }
+            (TypedWorld::DreamerHandler, TypedDomainOutcome::DreamerHandler(value)) => {
+                let handler_wit::HandlerOutcome::Handled(body) = value.as_ref();
+                GuestEcho {
+                    operation_id: Some(body.operation_id.as_str()),
+                    task_id: None,
+                    fence_epoch: None,
+                }
+            }
+            (TypedWorld::MemoryCurationScreen, TypedDomainOutcome::MemoryCurationScreen(value)) => {
+                let screen_wit::ScreenOutcome::Screened(body) = value.as_ref();
+                GuestEcho {
+                    operation_id: Some(body.operation_id.as_str()),
+                    task_id: Some(body.task_id.as_str()),
+                    fence_epoch: Some(body.fence_epoch.as_str()),
+                }
+            }
+            (TypedWorld::DreamerCycle, TypedDomainOutcome::DreamerCycle(value)) => {
+                let cycle_wit::CycleOutcome::Stepped(body) = value.as_ref();
+                GuestEcho {
+                    operation_id: Some(body.operation_id.as_str()),
+                    task_id: None,
+                    fence_epoch: Some(body.state.fence_epoch.as_str()),
+                }
+            }
+            _ => panic!("#758/3 a foreign world's outcome reached the identity read-back"),
+        }
+    }
+
     /// The host receipt the one real typed invocation actually produced, bound
     /// to this world's own artifact, ABI and admitted identity.
     ///
@@ -4677,18 +4789,58 @@ mod six_world_capsule_drive {
     /// expression it was assigned from. `receipt.terminal == "Completed"`
     /// stands on its own instead — a `GuestError` call reaching this helper
     /// fails it.
-    fn assert_host_receipt(drive: &WorldDrive, receipt: &TypedReceipt) {
+    ///
+    /// The retained `result` IS a parameter, because the identity leaves below
+    /// are compared against the identity the guest itself returned rather than
+    /// against this module's own literals; see the block comment at the
+    /// `guest_echo` call for the vacuity proof that forced that.
+    fn assert_host_receipt(drive: &WorldDrive, receipt: &TypedReceipt, result: &TypedDomainResult) {
         assert_eq!(receipt.world, drive.world.world_name());
         assert_eq!(receipt.package_id, TYPED_PACKAGE_ID);
         assert_eq!(receipt.proof, ExecutionMode::LocalExperimental.proof());
         assert_eq!(receipt.artifact_digest, drive.digest);
         assert_eq!(receipt.artifact_bytes, drive.byte_len);
-        // `receipt.engine_version` is deliberately NOT asserted here: it is
-        // assigned `ENGINE_VERSION.to_owned()` at both receipt construction
-        // sites (:1032 and :2133), so comparing it against that same constant
-        // is a self-comparison that no production change can fail.
-        // `tests/typed_execution.rs` asserts the receipt's engine version
-        // against independent sources instead, which is the only form that can.
+        // `receipt.engine_version` is bound to the two INDEPENDENT declarations
+        // of the pinned engine generation, never to `super::ENGINE_VERSION`.
+        //
+        // PROVENANCE, stated exactly. There was NO assertion on this field
+        // before this one. HEAD carried a comment in its place, recording a
+        // deliberate NON-assertion, and its text was:
+        //
+        //   "`receipt.engine_version` is deliberately NOT asserted here: it is
+        //    assigned `ENGINE_VERSION.to_owned()` at both receipt construction
+        //    sites (:1032 and :2133), so comparing it against that same constant
+        //    is a self-comparison that no production change can fail.
+        //    `tests/typed_execution.rs` asserts the receipt's engine version
+        //    against independent sources instead, which is the only form that
+        //    can."
+        //
+        // The reasoning in that comment about the self-comparison was correct,
+        // and this change does not reinstate the self-comparison it rejected.
+        // But the conclusion drawn from it — that `tests/typed_execution.rs`
+        // covers the field "instead", so nothing is lost here — did not hold for
+        // THIS lane: the six-world capsule drive builds and reads the host
+        // receipt only in-crate, and it is the only caller of these helpers, so
+        // the in-crate non-assertion left the whole domain lane with no
+        // comparison of `receipt.engine_version` at all. That is a coverage
+        // hole, not a proof: an identity that is bound but never compared BY
+        // VALUE is unproven.
+        //
+        // The two sides come from different owners and can differ:
+        //   - `crate::contour::PINNED_WASMTIME_VERSION` (src/contour.rs:49), the
+        //     package's own I14.19 baseline pin, documented there as "Must
+        //     match the exact workspace pin";
+        //   - `eliot_wasm_runtime::component_contract::TYPED_ENGINE_VERSION`
+        //     (crates/modules/eliot-wasm-runtime/src/component_contract.rs:37),
+        //     the neutral #760 contract's own pin, which production itself
+        //     compares a real engine binding against at
+        //     component_contract.rs:502 and capsule.rs:153.
+        // Both are separate declarations from the `ENGINE_VERSION` constant at
+        // :40 that the field is assigned from, so a drift between this receipt's
+        // reported engine version and either owner's pin fails here — which the
+        // in-crate non-assertion could not detect at all.
+        assert_eq!(receipt.engine_version, PINNED_WASMTIME_VERSION);
+        assert_eq!(receipt.engine_version, TYPED_ENGINE_VERSION);
         assert_eq!(receipt.wit_digest, typed_wit_digest());
         assert!(receipt.actual_imports.is_empty());
         // `actual_exports` is the component's REAL export name, copied
@@ -4710,9 +4862,106 @@ mod six_world_capsule_drive {
             receipt.actual_exports[0]
         );
         assert_eq!(receipt.instances, 1);
-        assert_eq!(receipt.operation_id.as_deref(), Some(OPERATION_ID));
-        assert_eq!(receipt.task_id.as_deref(), Some(TASK_ID));
-        assert_eq!(receipt.fence_epoch.as_deref(), Some(FENCE_EPOCH));
+
+        // The identity leaves below used to be compared against this module's OWN
+        // literals (`OPERATION_ID`, `TASK_ID`, `FENCE_EPOCH`, :4088-4092).
+        //
+        // Those assertions were WEAKER than they looked, but they were not
+        // unfalsifiable, and the honest description is narrower than "a
+        // tautology". Each reduced, TRANSITIVELY, to a copy check rather than a
+        // binding check: production's `check_echo` already forces the guest's
+        // returned value to equal the admitted value upstream (:3449, :3503,
+        // :3543, :3566, :3586, :3612 for `operation-id`, and the parallel sites
+        // for the other leaves), and the admitted record is built from those
+        // same module literals (`admitted_record`, :4261-4270). So
+        // `receipt.<leaf> == <module literal>` confirmed that the receipt copy
+        // matched a constant, and could not distinguish "production echoed the
+        // admitted identity" from "production echoed a value that happens to
+        // equal the admitted identity".
+        //
+        // They WERE still falsifiable, and specifically against a change at the
+        // receipt-construction lines: a production edit at :2146-2149 assigning
+        // anything other than the admitted leaf would have failed the old
+        // assertion. So this is a strengthening of what the comparison can
+        // DISTINGUISH, not the repair of a check that could never fail.
+        //
+        // What it buys: the second side is now an OBSERVED value rather than a
+        // constant. It is read back out of the retained result record, so it is
+        // the value the guest wrote into its own linear memory and the host
+        // lifted, not a literal this module also used to build the request. The
+        // receipt copy at :2146-2149 is therefore compared against the guest's
+        // own returned bytes, and a future production change that stopped
+        // comparing an identity upstream — dropping or weakening a `check_echo`
+        // call — becomes visible here instead of hiding behind a constant that
+        // both sides already shared. `guest_echo` below is that read-back.
+        let echo = guest_echo(drive.world, result);
+        // Why `operation-id` is compared UNCONDITIONALLY and the other two
+        // conditionally: the conditional arms below exist only because those
+        // WIT result records declare no such leaf, so there is no value to read
+        // back and nothing to compare — `None` there is a property of the
+        // frozen WIT, not an observation about this call. `operation-id` has no
+        // such arm, so a `None` for it would NOT be a WIT fact but the
+        // assertion below failing on the host/guest split. This guard is what
+        // keeps that honest and makes the read-back total: a world that returns
+        // no identity record at all (reachable — `admission-result`'s
+        // `incomplete` case, wit/typed/context-admission.wit:538, declares no
+        // identity leaf) fails HERE with the true reason, instead of comparing
+        // the host's `Some(admitted.operation_id.clone())` (:2146) against a
+        // `None` and reporting a mismatch that has nothing to do with identity
+        // echo. A `None` therefore never silently bypasses this block: it is
+        // only tolerated per-leaf where the WIT declares no leaf, and a world
+        // that stops echoing fails the guard rather than skipping the compare.
+        assert!(
+            echo.operation_id.is_some() || echo.task_id.is_some() || echo.fence_epoch.is_some(),
+            "#758/3 {} returned no identity record to read back",
+            drive.world.world_name()
+        );
+        assert_eq!(receipt.operation_id.as_deref(), echo.operation_id);
+        // `task-id` and `fence-epoch` are compared only for the worlds whose
+        // own WIT result record declares them, because there is nothing to
+        // read back for the others: `admitted-context-set`
+        // (context-admission.wit:520 :523), `active-view`
+        // (context-assembly.wit:104 :106) and `screen-result-body`
+        // (memory-curation-screen.wit:103 :105) carry both, while
+        // `activation-result-body` (cue-activation.wit:104-114) and
+        // `handler-result-body` (dreamer-handler.wit:466-475) declare neither,
+        // and `cycle-step-result` (dreamer-cycle.wit:133-144) carries
+        // `fence-epoch` only inside `state` (:124). The `operation-id`
+        // comparison is unconditional and the other two are conditional
+        // because `None` is only ever tolerated per-leaf where the frozen WIT
+        // declares no such leaf; the guard immediately above the unconditional
+        // compare is what rules out a `None` that would mean anything else.
+        if let Some(task_id) = echo.task_id {
+            assert_eq!(receipt.task_id.as_deref(), Some(task_id));
+        }
+        if let Some(fence_epoch) = echo.fence_epoch {
+            assert_eq!(receipt.fence_epoch.as_deref(), Some(fence_epoch));
+        }
+        // `receipt.policy_id` is KEPT as a literal comparison, and it is the one
+        // identity leaf that CANNOT be rewired onto an observed value. The
+        // reason is structural, not a shortcut: no WIT RESULT record anywhere
+        // declares `policy-id`. The only declaration in the whole typed surface
+        // is `priority-policy.policy-id`
+        // (wit/typed/context-admission.wit:234), which sits in the REQUEST's
+        // `priority` field. The guest therefore has no `policy-id` to echo and
+        // the host has no observed value to compare against, so
+        // `guest_echo` cannot supply a second origin for this leaf and the
+        // module literal is the only available expected value.
+        //
+        // It is still worth asserting, and it is falsifiable: production assigns
+        // the field `Some(admitted.policy_id.clone())` at :2149, so a production
+        // edit at that line assigning anything else fails here. What it cannot
+        // do is prove the BINDING, only the copy, and that limitation is
+        // recorded rather than papered over. Card 758 line 26 forbids weakening
+        // a case, so the assertion stays and the gap is stated beside it.
+        //
+        // What production does verify about this leaf is real and is not lost
+        // with it: the field is shape-validated — non-empty, bounded by
+        // `MAX_DESCRIPTOR_STRING_BYTES`, and free of control characters
+        // (`TypedDomainAdmission::validate`, :163-181, where `policy_id` is the
+        // fifth checked leaf at :169) — and it is folded into the request's
+        // input digest (`input_digest`, :2370), so changing it changes the
+        // measured input binding.
         assert_eq!(receipt.policy_id.as_deref(), Some(POLICY_ID));
         assert_eq!(receipt.terminal, "Completed");
         assert!(receipt.input_bytes > 0);
@@ -4797,7 +5046,7 @@ mod six_world_capsule_drive {
             .map_err(|error| error.to_string()),
         );
 
-        assert_host_receipt(&drive, &receipt);
+        assert_host_receipt(&drive, &receipt, &result);
         // The retained terminal result is this world's own typed outcome.
         assert!(is_world_outcome(world, &result));
 
@@ -5162,6 +5411,241 @@ mod six_world_capsule_drive {
         assert_eq!(stepped.state.fence_epoch.as_str(), FENCE_EPOCH);
     }
 
+    /// The identity-echo REFUSAL half, the `operation-id` case: the REAL engine
+    /// runs a checked-in `dreamer-cycle` component that keeps every request-side
+    /// value honest but returns a FOREIGN `operation-id` in its result record,
+    /// and the host must DENY the result with its own typed denial at the
+    /// `Output` stage.
+    ///
+    /// This is the half no earlier leg proves. Every checked-in fixture the
+    /// six-world drive executes echoes the admitted identity honestly, so the
+    /// `check_echo` call sites were previously shown to EXECUTE but never to
+    /// DENY. The gate under test is `check_echo` (:890-899), whose whole body
+    /// is `if observed != admitted { return Err(OutputViolation(field)) }` —
+    /// the audit's governing point being that a predictable name is not
+    /// ownership, so only a foreign value exercises it.
+    ///
+    /// The production path, in call order:
+    ///   - `check_cycle_result` (:3605) is selected by `check_result`'s
+    ///     `TypedDomainOutcome::DreamerCycle` arm (:3433) and binds
+    ///     `let R::Stepped(body) = value;` (:3611);
+    ///   - `check_echo(&body.operation_id, &admitted.operation_id,
+    ///     "operation-id")?` at :3612 is the comparison that fires, returning
+    ///     `TypedExecutionError::OutputViolation("operation-id")`;
+    ///   - `execute_domain_lane` stages that failure at `TypedStage::Output`
+    ///     through `staged` (:2113-2114, `staged` at :782-791), producing
+    ///     `Staged { stage: Output, cause: Box::new(OutputViolation(..)) }` —
+    ///     note the `Box` on the cause field (:292).
+    ///
+    /// Nothing here reads the fixture's source text to decide which branch ran:
+    /// the branch is fixed by the destructuring `let Err(denial) = .. else`,
+    /// and every asserted value is the typed denial the host itself returned.
+    ///
+    /// Only in-crate code can observe this, for the same reachability reason as
+    /// the lifted-listing legs above: `check_result`'s echo gate is reached only
+    /// through `execute_domain_lane`, and `mod typed_bindings` is private in
+    /// `src/lib.rs`, so no `tests/` target can build the `TypedDomainRequest`
+    /// both domain entries require.
+    fn assert_foreign_result_operation_id_is_denied_by_the_echo_gate() {
+        // The checked-in hostile `dreamer-cycle` component. HONEST: the request
+        // side (the host builds that record from the admitted envelope, and
+        // `bound_dreamer_cycle_request`'s own `check_echo` sites pass), the
+        // `describe` export (copied verbatim from the honest sibling), and the
+        // result's `state.fence-epoch`, which this fixture still echoes out of
+        // the lowered request (`foreign-result-operation-id.wat:336-337`).
+        // FOREIGN: exactly one store pair, `cycle-step-result.operation-id`,
+        // which the fixture fills from its own 36-byte data-segment literal
+        // instead of the request (`foreign-result-operation-id.wat:313-314`,
+        // literal at :345). Because the forgery is result-side only, the first
+        // check that can fail is the :3612 echo comparison and not an earlier
+        // request-path check.
+        let world = TypedWorld::DreamerCycle;
+        let artifact = load_fixture_file("foreign-result-operation-id");
+        let preflight = must(preflight_bytes(&artifact));
+        let limits = default_experimental_limits(preflight.digest.clone());
+        let kit = world_kit(world, &artifact);
+        let capsule = world_capsule(world, &kit, &limits);
+        let admitted = admitted_record();
+
+        // A returned result is a failure here. The binding is what excludes
+        // every other outcome, not a later check: a guest's own typed `Err` is
+        // NOT an `Err` from this entry at all (`check_result` returns `Ok(())`
+        // for `GuestError`, :3437, so it is handed back as a retained terminal
+        // result), a trap is a staged `Engine` cause, and host success is the
+        // `Ok` arm this `let .. else` rejects.
+        let Err(denial) = execute_capsule_domain_experimental(
+            &kit,
+            &capsule,
+            &artifact,
+            &limits,
+            &world_request(world, &admitted),
+            &admitted,
+        ) else {
+            panic!("#758/3 a foreign result operation-id must be denied, not returned");
+        };
+
+        // EXECUTED VALUE: the host's own echo-ownership denial, whole. Only a
+        // `Staged` denial reaches these assertions at all, and both halves are
+        // compared against the exact production values rather than a wildcard,
+        // so a generic denial, a wrongly staged denial, or the adjacent
+        // lifted-list/string `LimitDenied` ceilings cannot satisfy them.
+        assert_eq!(
+            denial,
+            TypedExecutionError::Staged {
+                stage: TypedStage::Output,
+                cause: Box::new(TypedExecutionError::OutputViolation(
+                    "operation-id".to_owned()
+                )),
+            }
+        );
+        // The exact rendering, derived from the production `Display` impls and
+        // not guessed: `Staged` renders `STAGE:{stage}:{cause}` (:312),
+        // `OutputViolation` renders `OUTPUT_VIOLATION:{reason}` (:311), and
+        // `TypedStage::Output` renders `output` (as_str, :129).
+        assert_eq!(
+            denial.to_string(),
+            "STAGE:output:OUTPUT_VIOLATION:operation-id"
+        );
+
+        // POSITIVE CONTROL, so the denial above cannot pass for the wrong
+        // reason: the same world, the same kit-owned entry, the same admitted
+        // envelope over that world's HONEST checked-in fixture, whose `step`
+        // result echoes the admitted operation id out of the request. The very
+        // same `check_echo` at :3612 therefore accepts it and the one call
+        // completes.
+        let honest = load_fixture(world);
+        let honest_preflight = must(preflight_bytes(&honest));
+        let honest_limits = default_experimental_limits(honest_preflight.digest.clone());
+        let honest_kit = world_kit(world, &honest);
+        let honest_capsule = world_capsule(world, &honest_kit, &honest_limits);
+        let (_receipt, result, _) = must(
+            execute_capsule_domain_experimental(
+                &honest_kit,
+                &honest_capsule,
+                &honest,
+                &honest_limits,
+                &world_request(world, &admitted),
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        let TypedDomainResult::Outcome(outcome) = &result else {
+            panic!("#758/3 an honestly echoed operation-id must be the retained outcome");
+        };
+        let TypedDomainOutcome::DreamerCycle(outcome) = outcome.as_ref() else {
+            panic!("#758/3 the retained outcome must be this world's cycle outcome");
+        };
+        let cycle_wit::CycleOutcome::Stepped(stepped) = &**outcome;
+        // Read from the retained result, not from the fixture text: the honest
+        // fixture's returned operation id, which the same gate accepted.
+        assert_eq!(stepped.operation_id.as_str(), OPERATION_ID);
+    }
+
+    /// The identity-echo REFUSAL half, the `scope-id` case, and deliberately a
+    /// DIFFERENT world and a DIFFERENT production call site from the
+    /// `operation-id` case above: the REAL engine runs a checked-in
+    /// `memory-curation-screen` component that keeps every request-side value
+    /// honest but returns a FOREIGN `scope-id`, and the host must DENY it with
+    /// its own typed denial at `Output`.
+    ///
+    /// It is a separate world on purpose. `check_echo` has 37 call sites in
+    /// production, spread over the six per-world request binders and the six
+    /// per-world `check_*_result` functions, and one world's denial says
+    /// nothing about the other five; this case therefore also covers
+    /// `scope-id`, which the six-world drive never asserts at all because
+    /// `TypedReceipt` has no `scope_id` field to carry it.
+    ///
+    /// The production path:
+    ///   - `check_screen_result` (:3579) is selected by `check_result`'s
+    ///     `TypedDomainOutcome::MemoryCurationScreen` arm (:3430) and binds
+    ///     `let R::Screened(body) = value;` (:3585);
+    ///   - `check_echo(&body.scope_id, &admitted.scope_id, "scope-id")?` at
+    ///     :3588 fires, returning
+    ///     `TypedExecutionError::OutputViolation("scope-id")`;
+    ///   - `execute_domain_lane` stages it at `TypedStage::Output`
+    ///     (:2113-2114), giving `Staged { stage: Output, cause: Box::new(..) }`.
+    ///
+    /// The forged field is the LAST of the four echoes this world makes, so
+    /// the three honest echoes ahead of it (:3586 operation-id, :3587 task-id)
+    /// prove the gate was reached with everything else already accepted — the
+    /// `scope-id` gate specifically is what refuses, not a substitute.
+    ///
+    /// Only in-crate code can observe this, for the same reachability reason as
+    /// the leg above.
+    fn assert_foreign_result_scope_id_is_denied_by_the_echo_gate() {
+        // HONEST: the request side, the `describe` export, and the result's
+        // `operation-id`, `task-id` and `fence-epoch`, all echoed out of the
+        // lowered request
+        // (`foreign-result-scope-id.wat:331-342` and :356-361). FOREIGN:
+        // exactly one store pair, `screen-result-body.scope-id`, filled from
+        // this fixture's own 32-byte data-segment literal instead of the
+        // request (`foreign-result-scope-id.wat:354-355`, literal at :369).
+        let world = TypedWorld::MemoryCurationScreen;
+        let artifact = load_fixture_file("foreign-result-scope-id");
+        let preflight = must(preflight_bytes(&artifact));
+        let limits = default_experimental_limits(preflight.digest.clone());
+        let kit = world_kit(world, &artifact);
+        let capsule = world_capsule(world, &kit, &limits);
+        let admitted = admitted_record();
+
+        // Same binding as the case above, and for the same reasons: a guest
+        // typed `Err` is a retained result rather than an `Err` from this entry
+        // (:3437), a trap stages an `Engine` cause, and the `Ok` arm is the one
+        // this `let .. else` rejects.
+        let Err(denial) = execute_capsule_domain_experimental(
+            &kit,
+            &capsule,
+            &artifact,
+            &limits,
+            &world_request(world, &admitted),
+            &admitted,
+        ) else {
+            panic!("#758/4 a foreign result scope-id must be denied, not returned");
+        };
+
+        assert_eq!(
+            denial,
+            TypedExecutionError::Staged {
+                stage: TypedStage::Output,
+                cause: Box::new(TypedExecutionError::OutputViolation("scope-id".to_owned())),
+            }
+        );
+        // The exact rendering, from the same production `Display` impls (:311,
+        // :312 and `TypedStage::as_str`, :129).
+        assert_eq!(denial.to_string(), "STAGE:output:OUTPUT_VIOLATION:scope-id");
+
+        // POSITIVE CONTROL over this world's honest fixture, so the denial
+        // above cannot pass for the wrong reason: its `screen` result echoes all
+        // four identity fields honestly, so the very same `check_screen_result`
+        // accepts it and the one call completes.
+        let honest = load_fixture(world);
+        let honest_preflight = must(preflight_bytes(&honest));
+        let honest_limits = default_experimental_limits(honest_preflight.digest.clone());
+        let honest_kit = world_kit(world, &honest);
+        let honest_capsule = world_capsule(world, &honest_kit, &honest_limits);
+        let (_receipt, result, _) = must(
+            execute_capsule_domain_experimental(
+                &honest_kit,
+                &honest_capsule,
+                &honest,
+                &honest_limits,
+                &world_request(world, &admitted),
+                &admitted,
+            )
+            .map_err(|error| error.to_string()),
+        );
+        let TypedDomainResult::Outcome(outcome) = &result else {
+            panic!("#758/4 an honestly echoed scope-id must be the retained outcome");
+        };
+        let TypedDomainOutcome::MemoryCurationScreen(outcome) = outcome.as_ref() else {
+            panic!("#758/4 the retained outcome must be this world's screen outcome");
+        };
+        let screen_wit::ScreenOutcome::Screened(screened) = &**outcome;
+        // Read from the retained result, not from the fixture text: the honest
+        // fixture's returned scope id, which the same gate accepted.
+        assert_eq!(screened.scope_id.as_str(), SCOPE_ID);
+    }
+
     // No `WORK_UNIT_CASE` marker here on purpose: case 3 of #758 is marked once,
     // in the acceptance file `tests/typed_execution.rs`, so the declared
     // denominator stays exactly 1..26 with one marker per case. This in-crate
@@ -5204,6 +5688,21 @@ mod six_world_capsule_drive {
         // are executed here, next to the lifted-item denial they are distinct
         // from. No `WORK_UNIT_CASE` marker is added by this leg.
         assert_host_lifted_string_ceiling_denies_the_real_result();
+        // The identity-echo REFUSAL halves, beside the calls above for the same
+        // reachability reason: `check_echo` is reachable only through
+        // `execute_domain_lane`, and `mod typed_bindings` is private in
+        // `src/lib.rs`, so no `tests/` target can build the `TypedDomainRequest`
+        // both domain entries require. Every checked-in fixture the six-world
+        // drive executes echoes the admitted identity honestly, so without these
+        // two legs the `check_echo` sites would be shown to execute but never
+        // to deny. They run on two different worlds and two different
+        // production call sites (`check_cycle_result`'s `operation-id` and
+        // `check_screen_result`'s `scope-id`), each with its own exact typed
+        // denial, exact rendering and honest-fixture positive control. The one
+        // marker for case 3, and the one for case 4, both stay in
+        // `tests/typed_execution.rs`; no `WORK_UNIT_CASE` marker is added here.
+        assert_foreign_result_operation_id_is_denied_by_the_echo_gate();
+        assert_foreign_result_scope_id_is_denied_by_the_echo_gate();
     }
 
     /// Real engine, real CHECKED-IN input: `instantiation-start-loop.wat` is a
