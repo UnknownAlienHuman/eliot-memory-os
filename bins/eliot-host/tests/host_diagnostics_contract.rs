@@ -28,16 +28,17 @@
 //! evidence only, never lifecycle authority, readiness, or completion.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use eliot_host::HostError;
 use eliot_host::host_diagnostics::{
     DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, HOST_TERMINAL_CODE_CONSOLE_FAILED,
-    HOST_TERMINAL_CODE_DISPATCHER_FAILED, HostConsoleRequest, HostRequestEvidence,
-    HostRequestProjection, MAX_DIAGNOSTIC_DETAIL_BYTES, MAX_DIAGNOSTIC_FIELD_BYTES, bound_detail,
-    bound_field, install_host_diagnostics, note_event_log_sink_status, observe_entrypoint,
-    observe_entrypoint_with_detail, observe_host_request, observe_terminal_error,
-    shutdown_event_log_reporting, sink_status, start_event_log_reporting,
+    HOST_TERMINAL_CODE_DISPATCHER_FAILED, HostConsoleRequest, HostDiagnosticsError,
+    HostRequestEvidence, HostRequestProjection, MAX_DIAGNOSTIC_DETAIL_BYTES,
+    MAX_DIAGNOSTIC_FIELD_BYTES, bound_detail, bound_field, install_host_diagnostics,
+    note_event_log_sink_status, observe_entrypoint, observe_entrypoint_with_detail,
+    observe_host_request, observe_terminal_error, shutdown_event_log_reporting, sink_status,
+    start_event_log_reporting,
 };
 use eliot_host::windows_event_log::{
     AdmittedEvent, EVENT_LOG_MAX_INSERTION_BYTES, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SOURCE,
@@ -94,6 +95,32 @@ fn write_protocol_frame(buffer: &mut Vec<u8>, value: &Value) -> bool {
         && buffer.flush().is_ok()
 }
 
+/// The ONE facade install attempt in this process, driven once through a
+/// `OnceLock` so no second caller can run it.
+///
+/// `install_claimed_subscriber` ends in `tracing_subscriber::fmt()...try_init()`
+/// (src/host_diagnostics.rs:349-355), which fails whenever ANY global subscriber
+/// already holds the slot -- including one that a `with_default` scope installed,
+/// because `set_default` publishes a THREAD-LOCAL default (the repo documents
+/// this at crates/kernel/eliot-kernel/src/tests/process_supervision_identity.rs
+/// :113). So whether the single attempt can win that slot is a fact about what
+/// else was already running, not about the facade. The honest reachable set is
+/// therefore read out of the facade's own typed answers below rather than
+/// demanded: a facade that claimed the install must have taken the slot
+/// (`Ok`), and one that found it already taken must report the typed degraded
+/// answer, never `Ok`.
+///
+/// The repeat refusal is decided from that first observed outcome, exactly as
+/// `install_host_diagnostics` itself decides it (`SubscriberSetup::
+/// as_install_result`, src/host_diagnostics.rs:118-123): a completed
+/// Host-owned install answers `AlreadyOwned` to every later caller, and a failed
+/// one keeps its own typed error for every later caller. Either way the repeat
+/// call is bounded, non-panicking, creates no second owner and replaces nothing.
+fn the_one_facade_install_this_process_drives() -> Result<(), HostDiagnosticsError> {
+    static FIRST_INSTALL: OnceLock<Result<(), HostDiagnosticsError>> = OnceLock::new();
+    *FIRST_INSTALL.get_or_init(install_host_diagnostics)
+}
+
 // WORK_UNIT_CASE: 889/3
 // WORK_UNIT_CASE: 889/4
 #[test]
@@ -101,25 +128,53 @@ fn host_diagnostics_install_is_singly_owned() {
     // First installation claims process ownership; a repeat install is
     // bounded AlreadyOwned, never a panic, a replacement, or a second owner.
     // (Cases 889/3 first install, 889/4 duplicate init.) This is the only
-    // test that touches the process-global install, so parallel tests stay
-    // deterministic.
-    install_host_diagnostics().expect("first facade install must succeed");
-    let repeat = install_host_diagnostics();
-    assert_eq!(
-        repeat,
-        Err(eliot_host::host_diagnostics::HostDiagnosticsError::AlreadyOwned),
-        "repeat install must be typed AlreadyOwned"
+    // test that touches the process-global install, and it drives the one
+    // attempt exactly once for the process, so parallel tests can neither
+    // race it into a second attempt nor depend on winning the global slot.
+    let first = the_one_facade_install_this_process_drives();
+    assert!(
+        matches!(
+            first,
+            Ok(())
+                | Err(HostDiagnosticsError::SetupUnavailable)
+                | Err(HostDiagnosticsError::SetupInProgress)
+        ),
+        "the one install attempt must answer one of the facade's own three truthful outcomes: \
+         this process owned the global slot (Ok), or the slot was already held / an attempt is \
+         in flight (SetupUnavailable / SetupInProgress), got {first:?}"
     );
+    // The repeat refusal, decided the way the facade decides it and read back
+    // through the call itself rather than through the value held above.
+    let repeat = install_host_diagnostics();
+    match first {
+        Ok(()) => assert_eq!(
+            repeat,
+            Err(HostDiagnosticsError::AlreadyOwned),
+            "a completed Host-owned install must answer a repeat install with the typed \
+             AlreadyOwned refusal, never a second owner, a replacement or a panic"
+        ),
+        Err(attempted) => assert_eq!(
+            repeat,
+            Err(attempted),
+            "an attempt that never took the global slot must keep its own typed answer for every \
+             later caller: the outcome is retained, never upgraded to success and never retried"
+        ),
+    }
 
-    // Tracing-stderr delivery is available; the facade's own Event Log arm
-    // stays typed-Unavailable (the facade routes to tracing only). #984
-    // landed, so the wrapper seam below attempts real delivery through the
-    // safe port on Windows and stays typed-Unavailable off Windows: never
+    // Tracing-stderr delivery is available exactly when this process's own
+    // install really took the global slot. The facade answers this arm from
+    // its OBSERVED install state and maps only `Installed` to `Ok` (src/
+    // host_diagnostics.rs:246-251), so this is a real equality against the
+    // product's own state rather than an assumption about this platform: if
+    // the one attempt above won the slot, the stderr sink is certified, and
+    // if it found the slot already held, the facade must never certify it.
+    // #984 landed, so the wrapper seam below attempts real delivery through
+    // the safe port on Windows and stays typed-Unavailable off Windows: never
     // silent delivery elsewhere and never FFI. (Supports 889/15-18.)
-    assert_eq!(sink_status(DiagnosticSink::TracingStderr), Ok(()));
+    assert_eq!(sink_status(DiagnosticSink::TracingStderr), first);
     assert_eq!(
         sink_status(DiagnosticSink::WindowsEventLog),
-        Err(eliot_host::host_diagnostics::HostDiagnosticsError::EventLogUnavailable)
+        Err(HostDiagnosticsError::EventLogUnavailable)
     );
     if cfg!(windows) {
         assert_eq!(
@@ -879,13 +934,24 @@ fn assert_the_stop_and_sighting_stay_two_scoped_host_request_records(
     let sighting = HostRequestProjection::observed(EntrypointStage::ScmDispatch);
     let text = capture_request_evidence(&[sighting, stop]).1;
 
-    // Each projection emits exactly one request record; the Event Log
-    // admission arm is inert because the bounded producer is never started in
-    // this suite, so this case never touches a second sink or a worker thread.
+    // Each projection emits exactly one REQUEST record, and that count is
+    // measured BY THE RECORD'S OWN EVENT NAME rather than by the width of the
+    // window. `observe_host_request` calls `publish_projected_event_log_record`
+    // FIRST (src/host_diagnostics.rs:954-955), and that publishes BEFORE it
+    // consults the producer's state (1012-1018, 1029), so a projection naming an
+    // admitted operation with matching evidence emits a `host.event_log_admission`
+    // line here even though the bounded producer was never started. The bare
+    // sighting names no `AdmittedEvent` and reaches no admission, so this window
+    // holds two request records and exactly one admission record; the admission is
+    // read by its own name below rather than being swept into the request count.
+    let request_records = text
+        .lines()
+        .filter(|line| line.contains("event=\"host.request\""))
+        .count();
     assert_eq!(
-        text.lines().count(),
-        2,
-        "one projection must emit exactly one request record, got: {text}"
+        request_records, 2,
+        "one projection must emit exactly one request record, got {request_records} of them in: \
+         {text}"
     );
     assert_eq!(
         text.matches("event=\"host.request\"").count(),
@@ -905,6 +971,24 @@ fn assert_the_stop_and_sighting_stay_two_scoped_host_request_records(
         text.matches("phase=\"scm_dispatch\"").count(),
         2,
         "every projected record must carry the phase it was constructed with, got: {text}"
+    );
+    // The one admission this window publishes is named, counted and classified
+    // as an ADMISSION rather than left to inflate the request count above: the
+    // committed stop is admitted by the Event Log and the bare sighting is not,
+    // and the evidence each was published under is the product's own vocabulary.
+    assert_eq!(
+        text.matches("event=\"host.event_log_admission\"").count(),
+        1,
+        "only the committed stop names an admitted operation, so exactly one admission record may \
+         be published, got: {text}"
+    );
+    assert_eq!(
+        request_record_carrying(&text, HostRequestEvidence::DurableCommitted.as_str())
+            .matches("event=\"host.event_log_admission\"")
+            .count(),
+        0,
+        "the Event Log admission record must be its own record, never merged into the request \
+         record it was published beside: {text}"
     );
     text
 }
@@ -1097,9 +1181,14 @@ fn canonical_host_launch_argv() -> Vec<std::ffi::OsString> {
 ///
 /// Same scoped-capture pattern as the sibling tests in this file: the scoped
 /// subscriber shadows rather than replaces the process-global one, so parallel
-/// tests never fight over it. Every projection passed here is bare of an
-/// `AdmittedEvent`, so `observe_host_request` reaches no Event Log admission
-/// and this test owns no producer worker.
+/// tests never fight over it.
+///
+/// A projection that DOES carry an `AdmittedEvent` reaches the Event Log
+/// admission arm, and that arm publishes its `host.event_log_admission` record
+/// before it consults the producer's state -- so the window can hold more lines
+/// than it holds `host.request` records. Every reader below therefore counts
+/// requests by the record's own `event=` name and never by the width of the
+/// window.
 fn capture_request_evidence(projections: &[HostRequestProjection]) -> (Vec<String>, String) {
     let sink = CaptureSink::default();
     let writer_sink = sink.clone();
@@ -5989,13 +6078,17 @@ fn assert_no_published_diagnostic_name_claims_a_completion(wrapper_source: &str)
 ///
 /// THE ARGSUMENTS THIS HELPER CARRIES, none of which the caller can bypass:
 /// * the formatted output holds exactly one stage and one terminal record per
-///   iteration, stays bounded, and yields exactly one request record per
-///   iteration -- no duplicated, missing, or extra emissions under concurrency;
+///   iteration, holds exactly the sink-status record per iteration on the
+///   platforms that publish one, stays inside a byte budget derived from the
+///   records each iteration really emits, and yields exactly one request record
+///   per iteration -- no duplicated, missing, or extra emissions under
+///   concurrency;
 /// * a projection really did reach the Event Log seam, so the sweep exercises
 ///   admission rather than only the tracing path;
 /// * every swept admission names the operation its projection carried, is never
-///   `not_started`, and is accounted for by EXACTLY one typed refusal -- every
-///   submission counted once, with a third outcome fatal;
+///   `not_started`, and is accounted for by EXACTLY ONE typed outcome -- every
+///   submission counted once, whether the product admitted it into the queue or
+///   refused it, with a third outcome fatal;
 /// * a counted worker refusal stays within the records the sweep submitted, so
 ///   exactly the worker-unavailable arm may advance the monotone drop counter;
 /// * the published drop counter never outruns the records submitted, which is the
@@ -6104,9 +6197,45 @@ fn assert_the_concurrent_sweep_is_accounted_exactly() -> (u64, u64) {
     (highest_drops, submissions)
 }
 
+/// The number of facade records ONE sweep iteration really emits: the stage
+/// record, the terminal record, the one `host.request` record, and the
+/// `host.event_log_admission` record that `observe_host_request` publishes for
+/// an admitted operation BEFORE it consults the producer's state
+/// (src/host_diagnostics.rs:954-955, 1012-1040). Off Windows
+/// `note_event_log_sink_status` publishes a fifth, `host.event_log_sink_
+/// unavailable`, which nothing else in this sweep emits.
+///
+/// It is a count, read from the sweep's own body rather than guessed: the byte
+/// budget below is the number of records each iteration produces multiplied by
+/// the product's own per-detail bound, so the arithmetic cannot drift away from
+/// the emissions it is bounding.
+const SWEEP_RECORDS_PER_ITERATION: usize = 4;
+
+/// The fifth record of the sweep: `note_event_log_sink_status` publishes it
+/// only where the Event Log sink cannot carry a record, so the sweep's byte
+/// budget admits it only where `event_log_sink_status` agrees that the sink is
+/// unavailable. Read through the product's own answer rather than through this
+/// platform's name, so the budget tracks the emissions the sweep really makes.
+fn the_sweep_sink_unavailable_record_name() -> &'static str {
+    if event_log_sink_status().is_ok() {
+        "no record: the sink carries what this sweep submits"
+    } else {
+        "host.event_log_sink_unavailable"
+    }
+}
+
 /// Every sweep iteration produced exactly one stage record and one terminal
 /// record, and the whole formatted output stayed within the product's own
 /// declared bound.
+///
+/// The budget is `expected_records * records-per-iteration *` the product's own
+/// per-detail bound, so it scales with the emissions the sweep really makes: a
+/// sweep whose output grows with the number of records it emits -- an unbounded
+/// detail, a redacted payload, a repeated emission -- still crosses it, while
+/// the per-record allowance of the old `expected_records *` form (one bound per
+/// ITERATION rather than per record) was smaller than a single `host.request`
+/// record can be, which is a property of this sweep's own inputs rather than of
+/// the product.
 fn assert_the_sweep_emitted_exactly_one_record_per_iteration(
     rendered: &str,
     expected_records: usize,
@@ -6121,9 +6250,38 @@ fn assert_the_sweep_emitted_exactly_one_record_per_iteration(
         expected_records,
         "every sweep iteration must have emitted exactly one terminal record"
     );
+    // The fifth record of an off-Windows sweep, counted only where the product's
+    // own sink answer says this platform really publishes it: a sweep that grew
+    // a sink-status record per iteration where the sink is live would fail here
+    // rather than quietly growing inside the byte budget.
+    let sink_unavailable_name = the_sweep_sink_unavailable_record_name();
+    let mut records_per_iteration = SWEEP_RECORDS_PER_ITERATION;
+    if sink_unavailable_name == "host.event_log_sink_unavailable" {
+        assert_eq!(
+            rendered.matches(sink_unavailable_name).count(),
+            expected_records,
+            "with no live Event Log port every sweep iteration must have emitted exactly one sink \
+             status record"
+        );
+        records_per_iteration = records_per_iteration.saturating_add(1);
+    } else {
+        assert_eq!(
+            rendered.matches(sink_unavailable_name).count(),
+            0,
+            "a live Event Log port publishes nothing to note, so the sweep must have emitted no \
+             sink status record at all"
+        );
+    }
+    let budget = expected_records
+        .saturating_mul(records_per_iteration)
+        .saturating_mul(MAX_DIAGNOSTIC_DETAIL_BYTES);
     assert!(
-        rendered.len() <= expected_records * MAX_DIAGNOSTIC_DETAIL_BYTES,
-        "the sweep's formatted output must stay bounded, got {} bytes",
+        rendered.len() <= budget,
+        "the sweep's formatted output must stay within {} bytes per emitted record -- {} records \
+         for {} iterations -- got {} bytes",
+        MAX_DIAGNOSTIC_DETAIL_BYTES,
+        records_per_iteration,
+        expected_records,
         rendered.len()
     );
 }
@@ -6156,12 +6314,17 @@ fn assert_the_sweep_reached_the_event_log_seam_exactly_once_per_iteration(
 /// state was when the sweep ran, and the monotone drop counter cannot outrun the
 /// records the sweep submitted.
 ///
-/// WHICH admission this sweep produced is derived, not pinned. Two real
-/// producers reach that name: a producer whose worker was refused (which
-/// increments the drop counter) and a closed one (which does not), and whether
-/// the worker was refused depends on what the worker thread was doing -- not on
-/// what this sweep did. So the branch is between the two arms below and never
-/// names a third outcome.
+/// WHICH admission this sweep produced is derived, not pinned, because this test
+/// STARTS the producer itself (through `capture_the_producer_start_record`) and
+/// then shuts it down (through `shutdown_event_log_producer`) before the sweep
+/// runs, so every swept admission is a refusal; but WHICH refusal depends on what
+/// the single product worker was doing when each sweep thread submitted, and that
+/// is a fact about the worker, not about this sweep. The worker has not been
+/// started yet by any other case at that point, so an `Admitted` outcome is not
+/// reachable here -- and the first arm below proves it is not, rather than
+/// assuming it. The `Admitted` arm of the accounting is nonetheless counted as a
+/// first-class outcome, so the sweep is accounted for by EXACTLY ONE typed
+/// outcome per submission however the product really answered.
 ///
 /// Returns the HIGHEST drop total any swept admission published, which the
 /// caller compares its post-shutdown counter against.
@@ -6185,6 +6348,7 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
     );
     let mut lowest_drops = u64::MAX;
     let mut highest_drops = 0u64;
+    let mut admitted = 0u64;
     let mut worker_refusals = 0u64;
     let mut shutdown_refusals = 0u64;
     for outcome in sweep_admitted {
@@ -6192,6 +6356,12 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
             outcome.event,
             AdmittedEvent::ServiceStart,
             "every swept admission must be for the operation the projection carried"
+        );
+        assert_eq!(
+            outcome.evidence,
+            HostRequestEvidence::ProcessStarted,
+            "every swept admission must be for the evidence the projection carried, the only class \
+             the Event Log admits for a start"
         );
         assert!(
             !matches!(
@@ -6201,16 +6371,13 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
             "this case starts the producer before the sweep, so the facade cannot answer \
              not_started for any swept projection"
         );
-        assert!(
-            !matches!(outcome.outcome, EventLogAdmission::Admitted { .. })
-                || event_log_sink_status().is_err(),
-            "only a platform with no live Event Log port can queue a record that can never be \
-             reported; a port that answers must account for every admission as a refusal"
-        );
         // WHICH refusal it is must be reported HONESTLY, so this arm checks the
         // product's own rule instead of trusting the branch: exactly the
         // worker-unavailable refusal advances the monotone drop counter, and
-        // the closed refusal does not.
+        // the closed refusal does not. `Admitted` is counted here rather than
+        // treated as a third, fatal outcome: it reports the counter it observed
+        // and admits nothing further, so the accounting below stays a total one
+        // over every submission.
         match outcome.outcome {
             EventLogAdmission::RejectedWorkerUnavailable { dropped_total } => {
                 assert!(
@@ -6223,8 +6390,11 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
             EventLogAdmission::RejectedShutdown { .. } => {
                 shutdown_refusals = shutdown_refusals.saturating_add(1);
             }
+            EventLogAdmission::Admitted { .. } => {
+                admitted = admitted.saturating_add(1);
+            }
             other => panic!(
-                "a swept projection must publish exactly one accounted refusal, got {other:?}"
+                "a swept projection must publish exactly one accounted outcome, got {other:?}"
             ),
         }
         let drops = outcome.outcome.dropped_total();
@@ -6232,9 +6402,25 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
         highest_drops = highest_drops.max(drops);
     }
     assert_eq!(
-        worker_refusals + shutdown_refusals,
+        admitted + worker_refusals + shutdown_refusals,
         submissions,
-        "every sweep submission must be accounted for by exactly one typed refusal"
+        "every sweep submission must be accounted for by exactly one typed outcome: admitted into \
+         the queue, refused as worker-unavailable, or refused as shut down"
+    );
+    // The `Admitted` arm is counted honestly above, and on THIS platform it must
+    // be unreachable rather than merely tolerated: no test has started the single
+    // product worker before this sweep, and the producer is closed before it
+    // runs, so a swept admission that reached the queue would mean a worker this
+    // suite never started -- a product that spawned one on demand.
+    assert_eq!(
+        admitted, 0,
+        "no producer worker exists when this sweep runs, so every swept admission must be a typed \
+         refusal: an admitted record means a worker was started that this suite never started"
+    );
+    assert!(
+        worker_refusals + shutdown_refusals == submissions,
+        "the worker-unavailable and closed refusals together must account for every record this \
+         sweep submitted, got {worker_refusals} + {shutdown_refusals} for {submissions} records"
     );
     // AND the counter itself, which is the part that can actually run away. A
     // producer that answered every refusal by retrying, or that charged a
@@ -6248,6 +6434,17 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
     assert!(
         lowest_drops <= highest_drops,
         "the published drop range must be well ordered, got {lowest_drops}..={highest_drops}"
+    );
+    // THE PRODUCT'S OWN COUNTER RULE, measured from the sweep's own records
+    // rather than restated from the comment above: exactly the
+    // worker-unavailable refusal advances the counter, the closed refusal does
+    // not, and the counter therefore cannot have advanced more than once per
+    // worker-unavailable refusal.
+    assert!(
+        highest_drops <= worker_refusals,
+        "only the worker-unavailable refusal advances the drop counter, so the published \
+         high-water mark must stay within the {worker_refusals} refusals of that kind the sweep \
+         received, got {highest_drops}"
     );
     highest_drops
 }
