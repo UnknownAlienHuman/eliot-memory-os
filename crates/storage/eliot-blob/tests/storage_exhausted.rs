@@ -217,6 +217,15 @@ struct FaultState {
     /// The flag itself is the condition: there is no retry budget, counter or
     /// timer behind it.
     fail_payload_write_while_full: bool,
+    /// The commit create installs its actual bytes, then its directory-flush
+    /// boundary reports unconfirmed durability and only then marks the volume
+    /// full for all following journal replacements.
+    ///
+    /// This destination-keyed seam cannot fire on the earlier payload,
+    /// metadata, or journal writes. It therefore lets both publication
+    /// checkpoints succeed before the commit boundary arms
+    /// `fail_replace_while_full`.
+    fail_commit_write_after_install_while_full: bool,
     fail_replace_once: bool,
     /// The volume is still full: the journal durable-state replace keeps
     /// failing for as long as this condition holds, across every call.
@@ -259,6 +268,12 @@ struct FaultState {
     /// to write the destination again. Recorded so that distinction can be
     /// asserted on a named path rather than on a magic total.
     replace_targets: Vec<String>,
+    /// Every `rename_no_replace_durable` attempt, including a failed one.
+    ///
+    /// Same-operation replay must add no rename after the commit checkpoint is
+    /// durable, so a file snapshot alone is not enough to prove that the owner
+    /// was left untouched.
+    rename_calls: u64,
     remove_calls: u64,
 }
 
@@ -340,6 +355,14 @@ impl FixturePlatform {
     fn is_payload_temp_destination(destination: &WorkScopePath) -> bool {
         let identity = destination.normalized_identity();
         identity.starts_with("staging/") && identity.ends_with(".payload")
+    }
+
+    /// Whether `destination` is this operation's commit-marker create.
+    fn is_commit_destination(destination: &WorkScopePath) -> bool {
+        destination
+            .normalized_identity()
+            .starts_with("transactions/")
+            && destination.normalized_identity().ends_with(".commit")
     }
 }
 
@@ -428,6 +451,21 @@ impl BlobPlatformPort for FixturePlatform {
         state
             .files
             .insert(path.normalized_identity().to_owned(), bytes.to_vec());
+        if state.fail_commit_write_after_install_while_full && Self::is_commit_destination(path) {
+            // The bytes are installed before the owner reports its own
+            // directory-flush boundary. The volume becomes full only at this
+            // commit boundary, after payload and metadata journal checkpoints
+            // have already succeeded.
+            state.fail_replace_while_full = true;
+            return Err(Self::port_capacity(
+                BlobCapacityStage::DirectoryFlush,
+                BlobCapacityEffect::DurabilityUnconfirmed {
+                    state: PublishState::MetadataDurable,
+                    possible_effect: true,
+                },
+                None,
+            ));
+        }
         Ok(())
     }
 
@@ -493,6 +531,7 @@ impl BlobPlatformPort for FixturePlatform {
         destination: &WorkScopePath,
     ) -> Result<(), BlobError> {
         let mut state = self.lock();
+        state.rename_calls += 1;
         if state.fail_rename {
             // The WRAPPED port's own label, deliberately different from the
             // caller's. A rename port cannot know which Blob object the service
@@ -768,9 +807,9 @@ fn has_file_extension(identity: &str, extension: &str) -> bool {
 ///
 /// `platform_rename` is DEFINED once and CALLED once: its single call site is in
 /// `publish_or_verify`, which both `settle_publication` invocations reach. The two
-/// destinations are disjoint by filename kind, so the phase is selected by
-/// destination identity. It is never a call ordinal: the fixture arms one flag and
-/// the port's own arguments decide which leg it applies to.
+/// publication destinations are disjoint by filename kind, so those phases are
+/// selected by destination identity. Commit uses the separate durable-create
+/// boundary and has its own destination-keyed flag. No seam is a call ordinal.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SeamPhase {
     /// `finish_journal`'s first `settle_publication` call: destination
@@ -781,6 +820,10 @@ enum SeamPhase {
     /// `PayloadDurable` in the `persist_journal` between the two calls, so that is
     /// the state this boundary fails after.
     Metadata,
+    /// `finish_journal`'s commit-marker create: `.commit` receives real bytes
+    /// after the metadata checkpoint, then its directory-flush boundary fails
+    /// with `MetadataDurable` as the last proven state.
+    Commit,
 }
 
 impl SeamPhase {
@@ -815,6 +858,13 @@ impl SeamPhase {
                 );
                 state.fail_metadata_rename_after_install = true;
             }
+            Self::Commit => {
+                assert!(
+                    !state.fail_replace_while_full,
+                    "the standing-full journal fault is armed only after actual commit bytes are installed"
+                );
+                state.fail_commit_write_after_install_while_full = true;
+            }
         }
     }
 
@@ -823,6 +873,7 @@ impl SeamPhase {
         match self {
             Self::Payload => ".p1",
             Self::Metadata => ".m1",
+            Self::Commit => ".commit",
         }
     }
 
@@ -831,21 +882,25 @@ impl SeamPhase {
         match self {
             Self::Payload => PublishState::JournalPrepared,
             Self::Metadata => PublishState::PayloadDurable,
+            Self::Commit => PublishState::MetadataDurable,
         }
     }
 }
 
-/// Drives the "final path installed, durability unconfirmed" seam against the
-/// live service for one publication phase and asserts what the SERVICE bound.
+/// Drives the "effect installed, durability unconfirmed" seam against the live
+/// service for one publication or commit phase and asserts what the SERVICE bound.
 ///
 /// The fixture installs the destination bytes and only THEN returns storage-full
-/// at its own directory-flush boundary.
+/// at its own directory-flush boundary. For `Commit`, the `.commit` bytes are
+/// real and the full-volume journal-replace fault is armed only after that write,
+/// so the earlier payload and metadata checkpoints run normally.
 ///
 /// Two axes of the bound record, and they are NOT equally informative:
 ///
 /// * `stage` is a real collision the assertions can see. The port says
-///   `DirectoryFlush`; the caller's stage for this leg is
-///   `PayloadPublication`/`MetadataPublication`. Those differ, so
+///   `DirectoryFlush`; rename callers say `PayloadPublication` or
+///   `MetadataPublication`, while the commit caller says `CommitWrite`. Those
+///   differ, so
 ///   `assert_eq!(failure.stage, DirectoryFlush)` proves the port's boundary
 ///   survived verbatim under `bind_platform_capacity_with_effect`'s collision rule.
 /// * `effect` is NOT a collision. Because the port named a boundary, the
@@ -858,7 +913,8 @@ impl SeamPhase {
 /// The axis that does prove the service bound this record is `identity`: this
 /// file's port contributes `provider-operation`/`provider-idempotency` and no
 /// locator, while the bound failure carries the operation's own journal identity
-/// and the storage identity that settled -- `publish_or_verify` states both.
+/// and the storage identity that settled -- `publish_or_verify` states both for
+/// rename phases, and the commit create binds that identity directly.
 fn assert_service_bound_unconfirmed_durability(phase: SeamPhase) {
     let root = unique_test_root();
     let platform = FixturePlatform::default();
@@ -901,9 +957,10 @@ fn assert_service_bound_unconfirmed_durability(phase: SeamPhase) {
         "the bound record names the operation, never the port's own placeholder"
     );
     assert_eq!(idempotency_key, "idem-1");
-    assert!(
-        locator.is_some(),
-        "the storage identity that settled is bound, never the port's empty one"
+    assert_eq!(
+        locator.as_ref(),
+        Some(&locator_for(bytes)),
+        "the bound record names this exact storage identity, never the port's empty one"
     );
     assert_eq!(
         failure.recovery,
@@ -922,14 +979,79 @@ fn assert_service_bound_unconfirmed_durability(phase: SeamPhase) {
             "the payload leg completed and persisted before this metadata boundary: {keys:?}"
         );
     }
+    if phase == SeamPhase::Commit {
+        assert_commit_and_journal_identity(
+            &platform,
+            "unconfirmed-durability-op",
+            "idem-1",
+            bytes,
+            "METADATA_DURABLE",
+        );
+    } else {
+        assert!(
+            !keys.iter().any(|key| key.ends_with(".commit")),
+            "an unconfirmed publication boundary must not reach the commit marker: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| has_file_extension(key, "stage")),
+            "the journal is retained under the original operation: {keys:?}"
+        );
+    }
+}
+
+/// Proves that a commit-path durability refusal left the real commit bytes and
+/// the matching journal on the fixture volume under one exact operation.
+fn assert_commit_and_journal_identity(
+    platform: &FixturePlatform,
+    operation: &str,
+    idempotency_key: &str,
+    bytes: &[u8],
+    expected_journal_state: &str,
+) -> (String, String) {
+    let state = platform.lock();
+    let Some((commit_path, commit_bytes)) = state
+        .files
+        .iter()
+        .find(|(path, _)| has_file_extension(path, "commit"))
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+    else {
+        panic!("the commit seam installs a real commit record before failing");
+    };
     assert!(
-        !keys.iter().any(|key| key.ends_with(".commit")),
-        "an unconfirmed durability boundary must never reach the commit marker: {keys:?}"
+        !commit_bytes.is_empty(),
+        "the installed commit bytes are real"
     );
-    assert!(
-        keys.iter().any(|key| key.starts_with("transactions/")),
-        "the journal is retained under the original operation: {keys:?}"
+    let commit: serde_json::Value = ok(serde_json::from_slice(&commit_bytes));
+    assert_eq!(commit["operation_id"], serde_json::json!(operation));
+    assert_eq!(
+        commit["idempotency_key"],
+        serde_json::json!(idempotency_key)
     );
+    assert_eq!(
+        commit["locator"],
+        ok(serde_json::to_value(locator_for(bytes)))
+    );
+
+    let Some((journal_path, journal_bytes)) = state
+        .files
+        .iter()
+        .find(|(path, _)| has_file_extension(path, "stage"))
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+    else {
+        panic!("the unresolved operation retains its stage journal");
+    };
+    let journal: serde_json::Value = ok(serde_json::from_slice(&journal_bytes));
+    assert_eq!(journal["operation_id"], serde_json::json!(operation));
+    assert_eq!(
+        journal["idempotency_key"],
+        serde_json::json!(idempotency_key)
+    );
+    assert_eq!(
+        journal["locator"],
+        ok(serde_json::to_value(locator_for(bytes)))
+    );
+    assert_eq!(journal["state"], serde_json::json!(expected_journal_state));
+    (commit_path, journal_path)
 }
 
 /// The card's negative clause, asserted against the live service: replaying the
@@ -1131,6 +1253,230 @@ fn assert_same_identity_reestablishment_settles_once() -> FixturePlatform {
     assert!(has_suffix(&platform, ".commit"));
     assert_settled_operation_is_inert(&platform, &store, &request, &root, ready.locator());
     platform
+}
+
+/// Replays an installed-but-unconfirmed commit across a service restart.
+///
+/// The first service installs the real commit bytes and only then arms the
+/// standing journal-replace capacity fault. A second service, with empty
+/// process-local retention but the same fixture volume, must ask the owner to
+/// replace that exact commit record and remain unresolved while the owner still
+/// reports full. After clearing the fault, one successful same-identity owner
+/// replacement checkpoints `CommitDurable`; all later replay is inert.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the commit restart, refusal, settlement and inert replay are one recovery proof"
+)]
+fn assert_same_commit_identity_reestablishment_settles_once() {
+    const OPERATION: &str = "commit-reestablish-op";
+    const BYTES: &[u8] = b"same-commit-identity-reestablishment";
+
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    {
+        let mut state = platform.lock();
+        assert!(!state.fail_replace_while_full);
+        state.fail_commit_write_after_install_while_full = true;
+    }
+    let first_store = store_with_platform(platform.clone(), &root);
+    let request = stage_request(OPERATION, BYTES, &root);
+    let Err(error) = block_on(first_store.stage(request.clone())) else {
+        panic!("an unconfirmed commit durability boundary must not issue Ready");
+    };
+    let BlobError::StorageCapacity { failure } = error else {
+        panic!("expected typed commit durability failure, got: {error:?}");
+    };
+    assert_eq!(failure.stage, BlobCapacityStage::DirectoryFlush);
+    assert_eq!(
+        failure.evidence.effect,
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::MetadataDurable,
+            possible_effect: true,
+        }
+    );
+    assert_eq!(
+        failure.recovery,
+        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+    );
+    let expected_locator = locator_for(BYTES);
+    let BlobCapacityIdentity::Journal {
+        operation_id,
+        idempotency_key,
+        locator,
+    } = &failure.identity
+    else {
+        panic!("the commit boundary must bind the journal identity");
+    };
+    assert_eq!(operation_id, OPERATION);
+    assert_eq!(idempotency_key, "idem-1");
+    assert_eq!(locator.as_ref(), Some(&expected_locator));
+    assert!(failure.validate().is_ok());
+    assert!(
+        file_keys(&platform)
+            .iter()
+            .any(|path| has_file_extension(path, "p1")),
+        "the payload checkpoint completed before the commit boundary"
+    );
+    assert!(
+        file_keys(&platform)
+            .iter()
+            .any(|path| has_file_extension(path, "m1")),
+        "the metadata checkpoint completed before the commit boundary"
+    );
+    let (commit_path, journal_path) = assert_commit_and_journal_identity(
+        &platform,
+        OPERATION,
+        "idem-1",
+        BYTES,
+        "METADATA_DURABLE",
+    );
+    {
+        let state = platform.lock();
+        assert!(state.fail_replace_while_full);
+        assert_eq!(
+            state
+                .replace_targets
+                .iter()
+                .filter(|target| target.as_str() == journal_path.as_str())
+                .count(),
+            2,
+            "payload and metadata journal checkpoints succeeded before the commit fault armed"
+        );
+        assert!(
+            !state
+                .replace_targets
+                .iter()
+                .any(|target| target.as_str() == commit_path.as_str()),
+            "the installed commit has not yet had a successful owner replace"
+        );
+    }
+    drop(first_store);
+
+    // A new service shares the exact files and owner but starts with no retained
+    // in-memory obligation from the first service.
+    let restarted_store = store_with_platform(platform.clone(), &root);
+    let files_before_refusal = file_keys(&platform);
+    let Err(error) = block_on(restarted_store.stage(request.clone())) else {
+        panic!("the still-full volume must keep commit replay unresolved");
+    };
+    let BlobError::StorageCapacity { failure } = error else {
+        panic!("the direct commit re-establishment must stay capacity-typed: {error:?}");
+    };
+    assert_eq!(failure.stage, BlobCapacityStage::CommitWrite);
+    assert_eq!(
+        failure.evidence.effect,
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::MetadataDurable,
+            possible_effect: true,
+        }
+    );
+    assert_eq!(failure.evidence.cause, BlobCapacityCause::IoStorageFull);
+    assert_eq!(
+        failure.evidence.attempted_bytes,
+        Some(platform.lock().files[&commit_path].len() as u64),
+        "the direct owner replace retains the bytes actually offered"
+    );
+    assert_eq!(
+        failure.recovery,
+        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+    );
+    let BlobCapacityIdentity::Journal {
+        operation_id,
+        idempotency_key,
+        locator,
+    } = &failure.identity
+    else {
+        panic!("the restart refusal must keep the journal identity");
+    };
+    assert_eq!(operation_id, OPERATION);
+    assert_eq!(idempotency_key, "idem-1");
+    assert_eq!(locator.as_ref(), Some(&expected_locator));
+    assert!(failure.validate().is_ok());
+    assert_eq!(file_keys(&platform), files_before_refusal);
+    assert_commit_and_journal_identity(&platform, OPERATION, "idem-1", BYTES, "METADATA_DURABLE");
+
+    // Capacity is revalidated. The same service now settles its retained
+    // obligation with one successful owner replace on the exact commit path.
+    {
+        let mut state = platform.lock();
+        state.fail_replace_while_full = false;
+        state.fail_commit_write_after_install_while_full = false;
+    }
+    let ready = match block_on(restarted_store.stage(request.clone())) {
+        Ok(ready) => ready,
+        Err(error) => panic!("the owner replace should settle commit durability: {error:?}"),
+    };
+    assert_eq!(ready.locator(), &expected_locator);
+    let (committed_path, committed_journal) =
+        assert_commit_and_journal_identity(&platform, OPERATION, "idem-1", BYTES, "COMMIT_DURABLE");
+    assert_eq!(committed_path, commit_path);
+    assert_eq!(committed_journal, journal_path);
+    let settled_journal: serde_json::Value = {
+        let state = platform.lock();
+        ok(serde_json::from_slice(&state.files[&journal_path]))
+    };
+    assert!(
+        settled_journal["pending_publication"].is_null(),
+        "the obligation is cleared in the same persisted CommitDurable checkpoint"
+    );
+    {
+        let state = platform.lock();
+        assert_eq!(
+            state
+                .replace_targets
+                .iter()
+                .filter(|target| target.as_str() == commit_path.as_str())
+                .count(),
+            1,
+            "the commit durability boundary is re-established by one owner replace"
+        );
+    }
+
+    let settled_files = file_keys(&platform);
+    let before_replay = {
+        let state = platform.lock();
+        (
+            state.write_new_calls,
+            state.replace_calls,
+            state.rename_calls,
+        )
+    };
+    let replay = match block_on(restarted_store.stage(request.clone())) {
+        Ok(ready) => ready,
+        Err(error) => {
+            panic!("CommitDurable replay must resolve without another owner write: {error:?}")
+        }
+    };
+    assert_eq!(replay.locator(), &expected_locator);
+    assert_eq!(file_keys(&platform), settled_files);
+    let after_replay = {
+        let state = platform.lock();
+        (
+            state.write_new_calls,
+            state.replace_calls,
+            state.rename_calls,
+        )
+    };
+    assert_eq!(after_replay, before_replay);
+
+    let Err(changed) =
+        block_on(restarted_store.stage(stage_request(OPERATION, b"changed-commit-payload", &root)))
+    else {
+        panic!("changed bytes under the committed operation must conflict");
+    };
+    assert!(
+        matches!(changed, BlobError::IdempotencyConflict),
+        "changed bytes under one operation must conflict, got: {changed:?}"
+    );
+    let after_conflict = {
+        let state = platform.lock();
+        (
+            state.write_new_calls,
+            state.replace_calls,
+            state.rename_calls,
+        )
+    };
+    assert_eq!(after_conflict, before_replay);
 }
 
 /// The observable tail of a settled operation: once a genuine same-identity
@@ -1890,16 +2236,15 @@ fn assert_failed_cleanup_retains_its_observation() {
 /// and both `settle_publication` → `publish_or_verify` →
 /// `bind_platform_capacity_with_effect` calls on a port-reported durability
 /// boundary.
-/// Discovery: fixture fails the payload write, then one store installs the final
-/// payload bytes and fails only its directory flush and a second store lets that
-/// leg complete before failing the metadata leg the same way; a read targets the
-/// unstaged locator.
-/// Executed-pass: no `BlobReadyReceipt` is issued and no commit artifact exists
-/// on either path, the read reports NotFound, the port's own durability-boundary
-/// stage survives verbatim where the caller's publication stage would have stood,
-/// and the bound record's identity — not its effect value — shows the SERVICE
-/// bound the port failure to the operation's own journal identity and settled
-/// storage identity.
+/// Discovery: the fixture fails the payload write, installs payload and metadata
+/// on separate runs before their directory flushes fail, then installs actual
+/// commit bytes before the commit directory-flush failure arms the standing-full
+/// journal-replace fault; a read targets the unstaged locator.
+/// Executed-pass: no `BlobReadyReceipt` is issued for any phase. Publication
+/// refusals have no commit marker; the commit refusal has its actual commit bytes
+/// and matching retained journal, both under the original identity. The read
+/// reports `NotFound`, the port's own durability-boundary stage survives verbatim,
+/// and the bound record names the operation and exact settled storage identity.
 // WORK_UNIT_CASE: 864/18
 #[test]
 fn exhaustion_or_unknown_durability_issues_no_ready_write_or_gc_evidence() {
@@ -1930,10 +2275,11 @@ fn exhaustion_or_unknown_durability_issues_no_ready_write_or_gc_evidence() {
     // case 18 a self-consistency check on a value the test itself authored. It is
     // now obtained from the live service through the install-then-directory-flush
     // seam, once for each publication phase, and still carries no ready/write/GC
-    // evidence. Each run is its own store with its own root, so the metadata run
-    // starts from a clean volume rather than inheriting the payload run's files.
+    // evidence. Each run is its own store with its own root, so every phase
+    // starts from a clean volume rather than inheriting another run's files.
     assert_service_bound_unconfirmed_durability(SeamPhase::Payload);
     assert_service_bound_unconfirmed_durability(SeamPhase::Metadata);
+    assert_service_bound_unconfirmed_durability(SeamPhase::Commit);
 }
 
 /// Source: `BlobCapacityRecovery` disposition on live service failures.
@@ -1992,20 +2338,19 @@ fn retry_disposition_requires_revalidation_never_blind_transient() {
     );
 }
 
-/// Source: `finish_journal` commit path + the publication-obligation guard in
-/// `stage_locked`/`finish_journal` on re-entry, and `settle_publication` →
-/// `publish_or_verify` → `bind_platform_capacity_with_effect` on a
-/// port-reported durability boundary.
-/// Discovery: fixture fails the commit write; the fault is then cleared and the
-/// same operation replays.
-/// Executed-pass: the commit failure carries unconfirmed durability under the
-/// same-operation journal identity with reconciliation recovery, and a
-/// revalidated same-operation replay stays a typed unresolved capacity outcome
-/// that never becomes a ready receipt — the commit record the obligation names
-/// was never installed, so the owner cannot re-establish it. A different
-/// operation is still rejected as an idempotency conflict, and only a genuine
-/// same-identity durable re-establishment settles such an operation afterwards,
-/// exactly once.
+/// Source: `finish_journal` commit creation, the commit-present recovery in
+/// `stage_locked`, and `reestablish_publication_durability` through the owner's
+/// existing `replace_durable` operation.
+/// Discovery: one fixture fault fails the commit create before installing it;
+/// a second installs real `.commit` bytes and only then reports `DirectoryFlush`
+/// unconfirmed while arming the standing journal-replace fault. A new service
+/// with the same files fails its same-identity owner replace until the fault
+/// clears.
+/// Executed-pass: the pre-create path leaves no commit record and stays typed
+/// unresolved on replay. The installed-commit path retains exact operation,
+/// idempotency key and locator across both refusals; after capacity is
+/// revalidated, one real owner replace persists `CommitDurable`. Same-identity
+/// replay then performs no writes or renames, and changed bytes conflict.
 // WORK_UNIT_CASE: 864/20
 #[test]
 fn possible_commit_requires_same_operation_reconciliation() {
@@ -2023,10 +2368,6 @@ fn possible_commit_requires_same_operation_reconciliation() {
         panic!("expected typed capacity failure, got: {error:?}");
     };
     assert_eq!(failure.stage, BlobCapacityStage::CommitWrite);
-    // `finish_journal`'s commit arm states its own effect, and the port's stage
-    // is not a durability boundary, so the failed commit write is reported as a
-    // possible installed effect whose durability is unconfirmed. It is never
-    // restated as a proven `MetadataDurable` publication.
     assert_eq!(
         failure.evidence.effect,
         BlobCapacityEffect::DurabilityUnconfirmed {
@@ -2049,12 +2390,13 @@ fn possible_commit_requires_same_operation_reconciliation() {
         BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
     );
     assert!(failure.validate().is_ok());
+    assert!(
+        !has_suffix(&platform, ".commit"),
+        "the failed commit create installed no commit record"
+    );
 
-    // External capacity is revalidated (fault cleared) and the SAME operation
-    // replays. It must still not reconcile to Ready: the commit record this
-    // journal's obligation names was never installed, so `finish_journal`'s
-    // guard cannot re-establish that boundary under this identity, and the
-    // obligation is returned as the existing typed fenced capacity failure.
+    // This is the already-present negative replay row: clearing a capacity
+    // fault cannot re-establish a commit destination that was never installed.
     platform.lock().fail_write_new_on = None;
     assert_replay_stays_typed_unresolved(
         &store,
@@ -2065,26 +2407,22 @@ fn possible_commit_requires_same_operation_reconciliation() {
     );
     assert!(
         !has_suffix(&platform, ".commit"),
-        "an unproved commit write must never leave a commit record"
+        "an unresolved pre-create failure still has no commit record"
     );
 
-    // A different operation may not claim the reconciled state.
     let foreign = match block_on(store.stage(stage_request("foreign-op", bytes, &root))) {
-        Ok(_) => panic!("a foreign operation must not reuse the journal"),
+        Ok(_) => panic!("a foreign operation must not reuse the committed scope"),
         Err(error) => error,
     };
     assert!(
         matches!(foreign, BlobError::IdempotencyConflict),
-        "foreign replay must conflict, got: {foreign:?}"
+        "a foreign operation must conflict with the retained commit-stage work: {foreign:?}"
     );
 
-    // The positive half the card requires: the possible-commit disposition is
-    // not a permanent lockout. After the volume is freed, a genuine
-    // same-identity durable re-establishment -- an owner `replace_durable` that
-    // actually succeeds on the exact bounded bytes of the boundary the
-    // obligation names -- is what finally lets the operation settle, exactly
-    // once and without duplicating anything.
-    assert_same_identity_reestablishment_settles_once();
+    // Extend case 20 over the distinct commit-present path: real commit bytes,
+    // a restart with empty in-memory retention, a failed owner replace, then
+    // one same-identity replacement and an inert CommitDurable replay.
+    assert_same_commit_identity_reestablishment_settles_once();
 }
 
 /// Source: journal resume + the publication-obligation guard in

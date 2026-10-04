@@ -1,13 +1,16 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! Starter probes for F-LOG-HOST-1 item 891 (Implements, not Closes).
+//! Starter probes and acceptance cases for F-LOG-HOST-1 item 891 (Implements,
+//! not Closes).
 //!
-//! Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
+//! Every observation travels through the one #889 library-owned facade
+//! (`host_diagnostics::observe_entrypoint`,
 //! `observe_entrypoint_with_detail`, `observe_terminal_error`); the Windows
 //! Event Log seam stays typed-Unavailable (`event_log_sink_status`), never
 //! implemented here (#984 still open).
 //!
-//! Exactly two probes:
+//! Exactly two retained starter probes (T-A, T-B) plus the 22 numbered
+//! acceptance cases (`// WORK_UNIT_CASE: 891/1`..`891/22`) declared below:
 //! - T-A stop/drain distinct (`Requested` -> `Draining` -> `StoppedClean` via
 //!   existing `HostComposition::stop` seams; three distinct records sharing
 //!   one `drain_generation` correlation, exactly one terminal on failure;
@@ -18,16 +21,20 @@
 //!   `reconcile_kernel_restart_request` shapes; typed non-success preserving
 //!   identity, `Unknown` never false-success, single terminal emission).
 //!
-//! The issue body's 22-case matrix (1..22, see
-//! `tests/data/host_lifecycle_diagnostics.json:deferred_cases`) is implemented
-//! below as one `// WORK_UNIT_CASE: 891/<n>` test per declared case; whole-Host
-//! acceptance stays deferred to the final child-union coverage proof
-//! (#837/#852). These probes and cases drive the real facade plus the real
-//! runtime-control wire types and read the real `lib.rs` call sites; a
-//! hand-built expected log alone is never call-site proof. Fake clocks/SCM
-//! ports do not establish live SCM behavior. Diagnostics are evidence only:
-//! they never change control flow, state, errors, receipts, order, status,
-//! or cleanup, and stdout framing stays exactly one-JSON-per-line.
+//! The issue body's 22-case matrix (1..22) is implemented below as one
+//! `// WORK_UNIT_CASE: 891/<n>` test per declared case, and case 22 requires
+//! `tests/data/host_lifecycle_diagnostics.json:deferred_cases` to be empty
+//! once they all exist; whole-Host acceptance stays deferred to the final
+//! child-union coverage proof (#837/#852). These probes and cases drive the
+//! real facade, the real runtime-control wire types and the real owner
+//! operations each case names (`HostComposition::open` in cases 1 and 22,
+//! `HostLaunchOptions::parse` in cases 15, 17, 19, 20 and 21, and the
+//! `HostComposition::stop` and runtime-control seams of T-A and T-B in
+//! source), and read the real `lib.rs` call sites; a hand-built expected log
+//! alone is never call-site proof. Fake clocks/SCM ports do not establish
+//! live SCM behavior. Diagnostics are evidence only: they never change
+//! control flow, state, errors, receipts, order, status, or cleanup, and
+//! stdout framing stays exactly one-JSON-per-line.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -85,6 +92,23 @@ fn capture_emit(emit: impl FnOnce()) -> String {
         sink.bytes.lock().unwrap().clone()
     };
     String::from_utf8_lossy(&captured).into_owned()
+}
+
+/// Runs `emit` under the same scoped subscriber as `capture_emit` and returns
+/// the captured text together with the value `emit` produced, so one call
+/// proves both the records it emitted and the outcome it returned.
+fn capture_emit_result<T>(emit: impl FnOnce() -> T) -> (String, T) {
+    let sink = CaptureSink::default();
+    let writer_sink = sink.clone();
+    let value = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit)
+    };
+    let captured = sink.bytes.lock().unwrap().clone();
+    (String::from_utf8_lossy(&captured).into_owned(), value)
 }
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
@@ -495,7 +519,7 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
 }
 
 // ---------------------------------------------------------------------------
-// #891 declared acceptance cases 1..5.
+// #891 declared acceptance cases 1..22.
 //
 // One `// WORK_UNIT_CASE: 891/<case>` test per declared case, appended after
 // the untouched T-A/T-B starter probes. Every case binds source -> discovery
@@ -510,6 +534,18 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
 // executed
 //   `capture_emit` over the frozen table vocabulary and a real public API
 //   round trip.
+// executed owner pass
+//   PRESENT in this target. Cases 1 and 22 execute the real owner operation
+//   `HostComposition::open` inside `capture_emit` and bind its OWNER-EMITTED
+//   records to the frozen table; cases 19, 20 and 21 execute the real
+//   production entry point `eliot_host::HostLaunchOptions::parse`. The
+//   remaining seventeen cases bind `executed` to the #889 facade itself, and
+//   for cases 15, 17 and 19 that facade is driven with a
+//   `HostRequestProjection` built from real parsed options rather than a
+//   frozen row spelling. Only the two owner rows and the three
+//   parse-entry-point rows are executed here; the emitting rows these cases
+//   never reach are never claimed to be executed. Cases 1 and 22 name the
+//   three named owner-pass risks at their own capture sites.
 //
 // No service start/stop side effect, no fake clock, no fake SCM port, no new
 // dependency, no diagnostic/control-flow change. The Windows Event Log seam
@@ -796,7 +832,13 @@ fn case_1_frozen_boundary_table_matches_fixture_and_propagated_exclusions() {
 
     // Executed: every emitting spelling survives the real bounded formatter
     // unchanged and reaches the real facade verbatim, so the parsed table is
-    // the vocabulary production actually emits.
+    // the vocabulary the real facade emits and delivers unchanged when handed a
+    // parsed row event.
+    // This capture calls the facade directly, so it still proves only the
+    // facade's own formatting and delivery for the frozen spellings. The
+    // OWNER-EMITTED spelling is now proved separately below by the
+    // `HostComposition::open` capture, which is a real production owner
+    // operation.
     for event in &emitting_events {
         assert_eq!(
             eliot_host::host_diagnostics::bound_detail(event).text(),
@@ -825,6 +867,51 @@ fn case_1_frozen_boundary_table_matches_fixture_and_propagated_exclusions() {
     assert!(
         emitted.contains(HOST_DIAGNOSTICS_TARGET),
         "the frozen vocabulary must travel through the #889 facade target"
+    );
+
+    // Owner pass risks, all three named: `lib.rs` emits the open request row
+    // and arms the open terminal BEFORE it runs the wiring self-check over a
+    // by-value backup-dispatch table, and none of the three registers a
+    // process-global; `HostOwnerLease::acquire` is a real `Global\` named mutex;
+    // and the guarded region is entered unconditionally, so the captured
+    // evidence is identical on every machine whichever fallible step fails
+    // first.
+    let owner_emitted = capture_emit(|| {
+        let _ = eliot_host::HostComposition::open(
+            eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+                .expect("the established argv must admit"),
+        );
+    });
+    assert_eq!(
+        count_occurrences(&owner_emitted, "detail=\"host.open requested\""),
+        1,
+        "one failed owner operation must emit the open request row exactly once: {owner_emitted}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_emitted, "code=\"host-open-failed\""),
+        1,
+        "one failed owner operation must emit exactly one designated terminal: {owner_emitted}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_emitted, "detail=\"host.open admitted\""),
+        0,
+        "a failed owner operation must never emit the admitted row: {owner_emitted}"
+    );
+    // The row is selected by its `name` column, never by the `event` spelling
+    // the needle is built from, so the expected detail comes from the parsed
+    // source table rather than from the literal it is then counted against.
+    let owner_requested = rows
+        .iter()
+        .find(|row| case1_field(row.as_slice(), "name") == "open.requested")
+        .expect("the frozen table must carry the `open.requested` row the owner emitted");
+    let owner_requested_detail = case1_field(owner_requested, "event");
+    assert_eq!(
+        count_occurrences(
+            &owner_emitted,
+            &format!("detail=\"{owner_requested_detail}\"")
+        ),
+        1,
+        "the detail the OWNER emitted must be byte-identical to the `event` spelling of the `open.requested` row this test parsed out of `src/lib.rs`, selected by that row's `name` and not by its `event`, which is what binds this row to the table rather than to a literal: {owner_emitted}"
     );
 }
 
@@ -6973,7 +7060,7 @@ fn case21_launch_argv() -> Vec<std::ffi::OsString> {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "case 22 proves all four allowed-diff properties from the real production call path: row ownership, the single terminal, the lifecycle vocabulary and the published surface"
+    reason = "case 22 proves all six allowed-diff properties from the executed HostComposition::open call path plus the parsed production call sites: row ownership, the single terminal, the lifecycle vocabulary and the published surface"
 )]
 fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     let lib = manifest_source("src/lib.rs");
@@ -7261,6 +7348,8 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
 
     // ---- no new visibility: nothing here is published, and cfg(test) is not a
     // publication channel ----
+    // This is the whole proof of `no_new_visibility` and nothing is executed for
+    // it: the property is provable only by declaration lines, never by execution.
     for published in [
         "pub fn host_lifecycle_",
         "pub struct HostLifecycleBoundary",
@@ -7304,7 +7393,15 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         "the published seam must resolve to an existing facade item, not a new one"
     );
 
-    // ---- executed pass: the real facade emits the table's rows verbatim ----
+    // ---- executed pass: the #889 facade's own formatting and delivery for the
+    // table's frozen row events and terminal codes ----
+    // Each row event is handed to `observe_entrypoint_with_detail` and each
+    // terminal code to `observe_terminal_error` directly, so this section proves
+    // the facade's own bounded formatting and delivery behaviour for those
+    // frozen spellings, not that a production call site emitted them.
+    // A real `HostComposition` owner operation IS now executed in this target
+    // further down through `HostComposition::open`, which emits the
+    // `open.requested` and `open.terminal` rows of the frozen table.
     for (row_name, stage_name) in [
         ("open.requested", "startup"),
         ("kernel-restart.requested", "scm_dispatch"),
@@ -7355,11 +7452,108 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         "no mutable global dedup cache may suppress a second emission: {repeated}"
     );
 
-    // ---- the fixture's declared diff is bound to the real call path ----
-    // Each allowed-diff property is proven above from `src/lib.rs` and the real
-    // facade, so here the object is only bound to that proof: its five names
-    // must be exactly the five properties this delivery proves, and each must
-    // stay a declared boolean rather than a free-text claim.
+    // Owner pass risks, all three named: `lib.rs` emits the open request row
+    // and arms the open terminal BEFORE it runs the wiring self-check over a
+    // by-value backup-dispatch table, and none of the three registers a
+    // process-global; `HostOwnerLease::acquire` is a real `Global\` named mutex;
+    // and the guarded region is entered unconditionally, so the captured
+    // evidence is identical on every machine whichever fallible step fails
+    // first.
+    // The declared `test` column of the `open.terminal` row is `891/case-14`, so
+    // case 22 only OBSERVES these rows and does not own them.
+    // One unobserved call runs first with no subscriber installed at all: it is
+    // the same real operation whose outcome the observation path must leave
+    // untouched, so the typed results are compared against it instead of being
+    // discarded.
+    let owner_unobserved = eliot_host::HostComposition::open(
+        eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+            .expect("the established argv must admit"),
+    );
+    let (owner_first, owner_first_outcome) = capture_emit_result(|| {
+        eliot_host::HostComposition::open(
+            eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+                .expect("the established argv must admit"),
+        )
+    });
+    let (owner_second, owner_second_outcome) = capture_emit_result(|| {
+        eliot_host::HostComposition::open(
+            eliot_host::HostLaunchOptions::parse(case21_launch_argv())
+                .expect("the established argv must admit"),
+        )
+    });
+    let owner_unobserved_error = owner_unobserved
+        .err()
+        .expect("no_lifecycle_delta: the unobserved owner operation must be a failure");
+    let owner_first_error = owner_first_outcome.err().expect(
+        "no_lifecycle_delta: the observed owner operation must be the same failure as the unobserved one",
+    );
+    let owner_second_error = owner_second_outcome.err().expect(
+        "no_lifecycle_delta: the second observed owner operation must be the same failure as the unobserved one",
+    );
+    assert_eq!(
+        std::mem::discriminant(&owner_first_error),
+        std::mem::discriminant(&owner_unobserved_error),
+        "no_lifecycle_delta: installing the subscriber must not change which failure the owner operation returns"
+    );
+    assert_eq!(
+        std::mem::discriminant(&owner_second_error),
+        std::mem::discriminant(&owner_unobserved_error),
+        "no_lifecycle_delta: the second observed owner operation must return the same failure as the unobserved one"
+    );
+    for (owner_label, owner) in [
+        ("owner_first", &owner_first),
+        ("owner_second", &owner_second),
+    ] {
+        let terminal_records: Vec<&str> = owner
+            .lines()
+            .filter(|line| line.contains("event=\"host.terminal_error\""))
+            .collect();
+        assert_eq!(
+            terminal_records.len(),
+            1,
+            "single_terminal_per_failed_op: one terminal RECORD per failed owner operation, whatever code it carries ({owner_label}): {owner}"
+        );
+        for &record in &terminal_records {
+            assert!(
+                record.contains("code=\"host-open-failed\""),
+                "single_terminal_per_failed_op: every terminal record of one failed operation must carry that operation's own terminal code ({owner_label}): {record}"
+            );
+        }
+        assert_eq!(
+            count_occurrences(owner, "code=\"host-open-failed\""),
+            1,
+            "single_terminal_per_failed_op: one designated terminal per failed owner operation, never two ({owner_label}): {owner}"
+        );
+        assert_eq!(
+            count_occurrences(owner, "detail=\"host.open admitted\""),
+            0,
+            "the admitted row was never reached, because this failing open stops at its first fallible step; the lifecycle-delta proof is the unchanged typed result above plus the observation-surface text proof, not this row count ({owner_label}): {owner}"
+        );
+    }
+    assert_eq!(
+        count_occurrences(&owner_first, "detail=\"host.open requested\""),
+        1,
+        "no_duplicate_evaluation: re-running the owner yields one record per call, not an accumulation: {owner_first}"
+    );
+    assert_eq!(
+        count_occurrences(&owner_second, "detail=\"host.open requested\""),
+        1,
+        "no_duplicate_evaluation: re-running the owner yields one record per call, not an accumulation: {owner_second}"
+    );
+    assert_eq!(
+        case21_without_observational_timing(&owner_first),
+        case21_without_observational_timing(&owner_second),
+        "no_mutable_global_dedup: a process-global dedup cache would make the second call's records differ from the first's once the observational timing is removed: {owner_first} vs {owner_second}"
+    );
+
+    // ---- the fixture's declared diff names are bound to the properties this
+    // test asserts ----
+    // The object is only bound to this test's assertions here, not re-proven by
+    // them: its six declared names must be exactly the six properties this
+    // delivery asserts, and each must hold rather than merely be declared a
+    // boolean, so the fixture can no longer claim a property this case proves
+    // nothing about. `no_unowned_edit` is proved by the identifier-to-row
+    // bijection and the free-event-string call-site scan above.
     let allowed = &fixture["allowed_diff"];
     let mut declared: Vec<String> = allowed
         .as_object()
@@ -7371,8 +7565,9 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     let mut proven: Vec<&str> = vec![
         "no_duplicate_evaluation",
         "no_lifecycle_delta",
-        "no_new_visibility",
         "no_mutable_global_dedup",
+        "no_new_visibility",
+        "no_unowned_edit",
         "single_terminal_per_failed_op",
     ];
     proven.sort_unstable();
@@ -7384,6 +7579,11 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
         assert!(
             allowed[key.as_str()].is_boolean(),
             "the allowed_diff property {key} must stay a declared boolean"
+        );
+        assert_eq!(
+            allowed[key.as_str()],
+            Value::Bool(true),
+            "the allowed_diff property {key} must hold, not merely be declared: this delivery proves it, so the fixture may not record it as not holding"
         );
     }
     assert_eq!(
@@ -7689,7 +7889,11 @@ fn case22_observation_surface(source: &str) -> String {
     let end = source
         .find("const fn boundary_event_is_propagated(")
         .unwrap_or_else(|| panic!("the row definitions must be followed by their const check"));
-    source[start..end.max(start)].to_owned()
+    assert!(
+        start < end,
+        "the observation surface must begin at its helpers and end after them: helpers at {start}, the const coverage check at {end}"
+    );
+    source[start..end].to_owned()
 }
 
 /// The frozen `EntrypointStage` names the facade publishes, in source order.

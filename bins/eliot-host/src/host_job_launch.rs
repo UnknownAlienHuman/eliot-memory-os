@@ -37,17 +37,20 @@ use eliot_platform_windows::{
 };
 
 #[cfg(windows)]
-use super::{
-    BranchLiveness, HostError, HostJobBranches, KernelLaunchBinding,
-    validate_eliotd_launch_descriptor, validate_store_bootstrap_descriptor,
-};
+use super::{BranchLiveness, HostError, HostJobBranches, KernelLaunchBinding};
 #[cfg(windows)]
 use crate::launch_artifact::{
-    LaunchLease, approved_locator, open_launch_lease, verify_launch_digest,
+    LaunchLease, approved_locator_with_correlation, open_launch_lease_with_correlation,
+    verify_launch_digest_with_correlation,
+};
+#[cfg(windows)]
+use crate::launch_descriptor_validation::{
+    validate_eliotd_launch_descriptor_with_correlation,
+    validate_store_bootstrap_descriptor_with_correlation,
 };
 #[cfg(windows)]
 use crate::store_kernel_launch_sequence::{
-    StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
+    StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel_with_correlation,
 };
 
 // F-LOG-HOST-3 (#978) launch observation helpers.
@@ -72,14 +75,14 @@ use crate::store_kernel_launch_sequence::{
 // One designated terminal per underlying operation: the leaf guard below is
 // PHASE-ONLY. `HostLaunchTerminalGuard` emits one correlated subordinate phase
 // record and no terminal at all. The designated terminal for one failed launch
-// is `lib.rs`'s `HostTerminalGuard(BOUNDARY_START_TERMINAL)`, whose frozen
-// code is "host-start-failed"; the leaf terminal code this file used to emit is
-// retired and appears nowhere here, so one failed launch can no longer produce
+// is `lib.rs`'s `HostTerminalGuard` on the OUTER contour that wrapped the call:
+// the production path arms `BOUNDARY_OPEN_TERMINAL` ("host-open-failed"), while
+// `BOUNDARY_START_TERMINAL` ("host-start-failed") is armed only inside
+// `start_approved_contour`, which has no in-repo caller. The leaf terminal code
+// retired here appears nowhere in this file, so one failed launch cannot produce
 // two terminal records. Typed rejections stay
-// `HostError::ProcessContour`/`RecoveryRequired`
-// (cases 978/2, 978/3); admitted launches are distinct from readiness (case
-// 978/4 — admitted here is never readiness, which stays with the readiness
-// contour).
+// `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2, 978/3); admitted
+// launches are distinct from readiness (case 978/4 — never readiness here).
 
 /// Bounded, secret-free correlation identities for one launch phase record.
 ///
@@ -308,10 +311,10 @@ fn host_launch_process_start_identity(process: &eliot_platform_windows::ProcessI
 /// `Err` return (explicit or via `?`) drops armed and emits exactly one
 /// subordinate phase record, correlated with the identities this contour
 /// already holds. It emits NO terminal: the designated terminal for one failed
-/// launch is `lib.rs`'s `HostTerminalGuard(BOUNDARY_START_TERMINAL)`
-/// ("host-start-failed"), which this leaf must not duplicate (issue #978 audit
-/// defect 2). Emitting here never changes the `Result`: the guard only observes
-/// the already-produced outcome. No dedup cache, no lock, no second evaluation.
+/// launch is `lib.rs`'s `HostTerminalGuard` on the outer contour - the production
+/// path arms `BOUNDARY_OPEN_TERMINAL`, while `BOUNDARY_START_TERMINAL` is armed
+/// only in the uncalled exported `start_approved_contour` - which this leaf must
+/// not duplicate (#978 audit 2). It only observes the outcome; no dedup or lock.
 #[cfg(windows)]
 struct HostLaunchTerminalGuard<'a> {
     phase: &'a str,
@@ -353,11 +356,16 @@ impl Drop for HostLaunchTerminalGuard<'_> {
 /// bytes. The future shared-executor adapter reuses this exact gate before
 /// resume; it never replaces it with a caller-supplied hash comparison.
 ///
-/// #978: the only values this gate holds are locators, and a locator is a raw
-/// path that never enters a diagnostic record (I15.4). No installation,
-/// generation, artifact or process identity is in hand here, so every record
-/// below keeps each identity slot explicitly missing rather than deriving one.
-#[cfg(windows)]
+/// #978: the only values this gate holds itself are locators, and a locator is
+/// a raw path that never enters a diagnostic record (I15.4). This cell derives
+/// no identity: it forwards the ones the calling contour already holds, while
+/// the slots it cannot name (an owner operation id, a process-start identity,
+/// and a generation that is not the authority generation) render explicitly
+/// missing. Its only callers are this module's `#[cfg(all(test, windows))]`
+/// cases now that the production contour calls the `_with_correlation` twin,
+/// and that `cfg` is what keeps this identity-free wrapper from reading as
+/// dead code without an `allow`.
+#[cfg(all(test, windows))]
 fn approved_launch_paths(
     executable: &Path,
     approved_executable_path: &PlatformHandle,
@@ -365,69 +373,72 @@ fn approved_launch_paths(
     approved_config_path: &PlatformHandle,
 ) -> Result<(), HostError> {
     // WORK_UNIT_CASE: 978/1 — approved paths requested.
-    host_launch_observe(
-        "host.launch approved paths requested",
+    approved_launch_paths_with_correlation(
         &LaunchPhaseCorrelation::NONE,
-    );
+        executable,
+        approved_executable_path,
+        config_path,
+        approved_config_path,
+    )
+}
+
+/// `approved_launch_paths` with the calling contour's already-held launch
+/// correlation forwarded to every record this gate emits.
+///
+/// Identical logic, phase literals, order, returns and typed rejections; the
+/// only difference is the correlation each observation receives. This gate
+/// derives no identity and binds no locator or approved handle of its own: the
+/// forwarded slots are rendered by `LaunchPhaseCorrelation::render`, so a slot
+/// the caller could not hold stays the renderer's explicit absence marker
+/// (I15.4).
+#[cfg(windows)]
+fn approved_launch_paths_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    executable: &Path,
+    approved_executable_path: &PlatformHandle,
+    config_path: &Path,
+    approved_config_path: &PlatformHandle,
+) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 978/1 — approved paths requested.
+    host_launch_observe("host.launch approved paths requested", correlation);
     let approved_executable = std::fs::canonicalize(executable).map_err(|error| {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        host_launch_observe(
-            "host.launch approved paths typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch approved paths typed rejection", correlation);
         HostError::ProcessContour(error.to_string())
     })?;
     let approved_executable_canonical =
         std::fs::canonicalize(Path::new(approved_executable_path.as_str())).map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe(
-                "host.launch approved paths typed rejection",
-                &LaunchPhaseCorrelation::NONE,
-            );
+            host_launch_observe("host.launch approved paths typed rejection", correlation);
             HostError::ProcessContour(error.to_string())
         })?;
     if approved_executable != executable || approved_executable_canonical != approved_executable {
         // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-        host_launch_observe(
-            "host.launch substitution preserved",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch substitution preserved", correlation);
         return Err(HostError::ProcessContour(
             "executable locator is not the approved path".to_owned(),
         ));
     }
     let approved_config = std::fs::canonicalize(config_path).map_err(|error| {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        host_launch_observe(
-            "host.launch approved paths typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch approved paths typed rejection", correlation);
         HostError::ProcessContour(error.to_string())
     })?;
     let approved_config_canonical = std::fs::canonicalize(Path::new(approved_config_path.as_str()))
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe(
-                "host.launch approved paths typed rejection",
-                &LaunchPhaseCorrelation::NONE,
-            );
+            host_launch_observe("host.launch approved paths typed rejection", correlation);
             HostError::ProcessContour(error.to_string())
         })?;
     if approved_config != config_path || approved_config_canonical != approved_config {
         // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-        host_launch_observe(
-            "host.launch substitution preserved",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch substitution preserved", correlation);
         return Err(HostError::ProcessContour(
             "config locator is not the approved path".to_owned(),
         ));
     }
     // WORK_UNIT_CASE: 978/1 — approved paths admitted, distinct from rejection.
-    host_launch_observe(
-        "host.launch approved paths admitted",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    host_launch_observe("host.launch approved paths admitted", correlation);
     Ok(())
 }
 
@@ -836,52 +847,65 @@ fn store_endpoint_collision_directive(
 /// or a missing doctor digest also fails closed instead of replacing live
 /// authority.
 ///
-/// #978: this helper holds only the stored argument contour and the Doctor
-/// executable locator, and both are raw launch values that never enter a
-/// diagnostic record. No installation, generation, artifact or process identity
-/// is in hand here, so every record below keeps each identity slot explicitly
-/// missing rather than deriving one.
+/// #978: the only values this helper holds itself are the stored argument
+/// contour and the Doctor executable locator, and both are raw launch values
+/// that never enter a diagnostic record. This cell derives no identity: it
+/// forwards the ones the calling contour already holds, while the slots it
+/// cannot name (an owner operation id, an artifact digest, and a process-start
+/// identity) render explicitly missing.
 #[cfg(windows)]
 pub(super) fn kernel_arguments_with_doctor_anchor(
     kernel_arguments: &[PlatformHandle],
     doctor_executable_path: &PlatformHandle,
 ) -> Result<Vec<PlatformHandle>, HostError> {
+    // WORK_UNIT_CASE: 978/1 — doctor anchor requested.
+    kernel_arguments_with_doctor_anchor_with_correlation(
+        &LaunchPhaseCorrelation::NONE,
+        kernel_arguments,
+        doctor_executable_path,
+    )
+}
+
+/// [`kernel_arguments_with_doctor_anchor`] with the calling contour's
+/// already-held launch correlation forwarded to every record this seam emits.
+///
+/// Identical logic, phase literals, order, injected contour, returns and typed
+/// rejections; the only difference is the correlation each observation
+/// receives. This seam derives no identity and binds no argument or path value
+/// of its own: the forwarded slots are rendered by
+/// `LaunchPhaseCorrelation::render`, so a slot the caller could not hold stays
+/// the renderer's explicit absence marker (I15.4).
+#[cfg(windows)]
+pub(super) fn kernel_arguments_with_doctor_anchor_with_correlation(
+    correlation: &LaunchPhaseCorrelation<'_>,
+    kernel_arguments: &[PlatformHandle],
+    doctor_executable_path: &PlatformHandle,
+) -> Result<Vec<PlatformHandle>, HostError> {
     const DOCTOR_DIGEST_FLAG: &str = "--doctor-artifact-sha256";
     const DOCTOR_PATH_FLAG: &str = "--doctor-executable-path";
-    // WORK_UNIT_CASE: 978/1 — doctor anchor requested.
-    host_launch_observe(
-        "host.launch doctor anchor requested",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    // WORK_UNIT_CASE: 978/1 — doctor anchor requested; the caller's already-held
+    // identities are forwarded and nothing is derived here.
+    host_launch_observe("host.launch doctor anchor requested", correlation);
     if kernel_arguments
         .iter()
         .any(|argument| argument.as_str() == DOCTOR_PATH_FLAG)
     {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        host_launch_observe(
-            "host.launch doctor anchor typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch doctor anchor typed rejection", correlation);
         return Err(HostError::ProcessContour(
             "Kernel launch contour already carries a Doctor path anchor".to_owned(),
         ));
     }
     if !Path::new(doctor_executable_path.as_str()).is_absolute() {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        host_launch_observe(
-            "host.launch doctor anchor typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch doctor anchor typed rejection", correlation);
         return Err(HostError::ProcessContour(
             "Doctor executable path anchor must be absolute".to_owned(),
         ));
     }
     let path_flag = PlatformHandle::new(DOCTOR_PATH_FLAG).map_err(|error| {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        host_launch_observe(
-            "host.launch doctor anchor typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch doctor anchor typed rejection", correlation);
         HostError::ProcessContour(error.to_string())
     })?;
     let mut injected = Vec::with_capacity(kernel_arguments.len().saturating_add(2));
@@ -893,10 +917,7 @@ pub(super) fn kernel_arguments_with_doctor_anchor(
         if argument.as_str() == DOCTOR_DIGEST_FLAG {
             let digest = kernel_arguments.get(index + 1).cloned().ok_or_else(|| {
                 // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                host_launch_observe(
-                    "host.launch doctor anchor typed rejection",
-                    &LaunchPhaseCorrelation::NONE,
-                );
+                host_launch_observe("host.launch doctor anchor typed rejection", correlation);
                 HostError::ProcessContour(
                     "Kernel launch contour is missing the digested doctor role".to_owned(),
                 )
@@ -912,19 +933,13 @@ pub(super) fn kernel_arguments_with_doctor_anchor(
     }
     if !anchored {
         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-        host_launch_observe(
-            "host.launch doctor anchor typed rejection",
-            &LaunchPhaseCorrelation::NONE,
-        );
+        host_launch_observe("host.launch doctor anchor typed rejection", correlation);
         return Err(HostError::ProcessContour(
             "Kernel launch contour is missing the digested doctor role".to_owned(),
         ));
     }
     // WORK_UNIT_CASE: 978/1 — doctor anchor admitted, exact count preserved.
-    host_launch_observe(
-        "host.launch doctor anchor admitted",
-        &LaunchPhaseCorrelation::NONE,
-    );
+    host_launch_observe("host.launch doctor anchor admitted", correlation);
     Ok(injected)
 }
 
@@ -998,7 +1013,8 @@ impl HostJobBranches {
         }
         // WORK_UNIT_CASE: 978/3 — retained lease bound, distinct from image name below.
         host_launch_observe("host.launch retained lease bound", &correlation);
-        approved_launch_paths(
+        approved_launch_paths_with_correlation(
+            &correlation,
             executable,
             approved_executable_path,
             config_path,
@@ -1572,83 +1588,132 @@ impl HostJobBranches {
         } else {
             None
         };
-        let kernel_executable =
-            approved_locator(kernel_executable, approved_kernel_path, launch.profile)?;
-        let kernel_lease =
-            open_launch_lease(launch.profile, portable_root.as_ref(), &kernel_executable)?;
-        verify_launch_digest(&kernel_lease, kernel_artifact, "runtime.kernel_artifact")?;
-        let store_bridge_executable = approved_locator(
+        let kernel_executable = approved_locator_with_correlation(
+            &correlation,
+            kernel_executable,
+            approved_kernel_path,
+            launch.profile,
+        )?;
+        let kernel_lease = open_launch_lease_with_correlation(
+            &correlation,
+            launch.profile,
+            portable_root.as_ref(),
+            &kernel_executable,
+        )?;
+        verify_launch_digest_with_correlation(
+            &correlation,
+            &kernel_lease,
+            kernel_artifact,
+            "runtime.kernel_artifact",
+        )?;
+        let store_bridge_executable = approved_locator_with_correlation(
+            &correlation,
             store_bridge_executable,
             approved_store_bridge_path,
             launch.profile,
         )?;
-        let store_lease = open_launch_lease(
+        let store_lease = open_launch_lease_with_correlation(
+            &correlation,
             launch.profile,
             portable_root.as_ref(),
             &store_bridge_executable,
         )?;
-        verify_launch_digest(&store_lease, store_artifact, "runtime.store_artifact")?;
-        let config_path = approved_locator(config_path, approved_config_path, launch.profile)?;
+        verify_launch_digest_with_correlation(
+            &correlation,
+            &store_lease,
+            store_artifact,
+            "runtime.store_artifact",
+        )?;
+        let config_path = approved_locator_with_correlation(
+            &correlation,
+            config_path,
+            approved_config_path,
+            launch.profile,
+        )?;
         let config_pin = PinnedRuntimeFile::open(&config_path)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let config_lease = open_launch_lease(launch.profile, portable_root.as_ref(), &config_path)?;
-        verify_launch_digest(&config_lease, config_digest, "runtime.config")?;
+        let config_lease = open_launch_lease_with_correlation(
+            &correlation,
+            launch.profile,
+            portable_root.as_ref(),
+            &config_path,
+        )?;
+        verify_launch_digest_with_correlation(
+            &correlation,
+            &config_lease,
+            config_digest,
+            "runtime.config",
+        )?;
         let semantic_config_hash = semantic_store_config_hash_from_json(
             &config_lease.read_bounded(1024 * 1024).map_err(|error| {
                 HostError::ProcessContour(format!("read Store config for semantic digest: {error}"))
             })?,
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let store_bootstrap_path = approved_locator(
+        let store_bootstrap_path = approved_locator_with_correlation(
+            &correlation,
             Path::new(launch.store_bootstrap_descriptor_path.as_str()),
             &launch.store_bootstrap_descriptor_path,
             launch.profile,
         )?;
-        let store_bootstrap_lease = open_launch_lease(
+        let store_bootstrap_lease = open_launch_lease_with_correlation(
+            &correlation,
             launch.profile,
             portable_root.as_ref(),
             &store_bootstrap_path,
         )?;
-        let store_bootstrap_requirement = validate_store_bootstrap_descriptor(
+        let store_bootstrap_requirement = validate_store_bootstrap_descriptor_with_correlation(
+            &correlation,
             &store_bootstrap_lease,
             &launch.store_bootstrap_descriptor_digest,
             store_artifact,
             &semantic_config_hash,
             host.host_process_nonce().as_handle(),
         )?;
-        let eliotd_config_path = approved_locator(
+        let eliotd_config_path = approved_locator_with_correlation(
+            &correlation,
             Path::new(launch.eliotd_config_path.as_str()),
             &launch.eliotd_config_path,
             launch.profile,
         )?;
-        let eliotd_config_lease =
-            open_launch_lease(launch.profile, portable_root.as_ref(), &eliotd_config_path)?;
-        verify_launch_digest(
+        let eliotd_config_lease = open_launch_lease_with_correlation(
+            &correlation,
+            launch.profile,
+            portable_root.as_ref(),
+            &eliotd_config_path,
+        )?;
+        verify_launch_digest_with_correlation(
+            &correlation,
             &eliotd_config_lease,
             &launch.eliotd_config_digest,
             "runtime.eliotd_config",
         )?;
-        let eliotd_descriptor_path = approved_locator(
+        let eliotd_descriptor_path = approved_locator_with_correlation(
+            &correlation,
             Path::new(launch.eliotd_descriptor_path.as_str()),
             &launch.eliotd_descriptor_path,
             launch.profile,
         )?;
-        let eliotd_descriptor_lease = open_launch_lease(
+        let eliotd_descriptor_lease = open_launch_lease_with_correlation(
+            &correlation,
             launch.profile,
             portable_root.as_ref(),
             &eliotd_descriptor_path,
         )?;
-        verify_launch_digest(
+        verify_launch_digest_with_correlation(
+            &correlation,
             &eliotd_descriptor_lease,
             &launch.eliotd_descriptor_digest,
             "runtime.eliotd_descriptor",
         )?;
-        validate_eliotd_launch_descriptor(
+        validate_eliotd_launch_descriptor_with_correlation(
+            &correlation,
             &eliotd_descriptor_lease,
             &launch.eliotd_descriptor_digest,
             launch,
         )?;
-        let store_config_path = approved_locator(
+        let store_config_path = approved_locator_with_correlation(
+            &correlation,
             Path::new(launch.store_config_path.as_str()),
             approved_config_path,
             launch.profile,
@@ -1669,7 +1734,8 @@ impl HostJobBranches {
         // digest-bound Doctor executable path into the stored 22-value
         // contour so the Kernel receives the exact 24-value launch options.
         // Missing or relative anchors fail closed here, never defaulted.
-        let kernel_arguments = kernel_arguments_with_doctor_anchor(
+        let kernel_arguments = kernel_arguments_with_doctor_anchor_with_correlation(
+            &correlation,
             &launch.kernel_arguments,
             &launch.doctor_executable_path,
         )?;
@@ -1685,7 +1751,8 @@ impl HostJobBranches {
                 state_fence: &launch.authority_state_fence,
             },
         )?;
-        let launch_result = launch_store_then_kernel(
+        let launch_result = launch_store_then_kernel_with_correlation(
+            &correlation,
             || {
                 Self::launch(
                     &store_bridge_executable,
@@ -2136,20 +2203,23 @@ mod approved_path_tests {
 ///
 /// These cases execute the real private seams of this module (the correlation
 /// renderer, this file's own observe seam, the production process-start
-/// projection and the drop of an armed `HostLaunchTerminalGuard`); no visibility
-/// is widened and no production algorithm is restated here. Every value below is
-/// a synthetic test identity, never a real path, credential or error text, and
-/// where a case has no unit-reachable producer for a slot it says so in its own
-/// `HONEST SCOPE` note rather than claiming a proof it does not have.
+/// projection, the drop of an armed `HostLaunchTerminalGuard`, and the
+/// Store-before-Kernel sequence through the correlation-forwarding entry point
+/// this file now calls); no visibility is widened and no production algorithm is
+/// restated here. Every value below is a synthetic test identity, never a real
+/// path, credential or error text, and where a case has no unit-reachable
+/// producer for a slot it says so in its own `HONEST SCOPE` note rather than
+/// claiming a proof it does not have.
 #[cfg(all(test, windows))]
 mod phase_correlation_tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
-    use super::{HostLaunchTerminalGuard, LaunchPhaseCorrelation, MISSING_IDENTITY};
+    use super::{HostError, HostLaunchTerminalGuard, LaunchPhaseCorrelation, MISSING_IDENTITY};
     use crate::host_diagnostics::{
         MAX_DIAGNOSTIC_DETAIL_BYTES, MAX_DIAGNOSTIC_FIELD_BYTES, bound_detail,
     };
+    use crate::store_kernel_launch_sequence::launch_store_then_kernel_with_correlation;
 
     /// The eight frozen correlation keys, in the order `LaunchPhaseCorrelation::render`
     /// emits them and the fixture's `correlation_keys` declares them.
@@ -2493,6 +2563,84 @@ mod phase_correlation_tests {
         );
     }
 
+    /// A correlation the call site already holds must reach the records the
+    /// forwarded helper emits: forwarding it away would render identities the
+    /// caller holds as explicit absence.
+    ///
+    /// HONEST SCOPE: this case is deliberately NOT attributed to a case number.
+    /// The correlation is the owner's SLOT SELECTION `start_approved` builds and
+    /// now forwards, with the same synthetic values the guard case above holds,
+    /// and every record below is a REAL emission of the real
+    /// Store-before-Kernel sequence taken through its correlation-forwarding
+    /// entry point, read back out of a scoped `tracing` subscriber. Reaching
+    /// `start_approved` itself needs a full admitted physical launch (approved
+    /// digests, retained leases and a validated descriptor), so this case proves
+    /// the FORWARDING seam carries the held identities and not `missing`; it
+    /// does not claim that any owner holds these exact identities, and it pins
+    /// no phase count, ordering or launch behaviour beyond what the sequence
+    /// already emits.
+    #[test]
+    fn a_forwarded_correlation_reaches_same_operation_phase_records() {
+        let correlation = LaunchPhaseCorrelation::NONE
+            .with_installation("installation-7")
+            .with_generation(7)
+            .with_fence("fence-3");
+        let forwarded = capture(|| {
+            let result = launch_store_then_kernel_with_correlation(
+                &correlation,
+                || Ok::<_, HostError>("store-handle"),
+                |store| {
+                    assert_eq!(*store, "store-handle");
+                    Ok(())
+                },
+                || Ok::<_, HostError>("kernel-handle"),
+                |_store| -> Result<(), Box<(&str, String)>> { Ok(()) },
+            );
+            assert!(matches!(result, Ok(("store-handle", "kernel-handle"))));
+        });
+        let records = count(&forwarded, "host.entrypoint_stage");
+        assert!(
+            records > 1,
+            "one sequence must emit more than one same-operation phase record: {forwarded}"
+        );
+        // Every same-operation phase record the forwarded seam emits carries the
+        // identities the caller already held, never their absence marker.
+        for record in forwarded.split("host.entrypoint_stage").skip(1) {
+            // The split yields the RAW captured text between two event markers, so it
+            // still carries the facade's own framing and the subscriber's trailing
+            // metadata. `rendered_slots` needs the extracted `detail`, and the
+            // difference is load-bearing for `reason`: it is the LAST frozen key, so
+            // its span has no following `<key>=` anchor and runs to the end of the
+            // haystack - on a raw chunk that end is the closing quote of the quoted
+            // detail field plus `detail_bytes=…`, which would read as
+            // `missing" detail_bytes=…` instead of the absent marker. Every other
+            // key survived only because a later anchor happened to stop it first. The
+            // extracted text is bound to a name first because `rendered_slots` returns
+            // spans that borrow its argument.
+            let detail = captured_detail(record);
+            let parsed = rendered_slots(&detail);
+            for (key, value) in [
+                ("installation", "installation-7"),
+                ("generation", "7"),
+                ("fence", "fence-3"),
+            ] {
+                assert_eq!(
+                    slot_value(&parsed, key),
+                    value,
+                    "the forwarded {key} identity must reach the emitted record: {record}"
+                );
+            }
+            // Nothing this contour does not bind is invented by forwarding.
+            for key in ["operation", "artifact", "process_start", "reason"] {
+                assert_eq!(
+                    slot_value(&parsed, key),
+                    MISSING_IDENTITY,
+                    "an unbound slot must read as explicit absence: {record}"
+                );
+            }
+        }
+    }
+
     /// A record composed from several maximal identities must stay inside the
     /// facade's own detail ceiling, and every slot must read as EITHER a complete
     /// bounded value OR the explicit absent marker - never a value cut in half,
@@ -2576,6 +2724,393 @@ mod phase_correlation_tests {
         assert!(
             rendered.contains("reason=missing"),
             "the shed reason slot must still be present as the frozen marker: {rendered}"
+        );
+    }
+
+    /// Both private correlation twins in this file render the caller's own
+    /// already-held identities into every record their real bodies emit: the
+    /// approved-path gate and the Doctor-anchor seam, on their success arms and
+    /// on their typed-rejection arms alike, while every slot that neither real
+    /// caller binds - and so neither twin derives a source for - stays the
+    /// renderer's explicit absence marker. Which slots those are differs per
+    /// twin, and the table below follows each twin's own caller.
+    ///
+    /// HONEST SCOPE: each twin's expected slots are read from the binding
+    /// expression its OWN real caller passes, and the two callers bind DIFFERENT
+    /// slots, so one shared expectation would be a false claim about one of them.
+    /// `HostJobBranches::launch` binds `LaunchPhaseCorrelation::NONE`
+    /// `.with_installation(host.installation.as_str())`
+    /// `.with_fence(host.epoch.current.lineage_id.as_str())`
+    /// `.with_artifact(artifact.as_str())` before it forwards that correlation to
+    /// this gate, so the approved-path twin's records really do carry a real
+    /// artifact digest, and that same binding names no generation, so that twin's
+    /// records really do carry the absence marker there. `start_approved` binds
+    /// `.with_installation(host.installation.as_str())`
+    /// `.with_generation(launch.authority_generation.value())`
+    /// `.with_fence(host.epoch.current.lineage_id.as_str())` before it forwards
+    /// that correlation to the anchor seam, naming no artifact, so the anchor
+    /// seam's records are exactly the mirror image. Neither caller names an owner
+    /// operation, a process-start identity or a reason, so those three read as
+    /// explicit absence for both twins.
+    ///
+    /// The bound VALUES below are still this case's own synthetic, non-secret
+    /// literals in the same `installation-7` / generation `7` / `fence-3` style
+    /// the cases above already hold, so this case proves the forwarding path and
+    /// the rendered slots, not any owner's real installation, generation, artifact
+    /// digest or lineage fence. No identity here is read from a path, argv, the
+    /// environment, a handle, a descriptor or a probe. All six calls really
+    /// execute these twins' own bodies against the same fixtures the
+    /// `approved_path_tests` cases construct - written temporary locators for the
+    /// approved-path gate, the same stored contour and the same absolute and
+    /// relative Doctor anchors for the anchor seam - and every record below is a
+    /// REAL emission read back out of a scoped `tracing` subscriber, so no SLOT
+    /// assertion below can pass on a string this case composed itself. The
+    /// canary, separator and rejection-text assertions below are FORWARD GUARDS
+    /// instead: neither twin has a path to those values today, so they pass
+    /// trivially, and they stand here so that binding any of them into a
+    /// correlation slot, or a future `with_*` bound to a path or an error string,
+    /// would fail at these exact lines rather than ship silently.
+    ///
+    /// SWEEP SCOPE: the loop below reads only the `detail` field of each
+    /// captured record. The other facade fields on that same line -
+    /// `detail_bytes`, `detail_truncated` and `target` - are outside this sweep
+    /// and are not asserted here; this file does not control them.
+    ///
+    /// Reaching `start_approved` itself needs a full admitted physical launch
+    /// (approved digests, retained leases and a validated descriptor), so this
+    /// case claims no owner-held identity, and each per-phase occurrence count
+    /// below is only the arm these calls reached in these two bodies.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one case drives both twins' real bodies and reads every captured record, so its per-phase occurrence table stays in one place beside the calls that produced it"
+    )]
+    #[test]
+    fn a_forwarded_correlation_reaches_both_twins_real_phase_records() {
+        /// One twin's slot expectation: the slots its real caller binds with the
+        /// values it binds there, then the slots that binding leaves unbound.
+        type TwinSlots<'s> = (&'s [(&'s str, &'s str)], &'s [&'s str]);
+        use super::{
+            approved_launch_paths_with_correlation,
+            kernel_arguments_with_doctor_anchor_with_correlation,
+        };
+
+        // The correlation `HostJobBranches::launch` really forwards into
+        // `approved_launch_paths_with_correlation`: the Host installation
+        // identity, the installation epoch's lineage identity and the approved
+        // artifact digest of the exact branch it launches. That caller binds no
+        // generation there, so this twin's records must show the absence marker
+        // in that slot. The artifact digest below is a synthetic non-secret
+        // literal in the shape the caller binds, and it is deliberately NOT the
+        // argv digest canary further down, because this value legitimately
+        // reaches this twin's own records.
+        let approved_artifact = "c".repeat(64);
+        let approved_correlation = LaunchPhaseCorrelation::NONE
+            .with_installation("installation-7")
+            .with_fence("fence-3")
+            .with_artifact(approved_artifact.as_str());
+        // The correlation `start_approved` really forwards into
+        // `kernel_arguments_with_doctor_anchor_with_correlation`: the Host
+        // installation identity, the approved descriptor's authority generation
+        // and the installation epoch's lineage identity, naming no artifact. The
+        // generation comes from the same descriptor field the caller binds, never
+        // from the opaque `generation: &PlatformHandle` argument, which holds no
+        // bounded numeric spelling.
+        let doctor_correlation = LaunchPhaseCorrelation::NONE
+            .with_installation("installation-7")
+            .with_generation(7)
+            .with_fence("fence-3");
+        // The approved-locator fixture shape the `approved_path_tests` cases
+        // build: a written temporary file and its canonical path. These names are
+        // distinct because this case shares one process with those cases.
+        let canonical = |name: &str| -> std::path::PathBuf {
+            let path =
+                std::env::temp_dir().join(format!("eliot-host-fwd-{}-{name}", std::process::id()));
+            std::fs::write(&path, b"binding")
+                .unwrap_or_else(|error| panic!("test fixture is not writable: {error}"));
+            std::fs::canonicalize(&path)
+                .unwrap_or_else(|error| panic!("test fixture cannot be canonicalized: {error}"))
+        };
+        let locator = |path: &std::path::Path| {
+            eliot_platform::PlatformHandle::new(path.to_string_lossy().into_owned())
+                .unwrap_or_else(|error| panic!("test fixture path is not a handle: {error}"))
+        };
+        let executable_path = canonical("bind-ok-exe");
+        let executable = locator(&executable_path);
+        let config_path = canonical("bind-ok-cfg");
+        let config = locator(&config_path);
+        let substitute_path = canonical("bind-exe-fake");
+        let substitute = locator(&substitute_path);
+        let missing =
+            std::env::temp_dir().join(format!("eliot-host-fwd-{}-absent", std::process::id()));
+        // The stored contour and the absolute and relative Doctor anchors the
+        // `approved_path_tests` doctor case constructs.
+        let argument = |value: &str| {
+            eliot_platform::PlatformHandle::new(value.to_owned())
+                .unwrap_or_else(|error| panic!("test handle is invalid: {error}"))
+        };
+        let stored = vec![
+            argument("--work-root"),
+            argument(r"C:\work"),
+            argument("--doctor-artifact-sha256"),
+            argument(&"a".repeat(64)),
+            argument("--testd-artifact-sha256"),
+            argument(&"b".repeat(64)),
+        ];
+        let doctor = argument(r"C:\install\eliot-doctor.exe");
+        let relative = argument(r"relative\eliot-doctor.exe");
+        let without_doctor = vec![argument("--work-root"), argument(r"C:\work")];
+        let path_canary = executable_path.to_string_lossy().into_owned();
+        let substitute_canary = substitute_path.to_string_lossy().into_owned();
+        let missing_canary = missing.to_string_lossy().into_owned();
+        let config_canary = config_path.to_string_lossy().into_owned();
+        let relative_canary = relative.as_str().to_owned();
+        let digest_canary = "a".repeat(64);
+
+        // One scoped subscriber over all six calls, so every record asserted on
+        // below is one these real executions emitted.
+        let executed = capture(|| {
+            // The approved-path gate: the admitted arm, the substitution refusal
+            // and the canonicalization refusal.
+            if let Err(error) = approved_launch_paths_with_correlation(
+                &approved_correlation,
+                &executable_path,
+                &executable,
+                &config_path,
+                &config,
+            ) {
+                panic!("exact canonical locators must stay admitted: {error}");
+            }
+            let Err(HostError::ProcessContour(reason)) = approved_launch_paths_with_correlation(
+                &approved_correlation,
+                &executable_path,
+                &substitute,
+                &config_path,
+                &config,
+            ) else {
+                panic!("a substituted executable locator must stay refused");
+            };
+            assert!(
+                reason.contains("executable locator is not the approved path"),
+                "unexpected rejection reason: {reason}"
+            );
+            let Err(HostError::ProcessContour(_)) = approved_launch_paths_with_correlation(
+                &approved_correlation,
+                &missing,
+                &executable,
+                &config_path,
+                &config,
+            ) else {
+                panic!("an absent locator must stay refused");
+            };
+            // The Doctor-anchor seam: the admitted arm, a relative anchor and a
+            // contour without the digested doctor role.
+            if let Err(error) = kernel_arguments_with_doctor_anchor_with_correlation(
+                &doctor_correlation,
+                &stored,
+                &doctor,
+            ) {
+                panic!("the absolute doctor anchor must inject: {error}");
+            }
+            let Err(HostError::ProcessContour(reason)) =
+                kernel_arguments_with_doctor_anchor_with_correlation(
+                    &doctor_correlation,
+                    &stored,
+                    &relative,
+                )
+            else {
+                panic!("a relative doctor anchor must stay refused");
+            };
+            assert!(
+                reason.to_lowercase().contains("absolute"),
+                "unexpected rejection reason: {reason}"
+            );
+            let Err(HostError::ProcessContour(reason)) =
+                kernel_arguments_with_doctor_anchor_with_correlation(
+                    &doctor_correlation,
+                    &without_doctor,
+                    &doctor,
+                )
+            else {
+                panic!("a contour without the digested doctor role must stay refused");
+            };
+            assert!(
+                reason.to_lowercase().contains("doctor"),
+                "the missing-role reason must name the doctor role: {reason}"
+            );
+        });
+        for path in [&executable_path, &config_path, &substitute_path] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        // The `detail` field of each captured record, in emission order, never
+        // composed by this case. ONLY that field is swept below: the rest of the
+        // facade line (`detail_bytes`, `detail_truncated`, `target`) is outside
+        // this sweep and is not asserted here.
+        let records: Vec<String> = executed
+            .split("host.entrypoint_stage")
+            .skip(1)
+            .map(captured_detail)
+            .collect();
+        // Each twin's own phases, with how often the calls above reached them, in
+        // the same order as the per-twin slot expectations beside it.
+        let arms: [(&str, &[(&str, usize)]); 2] = [
+            (
+                "approved paths",
+                &[
+                    ("host.launch approved paths requested", 3),
+                    ("host.launch approved paths admitted", 1),
+                    ("host.launch substitution preserved", 1),
+                    ("host.launch approved paths typed rejection", 1),
+                ],
+            ),
+            (
+                "doctor anchor",
+                &[
+                    ("host.launch doctor anchor requested", 3),
+                    ("host.launch doctor anchor admitted", 1),
+                    ("host.launch doctor anchor typed rejection", 2),
+                ],
+            ),
+        ];
+        // Per-twin slot expectations, in that same order: first the slots this
+        // twin's REAL caller binds and the value it binds there, then the slots
+        // that same binding leaves unbound. The two twins differ because their
+        // real callers differ: `HostJobBranches::launch` binds an artifact digest
+        // and names no generation, while `start_approved` binds a generation and
+        // names no artifact digest.
+        let slots: [TwinSlots; 2] = [
+            (
+                &[
+                    ("installation", "installation-7"),
+                    ("artifact", approved_artifact.as_str()),
+                    ("fence", "fence-3"),
+                ],
+                &["generation", "operation", "process_start", "reason"],
+            ),
+            (
+                &[
+                    ("installation", "installation-7"),
+                    ("generation", "7"),
+                    ("fence", "fence-3"),
+                ],
+                &["operation", "artifact", "process_start", "reason"],
+            ),
+        ];
+        let mut reached = 0_usize;
+        for ((twin, phases), (bound, unbound)) in arms.into_iter().zip(slots) {
+            for (phase, expected) in phases {
+                let matching: Vec<&String> = records
+                    .iter()
+                    .filter(|record| record.starts_with(&format!("phase={phase} ")))
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    *expected,
+                    "the {twin} twin must emit {phase} exactly {expected} time(s) for the calls above: {executed}"
+                );
+                for record in matching {
+                    assert!(
+                        record.starts_with(&format!("phase={phase} ")),
+                        "the phase token must lead the record: {record}"
+                    );
+                    let parsed = rendered_slots(record);
+                    assert_eq!(
+                        slot_value(&parsed, "phase").to_owned(),
+                        phase.to_string(),
+                        "the record must carry the phase its own twin emitted: {record}"
+                    );
+                    // Exactly the slots this twin's real caller binds, with the
+                    // value that caller binds, reach this twin's record as real
+                    // values and never as absence markers. HONEST LIMIT: this case
+                    // drives the twin with its OWN call of the real bindings, so it
+                    // cannot see whether `launch` or `start_approved` passes that
+                    // correlation at all — the production call sites are pinned by
+                    // the integration target's source-byte all-sites scan, named here
+                    // so a reader knows where that proof lives.
+                    for &(key, value) in bound {
+                        assert_eq!(
+                            slot_value(&parsed, key),
+                            value,
+                            "the {twin} twin renders the {key}={value} its caller's binding carries: {record}"
+                        );
+                    }
+                    // Exactly the slots that same binding leaves unnamed, and which
+                    // this twin therefore derives no source for, read as explicit
+                    // absence instead of an invented value.
+                    for &key in unbound {
+                        assert_eq!(
+                            slot_value(&parsed, key),
+                            MISSING_IDENTITY,
+                            "the {twin} twin's own caller binds no {key}, so forwarding must leave it absent: {record}"
+                        );
+                    }
+                    // FORWARD GUARD, not a proof about today: no phase literal in
+                    // either twin and no value either real caller binds contains a
+                    // path separator, so these lines pass trivially. They are worth
+                    // keeping because a future `with_*` bound to a path would fail
+                    // exactly here, where a leaked locator becomes visible.
+                    for separator in ['\\', '/'] {
+                        assert!(
+                            !record.contains(separator),
+                            "forward guard: no locator, argv or path value may reach this record: {record}"
+                        );
+                    }
+                    // FORWARD GUARD, one canary per value a twin genuinely receives
+                    // as an argument: the approved executable, config and
+                    // substituted locators and the absent locator reach the
+                    // approved-path twin, the absolute and relative Doctor anchors
+                    // reach the anchor seam, and the three contour flags and the
+                    // stored doctor digest reach the anchor seam inside its stored
+                    // argument list. Nothing in either twin binds any of them, so
+                    // these lines pass trivially; they are worth keeping because
+                    // binding any one of them into a correlation slot would fail
+                    // here, at the slot, rather than reach a record. Nothing here
+                    // is a claim that a leak was observed and fixed. The two
+                    // values deliberately NOT in this list never reach either twin
+                    // at all: `--doctor-executable-path` is only compared and
+                    // constructed inside the anchor seam, and `binding` is fixture
+                    // file CONTENT that neither twin ever reads - they only
+                    // canonicalize and compare paths - so asserting their absence
+                    // could not fail.
+                    for canary in [
+                        path_canary.as_str(),
+                        config_canary.as_str(),
+                        substitute_canary.as_str(),
+                        missing_canary.as_str(),
+                        doctor.as_str(),
+                        relative_canary.as_str(),
+                        "--work-root",
+                        "--doctor-artifact-sha256",
+                        "--testd-artifact-sha256",
+                        digest_canary.as_str(),
+                    ] {
+                        assert!(
+                            !record.contains(canary),
+                            "forward guard: no fixture value a twin receives may reach this record: {record}"
+                        );
+                    }
+                    // FORWARD GUARD, same standing as the separators above: no
+                    // typed rejection text is rendered into any slot today, so
+                    // these lines pass trivially, and a future `with_*` bound to
+                    // an error string would fail here.
+                    for rejection in [
+                        "executable locator is not the approved path",
+                        "must be absolute",
+                        "digested doctor role",
+                    ] {
+                        assert!(
+                            !record.contains(rejection),
+                            "forward guard: typed rejection text may never reach a record: {record}"
+                        );
+                    }
+                }
+                reached = reached.saturating_add(*expected);
+            }
+        }
+        assert_eq!(
+            records.len(),
+            reached,
+            "every captured record must be one of these two twins' own arms: {executed}"
         );
     }
 }

@@ -69,7 +69,7 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // terminal record of one SCM bootstrap validation, because this validation has
 // no outer terminal owner of its own — `main.rs` projects the stop receipt
 // without its own diagnostics terminal, unlike `lib.rs`, which already owns
-// the `host-start-failed` terminal of the launch contour. It therefore stays
+// the launch contour's terminal in `lib.rs`. It therefore stays
 // code-bearing rather than phase-only. `classify_*` and `resolve_*` correlate
 // by order plus the bound identities and never emit a terminal. There is no
 // mutable global dedup cache, and sink outcome never alters

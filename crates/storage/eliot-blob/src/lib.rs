@@ -3291,11 +3291,11 @@ where
     ///
     /// The obligation is durable and bound to the original operation, so every
     /// re-entry re-observes it and refuses to advance. Only the owner can
-    /// settle it, either by an exact operation-bound publication/durability
-    /// reconciliation or by re-establishing the boundary under this same
-    /// identity; the current platform port exposes neither, so the missing
-    /// capability stays unresolved here instead of being certified by the
-    /// caller. See #730/#946.
+    /// settle it, either through an exact operation-bound publication/durability
+    /// reconciliation or by the existing durable replace on the exact
+    /// destination under this same identity. A failed replace leaves this
+    /// obligation unresolved instead of letting the caller certify it. See
+    /// #730/#946.
     fn fenced_publication_error(
         journal: &StageJournal,
         obligation: &BlobPublicationObligation,
@@ -3375,19 +3375,25 @@ where
     /// cannot be discharged without the owner performing the durable write. It
     /// does not survive a restart, because the volume rejected the very write
     /// that would have carried it. After a restart the journal on the volume
-    /// still reads `pending_publication: None` and the retention is empty, so:
+    /// still reads `pending_publication: None` and the retention is empty, so a
+    /// payload or metadata boundary is re-derived from the journal and the
+    /// matching destination is routed through the same owner re-establishment.
+    /// An owner refusal re-records the obligation durably when possible; if that
+    /// write is also refused, process-local retention keeps it in front of the
+    /// next same-service entry.
     ///
-    /// * a payload or metadata boundary is still re-derived and re-asked — the
-    ///   destination bytes match, `settle_publication` routes them through the
-    ///   same re-establishment, and an owner refusal there re-records the
-    ///   obligation durably;
-    /// * a `CommitWrite` boundary that was only ever in memory is forgotten, and
-    ///   what happens next depends on the entry shape. A replay that finds the
-    ///   commit record issues its receipt directly, so that shape converges. A
-    ///   replay that instead loads the journal re-enters `finish_journal`, whose
-    ///   exclusive commit create finds the record this service has already made
-    ///   durable and re-arms an equivalent obligation, so that shape does not
-    ///   converge and neither does the `reconcile` sweep.
+    /// A `CommitWrite` boundary is different because a commit record can already
+    /// exist after its create reports an unconfirmed durability result. On replay,
+    /// the commit-present branch first proves the journal's operation identity,
+    /// settles any recorded or retained obligation, and—unless the journal
+    /// already carries `CommitDurable`, `Ready`, or `Cleaned`—asks the owner to
+    /// replace the exact bounded commit bytes under that same identity. Success
+    /// advances an earlier journal checkpoint to `CommitDurable` and persists it
+    /// before a receipt can be returned; an existing later checkpoint is
+    /// preserved. Refusal remains unresolved and preserves the journal. If the
+    /// obligation never reached the volume and the service restarted, this
+    /// checkpoint makes the existing commit record recoverable without treating
+    /// its mere presence or byte equality as durability evidence.
     ///
     /// The refusal is not one uniform error class, and the difference is whether
     /// a replacement obligation could be written. An owner refusal of the durable
@@ -3399,11 +3405,6 @@ where
     /// have no journal at all report `UnknownPublishOutcome` instead, because
     /// they have no obligation fence to build a capacity failure from; that is the
     /// card's other typed unresolved outcome, not a weakening.
-    ///
-    /// Closing the second case needs a journal record the volume accepted, a
-    /// commit create that can distinguish its own durable write, or the
-    /// owner-level reconciliation the fenced error already names as the external
-    /// gap. None is available here, so this is recorded rather than papered over.
     fn record_publication_obligation(
         &self,
         journal_path: &WorkScopePath,
@@ -3618,6 +3619,32 @@ where
             });
         }
         if let Err(error) = self.platform_replace(destination, &bytes) {
+            let identity = BlobCapacityIdentity::Journal {
+                operation_id: journal.operation_id.clone(),
+                idempotency_key: journal.idempotency_key.clone(),
+                locator: Some(locator.clone()),
+            };
+            let (primary, fence) = match bind_platform_capacity_with_effect(
+                error,
+                stage,
+                identity,
+                Some(BlobCapacityEffect::DurabilityUnconfirmed {
+                    state: journal.state,
+                    possible_effect: true,
+                }),
+            ) {
+                Ok(bound) => {
+                    let fence = publication_fence(&bound);
+                    (bound, fence)
+                }
+                Err(InvalidCapacityEvidence) => (
+                    BlobError::UnknownPublishOutcome {
+                        operation_id: journal.operation_id.clone(),
+                        state: journal.state,
+                    },
+                    BlobPublicationFence::Unconfirmed,
+                ),
+            };
             let obligation = BlobPublicationObligation {
                 operation_id: journal.operation_id.clone(),
                 idempotency_key: journal.idempotency_key.clone(),
@@ -3626,15 +3653,27 @@ where
                 destination: destination.normalized_identity().to_owned(),
                 expected_sha256: expected_sha256.to_owned(),
                 state_before: journal.state,
-                fence: publication_fence(&error),
+                fence,
             };
             obligation.validate()?;
             return Err(self.record_publication_obligation(
                 journal_path,
                 journal,
                 &obligation,
-                error,
+                primary,
             ));
+        }
+        if stage == BlobCapacityStage::CommitWrite {
+            match journal.state {
+                PublishState::JournalPrepared
+                | PublishState::PayloadDurable
+                | PublishState::MetadataDurable => {
+                    journal.state = PublishState::CommitDurable;
+                }
+                // Preserve a later checkpoint if a caller has already advanced
+                // it; re-establishing this boundary must never regress state.
+                PublishState::CommitDurable | PublishState::Ready | PublishState::Cleaned => {}
+            }
         }
         Ok(())
     }
@@ -4280,6 +4319,20 @@ where
                     return Err(BlobError::IdempotencyConflict);
                 }
                 self.settle_retained_publications(&journal_path, &mut journal)?;
+                if !matches!(
+                    journal.state,
+                    PublishState::CommitDurable | PublishState::Ready | PublishState::Cleaned
+                ) {
+                    self.reestablish_publication_durability(
+                        &journal_path,
+                        &mut journal,
+                        &commit_path,
+                        &sha256_hex(&bytes),
+                        MAX_JOURNAL_BYTES,
+                        BlobCapacityStage::CommitWrite,
+                    )?;
+                    self.persist_journal(&journal_path, &journal, true)?;
+                }
             } else if let Some(obligation) = self
                 .retained_publications(
                     request.context.operation.operation_id.as_str(),
