@@ -2793,27 +2793,28 @@ fn commit_with_durable_intent(
         },
     );
     drop(store);
-    let refusal = committed.as_ref().err().map(ToString::to_string);
-    let terminal = if refusal.is_some() {
-        CutoverIntentState::Failed
-    } else {
-        CutoverIntentState::Committed
-    };
-    // The terminal record is a separate journal mutation, so a registry
-    // refusal cannot destroy the primary error: the registry reason is
-    // returned even when the terminal append itself fails, and the append
-    // failure is reported only when the registry accepted.
-    let terminal_receipt = append_cutover_intent(
+    // A registry error is NOT proof that this operation's compare-and-swap did
+    // not commit. `commit_cutover_activation` delegates to the registry's atomic
+    // mutate, which includes the final `write.commit()`, and a commit-stage
+    // failure is mapped to the same typed error as a pre-commit refusal. So the
+    // outcome is resolved by a fresh exact owner readback under the ORIGINAL
+    // identity, never by inferring no-effect from the error itself: a durable
+    // `Failed` written here would contradict a registry that records the
+    // activation as committed, and `classify_retained_cutover` would then refuse
+    // this operation identity for good (I14.21, I5.27).
+    if let Err(refusal) = &committed {
+        return readback_unestablished_activation(host, validated, retirement, refusal.to_string());
+    }
+    // The terminal record is a separate journal mutation, so a journal failure
+    // cannot destroy the registry's own answer: this append runs only after the
+    // CAS was accepted, and a failure here is returned as this attempt's error.
+    append_cutover_intent(
         host,
         validated,
         retirement,
-        terminal,
+        CutoverIntentState::Committed,
         &validated.request().admission,
-    );
-    if let Some(refusal) = refusal {
-        return Err(CutoverError::Registry(refusal));
-    }
-    terminal_receipt?;
+    )?;
     Ok(CutoverOutcome {
         disposition: CutoverDisposition::Committed,
         residual: CutoverResidual::None,
@@ -2825,6 +2826,173 @@ fn commit_with_durable_intent(
             intent,
         ]),
     })
+}
+
+/// Resolves one commit-stage registry error by a fresh exact owner readback,
+/// under the attempt's ORIGINAL operation identity.
+///
+/// The registry writer is released before this runs, and the readback is the
+/// same owner projection the retained-operation classifier already trusts:
+/// [`resolve_cutover_activation`] over a freshly loaded, validated registry and
+/// this operation's own retained `Pending` intent. Three outcomes, and only
+/// one of them may write a durable `Failed`:
+///
+/// * [`CutoverActivationResolution::Committed`] — the registry's operation-bound
+///   receipt names this exact operation, installation, request digest and
+///   target, so the CAS committed and the retained intent is settled as
+///   `Committed` through the existing per-phase journal mutation identity. A
+///   committed effect is never reported as a failure.
+/// * [`CutoverActivationResolution::NotApplied`] — the registry proves the
+///   predecessor is still active and records no cutover for this operation.
+///   This is the only exact proof of no effect, so this is the only path that
+///   appends the terminal `Failed` and returns the registry refusal.
+/// * [`CutoverActivationResolution::Unresolved`] — the registry cannot establish
+///   the outcome. The intent stays `Pending` and the bounded unknown state is
+///   returned for evidence-backed reconciliation; nothing is rolled back, no
+///   new operation is created, and no terminal failure is invented from a
+///   storage condition.
+///
+/// An unreadable or unloadable registry is `Unresolved` for the same reason: a
+/// read that could not happen is not proof that the write did not.
+fn readback_unestablished_activation(
+    host: &HostComposition,
+    validated: &ValidatedCutover,
+    retirement: &GenerationRetirementFence,
+    refusal: String,
+) -> Result<CutoverOutcome, CutoverError> {
+    let operation = validated.sealed_operation()?;
+    let snapshot = host.journal.snapshot().map_err(|error| {
+        note_cutover_error(
+            "readback",
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string())),
+        )
+    })?;
+    // Only this operation's own retained `Pending` intent can settle it. Any
+    // other retained classification means the journal does not hold the intent
+    // this readback is resolving, so no outcome is invented for it here.
+    let intent = match snapshot.pending_cutover.as_ref() {
+        Some(record)
+            if classify_retained_cutover(Some(record), &operation)
+                == RetainedCutoverOperation::Pending =>
+        {
+            record
+        }
+        _ => {
+            return Err(note_cutover_error(
+                "readback",
+                CutoverError::IdentityConflict,
+            ));
+        }
+    };
+    let resolution = read_cutover_activation_resolution(host, intent, &operation);
+    match unestablished_activation_disposition(resolution) {
+        UnestablishedActivationDisposition::SettleCommitted => {
+            observe_cutover_progress(
+                "readback",
+                "recovered_commit",
+                "committed",
+                &sealed_cutover_phase_correlation(validated),
+                backup_cutover_count(2),
+            );
+            settle_committed_pending_activation(host, validated, retirement, intent)
+        }
+        UnestablishedActivationDisposition::RecordFailed => {
+            // Exact no-effect proof. The terminal append is best-effort in the
+            // same direction the success path uses: the registry reason stays
+            // the primary error, and an append that did not become durable
+            // leaves the intent `Pending` for the next reconciliation.
+            let _ = append_cutover_intent(
+                host,
+                validated,
+                retirement,
+                CutoverIntentState::Failed,
+                &validated.request().admission,
+            );
+            Err(note_cutover_error(
+                "readback",
+                CutoverError::Registry(refusal),
+            ))
+        }
+        UnestablishedActivationDisposition::RetainPending => {
+            observe_cutover_progress(
+                "readback",
+                "retained_unknown",
+                "unknown",
+                &sealed_cutover_phase_correlation(validated),
+                backup_cutover_count(2),
+            );
+            unresolved_cutover_outcome(validated, intent)
+        }
+    }
+}
+
+/// What one commit-stage registry error resolves to, given the fresh owner
+/// readback of this operation's activation.
+///
+/// Total and closed over [`CutoverActivationResolution`]: every resolution the
+/// owner can produce maps to exactly one disposition, and the mapping is the
+/// rule the issue exists to enforce — a durable `Failed` is written **only**
+/// for an exact no-effect proof, never for a committed activation and never for
+/// an outcome the owners cannot establish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnestablishedActivationDisposition {
+    /// The registry's operation-bound receipt proves the CAS committed: settle
+    /// the retained `Pending` intent as `Committed` under the original identity.
+    SettleCommitted,
+    /// The registry proves the activation never applied: this is the only
+    /// disposition that may append the terminal `Failed`.
+    RecordFailed,
+    /// The owners cannot establish the outcome: keep the intent `Pending` and
+    /// return the bounded unknown state.
+    RetainPending,
+}
+
+#[must_use]
+fn unestablished_activation_disposition(
+    resolution: CutoverActivationResolution,
+) -> UnestablishedActivationDisposition {
+    match resolution {
+        CutoverActivationResolution::Committed => {
+            UnestablishedActivationDisposition::SettleCommitted
+        }
+        CutoverActivationResolution::NotApplied => UnestablishedActivationDisposition::RecordFailed,
+        CutoverActivationResolution::Unresolved => {
+            UnestablishedActivationDisposition::RetainPending
+        }
+    }
+}
+
+/// One fresh owner read of the installation registry, resolved against this
+/// operation's retained intent.
+///
+/// The bounded writer handle is released before the projection is validated and
+/// before it is inspected. A registry that cannot be opened, loaded or
+/// validated yields [`CutoverActivationResolution::Unresolved`]: an unreadable
+/// owner is not an absent effect.
+fn read_cutover_activation_resolution(
+    host: &HostComposition,
+    intent: &CutoverIntentRecord,
+    operation: &CutoverOperationIdentity,
+) -> CutoverActivationResolution {
+    let Ok(store) = host.open_registry_store() else {
+        return CutoverActivationResolution::Unresolved;
+    };
+    let Ok(loaded) = store.load() else {
+        // Release the bounded writer handle before returning: the readback
+        // never holds it across an owner call.
+        drop(store);
+        return CutoverActivationResolution::Unresolved;
+    };
+    drop(store);
+    if loaded.validate().is_err() {
+        return CutoverActivationResolution::Unresolved;
+    }
+    resolve_cutover_activation(
+        loaded.committed_cutover_activation(),
+        loaded.active_generation(),
+        intent,
+        operation,
+    )
 }
 
 /// Activates the destination generation's live process contour under this
@@ -4564,4 +4732,41 @@ pub fn reconcile_cutover_outcome(
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     outcome
+}
+
+#[cfg(test)]
+mod unestablished_activation_tests {
+    use super::{
+        CutoverActivationResolution, UnestablishedActivationDisposition,
+        unestablished_activation_disposition,
+    };
+
+    /// The rule under test: only an exact no-effect proof may become a durable
+    /// `Failed`. A committed activation settles as committed and an
+    /// unestablishable outcome stays `Pending`, so a storage error can never
+    /// durably contradict a registry that records the flip.
+    #[test]
+    fn only_exact_no_effect_proof_records_a_failed_intent() {
+        assert_eq!(
+            unestablished_activation_disposition(CutoverActivationResolution::NotApplied),
+            UnestablishedActivationDisposition::RecordFailed
+        );
+        assert_eq!(
+            unestablished_activation_disposition(CutoverActivationResolution::Committed),
+            UnestablishedActivationDisposition::SettleCommitted
+        );
+        assert_eq!(
+            unestablished_activation_disposition(CutoverActivationResolution::Unresolved),
+            UnestablishedActivationDisposition::RetainPending
+        );
+        // The two dispositions that must never write `Failed`.
+        assert_ne!(
+            unestablished_activation_disposition(CutoverActivationResolution::Committed),
+            UnestablishedActivationDisposition::RecordFailed
+        );
+        assert_ne!(
+            unestablished_activation_disposition(CutoverActivationResolution::Unresolved),
+            UnestablishedActivationDisposition::RecordFailed
+        );
+    }
 }
