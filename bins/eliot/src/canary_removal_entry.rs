@@ -81,32 +81,38 @@ const RECOVER_OPERATION: &str = "RECOVER";
 /// document is the versioned `CanaryRemovalPlanEnvelope`: every label except the
 /// CLI's own installation scope comes from the owner type, so the same bytes
 /// `apply-canary-removal` decodes are exactly the bytes written here.
+///
+/// The exit code is returned directly rather than wrapped: every step above is a
+/// typed refusal through `refuse`, so this route has no error to propagate and a
+/// `Result` here would be a wrapper around nothing. The three routes that project
+/// a status keep their `Result`, because `print_removal_status` can genuinely
+/// fail to render one.
 pub fn run_plan_canary_removal(
     store_path: &Path,
     host_state_root: &Path,
     generation: &str,
     request_path: &Path,
-) -> Result<i32> {
+) -> i32 {
     let (target, request, store, registry) =
         match open_removal_owners(store_path, host_state_root, generation, request_path) {
             Ok(owners) => owners,
-            Err(error) => return Ok(refuse(PLAN_OPERATION, &error)),
+            Err(error) => return refuse(PLAN_OPERATION, &error),
         };
     let coordinator = WindowsInstallationCoordinator::new(store);
     let plan = match coordinator.plan_canary_removal(&registry, &request, &target) {
         Ok(plan) => plan,
-        Err(error) => return Ok(refuse(PLAN_OPERATION, &error)),
+        Err(error) => return refuse(PLAN_OPERATION, &error),
     };
     let scope = match PlatformHandle::new(INSTALLATION_SCOPE.to_owned()) {
         Ok(handle) => handle,
         Err(error) => {
-            return Ok(refuse(
+            return refuse(
                 PLAN_OPERATION,
                 &InstallationError::InvalidField {
                     field: "scope".to_owned(),
                     reason: error.to_string(),
                 },
-            ));
+            );
         }
     };
     // The envelope and its rendering are refusals on this route like every other
@@ -116,22 +122,22 @@ pub fn run_plan_canary_removal(
     // member that holds it with the cause kept in `detail`.
     let envelope = match CanaryRemovalPlanEnvelope::new(scope, plan) {
         Ok(envelope) => envelope,
-        Err(error) => return Ok(refuse(PLAN_OPERATION, &error)),
+        Err(error) => return refuse(PLAN_OPERATION, &error),
     };
     let document = match serde_json::to_string_pretty(&envelope) {
         Ok(document) => document,
         Err(error) => {
-            return Ok(refuse(
+            return refuse(
                 PLAN_OPERATION,
                 &InstallationError::InvalidField {
                     field: "plan".to_owned(),
                     reason: format!("the CanaryRemovalPlanEnvelope cannot be serialized: {error}"),
                 },
-            ));
+            );
         }
     };
-    println!("{}", document);
-    Ok(0)
+    println!("{document}");
+    0
 }
 
 /// Removes one exact installed canary through the installation owner.

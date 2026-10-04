@@ -2350,12 +2350,12 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             host_state_root,
             generation,
             request,
-        } => canary_removal_entry::run_plan_canary_removal(
+        } => Ok(canary_removal_entry::run_plan_canary_removal(
             &store,
             &host_state_root,
             &generation,
             &request,
-        ),
+        )),
         InstallationCommand::ApplyCanaryRemoval {
             store,
             host_state_root,

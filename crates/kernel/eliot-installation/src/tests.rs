@@ -10041,8 +10041,8 @@ fn trusted_source_observe_is_bound_to_retained_handle_and_fails_on_mutation() {
 
 use super::approved_generation_registry::TestSupportActivationFixture;
 use super::canary_removal::{
-    CanaryRemovalTerminalReceipt, apply_canary_removal, canary_removal_status, plan_canary_removal,
-    recover_canary_removal,
+    CanaryRemovalOperationVersion, CanaryRemovalTerminalReceipt, apply_canary_removal,
+    canary_removal_status, plan_canary_removal, recover_canary_removal,
 };
 
 /// Builds the explicit `Remove` authorization one canary removal is planned
@@ -13389,47 +13389,75 @@ fn canary_removal_blocking_effect_must_name_an_unknown_row_and_only_in_that_dire
     fixture.cleanup();
 }
 
-/// RULE B: the durable attempt stamp is forward-only and may advance by exactly
-/// one, because that is all the plan-time bound can reach.
+/// RULE B: the durable attempt stamp is forward-only, and what ADVANCES it is
+/// bounded by the STORE, not by the owner validator.
 ///
-/// INVARIANT pinned: `canary_removal.rs::CanaryRemovalOperation::validate`, the
-/// forward-only window at `canary_removal.rs:1295-1316` — `plan_time_bound` is
-/// `CanaryRemovalEffectBound::new()`, `reachable_attempt` is its single `next()`
-/// step, and `effect.bound.attempt > reachable_attempt` is refused with
-/// `InstallationError::IdentityConflict`.
+/// INVARIANT pinned, split by the owner each half actually lives in:
+/// * `redb_state.rs::validate_canary_removal_operation_transition` — the ATTEMPT
+///   ADVANCE BOUND. It is handed the decoded `current` record beside the proposed
+///   one, and refuses a save in which a row's `bound.attempt` moves backwards,
+///   moves more than exactly one step forward, or whose `bound.max_attempts`
+///   changed, with `InstallationError::IdentityConflict`. It is cited by symbol
+///   and not by line number because a line number rots the moment a writer adds a
+///   line above it, and a rotted citation reads exactly like a claim about code
+///   that is not there.
+/// * `canary_removal.rs::CanaryRemovalEffectBound::validate`, reached through
+///   `canary_removal.rs::CanaryRemovalEffect::validate` from
+///   `canary_removal.rs::CanaryRemovalOperation::validate` — what bounds a SINGLE
+///   record to its own contour: a non-zero `attempt` inside a non-zero
+///   `max_attempts`.
 ///
-/// WHY THE WINDOW IS DERIVED AND NOT TYPED. Both ends come from the production
-/// stamp of the frozen plan rather than from literals here, so the case keeps
-/// holding if `CANARY_REMOVAL_ROW_MAX_ATTEMPTS` ever moves: the admitted window
-/// is "the plan-time attempt, or exactly one past it", and the values below are
-/// that stamp and its successors.
+/// WHY THE ADVANCE BOUND IS A STORE RULE AND NOT AN OWNER ONE. It is a DELTA, and
+/// `CanaryRemovalOperation::validate` is a STATELESS validator: it is handed the
+/// proposed rows alone and has no memory of the rows this save replaces, so it
+/// cannot see a delta at all. `validate_canary_removal_operation_transition` is
+/// the only place a delta exists to be checked, because it is the one function
+/// handed the record its write transaction has ALREADY decoded — with no second
+/// read, no second transaction and no second decode.
+///
+/// WHY A CONSTANT-DERIVED OWNER WINDOW WOULD ALSO HAVE BEEN WRONG.
+/// `CanaryRemovalEffectBound::validate` admits ANY non-zero `max_attempts`, and a
+/// caller-supplied plan document is admitted on its own terms: `load_plan` in
+/// `bins/eliot/src/canary_removal_entry.rs` takes any envelope that validates, and
+/// that file's own doc calls the plan JSON an untrusted import. A window derived
+/// from `CANARY_REMOVAL_ROW_MAX_ATTEMPTS` would therefore have refused the OWNER'S
+/// OWN `commit_intent` save the moment such a row legitimately reached its third
+/// attempt, and it would have refused it permanently.
+///
+/// WHAT THE WIDE CONTOUR IN THE STORE HALF IS DOING. Every store-driven save
+/// below runs under a contour widened past the frozen one, on BOTH sides of the
+/// comparison. That is the only way a skip can be proposed at all: inside
+/// `CANARY_REMOVAL_ROW_MAX_ATTEMPTS`, `CanaryRemovalEffectBound::validate` refuses
+/// `attempt + 2` before the store is reached, and the refusal would be
+/// attributable to the contour check instead of to the floor under test. Both ends
+/// still come from the production stamp of the frozen plan rather than from
+/// literals here, so the cases keep holding if `CANARY_REMOVAL_ROW_MAX_ATTEMPTS`
+/// ever moves.
 ///
 /// THE REWIND IS REFUSED BY A DIFFERENT CHECK, AND THIS CASE NAMES WHICH ONE.
-/// Rewinding to attempt `0` is NOT this rule's refusal: the window admits every
-/// value at or below `reachable_attempt`, so a number below the plan-time stamp
-/// is invisible to it. It is refused by
-/// `canary_removal.rs::CanaryRemovalEffectBound::validate`
-/// (`canary_removal.rs:294-302`), reached through
-/// `canary_removal.rs::CanaryRemovalEffect::validate`
-/// (`canary_removal.rs:407`) from `self.plan.validate()?`
-/// (`canary_removal.rs:1282`) — and that refusal is
-/// `InstallationError::InvalidField`, not the `IdentityConflict` this rule
-/// returns. The two typed variants are what keep this assertion from crediting
-/// the window with a refusal the window does not cause.
+/// Rewinding a row to attempt `0` fails that row's own contour first, inside
+/// `CanaryRemovalOperation::validate`, and it is
+/// `InstallationError::InvalidField` on `canary_removal.effect.bound` — not the
+/// `IdentityConflict` the store floor returns, and not a refusal the store is
+/// ever shown, because `compare_and_save_canary_removal_operation` runs the owner
+/// validator on the proposed record before the floor reads anything. The floor's
+/// own rewind arm needs a NON-ZERO lower attempt to be visible at all, so it is
+/// asserted on one directly. The two typed variants are what keep each assertion
+/// from crediting either check with a refusal it does not cause.
 ///
-/// WHY THE SKIP NEEDS A RE-DIGEST AND THE REWIND DOES NOT.
-/// `canary_removal.rs::CanaryRemovalPlan::computed_digest`
-/// (`canary_removal.rs:652-660`) normalises `attempt` back to the plan-time
-/// stamp before hashing, so a record-to-record `plan_digest` comparison is BLIND
-/// to this member by construction. The case asserts that blindness directly:
-/// rewind and advance leave the digest untouched, and only the skip — which also
-/// has to widen `max_attempts` past the frozen contour to stay inside
-/// `CanaryRemovalEffectBound::validate` — moves it, and is re-digested.
+/// WHY THE CONTOUR IS RE-DIGESTED AND THE ATTEMPT NEVER IS.
+/// `canary_removal.rs::CanaryRemovalPlan::computed_digest` normalises
+/// `bound.attempt` back to the plan-time stamp before hashing and leaves
+/// `bound.max_attempts` inside it, so widening the contour moves the frozen digest
+/// and moving the attempt never does. That is exactly why the record-to-record
+/// `plan_digest` comparison inside `compare_and_save_canary_removal_operation` is
+/// BLIND to this member by construction, and the case asserts that blindness
+/// directly before driving the one check that has to see it.
 #[cfg(windows)]
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "skip, advance and rewind are each asserted against the derived window"
+    reason = "each attempt-stamp case is asserted against its own untouched control"
 )]
 fn canary_removal_attempt_stamp_advances_by_at_most_one_and_never_rewinds() {
     let _lock = PRODUCTION_INSTALLER_TEST_LOCK
@@ -13445,18 +13473,27 @@ fn canary_removal_attempt_stamp_advances_by_at_most_one_and_never_rewinds() {
         &canary_removal_request(&target),
         &target,
     ));
+    // The durable half of this case drives its own coordinator over its own store
+    // handle, exactly as production's apply path does and exactly as
+    // `canary_removal_recovers_the_same_operation_after_an_unrelated_registry_mutation`
+    // does. Nothing below is a second mechanism: every save is
+    // `RedbInstallationTransactionStore`'s own `create_canary_removal_operation` and
+    // `compare_and_save_canary_removal_operation`, reached through the coordinator's
+    // own `store_mut`/`store`, and every record it is handed goes through the owner
+    // validator's own `validate` first.
+    let mut driver = InstallationCoordinator::new(empty_canary_removal_port(), fixture.store());
 
-    // The control, and the frozen production stamp this rule measures against.
+    // The control, and the frozen production stamp the single-record cases read.
     let baseline = crashed_canary_removal_operation(&plan);
     must(baseline.validate());
-    let driven = canary_removal_destructive_rows(&plan)
+    let driven_row = canary_removal_destructive_rows(&plan)
         .into_iter()
         .next()
         .expect("rule B requires a plannable canary removal that drives at least one row");
     let position = plan
         .effects
         .iter()
-        .position(|row| row.effect_id == driven.effect_id)
+        .position(|row| row.effect_id == driven_row.effect_id)
         .unwrap_or_else(|| unreachable!());
     let plan_time = baseline.plan.effects[position].bound;
     assert!(
@@ -13471,8 +13508,8 @@ fn canary_removal_attempt_stamp_advances_by_at_most_one_and_never_rewinds() {
     );
 
     // THE PLAN DIGEST IS BLIND TO THIS MEMBER. Asserted on the untouched control
-    // first, so the two re-digest decisions below are attributable to `attempt`
-    // and `max_attempts` and not to a fixture whose digest was never correct.
+    // first, so the re-digest decision further below is attributable to
+    // `max_attempts` and not to a fixture whose digest was never correct.
     assert_eq!(
         must(baseline.plan.computed_digest()),
         baseline.plan.plan_digest,
@@ -13480,9 +13517,12 @@ fn canary_removal_attempt_stamp_advances_by_at_most_one_and_never_rewinds() {
          below would be vacuous"
     );
 
-    // ADVANCE OF EXACTLY ONE: admitted. `attempt` moved by one, `max_attempts`
-    // untouched, and the digest is unchanged precisely because `attempt` is
-    // normalised away — so nothing but the window under test can see this record.
+    // ADVANCE OF EXACTLY ONE, AS A SINGLE RECORD: admitted. `attempt` moved by
+    // one, `max_attempts` untouched, and the digest is unchanged precisely
+    // because `attempt` is normalised away. What this case proves is only that
+    // ONE record carrying the advanced stamp is inside its own contour. The
+    // bound on how far the counter may move PER SAVE is the store floor driven
+    // further below, and it is a different owner of the same member.
     let mut advanced = baseline.clone();
     advanced.plan.effects[position].bound = CanaryRemovalEffectBound {
         attempt: plan_time.attempt + 1,
@@ -13502,32 +13542,10 @@ fn canary_removal_attempt_stamp_advances_by_at_most_one_and_never_rewinds() {
     must(advanced.plan.validate());
     must(advanced.validate());
 
-    // A SKIP: refused. `attempt` moved by two, so the row claims an attempt this
-    // removal identity never spent. `max_attempts` is widened with it, because a
-    // skip inside the FROZEN contour would already be refused by
-    // `CanaryRemovalEffectBound::validate` and the refusal below would be
-    // attributable to that check instead.
-    let mut skipped = baseline.clone();
-    skipped.plan.effects[position].bound = CanaryRemovalEffectBound {
-        attempt: plan_time.attempt + 2,
-        max_attempts: plan_time.max_attempts + 1,
-    };
-    skipped.plan.plan_digest = must(skipped.plan.computed_digest());
-    // The PLAN alone admits this contour once the digest is recomputed, which is
-    // what makes the refusal below attributable to the operation-level window and
-    // not to `CanaryRemovalPlan::validate`.
-    must(skipped.plan.validate());
-    let refusal = skipped.validate();
-    assert!(
-        matches!(refusal, Err(InstallationError::IdentityConflict)),
-        "an attempt beyond the single step the plan-time bound stamp can reach is an attempt this \
-         removal identity never spent, and no record-to-record digest comparison can see it because \
-         that member is normalised away, got {refusal:?}"
-    );
-
-    // A REWIND: refused, but NOT by the window above. `attempt` back to zero.
-    // The digest is untouched for the same reason as the advance, so this refusal
-    // is about the contour alone.
+    // A REWIND: refused, but NOT by the store floor and NOT by anything that has
+    // seen an earlier record. `attempt` back to zero. The digest is untouched
+    // for the same reason as the advance, so this refusal is about the contour
+    // alone.
     let mut rewound = baseline.clone();
     rewound.plan.effects[position].bound.attempt = 0;
     assert_eq!(
@@ -13546,16 +13564,233 @@ fn canary_removal_attempt_stamp_advances_by_at_most_one_and_never_rewinds() {
             if field == "canary_removal.effect.bound"),
         "a rewound attempt is refused by `canary_removal.rs::CanaryRemovalEffectBound::validate`, \
          which requires a non-zero attempt inside a non-zero attempt bound and is reached through \
-         `CanaryRemovalEffect::validate` and `self.plan.validate()`. It is NOT the forward-only \
-         window: that window admits every value at or below the reachable attempt and so cannot \
-         see a number below the plan-time stamp. The typed variant is the point — it is what keeps \
-         this assertion from crediting the window with a refusal it does not cause, got \
-         {refusal:?}"
+         `CanaryRemovalEffect::validate` and `self.plan.validate()`. It is NOT \
+         `redb_state.rs::validate_canary_removal_operation_transition`: that floor compares a \
+         DELTA between two records, and this one is refused inside \
+         `CanaryRemovalOperation::validate` before the store ever reads a durable row. The typed \
+         variant is the point — it is what keeps this assertion from crediting either check with a \
+         refusal it does not cause, got {refusal:?}"
     );
     assert!(
         !matches!(refusal, Err(InstallationError::IdentityConflict)),
-        "the rewind must not be reported as the window's identity conflict, or the two checks \
+        "the rewind must not be reported as the store floor's identity conflict, or the two checks \
          would be indistinguishable and the attribution above would be wrong"
+    );
+
+    // -----------------------------------------------------------------------
+    // THE ADVANCE BOUND, DRIVEN THROUGH THE STORE. Everything above is a single
+    // record seen by a stateless validator; the floor below compares two, which
+    // is the only way the rule is visible at all.
+    // -----------------------------------------------------------------------
+
+    // The durable record every comparison below is read from. The contour is
+    // widened ONCE, here, on the side that is persisted AND on every side it is
+    // compared against, so `max_attempts` never differs across a save and a
+    // refusal below can only come from the advance term.
+    let widened = plan_time.max_attempts + 2;
+    assert!(
+        widened > plan_time.attempt + 2,
+        "the widened contour must admit a skip of exactly two inside itself, or the skip below would \
+         be refused by `CanaryRemovalEffectBound::validate` before the store floor is reached"
+    );
+    let mut admitted = baseline.clone();
+    admitted.plan.effects[position].bound.max_attempts = widened;
+    admitted.plan.plan_digest = must(admitted.plan.computed_digest());
+    assert_eq!(
+        must(admitted.plan.computed_digest()),
+        admitted.plan.plan_digest,
+        "`max_attempts` is inside the frozen digest, so the widened contour is re-digested while \
+         every `attempt` below is not"
+    );
+    must(admitted.plan.validate());
+    // The OPERATION alone admits this contour, which is what makes the refusal
+    // further below attributable to the store floor and not to
+    // `CanaryRemovalPlan::validate`.
+    must(admitted.validate());
+    assert_eq!(
+        admitted.plan.effects[position].bound.attempt, plan_time.attempt,
+        "the persisted row must still carry the plan-time attempt, so every delta below is measured \
+         from a stamp this removal identity really spent"
+    );
+    assert_eq!(
+        admitted.plan.effects[position].bound.max_attempts, widened,
+        "the persisted contour is the widened one the deltas below are read against"
+    );
+    must(
+        driver
+            .store_mut()
+            .create_canary_removal_operation(&admitted),
+    );
+    let current = must(
+        driver
+            .store()
+            .load_canary_removal_operation(&plan.removal_transaction_id),
+    )
+    .expect("the create above must have persisted this identity's own row");
+    assert_eq!(
+        current.revision, admitted.revision,
+        "the durable row starts at exactly the revision its own admission minted, which is the \
+         revision every save below steps from"
+    );
+    assert_eq!(
+        current.plan.effects[position].bound.max_attempts, widened,
+        "the contour that reached the table is the one every delta below is read against"
+    );
+
+    // A SKIP, THROUGH THE STORE: refused. `attempt` two past the stored row, so
+    // the record claims an attempt this removal identity never spent, and
+    // `max_attempts` deliberately unchanged so the contour term cannot be what
+    // refuses it.
+    let mut skipped = current.clone();
+    skipped.plan.effects[position].bound = CanaryRemovalEffectBound {
+        attempt: plan_time.attempt + 2,
+        max_attempts: widened,
+    };
+    skipped.revision = current.revision + 1;
+    must(skipped.validate());
+    let refusal = driver
+        .store_mut()
+        .compare_and_save_canary_removal_operation(
+            &must(CanaryRemovalOperationVersion::of(&current)),
+            &skipped,
+        );
+    assert!(
+        matches!(refusal, Err(InstallationError::IdentityConflict)),
+        "an attempt two past the row this save replaces is an attempt this removal identity never \
+         spent, and the record-to-record `plan_digest` comparison inside \
+         `compare_and_save_canary_removal_operation` cannot see it because `computed_digest` \
+         normalises this member back to the plan-time stamp: only \
+         `validate_canary_removal_operation_transition`, which is handed the decoded `current` \
+         beside the proposed record, can refuse it, got {refusal:?}"
+    );
+    let after_skip = must(
+        driver
+            .store()
+            .load_canary_removal_operation(&plan.removal_transaction_id),
+    )
+    .expect("a refused save leaves the row this case created in place");
+    assert_eq!(
+        after_skip.revision, current.revision,
+        "a refused save must leave the durable row exactly as it was, or the refusal above could \
+         have come after the write"
+    );
+    assert_eq!(
+        after_skip.plan.effects[position].bound.attempt, plan_time.attempt,
+        "the refused skip must not have spent an attempt this removal identity never earned"
+    );
+
+    // THE POSITIVE BESIDE IT, or a rule that refused everything would have passed
+    // the refusal above. The identical save, differing only in a step of exactly
+    // one instead of two, is admitted and durably written.
+    let mut stepped = current.clone();
+    stepped.plan.effects[position].bound = CanaryRemovalEffectBound {
+        attempt: plan_time.attempt + 1,
+        max_attempts: widened,
+    };
+    stepped.revision = current.revision + 1;
+    must(stepped.validate());
+    must(
+        driver
+            .store_mut()
+            .compare_and_save_canary_removal_operation(
+                &must(CanaryRemovalOperationVersion::of(&current)),
+                &stepped,
+            ),
+    );
+    let after_step = must(
+        driver
+            .store()
+            .load_canary_removal_operation(&plan.removal_transaction_id),
+    )
+    .expect("the admitted save replaced the row this case created");
+    assert_eq!(
+        after_step.revision,
+        current.revision + 1,
+        "the admitted advance must be the durable row's own next revision, or the acceptance above \
+         would be vacuous"
+    );
+    assert_eq!(
+        after_step.plan.effects[position].bound.attempt,
+        plan_time.attempt + 1,
+        "the durable row must carry exactly the one step past the stamp it replaced, and that \
+         counter is the ONLY member on which this save differs from the refusal above"
+    );
+
+    // THE FLOOR'S OWN REWIND ARM, which the rewind above cannot reach: `attempt`
+    // back down by one, still a non-zero attempt inside the same contour, so the
+    // owner validator admits the record and only a check handed the decoded
+    // `current` can see the backward step.
+    let mut stepped_back = after_step.clone();
+    stepped_back.plan.effects[position].bound = CanaryRemovalEffectBound {
+        attempt: plan_time.attempt,
+        max_attempts: widened,
+    };
+    stepped_back.revision = after_step.revision + 1;
+    must(stepped_back.validate());
+    let refusal = driver
+        .store_mut()
+        .compare_and_save_canary_removal_operation(
+            &must(CanaryRemovalOperationVersion::of(&after_step)),
+            &stepped_back,
+        );
+    assert!(
+        matches!(refusal, Err(InstallationError::IdentityConflict)),
+        "an attempt below the row this save replaces re-runs an attempt number this removal identity \
+         already spent, and `CanaryRemovalOperation::validate` cannot see it because a single \
+         record with this attempt is inside its own contour — which the rewind above asserts from \
+         the other side, got {refusal:?}"
+    );
+    assert_eq!(
+        must(
+            driver
+                .store()
+                .load_canary_removal_operation(&plan.removal_transaction_id)
+        )
+        .expect("a refused save leaves the row the admitted advance wrote in place")
+        .revision,
+        after_step.revision,
+        "a refused save must leave the durable row exactly as it was, so the save below is still \
+         measured against `after_step`"
+    );
+
+    // AND THE OTHER POSITIVE, or the lower bound could be tightened into
+    // demanding a fresh attempt per write: the same save with the attempt left
+    // EQUAL to the stored row's. A same-state save is legal — it discards no
+    // evidence — and it is the only case that separates "forward-only" from
+    // "strictly increasing".
+    let mut unchanged = after_step.clone();
+    unchanged.revision = after_step.revision + 1;
+    must(unchanged.validate());
+    assert_eq!(
+        unchanged.plan.effects[position].bound.attempt,
+        after_step.plan.effects[position].bound.attempt,
+        "this save must differ from the row it replaces in its revision and nothing else, so an \
+         acceptance below is about the attempt arm alone"
+    );
+    must(
+        driver
+            .store_mut()
+            .compare_and_save_canary_removal_operation(
+                &must(CanaryRemovalOperationVersion::of(&after_step)),
+                &unchanged,
+            ),
+    );
+    let after_same = must(
+        driver
+            .store()
+            .load_canary_removal_operation(&plan.removal_transaction_id),
+    )
+    .expect("the admitted same-attempt save replaced the row this case wrote");
+    assert_eq!(
+        after_same.revision,
+        after_step.revision + 1,
+        "an unchanged attempt is still one durable revision step, and the row must say so"
+    );
+    assert_eq!(
+        after_same.plan.effects[position].bound.attempt,
+        plan_time.attempt + 1,
+        "the accepted same-attempt save must not have moved the counter the floor reads, which is \
+         what makes it a positive rather than an unrelated write"
     );
 
     fixture.cleanup();

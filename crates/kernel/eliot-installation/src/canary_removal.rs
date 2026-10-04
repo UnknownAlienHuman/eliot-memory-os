@@ -752,6 +752,14 @@ impl CanaryRemovalPlan {
     }
 
     /// Validates the plan without performing any external effect.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one stateless validator keeps the wire version, the removal identity, the digest \
+                  re-derivation, the quiesce bounds, the retirement barrier, the frozen row order, \
+                  every row's shape and every row's postcondition in a single auditable pass, and \
+                  splitting it would scatter one decision across functions that each see only part \
+                  of the plan"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         if self.canary_removal_wire_version != CANARY_REMOVAL_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
@@ -854,6 +862,29 @@ impl CanaryRemovalPlan {
             return Err(InstallationError::IncompleteObservation(
                 "the terminal registry record must stay inside the removal denominator".to_owned(),
             ));
+        }
+        // The FROZEN ORDER is a property of the document, not only of the producer
+        // that froze it. `plan_canary_removal` runs `order_effect_graph` before it
+        // seals the digest, but `load_plan` accepts an untrusted import, and
+        // `advance` selects the next row purely by array position. Without this
+        // check a caller-supplied plan could place a mutating row ahead of a row
+        // no owner can read back, and the guarantee `order_band` states - that such
+        // a row is DETECTED before any destructive call - would hold only for
+        // plans this owner produced. Re-deriving through the SAME function is the
+        // whole check: no second ordering scheme and no new member.
+        let mut ordered = self.effects.clone();
+        order_effect_graph(&mut ordered);
+        let frozen = ordered
+            .iter()
+            .map(|row| row.effect_id.as_str())
+            .collect::<Vec<_>>();
+        if self
+            .effects
+            .iter()
+            .map(|row| row.effect_id.as_str())
+            .ne(frozen)
+        {
+            return Err(InstallationError::IdentityConflict);
         }
         if self.computed_digest()? != self.plan_digest {
             return Err(InstallationError::IdentityConflict);

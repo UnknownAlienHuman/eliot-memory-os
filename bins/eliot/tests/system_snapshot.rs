@@ -1197,9 +1197,9 @@ const REMOVE_CANARY_ROUTE_OPERATIONS: [&str; 2] = ["PLAN", "APPLY"];
 /// This command is deliberately NOT called read-only here. It is not a
 /// byte-preserving read of the owner's registry file: the route obtains that
 /// registry through `open_retained_registry_writer`
-/// (`bins/eliot/src/canary_removal_entry.rs:350`), which yields the owner's
-/// exclusive redb WRITER handle because the owner's `plan_canary_removal` seam
-/// admits only a writer, and redb commits a quick-repair `allocator_state`
+/// (`canary_removal_entry.rs::open_retained_registry_writer`), which yields the
+/// owner's exclusive redb WRITER handle because the owner's `plan_canary_removal`
+/// seam admits only a writer, and redb commits a quick-repair `allocator_state`
 /// transaction when such a handle drops. The bounded claim actually available
 /// about this route is asserted by `assert_durable_state_unchanged` and stated on
 /// the test that uses this set.
@@ -1434,10 +1434,10 @@ fn remove_canary_public_args(
 /// on purpose. It is NOT an unconditional property of the route: the owner's own
 /// required-cleanup refusal is still reachable in production and deliberately
 /// kept. `unsupported_cleanup_refusal`
-/// (`crates/kernel/eliot-installation/src/canary_removal.rs:3032`) composes a
+/// (`crates/kernel/eliot-installation/src/canary_removal.rs::unsupported_cleanup_refusal`) composes a
 /// sentence carrying the literal words `UNSUPPORTED` and `OUT_OF_SCOPE`, and it
 /// answers a frozen plan that carries a row classified `Unsupported`
-/// (`canary_removal.rs:3201-3208`). What rejects the retired CLI-local blocker
+/// (`canary_removal.rs::classify_action`). What rejects the retired CLI-local blocker
 /// for ANY input is the fixture-independent half stated above: the closed code
 /// set cannot express `INSTALLATION_REMOVE_CANARY_UNSUPPORTED`, because that
 /// suffix names neither a route phase nor a closed failure class, and the two
@@ -1581,15 +1581,13 @@ const PLAN_DOCUMENT_DECODE_MARKERS: [&str; 4] = [
 /// The exact member set the owner's `CanaryRemovalStatus` projection publishes.
 ///
 /// The thirteen names and their count are read off the owner type itself —
-/// `CanaryRemovalStatus` at `crates/kernel/eliot-installation/src/canary_removal.rs:1465`,
-/// whose public members are `removal_transaction_id` (`:1467`),
-/// `install_transaction_id` (`:1469`), `generation` (`:1471`), `plan_digest`
-/// (`:1473`), `stage` (`:1475`), `registry_revision` (`:1477`),
-/// `resolved_effect_ids` (`:1479`), `unresolved_effect_ids` (`:1481`),
-/// `blocking_effect_id` (`:1483`), `primary_uncertainty` (`:1485`),
-/// `cleanup_uncertainty` (`:1487`), `next_permitted_action` (`:1489`) and
-/// `evidence_refs` (`:1491`) — so the declared length is the count of fields the
-/// type actually has rather than a remembered number.
+/// `canary_removal.rs::CanaryRemovalStatus`, whose public members are
+/// `removal_transaction_id`, `install_transaction_id`, `generation`,
+/// `plan_digest`, `stage`, `registry_revision`, `resolved_effect_ids`,
+/// `unresolved_effect_ids`, `blocking_effect_id`, `primary_uncertainty`,
+/// `cleanup_uncertainty`, `next_permitted_action` and `evidence_refs` — so the
+/// declared length is the count of fields the type actually has rather than a
+/// remembered number.
 ///
 /// Pinning the set, not just the values, is what makes an added credential,
 /// environment value or free-form path member fail here instead of passing as
@@ -1854,19 +1852,19 @@ fn run_removal_command(args: &[String], cwd: &Path) -> std::process::Output {
 ///   blocking-row proof still needs a plan that carries a row this owner cannot
 ///   drive, and because `require_quiesced_owner_effects` still refuses such a
 ///   record at the destructive fence
-///   (`crates/kernel/eliot-installation/src/canary_removal.rs:2017`), which is
+///   (`crates/kernel/eliot-installation/src/canary_removal.rs::require_quiesced_owner_effects`), which is
 ///   the behaviour a pre-#1138 admission is refused for.
 /// * `NamedOutOfScope` adds BOTH shared surfaces the owner classifies
 ///   `OutOfScope`: `CanaryEvidenceRoot` and `StoreObjects`. Each is frozen with
 ///   the category, the `ForeignToThisRemoval` origin, the owner-recorded
 ///   identity, the ownership evidence and the reconciliation query that the
-///   owner's own `canary_evidence_row` (`canary_removal.rs:2491`) and
-///   `store_objects_row` (`canary_removal.rs:2576`) freeze, in the same row
+///   owner's own `canary_evidence_row` (`canary_removal.rs::canary_evidence_row`) and
+///   `store_objects_row` (`canary_removal.rs::store_objects_row`) freeze, in the same row
 ///   order the owner's own `expected_owners` list uses
-///   (`canary_removal.rs:1978`), and with the same `canary-removal/effect/…`
-///   effect-identity shape those two functions mint. That shape is what makes an
-///   operator able to SEE both categories named in the reported denominator
-///   instead of dropped from it.
+///   (`canary_removal.rs::require_quiesced_owner_effects`), and with the same
+///   `canary-removal/effect/…` effect-identity shape those two functions mint.
+///   That shape is what makes an operator able to SEE both categories named in
+///   the reported denominator instead of dropped from it.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RemovalFixtureRows {
@@ -1911,7 +1909,7 @@ fn removal_plan_envelope(
     // The generation's own owner-recorded Store bridge binding. The owner's
     // `store_objects_row` takes exactly this member as the `StoreObjects` row's
     // `resource_identity` AND as its sole `ownership_evidence` handle
-    // (`CanaryRemovalBuildBinding::from_manifest`, `canary_removal.rs:2580`), so
+    // (`CanaryRemovalBuildBinding::from_manifest`, `canary_removal.rs::CanaryRemovalBuildBinding::from_manifest`), so
     // the fixture freezes the shared Store row named the way the owner names it.
     let store_bridge_artifact_digest = fixture_handle("1".repeat(64));
     let canary_evidence_root_identity = fixture_path(canary_evidence_root, "canary-evidence");
@@ -2088,10 +2086,10 @@ fn json_string_leaves(value: &Value, into: &mut Vec<String>) {
 /// plan can carry `Unsupported` and the owner's required-cleanup refusal has no
 /// row to answer. That refusal is still production-reachable:
 /// `unsupported_cleanup_refusal`
-/// (`crates/kernel/eliot-installation/src/canary_removal.rs:3032`) composes a
+/// (`crates/kernel/eliot-installation/src/canary_removal.rs::unsupported_cleanup_refusal`) composes a
 /// sentence containing the literal words `UNSUPPORTED` and `OUT_OF_SCOPE` and is
 /// returned for a frozen plan carrying a row classified `Unsupported`
-/// (`canary_removal.rs:3201-3208`), which `apply_canary_removal` admits for any
+/// (`canary_removal.rs::classify_action`), which `apply_canary_removal` admits for any
 /// externally supplied envelope. The pair asserted beside it is the
 /// fixture-independent half and is what keeps the regression red for any input:
 /// the closed code set cannot express the retired blocker code, and neither
@@ -2131,7 +2129,7 @@ fn installation_remove_canary_reaches_the_installation_owner() {
     // This scan is fixture-scoped, and the reason is the owner's own: the run
     // refuses at target resolution before any row is frozen, so nothing here
     // classifies a row `Unsupported` and `unsupported_cleanup_refusal`
-    // (`canary_removal.rs:3032`) has no row to answer with its `UNSUPPORTED`
+    // (`canary_removal.rs::unsupported_cleanup_refusal`) has no row to answer with its `UNSUPPORTED`
     // sentence. The closed code set and the two prose markers below are the
     // fixture-independent half, and a route that regressed to that blocker fails
     // on all three.
@@ -2482,7 +2480,7 @@ fn canary_removal_status_reports_the_blocking_row_and_next_action() {
             .collect::<Vec<_>>(),
         effect_ids
             .iter()
-            .map(|identity| identity.as_str())
+            .map(PlatformHandle::as_str)
             .collect::<Vec<_>>(),
         "the projection must report every planned row, the unsupported Store/Blob row included: \
          {status_transcript}"
@@ -2523,7 +2521,7 @@ fn canary_removal_status_reports_the_blocking_row_and_next_action() {
         "RECONCILE",
     ]
     .into_iter()
-    .chain(effect_ids.iter().map(|identity| identity.as_str()))
+    .chain(effect_ids.iter().map(PlatformHandle::as_str))
     .collect::<Vec<_>>();
     assert!(
         !leaves.is_empty(),
@@ -2583,13 +2581,15 @@ fn canary_removal_status_reports_the_blocking_row_and_next_action() {
 /// generation identity and could never fail, and `canary-removal/readback/registry-terminal:`
 /// stood in for a registry reload that never happened. Neither may reach anything an
 /// operator reads, because a removal is never proved by a string this owner wrote about
-/// itself. These are the same two prefixes the owner's own record-level proof scans for
-/// (`crates/kernel/eliot-installation/src/tests.rs:12518`), and neither exists in
-/// production source: the only `canary-removal/evidence/` handles the owner mints are
-/// FROZEN plan-time ownership evidence inside a plan document
-/// (`canary_removal.rs:2403` `canary-removal/evidence/install-effect:…` and `:2604`
-/// `canary-removal/evidence/registry-record:…`), and `canary-removal/readback/` exists
-/// nowhere in the crate outside tests.
+/// itself. These are the same two prefixes the owner's own record-level proof
+/// scans for (`tests.rs::canary_removal_stops_on_an_unreadable_row_before_any_destructive_call`),
+/// and neither exists in production source: the only `canary-removal/evidence/`
+/// handles the owner mints are FROZEN plan-time ownership evidence inside a plan
+/// document (`canary_removal.rs::ownership_evidence`
+/// `canary-removal/evidence/install-effect:…` and
+/// `canary_removal.rs::registry_record_row`
+/// `canary-removal/evidence/registry-record:…`), and `canary-removal/readback/`
+/// exists nowhere in the crate outside tests.
 #[cfg(windows)]
 const FABRICATED_REMOVAL_EVIDENCE_HANDLES: [&str; 2] = [
     "canary-removal/evidence/store-owner:",
@@ -2622,11 +2622,11 @@ const FABRICATED_REMOVAL_EVIDENCE_HANDLES: [&str; 2] = [
 /// `OutOfScope` and never `Unsupported`. That is a property of those fixtures, not of
 /// the production surface. The owner's own required-cleanup refusal is still reachable
 /// and deliberately kept: `unsupported_cleanup_refusal`
-/// (`crates/kernel/eliot-installation/src/canary_removal.rs:3032`) composes one
+/// (`crates/kernel/eliot-installation/src/canary_removal.rs::unsupported_cleanup_refusal`) composes one
 /// sentence carrying the literal words `UNSUPPORTED` and `OUT_OF_SCOPE`, and it is
 /// returned for a frozen plan that carries a row classified `Unsupported`
-/// (`canary_removal.rs:3201-3208`) — a classification `CanaryRemovalEffect::validate`
-/// admits (`canary_removal.rs:436-439`) and `apply_canary_removal` admits for any
+/// (`canary_removal.rs::classify_action`) — a classification `CanaryRemovalEffect::validate`
+/// admits (`canary_removal.rs::CanaryRemovalEffect::validate`) and `apply_canary_removal` admits for any
 /// externally supplied envelope. So a plan naming a required cleanup this owner has
 /// no path for still answers with both of those words, and this scan would be red
 /// on it. What is NOT fixture-scoped is the pair asserted alongside every scan
@@ -2718,7 +2718,7 @@ fn assert_no_fabricated_removal_evidence(route: &str, result: &std::process::Out
 /// reported removal denominator and are never readable as verified.
 ///
 /// `CanaryRemovalAction::OutOfScope`
-/// (`crates/kernel/eliot-installation/src/canary_removal.rs:214-238`) is issue
+/// (`crates/kernel/eliot-installation/src/canary_removal.rs::CanaryRemovalAction::OutOfScope`) is issue
 /// #1138's algorithm step 2 read literally: the row stays in the denominator
 /// carrying the owner-recorded identity, the ownership evidence and the
 /// reconciliation query that are frozen in the plan, it is never reported as
@@ -2733,9 +2733,9 @@ fn assert_no_fabricated_removal_evidence(route: &str, result: &std::process::Out
 /// reported denominator is exactly the four frozen rows in plan order, and the
 /// two out-of-scope categories are two of them under the same
 /// `canary-removal/effect/…` identity shape the owner's own `canary_evidence_row`
-/// and `store_objects_row` mint (`canary_removal.rs:2506` and `:2585`), which is
-/// what makes the category legible in the projection at all. Not verified: no row
-/// is resolved, `evidence_refs` is empty, no string leaf of the whole printed
+/// and `store_objects_row` mint (`canary_removal.rs::canary_evidence_row` and
+/// `canary_removal.rs::store_objects_row`), which is what makes the category
+/// legible in the projection at all. Not verified: no row is resolved, `evidence_refs` is empty, no string leaf of the whole printed
 /// payload is a fabricated evidence handle, neither of the two plan-time
 /// owner-recorded identities is re-published as if it were a readback result, the
 /// exit code is non-zero and `next_permitted_action` is `RECONCILE` rather than
@@ -2755,11 +2755,13 @@ fn assert_no_fabricated_removal_evidence(route: &str, result: &std::process::Out
 /// * No removal this package can drive reaches `Completed`. The store's only
 ///   transaction-publishing constructor, `RedbInstallationTransactionStore::create_planned_at_exact_path`,
 ///   refuses a transaction whose `profile_governed_roots` is unset
-///   (`crates/kernel/eliot-installation/src/redb_state.rs:914`), and the only
+///   (`redb_state.rs::RedbInstallationTransactionStore::create_planned_at_exact_path`),
+///   and the only
 ///   constructor this package can call, `InstallationTransaction::new_unbound_for_fixture`
 ///   (`transaction.rs:656`), leaves that binding unset outside the owning crate's
 ///   own `cfg(test)` (`transaction.rs:799`); `create_canary_removal_operation` itself is
-///   `pub(crate)` (`redb_state.rs:1171`). This test therefore observes stage
+///   `pub(crate)` (`redb_state.rs::create_canary_removal_operation`). This test
+///   therefore observes stage
 ///   `ADMITTED` and proves the naming and the non-verification of the rows. It
 ///   proves nothing about a removal that drove a row to a mutating outcome, and
 ///   `plan-canary-removal` cannot return `Ok` from this package at all, so the
@@ -2769,12 +2771,12 @@ fn assert_no_fabricated_removal_evidence(route: &str, result: &std::process::Out
 /// * The fence that PINS these two categories to `OutOfScope` is not reached here.
 ///   `require_quiesced_owner_effects` compares each owner-derived row's identity
 ///   and action against the transaction the durable store holds
-///   (`canary_removal.rs:1978-2020`), and that runs inside `revalidate_fence`
-///   AFTER the install-transaction load (`canary_removal.rs:2788` before `:2821`),
-///   which is exactly what refuses this fixture. So what this test proves is the
-///   ADMISSION and PROJECTION surface — the rows survive admission and are named
-///   in the reported denominator — and the enforcement half is the owning crate's
-///   own proof, not this package's.
+///   (`canary_removal.rs::require_quiesced_owner_effects`), and inside
+///   `canary_removal.rs::revalidate_fence` that call runs AFTER the
+///   install-transaction load, which is exactly what refuses this fixture. So what
+///   this test proves is the ADMISSION and PROJECTION surface — the rows survive
+///   admission and are named in the reported denominator — and the enforcement half
+///   is the owning crate's own proof, not this package's.
 #[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
@@ -2848,7 +2850,8 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
     // Preconditions on the document this fixture admitted, asserted so the proof
     // below cannot silently degrade into proving something about a different
     // classification: both rows really carry `OutOfScope`, neither claims an
-    // installer effect (the owner refuses that pairing, `canary_removal.rs:421`),
+    // installer effect (the owner refuses that pairing,
+    // `canary_removal.rs::CanaryRemovalEffect::validate`),
     // and each is named with its owner-recorded identity as its ownership
     // evidence, which is what `OutOfScope` says it is and NOT a readback result.
     for (label, row) in [
@@ -2953,7 +2956,7 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
     let removal = &status_output["removal"];
 
     // Bounded and typed: exactly the member set `CanaryRemovalStatus` declares
-    // (canary_removal.rs:1465-1492), so no evidence member can be added to the
+    // (canary_removal.rs::CanaryRemovalStatus), so no evidence member can be added to the
     // projection without failing here.
     let members = removal
         .as_object()
@@ -2985,7 +2988,7 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
             .collect::<Vec<_>>(),
         effect_ids
             .iter()
-            .map(|identity| identity.as_str())
+            .map(PlatformHandle::as_str)
             .collect::<Vec<_>>(),
         "the reported denominator must name every admitted row, both out-of-scope rows \
          included: {status_transcript}"
@@ -3110,7 +3113,7 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
         "RECONCILE",
     ]
     .into_iter()
-    .chain(effect_ids.iter().map(|identity| identity.as_str()))
+    .chain(effect_ids.iter().map(PlatformHandle::as_str))
     .collect::<Vec<_>>();
     assert!(
         !removal_leaves.is_empty(),
@@ -3170,10 +3173,10 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
 /// `Unsupported`, so no frozen row of this fixture can make the owner's own
 /// required-cleanup refusal answer. That refusal is still reachable in production
 /// and deliberately kept: `unsupported_cleanup_refusal`
-/// (`crates/kernel/eliot-installation/src/canary_removal.rs:3032`) composes one
+/// (`crates/kernel/eliot-installation/src/canary_removal.rs::unsupported_cleanup_refusal`) composes one
 /// sentence carrying the literal words `UNSUPPORTED` and `OUT_OF_SCOPE` and is
 /// returned for a frozen plan carrying a row classified `Unsupported`
-/// (`canary_removal.rs:3201-3208`), which `apply_canary_removal` admits for any
+/// (`canary_removal.rs::classify_action`), which `apply_canary_removal` admits for any
 /// externally supplied envelope. The fixture-independent half of the same
 /// requirement is asserted here too: the closed code set each route is pinned
 /// inside cannot express the retired `INSTALLATION_REMOVE_CANARY_UNSUPPORTED`
@@ -3181,7 +3184,7 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
 ///
 /// Fixture state, stated rather than glossed. `recover-canary-removal` needs an
 /// already ADMITTED removal: `recover_canary_removal` starts from
-/// `load_operation` (`canary_removal.rs:1746`) and returns the owner's
+/// `load_operation` (`canary_removal.rs::load_operation`) and returns the owner's
 /// `TransactionNotFound` for an identity that was never admitted, which is a
 /// different answer and would not demonstrate that recovery reaches the owner's
 /// fence about this plan's install transaction. So the admitting route
@@ -3207,8 +3210,10 @@ fn canary_removal_status_reports_the_out_of_scope_rows_as_named_not_verified() {
 /// the one this file already records for every canary-removal route: no removal
 /// this package can drive reaches `Completed`, because the store's only
 /// transaction-publishing constructor refuses a transaction whose
-/// `profile_governed_roots` is unset (`redb_state.rs:914`) and the only constructor
-/// available here leaves it unset outside the owning crate's `cfg(test)`
+/// `profile_governed_roots` is unset
+/// (`redb_state.rs::RedbInstallationTransactionStore::create_planned_at_exact_path`)
+/// and the only constructor available here leaves it unset outside the owning
+/// crate's `cfg(test)`
 /// (`transaction.rs:799`). Every route therefore answers on the bounded non-zero
 /// refusal exit or on a non-completed projection, and a completed removal stays the
 /// #11 installed pulse.
@@ -3339,7 +3344,7 @@ fn no_route_prints_a_fabricated_handle_or_the_retired_cli_local_unsupported_refu
             .collect::<Vec<_>>(),
         effect_ids
             .iter()
-            .map(|identity| identity.as_str())
+            .map(PlatformHandle::as_str)
             .collect::<Vec<_>>(),
         "the status route must report every admitted row, both out-of-scope rows included: \
          {status_transcript}"
@@ -3400,6 +3405,18 @@ fn durable_member_observation(entry: &fs::DirEntry) -> String {
     format!("file {} {}", bytes.len(), sha256_hex(&bytes))
 }
 
+/// True for a recorded member that names a redb database file.
+///
+/// The comparison is case-insensitive on the extension only, because a
+/// case-sensitive suffix test would accept `X.RED` as the owner's registry and
+/// reject the owner's real `<hash>.redb` if its own naming ever changed case.
+#[cfg(windows)]
+fn is_redb_database_member(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("redb"))
+}
+
 /// Records every member below one durable root, recursively.
 ///
 /// Nothing is filtered and nothing is skipped: directories, regular files and
@@ -3409,7 +3426,12 @@ fn durable_member_observation(entry: &fs::DirEntry) -> String {
 #[cfg(windows)]
 fn collect_durable_members(label: &str, root: &Path, members: &mut Vec<(String, String)>) {
     let mut entries = fs::read_dir(root)
-        .unwrap_or_else(|error| panic!("enumerate the durable root {label} at {root:?}: {error}"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "enumerate the durable root {label} at {}: {error}",
+                root.display()
+            )
+        })
         .map(|entry| entry.expect("durable directory entry"))
         .collect::<Vec<_>>();
     entries.sort_by_key(fs::DirEntry::file_name);
@@ -3497,7 +3519,7 @@ fn report_durable_state_measurement(
 /// `RedbInstallationRegistry::open_existing_at`, opens the retained registry as a
 /// redb WRITER
 /// (`crates/kernel/eliot-installation/src/installation_registry.rs:322` through
-/// `open_registry_writer_with_retry`, `redb_state.rs:153`), and redb commits a
+/// `open_registry_writer_with_retry`, `redb_state.rs::open_registry_writer_with_retry`), and redb commits a
 /// quick-repair transaction that deletes and rewrites its own `allocator_state`
 /// system table every time a writable handle is dropped
 /// (`redb-4.1.0/src/db.rs:1061` `impl Drop for Database` calling
@@ -3625,7 +3647,7 @@ fn writable_database_members(
         .iter()
         .filter(|(path, observation)| {
             path.starts_with("installation-root/host/")
-                && path.ends_with(".redb")
+                && is_redb_database_member(path)
                 && observation.starts_with("file ")
         })
         .map(|(path, _)| path.clone())
@@ -3638,7 +3660,7 @@ fn writable_database_members(
     );
     let mut every_database = members
         .iter()
-        .filter(|(path, _)| path.ends_with(".redb"))
+        .filter(|(path, _)| is_redb_database_member(path))
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
     let mut expected_databases = registry_members.clone();
@@ -3689,13 +3711,13 @@ fn removal_domain_projection(fixture: &RemovalOwnerFixture) -> String {
         ),
         format!(
             "registry.active_generation={:?}",
-            projection.active_generation().map(|handle| handle.as_str())
+            projection.active_generation().map(PlatformHandle::as_str)
         ),
         format!(
             "registry.last_known_good_generation={:?}",
             projection
                 .last_known_good_generation()
-                .map(|handle| handle.as_str())
+                .map(PlatformHandle::as_str)
         ),
     ];
     drop(registry);
@@ -3753,12 +3775,12 @@ fn removal_store_measurement(store: &Path) -> String {
 /// The removal operation identities the installation owner itself reports present.
 ///
 /// `RedbInstallationTransactionStore::load_canary_removal_operation`
-/// (`redb_state.rs:1072`) and its generation-scoped sibling
-/// (`redb_state.rs:1105`) are `pub(crate)`, and this test package is not the
+/// (`redb_state.rs::RedbInstallationTransactionStore::load_canary_removal_operation`) and its generation-scoped sibling
+/// (`redb_state.rs::RedbInstallationTransactionStore::load_canary_removal_for_generation`) are `pub(crate)`, and this test package is not the
 /// owning crate, so there is no public table enumeration and no public
 /// reader that lists rows. The only public reader of a removal operation is the
 /// owner's own `WindowsInstallationCoordinator::canary_removal_status`
-/// (`lib.rs:11594`), which loads the durable row and projects it; that is what
+/// (`lib.rs::WindowsInstallationCoordinator::canary_removal_status`), which loads the durable row and projects it; that is what
 /// is used here rather than reaching into private state or the raw database.
 ///
 /// An absent row is the owner's typed `TransactionNotFound`. Any other answer
@@ -3794,15 +3816,13 @@ fn known_removal_operation_identities(store_path: &Path, probes: &[PlatformHandl
 /// `detail_member` is an exact string the OWNER composes, never one this
 /// package or the composition root could print: for the two target-resolving
 /// routes it is the sentence `canary_removal::resolve_approved_generation`
-/// formats (in `crates/kernel/eliot-installation/src/canary_removal.rs`:
-/// `resolve_approved_generation` at `:2028`, composing it at `:2038`; line
-/// numbers as read at 7da01f5fa) and for the read-only status route it is the
-/// removal operation identity the owner reports absent. The exit code, the
-/// closed `INSTALLATION_REMOVE_CANARY_*` refusal class set and the typed envelope
-/// are asserted through the existing harness (`assert_installation_error` and
-/// `assert_removal_route_owner_codes_only`), so this is the positive half of the
-/// unchanged-state proof: a route that crashed or never reached the owner
-/// cannot satisfy it.
+/// formats (`canary_removal.rs::resolve_approved_generation`), and for the
+/// read-only status route it is the removal operation identity the owner reports
+/// absent. The exit code, the closed `INSTALLATION_REMOVE_CANARY_*` refusal
+/// class set and the typed envelope are asserted through the existing harness
+/// (`assert_installation_error` and `assert_removal_route_owner_codes_only`), so
+/// this is the positive half of the unchanged-state proof: a route that crashed
+/// or never reached the owner cannot satisfy it.
 ///
 /// `operations` is the route's own phase set, so this also rejects a route that
 /// answered with a phase tag it never composes.
@@ -3918,13 +3938,14 @@ fn assert_owner_typed_refusal(
 /// neighbour's set. That is not tidiness: the status route's expectation below is
 /// `INSTALLATION_REMOVE_CANARY_STATUS_NOT_FOUND`, which the entry composes by
 /// tagging every status refusal `STATUS_OPERATION`
-/// (`bins/eliot/src/canary_removal_entry.rs:203`, with that tag declared at
-/// `:57`), mapping `TransactionNotFound` to the `NOT_FOUND` class (`:414`) and
-/// formatting it into the code (`:416`). A `PLAN`/`APPLY` set rejects that code by
-/// construction, so one shared set for all three routes makes this proof red for a
-/// reason that has nothing to do with durable state. The route name sits beside its
-/// own set in every arm, so the closed-code check names the one route that
-/// published an out-of-phase code.
+/// (`canary_removal_entry.rs::run_canary_removal_status`, with that tag declared
+/// at `canary_removal_entry.rs::STATUS_OPERATION`), mapping `TransactionNotFound`
+/// to the `NOT_FOUND` class and formatting it into the code in
+/// `canary_removal_entry.rs::removal_error_code`. A `PLAN`/`APPLY` set rejects
+/// that code by construction, so one shared set for all three routes makes this
+/// proof red for a reason that has nothing to do with durable state. The route
+/// name sits beside its own set in every arm, so the closed-code check names the
+/// one route that published an out-of-phase code.
 ///
 /// Proof ceiling, stated rather than hidden. The target this fixture publishes is
 /// never an accepted generation, so both target-resolving routes refuse inside
@@ -3953,11 +3974,15 @@ fn assert_owner_typed_refusal(
 #[test]
 fn plan_canary_removal_and_remove_canary_create_no_durable_state_but_the_owners_registry_redb_bookkeeping()
  {
+    // One row per route: its name, the argv the fixture composes, the operation
+    // tags its refusals must carry, the code its refusal must compose, and the
+    // detail every such refusal must name.
+    type RouteCase<'a> = (&'a str, Vec<String>, &'a [&'a str], &'a str, &'a str);
     let fixture = removal_owner_fixture("no-observable-state");
     let removal_transaction_id =
         canary_removal_operation_id(&fixture.install_transaction_id, &fixture.generation)
             .expect("derive the removal operation identity for this target");
-    let routes: [(&str, Vec<String>, &[&str], &str, &str); 3] = [
+    let routes: [RouteCase<'_>; 3] = [
         (
             "plan-canary-removal",
             fixture.plan_canary_removal_args(),
@@ -4006,7 +4031,7 @@ fn plan_canary_removal_and_remove_canary_create_no_durable_state_but_the_owners_
         // this fixture's generation verbatim, because
         // `canary_removal::canary_removal_operation_id` composes that identity
         // from the install identity and the generation
-        // (`canary_removal.rs:1617`). An empty or generic "not found" answer
+        // (`canary_removal.rs::canary_removal_operation_id`). An empty or generic "not found" answer
         // cannot satisfy it.
         assert!(
             detail.contains(fixture.generation.as_str()),
@@ -4133,8 +4158,12 @@ fn plan_canary_removal_and_remove_canary_create_no_durable_state_but_the_owners_
 /// own name. `plan-canary-removal` decodes and resolves and never drives an
 /// effect, so only its own `PLAN` phase is admissible; `remove-canary` resolves
 /// AND drives one plan in one command, so both of its phases are. Both are
-/// tagged `PLAN_OPERATION`/`APPLY_OPERATION` in
-/// `bins/eliot/src/canary_removal_entry.rs` (`:142`, `:146`, `:151`), and
+/// tagged in `bins/eliot/src/canary_removal_entry.rs`:
+/// `canary_removal_entry.rs::run_plan_canary_removal` composes only
+/// `canary_removal_entry.rs::PLAN_OPERATION`, and
+/// `canary_removal_entry.rs::run_remove_canary` composes
+/// `canary_removal_entry.rs::PLAN_OPERATION` then
+/// `canary_removal_entry.rs::APPLY_OPERATION`, and
 /// `plan_canary_removal_and_remove_canary_create_no_durable_state_but_the_owners_registry_redb_bookkeeping`
 /// above needs the same distinction for the status route, so the closed-code check is driven
 /// from the route rather than from one shared set.
