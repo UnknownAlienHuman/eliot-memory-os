@@ -12,6 +12,6 @@
   "authority_activation_ref": null,
   "runtime_manifest_sha256": null,
   "artifact_manifest_sha256": null,
-  "plan_hash": "blake3:6675b8349fb892407faf2bd706fbd437825e3aea023bd637adbe9f160cec3f25",
+  "plan_hash": "blake3:e8ba9a89bf2fbb1ad3cc3cff37263f4d6a9495ff8923cdd2088b8ee3ba333c46",
   "sealed_at": "2026-09-07T12:00:00Z"
 }

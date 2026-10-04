@@ -70,7 +70,7 @@ fn work_lease_wire() -> Value {
         },
         "conflict_refs": [],
         "granted_at": "2026-09-07T12:00:00Z",
-        "expires_at": "2026-09-07T13:00:00Z",
+        "expires_at": "2026-09-07T12:00:01Z",
         "renewed_at": null,
         "released_at": null,
         "revoked_at": null,
@@ -119,11 +119,41 @@ fn safety_receipt_wire() -> Value {
 // #708 case 1..20 support.
 //
 // The 20 numbered cases below drive real `serde_json` decodes against the
-// nine-file boundary types. Nothing here re-implements a decoder, a source
-// attribute assertion or a second serde-boundary scanner: the case-15/16
-// oracle borrows its classification vocabulary and its unsupported-syntax
-// rule from `scripts/serde_boundary_inventory.py` at run time, and it
-// acquires the same nine source files that script already owns.
+// nine-file boundary types.
+//
+// Scanner scope, stated accurately: the case-15/16 oracle IS a package-local
+// source scan, because the card requires one (`cards/708.md`). It re-acquires
+// the nine production files the shipped inventory already reads, and re-derives
+// from source the field-level `default`/bypass facts that
+// `scripts/serde_boundary_inventory.py` also derives. What it reuses rather
+// than re-derives is the shipped CLASSIFICATION VOCABULARY: the oracle reads
+// that script at run time and asserts against its own `DISPOSITIONS` set for
+// equality, and probes its protected dimensions, bypass shapes and
+// unsupported-syntax markers by name. `DISPOSITIONS` equality is the load-
+// bearing coupling; the string probes are weaker than they look, and the
+// behavioural half of "unsupported-syntax handling is the script's" is the
+// `unresolved == 0` assertion, not the probes. So: one scanner, in this file,
+// not a second shipped inventory.
+//
+// Oracle ownership (I18-27:3, "every acceptance oracle has an owner and
+// origin"). Nothing here creates authority by assertion; each constant below
+// states where its authority comes from:
+//   - `EXPECTED_DEFAULT_SITE_COUNT`, the paired/helper/manual/bypass counts
+//     and `DEFAULT_SITE_EXCEPTIONS`: derived by the scan below from the nine
+//     production files, and cross-checked against the frozen field inventory in
+//     `crates/eliot-types/src/lifecycle.rs` (its per-file zero counts, its
+//     three helper-form sites, its untagged-NONE and single-flatten findings),
+//     with the disposition vocabulary owned by
+//     `scripts/serde_boundary_inventory.py:93`.
+//   - `EXPECTED_BARE_OPTION_SITE_COUNT` and its line list: derived by the same
+//     scan from the serde rule that a missing `Option<T>` decodes to `None`
+//     (`serde::private::de::missing_field`), with no other authority.
+//   - `EXPECTED_SPECIFIC_OWNER_ROWS` / `EXPECTED_OWNER_FILES` /
+//     `BREAKING_CANDIDATE_OWNER_MAP`: owner for each deferred breaking
+//     candidate is the named file; the base-object column records `n/a`
+//     because no resolvable object identity exists for those rows.
+//   - the case-20 completeness cross-check: `crates/eliot-types/src/lifecycle.rs`
+//     frozen inventory, as pinned by case 16.
 // ---------------------------------------------------------------------
 
 /// The nine-file domain this issue owns, in the order the frozen field
@@ -320,6 +350,12 @@ const BREAKING_CANDIDATE_OWNER_MAP: &[(&str, &str, &str, &str)] = &[
         "crates/eliot-store/src/canonical_store.rs",
     ),
     (
+        "AgentCandidateSubmitInput.cue_bindings",
+        "n/a",
+        "the eliot.remember candidate-capture catalogue's published required set",
+        "crates/eliot-app/src/mcp_stdio/catalog.rs",
+    ),
+    (
         "published eliot.observe / eliot.packet wire shapes (contract.rs types, not the nine-file types)",
         "n/a",
         "surfaces/eliot-mcp declares its own ObserveInput as a kind-tagged enum (contract.rs:330) and its own two-field PacketInput (contract.rs:212); neither is the nine-file ObserveInput struct this oracle scans, and PacketInput.material_refs carries a serde(default) outside the nine-file denominator. Both surfaces are READ ONLY for this card, so the divergence is deferred to their owner.",
@@ -372,7 +408,7 @@ fn assert_refused<T: DeserializeOwned + std::fmt::Debug>(raw: &str, field: &str,
         Ok(_) => panic!("{fixture} must refuse a missing `{field}`"),
         Err(error) => assert!(
             error.to_string().contains(field),
-            "{fixture}: the typed error must name the missing member `{field}`, got: {error}"
+            "{fixture}: the typed error must name `{field}`, got: {error}"
         ),
     }
 }
@@ -1926,7 +1962,16 @@ const DEFAULT_SITE_EXCEPTIONS: &[(&str, &str)] = &[
         "mcp_contract.rs::AgentCandidateCurationInput.counterevidence_refs",
         "exact-internal",
     ),
-    ("mcp_contract.rs::ObserveInput.hint", "named-legacy"),
+    (
+        // A RECORDED DEFECT, not a sanctioned boundary: see case 9. `I07-20:14`
+        // admits an alias only at a migration or compatibility boundary, and this
+        // one is neither - `mcp_contract.rs:378-384` records it as a W4 defect
+        // that APPENDIX-P's fail-closed rule is violated by, blocked on the
+        // renaming owner outside this card's scope. The disposition stays
+        // `named-legacy` because the card forbids correcting the retained row.
+        "mcp_contract.rs::ObserveInput.hint",
+        "named-legacy",
+    ),
     ("mcp_contract.rs::ObserveInput.task_id", "exact-internal"),
     (
         "mcp_contract.rs::ObserveInput.affected_resources",
@@ -2577,8 +2622,21 @@ fn case_08_versions_and_control_vocabulary_outside_the_frozen_set_fail() {
 #[test]
 fn case_09_legacy_payloads_decode_only_through_their_named_boundary() {
     // Case 9: retained legacy vocabulary decodes through the current closed
-    // decoder, and the one admitted alias is accepted only because its named
-    // boundary records it. No `untagged` or trial-accept path is added.
+    // decoder, and the one alias this decoder carries is a RECORDED DEFECT, not a
+    // sanctioned boundary. `mcp_contract.rs:378-384` states it outright: the
+    // current decoder "trial-accepts the same classification hint under two
+    // names", APPENDIX-P requires the current decoder to fail closed on a closed
+    // control variant, removal needs the renaming owner
+    // (`crates/surfaces/eliot-mcp/src/core.rs::decode_protected_request_bytes`),
+    // and #708 forbids compensating with an alias, `untagged` or a default. The
+    // card also lists `ObserveInput.{hint,schema_version}` among the retained
+    // rows this delivery must NOT correct. So the row stays, the disposition
+    // stays, and this arm documents the defect rather than endorsing it: it
+    // proves the alias is REACHABLE today, so a reviewer can see the trial-accept
+    // that has to be closed by its owner. Note the consequence: case 15's
+    // fail-closed bypass list pins `mcp_contract.rs:alias` as part of the current
+    // state, so the owner's fix will have to update that freeze deliberately.
+    // No `untagged` or new trial-accept path is added here.
     let legacy: MemoryStateTransition =
         decode_fixture("memory_state_transition_legacy_from_state.json");
     assert_eq!(legacy.from_state, MemoryLifecycleState::Demoted);
@@ -2961,10 +3019,20 @@ fn case_15_the_source_oracle_reuses_the_shipped_inventory_vocabulary() {
     }
 
     // The unsupported-syntax handling is the script's too: the same evidence
-    // prefix and the same unreadable-source kind, and this oracle applies the
-    // same rule that an unresolved site is incomplete and never clean.
-    assert!(script.contains("unsupported-macro: "));
-    assert!(script.contains("unreadable-source"));
+    // prefix and the same unreadable-source kind. These two probes are the WEAK
+    // half of that claim - a comment anywhere in the script would satisfy them -
+    // so they are stated as what they are, with messages, and the BEHAVIOURAL
+    // half of the claim is the `unresolved == 0` assertion below, which is the
+    // same rule the script applies: an unresolved site is incomplete, never
+    // clean.
+    assert!(
+        script.contains("unsupported-macro: "),
+        "the shipped inventory must keep its unsupported-macro evidence prefix"
+    );
+    assert!(
+        script.contains("unreadable-source"),
+        "the shipped inventory must keep its unreadable-source kind"
+    );
 
     let sites = discovered_default_sites();
     let unresolved = sites
@@ -3589,6 +3657,20 @@ fn case_20_the_deferred_owner_map_is_complete_and_outside_this_scope() {
     );
 
     assert!(!BREAKING_CANDIDATE_OWNER_MAP.is_empty());
+    // Completeness, the property the card asks for and nothing enforced until
+    // now: every `specific-owner` exception row must have an entry in this map.
+    // Case 16 pins those rows as a frozen set, so a `specific-owner` disposition
+    // without a recorded owner is otherwise invisible - exactly what happened
+    // for `AgentCandidateSubmitInput.cue_bindings`.
+    for owner_row in EXPECTED_SPECIFIC_OWNER_ROWS {
+        let field = owner_row.rsplit('.').next().unwrap_or(owner_row);
+        assert!(
+            BREAKING_CANDIDATE_OWNER_MAP
+                .iter()
+                .any(|(candidate, ..)| candidate.contains(field)),
+            "{owner_row} is a specific-owner exception with no entry in the deferred owner map"
+        );
+    }
     let mut owners: Vec<&str> = BREAKING_CANDIDATE_OWNER_MAP
         .iter()
         .map(|(_candidate, _base, _blocking, owner)| *owner)
