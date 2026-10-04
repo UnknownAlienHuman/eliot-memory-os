@@ -1,0 +1,19 @@
+{
+  "rejection_id": "meta-isolation-rejection:7f07ba24b0ab1c23b01e0a53e57c36c87c837e667bb288c70b58ddd7063feb05",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "candidate_ref": "cd1fa3a3c3ddadf1970f9f864e4fa01fa0e8d633e213cbf7a796dbf10e637199",
+  "derived_fence": {
+    "evaluator_version": "v1",
+    "evaluator_hash": "0ff34fe8547b747012228c2e0d5083a640a3da7902d2904445d4b6d1b48b3065",
+    "threshold_version": "1",
+    "threshold_hash": "cd1fa3a3c3ddadf1970f9f864e4fa01fa0e8d633e213cbf7a796dbf10e637199",
+    "fixed_replay_set_hash": "50a695fae188296f0afaf4c9c87515aa15278d1e8e368a7fb282958bb5dfa2c6",
+    "holdout_replay_set_hash": "cac052b747823d9346d79ad026799eb6cd2ead9b1bcde9e5cfef42bdeb4dd4c0"
+  },
+  "attempted_fence_hash": "26f9a9edec9138292723b228a0a162322b55e38d320e044a632939f9592bd430",
+  "reasons": [
+    "meta-isolation rejected a mutation to evaluator, replay sets, or thresholds"
+  ],
+  "decision": "REJECTED",
+  "created_at": "2026-09-07T12:00:00Z"
+}

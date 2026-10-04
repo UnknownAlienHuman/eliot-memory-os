@@ -1,0 +1,14 @@
+{
+  "verification_id": "00000000-0000-7000-8000-000000000005",
+  "claim_id": null,
+  "project_id": null,
+  "task_id": null,
+  "write_id": null,
+  "memory_revision": null,
+  "verifier": "verifier-1",
+  "result": "passed",
+  "summary": "the write set matches the declared scope",
+  "payload": {
+    "kind": "verification"
+  }
+}

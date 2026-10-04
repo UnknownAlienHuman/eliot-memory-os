@@ -1,0 +1,41 @@
+{
+  "run_id": "run-1",
+  "request_id": "request-1",
+  "state": "succeeded",
+  "provider_state": "ready_enabled",
+  "dry_run": false,
+  "fixture_runner": false,
+  "binary_path": null,
+  "effective_cwd": "C:/repo",
+  "stdout_blob_ref": null,
+  "stderr_blob_ref": null,
+  "log_blob_ref": null,
+  "stdout_excerpt": "",
+  "stderr_excerpt": "",
+  "safety_receipt": {
+    "typed_argv": [
+      "agy",
+      "--json"
+    ],
+    "prompt_hash_blake3": "prompt-sha",
+    "shell_false": true,
+    "stdin_devnull": true,
+    "process_group_kill_on_timeout": true,
+    "timeout_ms": 1000,
+    "max_output_bytes": 1024,
+    "effective_cwd": "C:/repo",
+    "env_fixed_vars": [],
+    "env_dropped_names": [],
+    "model_observation": null
+  },
+  "redaction_receipt": {
+    "redacted": false,
+    "redacted_markers": [],
+    "original_bytes": 0,
+    "retained_bytes": 0
+  },
+  "normalized_result": null,
+  "message": "ok",
+  "created_at": "2026-09-07T12:00:00Z",
+  "completed_at": "2026-09-07T12:00:01Z"
+}
