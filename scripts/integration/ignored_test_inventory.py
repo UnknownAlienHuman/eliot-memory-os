@@ -194,12 +194,22 @@ class Artifact:
     filenames: tuple[Path, ...] = ()
     file_identity: dict[str, int] = dataclasses.field(default_factory=dict)
     executable_sha256: str = ""
+    # Internal admission binding only; deliberately excluded from public rows,
+    # artifact records, and their digests.
+    target_root: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class CommandResult:
     stdout: bytes
     stderr: bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class _WindowsHandleDetails:
+    attributes: int
+    native_identity: tuple[int, int, int]
+    final_path: str
 
 
 def _sha256(data: bytes) -> str:
@@ -378,6 +388,375 @@ def _assign_job_object(job: int, process_handle: int) -> None:
         raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
 
 
+def _windows_api_path(path: str | Path) -> str:
+    """Return an absolute extended-length path for a Windows file API call."""
+    import ntpath
+
+    value = os.fspath(path)
+    if not isinstance(value, str) or not ntpath.isabs(value):
+        raise OSError("Windows path is not absolute")
+    value = ntpath.normpath(value)
+    if value.startswith("\\\\?\\") or value.startswith("\\\\.\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _normalize_windows_path(path: str | Path) -> str:
+    """Normalize DOS/extended final paths for case-insensitive comparison."""
+    import ntpath
+
+    value = os.fspath(path).replace("/", "\\")
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return ntpath.normcase(ntpath.normpath(value))
+
+
+def _open_windows_path_handle(path: str | Path, *, directory: bool) -> int:
+    """Open one path component without following its reparse point."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    desired_access = 0x00000080 if directory else 0x80000000  # FILE_READ_ATTRIBUTES / GENERIC_READ
+    share_mode = 0x00000001  # FILE_SHARE_READ; deny write and delete while held
+    flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+    if directory:
+        flags |= 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS
+    handle = kernel.CreateFileW(
+        _windows_api_path(path), desired_access, share_mode, None, 3, flags, None
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle is None or int(handle) == invalid:
+        raise OSError(ctypes.get_last_error(), "CreateFileW could not hold admitted path component")
+    return int(handle)
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    if not kernel.CloseHandle(wintypes.HANDLE(handle)):
+        raise OSError(ctypes.get_last_error(), "CloseHandle for launch lease failed")
+
+
+def _windows_handle_details(handle: int) -> _WindowsHandleDetails:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", FileTime),
+            ("ftLastAccessTime", FileTime),
+            ("ftLastWriteTime", FileTime),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    )
+    kernel.GetFileInformationByHandle.restype = wintypes.BOOL
+    value = ByHandleFileInformation()
+    if not kernel.GetFileInformationByHandle(wintypes.HANDLE(handle), ctypes.byref(value)):
+        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
+    kernel.GetFinalPathNameByHandleW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    capacity = 32768
+    while capacity <= 131072:
+        buffer = ctypes.create_unicode_buffer(capacity)
+        length = kernel.GetFinalPathNameByHandleW(
+            wintypes.HANDLE(handle), buffer, capacity, 0  # normalized DOS volume path
+        )
+        if length == 0:
+            raise OSError(ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+        if length < capacity:
+            return _WindowsHandleDetails(
+                attributes=int(value.dwFileAttributes),
+                native_identity=(
+                    int(value.dwVolumeSerialNumber),
+                    int(value.nFileIndexHigh),
+                    int(value.nFileIndexLow),
+                ),
+                final_path=buffer.value,
+            )
+        capacity = int(length) + 1
+    raise OSError("GetFinalPathNameByHandleW path exceeds the supported bound")
+
+
+def _windows_handle_python_identity(handle: int) -> dict[str, int]:
+    """Read Python's admitted stat identity from a duplicate of the same handle."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.argtypes = ()
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.DuplicateHandle.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel.DuplicateHandle.restype = wintypes.BOOL
+    current = kernel.GetCurrentProcess()
+    duplicate = wintypes.HANDLE()
+    if not kernel.DuplicateHandle(
+        current,
+        wintypes.HANDLE(handle),
+        current,
+        ctypes.byref(duplicate),
+        0,
+        False,
+        0x00000002,  # DUPLICATE_SAME_ACCESS
+    ):
+        raise OSError(ctypes.get_last_error(), "DuplicateHandle for admitted identity failed")
+    duplicate_value = int(duplicate.value)
+    fd: int | None = None
+    try:
+        fd = msvcrt.open_osfhandle(duplicate_value, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        duplicate_value = 0  # ownership transferred to the CRT descriptor
+        info = os.fstat(fd)
+        return {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "size": int(info.st_size),
+            "mtime_ns": int(info.st_mtime_ns),
+        }
+    finally:
+        if fd is not None:
+            os.close(fd)
+        elif duplicate_value:
+            _close_windows_handle(duplicate_value)
+
+
+def _windows_handle_sha256(handle: int, deadline: float | None) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.SetFilePointerEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    )
+    kernel.SetFilePointerEx.restype = wintypes.BOOL
+    position = ctypes.c_longlong()
+    if not kernel.SetFilePointerEx(wintypes.HANDLE(handle), 0, ctypes.byref(position), 0):
+        raise OSError(ctypes.get_last_error(), "SetFilePointerEx for admitted image failed")
+    kernel.ReadFile.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    )
+    kernel.ReadFile.restype = wintypes.BOOL
+    digest = hashlib.sha256()
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    while True:
+        _remaining(deadline)
+        count = wintypes.DWORD()
+        if not kernel.ReadFile(
+            wintypes.HANDLE(handle), buffer, len(buffer), ctypes.byref(count), None
+        ):
+            raise OSError(ctypes.get_last_error(), "ReadFile for admitted image failed")
+        if count.value == 0:
+            return digest.hexdigest()
+        digest.update(buffer.raw[: count.value])
+
+
+def _query_suspended_image_path(process_handle: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(32768)
+    size = wintypes.DWORD(len(buffer))
+    if not kernel.QueryFullProcessImageNameW(
+        wintypes.HANDLE(process_handle), 0, buffer, ctypes.byref(size)
+    ):
+        raise OSError(ctypes.get_last_error(), "QueryFullProcessImageNameW failed")
+    if not buffer.value:
+        raise OSError("QueryFullProcessImageNameW returned an empty image path")
+    return buffer.value
+
+
+def _snapshot_launch_artifact(artifact: Artifact) -> tuple[Artifact, tuple[tuple[str, int], ...], str]:
+    """Freeze the private admission receipt before entering native APIs."""
+    if not isinstance(artifact, Artifact) or artifact.target_root is None:
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "native listing lacks its admitted artifact receipt")
+    if not all(isinstance(value, str) and value for value in (artifact.package_id, artifact.target_name, artifact.target_kind)):
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact target identity is invalid")
+    if not isinstance(artifact.profile, dict) or set(artifact.profile) != _PROFILE_FIELDS or artifact.profile.get("test") is not True:
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact profile is invalid")
+    if not isinstance(artifact.file_identity, dict) or set(artifact.file_identity) != {"device", "inode", "size", "mtime_ns"}:
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact file identity is incomplete")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in artifact.file_identity.values()
+    ):
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact file identity is invalid")
+    digest = artifact.executable_sha256
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact digest is invalid")
+    snapshot = dataclasses.replace(
+        artifact,
+        executable=Path(artifact.executable),
+        profile=dict(artifact.profile),
+        features=tuple(artifact.features),
+        filenames=tuple(artifact.filenames),
+        file_identity=dict(artifact.file_identity),
+        target_root=Path(artifact.target_root),
+    )
+    identity = tuple(sorted((key, int(value)) for key, value in snapshot.file_identity.items()))
+    return snapshot, identity, digest
+
+
+def _open_artifact_launch_lease(
+    root: Path,
+    artifact: Artifact,
+    expected_identity: tuple[tuple[str, int], ...],
+    expected_sha256: str,
+    deadline: float | None,
+) -> tuple[int, ...]:
+    """Hold every lexical component and the admitted image against replacement."""
+    handles: list[int] = []
+    try:
+        if artifact.target_root is None:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact has no target-root binding")
+        root_path = Path(os.path.abspath(root))
+        target_path = Path(os.path.abspath(artifact.target_root))
+        image_path = Path(os.path.abspath(artifact.executable))
+        expected_target = Path(os.path.abspath(root_path.joinpath(*_TARGET_ROOT_PARTS)))
+        if _normalize_windows_path(target_path) != _normalize_windows_path(expected_target):
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact target root differs from its original root binding")
+        try:
+            target_path.relative_to(root_path)
+            image_path.relative_to(target_path)
+        except ValueError as exc:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted artifact image is outside its target root") from exc
+        if not image_path.is_absolute() or not root_path.is_absolute() or not target_path.is_absolute():
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted launch path is not absolute")
+        parts = image_path.parts
+        if not parts or not image_path.anchor:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted image path has no volume root")
+        chain: list[Path] = [Path(image_path.anchor)]
+        current = chain[0]
+        for component in parts[1:]:
+            current = current / component
+            chain.append(current)
+        if len(chain) < 2:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted image path has no file component")
+        for index, component_path in enumerate(chain):
+            _remaining(deadline)
+            is_directory = index < len(chain) - 1
+            handle = _open_windows_path_handle(component_path, directory=is_directory)
+            handles.append(handle)
+            details = _windows_handle_details(handle)
+            is_reparse = bool(details.attributes & 0x00000400)  # FILE_ATTRIBUTE_REPARSE_POINT
+            is_directory_actual = bool(details.attributes & 0x00000010)  # FILE_ATTRIBUTE_DIRECTORY
+            if is_reparse or is_directory_actual != is_directory:
+                raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "admitted launch path contains a reparse or type-mismatched component")
+            if _normalize_windows_path(details.final_path) != _normalize_windows_path(component_path):
+                raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "held launch component final path differs from its lexical path")
+        image_handle = handles[-1]
+        if tuple(sorted(_windows_handle_python_identity(image_handle).items())) != expected_identity:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "held image identity differs from the admitted Cargo artifact")
+        if _windows_handle_sha256(image_handle, deadline) != expected_sha256:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "held image digest differs from the admitted Cargo artifact")
+        return tuple(handles)
+    except BaseException as exc:
+        close_errors: list[BaseException] = []
+        for handle in reversed(handles):
+            try:
+                _close_windows_handle(handle)
+            except BaseException as close_exc:
+                close_errors.append(close_exc)
+        if close_errors:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "partial launch lease cleanup could not be confirmed") from exc
+        raise
+
+
+def _verify_suspended_artifact_image(
+    process_handle: int,
+    artifact: Artifact,
+    held_handles: tuple[int, ...],
+    expected_identity: tuple[tuple[str, int], ...],
+    expected_sha256: str,
+    deadline: float | None,
+) -> None:
+    """Bind the still-suspended child image to the already-held artifact."""
+    if not held_handles:
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended image check has no retained launch lease")
+    _remaining(deadline)
+    queried_path = _query_suspended_image_path(process_handle)
+    expected_path = Path(os.path.abspath(artifact.executable))
+    if _normalize_windows_path(queried_path) != _normalize_windows_path(expected_path):
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended process image path differs from the admitted executable")
+    actual_handle = _open_windows_path_handle(queried_path, directory=False)
+    try:
+        actual = _windows_handle_details(actual_handle)
+        admitted = _windows_handle_details(held_handles[-1])
+        if actual.attributes & (0x00000400 | 0x00000010):
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended process image is a reparse point or directory")
+        if _normalize_windows_path(actual.final_path) != _normalize_windows_path(admitted.final_path):
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended process image final path differs from the admitted image")
+        if actual.native_identity != admitted.native_identity:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended process image identity differs from the admitted image")
+        if tuple(sorted(_windows_handle_python_identity(actual_handle).items())) != expected_identity:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended process image stat identity differs from the admitted Cargo artifact")
+        if tuple(sorted(_windows_handle_python_identity(held_handles[-1]).items())) != expected_identity:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "held image identity changed after process creation")
+        if _windows_handle_sha256(held_handles[-1], deadline) != expected_sha256:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "held image digest changed after process creation")
+    finally:
+        _close_windows_handle(actual_handle)
+
+
 def _resume_suspended_process(pid: int) -> None:
     """Resume the suspended process using its owning thread handles."""
     import ctypes
@@ -402,28 +781,31 @@ def _resume_suspended_process(pid: int) -> None:
     snapshot = kernel.CreateToolhelp32Snapshot(0x00000004, 0)
     if snapshot == ctypes.c_void_p(-1).value:
         raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
-    resumed = False
+    process_threads: list[int] = []
     entry = ThreadEntry()
     entry.dwSize = ctypes.sizeof(entry)
     try:
         more = kernel.Thread32First(snapshot, ctypes.byref(entry))
         while more:
             if entry.th32OwnerProcessID == pid:
-                thread = kernel.OpenThread(0x0002, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
-                if not thread:
-                    raise OSError(ctypes.get_last_error(), "OpenThread failed")
-                try:
-                    if kernel.ResumeThread(thread) == 0xFFFFFFFF:
-                        raise OSError(ctypes.get_last_error(), "ResumeThread failed")
-                    resumed = True
-                finally:
-                    kernel.CloseHandle(thread)
+                process_threads.append(int(entry.th32ThreadID))
             entry.dwSize = ctypes.sizeof(entry)
             more = kernel.Thread32Next(snapshot, ctypes.byref(entry))
     finally:
         kernel.CloseHandle(snapshot)
-    if not resumed:
-        raise OSError("suspended process has no resumable thread")
+    if len(process_threads) != 1:
+        raise OSError("suspended process does not have exactly one creation thread")
+    thread = kernel.OpenThread(0x0002, False, process_threads[0])  # THREAD_SUSPEND_RESUME
+    if not thread:
+        raise OSError(ctypes.get_last_error(), "OpenThread failed")
+    try:
+        previous_suspend_count = int(kernel.ResumeThread(thread))
+        if previous_suspend_count == 0xFFFFFFFF:
+            raise OSError(ctypes.get_last_error(), "ResumeThread failed")
+        if previous_suspend_count != 1:
+            raise OSError("suspended process creation thread had an unexpected suspend count")
+    finally:
+        kernel.CloseHandle(thread)
 
 
 def _query_job_active_processes(job: int) -> int:
@@ -505,12 +887,31 @@ def _run_fixed(
     *,
     deadline: float | None = None,
     admitted_executable: Path | None = None,
+    admitted_target_root: Path | None = None,
+    admitted_artifact: Artifact | None = None,
 ) -> CommandResult:
     command = _snapshot_argv(argv)
+    launch_artifact: Artifact | None = None
+    expected_identity: tuple[tuple[str, int], ...] = ()
+    expected_sha256 = ""
+    listing_command = len(command) == 1 + len(_LIBTEST_LIST_ARGS) and command[1:] == _LIBTEST_LIST_ARGS
+    if admitted_artifact is not None:
+        launch_artifact, expected_identity, expected_sha256 = _snapshot_launch_artifact(admitted_artifact)
+        if not listing_command or Path(admitted_executable or "") != launch_artifact.executable:
+            raise InventoryError("COMMAND_NOT_ALLOWED", "artifact receipt is only valid for its exact libtest listing command")
+        if admitted_target_root is not None and _normalize_windows_path(admitted_target_root) != _normalize_windows_path(launch_artifact.target_root):
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "listing target root differs from the admitted artifact binding")
+        admitted_executable = launch_artifact.executable
+        admitted_target_root = launch_artifact.target_root
+    elif listing_command:
+        raise InventoryError("COMMAND_NOT_ALLOWED", "native listing requires the original admitted artifact receipt")
     _validate_command(command, root, admitted_executable=admitted_executable)
     if os.name != "nt":
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "owned Windows Job process-tree execution is unavailable on this platform")
-    target_root = _admitted_target_root(root)
+    if admitted_target_root is not None:
+        target_root = Path(os.path.abspath(admitted_target_root))
+    else:
+        target_root = _admitted_target_root(root)
     env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
@@ -536,6 +937,7 @@ def _run_fixed(
     job: int | None = None
     assigned = False
     cleanup_confirmed = False
+    launch_handles: tuple[int, ...] = ()
     output_lock = __import__("threading").Lock()
     overflow = __import__("threading").Event()
     chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
@@ -612,11 +1014,22 @@ def _run_fixed(
     try:
         if time.monotonic() >= run_until:
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "inventory command deadline expired")
+        if launch_artifact is not None:
+            launch_handles = _open_artifact_launch_lease(
+                root,
+                launch_artifact,
+                expected_identity,
+                expected_sha256,
+                run_until,
+            )
+        if time.monotonic() >= run_until:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "launch lease acquisition exceeded the inventory deadline")
         proc = subprocess.Popen(
             list(command), cwd=root, env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
             bufsize=0,
             creationflags=getattr(subprocess, "CREATE_SUSPENDED", 0x00000004),
+            executable=None if launch_artifact is None else str(launch_artifact.executable),
         )
         job = _create_job_object()
         _assign_job_object(job, int(proc._handle))
@@ -626,6 +1039,21 @@ def _run_fixed(
             if not clean:
                 raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "process-tree cleanup after setup deadline is uncertain")
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "fixed command setup exceeded the inventory deadline")
+        if launch_artifact is not None:
+            assert proc is not None
+            _verify_suspended_artifact_image(
+                int(proc._handle),
+                launch_artifact,
+                launch_handles,
+                expected_identity,
+                expected_sha256,
+                run_until,
+            )
+        if time.monotonic() >= run_until:
+            clean = terminate_owned()
+            if not clean:
+                raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "process-tree cleanup after image validation deadline is uncertain")
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "suspended image validation exceeded the inventory deadline")
         _resume_suspended_process(proc.pid)
         if time.monotonic() >= run_until:
             clean = terminate_owned()
@@ -701,6 +1129,17 @@ def _run_fixed(
             "COMPILED_GRAPH_UNAVAILABLE",
             shared_failure_detail(f"fixed command failed: {command_name}: {exc}"),
         ) from exc
+    except BaseException as exc:
+        if proc is not None and (proc.poll() is None or (job is not None and assigned)):
+            clean = terminate_owned()
+            if not clean:
+                settle_output_pumps()
+                raise InventoryError(
+                    "COMPILED_GRAPH_UNAVAILABLE",
+                    shared_failure_detail("owned process-tree cleanup after cancellation is uncertain"),
+                ) from exc
+        settle_output_pumps()
+        raise
     finally:
         live_readers = [thread for thread in threads if thread.is_alive()]
         for thread in live_readers:
@@ -726,6 +1165,12 @@ def _run_fixed(
                 _close_job_object(job)
             except Exception as exc:
                 job_close_error = exc
+        lease_close_errors: list[BaseException] = []
+        for handle in reversed(launch_handles):
+            try:
+                _close_windows_handle(handle)
+            except BaseException as exc:
+                lease_close_errors.append(exc)
         if not readers_finished:
             error = InventoryError(
                 "COMPILED_GRAPH_UNAVAILABLE",
@@ -733,12 +1178,19 @@ def _run_fixed(
             )
             if job_close_error is not None:
                 raise error from job_close_error
+            if lease_close_errors:
+                raise error from lease_close_errors[0]
             raise error
         if job_close_error is not None:
             raise InventoryError(
                 "COMPILED_GRAPH_UNAVAILABLE",
                 shared_failure_detail("owned Job Object closure could not be confirmed"),
             ) from job_close_error
+        if lease_close_errors:
+            raise InventoryError(
+                "COMPILED_GRAPH_UNAVAILABLE",
+                shared_failure_detail("admitted executable lease closure could not be confirmed"),
+            ) from lease_close_errors[0]
 
 
 def _runner_accepts_timeout(runner: Any) -> bool:
@@ -812,6 +1264,8 @@ def _run_cmd(
     *,
     deadline: float | None = None,
     admitted_executable: Path | None = None,
+    admitted_target_root: Path | None = None,
+    admitted_artifact: Artifact | None = None,
 ) -> CommandResult:
     command = _snapshot_argv(argv)
     _validate_command(command, root, admitted_executable=admitted_executable)
@@ -824,7 +1278,18 @@ def _run_cmd(
         if deadline is not None and time.monotonic() >= deadline:
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "injected command exceeded the inventory deadline")
         return _normalize_command_result(value)
-    return _run_fixed(root, command, timeout=budget, deadline=deadline, admitted_executable=admitted_executable)
+    launch_artifact = admitted_artifact
+    if admitted_artifact is not None:
+        launch_artifact, _, _ = _snapshot_launch_artifact(admitted_artifact)
+    return _run_fixed(
+        root,
+        command,
+        timeout=budget,
+        deadline=deadline,
+        admitted_executable=admitted_executable,
+        admitted_target_root=admitted_target_root,
+        admitted_artifact=launch_artifact,
+    )
 
 
 def _cargo_metadata(root: Path, runner: Any = None, *, deadline: float | None = None) -> dict[str, Any]:
@@ -2888,10 +3353,16 @@ def _collect_test_artifacts(
     build_finished_success_out: list[bool] | None = None,
     deadline: float | None = None,
 ) -> tuple[list[Artifact], str]:
-    result = _run_cmd(runner, root, _CARGO_BUILD_ARGV, deadline=deadline)
+    target_root = _admitted_target_root(root)
+    result = _run_cmd(
+        runner,
+        root,
+        _CARGO_BUILD_ARGV,
+        deadline=deadline,
+        admitted_target_root=target_root,
+    )
     if not result.stdout or not result.stdout.endswith(b"\n"):
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo JSON stream is empty or truncated")
-    target_root = _admitted_target_root(root)
     metadata_index = _metadata_target_index(metadata)
     workspace_ids = set(metadata.get("workspace_members", [])) if metadata is not None else {item.package_id for item in targets}
     package_keys: dict[str, str] = {}
@@ -2993,6 +3464,7 @@ def _collect_test_artifacts(
                         filenames=tuple(sorted(filename_paths, key=lambda item: item.relative_to(target_root).as_posix())),
                         file_identity=identity,
                         executable_sha256=digest,
+                        target_root=Path(os.path.abspath(target_root)),
                     )
                 )
                 if len(artifacts) > BOUNDS.max_test_binaries:
@@ -3068,12 +3540,14 @@ def discover_compiled(
             "COMPILED_GRAPH_UNAVAILABLE",
             _redact_detail("declared test targets produced no test executable: " + "; ".join(missing)),
         )
-    target_root = _admitted_target_root(root)
     artifact_records: list[dict[str, Any]] = []
     for artifact in artifacts:
         target = target_map.get((artifact.package_id, artifact.target_kind, artifact.target_name))
         if target is None:
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "compiled artifact has no workspace metadata target")
+        target_root = artifact.target_root
+        if target_root is None:
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "compiled artifact lost its admitted target-root binding")
         identity_before, digest_before = _observe_executable(root, target_root, artifact.executable, deadline=deadline)
         if identity_before != artifact.file_identity or digest_before != artifact.executable_sha256:
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "compiled executable changed after Cargo artifact admission")
@@ -3083,6 +3557,8 @@ def discover_compiled(
             (str(artifact.executable), *_LIBTEST_LIST_ARGS),
             deadline=deadline,
             admitted_executable=artifact.executable,
+            admitted_target_root=target_root,
+            admitted_artifact=artifact,
         )
         if listing.stdout and not listing.stdout.endswith(b"\n"):
             raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "truncated ignored-test listing")

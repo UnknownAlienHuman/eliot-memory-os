@@ -1,6 +1,6 @@
 {
   "header": {
-    "aggregate_sha256": "e98b3917031fa101f1cc6e5c80fd93021cab0808002d3f68b8850dd34f5fa9f9",
+    "aggregate_sha256": "5583357ef7916cf989e4f82a4bcd522faef7a68c715179bbbfa3d9708bff87a9",
     "artifact_denominator": [
       {
         "executable": "debug/deps/sample_package-1111111111111111",
@@ -151,7 +151,7 @@
       "attribute_digest": "0db9d47e375012b1a631bf03f889249ad280c4aa43ffbf850d047f13b17b9653",
       "attribute_text": "#[test]\n#[ignore = \"requires local authenticated SurrealDB store\"]",
       "cfg_evidence": [],
-      "executable": ".eliot/integration/ignored-test-inventory/target/debug/deps/sample_package-1111111111111111",
+      "executable": "debug/deps/sample_package-1111111111111111",
       "executable_digest": "a952b4669e432dccf930ec5d55eae7ff528ba625a151596934939e6289e41f2c",
       "ignore_reason": "requires local authenticated SurrealDB store",
       "isolation": [],
@@ -161,7 +161,7 @@
       "requirements": [
         "STORE"
       ],
-      "row_digest": "ebc6a8d0fa02a27e936e3b0af777ca754f15f510bf8acedd64c3137ce7138364",
+      "row_digest": "7621fabe50427c82d94997ea5921ee9b074a356e4eaa17894ae079b0bd828dba",
       "source_digest": "bdf1917753dc7ef53b16299329750f73a7d9b1edf1445fb4e820612362659128",
       "source_line": 5,
       "source_path": "crates/sample-package/src/lib.rs",
