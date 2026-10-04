@@ -2487,7 +2487,7 @@ mod control_plane_diagnostics_tests {
                 })
                 .unwrap_or_default();
             // A missing field reads as the empty string, and that is CORRECT
-            // rather than convenient: `observe_control` emits only `event` and
+            // rather than convenient: `observe_control` authors only `event` and
             // `outcome` (:39-45) and `observe_control_capacity` only `event` and
             // `capacity` (:120-125), and `assert_capacity_records` below ASSERTS
             // that a capacity record's `outcome` and `code` are empty. Panicking
@@ -2495,8 +2495,24 @@ mod control_plane_diagnostics_tests {
             // never reaching the rename case it was meant to catch.
             //
             // The rename case is caught by CONTENT instead: `fields` carries the
-            // exact key set the producer emitted, and the helpers compare it, so
-            // a renamed field changes the expected key set and goes red there.
+            // exact key set the producer emitted, and `assert_capacity_records`
+            // compares it, so a renamed field changes the expected key set and
+            // goes red there. SCOPE, stated so the next reader does not overclaim
+            // it: that comparison exists for CAPACITY records only, and this
+            // module has no key-set assertion for `observe_control` records, so
+            // a rename confined to the control emitter is not covered by it.
+            //
+            // "AUTHORED" is the operative word, and the emitted set is one key
+            // LARGER than the authored one: both producers pass a format string
+            // to `tracing::info!`, and the macro turns it into a field named
+            // `message` before the authored fields
+            // (tracing-0.1.44 `src/macros.rs:660`:
+            // `{ message = format_args!($($arg)+), $($fields)* }`, documented as
+            // the implicit `message` field at `src/lib.rs:414`). `Event::record`
+            // visits every field including that one, so a capacity record's key
+            // set is `capacity`, `event`, `message`. An expectation written from
+            // the source call alone omits `message` and is therefore false on
+            // every run - which is what the first version of this assertion did.
             let field = |name: &str| visitor.fields.get(name).cloned().unwrap_or_default();
             if let Ok(mut records) = self.records.lock() {
                 let mut fields: Vec<String> = visitor.fields.keys().cloned().collect();
@@ -2793,10 +2809,18 @@ mod control_plane_diagnostics_tests {
             );
             // The producer's own key set, compared rather than trusted: a
             // renamed `capacity` or `event` field changes this vector, which is
-            // what the absent-field read above cannot see.
+            // what the absent-field read above cannot see. `message` is present
+            // because `tracing::info!` synthesises it from the format string
+            // (tracing-0.1.44 `src/macros.rs:660`), not because any producer
+            // authored it; it is listed so the expectation stays the EXACT
+            // emitted set rather than a hand-picked subset.
             assert_eq!(
                 record.fields,
-                vec!["capacity".to_owned(), "event".to_owned()],
+                vec![
+                    "capacity".to_owned(),
+                    "event".to_owned(),
+                    "message".to_owned(),
+                ],
                 "the capacity observation must emit exactly the keys its owner writes"
             );
         }
