@@ -1076,3 +1076,1397 @@ pub async fn commit_selection_chain<P: KernelGenerationPort + ?Sized>(
     )?;
     composition.commit_canonical(identity, envelope).await
 }
+
+/// Drives one whole selection-chain append from the admission boundary to the
+/// sealed delivery, in the order the steps in this module already state.
+///
+/// This is the production entry seam the chain was missing: every step below is
+/// an existing function of this module, called once and in the order their own
+/// doc comments require, and no step is re-implemented or re-interpreted here.
+///
+/// 1. [`prepare_selection_chain`] reads the admission owner's recorded
+///    [`AdmissionInput`] and [`AdmissionResult`] and writes the one shared
+///    [`SelectionIntegrityReceipt`]. Its `compile_observation` is the caller's
+///    own [`SelectionStageObservation`] for the context-compilation/export
+///    boundary it actually ran; omitting it records the honest chain that ends
+///    at admission. A refusal here is never downgraded: an incomplete outcome
+///    stays [`SelectionChainError::IncompleteAdmission`] rather than becoming a
+///    chain with a fabricated stage.
+/// 2. [`commit_selection_chain`] is the ONLY Store write: the chain, its
+///    advanced head and its seal travel inside the hash-bound
+///    `CanonicalWriteEnvelope`, and the append is arbitrated by the chain
+///    revision the caller observed.
+/// 3. [`seal_delivered_packet`] re-derives and re-verifies the seal against the
+///    exact delivered bytes and expansion handles. It is a pure recompute of
+///    what step 2 already verified inside the envelope, returned here so the
+///    caller and its consumer read the same seal rather than trusting that a
+///    commit happened.
+/// 4. [`selection_chain_envelope`] returns the committed envelope itself, so
+///    the caller can log or hand on the exact bytes that were submitted.
+///
+/// The returned fourth member is
+/// [`selection_chain_head_expectation_key`] of the head the caller observed —
+/// the stable compare-and-swap identity this append arbitrates under, and the
+/// key a reconciling reader of a lost acknowledgement must present.
+///
+/// This adds no owner, no store, and no transport: it takes the same public
+/// types the steps above take, so a caller in `bins/eliotd` reaches the whole
+/// instrument without holding a borrow this module would have to manufacture.
+///
+/// # Errors
+///
+/// Returns [`CompositionError`] when any composed step refuses: the chain is
+/// not prepared, the commit is refused, or the seal does not bind these bytes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the append is one transaction over an exact set of recorded coordinates; grouping them would hide a binding"
+)]
+pub async fn drive_selection_chain<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    identity: &RequestIdentity,
+    input: &AdmissionInput,
+    result: &AdmissionResult,
+    recipe: &ContextRecipe,
+    compile_observation: Option<&SelectionStageObservation<'_>>,
+    expected_chain_head: &SelectionChainHead,
+    delivered_packet_bytes: &[u8],
+    delivered_expansion_handle_ids: &[String],
+    expected_ordering_sequence: u64,
+) -> Result<
+    (
+        WriteReceipt,
+        CanonicalWriteEnvelope,
+        SelectionChainSeal,
+        String,
+    ),
+    CompositionError,
+> {
+    let receipt = prepare_selection_chain(input, result, recipe, compile_observation)
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let write_receipt = commit_selection_chain(
+        composition,
+        identity,
+        &receipt,
+        expected_chain_head,
+        delivered_packet_bytes,
+        delivered_expansion_handle_ids,
+        expected_ordering_sequence,
+    )
+    .await?;
+    let seal = seal_delivered_packet(
+        &receipt,
+        delivered_packet_bytes,
+        delivered_expansion_handle_ids,
+    )
+    .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let envelope = selection_chain_envelope(
+        identity,
+        &receipt,
+        expected_chain_head,
+        delivered_packet_bytes,
+        delivered_expansion_handle_ids,
+        expected_ordering_sequence,
+    )?;
+    Ok((
+        write_receipt,
+        envelope,
+        seal,
+        selection_chain_head_expectation_key(expected_chain_head),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests use expects for fixed-valid protocol fixtures"
+    )]
+
+    use super::*;
+    use eliot_context_contracts::{
+        AdmissionDecisionEvidence, AdmissionMeasuredCost, AdmissionMeasurement,
+        AdmissionMeasurementBinding, AdmissionPriorityClass, AdmissionRecord,
+        AdmissionRuleIdentity, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
+        CONTEXT_CONTRACT_VERSION, CandidatePriority, CapacityLimits, ContextBinding,
+        ContextCandidateSet, ContextEconomyReceipt, DecisionContextIncomplete, DecisionRevision,
+        DecisionSafetyFloor, EconomyAllocations, LossPolicy, MeasurementAggregationMode,
+        MeasurementCompositionProfile, MeasurementRef, MeasurementUnit, NonRecoverableReason,
+        PriorityPolicyIdentity, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
+        ProviderRole, ProviderRoleDenominator, RepresentationKind, RoleLossRule,
+        SafetyFloorIdentity, SafetyFloorMember, SemanticRole, SourceSnapshot,
+        SuppliedOmissionBinding, canonical_digest,
+    };
+    use eliot_contracts::{
+        ArtifactId, ClockReading, DecisionId, EpochId, EpochLineageId, ProductId, RequestId,
+        RequestMetadata, ResourceGeneration, SessionId, SourceId, TaskId, TaskRevision,
+    };
+    use eliot_evidence::{Assertability, EpistemicStatus};
+    use eliot_learning_contracts::AgentAttemptId;
+    use eliot_receipts::{ProofCeiling, RequestBinding, WorkScopeId};
+    use eliot_security_contracts::{
+        MAX_SELECTION_MEMBERS, MAX_SELECTION_STAGES, SecurityContractError,
+    };
+
+    /// Admitted member of the fixture boundary; the only member that survives.
+    const KEPT: &str = "atom:kept";
+    /// Rival the owner withheld under `Blocked`: preserved as counterevidence.
+    const COUNTEREVIDENCE: &str = "atom:counterevidence";
+    /// Rival the owner withheld under `Capacity`: preserved as a budget omission.
+    const BUDGETED: &str = "atom:budgeted";
+
+    const SERIALIZER: &str = "json-v1";
+    const SERIALIZER_VERSION: &str = "1";
+    const ROUTE: &str = "route:selection-chain";
+    const MODEL: &str = "model:selection-chain";
+    const ADMISSION_RULE: &str = "admission-rule";
+    /// Exact transformer/config revision the compile stage reports for itself.
+    const COMPILE_TRANSFORMER: &str = "a17a.context-compile.v1";
+
+    /// One complete admission boundary plus the delivered bytes a consumer reads.
+    struct Boundary {
+        input: AdmissionInput,
+        result: AdmissionResult,
+        admitted: AdmittedContextSet,
+        bytes: Vec<u8>,
+        handles: Vec<String>,
+    }
+
+    fn artifact(value: &str) -> ArtifactId {
+        ArtifactId::new(value).expect("fixture artifact identity")
+    }
+
+    /// A syntactically valid lowercase SHA-256 hex digest over fixture bytes.
+    fn digest(byte: char) -> String {
+        byte.to_string().repeat(64)
+    }
+
+    fn epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch")
+    }
+
+    fn fence() -> StateFence {
+        let mut fence = StateFence::new(epoch(), ResourceGeneration::new(1).expect("generation"));
+        fence.task_revision = Some(TaskRevision::new(1).expect("revision"));
+        fence
+    }
+
+    /// A second generation: the fence of a different owning attempt.
+    fn foreign_fence() -> StateFence {
+        StateFence::new(epoch(), ResourceGeneration::new(2).expect("generation"))
+    }
+
+    fn binding() -> ContextBinding {
+        ContextBinding {
+            task_id: TaskId::new("task:selection-chain").expect("task"),
+            attempt_id: AgentAttemptId::new("attempt:selection-chain").expect("attempt"),
+            scope_id: WorkScopeId::new("scope:selection-chain").expect("scope"),
+            state_fence: fence(),
+            decision_id: DecisionId::new("decision:selection-chain").expect("decision"),
+            operation_id: None,
+        }
+    }
+
+    fn decision_revision() -> DecisionRevision {
+        DecisionRevision {
+            decision_id: binding().decision_id.clone(),
+            recipe_revision: TaskRevision::new(1).expect("revision"),
+            policy_sha256: digest('a'),
+        }
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the fixture mirrors the production field type `Option<ProofBinding>`; a fixture that returned the bare value would hide the optionality the contract declares"
+    )]
+    fn provider_evidence(name: &str) -> Option<ProofBinding> {
+        Some(ProofBinding {
+            evidence_id: artifact(&format!("evidence:{name}")),
+            ceiling: ProofCeiling::Observation,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a candidate fixture states every field the contract declares, and grouping them would hide one"
+    )]
+    fn candidate(
+        binding: &ContextBinding,
+        atom: &str,
+        provider: &str,
+        role: SemanticRole,
+        availability: AtomAvailability,
+        policy: LossPolicy,
+        representation: AtomRepresentation,
+        measurement: char,
+    ) -> ContextCandidate {
+        ContextCandidate {
+            binding: binding.clone(),
+            atom_id: artifact(atom),
+            provider_role: ProviderRole {
+                provider: ProviderId::new(provider).expect("provider"),
+                role,
+            },
+            source_range: None,
+            source: SourceSnapshot {
+                source_id: SourceId::new(format!("source:{atom}")).expect("source"),
+                owner: ProviderId::new(provider).expect("owner"),
+                snapshot_id: artifact("snapshot:selection-chain"),
+                revision: "r1".to_owned(),
+                content_sha256: digest('c'),
+                predecessor: None,
+            },
+            learning: None,
+            representation,
+            loss_policy: policy,
+            availability,
+            protected: true,
+            privacy: PrivacyClass::Public,
+            authority: AuthorityClass::DecisionRelevant,
+            status: EpistemicStatus::Observed,
+            assertability: Assertability::NonAssertableUnverified,
+            measurement: MeasurementRef {
+                digest: digest(measurement),
+                serializer: SERIALIZER.to_owned(),
+            },
+            dependencies: Vec::new(),
+            proof: ProofBinding {
+                evidence_id: artifact("evidence:candidate"),
+                ceiling: ProofCeiling::Observation,
+            },
+        }
+    }
+
+    fn measurement(
+        binding: &ContextBinding,
+        candidate: &ContextCandidate,
+        cost: u64,
+    ) -> AdmissionMeasurement {
+        AdmissionMeasurement {
+            measurement_id: artifact(&format!("measurement:{}", candidate.atom_id)),
+            atom_id: candidate.atom_id.clone(),
+            representation: candidate.representation.kind(),
+            unit: MeasurementUnit::Utf8Bytes,
+            binding: AdmissionMeasurementBinding {
+                context: binding.clone(),
+                schema_version: CONTEXT_CONTRACT_VERSION,
+                input_digest: candidate.measurement.digest.clone(),
+                subject_digest: canonical_digest(candidate).expect("candidate subject digest"),
+                output_digest: digest('9'),
+                serializer_id: SERIALIZER.to_owned(),
+                serializer_version: SERIALIZER_VERSION.to_owned(),
+                serializer_options_digest: digest('7'),
+                route_id: ROUTE.to_owned(),
+                model_id: MODEL.to_owned(),
+            },
+            cost: AdmissionMeasuredCost::ExactUtf8Bytes { value: cost },
+            observation: None,
+        }
+    }
+
+    fn omission(candidate: &ContextCandidate, reason: OmissionReason, cost: u64) -> OmissionRecord {
+        OmissionRecord {
+            atom_id: candidate.atom_id.clone(),
+            source_id: artifact(candidate.source.source_id.as_str()),
+            provider_role: candidate.provider_role.clone(),
+            decision: decision_revision(),
+            task_revision: TaskRevision::new(1).expect("revision"),
+            reason,
+            competing_constraint: format!(
+                "the {} slot was displaced by the admitted goal",
+                candidate.atom_id
+            ),
+            measured_cost: Some(cost),
+            allowed_representation: candidate.loss_policy,
+            expansion: None,
+            non_recoverable_reason: Some(NonRecoverableReason::SourceUnavailable),
+            authorization_requirement: "decision owner".to_owned(),
+            privacy_requirement: "restricted".to_owned(),
+            proof_requirement: "observation".to_owned(),
+            expires: None,
+            invalidation: None,
+            digest: digest('d'),
+        }
+    }
+
+    fn supplied(atom: &str, policy: LossPolicy) -> SuppliedOmissionBinding {
+        SuppliedOmissionBinding {
+            atom_id: artifact(atom),
+            policy,
+            expansion: None,
+            non_recoverable_reason: Some(NonRecoverableReason::SourceUnavailable),
+            authorization_requirement: "decision owner".to_owned(),
+            privacy_requirement: "restricted".to_owned(),
+            proof_requirement: "observation".to_owned(),
+            expires: None,
+            invalidation: None,
+        }
+    }
+
+    /// Resigns an economy receipt over its own content, as its owner does.
+    fn seal_economy(economy: &mut ContextEconomyReceipt) {
+        let mut unsigned = economy.clone();
+        unsigned.receipt_digest = digest('0');
+        economy.receipt_digest = canonical_digest(&unsigned).expect("economy receipt digest");
+    }
+
+    /// Resigns an admission result over its own content, as its owner does.
+    fn seal_result(result: &mut AdmissionResult) {
+        let mut unsigned = result.clone();
+        unsigned.result_digest = digest('0');
+        result.result_digest = canonical_digest(&unsigned).expect("admission result digest");
+    }
+
+    /// A complete admission boundary: one admitted member and two named rivals.
+    ///
+    /// `kept_atom` names the admitted identity, so two calls produce two chains
+    /// under the SAME `selection_id` (the decision) with different recorded
+    /// membership — the divergent-history case the head must refuse.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture is one immutable admission closure; splitting it would hide a binding"
+    )]
+    fn boundary(kept_atom: &str) -> Boundary {
+        let binding = binding();
+        let kept = candidate(
+            &binding,
+            kept_atom,
+            "provider:kept",
+            SemanticRole::Goal,
+            AtomAvailability::PresentCurrent,
+            LossPolicy::NonDroppable,
+            AtomRepresentation::Whole {
+                content: "the admitted goal".to_owned(),
+            },
+            '1',
+        );
+        let counter = candidate(
+            &binding,
+            COUNTEREVIDENCE,
+            "provider:counterevidence",
+            SemanticRole::Negative,
+            AtomAvailability::Blocked,
+            LossPolicy::Summarizable,
+            AtomRepresentation::Summary {
+                content: "the competing claim".to_owned(),
+                source_digest: digest('e'),
+            },
+            '2',
+        );
+        let budgeted = candidate(
+            &binding,
+            BUDGETED,
+            "provider:budgeted",
+            SemanticRole::Optional,
+            AtomAvailability::Unavailable,
+            LossPolicy::Summarizable,
+            AtomRepresentation::Summary {
+                content: "the verbose rival".to_owned(),
+                source_digest: digest('f'),
+            },
+            '3',
+        );
+
+        let capacity = CapacityLimits {
+            route_capacity: 100,
+            fixed_overhead: 10,
+            output_reserve: 20,
+            review_reserve: 20,
+        };
+        let slot = |candidate: &ContextCandidate| candidate.provider_role.clone();
+        let denominator = ProviderRoleDenominator {
+            requested: vec![slot(&kept), slot(&counter), slot(&budgeted)],
+            dispositions: vec![
+                ProviderDisposition {
+                    slot: slot(&kept),
+                    state: AtomAvailability::PresentCurrent,
+                    evidence: None,
+                },
+                ProviderDisposition {
+                    slot: slot(&counter),
+                    state: AtomAvailability::Blocked,
+                    evidence: provider_evidence(COUNTEREVIDENCE),
+                },
+                ProviderDisposition {
+                    slot: slot(&budgeted),
+                    state: AtomAvailability::Unavailable,
+                    evidence: provider_evidence(BUDGETED),
+                },
+            ],
+        };
+        let mut recipe = ContextRecipe {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: binding.clone(),
+            decision: decision_revision(),
+            recipe_sha256: digest('0'),
+            denominator: denominator.clone(),
+            mandatory_roles: vec![SemanticRole::Goal],
+            role_policies: vec![
+                RoleLossRule {
+                    role: SemanticRole::Goal,
+                    loss_policy: LossPolicy::NonDroppable,
+                    required: true,
+                    allowed_representations: vec![RepresentationKind::Whole],
+                },
+                RoleLossRule {
+                    role: SemanticRole::Negative,
+                    loss_policy: LossPolicy::Summarizable,
+                    required: false,
+                    allowed_representations: vec![
+                        RepresentationKind::Whole,
+                        RepresentationKind::Summary,
+                    ],
+                },
+                RoleLossRule {
+                    role: SemanticRole::Optional,
+                    loss_policy: LossPolicy::Summarizable,
+                    required: false,
+                    allowed_representations: vec![
+                        RepresentationKind::Whole,
+                        RepresentationKind::Summary,
+                    ],
+                },
+            ],
+            capacity,
+            predecessor: None,
+            invalidation: None,
+        };
+        recipe.recipe_sha256 = recipe
+            .canonical_policy_digest()
+            .expect("recipe policy digest");
+
+        // Only the admitted goal is mandatory floor material; the two rivals are
+        // accounted for by the owner's omission records instead.
+        let floor = DecisionSafetyFloor {
+            binding: binding.clone(),
+            mandatory_atoms: vec![kept.atom_id.clone()],
+            mandatory_roles: vec![SemanticRole::Goal],
+            providers: ProviderRoleDenominator {
+                requested: vec![slot(&kept)],
+                dispositions: vec![ProviderDisposition {
+                    slot: slot(&kept),
+                    state: AtomAvailability::PresentCurrent,
+                    evidence: None,
+                }],
+            },
+            members: vec![SafetyFloorMember {
+                atom_id: kept.atom_id.clone(),
+                role: SemanticRole::Goal,
+                availability: AtomAvailability::PresentCurrent,
+                measurement: Some(kept.measurement.clone()),
+                required_dependencies: Vec::new(),
+            }],
+            interpretation_dependencies: Vec::new(),
+            rule_evidence: artifact("floor-rule"),
+            capacity,
+        };
+
+        let input = AdmissionInput {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: binding.clone(),
+            recipe: recipe.clone(),
+            candidates: ContextCandidateSet {
+                binding: binding.clone(),
+                candidates: vec![kept.clone(), counter.clone(), budgeted.clone()],
+                denominator: denominator.clone(),
+            },
+            learning_tickets: Vec::new(),
+            floor: SafetyFloorIdentity {
+                floor_id: artifact("floor"),
+                decision: recipe.decision.clone(),
+                floor: floor.clone(),
+            },
+            priority: PriorityPolicyIdentity {
+                policy_id: artifact("priority"),
+                decision: recipe.decision.clone(),
+                priorities: vec![
+                    CandidatePriority {
+                        atom_id: kept.atom_id.clone(),
+                        class: AdmissionPriorityClass::Required,
+                        ordinal: 0,
+                    },
+                    CandidatePriority {
+                        atom_id: counter.atom_id.clone(),
+                        class: AdmissionPriorityClass::Normal,
+                        ordinal: 1,
+                    },
+                    CandidatePriority {
+                        atom_id: budgeted.atom_id.clone(),
+                        class: AdmissionPriorityClass::Low,
+                        ordinal: 2,
+                    },
+                ],
+            },
+            rule: AdmissionRuleIdentity {
+                rule_id: artifact("rule"),
+                decision: recipe.decision.clone(),
+                rule_sha256: digest('b'),
+            },
+            measurement_profile: MeasurementCompositionProfile {
+                profile_id: artifact("profile"),
+                schema_version: CONTEXT_CONTRACT_VERSION,
+                serializer_id: SERIALIZER.to_owned(),
+                serializer_version: SERIALIZER_VERSION.to_owned(),
+                serializer_options_digest: digest('7'),
+                route_id: ROUTE.to_owned(),
+                model_id: MODEL.to_owned(),
+                unit: MeasurementUnit::Utf8Bytes,
+                aggregation: MeasurementAggregationMode::QualifiedUtf8Contribution,
+                qualification: artifact("qualification"),
+                capacity,
+            },
+            supplied_omissions: vec![
+                supplied(COUNTEREVIDENCE, LossPolicy::Summarizable),
+                supplied(BUDGETED, LossPolicy::Summarizable),
+            ],
+            measurements: vec![
+                measurement(&binding, &kept, 4),
+                measurement(&binding, &counter, 2),
+                measurement(&binding, &budgeted, 3),
+            ],
+        };
+        input.validate().expect("fixture admission input");
+
+        let profile_digest = input
+            .measurement_profile
+            .canonical_digest()
+            .expect("measurement profile digest");
+        let omissions = vec![
+            omission(&counter, OmissionReason::Blocked, 2),
+            omission(&budgeted, OmissionReason::Capacity, 3),
+        ];
+        let mut economy = ContextEconomyReceipt {
+            binding: binding.clone(),
+            decision_id: binding.decision_id.clone(),
+            measurement: MeasurementRef {
+                digest: profile_digest.clone(),
+                serializer: SERIALIZER.to_owned(),
+            },
+            requested: vec![
+                kept.atom_id.clone(),
+                counter.atom_id.clone(),
+                budgeted.atom_id.clone(),
+            ],
+            admitted: vec![kept.atom_id.clone()],
+            displaced: vec![counter.atom_id.clone(), budgeted.atom_id.clone()],
+            omissions: omissions.clone(),
+            applied_rule: artifact("economy-rule"),
+            allocations: EconomyAllocations {
+                fixed_overhead: capacity.fixed_overhead,
+                output_reserve: capacity.output_reserve,
+                review_reserve: capacity.review_reserve,
+                admitted_required: 4,
+                admitted_optional: 0,
+                remaining_headroom: 46,
+                route_capacity: capacity.route_capacity,
+            },
+            recipe_digest: input.recipe.recipe_sha256.clone(),
+            policy_sha256: input.recipe.decision.policy_sha256.clone(),
+            receipt_digest: digest('0'),
+        };
+        seal_economy(&mut economy);
+
+        let mut admitted = AdmittedContextSet {
+            binding: binding.clone(),
+            records: vec![AdmittedAtom {
+                candidate: kept.clone(),
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: artifact(ADMISSION_RULE),
+            }],
+            admissions: vec![AdmissionRecord {
+                atom_id: kept.atom_id.clone(),
+                provider_role: kept.provider_role.clone(),
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: artifact(ADMISSION_RULE),
+            }],
+            floor: input.floor.floor.clone(),
+            economy: economy.clone(),
+        };
+        seal_economy(&mut admitted.economy);
+        let admitted_digest = admitted
+            .canonical_payload_digest()
+            .expect("admitted payload digest");
+        admitted
+            .economy
+            .measurement
+            .digest
+            .clone_from(&admitted_digest);
+        seal_economy(&mut admitted.economy);
+
+        let mut result = AdmissionResult {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: binding.clone(),
+            input_digest: input.canonical_digest().expect("admission input digest"),
+            recipe_digest: input.recipe.recipe_sha256.clone(),
+            profile_digest,
+            floor_id: input.floor.floor_id.clone(),
+            selection_digest: admitted_digest,
+            outcome: ContextOutcome::Complete(admitted.clone()),
+            evidence: AdmissionDecisionEvidence {
+                binding: binding.clone(),
+                decisions: vec![
+                    AdmissionRecord {
+                        atom_id: kept.atom_id.clone(),
+                        provider_role: kept.provider_role.clone(),
+                        disposition: AdmissionDisposition::Include,
+                        rule_evidence: artifact(ADMISSION_RULE),
+                    },
+                    AdmissionRecord {
+                        atom_id: counter.atom_id.clone(),
+                        provider_role: counter.provider_role.clone(),
+                        disposition: AdmissionDisposition::Blocked,
+                        rule_evidence: artifact(ADMISSION_RULE),
+                    },
+                    AdmissionRecord {
+                        atom_id: budgeted.atom_id.clone(),
+                        provider_role: budgeted.provider_role.clone(),
+                        disposition: AdmissionDisposition::Unavailable,
+                        rule_evidence: artifact(ADMISSION_RULE),
+                    },
+                ],
+                omissions: omissions.clone(),
+                supplied_omissions: input.supplied_omissions.clone(),
+                incomplete: None,
+                economy: Some(admitted.economy.clone()),
+                proof_ceiling: ProofCeiling::Observation,
+            },
+            result_digest: digest('0'),
+        };
+        seal_result(&mut result);
+        result
+            .validate_for(&input)
+            .expect("fixture admission result");
+
+        Boundary {
+            input,
+            result,
+            admitted,
+            bytes: b"{\"packet\":\"selection-chain-fixture\"}".to_vec(),
+            handles: vec!["handle:expansion-1".to_owned()],
+        }
+    }
+
+    /// The same boundary, reported by its owner as an explicit incomplete gap.
+    fn incomplete_result(input: &AdmissionInput) -> AdmissionResult {
+        let mut incomplete = DecisionContextIncomplete::new(artifact("floor-rule"));
+        incomplete.unavailable = vec![input.candidates.candidates[0].atom_id.clone()];
+        incomplete.validate().expect("fixture incomplete decision");
+        let mut result = AdmissionResult {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: input.binding.clone(),
+            input_digest: input.canonical_digest().expect("admission input digest"),
+            recipe_digest: input.recipe.recipe_sha256.clone(),
+            profile_digest: input
+                .measurement_profile
+                .canonical_digest()
+                .expect("measurement profile digest"),
+            floor_id: input.floor.floor_id.clone(),
+            selection_digest: canonical_digest(&incomplete).expect("incomplete selection digest"),
+            outcome: ContextOutcome::Incomplete(incomplete.clone()),
+            evidence: AdmissionDecisionEvidence {
+                binding: input.binding.clone(),
+                decisions: input
+                    .candidates
+                    .candidates
+                    .iter()
+                    .map(|candidate| AdmissionRecord {
+                        atom_id: candidate.atom_id.clone(),
+                        provider_role: candidate.provider_role.clone(),
+                        disposition: AdmissionDisposition::Revalidate,
+                        rule_evidence: artifact(ADMISSION_RULE),
+                    })
+                    .collect(),
+                omissions: Vec::new(),
+                supplied_omissions: Vec::new(),
+                incomplete: Some(incomplete),
+                economy: None,
+                proof_ceiling: ProofCeiling::Observation,
+            },
+            result_digest: digest('0'),
+        };
+        seal_result(&mut result);
+        result
+            .validate_for(input)
+            .expect("fixture incomplete admission result");
+        result
+    }
+
+    /// An honest context-compilation stage: it selected nothing and names no
+    /// member change, so its output membership is its input membership.
+    fn compile_observation(disclosure_closure_ref: &str) -> SelectionStageObservation<'_> {
+        SelectionStageObservation {
+            stage_id: "governor-context-compile",
+            stage: SelectionStageKind::ContextCompile,
+            transformer_identity_and_config_revision: COMPILE_TRANSFORMER,
+            disclosure_closure_ref,
+            suppressed_counterevidence_refs: Vec::new(),
+            budget_or_policy_omission_refs: Vec::new(),
+            untrusted_influence: SelectionInfluenceState::Absent,
+            influence_evidence_refs: Vec::new(),
+            member_dispositions: Vec::new(),
+        }
+    }
+
+    fn request_identity(state_fence: &StateFence) -> RequestIdentity {
+        let metadata = RequestMetadata {
+            request_id: RequestId::new("req-selection-chain").expect("request id"),
+            session_id: Some(SessionId::new("session-selection-chain").expect("session")),
+            task_id: Some(TaskId::new("task:selection-chain").expect("task")),
+            product_id: ProductId::new("product:selection-chain").expect("product"),
+            source_id: SourceId::new("source:governor").expect("source"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading::default(),
+        };
+        RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            idempotency_key: "idem-selection-chain-1".to_owned(),
+            deadline_unix_ms: 1_800_000_000_000,
+            cancellation_id: "cancel-selection-chain-1".to_owned(),
+        }
+    }
+
+    /// Prepares the two-stage chain a complete admission boundary produces.
+    fn chain(boundary: &Boundary) -> SelectionIntegrityReceipt {
+        let receipt = prepare_selection_chain(
+            &boundary.input,
+            &boundary.result,
+            &boundary.input.recipe,
+            None,
+        )
+        .expect("a complete admission prepares a chain");
+        receipt.validate().expect("prepared chain validates");
+        receipt
+    }
+
+    /// Position of the admission stage, read from the chain rather than assumed.
+    fn admission_ordinal(receipt: &SelectionIntegrityReceipt) -> usize {
+        receipt
+            .transformation_stages
+            .iter()
+            .position(|stage| stage.stage_id == ADMISSION_STAGE_ID)
+            .expect("admission stage")
+    }
+
+    /// The admitted membership the owner actually produced.
+    fn admitted_refs(admitted: &AdmittedContextSet) -> Vec<String> {
+        admitted
+            .records
+            .iter()
+            .map(|record| record.candidate.atom_id.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn prepare_selection_chain_records_every_membership_change_and_its_own_reason() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+
+        // The chain order is read back from the chain itself.
+        let ordinals: Vec<usize> = receipt
+            .transformation_stages
+            .iter()
+            .map(|stage| stage.ordinal)
+            .collect();
+        assert_eq!(
+            ordinals,
+            (0..receipt.transformation_stages.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            receipt.transformation_stages[0].stage_id,
+            INITIAL_MEMBERSHIP_STAGE_ID
+        );
+        assert_eq!(
+            receipt.transformation_stages[1].stage_id,
+            ADMISSION_STAGE_ID
+        );
+
+        // The initial membership is the caller's own pre-admission candidate set.
+        let candidate_refs: Vec<String> = boundary
+            .input
+            .candidates
+            .candidates
+            .iter()
+            .map(|candidate| candidate.atom_id.as_str().to_owned())
+            .collect();
+        let initial_refs: Vec<String> = receipt
+            .initial_candidate_members
+            .iter()
+            .map(|member| member.member_ref.clone())
+            .collect();
+        assert_eq!(initial_refs, candidate_refs);
+
+        // The final membership is the membership the owner admitted.
+        let admitted_refs = admitted_refs(&boundary.admitted);
+        assert_eq!(receipt.final_output_refs, admitted_refs);
+        assert!(final_membership_matches(&receipt, &boundary.admitted));
+
+        // Every rival is named with the boundary's OWN reason, not silently lost.
+        let stage = &receipt.transformation_stages[admission_ordinal(&receipt)];
+        let removed: BTreeSet<&str> = stage
+            .member_dispositions
+            .iter()
+            .filter(|row| row.disposition == SelectionMemberDispositionKind::Removed)
+            .map(|row| row.member_ref.as_str())
+            .collect();
+        assert_eq!(removed, BTreeSet::from([COUNTEREVIDENCE, BUDGETED]));
+        for (atom, reason) in [
+            (COUNTEREVIDENCE, OmissionReason::Blocked),
+            (BUDGETED, OmissionReason::Capacity),
+        ] {
+            let row = stage
+                .member_dispositions
+                .iter()
+                .find(|row| row.member_ref == atom)
+                .expect("removal row");
+            let owner_record = boundary
+                .result
+                .evidence
+                .omissions
+                .iter()
+                .find(|record| record.atom_id.as_str() == atom)
+                .expect("owner omission record");
+            assert_eq!(owner_record.reason, reason);
+            let recorded = row.reason.as_deref().expect("a removal names a reason");
+            assert!(
+                recorded.contains(&owner_record.competing_constraint),
+                "recorded reason {recorded} must carry the owner's own constraint"
+            );
+            assert_ne!(recorded, UNATTRIBUTED_WITHHELD_REASON);
+        }
+        // Counterevidence and boundedness cost are preserved separately.
+        assert_eq!(
+            stage.suppressed_counterevidence_refs,
+            vec![COUNTEREVIDENCE.to_owned()]
+        );
+        assert_eq!(
+            stage.budget_or_policy_omission_refs,
+            vec![BUDGETED.to_owned()]
+        );
+
+        // The admission boundary's own untrusted influence is never defaulted.
+        assert_eq!(
+            selection_claim_ceiling(&receipt),
+            SelectionInfluenceState::Unknown
+        );
+        assert_ne!(
+            selection_claim_ceiling(&receipt),
+            SelectionInfluenceState::Absent
+        );
+    }
+
+    #[test]
+    fn a_later_clean_compile_stage_does_not_launder_an_unknown_stage() {
+        let boundary = boundary(KEPT);
+        let disclosure = boundary
+            .input
+            .recipe
+            .canonical_policy_digest()
+            .expect("disclosure closure reference");
+        let compile = compile_observation(&disclosure);
+        let receipt = prepare_selection_chain(
+            &boundary.input,
+            &boundary.result,
+            &boundary.input.recipe,
+            Some(&compile),
+        )
+        .expect("a compilation stage prepares a chain");
+        receipt.validate().expect("prepared chain validates");
+
+        let stage = receipt.transformation_stages.last().expect("compile stage");
+        assert_eq!(stage.stage, SelectionStageKind::ContextCompile);
+        assert_eq!(stage.stage_id, compile.stage_id);
+        assert_eq!(
+            stage.untrusted_input_influenced_membership,
+            SelectionInfluenceState::Absent
+        );
+        // The chain ceiling is the maximum over the stages, so the later clean
+        // stage cannot raise what the admission stage recorded as unknown.
+        assert_eq!(
+            selection_claim_ceiling(&receipt),
+            SelectionInfluenceState::Unknown
+        );
+        assert_eq!(
+            selection_claim_ceiling(&receipt),
+            receipt.transformation_stages[admission_ordinal(&receipt)]
+                .untrusted_input_influenced_membership
+        );
+        assert_eq!(receipt.final_output_refs, admitted_refs(&boundary.admitted));
+    }
+
+    #[test]
+    fn the_stage_grammar_is_closed_and_a_malformed_stage_is_refused() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let stage = &receipt.transformation_stages[admission_ordinal(&receipt)];
+
+        let wire = serde_json::to_value(stage).expect("stage wire form");
+        assert_eq!(
+            serde_json::from_value::<SelectionStage>(wire.clone()).expect("closed grammar decodes"),
+            *stage
+        );
+
+        // An undeclared disposition is not a stage.
+        let mut unknown_disposition = wire.clone();
+        unknown_disposition["member_dispositions"][0]["disposition"] =
+            serde_json::json!("LAUNDERED");
+        let error = serde_json::from_value::<SelectionStage>(unknown_disposition)
+            .expect_err("an undeclared disposition is not a stage");
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected refusal: {error}"
+        );
+
+        // An undeclared member is not a stage either.
+        let mut unknown_member = wire;
+        unknown_member["member_dispositions"][0]["grade"] = serde_json::json!("A");
+        let error = serde_json::from_value::<SelectionStage>(unknown_member)
+            .expect_err("an undeclared field is not a stage");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn a_stage_outside_the_contiguous_ordinal_sequence_is_refused() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let ordinal = admission_ordinal(&receipt);
+
+        let mut broken = receipt.clone();
+        broken.transformation_stages[ordinal].ordinal = ordinal + 3;
+        assert_eq!(
+            broken.validate(),
+            Err(SecurityContractError::SelectionStageOrder {
+                stage_id: ADMISSION_STAGE_ID.to_owned(),
+                ordinal,
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_contiguous_member_list_leaves_a_member_unaccounted_for() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let ordinal = admission_ordinal(&receipt);
+
+        let mut broken = receipt.clone();
+        broken.transformation_stages[ordinal]
+            .member_dispositions
+            .retain(|row| row.member_ref != COUNTEREVIDENCE);
+        assert_eq!(
+            broken.validate(),
+            Err(SecurityContractError::SelectionMemberLoss {
+                stage_id: ADMISSION_STAGE_ID.to_owned(),
+                ordinal,
+                member_ref: COUNTEREVIDENCE.to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_breaking_linkage_change_across_appends_is_refused() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let ordinal = admission_ordinal(&receipt);
+
+        // The stage still names its predecessor by identity, and its declared
+        // digest is recomputed over the tampered input, yet it silently consumes
+        // a narrower membership than that predecessor produced.
+        let mut broken = receipt.clone();
+        broken.transformation_stages[ordinal]
+            .input_members
+            .retain(|member| member.member_ref != COUNTEREVIDENCE);
+        broken.transformation_stages[ordinal].input_digest =
+            selection_member_digest(&broken.transformation_stages[ordinal].input_members)
+                .expect("tampered stage input digest");
+        assert_eq!(
+            broken.validate(),
+            Err(SecurityContractError::SelectionStageLinkBroken {
+                stage_id: ADMISSION_STAGE_ID.to_owned(),
+                ordinal,
+            })
+        );
+    }
+
+    #[test]
+    fn a_compile_stage_that_names_an_unattributed_membership_change_is_refused() {
+        let boundary = boundary(KEPT);
+        let disclosure = boundary
+            .input
+            .recipe
+            .canonical_policy_digest()
+            .expect("disclosure closure reference");
+        let mut compile = compile_observation(&disclosure);
+        compile.member_dispositions = vec![SelectionMemberDisposition {
+            member_ref: "atom:never-consumed".to_owned(),
+            disposition: SelectionMemberDispositionKind::Removed,
+            reason: Some("this stage never consumed that member".to_owned()),
+            derived_output_ref: None,
+            source_evidence_ref: None,
+        }];
+        assert_eq!(
+            prepare_selection_chain(
+                &boundary.input,
+                &boundary.result,
+                &boundary.input.recipe,
+                Some(&compile),
+            ),
+            Err(SelectionChainError::UnattributedRemoval {
+                member_ref: "atom:never-consumed".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_sealed_final_membership_is_the_delivered_membership() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let seal =
+            seal_delivered_packet(&receipt, &boundary.bytes, &boundary.handles).expect("seal");
+
+        assert_eq!(seal.final_output_refs, admitted_refs(&boundary.admitted));
+        seal.verify_against(&receipt, &boundary.bytes, &boundary.handles)
+            .expect("the seal binds this chain and these delivered bytes");
+
+        // Changed packet bytes cannot substitute, whatever the member count.
+        let rewritten = b"{\"packet\":\"selection-chain-fixture-v2\"}".to_vec();
+        assert_eq!(
+            seal.verify_against(&receipt, &rewritten, &boundary.handles),
+            Err(SecurityContractError::SelectionSealPacketBytes)
+        );
+        // A swapped expansion handle set is the handle failure it is.
+        assert_eq!(
+            seal.verify_against(&receipt, &boundary.bytes, &[]),
+            Err(SecurityContractError::SelectionSealExpansionHandles)
+        );
+
+        // An ordered final membership that is not the chain's own is refused even
+        // though the seal recomputes its own digest over the substituted members.
+        let mut substituted = seal.clone();
+        substituted.final_output_members.push(SelectionMember {
+            member_ref: "atom:never-admitted".to_owned(),
+            member_revision: "r1".to_owned(),
+            representation_ref: digest('1'),
+        });
+        substituted.final_output_refs = substituted
+            .final_output_members
+            .iter()
+            .map(|member| member.member_ref.clone())
+            .collect();
+        substituted.final_output_digest =
+            selection_member_digest(&substituted.final_output_members).expect("substituted digest");
+        assert_eq!(
+            substituted.verify_against(&receipt, &boundary.bytes, &boundary.handles),
+            Err(SecurityContractError::SelectionSealFinalMembership)
+        );
+
+        // And the owner-issued admitted membership is the compared value: a
+        // substituted final set fails the kept equality check here.
+        let mut foreign_candidate = boundary.admitted.records[0].candidate.clone();
+        foreign_candidate.atom_id = artifact("atom:kept-other");
+        let mut foreign_admitted = boundary.admitted.clone();
+        foreign_admitted.records.push(AdmittedAtom {
+            candidate: foreign_candidate,
+            disposition: AdmissionDisposition::Include,
+            rule_evidence: artifact(ADMISSION_RULE),
+        });
+        assert!(final_membership_matches(&receipt, &boundary.admitted));
+        assert!(!final_membership_matches(&receipt, &foreign_admitted));
+    }
+
+    #[test]
+    fn a_chain_head_that_does_not_match_the_prior_prefix_is_refused() {
+        let first = boundary(KEPT);
+        let second = boundary("atom:kept-other");
+        let first_receipt = chain(&first);
+        let second_receipt = chain(&second);
+
+        // Two chains under the SAME decision identity with different membership.
+        assert_eq!(first_receipt.selection_id, second_receipt.selection_id);
+        let head = first_receipt
+            .derive_chain_head(first_receipt.revision, &chain_append_key(&first_receipt))
+            .expect("observed chain head");
+        first_receipt
+            .verify_chain_head(&head)
+            .expect("a derived head binds its own stage prefix");
+
+        // A divergent chain cannot append onto this prefix.
+        assert_eq!(
+            second_receipt.verify_chain_head(&head),
+            Err(SecurityContractError::SelectionChainHeadDigest)
+        );
+        assert!(matches!(
+            selection_chain_security_context(&second_receipt, &head, &first.bytes, &first.handles),
+            Err(SelectionChainError::Security(
+                SecurityContractError::SelectionChainHeadDigest
+            ))
+        ));
+
+        let mut wrong_prefix = head.clone();
+        wrong_prefix.chain_head_digest = digest('8');
+        assert_eq!(
+            first_receipt.verify_chain_head(&wrong_prefix),
+            Err(SecurityContractError::SelectionChainHeadDigest)
+        );
+
+        let mut foreign_chain = head.clone();
+        foreign_chain.selection_id = "decision:other".to_owned();
+        assert_eq!(
+            first_receipt.verify_chain_head(&foreign_chain),
+            Err(SecurityContractError::SelectionChainHeadIdentity)
+        );
+
+        let mut beyond = head.clone();
+        beyond.chain_head_ordinal = first_receipt.transformation_stages.len();
+        assert_eq!(
+            first_receipt.verify_chain_head(&beyond),
+            Err(SecurityContractError::SelectionChainHeadOrdinal {
+                expected: first_receipt.transformation_stages.len(),
+                observed: first_receipt.transformation_stages.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_append_is_arbitrated_under_the_chain_head_the_caller_observed() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let observed = receipt
+            .derive_chain_head(receipt.revision, "selection-chain-append:observed")
+            .expect("observed chain head");
+        let identity = request_identity(&receipt.state_fence);
+
+        let first = selection_chain_envelope(
+            &identity,
+            &receipt,
+            &observed,
+            &boundary.bytes,
+            &boundary.handles,
+            7,
+        )
+        .expect("the first append builds its envelope");
+
+        // The same append observed at the same head is the same operation, byte
+        // for byte, so a retry replays instead of forking.
+        let replayed = selection_chain_envelope(
+            &identity,
+            &receipt,
+            &observed,
+            &boundary.bytes,
+            &boundary.handles,
+            7,
+        )
+        .expect("the replayed append builds the same envelope");
+        assert_eq!(first, replayed);
+        assert_eq!(
+            first.operation_id.as_str(),
+            format!(
+                "selection-chain:{}:{}@{}",
+                receipt.selection_id, observed.chain_head_ordinal, observed.chain_revision
+            )
+        );
+
+        // The head this append advances is derived from this chain's own prefix
+        // and carries the caller's compare-and-swap identity.
+        let security = selection_chain_security_context(
+            &receipt,
+            &observed,
+            &boundary.bytes,
+            &boundary.handles,
+        )
+        .expect("append security context");
+        let advanced = security
+            .selection_chain_head
+            .as_ref()
+            .expect("advanced chain head");
+        assert_eq!(advanced.chain_revision, observed.chain_revision + 1);
+        assert_eq!(
+            advanced.chain_head_digest,
+            receipt
+                .derive_chain_head(
+                    observed.chain_revision + 1,
+                    &selection_chain_head_expectation_key(&observed),
+                )
+                .expect("advanced head")
+                .chain_head_digest
+        );
+        assert_eq!(
+            advanced.append_idempotency_key,
+            selection_chain_head_expectation_key(&observed)
+        );
+
+        let expectation = first
+            .expected_revision_heads
+            .first()
+            .expect("the chain revision compare-and-swap expectation");
+        assert_eq!(
+            expectation.expected_revision,
+            observed.chain_revision.max(1)
+        );
+        assert_eq!(
+            first
+                .expected_ordering_heads
+                .first()
+                .map(|head| head.scope.as_str()),
+            Some(SELECTION_CHAIN_ORDERING_SCOPE)
+        );
+
+        // A second appender that observed the ADVANCED head is a different
+        // operation under a different expectation, never an overwrite of this one.
+        let second = selection_chain_envelope(
+            &identity,
+            &receipt,
+            advanced,
+            &boundary.bytes,
+            &boundary.handles,
+            8,
+        )
+        .expect("the next append builds its envelope");
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_eq!(
+            second
+                .expected_revision_heads
+                .first()
+                .expect("the next chain revision expectation")
+                .expected_revision,
+            observed.chain_revision + 1
+        );
+    }
+
+    #[test]
+    fn the_stage_and_member_bounds_are_the_shared_contract_bounds() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+
+        let mut stage_bound = receipt.clone();
+        let admission = stage_bound
+            .transformation_stages
+            .last()
+            .expect("admission stage")
+            .clone();
+        while stage_bound.transformation_stages.len() <= MAX_SELECTION_STAGES {
+            stage_bound.transformation_stages.push(admission.clone());
+        }
+        assert_eq!(
+            stage_bound.transformation_stages.len(),
+            MAX_SELECTION_STAGES + 1
+        );
+        assert_eq!(
+            stage_bound.validate(),
+            Err(SecurityContractError::SelectionStageLimitExceeded {
+                count: MAX_SELECTION_STAGES + 1,
+                bound: MAX_SELECTION_STAGES,
+            })
+        );
+
+        let mut member_bound = receipt;
+        member_bound.initial_candidate_members = (0..=MAX_SELECTION_MEMBERS)
+            .map(|index| SelectionMember {
+                member_ref: format!("atom:bulk-{index}"),
+                member_revision: "r1".to_owned(),
+                representation_ref: digest('1'),
+            })
+            .collect();
+        assert_eq!(
+            member_bound.initial_candidate_members.len(),
+            MAX_SELECTION_MEMBERS + 1
+        );
+        assert_eq!(
+            member_bound.validate(),
+            Err(SecurityContractError::SelectionMemberLimitExceeded {
+                field: "initial_candidate_members",
+                count: MAX_SELECTION_MEMBERS + 1,
+                bound: MAX_SELECTION_MEMBERS,
+            })
+        );
+    }
+
+    #[test]
+    fn chain_state_stays_private_to_the_owning_attempt() {
+        let boundary = boundary(KEPT);
+        let receipt = chain(&boundary);
+        let head = receipt
+            .derive_chain_head(receipt.revision, "selection-chain-append:observed")
+            .expect("observed chain head");
+
+        // A result recorded for another attempt is not this chain's evidence.
+        let mut foreign_attempt = boundary.result.clone();
+        foreign_attempt.binding.attempt_id = AgentAttemptId::new("attempt:other").expect("attempt");
+        assert_eq!(
+            prepare_selection_chain(
+                &boundary.input,
+                &foreign_attempt,
+                &boundary.input.recipe,
+                None,
+            ),
+            Err(SelectionChainError::Contract(
+                ContextError::IdentityConflict
+            ))
+        );
+
+        // The chain's state fence is its own binding, so an append presented under
+        // another attempt's fence is refused before an envelope is built.
+        let foreign_identity = request_identity(&foreign_fence());
+        assert!(matches!(
+            selection_chain_envelope(
+                &foreign_identity,
+                &receipt,
+                &head,
+                &boundary.bytes,
+                &boundary.handles,
+                1,
+            ),
+            Err(CompositionError::Owner(ref message))
+                if message.contains("selection chain fence does not match")
+        ));
+        let owning_identity = request_identity(&receipt.state_fence);
+        assert_eq!(receipt.state_fence, boundary.input.binding.state_fence);
+        selection_chain_envelope(
+            &owning_identity,
+            &receipt,
+            &head,
+            &boundary.bytes,
+            &boundary.handles,
+            1,
+        )
+        .expect("the owning attempt's append is admitted");
+    }
+
+    #[test]
+    fn an_incomplete_admission_falls_through_without_inventing_a_next_stage() {
+        let boundary = boundary(KEPT);
+        let incomplete = incomplete_result(&boundary.input);
+        assert!(matches!(incomplete.outcome, ContextOutcome::Incomplete(_)));
+
+        // The honest answer is the refusal itself: no chain, no sealed membership
+        // and no compiled next probe is manufactured from an unproven boundary.
+        assert_eq!(
+            prepare_selection_chain(&boundary.input, &incomplete, &boundary.input.recipe, None,),
+            Err(SelectionChainError::IncompleteAdmission)
+        );
+        // A compile observation cannot rescue an incomplete admission either.
+        let disclosure = boundary
+            .input
+            .recipe
+            .canonical_policy_digest()
+            .expect("disclosure closure reference");
+        let compile = compile_observation(&disclosure);
+        assert_eq!(
+            prepare_selection_chain(
+                &boundary.input,
+                &incomplete,
+                &boundary.input.recipe,
+                Some(&compile),
+            ),
+            Err(SelectionChainError::IncompleteAdmission)
+        );
+    }
+}
