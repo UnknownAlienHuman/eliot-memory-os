@@ -2033,6 +2033,283 @@ mod tests {
     // -- terminal candidate + provider-neutral translation -----------------
 
     #[tokio::test]
+    async fn terminal_from_another_attempt_is_rejected_before_result_translation() -> TestResult {
+        let (_, factory) = factory();
+        let mut prepared = prepared_fixture()?;
+        let running = launched(&factory, &mut prepared).await?;
+        let binding_a = binding_fixture()?;
+
+        let mut binding_b = binding_fixture()?;
+        binding_b.attempt_id = AttemptId::new("attempt-claude-2")?;
+        validate_binding_for_claude(&binding_b)?;
+        let admission_b = admission_fixture(&binding_b)?;
+        admission_b.validate()?;
+        let ceiling_b = ceiling_fixture();
+        let valid_b = translate_candidate_result(
+            ClaudeResultInput {
+                terminal: None,
+                usage: usage_fixture(),
+                cancelled: false,
+                unknown_reason: Some("terminal candidate absent".to_owned()),
+            },
+            &binding_b,
+            &admission_b,
+            &ceiling_b,
+        )?;
+        valid_b.validate_for_binding(&binding_b, &admission_b, &ceiling_b)?;
+
+        let candidate = candidate_fixture();
+        let mut foreign_candidate = candidate.clone();
+        foreign_candidate.attempt_id = binding_b.attempt_id.as_str().to_owned();
+        let terminal_line = response_line(ClaudeResponseKind::Result, 2);
+        assert!(matches!(
+            running.complete_terminal(&foreign_candidate, &terminal_line),
+            Err(ClaudeSidecarError::BindingMismatch(message))
+                if message == "terminal candidate addresses another attempt"
+        ));
+
+        let terminal = running.complete_terminal(&candidate, &terminal_line)?;
+        assert_eq!(
+            terminal.candidate().attempt_id,
+            binding_a.attempt_id.as_str()
+        );
+        assert_ne!(binding_a.attempt_id, binding_b.attempt_id);
+        for cancelled in [false, true] {
+            assert!(matches!(
+                translate_candidate_result(
+                    ClaudeResultInput {
+                        terminal: Some(terminal.clone()),
+                        usage: usage_fixture(),
+                        cancelled,
+                        unknown_reason: None,
+                    },
+                    &binding_b,
+                    &admission_b,
+                    &ceiling_b,
+                ),
+                Err(ClaudeSidecarError::BindingMismatch(message))
+                    if message == "terminal candidate addresses another attempt"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_rejects_same_attempt_under_changed_launch_binding() -> TestResult {
+        let (_, factory) = factory();
+        let mut prepared = prepared_fixture()?;
+        let running = launched(&factory, &mut prepared).await?;
+        let binding = binding_fixture()?;
+        let admission = admission_fixture(&binding)?;
+        let candidate = candidate_fixture();
+        let terminal_line = response_line(ClaudeResponseKind::Result, 2);
+
+        let mut changed_bindings = Vec::new();
+
+        let mut changed_start_request = binding.clone();
+        changed_start_request.start_request_id = eliot_agent_api::RequestId::new("req-claude-2")?;
+        changed_start_request.start_request_sha256 = eliot_contracts::sha256_hex(b"req-claude-2");
+        changed_bindings.push(changed_start_request);
+
+        let mut changed_fence = binding.clone();
+        changed_fence.state_fence.policy_revision = Some(admission.policy_revision);
+        changed_bindings.push(changed_fence);
+
+        let mut changed_runtime_generation = binding.clone();
+        changed_runtime_generation.runtime_generation =
+            eliot_agent_api::ResourceGeneration::new(2)?;
+        changed_bindings.push(changed_runtime_generation);
+
+        let mut changed_lease = binding.clone();
+        changed_lease.lease_id = lease_fixture("lease-claude-2")?;
+        changed_bindings.push(changed_lease);
+
+        let mut changed_route = binding.clone();
+        changed_route.route.runtime_hash = changed_route.route.adapter_hash.clone();
+        changed_bindings.push(changed_route);
+
+        for changed_binding in changed_bindings {
+            assert_eq!(changed_binding.attempt_id, binding.attempt_id);
+            assert_ne!(changed_binding, binding);
+            validate_binding_for_claude(&changed_binding)?;
+
+            let changed_admission = admission_fixture(&changed_binding)?;
+            changed_admission.validate()?;
+            let ceiling = ceiling_fixture();
+            let valid_result = translate_candidate_result(
+                ClaudeResultInput {
+                    terminal: None,
+                    usage: usage_fixture(),
+                    cancelled: false,
+                    unknown_reason: Some("terminal candidate absent".to_owned()),
+                },
+                &changed_binding,
+                &changed_admission,
+                &ceiling,
+            )?;
+            valid_result.validate_for_binding(&changed_binding, &changed_admission, &ceiling)?;
+
+            let terminal = running.complete_terminal(&candidate, &terminal_line)?;
+            assert_eq!(
+                terminal.candidate().attempt_id,
+                changed_binding.attempt_id.as_str()
+            );
+            assert!(matches!(
+                translate_candidate_result(
+                    ClaudeResultInput {
+                        terminal: Some(terminal),
+                        usage: usage_fixture(),
+                        cancelled: false,
+                        unknown_reason: None,
+                    },
+                    &changed_binding,
+                    &changed_admission,
+                    &ceiling,
+                ),
+                Err(ClaudeSidecarError::BindingMismatch(message))
+                    if message == "terminal candidate was produced under a different launch binding"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn own_binding_terminal_preserves_candidate_and_raw_evidence() -> TestResult {
+        let (_, factory) = factory();
+        let mut prepared = prepared_fixture()?;
+        let running = launched(&factory, &mut prepared).await?;
+        let binding = binding_fixture()?;
+        let admission = admission_fixture(&binding)?;
+        let ceiling = ceiling_fixture();
+        let candidate = candidate_fixture();
+        let ordinary_raw_line = response_line(ClaudeResponseKind::Result, 2);
+        let oversized_raw_line = format!(
+            "{}{}",
+            response_line(ClaudeResponseKind::Result, 2),
+            " ".repeat(MAX_FRAME_BYTES + 1)
+        );
+
+        for raw_line in [ordinary_raw_line, oversized_raw_line] {
+            let terminal = running.complete_terminal(&candidate, &raw_line)?;
+            assert_eq!(terminal.candidate().attempt_id, binding.attempt_id.as_str());
+            if raw_line.len() > MAX_FRAME_BYTES {
+                assert!(matches!(&terminal.raw, PreservedOrOmitted::Omitted(_)));
+            } else {
+                assert!(matches!(&terminal.raw, PreservedOrOmitted::Preserved(_)));
+            }
+
+            let raw_ref = match &terminal.raw {
+                PreservedOrOmitted::Preserved(handle) => {
+                    format!("claude-raw:{}", handle.digest)
+                }
+                PreservedOrOmitted::Omitted(omission) => {
+                    format!("claude-omitted:{}", omission.manifest_digest)
+                }
+            };
+            let recovery_ref = format!("claude-terminal:{}", binding.start_request_id.as_str());
+            let expected_refs = vec![
+                format!("claude-output:{}", candidate.output_digest),
+                raw_ref,
+                recovery_ref.clone(),
+            ];
+            let result = translate_candidate_result(
+                ClaudeResultInput {
+                    terminal: Some(terminal),
+                    usage: usage_fixture(),
+                    cancelled: false,
+                    unknown_reason: None,
+                },
+                &binding,
+                &admission,
+                &ceiling,
+            )?;
+
+            assert_eq!(
+                result.disposition,
+                eliot_agent_api::ResultDisposition::CandidateSucceeded
+            );
+            assert_eq!(result.evidence_refs, expected_refs);
+            assert!(result.artifacts.is_empty());
+            assert!(result.proposed_effects.is_empty());
+            assert!(result.unresolved_questions.is_empty());
+            assert!(result.actual_route.observed_route.is_none());
+            assert_eq!(
+                result.actual_route.route_state,
+                RouteObservationState::Unobserved
+            );
+            assert_eq!(
+                result.actual_route.execution_outcome,
+                ExecutionOutcome::UnknownOutcome
+            );
+            assert_eq!(
+                result.actual_route.unobserved_reason.as_deref(),
+                Some(CLAUDE_UNOBSERVED_ROUTE_REASON)
+            );
+            assert_eq!(
+                result.actual_route.recovery_ref.as_deref(),
+                Some(recovery_ref.as_str())
+            );
+            result.validate_for_binding(&binding, &admission, &ceiling)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absent_terminal_preserves_unknown_outcome_reason_requirements() -> TestResult {
+        let binding = binding_fixture()?;
+        let admission = admission_fixture(&binding)?;
+        let ceiling = ceiling_fixture();
+        let reason = "terminal candidate absent".to_owned();
+        let recovery_ref = format!("claude-recovery:{reason}");
+        let result = translate_candidate_result(
+            ClaudeResultInput {
+                terminal: None,
+                usage: usage_fixture(),
+                cancelled: false,
+                unknown_reason: Some(reason.clone()),
+            },
+            &binding,
+            &admission,
+            &ceiling,
+        )?;
+
+        assert_eq!(
+            result.disposition,
+            eliot_agent_api::ResultDisposition::UnknownOutcome
+        );
+        assert_eq!(result.unknown_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(result.evidence_refs, vec![recovery_ref.clone()]);
+        assert_eq!(
+            result.actual_route.execution_outcome,
+            ExecutionOutcome::UnknownOutcome
+        );
+        assert_eq!(
+            result.actual_route.recovery_ref.as_deref(),
+            Some(recovery_ref.as_str())
+        );
+        assert!(result.actual_route.observed_route.is_none());
+        result.validate_for_binding(&binding, &admission, &ceiling)?;
+
+        for unknown_reason in [None, Some(String::new())] {
+            assert!(matches!(
+                translate_candidate_result(
+                    ClaudeResultInput {
+                        terminal: None,
+                        usage: usage_fixture(),
+                        cancelled: false,
+                        unknown_reason,
+                    },
+                    &binding,
+                    &admission,
+                    &ceiling,
+                ),
+                Err(ClaudeSidecarError::MissingUnknownReason)
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn terminal_candidate_translates_to_candidate_only_result() -> TestResult {
         let (_, factory) = factory();
         let mut prepared = prepared_fixture()?;
