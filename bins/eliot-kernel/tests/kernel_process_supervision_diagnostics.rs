@@ -3,12 +3,12 @@
 //! Kernel process-execution and supervision diagnostics (F-LOG-KERNEL-3, issue #901).
 //!
 //! Every case drives a real production callsite through an existing public
-//! seam and asserts against the bytes that run actually emitted. The five
+//! seam and asserts against the bytes that run actually emitted. The six
 //! owned modules stay read-only here: this suite adds no production
 //! behaviour, no inline test inside them, and no expected-log vector in
 //! place of executing a callsite.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,7 @@ use eliot_kernel_service::{
     ProcessExecutionClient, ProcessExecutionRejection, ProcessExecutionRequest,
     ProcessExecutionResponse,
 };
+use eliot_observability::field_policy::{RedactionReason, TelemetryFieldFamily, mint_handle};
 use eliot_ors::{
     EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, ProcessStartReplayRecord,
     ProcessStartReplayState, RecoveryPayload, RedbRecoveryStore, StateFenceSnapshot,
@@ -43,35 +44,141 @@ use eliot_runtime_contracts::{HealthVector, ModuleGeneration, ModuleGenerationSt
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// The exact five source files this leaf owns, in the fixture's spelling.
-const OWNED_FILES: [&str; 5] = [
+/// The exact six source files this leaf owns, in the fixture's spelling.
+///
+/// `process_execution_client.rs` is the sixth and was added by the same
+/// instrumentation commit that created the five process/daemon/supervision
+/// modules (80659466e, "fix: Instrument Kernel process execution and
+/// supervision boundaries (#901)"). It carries one production
+/// `observe_process_in_context` callsite at :106, emitting
+/// `kernel.process.request_rejected` with outcome `path_proof` on the arm where
+/// `retain_process_path_proof` fails, and the fixture now names it in `files`
+/// and carries its boundary row (covering case 4). The fixture's earlier
+/// 116-against-117 count was measured entirely inside the other five files, so
+/// that understated denominator is corrected here rather than excused.
+const OWNED_FILES: [&str; 6] = [
     "bins/eliot-kernel/src/process_execution.rs",
     "bins/eliot-kernel/src/daemon_process_launch.rs",
     "bins/eliot-kernel/src/daemon_live_receipt.rs",
     "bins/eliot-kernel/src/daemon_supervision.rs",
     "bins/eliot-kernel/src/supervision_lease_authority.rs",
+    "bins/eliot-kernel/src/process_execution_client.rs",
 ];
 
 /// The crate-relative owned paths this suite reads for case 30's diff.
-const OWNED_PATHS: [&str; 5] = [
+///
+/// One entry per [`OWNED_FILES`] path, so the forbidden-vocabulary sweep
+/// covers EVERY path the denominator derivation covers: `process_execution.rs`
+/// was the sixth until `process_execution_client.rs` joined the denominator,
+/// and a sweep that still listed five paths would leave a second subscriber
+/// owner in that sixth file unobserved. `assert_sweep_covers_derivation` fails
+/// if the two lists ever drift apart, so the two cannot be maintained apart.
+const OWNED_PATHS: [&str; 6] = [
     "src/process_execution.rs",
     "src/daemon_process_launch.rs",
     "src/daemon_live_receipt.rs",
     "src/daemon_supervision.rs",
     "src/supervision_lease_authority.rs",
+    "src/process_execution_client.rs",
 ];
 
-/// Vocabulary no owned module may gain: a second subscriber owner, a new
-/// public observation surface, or a facade installer.
-const FORBIDDEN_IN_OWNED: [&str; 5] = [
+/// Vocabulary no owned module may contain AT ALL, in any region: a facade
+/// installer, a process-global subscriber install, or a new public observation
+/// surface.
+///
+/// The subscriber CALLS are deliberately NOT in this list. Both in-crate
+/// capsules legitimately install a thread-local subscriber
+/// (`daemon_supervision.rs:841`, `process_execution.rs:4866`) from inside a
+/// `#[cfg(test)]` module, so a whole-file needle would redden on test code that
+/// is allowed to capture. Those needles live in
+/// [`FORBIDDEN_SUBSCRIBER_IN_PRODUCTION`], which is checked outside the
+/// test-module extents instead.
+///
+/// `tracing::subscriber::set_global` WAS the fifth entry here and is GONE. It is
+/// a strict prefix of the `set_global_default` entry, so it could only ever
+/// fire together with that entry - never on its own - while `set_default` and
+/// `with_default`, which DO install a subscriber, were not needled at all. Its
+/// honest form is the call needle `set_global(` in the production list, which
+/// matches the bare `tracing::subscriber::set_global(subscriber)` call no other
+/// needle names and still does not match `set_global_default(`.
+///
+/// `pub fn observe_` stays a whole-file needle, and is now also covered by the
+/// exact declaration set in [`OWNED_OBSERVATION_DECLARATIONS`], which does not
+/// depend on the visibility spelling.
+const FORBIDDEN_IN_OWNED: [&str; 6] = [
     "try_init",
     "set_global_default",
     "install_kernel_diagnostics",
     "pub fn observe_",
-    "tracing::subscriber::set_global",
+    // A new event family emitted STRAIGHT through `tracing::info!` instead of
+    // through one of the six observers, which the observer-name derivation
+    // cannot see at all. The six observer declarations pass a BOUND field
+    // (`event = event_bound.text()`, `process_execution.rs:84`), so a direct
+    // emission has to name a literal and both literal spellings are needled:
+    // `event = "kernel.` is this tree's rustfmt spelling (16 measured sites,
+    // `kernel_diagnostics.rs:704` among them, none of them owned) and
+    // `event="kernel.` is the unspaced spelling.
+    "event = \"kernel.",
+    "event=\"kernel.",
 ];
 
-/// Event families the five owned modules alone emit; neither the crate root
+/// Vocabulary that makes a module a SUBSCRIBER OWNER: every spelling of a
+/// thread-local or process-global subscriber install, plus the one facade
+/// installer.
+///
+/// These are CALL forms, not bare names, so an unrelated mention in a comment
+/// cannot redden, and so `set_global(` and `set_global_default(` are
+/// INDEPENDENT: neither is a prefix of the other, which is exactly what the
+/// dropped `tracing::subscriber::set_global` needle was not. `with_default(`
+/// and `set_default(` are the two thread-local installers the old five-entry
+/// list could not name at all, and they are what both in-crate capsules use.
+const FORBIDDEN_SUBSCRIBER_IN_PRODUCTION: [&str; 5] = [
+    "set_global_default(",
+    "set_global(",
+    "set_default(",
+    "with_default(",
+    "install_kernel_diagnostics(",
+];
+
+/// The ONLY modules under this package's `src/` allowed to install a subscriber
+/// in PRODUCTION code, named rather than assumed.
+///
+/// `src/kernel_diagnostics.rs` DECLARES the one installer
+/// (`install_kernel_diagnostics`, `:242`) and `src/main.rs` is the composition
+/// root that CALLS it exactly once (`:224`), which is the accepted single-owner
+/// shape the diagnostic brief describes. Every other production module under
+/// `src/` must be free of the list above.
+const FACADE_SUBSCRIBER_OWNERS: [&str; 2] = ["src/kernel_diagnostics.rs", "src/main.rs"];
+
+/// Every `observe`-named function DECLARATION the six owned modules may carry,
+/// as `(owned path, function name)`, measured from the tree on 2026-10-03.
+///
+/// Visibility and the `async` modifier are NOT part of the key on purpose: the
+/// escapes this pins are exactly the spellings a substring test CAN read -
+/// `pub(crate) fn observe_...` (`process_execution.rs:73` is the one legitimate
+/// `pub(crate)` surface the crate has), `pub async fn observe_...` and
+/// `pub fn observe(` with no underscore. Two entries are not observation
+/// surfaces at all and are listed so the set is honest rather than narrowed:
+/// `observe_process` is the unscoped wrapper that forwards, and
+/// `observe_external_filesystem_transition` (`process_execution.rs:601`) is a
+/// production helper whose name merely begins with `observe`.
+const OWNED_OBSERVATION_DECLARATIONS: [(&str, &str); 7] = [
+    ("src/daemon_live_receipt.rs", "observe_live_receipt"),
+    ("src/daemon_process_launch.rs", "observe_daemon_launch"),
+    ("src/daemon_supervision.rs", "observe_supervision"),
+    (
+        "src/process_execution.rs",
+        "observe_external_filesystem_transition",
+    ),
+    ("src/process_execution.rs", "observe_process"),
+    ("src/process_execution.rs", "observe_process_in_context"),
+    (
+        "src/supervision_lease_authority.rs",
+        "observe_supervision_lease",
+    ),
+];
+
+/// Event families the six owned modules alone emit; neither the crate root
 /// nor the shared facade may learn them.
 const OWNED_EVENT_FAMILIES: [&str; 4] = [
     "kernel.process.",
@@ -80,7 +187,19 @@ const OWNED_EVENT_FAMILIES: [&str; 4] = [
     "kernel.supervision.commit_",
 ];
 
-/// Slot defaults declared by the shared operation span.
+/// A spot-check of the identity slots the shared operation span declares with the
+/// literal `"unavailable"` default, as `name = "unavailable"` source spellings.
+///
+/// It is deliberately NOT the full declared-slot list: the facade declares SEVENTEEN
+/// slots, of which TEN carry a literal default - these eight plus
+/// `request_id = "unavailable"` and `request_id_redaction = "none"`
+/// (`kernel_diagnostics.rs:660`-`:661`), which are left to
+/// [`declared_operation_slots`] - and seven carry a computed value or a
+/// redaction marker (`operation`, `generation`, `state_fence`, `authority_epoch`
+/// and their four `_redaction` companions). The complete, source-derived list is
+/// [`declared_operation_slots`], which the canary sweep in case 28 uses; this
+/// constant only pins the spelling of the eight identity-slot defaults, so a
+/// facade that renamed one of them is red in case 1 as well.
 const SPAN_SLOT_DEFAULTS: [&str; 8] = [
     "process_tree = \"unavailable\"",
     "process_id = \"unavailable\"",
@@ -91,6 +210,24 @@ const SPAN_SLOT_DEFAULTS: [&str; 8] = [
     "receipt = \"unavailable\"",
     "request_id = \"unavailable\"",
 ];
+
+/// The six observation helpers the boundary inventory is derived from: the
+/// two process funnels, the daemon-launch funnel, the live-receipt funnel and
+/// the two supervision funnels. A production file that CALLS one of these owns
+/// an observable boundary, whether or not this suite names it.
+const OBSERVER_FUNCTIONS: [&str; 6] = [
+    "observe_process",
+    "observe_process_in_context",
+    "observe_daemon_launch",
+    "observe_live_receipt",
+    "observe_supervision",
+    "observe_supervision_lease",
+];
+
+/// The exact text that opens a frozen case marker in this file. Kept as a
+/// named constant so the self-read in [`local_case_owners`] and the markers
+/// themselves cannot drift apart.
+const WORK_UNIT_MARKER: &str = "// WORK_UNIT_CASE: 901/";
 
 #[derive(Clone, Default)]
 struct CaptureSink {
@@ -150,7 +287,29 @@ fn fixture() -> Value {
 
 /// Thread-local capture: `with_default` never installs a process-global
 /// subscriber, so these tests stay parallel-safe with every sibling suite.
-fn capture_with<F, R>(f: F) -> (String, R)
+///
+/// The closure is run to COMPLETION INSIDE the subscriber region; that is the
+/// constraint this name states, and every call site below honours it by passing
+/// a synchronous body. `with_default` takes a synchronous closure and returns
+/// its result - it never awaits - so an async body passed here would come back
+/// as an UN-POLLED future with the guard already dropped, and would then be
+/// polled with NO subscriber current: every span-field assertion would silently
+/// read a dispatcher that was never installed.
+///
+/// Any `tracing::Span` an assertion needs must be CONSTRUCTED inside this call,
+/// because a span binds its dispatcher at construction, not at first use.
+///
+/// A test that genuinely needs an async body must instead install the
+/// subscriber by value and hold the guard across the await:
+///
+/// ```rust
+/// let guard = tracing::subscriber::set_default(subscriber);
+/// let value = run().await;
+/// drop(guard);
+/// ```
+///
+/// which is the form the five in-crate capsules of #901 now use.
+fn capture_blocking<F, R>(f: F) -> (String, R)
 where
     F: FnOnce() -> R,
 {
@@ -265,20 +424,83 @@ fn quoted_value<'a>(line: &'a str, key: &str) -> &'a str {
 ///   the line is the recorded value and the first is the declared default.
 ///
 /// A slot the owner never recorded occurs exactly once and resolves to its
-/// declared `"unavailable"` default, which is the honest answer for it. The
-/// `*_redaction` twins cannot false-match, because the needle requires `="`
-/// immediately after the slot name.
+/// declared `"unavailable"` default, which is the honest answer for it.
+///
+/// A third property decides WHICH occurrence of a name counts, and it is
+/// what makes this a field reader rather than a substring reader. The needle
+/// `{slot}="` alone matches inside a LONGER identifier that ends in the same
+/// letters: `operation="` also matches inside `lease_operation="`, and
+/// `supervision_lease_authority.rs` records `lease_operation` (`:120`, `:137`)
+/// before any `operation`, so a plain `rfind` on a supervision span answers
+/// `"expire"`/`"revoke"` to a request for `operation`. The renderer makes the
+/// fix exact rather than heuristic: `DefaultVisitor` emits `name` then `=`
+/// then the value (`format/mod.rs:1332-1338`) and separates fields with a
+/// single space (`maybe_pad`, `format/mod.rs:1250-1260`), and the run is
+/// wrapped in one `{...}` pair (`format/mod.rs:997`). So the byte before any
+/// rendered key is always `{` or a space - never part of a longer identifier -
+/// and requiring that byte to be outside `[A-Za-z0-9_]` accepts every real
+/// field and rejects every suffix of a longer one.
 fn span_field(logs: &str, event: &str, slot: &str) -> String {
     let line = captured_line(logs, &format!("event=\"{event}\""));
     let key = format!("{slot}=\"");
-    let last = line
-        .rfind(&key)
-        .unwrap_or_else(|| panic!("span slot {slot} absent from captured line: {line}"));
+    let bytes = line.as_bytes();
+    let mut last = None;
+    for (hit, _) in line.match_indices(&key) {
+        let boundary =
+            hit == 0 || !(bytes[hit - 1].is_ascii_alphanumeric() || bytes[hit - 1] == b'_');
+        if boundary {
+            last = Some(hit);
+        }
+    }
+    let last = last.unwrap_or_else(|| panic!("span slot {slot} absent from captured line: {line}"));
     let rest = &line[last + key.len()..];
     let end = rest
         .find('"')
         .unwrap_or_else(|| panic!("unterminated span slot {slot} in captured line: {line}"));
     rest[..end].to_owned()
+}
+
+/// The exact field names the shared operation span DECLARES, read out of
+/// `kernel_diagnostics::operation_context` in the facade source instead of
+/// restated here.
+///
+/// That function builds one `tracing::info_span!` (`kernel_diagnostics.rs:657`
+/// through `:677`), so every declared field is rendered on every record under
+/// the span whether or not an owner ever records a value for it. Sweeping
+/// exactly this list is what makes the canary sweep in case 28 total over the
+/// span: a slot added to the facade extends the sweep without editing this
+/// file, and a slot the facade stops declaring turns the sweep red rather than
+/// silently narrowing it.
+fn declared_operation_slots() -> Vec<String> {
+    let facade = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/kernel_diagnostics.rs"),
+    )
+    .expect("shared facade source");
+    let start = facade
+        .find("pub fn operation_context(")
+        .expect("the facade declares operation_context");
+    let body = &facade[start..];
+    let end = body
+        .find("\n    )")
+        .expect("the operation_context declaration closes");
+    let mut slots = Vec::new();
+    for line in body[..end].lines() {
+        let Some((name, value)) = line.trim().split_once(" = ") else {
+            continue;
+        };
+        let is_field_name = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if is_field_name && value.ends_with(',') {
+            slots.push(name.to_owned());
+        }
+    }
+    assert!(
+        !slots.is_empty(),
+        "the facade declaration yielded no operation span slots"
+    );
+    slots
 }
 
 fn event_outcome(logs: &str, event: &str) -> String {
@@ -331,6 +553,1094 @@ fn fixture_terminal_codes() -> Vec<String> {
         .iter()
         .map(|value| value.as_str().expect("terminal code string").to_owned())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Derived-source readers
+//
+// Case 1 proves the issue's denominator instead of restating it. Everything
+// below reads the production tree at TEST time instead of trusting a constant
+// written next to the assertion that consumes it.
+// ---------------------------------------------------------------------------
+
+/// True when `source` CALLS `observer`, as opposed to declaring, importing or
+/// merely mentioning it.
+///
+/// Four measured conditions, all read off this crate's own sources:
+///
+/// * the name is not preceded by an identifier byte, so a longer name that
+///   merely ends in it - `observe_supervision_lease` seen while looking for
+///   `observe_supervision` - is not a match;
+/// * the name is followed by `(`, so a `use` list is not a match: see
+///   `src/process_execution_client.rs:23 use super::process_execution::{
+///   observe_process_in_context, process_terminal_code};`;
+/// * the line does not begin with `//`, so no comment can manufacture a
+///   callsite;
+/// * the name is not a name an `fn` keyword DECLARES - see
+///   [`is_observer_declaration`] - so the six helper declarations
+///   (`src/process_execution.rs:65` and `:73`, `src/daemon_live_receipt.rs:38`,
+///   `src/daemon_process_launch.rs:55`, `src/daemon_supervision.rs:52`,
+///   `src/supervision_lease_authority.rs:55`) are not counted. That exclusion is
+///   made by what a declaration IS rather than by a property of its line, so a
+///   callsite sharing a line with a function's own `fn` keyword is still
+///   counted.
+///
+/// The `observe_process` forwarder at `src/process_execution.rs:67` IS a
+/// callsite by this definition - it is a call - and the fixture note already
+/// records that it owns no boundary row of its own.
+fn calls_observer(source: &str, observer: &str) -> bool {
+    !observer_callsite_offsets(source, observer).is_empty()
+}
+
+/// Every byte offset in `source` at which `observer` is CALLED, under the same
+/// four conditions [`calls_observer`] states.
+///
+/// The offsets are what the completeness derivation below needs: a BOOLEAN
+/// cannot tell one callsite from two, so the conditions live here once and
+/// both readers - the per-FILE denominator walk and the per-CALLSITE multiset -
+/// decide "is this a callsite" with one definition that cannot drift.
+fn observer_callsite_offsets(source: &str, observer: &str) -> Vec<usize> {
+    source
+        .match_indices(observer)
+        .filter_map(|(hit, _)| {
+            if source
+                .as_bytes()
+                .get(hit.wrapping_sub(1))
+                .copied()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return None;
+            }
+            if !source[hit + observer.len()..].trim_start().starts_with('(') {
+                return None;
+            }
+            let head = source[..hit]
+                .rsplit_once('\n')
+                .map_or("", |(_, tail)| tail)
+                .trim();
+            if head.starts_with("//") || is_observer_declaration(source, hit) {
+                return None;
+            }
+            Some(hit)
+        })
+        .collect()
+}
+
+/// True when the name at byte `name_start` is the name an `fn` keyword
+/// DECLARES, as opposed to a USE of an already-declared name.
+///
+/// The distinction is structural: a declaration is a `fn` whose OWN NAME is
+/// this name, so the `fn` keyword is the nearest preceding token and only
+/// whitespace lies between them. A USE of the same name on the same line as some
+/// function's own `fn` keyword leaves that function's declared name, a parameter
+/// list or an opening brace in between, so the nearest preceding token is not
+/// the keyword and the call is counted - which is what keeps a one-line wrapper
+/// such as `fn observe_process_scoped(event: &str, outcome: &str) { ... }`, or
+/// any call written on an `fn` line, inside the derived denominator.
+///
+/// Two shapes count as one declaration: the keyword immediately before the name
+/// (`pub(crate) fn observe_process_in_context(`), and a signature split across
+/// lines whose preceding line ends with the keyword. A comment line is never
+/// read as a declaration, so `// ... forwards to fn` above a call cannot hide
+/// it, and the keyword must be a whole word so `myfn` never introduces one.
+fn is_observer_declaration(source: &str, name_start: usize) -> bool {
+    fn ends_with_fn_keyword(text: &str) -> bool {
+        let Some(head) = text.strip_suffix("fn") else {
+            return false;
+        };
+        match head.chars().next_back() {
+            None => true,
+            Some(character) => !(character.is_alphanumeric() || character == '_'),
+        }
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = name_start;
+    while index > 0 && matches!(bytes[index - 1], b' ' | b'\t' | b'\r') {
+        index -= 1;
+    }
+    let head = &source[..index];
+    if ends_with_fn_keyword(head) {
+        return true;
+    }
+    let Some(line_start) = head.rfind('\n') else {
+        return false;
+    };
+    let previous = head[..line_start].trim_end();
+    !previous.starts_with("//") && ends_with_fn_keyword(previous)
+}
+
+/// The half-open line range each COLUMN-ZERO test-gated `mod` capsule occupies
+/// in `lines`, so the exclusion is by MODULE EXTENT and never truncates a file.
+///
+/// Both #901 capsules are declared that way, and a callsite inside one of them
+/// is a TEST callsite, not a production boundary: `process_execution.rs:4827`
+/// (`#[cfg(test)] mod process_execution_diagnostics_tests`, holding `:4923`,
+/// `:4924`, `:4925`) and `daemon_supervision.rs:802` (`#[cfg(all(test,
+/// windows))] mod daemon_supervision_diagnostics_tests`, holding `:918`,
+/// `:919`, `:924`, `:925`). Only an attribute that is followed by a `mod` item
+/// counts, so the `#[cfg(test)]` inside a function body at
+/// `process_execution.rs:4790` and the one named inside a doc comment at
+/// `daemon_process_launch.rs:788` do not shorten anyone's production region.
+///
+/// The extent runs from the attribute to the line whose closing brace returns
+/// the depth to zero, which is measured rather than assumed, because the
+/// measured extents are NOT all trailing. `process_execution.rs` carries a
+/// SECOND capsule, `#[cfg(all(test, windows))]` at `:4948`, so the measured
+/// ranges there are `:4827`-`:4946` and `:4948`-`:5415` and production line
+/// `:4947` sits BETWEEN them - a derivation that truncated the file at its
+/// first capsule would leave everything below it invisible, so the derived map,
+/// the forwarder list and the total would all be unchanged by a production
+/// callsite appended after one, while the per-FILE walk, which has no cutoff,
+/// still counted the file as instrumented. Every line outside these ranges is
+/// production, wherever it sits.
+///
+/// KNOWN AND STATED LIMIT of this reader, so no caller over-claims it: only a
+/// COLUMN-ZERO `#[cfg(...)]` attribute immediately followed by a `mod` item is
+/// recognised. An indented in-function `#[cfg(test)] mod tests { ... }`, a
+/// capsule gated by a macro or by a `cfg_attr`, and a `mod` whose attribute is
+/// not adjacent to it are all read as PRODUCTION. Nothing in `src/` is shaped
+/// that way today - measured on this tree, the recognised capsules are
+/// `process_execution.rs:4827` and `:4948`, `daemon_supervision.rs:802`,
+/// `daemon_process_launch.rs:681`, `generation_control.rs:1324`,
+/// `generation_recovery.rs:556` and `runtime_identity.rs:195`, all column-zero
+/// and adjacent, while `generation_control.rs:647` is a `#[cfg(test)]` on a
+/// FUNCTION and correctly opens no extent - and the
+/// direction of a miss is conservative: an unrecognised capsule is counted as
+/// production callsites, which turns the per-(file, event) multiset red rather
+/// than silently accepting a missing row.
+fn test_module_extents(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut extents = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let is_test_attribute = line.starts_with("#[cfg(") && line.contains("test");
+        let module_line = lines
+            .get(index + 1)
+            .is_some_and(|next| next.trim_start().starts_with("mod "));
+        if !(is_test_attribute && module_line) {
+            continue;
+        }
+        // A `mod name;` item has no body here, so only the attribute and the
+        // item line are excluded; otherwise the closing brace is found by
+        // depth, and a file whose capsule never closes runs to its last line.
+        let mut depth = 0i64;
+        let mut end = lines.len();
+        for (cursor, body_line) in lines.iter().enumerate().skip(index + 1) {
+            depth += brace_delta(body_line);
+            if depth <= 0 {
+                end = cursor + 1;
+                break;
+            }
+        }
+        extents.push((index, end));
+    }
+    extents
+}
+
+/// How many `{` minus `}` a single line opens, ignoring braces inside a `//`
+/// comment or a string literal so a documented or quoted brace cannot move the
+/// depth a test capsule's extent is measured by.
+fn brace_delta(line: &str) -> i64 {
+    let mut delta = 0i64;
+    let mut characters = line.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '/' => {
+                if characters.peek() == Some(&'/') {
+                    break;
+                }
+            }
+            '"' => in_string = true,
+            '{' => delta += 1,
+            '}' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+/// The parenthesised argument list of the callsite whose observer name ends at
+/// `name_end`, matched by depth so a nested call - or a bracket inside a string
+/// literal the callsite passes - cannot end it early.
+fn callsite_arguments(source: &str, name_end: usize) -> &str {
+    let open = source[name_end..].find('(').map_or_else(
+        || panic!("a callsite at byte {name_end} is followed by its argument list"),
+        |offset| name_end + offset,
+    );
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[open..=index];
+                }
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    panic!("the callsite's argument list at byte {open} is unterminated");
+}
+
+/// The first string literal in `arguments`, or `None` when the argument list
+/// carries none.
+fn first_string_literal(arguments: &str) -> Option<&str> {
+    let bytes = arguments.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            let mut end = index + 1;
+            while end < bytes.len() && bytes[end] != b'"' {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            return Some(&arguments[index + 1..end]);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Item VISIBILITY and SIGNATURE modifiers, longest first so `pub(crate)` is
+/// consumed before a bare `pub` could be tried against it.
+const SIGNATURE_MODIFIERS: [&str; 9] = [
+    "pub(crate)",
+    "pub(super)",
+    "pub(in",
+    "pub",
+    "async",
+    "unsafe",
+    "const",
+    "extern",
+    "default",
+];
+
+/// The declared name on an item signature line once its visibility and
+/// signature modifiers are stripped, or `None` when the line declares no
+/// function.
+///
+/// A function declaration is not spelled `fn ` at column zero:
+/// `pub(crate) fn observe_process_in_context(`, `pub async fn start_in_context(`
+/// and `pub(crate) async fn close_registered_descendant_in_context(` are all
+/// declarations. An earlier revision of this file matched the bare `fn `
+/// prefix only, so `ProductionCallsite::enclosing` - the field the FORWARDER
+/// classification and the literal-free diagnostic both read - carried the name
+/// of whatever unprefixed helper happened to precede the callsite. Measured on
+/// this tree that returned `live_receipt_terminal_code` for the callsite at
+/// `daemon_live_receipt.rs:146`, `staged_ticket` for the one at
+/// `supervision_lease_authority.rs:830` and `from` for the one at
+/// `daemon_supervision.rs:556`: 117 of the 118 derived callsites carried a name
+/// that is not the function they sit in. The forwarder count stayed at one only
+/// because the forwarder at `process_execution.rs:67` is the one callsite whose
+/// own declaration is the bare `fn observe_process(` - so the classification
+/// rested on an accident of spelling, not on the enclosing function. With the
+/// modifiers stripped the derivation is unchanged in every count: 118 measured
+/// callsites, the same ONE forwarder at `process_execution.rs:67`, 117 keyed
+/// rows, the same ONE literal-free callsite at `process_execution.rs:2403`.
+fn declared_item_name(line: &str) -> Option<String> {
+    let mut start = line.len() - line.trim_start().len();
+    if line[start..].starts_with("//") {
+        return None;
+    }
+    loop {
+        let Some(modifier) = SIGNATURE_MODIFIERS
+            .iter()
+            .find(|modifier| line[start..].starts_with(*modifier))
+        else {
+            // The loop exits at the first byte that is no longer a MODIFIER, which
+            // is the only place a declared name can start: a declaration spells
+            // `fn ` here, and every other line - a body statement, an attribute,
+            // a blank line, a comment already refused above - declares nothing and
+            // is skipped. The name ends at the `(`, `<` or space that opens the
+            // parameter list, so `observe_process(` and `observe_process_in_`
+            // context<T>(` both yield their own name.
+            let signature = line[start..].strip_prefix("fn ")?;
+            let name = signature
+                .split(['(', '<', ' '])
+                .next()
+                .unwrap_or(signature)
+                .trim();
+            return (!name.is_empty()).then(|| name.to_owned());
+        };
+        let after_start = start + modifier.len();
+        let after = &line[after_start..];
+        // `pub(in path)` and `extern "C"` carry a delimited tail, so consume
+        // through the closing delimiter instead of only the keyword.
+        let consumed = if modifier.starts_with("pub(in") {
+            after.find(')').map_or(after.len(), |close| close + 1)
+        } else if modifier.starts_with("extern") {
+            after
+                .find('"')
+                .and_then(|open| {
+                    after[open + 1..]
+                        .find('"')
+                        .map(|close| open + 1 + close + 1)
+                })
+                .unwrap_or(after.len())
+        } else {
+            0
+        };
+        start = after_start + consumed;
+        start += line[start..].len() - line[start..].trim_start().len();
+    }
+}
+
+/// The name of the function whose body the line at `lines` sits in, found by
+/// the nearest preceding function DECLARATION.
+///
+/// A declaration is read by [`declared_item_name`], so a `pub`/`pub(crate)`/
+/// `async`/`unsafe`/`const`/`extern` prefix is stripped before the `fn `
+/// keyword is required and a `//` comment line is never read as one.
+fn enclosing_function(lines: &[&str]) -> Option<String> {
+    let mut enclosing = None;
+    for line in lines {
+        if let Some(name) = declared_item_name(line) {
+            enclosing = Some(name);
+        }
+    }
+    enclosing
+}
+
+/// One PRODUCTION observation callsite, keyed by what the fixture can name:
+/// its file and the event literal its argument list carries.
+struct ProductionCallsite {
+    file: &'static str,
+    event: String,
+    line: usize,
+    /// The observer this callsite calls.
+    observer: &'static str,
+    /// The function whose body the callsite sits in.
+    enclosing: Option<String>,
+    /// True for a callsite inside one of the six observer DECLARATIONS, which
+    /// forwards the caller's `event`/`outcome` parameters instead of naming an
+    /// event of its own and therefore owns no boundary row.
+    forwarder: bool,
+}
+
+/// Every production observer callsite in `sources`, as a MULTISET keyed on
+/// `(file, event literal)`.
+///
+/// This is per CALLSITE, where [`derived_instrumented_files`] is per FILE: a
+/// file that still calls fifteen observers derives as present either way, so
+/// deleting the sixteenth callsite from it is invisible to a file-level check
+/// and invisible to a row-resolution check whose needles - `fn <name>` and the
+/// event string - usually occur elsewhere in the same file. Counting per event
+/// is what makes a deleted callsite cost the fixture exactly one row.
+///
+/// The key is `(file, event)` and NOT `(file, function, detail_prefix)`:
+/// 64 of the 117 rows share a `detail_prefix` that occurs 2 to 15 times in its
+/// module, so a prefix cannot address a callsite. The event literal can,
+/// because it is what the callsite passes to the observer.
+///
+/// Two measured shapes are handled rather than assumed:
+///
+/// * a callsite whose argument list carries NO string literal has its event
+///   bound to a local tuple - `process_execution.rs:2403` inside
+///   `origin_grant_effect_receipt`, where `event` is one of the three
+///   `kernel.process.grant_reconcile_*` literals above it. It keys on the
+///   EMPTY event, which is exactly how the fixture's one empty-`event` row
+///   (`reconcile_origin_grant_effect`, covering case 20) is spelled;
+/// * a callsite inside an observer DECLARATION is a FORWARDER, not a boundary:
+///   `process_execution.rs:67` forwards `(&context, event, outcome)` out of
+///   `fn observe_process` (declared at `:65`), so it has no event of its own
+///   and owns no row. It is reported separately instead of being folded into a
+///   gap allowance.
+fn derived_production_callsites(
+    sources: &BTreeMap<&'static str, String>,
+) -> Vec<ProductionCallsite> {
+    let mut callsites = Vec::new();
+    for (file, source) in sources {
+        let lines: Vec<&str> = source.lines().collect();
+        let excluded = test_module_extents(&lines);
+        for observer in OBSERVER_FUNCTIONS {
+            for hit in observer_callsite_offsets(source, observer) {
+                let line_index = source[..hit].lines().count();
+                if excluded
+                    .iter()
+                    .any(|(start, end)| line_index >= *start && line_index < *end)
+                {
+                    // A callsite inside an in-crate capsule is a TEST boundary,
+                    // skipped exactly as `derived_instrumented_files` skips
+                    // `src/tests/`. Only the capsule's own extent is skipped, so
+                    // a production callsite BELOW one is still counted.
+                    continue;
+                }
+                let enclosing = enclosing_function(&lines[..line_index]);
+                let forwarder = enclosing
+                    .as_deref()
+                    .is_some_and(|name| OBSERVER_FUNCTIONS.contains(&name));
+                let event = if forwarder {
+                    String::new()
+                } else {
+                    first_string_literal(callsite_arguments(source, hit + observer.len()))
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                callsites.push(ProductionCallsite {
+                    file,
+                    event,
+                    line: line_index + 1,
+                    observer,
+                    enclosing,
+                    forwarder,
+                });
+            }
+        }
+    }
+    callsites
+}
+
+/// The expected number of cases that own no boundary row, and what each claim
+/// is.
+///
+/// Every claim below is quoted VERBATIM from issue #901's own
+/// "## Required test matrix" section, read read-only from GitHub on 2026-10-03
+/// with `gh issue view 901 --repo UnknownAlienHuman/eliot-memory-os
+/// --comments` and `gh issue view 901 --repo
+/// UnknownAlienHuman/eliot-memory-os --json body`: the numbered matrix list
+/// "**30 cases, exactly 1..30.**", items 1..30. No claim is taken from the
+/// FIXTURE's `note` gloss, from its `boundaries` rows or from its
+/// `case_owners[].boundary` list; no sentence claims the matrix is unavailable.
+/// Because none of these nine strings occurs anywhere in the fixture, the
+/// expected set is independent of the artifact it checks.
+///
+/// WHAT THE ISSUE DOES NOT SAY. The matrix assigns a claim to each of the
+/// thirty numbered cases and contains NO statement, in the body or in any
+/// comment, that any case owns no boundary row: it never uses "row",
+/// "rowless" or "cross-cutting" of a case. That these nine own no row is
+/// therefore NOT read from the issue - it is MEASURED, from the production tree
+/// and the fixture's declared `covering_case` values, by the two-way comparison
+/// in [`assert_boundary_completeness`]. The issue supplies the wording; this
+/// suite supplies the rowlessness, and asserts it in both directions.
+///
+/// CASE 1 is the single deliberate deviation and is not a rewrite of the issue.
+/// The matrix line is "exact five-file process/supervision boundary
+/// denominator" - the issue names five modules. This suite's denominator is
+/// SIX instrumented files: those five plus `process_execution_client.rs`, which
+/// carries one #901 callsite of its own. Entry 1 keeps the suite's corrected
+/// denominator; the matrix line it corrects is quoted above so the difference
+/// is visible rather than silent.
+///
+/// Each claim names what the ISSUE claims for its case, verbatim, and NOT one
+/// instrumented callsite's emitted observation - which is the property that
+/// makes these nine cross-cutting and every other declared case a boundary
+/// owner. It is deliberately NOT a claim about what the test here proves: entry
+/// 11 is the case where the two come apart, and case 11's own scope note
+/// (`stale_generation_owner_stays_fenced_and_current_generation_is_admitted`)
+/// records that the PID-reuse half of the issue's sentence has no
+/// representation in these owned modules - no `pid_reused` or `foreign`
+/// outcome literal exists in them - so that test proves the
+/// generation/identity half only. The constant is the issue's expected set for
+/// the rowlessness comparison, and the honest statement of what each case
+/// reaches stays on that case.
+const CROSS_CUTTING_ISSUE_CASES: [(u64, &str); 9] = [
+    (1, "exact six-file process/supervision boundary denominator"),
+    (9, "changed same-operation payload remains conflict"),
+    (11, "PID reuse/foreign identity remains stale/foreign"),
+    (
+        25,
+        "one terminal failure per underlying operation across propagation",
+    ),
+    (26, "typed cause/recovery owner preserved"),
+    (
+        27,
+        "command/argument/environment/path/credential canaries absent",
+    ),
+    (28, "stream/provider/user payload canaries absent"),
+    (
+        29,
+        "sink failure/drop/disabled logging preserves launch/cancel/lease/reap result, cleanup and order",
+    ),
+    (
+        30,
+        "fixed observations and actual instrumented-path captures preserve causal fields/order and exact diagnostic-only diff",
+    ),
+];
+
+/// The nine cross-cutting case numbers, read out of [`CROSS_CUTTING_ISSUE_CASES`].
+fn issue_cross_cutting_cases() -> BTreeSet<u64> {
+    let cases: BTreeSet<u64> = CROSS_CUTTING_ISSUE_CASES
+        .iter()
+        .map(|(case, _claim)| *case)
+        .collect();
+    assert_eq!(
+        cases.len(),
+        CROSS_CUTTING_ISSUE_CASES.len(),
+        "CROSS_CUTTING_ISSUE_CASES names no cross-cutting case twice"
+    );
+    for (case, claim) in CROSS_CUTTING_ISSUE_CASES {
+        assert!(
+            !claim.is_empty(),
+            "cross-cutting case {case} carries its stated claim"
+        );
+    }
+    cases
+}
+
+/// Proves the inventory is COMPLETE, not merely resolvable.
+///
+/// Five independent directions, all measured from the production tree or from
+/// the nine rowless case numbers stated in [`CROSS_CUTTING_ISSUE_CASES`] - never
+/// from the fixture's `boundaries` - against the fixture's `boundaries`:
+///
+/// * every derived `(file, event)` must have AT LEAST as many production
+///   callsites as the fixture carries rows for it. This direction alone does
+///   NOT catch a deleted callsite whose event literal occurs more than once in
+///   the same module - `kernel.process.effect_observed` is passed to an
+///   observer at fifteen production callsites - because deleting one of the
+///   fifteen leaves the measured count above the row count. What catches it is
+///   the per-file equality and the total below, and both name the module;
+/// * every fixture row must correspond to a real production callsite of that
+///   event in that file, and the multiset is compared in BOTH directions, so
+///   DELETING one row and DUPLICATING another keeps the pinned row count at
+///   117 and still turns this red;
+/// * the derived callsite count and the fixture row count must be EQUAL PER
+///   FILE, in both directions, which is the local form of the total below: it
+///   is implied by the two key directions plus the total, and is stated here so
+///   the failure names the module and both numbers instead of one difference;
+/// * exactly one callsite may lack an event of its own, the named forwarder
+///   `observe_process` in `process_execution.rs` (declared `:65`, forwarding
+///   at `:67`), so there is no gap tolerance a second missing row could hide
+///   inside;
+/// * the set of declared cases owning NO row must be exactly the nine
+///   cross-cutting cases, in BOTH directions, so a row moved ONTO one of them
+///   and a case moved OFF one are both red here. That set check says nothing
+///   about which ROW a boundary belongs to: repointing one row's
+///   `covering_case` from one declared case to another leaves the unrowed set
+///   unchanged and stays green, and this suite does not claim otherwise.
+// One length buys this: the whole completeness proof reads as one ordered pass.
+#[allow(clippy::too_many_lines)]
+fn assert_boundary_completeness(
+    boundaries: &[Value],
+    declared: &BTreeSet<u64>,
+    sources: &BTreeMap<&'static str, String>,
+) {
+    let callsites = derived_production_callsites(sources);
+    let mut derived: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut forwarders: Vec<String> = Vec::new();
+    let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
+    for callsite in &callsites {
+        *per_file.entry(callsite.file).or_insert(0) += 1;
+        if callsite.forwarder {
+            forwarders.push(format!("{}:{}", callsite.file, callsite.line));
+            continue;
+        }
+        *derived
+            .entry((callsite.file.to_owned(), callsite.event.clone()))
+            .or_insert(0) += 1;
+    }
+    let mut rows: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for boundary in boundaries {
+        let file = boundary["file"]
+            .as_str()
+            .expect("boundary file is a string")
+            .to_owned();
+        let event = boundary["event"]
+            .as_str()
+            .expect("boundary event is a string")
+            .to_owned();
+        *rows.entry((file, event)).or_insert(0) += 1;
+    }
+
+    // Direction 1: production is never UNDERSTATED by the inventory.
+    for ((file, event), measured) in &derived {
+        let named = rows
+            .get(&(file.clone(), event.clone()))
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            measured >= &named,
+            "{file} passes \"{event}\" to an observer {measured} time(s) and the \
+             fixture names it {named} time(s): a deleted production callsite \
+             leaves every row-resolution check green and must be red here"
+        );
+    }
+    // Direction 2: the inventory is never OVERSTATED by production, row by row.
+    for ((file, event), named) in &rows {
+        let measured = derived
+            .get(&(file.clone(), event.clone()))
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            measured >= *named,
+            "the fixture names {named} row(s) for {file} :: \"{event}\" but the \
+             production tree calls it {measured} time(s): deleting one row and \
+             duplicating another keeps the pinned row COUNT and is red here"
+        );
+    }
+    // The ONE forwarder, named - not an allowance.
+    assert_eq!(
+        forwarders.len(),
+        1,
+        "exactly one production callsite forwards its event argument instead of \
+         naming one of its own: {forwarders:?}; a second one would be a second \
+         unrowed boundary, not tolerance"
+    );
+    let forwarder = callsites
+        .iter()
+        .find(|callsite| callsite.forwarder)
+        .expect("the one forwarder");
+    assert_eq!(
+        forwarder.file,
+        OWNED_FILES
+            .iter()
+            .find(|owned| owned.ends_with("process_execution.rs"))
+            .copied()
+            .expect("process_execution.rs is an owned file"),
+        "the one forwarder lives in process_execution.rs"
+    );
+    assert_eq!(
+        forwarder.observer, "observe_process_in_context",
+        "the one forwarder is the call `observe_process` makes into the shared \
+         process observer"
+    );
+    assert_eq!(
+        forwarder.enclosing.as_deref(),
+        Some("observe_process"),
+        "the one forwarder is the unscoped wrapper declared at \
+         process_execution.rs:65, which forwards its own `event`/`outcome` \
+         parameters at :67 and therefore owns no boundary row"
+    );
+    // The LITERAL-FREE callsites, pinned by their own count rather than by the
+    // enclosing function's NAME. A second wrapper - `fn observe_process_scoped(
+    // event, outcome) { observe_process_in_context(&ctx, event, outcome) }` - is
+    // classified a NON-forwarder (its enclosing name is not one of the six
+    // observers) and keyed on the empty event, so the one-forwarder count above
+    // stays GREEN for it and the failure is reported three times over: this
+    // count names the wrapper's file, line and enclosing function, the per-file
+    // equality above names its module, and the total difference names the one
+    // forwarder it knows. A wrapper whose enclosing name IS one of the six
+    // observers is caught by the forwarder count instead, which also names it.
+    // The tree legitimately has exactly ONE callsite whose argument list carries
+    // no string literal (`process_execution.rs:2403`, inside
+    // `reconcile_origin_grant_effect_receipt`, which owns a real row), and the
+    // fixture exactly ONE row whose `event` is the empty string, so those two
+    // counts are equal and must stay equal: a wrapper adds one to each.
+    let literal_free: Vec<String> = callsites
+        .iter()
+        .filter(|callsite| !callsite.forwarder && callsite.event.is_empty())
+        .map(|callsite| {
+            format!(
+                "{}:{} calls {} in fn {}",
+                callsite.file,
+                callsite.line,
+                callsite.observer,
+                callsite.enclosing.as_deref().unwrap_or("<none>")
+            )
+        })
+        .collect();
+    let empty_event_rows: Vec<String> = boundaries
+        .iter()
+        .filter(|boundary| boundary["event"].as_str() == Some(""))
+        .map(|boundary| {
+            let file = boundary["file"]
+                .as_str()
+                .expect("boundary file is a string");
+            let covering_case = boundary["covering_case"]
+                .as_u64()
+                .expect("boundary covering_case is a case number");
+            format!("{file} :: \"\" (covering case {covering_case})")
+        })
+        .collect();
+    assert_eq!(
+        literal_free.len(),
+        empty_event_rows.len(),
+        "the production callsites with NO string literal in their argument list \
+         number {literal_free:?}, and the fixture rows whose event is the empty \
+         string number {empty_event_rows:?}; those two counts are equal by \
+         construction, so a wrapper that forwards a non-literal argument instead \
+         of naming an event adds one to each and is red here"
+    );
+    let derived_total: usize = derived.values().sum();
+    let rows_total: usize = rows.values().sum();
+    let production_total = derived_total + forwarders.len();
+    // PER FILE, in BOTH directions, before the total. The two `(file, event)`
+    // directions above compare `measured >= named` per KEY and the total below
+    // closes the sum, so per-file equality is already implied - but an implied
+    // equality is reported only as one number, and the number does not say which
+    // module lost or gained a callsite. This states it per module, naming both
+    // sides, so a DELETED callsite is a message that reads "process_execution.rs:
+    // 84 derived against 85 rows" instead of "the totals differ by -1".
+    let mut rows_per_file: BTreeMap<&str, usize> = BTreeMap::new();
+    for boundary in boundaries {
+        let file = boundary["file"]
+            .as_str()
+            .expect("boundary file is a string");
+        *rows_per_file.entry(file).or_insert(0) += 1;
+    }
+    let mut derived_per_file: BTreeMap<&str, usize> = BTreeMap::new();
+    for ((file, _event), count) in &derived {
+        *derived_per_file.entry(file.as_str()).or_insert(0) += *count;
+    }
+    for file in derived_per_file.keys().chain(rows_per_file.keys()) {
+        let measured = derived_per_file.get(*file).copied().unwrap_or(0);
+        let named = rows_per_file.get(*file).copied().unwrap_or(0);
+        assert_eq!(
+            measured, named,
+            "{file} carries {measured} production observation callsite(s) that \
+             name an event of their own and the fixture names it {named} row(s), \
+             in EITHER direction: a deleted production callsite, or a row \
+             duplicated in one module while another module's callsite went \
+             missing, is red here with both numbers named"
+        );
+    }
+    // Signed, so a fixture that names MORE rows than the tree calls reports
+    // this difference instead of underflowing on the way to the message.
+    assert_eq!(
+        i64::try_from(production_total).expect("the production callsite total is a count")
+            - i64::try_from(rows_total).expect("the fixture row total is a count"),
+        i64::try_from(forwarders.len()).expect("the forwarder total is a count"),
+        "the production callsites exceed the fixture's rows by EXACTLY the one \
+         named forwarder and by nothing else: measured per file {per_file:?} \
+         against rows per file {rows_per_file:?}, that is {production_total} \
+         production callsites ({derived_total} keyed + {} forwarder) against \
+         {rows_total} rows; this difference is derived, never a tolerance. The \
+         per-file equality above localises any such difference to its module",
+        forwarders.len()
+    );
+
+    // The nine cross-cutting cases, and no others, own no row.
+    let owned_by_a_row: BTreeSet<u64> = boundaries
+        .iter()
+        .map(|boundary| {
+            boundary["covering_case"]
+                .as_u64()
+                .expect("boundary covering_case is a case number")
+        })
+        .collect();
+    let cross_cutting = issue_cross_cutting_cases();
+    let unrowed: BTreeSet<u64> = declared.difference(&owned_by_a_row).copied().collect();
+    assert_eq!(
+        unrowed, cross_cutting,
+        "exactly the nine cross-cutting cases own no boundary row and every \
+         other declared case owns at least one: the unrowed SET is compared in \
+         both directions, so a row given a cross-cutting covering_case, or a \
+         cross-cutting case given a row, is red here. Repointing one row from \
+         one DECLARED case to another DECLARED case is NOT what this checks - \
+         it leaves the unrowed set unchanged - and no claim is made about it"
+    );
+    let reclaimed: Vec<u64> = cross_cutting.difference(declared).copied().collect();
+    assert_eq!(
+        reclaimed,
+        Vec::<u64>::new(),
+        "every cross-cutting case is a DECLARED case"
+    );
+}
+
+/// Walks this package's `src/` tree once and returns every PRODUCTION Rust
+/// source file, paired with its repository-relative path spelling, sorted by
+/// that spelling.
+///
+/// Both derivations that walk the tree share this one walk, so they cannot
+/// disagree about which files exist or which two shapes are skipped.
+///
+/// The root is `env!("CARGO_MANIFEST_DIR")`, which Cargo fixes at COMPILE time
+/// to this integration-test target's own package directory,
+/// `<repo>/bins/eliot-kernel`. Nothing here reads the process working
+/// directory, so the walk cannot follow wherever the test binary was started
+/// from. The walk is a `read_dir` recursion because `std` has no
+/// directory-tree iterator available here; the result is collected through a
+/// `BTreeMap` because `read_dir` order is unspecified and every assertion must
+/// not depend on it.
+///
+/// Exactly two shapes are skipped, and both are test code rather than
+/// production code: `src/tests.rs` and everything under `src/tests/`. That is
+/// where `src/lib.rs` registers its five `#[cfg(test)]` capsules (`#[cfg(test)]
+/// mod tests;` at `:5699` and one `#[path = "tests/....rs"]` module per
+/// capsule), and a callsite inside one of them is a test callsite, not a
+/// production boundary. The skip is structural rather than name-based, so adding
+/// a production module anywhere else under `src/` still reaches every assertion.
+///
+/// WHAT THIS WALK DOES NOT EXCLUDE, stated so no caller reads it as a single
+/// definition of "production" for the whole file: an IN-FILE `#[cfg(test)] mod`
+/// capsule is walked like any other text. This crate has several - measured on
+/// this tree, `process_execution.rs:4827` and `:4948`, `daemon_supervision.rs
+/// :802`, `daemon_process_launch.rs:681`, `generation_control.rs:1324`,
+/// `generation_recovery.rs:556` and `runtime_identity.rs:195` - so the two
+/// derivations that use this walk use DIFFERENT definitions on purpose:
+/// [`derived_instrumented_files`] counts a FILE as instrumented if it calls an
+/// observer anywhere, including inside an in-file capsule, and
+/// [`derived_production_callsites`] excludes the capsule EXTENT via
+/// [`test_module_extents`] before keying a CALLSITE. That asymmetry is
+/// conservative in the only direction that matters here: a module whose only
+/// observer callsite is test-gated still enters the denominator and turns case 1
+/// red rather than quietly shrinking it, while the per-callsite multiset never
+/// counts a test callsite as a production boundary.
+fn production_source_files() -> Vec<(String, String)> {
+    let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut pending = vec![package_root.join("src")];
+    let mut files = BTreeMap::new();
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("a readable source directory entry").path();
+            let relative = path
+                .strip_prefix(&package_root)
+                .expect("every walked path is under this package")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == "src/tests.rs" || relative.starts_with("src/tests/") {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+                files.insert(relative, source);
+            }
+        }
+    }
+    files.into_iter().collect()
+}
+
+/// Every production source file that CALLS one of [`OBSERVER_FUNCTIONS`], as
+/// sorted repository-relative paths.
+///
+/// This walk is [`production_source_files`], filtered; the root and the two
+/// skipped test shapes are stated there. `package_prefix` is taken from the
+/// fixture's own `test_file`, so the repository-relative spelling compared
+/// against `files` cannot drift away from the tree that was actually walked;
+/// case 1 asserts the manifest directory really ends with that prefix before
+/// calling this.
+fn derived_instrumented_files(package_prefix: &str) -> Vec<String> {
+    let mut derived: Vec<String> = production_source_files()
+        .into_iter()
+        .filter(|(_relative, source)| {
+            OBSERVER_FUNCTIONS
+                .iter()
+                .any(|observer| calls_observer(source, observer))
+        })
+        .map(|(relative, _source)| format!("{package_prefix}/{relative}"))
+        .collect();
+    derived.sort();
+    derived
+}
+
+/// Every `observe`-named function DECLARATION in `source`, as a set of names.
+///
+/// "DECLARATION" is decided by [`is_observer_declaration`], so the same
+/// structural question is answered one way in the denominator derivation and
+/// here: the name is introduced by an `fn` keyword, with only whitespace,
+/// `async`, `unsafe` or `pub(..)` between it and the name. A `use` of the same
+/// name, and any mention inside a `//` comment line, are not declarations.
+///
+/// The visibility modifier is deliberately NOT part of what is returned, which
+/// is what lets one set pin the three escaped spellings at once: a
+/// `pub(crate) fn observe_...`, a `pub async fn observe_...` and a
+/// `pub fn observe(` are all read here as the declarations they are, so
+/// comparing the set against [`OWNED_OBSERVATION_DECLARATIONS`] closes all
+/// three without three separate needles.
+///
+/// The matched prefix must END a name, or the set would pin production
+/// accessors whose names merely begin with those letters: `observed` is
+/// matched by `fn observe` and is declared twice in `process_execution.rs`
+/// (`:372`, `:407`, both `pub(crate) fn observed(&self) -> bool`), and it is a
+/// state accessor, not an observation surface. So a name that continues with an
+/// identifier byte is not a name at all here.
+fn derived_observation_declarations(source: &str) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    for (hit, _) in source.match_indices("fn observe") {
+        let name_start = hit + "fn ".len();
+        if source[hit + "fn observe".len()..]
+            .starts_with(|character: char| character.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        if !is_observer_declaration(source, name_start) {
+            continue;
+        }
+        let head = source[..hit]
+            .rsplit_once('\n')
+            .map_or("", |(_, tail)| tail)
+            .trim();
+        if head.starts_with("//") {
+            continue;
+        }
+        let rest = &source[name_start..];
+        let end = rest
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(rest.len());
+        declared.insert(rest[..end].to_owned());
+    }
+    declared
+}
+
+/// Every production module under `src/` that installs a subscriber, as sorted
+/// crate-relative paths.
+///
+/// This is the derivation that finds a module which installs its OWN subscriber
+/// without calling one of the six observers: such a module is in neither
+/// [`OWNED_FILES`] nor [`OWNED_PATHS`], and
+/// [`derived_instrumented_files`] is keyed only on the observer names, so no
+/// other reader in this file can reach it.
+///
+/// "Production" excludes a test-gated `mod` capsule by MODULE EXTENT, measured
+/// by the existing [`test_module_extents`] rather than by a second brace
+/// mechanism, so the same definition decides both exclusions. FIVE installs
+/// legitimately sit inside such capsules and are excluded by that extent alone
+/// - `process_execution.rs:4866` inside the two capsules of one owned module,
+///   `daemon_supervision.rs:841` inside the capsule of another, and
+///   `generation_recovery.rs:606`, `generation_control.rs:1358` and
+///   `runtime_identity.rs:234` inside three capsules outside the owned six.
+///   The count is five and the enumeration above names five: it is the only
+///   subscriber install outside a capsule that exists on this tree besides the
+///   facade declaration at `kernel_diagnostics.rs:242` and the composition
+///   root's single call at `main.rs:224`, which are the two NAMED owners in
+///   [`FACADE_SUBSCRIBER_OWNERS`].
+fn derived_subscriber_installers() -> Vec<String> {
+    production_source_files()
+        .into_iter()
+        .filter_map(|(relative, source)| {
+            let lines: Vec<&str> = source.lines().collect();
+            let extents = test_module_extents(&lines);
+            let installs = FORBIDDEN_SUBSCRIBER_IN_PRODUCTION
+                .iter()
+                .any(|needle| !production_needle_offsets(&source, needle, &extents).is_empty());
+            installs.then_some(relative)
+        })
+        .collect()
+}
+
+/// The line indices in `source` at which `needle` occurs OUTSIDE every
+/// `(start, end)` line extent in `extents`.
+///
+/// One definition of "this occurrence is in production code", shared by the
+/// per-owned-module check and the whole-tree derivation, so the two cannot
+/// decide the four legitimate test-gated installs differently.
+fn production_needle_offsets(source: &str, needle: &str, extents: &[(usize, usize)]) -> Vec<usize> {
+    source
+        .match_indices(needle)
+        .map(|(hit, _)| source[..hit].lines().count())
+        .filter(|line| {
+            !extents
+                .iter()
+                .any(|(start, end)| *line >= *start && *line < *end)
+        })
+        .collect()
+}
+
+/// Asserts that no owned module installs a subscriber outside a test-gated
+/// module, naming the offending file and line.
+///
+/// The exclusion is by MODULE EXTENT from [`test_module_extents`], so the TWO
+/// legitimate thread-local installs in the owned six - the `with_default(` call
+/// at `daemon_supervision.rs:841` and the one at `process_execution.rs:4866` -
+/// are excluded as a property of the capsule that contains them rather than as
+/// two enumerated exceptions, while the same `with_default(` or `set_default(`
+/// call added anywhere else in any owned module - including BELOW a capsule,
+/// which a file-truncating shortcut would hide - is red here.
+fn assert_no_production_subscriber(owned: &str, source: &str) {
+    let lines: Vec<&str> = source.lines().collect();
+    let extents = test_module_extents(&lines);
+    let mut installs: Vec<String> = Vec::new();
+    for needle in FORBIDDEN_SUBSCRIBER_IN_PRODUCTION {
+        for line in production_needle_offsets(source, needle, &extents) {
+            installs.push(format!("{needle} at line {}", line + 1));
+        }
+    }
+    assert_eq!(
+        installs,
+        Vec::<String>::new(),
+        "{owned} installs a subscriber OUTSIDE every test-gated module: {installs:?}. \
+         The thread-local installs that exist today all sit inside `#[cfg(test)]` \
+         capsules, and there are exactly TWO of them in the owned six: the \
+         `with_default(` call at daemon_supervision.rs:841 and the one at \
+         process_execution.rs:4866 (`:837` and `:4862` are the \
+         `tracing_subscriber::fmt()` builder lines of the same two capture \
+         helpers, not installs). The exclusion is by that capsule's \
+         brace-matched extent, so a production thread-local subscriber - \
+         including one appended BELOW a capsule - is a second owner exactly \
+         like a process-global one"
+    );
+}
+
+/// Asserts that `owned` declares exactly the observation surfaces the owned set
+/// already carries, in any visibility and with or without `async`.
+fn assert_observation_declarations(owned: &str, source: &str) {
+    let expected: BTreeSet<String> = OWNED_OBSERVATION_DECLARATIONS
+        .iter()
+        .filter(|(path, _name)| *path == owned)
+        .map(|(_path, name)| (*name).to_owned())
+        .collect();
+    assert_eq!(
+        derived_observation_declarations(source),
+        expected,
+        "{owned} declares exactly the observation surfaces the six owned modules \
+         already carry, in BOTH directions: the visibility and the `async` \
+         modifier are not part of the key, so `pub(crate) fn observe_...` (the one \
+         legitimate spelling, process_execution.rs:73), `pub async fn observe_...` \
+         and `pub fn observe(` are all read as declarations and a second one is red \
+         here"
+    );
+}
+
+/// The `(case, test function)` pairs THIS file claims, read out of its own
+/// issue markers through a compile-time `include_str!` of itself.
+///
+/// This is the INDEPENDENT expected set for the fixture's `case_owners`: the
+/// marker text in this source file is the authority for which case number
+/// belongs to which test function, so renaming a test, moving a marker or
+/// dropping one turns case 1 red instead of leaving a copied table agreeing
+/// with itself.
+fn local_case_owners() -> BTreeMap<u64, String> {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/kernel_process_supervision_diagnostics.rs"
+    ));
+    let mut owners: BTreeMap<u64, String> = BTreeMap::new();
+    let mut pending: Option<u64> = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(WORK_UNIT_MARKER) {
+            assert!(
+                pending.is_none(),
+                "two issue markers with no test between them: {trimmed}"
+            );
+            pending = Some(
+                rest.trim()
+                    .parse::<u64>()
+                    .expect("an issue marker carries a case number"),
+            );
+        } else if let Some(signature) = trimmed.strip_prefix("fn ")
+            && let Some(case) = pending.take()
+        {
+            let name = signature
+                .split_once('(')
+                .map_or("", |(name, _)| name)
+                .to_owned();
+            assert!(
+                owners.insert(case, name).is_none(),
+                "case {case} is claimed by two tests in this file"
+            );
+        }
+    }
+    assert!(
+        pending.is_none(),
+        "an issue marker in this file owns no test function"
+    );
+    owners
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +1985,7 @@ fn drive_request<'a>(
     request: ProcessExecutionRequest,
 ) -> (String, ProcessExecutionResponse) {
     let rt = current_thread_runtime();
-    capture_with(move || {
+    capture_blocking(move || {
         rt.block_on(kernel.execute_process_request(session, binding.clone(), request))
     })
 }
@@ -687,7 +1997,7 @@ fn drive_client_start(
     admission: ProcessExecutionAdmissionRequest,
 ) -> (String, ProcessExecutionResponse) {
     let rt = current_thread_runtime();
-    capture_with(move || {
+    capture_blocking(move || {
         let client = eliot_kernel::process_execution_client(kernel, session, binding)
             .expect("front-door process-execution client");
         rt.block_on(client.execute(ProcessExecutionRequest::Start(admission)))
@@ -723,36 +2033,410 @@ fn rejection_detail(response: &ProcessExecutionResponse) -> String {
     rejection.detail.clone()
 }
 
-// WORK_UNIT_CASE: 901/1
-#[test]
-fn process_supervision_denominator_is_exact() {
-    let f = fixture();
-    assert_eq!(f["issue"].as_u64(), Some(901), "fixture pins this issue");
-    let files = f["files"].as_array().expect("fixture files array");
-    assert_eq!(files.len(), 5, "exactly five owned source files");
+/// The fixture's `files` array, read as owned strings.
+fn fixture_owned_files(f: &Value) -> Vec<String> {
+    f["files"]
+        .as_array()
+        .expect("fixture files array")
+        .iter()
+        .map(|value| value.as_str().expect("owned file string").to_owned())
+        .collect()
+}
+
+/// Proves case 30's forbidden-vocabulary sweep covers exactly the paths the
+/// denominator derivation covers.
+///
+/// The two lists are spelled differently - [`OWNED_FILES`] repository-relative,
+/// [`OWNED_PATHS`] crate-relative - so they are compared AFTER the same
+/// `src/<module>` suffix is taken from both. Without this, adding an owned
+/// module would sweep five paths while the derivation walks six, and a second
+/// subscriber owner or a new public observation surface could be added in the
+/// unswept file with every assertion green.
+fn assert_sweep_covers_derivation() {
+    let mut measured: BTreeSet<String> = OWNED_FILES
+        .iter()
+        .map(|owned| {
+            let (_, module) = owned.split_once("/src/").unwrap_or_else(|| {
+                panic!("owned file {owned} names a module under this package's src/")
+            });
+            format!("src/{module}")
+        })
+        .collect();
+    let swept: BTreeSet<&str> = OWNED_PATHS.iter().copied().collect();
+    assert_eq!(
+        swept.len(),
+        OWNED_PATHS.len(),
+        "the sweep names no owned path twice"
+    );
+    for owned in swept {
+        measured.remove(owned);
+    }
+    assert_eq!(
+        measured,
+        BTreeSet::new(),
+        "case 30's forbidden-vocabulary sweep covers every path the derivation \
+         covers: an owned module missing from OWNED_PATHS is never swept"
+    );
+    let unswept: Vec<&str> = OWNED_PATHS
+        .iter()
+        .copied()
+        .filter(|path| !OWNED_FILES.iter().any(|owned| owned.ends_with(*path)))
+        .collect();
+    assert_eq!(
+        unswept,
+        Vec::<&str>::new(),
+        "case 30 sweeps no path the derivation does not cover"
+    );
+}
+
+/// Proves the denominator of case 1 in BOTH directions against the DERIVED
+/// callsite set, and returns nothing.
+///
+/// * the derived set must equal [`OWNED_FILES`] exactly - so a seventh
+///   instrumented module, a renamed module, a relocated module, or the loss of
+///   the client module's `observe_process_in_context` callsite at
+///   `process_execution_client.rs:106` all turn this red;
+/// * every derived file absent from the fixture's `files` must be NOTHING - so
+///   a new instrumented file cannot slip in unremarked, and the fixture cannot
+///   understate the denominator by omitting an instrumented module;
+/// * every file in `files` must be in the derived set - so the fixture cannot
+///   keep naming a module that no longer calls any observer;
+/// * case 30's sweep covers every one of those paths, so the two lists cannot
+///   drift apart.
+///
+/// The fixture now carries the same six files the walk derives, so this
+/// comparison carries no allowance at all.
+fn assert_denominator(files: &[String], derived: &[String]) {
+    assert_sweep_covers_derivation();
+    assert_eq!(
+        files.len(),
+        OWNED_FILES.len(),
+        "the fixture names exactly the six owned modules"
+    );
     for expected in OWNED_FILES {
         assert!(
-            files.iter().any(|v| v.as_str() == Some(expected)),
+            files.iter().any(|value| value == expected),
             "fixture must list {expected}"
         );
     }
-    let boundaries = f["boundaries"].as_array().expect("fixture boundaries");
+    let mut measured: Vec<String> = OWNED_FILES.iter().map(|file| (*file).to_owned()).collect();
+    measured.sort();
+    assert_eq!(
+        derived, measured,
+        "the DERIVED instrumented-file set is exactly the measured list"
+    );
+    let uncovered: Vec<&String> = derived
+        .iter()
+        .filter(|file| !files.contains(*file))
+        .collect();
+    assert_eq!(
+        uncovered,
+        Vec::<&String>::new(),
+        "`files` omits no instrumented file: the derived set and the fixture's \
+         `files` array differ in neither direction"
+    );
+    for file in files {
+        assert!(
+            derived.contains(file),
+            "fixture file {file} has no observer callsite in the source tree"
+        );
+    }
+}
+
+/// Proves the fixture's `inline_tests` field against the capsule registrations
+/// DERIVED from this crate's own root module, `src/lib.rs`.
+///
+/// `inline_tests` is this delivery's record of which in-crate capsules carry the
+/// inline tests it registers, so a name in that array with no registration behind
+/// it would be a field asserting something no test performs - and, before this
+/// assertion existed, the field was both unasserted AND incomplete, naming three
+/// of the five capsules `src/lib.rs` actually registers.
+///
+/// The five names are therefore NOT written here: they are read out of
+/// `src/lib.rs`, in source order, and compared in full, so this is red in both
+/// drift directions.
+///
+/// The extraction is structural, not a substring sweep. `CAPSULE_PATH_PREFIX`
+/// selects this issue's capsule family out of every `#[cfg(test)] #[path = ...]
+/// mod ...;` registration the crate root declares, so `mod tests;` and
+/// `local_read_claim_tests` are outside it and can never be mistaken for one of
+/// these capsules. The attribute buffer is what makes the `#[cfg(test)]` half
+/// load-bearing: the test gate is read from an attribute that both BEGINS
+/// `#[cfg(` and names `test`, because the `#[path = "tests/..."]` attribute
+/// itself contains the word `tests` and would otherwise satisfy a bare
+/// containment check on its own. A path is paired with the `mod` line it
+/// actually precedes and names, and the buffer is cleared at each non-attribute,
+/// non-comment line, so an unpaired `#[path]` cannot drift onto a later module.
+fn assert_inline_tests(f: &Value) {
+    const CAPSULE_PATH_PREFIX: &str = "tests/process_supervision_";
+    let root =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+            .expect("crate root source");
+    let mut derived: Vec<String> = Vec::new();
+    let mut attributes: Vec<&str> = Vec::new();
+    for line in root.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            attributes.push(trimmed);
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let path = attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| attribute.strip_prefix("#[path = \""))
+            .and_then(|value| value.strip_suffix("\"]"))
+            .map(str::to_owned);
+        let test_gated = attributes
+            .iter()
+            .any(|attribute| attribute.starts_with("#[cfg(") && attribute.contains("test"));
+        if test_gated
+            && let Some(path) = path.as_deref()
+            && let Some(stem) = path.strip_suffix(".rs")
+            && stem.starts_with(CAPSULE_PATH_PREFIX)
+            && let Some(signature) = trimmed.strip_prefix("mod ")
+            && let Some(name) = signature.strip_suffix(';')
+        {
+            derived.push(name.to_owned());
+        }
+        attributes.clear();
+    }
+    assert!(
+        !derived.is_empty(),
+        "src/lib.rs registers no #[cfg(test)] #[path = \"{CAPSULE_PATH_PREFIX}*.rs\"] \
+         module, so the comparison below would be against nothing"
+    );
+    let declared: Vec<String> = f["inline_tests"]
+        .as_array()
+        .expect("fixture inline_tests array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("an inline_tests capsule module name")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        declared, derived,
+        "the fixture's `inline_tests` is exactly the capsule registrations DERIVED \
+         from src/lib.rs, in registration order: a capsule registered there and \
+         missing here is unrecorded, and a name here with no registration behind it \
+         asserts nothing"
+    );
+}
+
+/// Proves the fixture's `case_owners` table against sets that do not come from
+/// it, and returns the declared case numbers for the boundary cross-check.
+///
+/// * `case_owners` must declare exactly the issue's thirty case numbers, 1..=30,
+///   with no number declared twice - checked against the literal issue range,
+///   not against `boundaries`;
+/// * the rows naming `suite` must equal [`local_case_owners`] EXACTLY, in both
+///   directions: every frozen marker in this file must have a row with this
+///   test's `test_fn`, and every row naming this suite must correspond to a
+///   marker. Renaming a test, moving a marker or dropping one is therefore red.
+fn assert_case_owners(f: &Value, suite: &str) -> BTreeSet<u64> {
+    let rows = f["case_owners"].as_array().expect("fixture case_owners");
+    let declared: BTreeSet<u64> = rows
+        .iter()
+        .map(|row| row["case"].as_u64().expect("a case_owners case number"))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        rows.len(),
+        "no case number is declared by two case_owners rows"
+    );
+    assert_eq!(
+        declared.iter().copied().collect::<Vec<u64>>(),
+        (1..=30).collect::<Vec<u64>>(),
+        "case_owners declares exactly the issue's thirty cases, 1..=30"
+    );
+    let mut suite_rows: BTreeMap<u64, String> = BTreeMap::new();
+    for row in rows {
+        if row["test_file"].as_str() != Some(suite) {
+            continue;
+        }
+        let case = row["case"].as_u64().expect("a case_owners case number");
+        let test_fn = row["test_fn"].as_str().expect("a case_owners test_fn");
+        assert!(
+            suite_rows.insert(case, test_fn.to_owned()).is_none(),
+            "case {case} is claimed by two case_owners rows for this suite"
+        );
+    }
+    assert_eq!(
+        suite_rows,
+        local_case_owners(),
+        "this suite's case_owners rows are exactly its own frozen case markers"
+    );
+    declared
+}
+
+/// Reads the six owned modules' production sources once, keyed by the
+/// fixture's own repository-relative spelling of each path.
+fn owned_module_sources(package_prefix: &str) -> BTreeMap<&'static str, String> {
+    OWNED_FILES
+        .iter()
+        .map(|owned| {
+            let manifest_relative = owned
+                .strip_prefix(&format!("{package_prefix}/"))
+                .expect("an owned file is inside this package");
+            (
+                *owned,
+                std::fs::read_to_string(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(manifest_relative),
+                )
+                .unwrap_or_else(|_| panic!("owned module {owned} must be readable")),
+            )
+        })
+        .collect()
+}
+
+/// Proves the boundary inventory against three sets that do not come from it.
+///
+/// * [`assert_boundary_completeness`] first, because the checks below only
+///   RESOLVE rows: the per-CALLSITE `(file, event)` multiset derived from the
+///   production tree and the nine cross-cutting rowless cases are what make
+///   the inventory COMPLETE;
+/// * every row's `file` must be inside the fixture's denominator AND still in
+///   the DERIVED callsite set, so a row cannot name a module that stopped
+///   instrumenting;
+/// * every row's `covering_case` must be a case number `case_owners` declares,
+///   which is what makes the old `(1..=30).contains(&case)` range test
+///   unnecessary - that predicate is true of every number that parses as
+///   `u64` and constrained nothing;
+/// * every row's `function` and `detail_prefix` must appear literally in the
+///   production module the row names, so the inventory cannot drift away from
+///   the event literals the module really passes to an observer. The one row
+///   whose `event` is empty is unaffected: it carries the shared
+///   `kernel.process.grant_reconcile_` prefix, which that module does contain.
+fn assert_boundary_inventory(
+    boundaries: &[Value],
+    files: &[String],
+    derived: &[String],
+    declared: &BTreeSet<u64>,
+    sources: &BTreeMap<&'static str, String>,
+) {
     assert!(!boundaries.is_empty(), "boundary table is non-empty");
+    assert_boundary_completeness(boundaries, declared, sources);
     for boundary in boundaries {
         let file = boundary["file"]
             .as_str()
             .expect("boundary file is a string");
         assert!(
-            files.iter().any(|v| v.as_str() == Some(file)),
+            files.iter().any(|value| value == file),
             "boundary file {file} is inside the denominator"
         );
         assert!(
-            boundary["covering_case"]
-                .as_u64()
-                .is_some_and(|case| (1..=30).contains(&case)),
-            "every boundary names a case in 1..30"
+            derived.iter().any(|value| value == file),
+            "boundary file {file} still carries an observer callsite"
+        );
+        let covering_case = boundary["covering_case"]
+            .as_u64()
+            .expect("boundary covering_case is a case number");
+        assert!(
+            declared.contains(&covering_case),
+            "boundary {file} names case {covering_case}, which case_owners never declares"
+        );
+        let source = sources
+            .get(file)
+            .unwrap_or_else(|| panic!("boundary file {file} is an owned module"));
+        let function = boundary["function"]
+            .as_str()
+            .expect("boundary function is a string");
+        assert!(
+            source.contains(&format!("fn {function}")),
+            "boundary {file} names function {function}, which that module does not define"
+        );
+        let detail_prefix = boundary["detail_prefix"]
+            .as_str()
+            .expect("boundary detail_prefix is a string");
+        assert!(
+            source.contains(detail_prefix),
+            "boundary {file}::{function} names event prefix {detail_prefix}, \
+             which that module never passes to an observer"
         );
     }
+}
+
+// WORK_UNIT_CASE: 901/1
+// The denominator is DERIVED, not restated. `derived_instrumented_files` walks
+// this package's own `src/` tree and keeps every production file that CALLS one
+// of the six observer functions; that measured set is what the fixture's
+// `files` array is compared against, in BOTH directions. A seventh instrumented
+// module, or a renamed or relocated one, now changes the derived set and turns
+// this red instead of agreeing with a restated constant.
+//
+// The two sets are now IDENTICAL and the comparison carries NO allowance.
+// `bins/eliot-kernel/src/process_execution_client.rs` carries a production
+// `observe_process_in_context` callsite at :106 emitting
+// `kernel.process.request_rejected` with outcome `path_proof`, and the fixture
+// names that file in `files` and carries its boundary row (covering case 4).
+// An earlier revision of this fixture carried 116 rows against 117 counted
+// callsites because that count had been measured entirely inside the other five
+// files; the understated denominator is corrected in the fixture rather than
+// recorded as an exception here, so the difference asserted below is EMPTY.
+#[test]
+fn process_supervision_denominator_is_exact() {
+    let f = fixture();
+    assert_eq!(f["issue"].as_u64(), Some(901), "fixture pins this issue");
+    let suite = f["test_file"].as_str().expect("fixture test_file");
+    let (package_prefix, _) = suite
+        .split_once("/tests/")
+        .expect("the fixture names this package's tests directory");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(
+        manifest.ends_with(&format!("/{package_prefix}")),
+        "this package directory is the tree the fixture names: {manifest}"
+    );
+
+    let derived = derived_instrumented_files(package_prefix);
+    let files = fixture_owned_files(&f);
+    let declared = assert_case_owners(&f, suite);
+    assert_denominator(&files, &derived);
+    // The `inline_tests` half is derived from src/lib.rs for the same reason: the
+    // field names the capsules this delivery registers, so it is compared against
+    // the registrations themselves rather than against a list copied beside them.
+    assert_inline_tests(&f);
+    let boundaries = f["boundaries"].as_array().expect("fixture boundaries");
+    assert_boundary_inventory(
+        boundaries,
+        &files,
+        &derived,
+        &declared,
+        &owned_module_sources(package_prefix),
+    );
+    // COMPLETENESS TRIPWIRE. `assert_boundary_inventory` proves only that each
+    // row RESOLVES - that its `function` is defined and its `detail_prefix`
+    // really appears in the module it names - so a DELETED row passes it
+    // silently. This delivery pins 117 boundary rows, counted from the fixture
+    // itself (85 `process_execution.rs`, 11 `daemon_live_receipt.rs`, 9
+    // `supervision_lease_authority.rs`, 7 `daemon_supervision.rs`, 4
+    // `daemon_process_launch.rs`, 1 `process_execution_client.rs`).
+    //
+    // It pins a COUNT, not a MAPPING, and it is now only the second line of
+    // defence: `assert_boundary_completeness` compares the per-CALLSITE
+    // `(file, event)` multiset DERIVED from the production tree against the
+    // fixture's rows in both directions, so deleting one row and duplicating
+    // another satisfies this count and is red there. What this count adds is
+    // the reviewable total, and the derivation is scoped to what a text reader
+    // can decide exactly - it stops at the first top-level `#[cfg(test)] mod`,
+    // so the two in-crate capsules cannot be counted as production boundaries.
+    assert_eq!(
+        boundaries.len(),
+        117,
+        "the fixture pins 117 boundary rows: one per production observation \
+         callsite that names an event of its own, which is the 118 measured \
+         production callsites MINUS the one named forwarder at \
+         process_execution.rs:67; this count is NOT the completeness proof on \
+         its own, because deleting one row and duplicating another keeps it at \
+         117 - the derived (file, event) multiset asserted by \
+         assert_boundary_completeness is what makes the mapping honest"
+    );
     assert_eq!(
         f["test_file"].as_str(),
         Some("bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs"),
@@ -967,6 +2651,19 @@ fn pre_launch_refusal_stays_not_attempted() {
         vec![ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE.to_owned()],
         "exactly one typed terminal: {logs}"
     );
+    // REGRESSION GUARD (absence), non-vacuously satisfiable: this run is proven
+    // POSITIVE first - the guard emitted `kernel.process.request_rejected` with
+    // outcome `watchdog_coverage` exactly once and exactly one typed terminal,
+    // both asserted immediately above - and every name below is read through
+    // `fixture_event`, which PANICS if the fixture does not carry it, so a
+    // renamed or misspelled event cannot satisfy the loop by naming nothing.
+    // The four emitters it guards are `process_execution.rs:2906`
+    // (start_requested), `:3949` (start_registration), `:4143`
+    // (start_handoff) and `:2943` (start_committed), all of which sit inside
+    // `start_in_context` (`:2881`) or the `run_process_start` projection it
+    // reaches (`:3949`/`:4143`), behind the guard that returned above; and
+    // `daemon_process_launch.rs:127` (launch_requested) sits behind a launch
+    // that this run never reaches.
     for never in [
         "process.start_requested",
         "process.start_registration",
@@ -1138,12 +2835,12 @@ fn stale_generation_owner_stays_fenced_and_current_generation_is_admitted() {
         "the admitted owner site is still subordinate to the one terminal: {current_logs}"
     );
 
-    // Honest scope note: PID reuse itself has no representation in these five
-    // modules. No `pid_reused` or `foreign` outcome literal exists anywhere in
-    // them, and `process_id`/`process_start_100ns` are recorded only from a
-    // validated start receipt (process_execution.rs:187-204), never reopened by
-    // number. So case 11 is proven in its generation/identity half only; the
-    // PID-reuse half is unreachable from these public seams.
+    // Honest scope note: PID reuse itself has no representation in these
+    // owned modules. No `pid_reused` or `foreign` outcome literal exists
+    // anywhere in them, and `process_id`/`process_start_100ns` are recorded only
+    // from a validated start receipt (process_execution.rs:187-204), never
+    // reopened by number. So case 11 is proven in its generation/identity half
+    // only; the PID-reuse half is unreachable from these public seams.
 }
 
 // WORK_UNIT_CASE: 901/18
@@ -1221,6 +2918,14 @@ fn unknown_reconcile_outcome_emits_exactly_one_terminal() {
         1,
         "exactly one terminal for one operation: {logs}"
     );
+    // REGRESSION GUARD (absence): the emitted code must be one of the FIVE stable
+    // literals `process_terminal_code` (`process_execution.rs:236-244`) can
+    // return, so a free-form error string reaching `observe_terminal_error_in_context`
+    // (`kernel_diagnostics.rs:699-712`, which bounds the code with
+    // `bound_field` but does not make it static) is red here. It is
+    // non-vacuously satisfiable because `codes.len() == 1` is asserted
+    // immediately above, so the predicate is evaluated over one real code read
+    // out of the captured terminal line rather than over an empty set.
     assert!(
         codes
             .iter()
@@ -1320,11 +3025,18 @@ fn exit_observation_never_claims_completed_work() {
         matches!(exit_response, ProcessExecutionResponse::Rejected(_)),
         "an unprovable exit never becomes an evidence projection: {exit_response:?}"
     );
-    // No exit status and no completion-shaped field is ever formatted on this
-    // path. This is a negative vocabulary guard, not the primary discrimination
-    // above: it turns red the moment the projection grows an `exit_code`,
-    // `exit_status`, `completion` or `completed` field, none of which the five
-    // owned modules emit today.
+    // REGRESSION GUARD (absence), NOT the primary discrimination above. It is
+    // non-vacuously satisfiable because this capture is already proven POSITIVE
+    // immediately above: `reconcile_requested` and `reconcile_unknown` each
+    // occur EXACTLY once with their outcomes pinned, so
+    // `exit_logs` is a non-empty rendering of a real `reconcile_in_context` run
+    // (`process_execution.rs:3527`/`:3561`) rather than an empty string that
+    // trivially contains no vocabulary. What it adds is a whole-run scan
+    // rather than a field read: it turns red the moment the projection grows an
+    // `exit_code`, `exit_status`, `completion` or `completed` string ANYWHERE
+    // in the rendered record - in a span slot, in a message, in a target - none
+    // of which the owned modules emit today, and which a field reader over the
+    // seventeen declared span slots would not see.
     for forbidden in ["exit_code", "exit_status", "completion", "completed"] {
         assert!(
             !exit_logs.contains(forbidden),
@@ -1439,8 +3151,9 @@ fn terminal_code_is_a_static_projection_not_error_prose() {
 // refused by `admit_material_process_start` (`src/lib.rs:3308`), which reads
 // only `admission.state_fence()` plus the Kernel's own service and activation
 // state, and the composition path returns at `process_execution.rs:4708` before
-// `retain_process_path_proof` (`:4756`) - the only reader of `executable` and
-// `working_directory` - can run. So these loops prove the REFUSAL BOUNDARY
+// `retain_process_path_proof` (declared `:4752`, whose `:4756`-`:4757` are the
+// only reads of `executable` and `working_directory`) can run. So these loops
+// prove the REFUSAL BOUNDARY
 // DOES NOT LEAK the payload, which is the property issue-901-body.md:45 asks
 // for ("Redact before formatting ... Fixed-field tests include nested and
 // oversized canaries"). They are reddened by ADDING a leak on this path, not
@@ -1451,14 +3164,17 @@ fn terminal_code_is_a_static_projection_not_error_prose() {
 //
 // The captured-byte loop below is therefore not the only leak channel this case
 // checks. The other one is the returned `ProcessExecutionRejection.detail`,
-// which production builds from the typed error at `process_execution.rs:4591`
-// (`error.to_string()`), so it is inspected for every canary too. And the
+// which production builds from the typed error at `process_execution.rs:4593`
+// (`detail: error.to_string().chars().take(512).collect()`), so it is inspected
+// for every canary too. And the
 // redaction owner itself is driven directly through
 // `eliot_kernel::kernel_diagnostics::bound_field`, the single emission boundary
-// every one of these five modules reaches (`kernel_diagnostics.rs:347-349`),
+// every one of these owned modules reaches (`kernel_diagnostics.rs:347-349`),
 // which is what puts the oversized/nested screening under test rather than only
 // the refusal path.
 #[test]
+// One length buys this: every leak channel of this shape is swept in one pass.
+#[allow(clippy::too_many_lines)]
 fn command_argument_environment_path_credential_canaries_are_absent() {
     let mut shape = default_shape("op-901-case27");
     let command = fixture_canary("command");
@@ -1553,10 +3269,33 @@ fn command_argument_environment_path_credential_canaries_are_absent() {
         Some("redacted:content"),
         "an over-long value is screened as content before bounding, not silently truncated"
     );
+    // The emitted value is anchored against an INDEPENDENTLY minted handle, not
+    // against `bounded.evidence_handle()`: comparing two accessors of one
+    // `BoundedField` cannot fail unless the implementation defines text ==
+    // handle, so it proved nothing. The expected handle is what production's own
+    // public `mint_handle` produces for THIS input under the Kernel family the
+    // facade declares (`KERNEL_TELEMETRY_FAMILY =
+    // TelemetryFieldFamily::OperationalLog` and `FIELD_LABEL_KEY = "code"`,
+    // `kernel_diagnostics.rs:68` and `:73`), which binds the handle to the
+    // canary's CONTENT: a facade that emitted a constant, a prefix, a different
+    // value's handle or a truncated input is now red here.
+    let expected_handle = mint_handle(
+        TelemetryFieldFamily::OperationalLog,
+        "code",
+        &oversized,
+        RedactionReason::Content,
+    )
+    .handle;
+    assert_eq!(
+        bounded.text(),
+        expected_handle,
+        "the emitted value IS the immutable evidence handle minted for this \
+         screened input"
+    );
     assert_eq!(
         bounded.evidence_handle(),
-        Some(bounded.text()),
-        "the emitted value IS the immutable evidence handle"
+        Some(expected_handle.as_str()),
+        "the recorded handle is that same content-bound handle"
     );
     for fragment in ["CANARY_OVERSIZED_901", "oversized-field-filler", "CANARY"] {
         assert!(
@@ -1577,9 +3316,23 @@ fn command_argument_environment_path_credential_canaries_are_absent() {
 // path never reads argv, environment or secret_refs, so these loops prove the
 // boundary does not leak them rather than proving reader-side redaction. The
 // returned rejection detail (built by production from the typed error at
-// `process_execution.rs:4591`) is the second channel and is checked for every
+// `process_execution.rs:4593`) is the second channel and is checked for every
 // canary too; the oversized value's screening disposition itself is pinned in
 // case 27 through the public `bound_field` boundary.
+//
+// The three `span_field(... "process_id" | "process_start_100ns" |
+// "image_sha256") == "unavailable"` comparisons are BACK, at the end of this
+// case, each labelled for what it is. They are REGRESSION GUARDS (absences) on
+// production behaviour, NOT a proof that this path produced an identity: the
+// only writer that can fill those three slots is
+// `record_process_start_receipt_identity` (`process_execution.rs:187-204`),
+// which takes a `&ProcessStartReceipt` this pre-launch refusal never mints, so
+// what they pin is that a production change recording a GUESSED PID, start time
+// or image digest on this path turns all three red. They are kept for that
+// reason, with the seventeen-slot sweep
+// (`assert_operation_span_carries_no_canary`) and the recorded-admission anchor
+// (`assert_recorded_admission_identity`) alongside them, unchanged.
+// No canary was removed from the planted payload to make any assertion pass.
 #[test]
 fn stream_provider_model_user_canaries_stay_unavailable_not_guessed() {
     let mut shape = default_shape("op-901-case28");
@@ -1619,37 +3372,142 @@ fn stream_provider_model_user_canaries_stay_unavailable_not_guessed() {
         "the canary admission still ran the real refusal"
     );
     let detail = rejection_detail(&response);
-    for canary in [
-        &stream,
-        &provider,
-        &model,
-        &user,
-        &lease_signature,
-        &process_memory,
-        &error_debug,
-        &nested,
-        &oversized,
-    ] {
+    let payload_canaries = [
+        stream.as_str(),
+        provider.as_str(),
+        model.as_str(),
+        user.as_str(),
+        lease_signature.as_str(),
+        process_memory.as_str(),
+        error_debug.as_str(),
+        nested.as_str(),
+        oversized.as_str(),
+    ];
+    assert_payload_canaries_absent(&logs, &detail, &payload_canaries);
+    let rejection = fixture_event("process.request_rejected");
+    assert_operation_span_carries_no_canary(&logs, &rejection, &payload_canaries);
+    assert_recorded_admission_identity(&logs, &rejection, &shape);
+
+    // Three REGRESSION GUARDS (absences) on the physical process identity, the
+    // same class the in-crate capsules of this issue keep and name as such in
+    // `src/tests/process_supervision_unknown_outcome.rs`.
+    //
+    // What each one IS: a guard on production behaviour. What each one is NOT:
+    // a proof that this path PRODUCED an identity - it produces none, which is
+    // the whole point. The shared span declares exactly these three slots as
+    // the literal "unavailable" (`kernel_diagnostics.rs:671-673`), and the
+    // ONLY writer that can fill them is
+    // `record_process_start_receipt_identity` (`process_execution.rs:187-204`),
+    // which needs a `&ProcessStartReceipt`. Its one callsite (`:2936`) sits on
+    // the `Ok(receipt)` arm of a launch that already completed, while this
+    // pre-launch refusal returns out of
+    // `reject_process_start_without_material_coverage_in_context`
+    // (`process_execution.rs:4575-4597`) - before a receipt exists and before
+    // `start_in_context` is ever reached (`process_execution_client.rs:118`,
+    // the `gateway.start_in_context(...)` call behind the path-proof match
+    // that begins at `:103`), so this path cannot reach that writer.
+    //
+    // That is why the guard bites instead of being vacuous: a production change
+    // that recorded a GUESSED PID, a guessed start time or a guessed image
+    // digest on a pre-launch refusal would overwrite the declared default and
+    // redden all three comparisons at once. That is the rule they hold, in the
+    // issue's own words - TASK.md:61 "PID alone cannot identify a process after
+    // reuse" and :63 "A malformed or absent identity remains unavailable, not
+    // guessed".
+    assert_eq!(
+        span_field(&logs, &rejection, "process_id"),
+        "unavailable",
+        "a pre-launch refusal records no PID: the identity is absent, not guessed: {logs}"
+    );
+    assert_eq!(
+        span_field(&logs, &rejection, "process_start_100ns"),
+        "unavailable",
+        "a pre-launch refusal records no start time: the identity is absent, not guessed: {logs}"
+    );
+    assert_eq!(
+        span_field(&logs, &rejection, "image_sha256"),
+        "unavailable",
+        "a pre-launch refusal records no image digest: the identity is absent, not guessed: {logs}"
+    );
+}
+
+/// Case 28's first canary channel: the captured diagnostic bytes and the
+/// returned `ProcessExecutionRejection.detail`, which production renders from
+/// the typed error at `process_execution.rs:4593`.
+fn assert_payload_canaries_absent(logs: &str, detail: &str, canaries: &[&str]) {
+    for canary in canaries {
         assert!(
-            !logs.contains(canary.as_str()),
+            !logs.contains(canary),
             "payload canary {canary} must never reach the captured bytes: {logs}"
         );
         assert!(
-            !detail.contains(canary.as_str()),
+            !detail.contains(canary),
             "payload canary {canary} must never reach the returned rejection detail, which production renders from the typed error: {detail}"
         );
     }
-    // The span is fed only from typed identities. No start receipt identity was
-    // recorded here, so those slots stay exactly "unavailable" and are never
-    // guessed from the payload material.
-    let rejection = fixture_event("process.request_rejected");
-    for slot in ["process_id", "process_start_100ns", "image_sha256"] {
-        assert_eq!(
-            span_field(&logs, &rejection, slot),
-            "unavailable",
-            "{slot} stays unavailable without a validated receipt: {logs}"
-        );
+}
+
+/// Case 28's second canary channel, and a TOTAL sweep over every field the
+/// shared operation span declares - the list is read out of the facade by
+/// [`declared_operation_slots`], not restated here - requiring no declared slot
+/// to carry a payload canary.
+///
+/// What it adds OVER the payload scan that ran two lines earlier on the same
+/// bytes with the same canary list: a different MECHANISM. That scan is a
+/// substring search over the captured line, so anything it cannot see as
+/// literal canary bytes is invisible to it, while this reads each declared slot
+/// off the RENDERED record through [`span_field`] and compares the slot's value
+/// itself. A recorder that emitted a canary transformed rather than verbatim, or
+/// a span whose slots arrived as recorded fields the scan's needle never matches
+/// as one token, is caught here and only here.
+///
+/// What it does NOT add: it is LOGICALLY SUBSUMED by that scan. Any canary
+/// reaching a declared slot appears in the same bytes and is therefore already
+/// caught by `assert_payload_canaries_absent`, so in the absence of a
+/// transforming recorder this sweep cannot fail independently. It is kept
+/// because it covers the failure mode the scan structurally cannot, and because
+/// it is total over the declared slot list - a slot the facade stops declaring
+/// turns it red instead of narrowing it - not as an independent proof.
+fn assert_operation_span_carries_no_canary(logs: &str, event: &str, canaries: &[&str]) {
+    for slot in declared_operation_slots() {
+        let value = span_field(logs, event, &slot);
+        for canary in canaries {
+            assert!(
+                !value.contains(canary),
+                "declared span slot {slot} must never carry payload canary \
+                 {canary}, got {value}: {logs}"
+            );
+        }
     }
+}
+
+/// Case 28's anchor, and the reason the sweep above is not vacuous: this
+/// pre-launch refusal path DOES record the caller's own admission identities
+/// onto the span. `record_process_start_request_context`
+/// (`process_execution.rs:145-183`) feeds `operation`, `generation`,
+/// `state_fence`, `process_tree` and `lease` from the admission, and the
+/// admission under test validated at construction -
+/// `ProcessExecutionAdmissionRequest::new` returns only a validated request
+/// (eliot-process `lib.rs:1108`), so the early return at
+/// `process_execution.rs:161-163` is not taken. So the sweep reads RECORDED
+/// values, not only declared defaults. Case 3 pins the same identities against
+/// a canary-free payload; this is the canary-bearing counterpart.
+fn assert_recorded_admission_identity(logs: &str, event: &str, shape: &IntentShape) {
+    assert_eq!(
+        span_field(logs, event, "operation"),
+        shape.operation_id,
+        "the span carries the caller's own operation identity: {logs}"
+    );
+    assert_eq!(
+        span_field(logs, event, "process_tree"),
+        shape.process_tree_id,
+        "the span carries the caller's own process tree: {logs}"
+    );
+    assert_eq!(
+        span_field(logs, event, "lease"),
+        format!("{}-lease", shape.operation_id),
+        "the span carries the caller's own lease reference: {logs}"
+    );
 }
 
 // WORK_UNIT_CASE: 901/29
@@ -1766,20 +3624,78 @@ fn captured_causal_order_and_diagnostic_only_diff() {
     assert_eq!(rejection_code(&response), "NOT_FOUND");
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // F-LOG-KERNEL-3 (#901 T30): the sweep must establish its OWN coverage
+    // before it sweeps. `assert_sweep_covers_derivation` was reached only
+    // through `assert_denominator`, whose sole caller is case 1, so running
+    // case 30 on its own swept six paths with the six-against-six
+    // correspondence between `OWNED_FILES` and `OWNED_PATHS` unasserted on this
+    // path. It is called here too, not moved: it reports the DIRECTION of any
+    // drift - "an owned module missing from OWNED_PATHS is never swept" for an
+    // extra owned file, "case 30 sweeps no path the derivation does not cover"
+    // for an extra swept path - naming which lists differ.
+    assert_sweep_covers_derivation();
     for owned in OWNED_PATHS {
         let src = std::fs::read_to_string(manifest_dir.join(owned))
             .unwrap_or_else(|_| panic!("owned module {owned} must be readable"));
         for needle in FORBIDDEN_IN_OWNED {
             assert!(!src.contains(needle), "{owned} must not contain {needle}");
         }
+        // A THREAD-LOCAL subscriber install, which the whole-file list above
+        // cannot carry because the capsules' own `with_default(` calls are
+        // legitimate, plus the exact observation-surface declaration set in any
+        // visibility.
+        assert_no_production_subscriber(owned, &src);
+        assert_observation_declarations(owned, &src);
     }
+    // F-LOG-KERNEL-3 (#901 T30), the seventh-module gap: a module that installs
+    // its OWN subscriber without calling one of the six observers is in neither
+    // owned list, is not produced by `derived_instrumented_files` - which is
+    // keyed only on the observer names - and is not in the unowned list below.
+    // That gap is CLOSED BY WIDENING THE DERIVATION rather than by prose:
+    // `derived_subscriber_installers` walks the same `src/` tree as the
+    // denominator derivation and reports every module whose PRODUCTION region
+    // installs a subscriber, so such a module is found here by measurement. The
+    // comparison is against a NAMED exclusion list, `FACADE_SUBSCRIBER_OWNERS`:
+    // the shared facade that declares the one installer and the composition root
+    // that calls it once. The owned six are filtered out because the loop above
+    // already proves each of them individually and names the exact line.
+    let outsiders: Vec<String> = derived_subscriber_installers()
+        .into_iter()
+        .filter(|path| !OWNED_PATHS.contains(&path.as_str()))
+        .collect();
+    assert_eq!(
+        outsiders,
+        FACADE_SUBSCRIBER_OWNERS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<Vec<String>>(),
+        "no production module under src/ installs a subscriber except the two \
+         NAMED owners: {outsiders:?}. A module with its own facade and no \
+         observer call is in neither owned list and is not produced by the \
+         observer-keyed denominator derivation, so this whole-tree derivation \
+         is the only reader in this file that can find it"
+    );
     // F-LOG-KERNEL-3 (#901 T30): the guard against a new PUBLIC observation
-    // surface is `pub fn observe_` (not `fn observe_`: the five owned modules
-    // legitimately carry `process_execution.rs:73 observe_process_in_context`,
-    // which is `pub(crate)`), and it is already asserted per file above because
-    // `pub fn observe_` is one of the `FORBIDDEN_IN_OWNED` needles. A separate
-    // zero-count over the concatenated sources would be implied by that
-    // assertion, so it is deliberately absent rather than duplicated.
+    // surface is `pub fn observe_` (not `fn observe_`: the six owned paths swept
+    // above legitimately carry `process_execution.rs:73 observe_process_in_context`,
+    // which is `pub(crate)`), and it is asserted per file above because
+    // `pub fn observe_` is one of the `FORBIDDEN_IN_OWNED` needles.
+    // `assert_observation_declarations` in that same loop now CLOSES THE THREE
+    // SPELLINGS the needle evaded, because its key is the DECLARATION and not
+    // the visibility: `pub(crate) fn observe_...`, `pub async fn observe_...`
+    // and `pub fn observe(` are all read and none is in the pinned set except
+    // `observe_process_in_context` at `process_execution.rs:73`. A separate
+    // zero-count over the concatenated sources would be implied by those two
+    // assertions, so it is deliberately absent rather than duplicated.
+    //
+    // WHAT IS STILL NOT COVERED, so that no reader of this case over-claims it:
+    // a public observation surface whose name does not begin with `observe`
+    // (`pub fn emit_boundary`), a re-export of a facade type (`pub use
+    // super::kernel_diagnostics::...`, bare or renamed with `as`), and a
+    // `macro_rules!` or trait impl that emits without naming `fn observe`. A
+    // direct emission of a `kernel.*` event IS partly covered: both literal
+    // spellings of `event` are needled above, but a new family emitted through
+    // any other field shape is not.
 
     for unowned in ["src/lib.rs", "src/kernel_diagnostics.rs"] {
         let src = std::fs::read_to_string(manifest_dir.join(unowned))
@@ -2079,7 +3995,7 @@ fn drive_commit_active(
             binding,
         ))
         .expect("staged supervision lease ticket");
-    let (logs, committed) = capture_with(|| authority.commit_active(stage.ticket()));
+    let (logs, committed) = capture_blocking(|| authority.commit_active(stage.ticket()));
     (
         logs,
         committed.expect("committed active supervision lease revision"),
@@ -2163,7 +4079,8 @@ fn drive_distinct_lease_phases(fixture: &SupervisionFixture) -> DistinctLeasePha
         Some(revoke_head.record.revision),
         revocation_binding(&revoke_head, "eliot-901-case16-revocation"),
     );
-    let (revoke_logs, revoked) = capture_with(|| authority.commit_terminal(revoke_stage.ticket()));
+    let (revoke_logs, revoked) =
+        capture_blocking(|| authority.commit_terminal(revoke_stage.ticket()));
     let revoked = revoked.expect("committed revoked supervision lease revision");
 
     let (_expire_acquire_logs, expire_head) = drive_commit_active(
@@ -2175,7 +4092,7 @@ fn drive_distinct_lease_phases(fixture: &SupervisionFixture) -> DistinctLeasePha
         active_lease_binding(fixture, first_expiry_ms),
     );
     let past_due_ms = expire_head.record.binding.expires_at_ms + 1;
-    let (expire_logs, expired) = capture_with(|| {
+    let (expire_logs, expired) = capture_blocking(|| {
         authority.expire_past_due_lease("eliot-901-case16-expire", &fixture.fence, past_due_ms)
     });
     let expired = expired
@@ -2192,7 +4109,7 @@ fn drive_distinct_lease_phases(fixture: &SupervisionFixture) -> DistinctLeasePha
     );
     let mut conflicting = conflict_stage.ticket().clone();
     conflicting.binding.revocation_reason = Some("eliot-901-case16-conflict-altered".to_owned());
-    let (conflict_logs, conflict) = capture_with(|| authority.commit_terminal(&conflicting));
+    let (conflict_logs, conflict) = capture_blocking(|| authority.commit_terminal(&conflicting));
 
     DistinctLeasePhases {
         acquired,
@@ -2240,7 +4157,7 @@ fn lease_acquisition_is_not_yet_active_ownership() {
         "a staged acquisition is not active ownership yet"
     );
 
-    let (logs, committed) = capture_with(|| authority.commit_active(stage.ticket()));
+    let (logs, committed) = capture_blocking(|| authority.commit_active(stage.ticket()));
     let committed = committed.expect("committed active supervision lease revision");
 
     let requested = "kernel.supervision.commit_requested";
@@ -2335,6 +4252,18 @@ fn renewal_revocation_expiry_and_conflict_are_distinct_observations() {
         "renewal and expiry stay distinct: {logs}",
         logs = phases.expire_logs
     );
+    // REGRESSION GUARD (absence), non-vacuously satisfiable. Each of these three
+    // captures is already proven POSITIVE above: `span_field` PANICS unless the
+    // capture carries that phase's own `commit_requested` /
+    // `terminal_requested` / `expire_committed` line, and
+    // `event_outcome(...) == "success"` PINNED its committed sibling, so each
+    // capture is non-empty and carries the committed pair. What the loop adds is
+    // the negative half of the same commit: `terminal_failed`
+    // (`supervision_lease_authority.rs:918`, the refusal arm of
+    // `commit_terminal_in_context`) and a `kernel.terminal_error`
+    // (`:923`) must be absent from a run that committed - the difference between
+    // "attempted and refused" and "attempted and committed" is what this case
+    // draws, and neither absence can be satisfied by an empty capture.
     for logs in [&phases.renew_logs, &phases.revoke_logs, &phases.expire_logs] {
         assert!(
             !logs.contains("event=\"kernel.supervision.terminal_failed\""),

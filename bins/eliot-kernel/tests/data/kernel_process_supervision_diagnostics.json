@@ -8,7 +8,8 @@
     "bins/eliot-kernel/src/daemon_process_launch.rs",
     "bins/eliot-kernel/src/daemon_live_receipt.rs",
     "bins/eliot-kernel/src/daemon_supervision.rs",
-    "bins/eliot-kernel/src/supervision_lease_authority.rs"
+    "bins/eliot-kernel/src/supervision_lease_authority.rs",
+    "bins/eliot-kernel/src/process_execution_client.rs"
   ],
   "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
   "events": {
@@ -1059,6 +1060,14 @@
       "detail_prefix": "kernel.supervision.expire_committed",
       "event": "kernel.supervision.expire_committed",
       "covering_case": 16
+    },
+    {
+      "file": "bins/eliot-kernel/src/process_execution_client.rs",
+      "function": "start",
+      "stage": "admitted launch",
+      "detail_prefix": "kernel.process.request_rejected",
+      "event": "kernel.process.request_rejected",
+      "covering_case": 4
     }
   ],
   "canaries": {
@@ -1080,10 +1089,225 @@
     "oversized": "CANARY_OVERSIZED_901_oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-oversized-field-filler-"
   },
   "inline_tests": [
-    "process_execution_diagnostics_tests",
-    "daemon_supervision_diagnostics_tests"
+    "process_supervision_daemon_receipt_tests",
+    "process_supervision_launch_tests",
+    "process_supervision_lifecycle_tests",
+    "process_supervision_identity_tests",
+    "process_supervision_unknown_outcome_tests"
   ],
   "max_field_bytes": 256,
   "max_detail_bytes": 1024,
-  "note": "Pins the exact five-module production boundary inventory of issue #901 as measured on origin/main@8fb0a426f: git diff 5eac63dc7..8fb0a426f -- bins/eliot-kernel/src/ is empty for these five paths, so the inventory is unchanged from the base where they were last touched (5eac63dc7, #1884), and the two commits origin/main gained after 8fb0a426f (0ec97e52b, f5cc5d2bb) touch neither these five paths nor src/kernel_diagnostics.rs, so the bounds pinned below still hold. Every entry of boundaries is one citable PRODUCTION callsite of observe_process/observe_process_in_context (process_execution.rs), observe_daemon_launch (daemon_process_launch.rs), observe_live_receipt (daemon_live_receipt.rs), observe_supervision (daemon_supervision.rs) or observe_supervision_lease (supervision_lease_authority.rs) in the five files listed by files: 85 in process_execution.rs, 4 in daemon_process_launch.rs, 11 in daemon_live_receipt.rs, 7 in daemon_supervision.rs and 9 in supervision_lease_authority.rs, 116 in total, against 117 measured production callsites. Exactly one of those 117 carries no row: the observe_process forwarder at src/process_execution.rs:67, inside fn observe_process (src/process_execution.rs:65-68), which builds the all-\"unavailable\" operation span at :66 and forwards to observe_process_in_context at :67 instead of instrumenting a boundary of its own; it is still present and is still only a forwarder, so no row is fabricated for it. detail_prefix is the exact fixed event literal that the named callsite passes to the observer and event carries that same literal under the sibling fixture's key name, so the two keys are deliberately redundant, with exactly one exception: at src/process_execution.rs:2403 reconcile_origin_grant_effect passes the local event selected at src/process_execution.rs:2397, :2399 and :2401, so that row's event is the empty string and its detail_prefix is the shared literal prefix kernel.process.grant_reconcile_. The 7 excluded callsites are exactly the ones behind the two test gates: #[cfg(test)] mod process_execution_diagnostics_tests (src/process_execution.rs:4827-4828) holds :4923, :4924 and :4925, and #[cfg(all(test, windows))] mod daemon_supervision_diagnostics_tests (src/daemon_supervision.rs:802-803) holds 4 callsites, :918, :919, :924 and :925. inline_tests names those same two pre-existing diagnostics modules and no other: process_execution_diagnostics_tests holds its single #[test] at src/process_execution.rs:4887 and daemon_supervision_diagnostics_tests holds its single #[test] at src/daemon_supervision.rs:872; both PRE-DATE this delivery, and this work unit authors NO inline test because cards/901.md:14 places the five owned modules under READ ONLY and cards/901.md:20 lists them under DO NOT. stage values are the frozen boundary names of issue-901-body.md:35 rather than tokens carried in the modules' records, because the five observation helpers emit only event and outcome and no detail field at all (src/process_execution.rs:81-87, src/daemon_process_launch.rs:59-65, src/daemon_live_receipt.rs:42-48, src/daemon_supervision.rs:56-62, src/supervision_lease_authority.rs:59-65). covering_case maps each callsite to the issue-901-body.md:49-80 matrix case that observes it, so many callsites share one case; cases 1, 9, 11, 25, 26, 27, 28, 29 and 30 are cross-cutting - the five-file denominator, the changed-payload conflict branch, the PID-reuse branch, one-terminal-per-operation, the typed-code rule, the two canary cases, sink noninterference and the diagnostic-only diff - and therefore own no boundary row. max_field_bytes is the real MAX_DIAGNOSTIC_FIELD_BYTES (src/kernel_diagnostics.rs:59) and is the operative bound for every record these five modules emit, because both the observation helpers and the terminal funnel reach it through bound_field (src/kernel_diagnostics.rs:347-349 and :699-712). max_detail_bytes is the real MAX_DIAGNOSTIC_DETAIL_BYTES (src/kernel_diagnostics.rs:61) but it is NOT the operative limit here: bound_detail is never called from any of the five owned modules, no boundary in them emits a detail field, and observe_terminal_error_in_context bounds its code with bound_field, so no record from these five modules is ever screened against the 1024-byte detail bound. terminal_codes pins the exact static vocabulary of each of the four mappers: process_terminal_code (src/process_execution.rs:236-244) yields process_contract, process_not_found, process_unavailable, process_evidence_sink and process_unknown_outcome; daemon_launch_terminal_code (src/daemon_process_launch.rs:79-91) yields PLATFORM, TRANSPORT, RUNTIME, ORS, CORE, SERVICE, STORE_BOOTSTRAP_REQUIRED, STORE_ALREADY_CONNECTED and PRINCIPAL; live_receipt_terminal_code (src/daemon_live_receipt.rs:95-109) yields LIVE_INVALID_FIELD, LIVE_ILLEGAL_TRANSITION, LIVE_HANDSHAKE_MISMATCH, LIVE_MISSING_CONTAINMENT, READINESS_NOT_PROVEN, LIVE_ADMISSION_CLOSED, LIVE_GENERATION_FENCED, LIVE_RESTART_BUDGET_EXHAUSTED, LIVE_CONTROL_RESERVE_EXHAUSTED, LIVE_PLATFORM and LIVE_CORE; supervision_authority_terminal_code (src/supervision_lease_authority.rs:233-249) yields SUPERVISION_CONFIGURATION, SUPERVISION_KEY_UNAVAILABLE, SUPERVISION_CONTRACT, SUPERVISION_IDENTITY_CONFLICT, SUPERVISION_STALE_REVISION, SUPERVISION_TICKET_EXPIRED and SUPERVISION_ORS. It additionally pins exactly one code emitted on kernel.terminal_error DIRECTLY from these five modules outside any mapper, WATCHDOG_COVERAGE_UNAVAILABLE, passed as a plain local at src/process_execution.rs:4590 from the binding at :4583-4584 whose string literal is ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE (crates/kernel/eliot-kernel-service/src/protocol.rs:2644); it is filed under process because its emitter is process_execution.rs. Every other observe_terminal_error call in the five modules passes one of the four mappers, and src/daemon_supervision.rs emits no terminal error at all, which is why the supervision family maps to supervision_lease_authority.rs. One production gap is recorded here rather than fixed: issue-901-body.md:35 freezes the boundary list \"daemon receipt request/publication/validation/expiry\", but src/daemon_live_receipt.rs contains no expiry observation at all - its 11 production callsites are publication (:146, :163, :169, :182), validation (:456, :462), readiness (:577, :587, :591) and store availability (:829, :902) - so receipt-expiry is a production instrumentation gap in issue #901 rather than a fixture omission, and no fixture row can exist for it until that module gains one, which cards/901.md:14 and cards/901.md:20 forbid here. The canaries are secret-shaped strings a test plants in the admission payload's own fields (executable, argv, working_directory, environment, secret_refs) and then asserts absent from the captured diagnostic bytes, so each can reach the payload if a caller passed it and none of them is emitted by production code; canaries.nested embeds the token inside a three-level nested envelope and canaries.oversized is 320 bytes, strictly longer than the 256-byte max_field_bytes. This fixture pins the boundary inventory only; the 30-case WORK_UNIT_CASE: 901/1..30 matrix belongs to test_file (cards/901.md:18)."
+  "case_owners": [
+    {
+      "case": 1,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "process_supervision_denominator_is_exact",
+      "covered_item": "AUD5",
+      "boundary": null
+    },
+    {
+      "case": 2,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "admitted_owner_and_rejected_owner_are_distinct_sites",
+      "covered_item": "W1",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::authorize_process_owner_in_context::kernel.process.owner_admitted"
+    },
+    {
+      "case": 3,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "operation_tree_and_lease_bind_the_validated_admission",
+      "covered_item": "W27",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::reject_process_start_without_material_coverage_in_context::kernel.process.request_rejected"
+    },
+    {
+      "case": 4,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "pre_launch_refusal_stays_not_attempted",
+      "covered_item": "W12",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::reject_process_start_without_material_coverage_in_context::kernel.process.request_rejected"
+    },
+    {
+      "case": 5,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_launch.rs",
+      "test_fn": "registration_is_recorded_before_any_launch_handoff",
+      "covered_item": "W13",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::run_process_start::kernel.process.start_registration"
+    },
+    {
+      "case": 6,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_launch.rs",
+      "test_fn": "registered_intent_os_launch_live_handle_and_receipt_are_different_evidence",
+      "covered_item": "W9",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::require_effect_replay_authority::kernel.process.effect_replay_denied"
+    },
+    {
+      "case": 7,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "possible_effect_outcome_stays_unknown_under_its_operation",
+      "covered_item": "W22",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::cancel_with_origin_grant_inner::kernel.process.cancel_failed"
+    },
+    {
+      "case": 8,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_launch.rs",
+      "test_fn": "an_exact_replay_neither_launches_again_nor_commits_a_start_again",
+      "covered_item": "W23",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::require_effect_replay_authority::kernel.process.effect_replay_denied"
+    },
+    {
+      "case": 9,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_launch.rs",
+      "test_fn": "a_changed_same_operation_payload_retains_the_actual_store_conflict",
+      "covered_item": "W25",
+      "boundary": null
+    },
+    {
+      "case": 10,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_launch.rs",
+      "test_fn": "owner_generation_and_physical_start_identity_are_exact",
+      "covered_item": "W29",
+      "boundary": null
+    },
+    {
+      "case": 11,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "stale_generation_owner_stays_fenced_and_current_generation_is_admitted",
+      "covered_item": null,
+      "boundary": null
+    },
+    {
+      "case": 12,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_daemon_receipt.rs",
+      "test_fn": "live_receipt_request_publication_and_validation_are_distinct_observations",
+      "covered_item": "W16",
+      "boundary": "bins/eliot-kernel/src/daemon_live_receipt.rs::publish_eliotd_live_receipt::kernel.live_receipt.publication_requested"
+    },
+    {
+      "case": 13,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_daemon_receipt.rs",
+      "test_fn": "invalid_stale_or_expired_receipt_cannot_imply_readiness",
+      "covered_item": "W14",
+      "boundary": "bins/eliot-kernel/src/daemon_live_receipt.rs::verify_published_eliotd_live_receipt::kernel.live_receipt.validation_observed"
+    },
+    {
+      "case": 14,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_daemon_receipt.rs",
+      "test_fn": "liveness_is_not_semantic_readiness",
+      "covered_item": "W15",
+      "boundary": "bins/eliot-kernel/src/daemon_live_receipt.rs::validate_daemon_process_readiness_in_context::kernel.live_receipt.readiness_rejected"
+    },
+    {
+      "case": 15,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "lease_acquisition_is_not_yet_active_ownership",
+      "covered_item": "W17",
+      "boundary": "bins/eliot-kernel/src/supervision_lease_authority.rs::commit_active_in_context::kernel.supervision.commit_requested"
+    },
+    {
+      "case": 16,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "renewal_revocation_expiry_and_conflict_are_distinct_observations",
+      "covered_item": "W18",
+      "boundary": "bins/eliot-kernel/src/supervision_lease_authority.rs::commit_terminal_in_context::kernel.supervision.terminal_requested"
+    },
+    {
+      "case": 17,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_daemon_receipt.rs",
+      "test_fn": "old_or_late_generation_receipt_cannot_restore_current_state",
+      "covered_item": "W19",
+      "boundary": "bins/eliot-kernel/src/daemon_supervision.rs::classify_eliotd_live_receipt_transition_in_context::kernel.supervision.receipt_replaced"
+    },
+    {
+      "case": 18,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "cancellation_request_differs_from_acknowledgement",
+      "covered_item": "W20",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::cancel_with_origin_grant_inner::kernel.process.cancel_requested"
+    },
+    {
+      "case": 19,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_lifecycle.rs",
+      "test_fn": "cancellation_acknowledgement_is_not_terminal_cancellation",
+      "covered_item": "W21",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::cancel_with_origin_grant_inner::kernel.process.cancel_failed"
+    },
+    {
+      "case": 20,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "unknown_reconcile_outcome_emits_exactly_one_terminal",
+      "covered_item": "W26",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::reconcile_in_context::kernel.process.reconcile_unknown"
+    },
+    {
+      "case": 21,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "exit_observation_never_claims_completed_work",
+      "covered_item": "W8",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::inspect_inner::kernel.process.inspect_failed"
+    },
+    {
+      "case": 22,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_lifecycle.rs",
+      "test_fn": "parent_exit_alone_never_establishes_descendant_cleanup",
+      "covered_item": "W11",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::close_registered_descendant_in_context::kernel.process.descendant_close_requested"
+    },
+    {
+      "case": 23,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_lifecycle.rs",
+      "test_fn": "cleanup_and_reap_failure_retain_owner_and_reconciliation_requirement",
+      "covered_item": "W30",
+      "boundary": "bins/eliot-kernel/src/process_execution.rs::close_all_registered_descendants::kernel.process.descendant_close_failed"
+    },
+    {
+      "case": 24,
+      "test_file": "bins/eliot-kernel/src/tests/process_supervision_lifecycle.rs",
+      "test_fn": "restart_reattach_observation_binds_exact_operation_process_and_lease",
+      "covered_item": "W31",
+      "boundary": "bins/eliot-kernel/src/daemon_live_receipt.rs::validate_daemon_process_readiness_in_context::kernel.live_receipt.readiness_requested"
+    },
+    {
+      "case": 25,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "one_designated_terminal_per_failed_operation",
+      "covered_item": "W7",
+      "boundary": null
+    },
+    {
+      "case": 26,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "terminal_code_is_a_static_projection_not_error_prose",
+      "covered_item": "W33",
+      "boundary": null
+    },
+    {
+      "case": 27,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "command_argument_environment_path_credential_canaries_are_absent",
+      "covered_item": "W34",
+      "boundary": null
+    },
+    {
+      "case": 28,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "stream_provider_model_user_canaries_stay_unavailable_not_guessed",
+      "covered_item": "W35",
+      "boundary": null
+    },
+    {
+      "case": 29,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "sink_presence_leaves_results_unchanged",
+      "covered_item": "W36",
+      "boundary": null
+    },
+    {
+      "case": 30,
+      "test_file": "bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs",
+      "test_fn": "captured_causal_order_and_diagnostic_only_diff",
+      "covered_item": "W37",
+      "boundary": null
+    }
+  ],
+  "note": "Pins the exact production boundary inventory of issue #901 across the six instrumented files this fixture lists in files: the five modules the issue names, plus the sixth that carries one of its own #901 observation callsites, re-derived from origin/main and re-confirmed at the delivery commit: all six inspected files are byte-identical between this branch and origin/main, i.e. git diff HEAD origin/main -- over those six paths is empty. No SHA is restated in this sentence on purpose - every earlier revision of it named SHAs that went stale on the next merge, and one of them asserted an ancestry that stopped being true; the reproducible check is the diff above, not a remembered hash. The five owned modules are therefore unchanged from the base where they were last touched: git log 5eac63dc7..HEAD -- over the five owned modules is empty, so those five modules are unchanged from the base where they were last touched (5eac63dc7, #1884, still the last commit touching any of them), and the single commit in that range that touches src/kernel_diagnostics.rs is c015cf493 (#5028), which changed that file and none of the five modules. No revision SHA is restated here either, for the same reason: an earlier revision of this sentence named two branch SHAs that are no longer this branch's head. The two reproducible checks are git log origin/main -- over the five owned modules plus src/kernel_diagnostics.rs, which must show no commit touching them, and git diff HEAD origin/main -- over those same six paths, which must be empty, so every count, line number, event literal and bound pinned below was re-read on this tree and still holds. Every entry of boundaries is one citable PRODUCTION callsite of observe_process/observe_process_in_context (process_execution.rs and process_execution_client.rs), observe_daemon_launch (daemon_process_launch.rs), observe_live_receipt (daemon_live_receipt.rs), observe_supervision (daemon_supervision.rs) or observe_supervision_lease (supervision_lease_authority.rs) in the files listed by files: 85 in process_execution.rs, 1 in process_execution_client.rs, 4 in daemon_process_launch.rs, 11 in daemon_live_receipt.rs, 7 in daemon_supervision.rs and 9 in supervision_lease_authority.rs, 117 in total, against 118 measured production callsites. The earlier count of 116 rows against 117 callsites was measured ONLY inside the five files this note previously listed, and was therefore wrong: bins/eliot-kernel/src/process_execution_client.rs carries one #901 observation callsite of its own, observe_process_in_context at :106 with event kernel.process.request_rejected and outcome path_proof, on the arm where retaining the process path proof fails. That is now a row (function start, the GatewayProcessStarter::start method of impl ProcessStarter at process_execution_client.rs:72-123 that encloses the callsite; stage \"admitted launch\", covering_case 4), and the file is now listed in files. The omission was found in this delivery by DERIVING the instrumented set from the source tree instead of restating it: the denominator case walks bins/eliot-kernel/src, enumerates every production callsite of the six observers and compares that DERIVED set against this array in both directions, so a sixth instrumented module - or a sixth one added later - now turns the test red instead of passing silently. The five OWNED modules named by the issue are exactly bins/eliot-kernel/src/process_execution.rs, bins/eliot-kernel/src/daemon_process_launch.rs, bins/eliot-kernel/src/daemon_live_receipt.rs, bins/eliot-kernel/src/daemon_supervision.rs and bins/eliot-kernel/src/supervision_lease_authority.rs, and they contribute 116 of the 117 rows. A SIXTH file contributes the remaining row: bins/eliot-kernel/src/process_execution_client.rs, whose single callsite at :106 was added by the same instrumentation commit 80659466e that created the five owned modules, so it is part of this issue's instrumentation even though the issue's module list does not name it. It is inventoried rather than ignored, because the denominator is now derived. Exactly one of those 118 carries no row: the observe_process forwarder at src/process_execution.rs:67, inside fn observe_process (src/process_execution.rs:65-68), which builds the all-\"unavailable\" operation span at :66 and forwards to observe_process_in_context at :67 instead of instrumenting a boundary of its own; it is still present and is still only a forwarder, so no row is fabricated for it. detail_prefix is the exact fixed event literal that the named callsite passes to the observer and event carries that same literal under the sibling fixture's key name, so the two keys are deliberately redundant, with exactly one exception: at src/process_execution.rs:2403 reconcile_origin_grant_effect passes the local event selected at src/process_execution.rs:2397, :2399 and :2401, so that row's event is the empty string and its detail_prefix is the shared literal prefix kernel.process.grant_reconcile_. The 7 excluded callsites are exactly the ones behind the two test gates: #[cfg(test)] mod process_execution_diagnostics_tests (src/process_execution.rs:4827-4828) holds :4923, :4924 and :4925, and #[cfg(all(test, windows))] mod daemon_supervision_diagnostics_tests (src/daemon_supervision.rs:802-803) holds 4 callsites, :918, :919, :924 and :925. inline_tests names all FIVE in-crate capsules that bins/eliot-kernel/src/lib.rs registers for this delivery - process_supervision_daemon_receipt_tests (lib.rs:5711-5713), process_supervision_launch_tests (lib.rs:5718-5720), process_supervision_lifecycle_tests (lib.rs:5722-5724), process_supervision_identity_tests (lib.rs:5729-5731) and process_supervision_unknown_outcome_tests (lib.rs:5738-5740) - and no other module. Its selection rule is that registration set, NOT case ownership: an earlier revision of this sentence stated a DIFFERENT property, that the list holds only capsules carrying a WORK_UNIT_CASE marker, and that is false of the list as it now stands. lib.rs declares exactly six #[cfg(test)] modules in all - mod tests (lib.rs:5699-5700) and local_read_claim_tests (lib.rs:5702-5704) alongside these five - and inline_tests omits the two pre-existing ones because they are the crate's own internal suites, not this delivery's capsules. Whether a capsule carries a case marker is recorded instead by case_owners[].test_file, and by that field process_supervision_identity_tests and process_supervision_unknown_outcome_tests own NO case number at all - measured: a WORK_UNIT_CASE: 901/ marker appears 17 times in this integration suite, 5 times in process_supervision_launch.rs, 4 times in process_supervision_daemon_receipt.rs and 4 times in process_supervision_lifecycle.rs, and not at all in those last two capsules. That is a separate and independently useful fact about case ownership, not a selection rule for inline_tests. One surface of this delivery is target-dependent and is recorded here rather than left implicit: FIFTEEN of the thirty matrix cases do not exist at all on a non-Windows target. Every capsule that carries a case number is gated at the FILE level by an inner #![cfg(windows)] placed before its first item - process_supervision_launch.rs:9, process_supervision_daemon_receipt.rs:46 and process_supervision_lifecycle.rs:2 - so cases 5, 6, 8, 9 and 10 (launch), cases 12, 13, 14 and 17 (daemon receipt) and cases 19, 22, 23 and 24 (lifecycle) are all elided on such a target; process_supervision_identity.rs:2 and process_supervision_unknown_outcome.rs:2 are gated the same way, which costs no case number because neither owns one. The remaining two of the fifteen are integration-suite tests that carry #[cfg(windows)] on the #[test] itself, cases 15 and 16 at kernel_process_supervision_diagnostics.rs:4128 and :4223. The other fifteen cases - 1, 2, 3, 4, 7, 11, 18, 20, 21, 25, 26, 27, 28, 29 and 30 - carry no Windows gate at either level and are compiled on every target. A cfg-elided case is not a passing case: the fifteen gated cases are proven only where they are actually built and run, which for this issue is the real Windows process/protocol edge - I02-20's proof and stop condition requires \"the owning cell's deterministic Module Proof plus the affected real Windows/process/protocol edge\" - and never by a target on which they do not exist. The two PRE-EXISTING in-file diagnostics modules named above, process_execution_diagnostics_tests (src/process_execution.rs:4827-4828) and daemon_supervision_diagnostics_tests (src/daemon_supervision.rs:802-803), are not capsules and are not listed: every one of their #[test] pre-dates this delivery: EXACTLY ONE in process_execution_diagnostics_tests, the diagnostics mapping test at src/process_execution.rs:4887 (process_diagnostics_terminal_mapping_and_owner_boundary), and exactly one in daemon_supervision_diagnostics_tests, at src/daemon_supervision.rs:872 (supervision_diagnostics_readiness_and_renewal_boundaries). The earlier \"seven\" was a whole-FILE total misread as one module's count; measured by brace-matched extent on this tree, mod process_execution_diagnostics_tests runs src/process_execution.rs:4828-4946 and holds exactly one #[test], while the SIX other #[test]s of that same file - at :5245, :5266, :5288, :5315, :5356 and :5382 - all belong to the separate #[cfg(all(test, windows))] mod new_effect_operation_authority_1884_tests at src/process_execution.rs:4949-5415, which is #1884's module and not part of this issue's surface. Both file-level modules here are pre-existing and neither is a capsule. No inline test was added inside a production module, because cards/901.md:14 places the five owned modules under READ ONLY and cards/901.md:20 lists them under DO NOT. stage values are the frozen boundary names of issue-901-body.md:35 rather than tokens carried in the modules' records, because the five observation helpers emit only event and outcome and no detail field at all (src/process_execution.rs:81-87, src/daemon_process_launch.rs:59-65, src/daemon_live_receipt.rs:42-48, src/daemon_supervision.rs:56-62, src/supervision_lease_authority.rs:59-65). A stage value is therefore the issue's name for the boundary, and is NOT a claim that the callsite it sits at performs the activity that name suggests. Measured on this tree by tallying the fixture own two fields, with no parsing involved: 34 rows carry the value operation registration, and exactly FOUR of them name a start event - run_process_start with kernel.process.start_registration, whose literal stands at src/process_execution.rs:3949, :3959 and :4002, and kernel.process.start_replay_observed at :4034. The other THIRTY name an effect event and sit at callsites that do something else under that issue name, across fourteen function-and-event pairs: capture_before reports the effect baseline as unavailable on 2 rows and the effect observed on 2, read_after produces the effect readback on 4 readback-failed rows and 1 readback-deleted row, ingest reports the effect observed on 8, ingest_governed_effect_observation reports the effect observed on 2, the effect ingest failed on 1 and the effect readback failed on 1, check_retained_external_transition detects a retained external transition on 3, record_proven_target_transition reports the effect observed on 2, admit_host_event_hint on 1, capture_governed_effect_baseline and new each report the effect baseline as unavailable on 1, and require_effect_replay_authority decides on 1 whether an already-executed effect may be replayed. None of the thirty registers an operation. The value supervision lease acquire is likewise not acquire-only: commit_active_in_context (src/supervision_lease_authority.rs:821, whose own comment at :826 reads lease acquire/renew boundary) is the renewal boundary too, called as renewed from src/lib.rs:3846 and :4075 and as the acquire from src/lib.rs:3766. covering_case maps each callsite to the issue-901-body.md:49-80 matrix case that OWNS ITS INSTRUMENTATION. That is a matrix-ownership map, and it is NOT a claim that the covering case's own test reads that row's event, so many callsites share one case. Measured on this tree, 80 of the 117 rows name a callsite whose event the covering case's own test never reads - counted over each test's own body PLUS the same-file helper functions that body calls, with the suite's fixture_event(key) indirection resolved to its kernel.<key> literal and with a row counted as read only where the source carries that event as a COMPLETE quoted literal, so an event=\"...\" fragment asserted ABSENT is a proof of absence and not a read. The helper term is load-bearing, not decorative: a body-only reading of the same rule yields 84 rather than 80, and the ENTIRE four-row difference is case 16. Its body (kernel_process_supervision_diagnostics.rs:4225-4277) carries exactly ONE kernel.supervision literal, the absence check on kernel.supervision.terminal_failed at :4269, so under this rule the body reads NONE of case 16's nine owned rows, while the four same-file phase helpers that body calls read four of them: terminal_requested and terminal_committed in assert_revocation_phase, expire_committed in assert_expiry_phase, and terminal_failed in assert_conflict_phase. assert_renewal_phase names commit_requested and commit_committed, which are case 15's rows and not case 16's, so the helper term is worth four owned rows and not six. The per-case shape is otherwise unchanged: case 3 owns 24 effect_* rows while its test reads only kernel.process.request_rejected and NONE of the 24, case 2 owns 13 rows while its test reads only four of them (kernel.process.request_received, kernel.process.request_admitted, kernel.process.owner_admitted and kernel.process.owner_rejected), and case 24 owns 5 reconcile rows while its test reads only kernel.live_receipt.readiness_requested. Two sets must be stated rather than the one ambiguous phrase \"the same holds\": twenty-one of the thirty cases own at least one boundary row, EIGHTEEN of those have at least one OWNED row unread - cases 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 15, 16, 18, 19, 20, 21, 22 and 24 - and the remaining three, 14, 17 and 23, read every row they own. But \"at least one owned row unread\" is NOT \"reads none of its rows\", and FIVE of those eighteen read NONE of their own rows at all: cases 3 (all 24), 6 (all 4), 7 (all 3), 10 (both 2) and 24 (all 5). A reader must therefore take boundaries[].covering_case as ownership and case_owners[].boundary as the single representative callsite a case actually executes, and must not read covering_case as proof that a case observes that event; cases 1, 9, 11, 25, 26, 27, 28, 29 and 30 are cross-cutting - the instrumented-file denominator, the changed-payload conflict branch, the PID-reuse branch, one-terminal-per-operation, the typed-code rule, the two canary cases, sink noninterference and the diagnostic-only diff - and therefore own no boundary row. max_field_bytes is the real MAX_DIAGNOSTIC_FIELD_BYTES (src/kernel_diagnostics.rs:59) and is the operative bound for every record these five modules emit, because both the observation helpers and the terminal funnel reach it through bound_field (src/kernel_diagnostics.rs:347-349 and :699-712). max_detail_bytes is the real MAX_DIAGNOSTIC_DETAIL_BYTES (src/kernel_diagnostics.rs:61) but it is NOT the operative limit here: bound_detail is never called from any of the five owned modules, no boundary in them emits a detail field, and observe_terminal_error_in_context bounds its code with bound_field, so no record from these five modules is ever screened against the 1024-byte detail bound. terminal_codes pins the exact static vocabulary of each of the four mappers: process_terminal_code (src/process_execution.rs:236-244) yields process_contract, process_not_found, process_unavailable, process_evidence_sink and process_unknown_outcome; daemon_launch_terminal_code (src/daemon_process_launch.rs:79-91) yields PLATFORM, TRANSPORT, RUNTIME, ORS, CORE, SERVICE, STORE_BOOTSTRAP_REQUIRED, STORE_ALREADY_CONNECTED and PRINCIPAL; live_receipt_terminal_code (src/daemon_live_receipt.rs:95-109) yields LIVE_INVALID_FIELD, LIVE_ILLEGAL_TRANSITION, LIVE_HANDSHAKE_MISMATCH, LIVE_MISSING_CONTAINMENT, READINESS_NOT_PROVEN, LIVE_ADMISSION_CLOSED, LIVE_GENERATION_FENCED, LIVE_RESTART_BUDGET_EXHAUSTED, LIVE_CONTROL_RESERVE_EXHAUSTED, LIVE_PLATFORM and LIVE_CORE; supervision_authority_terminal_code (src/supervision_lease_authority.rs:233-249) yields SUPERVISION_CONFIGURATION, SUPERVISION_KEY_UNAVAILABLE, SUPERVISION_CONTRACT, SUPERVISION_IDENTITY_CONFLICT, SUPERVISION_STALE_REVISION, SUPERVISION_TICKET_EXPIRED and SUPERVISION_ORS. It additionally pins exactly one code emitted on kernel.terminal_error DIRECTLY from these five modules outside any mapper, WATCHDOG_COVERAGE_UNAVAILABLE, passed as a plain local at src/process_execution.rs:4590 from the binding at :4583-4584 whose string literal is ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE (crates/kernel/eliot-kernel-service/src/protocol.rs:2644); it is filed under process because its emitter is process_execution.rs. Every other observe_terminal_error call in the five modules passes one of the four mappers, and src/daemon_supervision.rs emits no terminal error at all, which is why the supervision family maps to supervision_lease_authority.rs. One production gap is recorded here rather than fixed: issue-901-body.md:35 freezes the boundary list \"daemon receipt request/publication/validation/expiry\", but src/daemon_live_receipt.rs contains no expiry observation at all - its 11 production callsites are publication (:146, :163, :169, :182), validation (:456, :462), readiness (:577, :587, :591) and store availability (:829, :902) - so receipt-expiry is a production instrumentation gap in issue #901 rather than a fixture omission, and no fixture row can exist for it until that module gains one, which cards/901.md:14 and cards/901.md:20 forbid here. The canaries are secret-shaped strings a test plants in the admission payload's own fields (executable, argv, working_directory, environment, secret_refs) and then asserts absent from the captured diagnostic bytes, so each can reach the payload if a caller passed it and none of them is emitted by production code; canaries.nested embeds the token inside a three-level nested envelope and canaries.oversized is 320 bytes, strictly longer than the 256-byte max_field_bytes. case_owners records where each of the 30 WORK_UNIT_CASE: 901/1..30 cases lives. The crate's own pattern for reaching crate-internal (pub(crate)) production observations is an in-crate #[cfg(test)] suite under bins/eliot-kernel/src/tests/ registered from bins/eliot-kernel/src/lib.rs: lib.rs:5699-5700 declares #[cfg(test)] mod tests; (-> src/tests.rs) and lib.rs:5702-5704 declares #[cfg(test)] #[path = \"tests/local_read_claim.rs\"] mod local_read_claim_tests;, so a case whose boundary is reachable only through a pub(crate) item or a #[cfg(test)] arm lives in one of those in-crate suites, because an integration test under bins/eliot-kernel/tests/ can see neither pub(crate) items nor the #[cfg(test)] arms. In case_owners a boundary names the single representative file::function::event the case executes to make its assertion, and that representative is SHARED by two pairs of cases because both cases in each pair drive one production entry point into the same emitter: cases 6 and 8 both reach require_effect_replay_authority::kernel.process.effect_replay_denied (process_execution.rs:2734) through start_in_context; cases 7 and 19 both reach cancel_with_origin_grant_inner::kernel.process.cancel_failed (process_execution.rs:3300) through cancel_in_context; and cases 3 and 4 both reach reject_process_start_without_material_coverage_in_context::kernel.process.request_rejected (process_execution.rs:4587) through the material-coverage guard, which is the arm both of them drive. Two further representatives were corrected in this delivery because the row named a callsite the case does not enter: case 3 names the guard emitter reject_process_start_without_material_coverage_in_context::kernel.process.request_rejected (process_execution.rs:4587) rather than execute_process_request, whose six own request_rejected emitters at :4618, :4637, :4660, :4679, :4689 and :4715 are all unreached because the case returns at the guard; and case 21 names inspect_inner::kernel.process.inspect_failed (:3090) rather than the sibling success arm inspect_reported (:3086), which the case asserts is absent, read from the test body where a test exists and otherwise from the issue-901-body.md:49-80 matrix line matched against boundaries; the exhaustive per-callsite map stays in boundaries[].covering_case, which assigns each CALLSITE to the matrix case that owns its instrumentation, so a case may execute a callsite another case also covers, and boundary is null exactly for the ten cases that name no single representative CALLSITE - which is NOT the same as owning no callsite, because case 10 owns two rows and still has no one representative: the nine cross-cutting ones (1, 9, 11, 25, 26, 27, 28, 29 and 30), where what each proves is an absence - a denominator, a retained conflict, a fenced identity, exactly one terminal, a static code, a redacted canary, an unchanged result or a diagnostic-only diff - and case 10, where the identity-exactness claim is executed at the durable validator that MINTS the record, ProcessStartReplayRecord::validate in crates/kernel/eliot-ors, together with the production begin_process_start seam, because the instrumented callsite this case would otherwise name, process_execution.rs:187 record_process_start_receipt_identity, is a private fn called only from start_in_context Ok arm at :2936 behind admit_material_process_start (lib.rs:3308), so kernel.process.start_identity_observed is captured by no test in the repository and naming it here would overstate the proof. Two further boundaries were corrected in this delivery because the row named a callsite its test does not enter: case 8 now names require_effect_replay_authority::kernel.process.effect_replay_denied (process_execution.rs:2734), which is the record its test asserts, rather than run_process_start::kernel.process.start_replay_observed (:4034), which no test captures; and case 19 now names cancel_with_origin_grant_inner::kernel.process.cancel_failed (:3300), which the case-19 test observes, rather than cancel_acknowledged (:3276/:3321), which it proves is never emitted. Case 14 was corrected twice and now names the boundary this issue owns: its test had proved liveness-versus-semantic-readiness through kernel.mark_daemon_ready, whose kernel.daemon.ready_proven record is emitted by bins/eliot-kernel/src/daemon_runtime.rs:2215 - a module outside the five owned files and outside this issue observed vocabulary - so the test was extended to drive daemon_live_receipt.rs:567 validate_daemon_process_readiness_in_context itself and to assert readiness_requested (outcome attempt, :577-581), readiness_rejected (outcome fenced, :591), exactly zero readiness_proven (:587) and exactly one terminal READINESS_NOT_PROVEN (:101), which is the row value now. Its ACCEPTED arm is unreachable in-crate and no test asserts readiness_proven: that arm requires inspect_exact_running_receipt_in_context to find a Completed replay record (:615-623) and the presented receipt operation_id to equal a digest over the KERNEL's own pid, start time and image (:628-645), a pair no in-crate fixture can mint. Case 6 carries the same correction for a measured reason: kernel.process.start_committed has exactly ONE emitter in the workspace, process_execution.rs:2943-2947 inside the Ok arm of start_in_context (:2881) under the !replayed guard at :2942, and no in-crate fixture can reach that arm - run_process_start requires require_new_effect_operation_authority (:3985, which resolves at :3827 to an admitted BoundKernelExecutionManifest whose admission receipt is verified at crates/kernel/eliot-ors/src/store.rs:27291), ports.snapshot() (:4046, whose Unavailable refusal is raised inside canonical_validation_snapshot at :2457-2463 unless attach_canonical_store (:2414) has installed a live gateway) and ports.issue (:4117, the real ProcessDispatchAuthorityController at :4360 rather than a test controller), which is why this file's fixture calls gateway.execute and ports.persist_completed directly at :799 and :808. The case-6 test therefore enters require_effect_replay_authority, which is what its boundary now names. It does NOT pin kernel.process.start_committed by its absence: cases 5 and 8 hold those absence-only pins and case 6 holds none, and no in-crate test can make them non-vacuous, because an emitter that is never reached also never fires. covered_item names the single WORK or Acceptance item of the issue #901 CHECKLIST.json item ids W1..W38 and AUD1..AUD6 that the case proves, and it is null exactly where no item states the distinction the case draws: case 11 (stale_generation_owner_stays_fenced_and_current_generation_is_admitted) draws the admitted-versus-fenced OWNER boundary with exactly one terminal and subordinate-before-terminal order, and mentions no pid, no creation marker and no image anywhere, so it claimed W10 (PID alone cannot identify a process after reuse) and that binding was false; it is null rather than repointed, because no item states its sentence and a neighbouring id would be a claim nobody measured. Six further rows name the RIGHT item but discharge only PART of its sentence, and that limit is stated here rather than hidden: case 3 on W27 never reads the idempotency identity; case 6 on W9 produces four of the six artifacts its item names, never a readiness receipt, an exit or a fully reaped tree, and its fifth leg is a replay refusal that is W5's and W23's claim; case 10 on W29 discharges the identity-exactness clause only, and its own body records that the validator ACCEPTS a fabricated non-zero creation marker, so the reuse half is carried by the identity capsule and not by that case; case 7 on W22 and case 20 on W26 never establish the item's after-possible-execution or after-timeout precondition; case 12 on W16 observes only the refused publication pair and never kernel.live_receipt.published; case 19 on W21 proves the acknowledgement is unreachable from both arms rather than that a real one is classified. One binding is structural rather than load-bearing: case 28 on W35 scans for the stream, provider, model and user canaries over a path that never reads those inputs, so the absence holds because the facade has no such read at all, and deleting the bounded-value owner would leave it green; only case 27 drives that owner. Every one of these limits was measured against the test bodies, and none of them is a claim that the behaviour is absent - each is a statement of how much of its item's sentence one case reaches. Seventeen cases are resolved by reading their marker: bins/eliot-kernel/tests/kernel_process_supervision_diagnostics.rs carries 1, 2, 3, 4, 7, 11, 15, 16, 18, 20, 21, 25, 26, 27, 28, 29 and 30, and those seventeen keep those numbers. The remaining thirteen cases (5, 6, 8, 9, 10, 12, 13, 14, 17, 19, 22, 23 and 24) are owned one per case by the in-crate capsules under bins/eliot-kernel/src/tests/ registered from bins/eliot-kernel/src/lib.rs, because their boundaries are reachable only through pub(crate) items or #[cfg(test)] arms that an integration test cannot see, and the assignment is exact rather than shared: process_supervision_launch.rs owns 5, 6, 8, 9 and 10, process_supervision_daemon_receipt.rs owns 12, 13, 14 and 17, process_supervision_lifecycle.rs owns 19, 22, 23 and 24, and process_supervision_identity.rs and process_supervision_unknown_outcome.rs own NO case number at all. This delivery re-assigned every one of those thirteen markers to the capsule whose test actually proves that case's covered_item, so exactly one test in exactly one capsule carries each of the thirteen numbers, no number is claimed by two tests, and cases 23 and 24 - previously claimed by nobody - are now carried by cleanup_and_reap_failure_retain_owner_and_reconciliation_requirement and restart_reattach_observation_binds_exact_operation_process_and_lease. Before this delivery the same thirteen numbers carried 31 markers: 5, 6, 8, 9 and 10 were each claimed twice and 12 three times, which is why no case could be attributed to an owner without an arbitrary tie-break. Any surplus test in the capsules carries no marker and is supplementary rather than an owner; the identity capsule holds nine such tests (three PID-reuse, two malformed-identity, one logging-cannot, one repeated-shutdown-sweep, one substituted-image/path/job/digest and one grant-minted-for-another-generation test), the launch capsule one (an_exact_replay_meets_the_recorded_outcome_and_never_a_second_launch, which proves item W5 and has no case number because W5 is not one of the thirty), the receipt capsule one (live_receipt_boundaries_are_exactly_the_frozen_selection, which proves item W3) and the lifecycle capsule two (late_receipt_or_exit_cannot_revive_revoked_or_old_generation_authority, which proves item W24, and descendant_close_read_failure_emits_exactly_one_terminal_per_operation). The authoritative case -> item binding is this file's own covered_item, so what each case proves is read from that row and not inferred from a test name. This fixture pins the boundary inventory and, in case_owners, where each of the 30 WORK_UNIT_CASE: 901/1..30 cases lives; test_file (cards/901.md:18) remains the suite that owns cases 1, 2, 3, 4, 7, 11, 15, 16, 18, 20, 21, 25, 26, 27, 28, 29 and 30, and the other thirteen are owned by the five in-crate capsules named above."
 }
