@@ -36,8 +36,9 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
@@ -64,6 +65,7 @@ __all__ = [
     "SinkError",
     "CounterReading",
     "ProcessBinding",
+    "AdmittedProcessBinding",
     "PhaseBinding",
     "CollectionLimits",
     "SamplingPlan",
@@ -102,14 +104,27 @@ __all__ = [
 
 
 SCHEMA_FAMILY = "eliot.soak_samples"
-SCHEMA_VERSION = 1
-SCHEMA_ID = "eliot.soak_samples/v1"
+SCHEMA_VERSION = 2
+SCHEMA_ID = "eliot.soak_samples/v2"
 
 HANDOFF_IDENTITY_UNAVAILABLE = (
     "process identity unavailable: #944 must supply the validated "
     "owner observation/retained-handle handoff via the #907/#911 seam; "
     "PID alone never identifies the owned process"
 )
+
+_RECEIPT_MINT_TOKEN = object()
+
+
+def _canonical_digest(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class CounterName(str, Enum):
@@ -242,6 +257,8 @@ _MAX_REASON_DETAIL_LEN = 512
 _MAX_JSON_DEPTH = 12
 _MAX_JSON_KEYS = 512
 _MAX_API_ERROR = 0xFFFFFFFF
+_MAX_DWORD = 0xFFFFFFFF
+_MAX_PROCESS_COUNT = 4096
 
 
 class SamplingError(Exception):
@@ -274,6 +291,10 @@ class IdentityUnavailable(SamplingError):
 
 class IdentityMismatch(SamplingError):
     """Live readback disagreed with the trusted owner identity."""
+
+    def __init__(self, reason: str = Reason.UNKNOWN_OWNERSHIP) -> None:
+        self.reason = reason if reason in CLOSED_REASONS else Reason.UNKNOWN_OWNERSHIP
+        super().__init__(self.reason)
 
 
 class AdapterUnavailable(SamplingError):
@@ -323,9 +344,15 @@ class ProcessBinding:
     generation: str
 
     def stream_key(self) -> str:
+        """Return the four-field grouping key consumed by #943."""
         return "|".join(
             (self.owner_ref, self.component, str(self.pid), self.generation)
         )
+
+    @cached_property
+    def binding_digest(self) -> str:
+        """Collision-resistant digest of the complete six-field identity."""
+        return _canonical_digest(self.to_dict())
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -336,6 +363,34 @@ class ProcessBinding:
             "image_identity": self.image_identity,
             "generation": self.generation,
         }
+
+
+@dataclass(frozen=True, init=False)
+class AdmittedProcessBinding:
+    """In-process, source-issued authority to prepare one expected binding.
+
+    The value is deliberately not deserializable. Its issuer identity is
+    checked by the source before preparation or handle attachment; the digest
+    alone is evidence of identity equality, never authority.
+    """
+
+    binding: ProcessBinding
+    binding_digest: str
+    _issuer: object = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        binding: ProcessBinding,
+        issuer: object,
+        token: object,
+    ) -> None:
+        if token is not _RECEIPT_MINT_TOKEN:
+            raise TypeError("admitted process bindings are owner-issued only")
+        if not isinstance(binding, ProcessBinding):
+            raise TypeError("admitted process binding requires ProcessBinding")
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "binding_digest", binding.binding_digest)
+        object.__setattr__(self, "_issuer", issuer)
 
 
 @dataclass(frozen=True)
@@ -395,6 +450,15 @@ class SamplingPlan:
     optional_counters: Tuple[str, ...]
     limits: CollectionLimits
     hard_deadline_required: bool = False
+
+    @cached_property
+    def plan_digest(self) -> str:
+        """Canonical digest of the complete normalized plan content."""
+        return _canonical_digest(self.to_dict())
+
+    @cached_property
+    def _binding_index(self) -> Dict[str, ProcessBinding]:
+        return {binding.binding_digest: binding for binding in self.bindings}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -491,7 +555,9 @@ def _validate_binding(data: Any, index: int) -> ProcessBinding:
     if not isinstance(data, Mapping):
         raise PlanRejected(f"bindings[{index}]: must be an object")
     _require_keys(data, _BINDING_KEYS, f"bindings[{index}]")
-    pid = _require_int(data["pid"], f"bindings[{index}].pid", minimum=1)
+    pid = _require_int(
+        data["pid"], f"bindings[{index}].pid", minimum=1, maximum=_MAX_DWORD
+    )
     return ProcessBinding(
         owner_ref=_require_ref(data["owner_ref"], f"bindings[{index}].owner_ref"),
         component=_require_ref(data["component"], f"bindings[{index}].component"),
@@ -537,7 +603,12 @@ def _validate_limits(data: Any) -> CollectionLimits:
         raise PlanRejected("limits: must be an object")
     _require_keys(data, _LIMIT_KEYS, "limits")
     return CollectionLimits(
-        max_processes=_require_int(data["max_processes"], "limits.max_processes", minimum=1, maximum=4096),
+        max_processes=_require_int(
+            data["max_processes"],
+            "limits.max_processes",
+            minimum=1,
+            maximum=_MAX_PROCESS_COUNT,
+        ),
         max_samples_total=_require_int(data["max_samples_total"], "limits.max_samples_total", minimum=1),
         max_total_bytes=_require_int(data["max_total_bytes"], "limits.max_total_bytes", minimum=1024),
         max_record_bytes=_require_int(data["max_record_bytes"], "limits.max_record_bytes", minimum=256, maximum=16 * 1024 * 1024),
@@ -623,6 +694,14 @@ def validate_sampling_plan(data: Any) -> SamplingPlan:
     limits = _validate_limits(data["limits"])
     if len(bindings) > limits.max_processes:
         raise PlanRejected("plan.bindings: exceeds limits.max_processes")
+    terminal_reserve_bytes = (
+        limits.terminal_reserve_records * limits.max_record_bytes
+    )
+    if terminal_reserve_bytes >= limits.max_total_bytes:
+        raise PlanRejected(
+            "plan.limits: terminal byte reserve must leave capacity "
+            "for nonterminal records"
+        )
     return SamplingPlan(
         schema=SCHEMA_ID,
         plan_id=_require_ref(data["plan_id"], "plan.plan_id"),
@@ -647,6 +726,7 @@ _RECORD_HEADER_KEYS = (
     "kind",
     "run_ref",
     "plan_id",
+    "plan_digest",
     "source_ref",
     "artifact_ref",
     "stream",
@@ -656,9 +736,15 @@ _RECORD_HEADER_KEYS = (
     "phase_id",
     "workload_ref",
 )
-_STREAM_KEYS = ("owner_ref", "component", "pid", "generation")
+_STREAM_KEYS = (
+    "owner_ref",
+    "component",
+    "pid",
+    "generation",
+    "binding_digest",
+)
 _COUNTER_KEYS = ("name", "value", "unit", "status", "reason", "api_error")
-_EVENT_KEYS = ("code", "detail", "handoff")
+_EVENT_KEYS = ("code", "detail", "handoff", "api_error", "exit_code")
 
 
 def _record_fail(message: str) -> RecordRejected:
@@ -683,6 +769,16 @@ def _check_int(value: Any, name: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _check_digest(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(ch not in "0123456789abcdef" for ch in value)
+    ):
+        raise _record_fail(f"{name}: must be a lowercase SHA-256 digest")
+    return value
+
+
 def _validate_stream_key(data: Any) -> Dict[str, Any]:
     if not isinstance(data, Mapping):
         raise _record_fail("stream: must be an object")
@@ -694,8 +790,11 @@ def _validate_stream_key(data: Any) -> Dict[str, Any]:
             raise _record_fail(f"stream: missing field {key!r}")
     _check_ref(data["owner_ref"], "stream.owner_ref")
     _check_ref(data["component"], "stream.component")
-    _check_int(data["pid"], "stream.pid", minimum=1)
+    pid = _check_int(data["pid"], "stream.pid", minimum=1)
+    if pid > _MAX_DWORD:
+        raise _record_fail("stream.pid: exceeds the Win32 DWORD range")
     _check_ref(data["generation"], "stream.generation")
+    _check_digest(data["binding_digest"], "stream.binding_digest")
     return dict(data)
 
 
@@ -771,18 +870,22 @@ def _validate_event(data: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {"code": code}
     if "detail" in data:
         detail = data["detail"]
-        if not isinstance(detail, str) or not detail:
-            raise _record_fail("event.detail: must be a non-empty string")
-        if len(detail) > _MAX_REASON_DETAIL_LEN:
-            raise _record_fail("event.detail: exceeds bound")
+        if not isinstance(detail, str) or detail not in CLOSED_REASONS:
+            raise _record_fail("event.detail: must be a closed reason")
         out["detail"] = detail
     if "handoff" in data:
         handoff = data["handoff"]
-        if not isinstance(handoff, str) or not handoff:
-            raise _record_fail("event.handoff: must be a non-empty string")
-        if len(handoff) > _MAX_REASON_DETAIL_LEN:
-            raise _record_fail("event.handoff: exceeds bound")
+        if handoff != HANDOFF_IDENTITY_UNAVAILABLE:
+            raise _record_fail("event.handoff: unknown handoff reference")
         out["handoff"] = handoff
+    for key in ("api_error", "exit_code"):
+        if key in data:
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _record_fail(f"event.{key}: must be an integer")
+            if not 0 <= value <= _MAX_API_ERROR:
+                raise _record_fail(f"event.{key}: out of range")
+            out[key] = value
     return out
 
 
@@ -821,9 +924,10 @@ def validate_record(
         raise _record_fail("record: sample must not carry an event")
     if kind != RecordKind.SAMPLE and "counters" in data:
         raise _record_fail(f"record: {kind} must not carry counters")
-    _validate_stream_key(data["stream"])
+    stream = _validate_stream_key(data["stream"])
     _check_ref(data["run_ref"], "record.run_ref")
     _check_ref(data["plan_id"], "record.plan_id")
+    _check_digest(data["plan_digest"], "record.plan_digest")
     _check_ref(data["source_ref"], "record.source_ref")
     _check_ref(data["artifact_ref"], "record.artifact_ref")
     _check_int(data["seq"], "record.seq")
@@ -836,18 +940,55 @@ def validate_record(
     if plan is not None:
         if data["plan_id"] != plan.plan_id or data["run_ref"] != plan.run_ref:
             raise _record_fail("record: plan/run binding mismatch")
+        if data["plan_digest"] != plan.plan_digest:
+            raise _record_fail("record: canonical plan digest mismatch")
         if data["source_ref"] != plan.source_ref:
             raise _record_fail("record: source binding mismatch")
         if data["artifact_ref"] != plan.artifact_ref:
             raise _record_fail("record: artifact binding mismatch")
-        if data["slot"] > plan.expected_slots or (
-            data["slot"] == plan.expected_slots
-            and kind != RecordKind.TERMINAL
+        if (
+            (kind == RecordKind.TERMINAL and data["slot"] != plan.expected_slots)
+            or (kind != RecordKind.TERMINAL and data["slot"] >= plan.expected_slots)
         ):
             raise _record_fail("record: slot outside plan range")
-        phase_ids = {p.phase_id for p in plan.phases}
-        if data["phase_id"] not in phase_ids:
-            raise _record_fail("record: unknown phase binding")
+        expected_binding = plan._binding_index.get(stream["binding_digest"])
+        if expected_binding is None:
+            raise _record_fail("record: stream is not a plan-bound process")
+        expected_stream = {
+            "owner_ref": expected_binding.owner_ref,
+            "component": expected_binding.component,
+            "pid": expected_binding.pid,
+            "generation": expected_binding.generation,
+            "binding_digest": expected_binding.binding_digest,
+        }
+        if stream != expected_stream:
+            raise _record_fail("record: stream identity differs from plan binding")
+        if kind == RecordKind.TERMINAL:
+            phase = next(
+                (
+                    candidate
+                    for candidate in plan.phases
+                    if candidate.first_slot
+                    <= plan.expected_slots - 1
+                    <= candidate.last_slot
+                ),
+                None,
+            )
+        else:
+            phase = next(
+                (
+                    candidate
+                    for candidate in plan.phases
+                    if candidate.first_slot <= data["slot"] <= candidate.last_slot
+                ),
+                None,
+            )
+        if (
+            phase is None
+            or data["phase_id"] != phase.phase_id
+            or data["workload_ref"] != phase.workload_ref
+        ):
+            raise _record_fail("record: slot/phase/workload binding mismatch")
     if kind == RecordKind.SAMPLE:
         raw_counters = data["counters"]
         if not isinstance(raw_counters, Sequence) or isinstance(
@@ -877,7 +1018,35 @@ def validate_record(
                     f"record.counters: {name!r} replaces no required metric"
                 )
     else:
-        _validate_event(data["event"])
+        event = _validate_event(data["event"])
+        if kind == RecordKind.MISSED_SLOT:
+            allowed_codes = {LifecycleCode.SLOT_MISSED}
+        elif kind == RecordKind.LIFECYCLE:
+            allowed_codes = {
+                LifecycleCode.PROCESS_EXIT,
+                LifecycleCode.PROCESS_REPLACEMENT,
+                LifecycleCode.QUERY_FAILURE,
+                LifecycleCode.UNKNOWN_OWNERSHIP,
+                LifecycleCode.IDENTITY_UNAVAILABLE,
+                LifecycleCode.LIFECYCLE_UPDATE_REJECTED,
+            }
+        else:
+            allowed_codes = {
+                LifecycleCode.CANCELLATION,
+                LifecycleCode.OUTPUT_TRUNCATION,
+                LifecycleCode.RUN_COMPLETE,
+            }
+        if event["code"] not in allowed_codes:
+            raise _record_fail(f"record: {kind} has an inconsistent event code")
+        if kind in (RecordKind.MISSED_SLOT, RecordKind.LIFECYCLE):
+            if "detail" not in event:
+                raise _record_fail(f"record: {kind} requires a closed reason")
+        if "api_error" in event and event["code"] != LifecycleCode.QUERY_FAILURE:
+            raise _record_fail("record: api_error requires query_failure")
+        if "exit_code" in event and event["code"] != LifecycleCode.PROCESS_EXIT:
+            raise _record_fail("record: exit_code requires process_exit")
+        if "handoff" in event and event["code"] != LifecycleCode.IDENTITY_UNAVAILABLE:
+            raise _record_fail("record: handoff requires identity_unavailable")
     return dict(data)
 
 
@@ -925,17 +1094,40 @@ def decode_record(
     """
     if not isinstance(data, (bytes, bytearray)):
         raise RecordRejected("record: transport body must be bytes")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise RecordRejected("record: max_bytes must be a non-negative integer")
     if len(data) > max_bytes:
         raise RecordRejected("record: transport body exceeds max_record_bytes")
     try:
         text = bytes(data).decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise RecordRejected(f"record: transport body is not UTF-8: {exc}") from exc
+        raise RecordRejected("record: transport body is not UTF-8") from exc
+
+    def reject_duplicate_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise RecordRejected("record: duplicate JSON key rejected")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(_value: str) -> Any:
+        raise RecordRejected("record: non-finite JSON number rejected")
+
     try:
-        obj = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RecordRejected(f"record: invalid JSON: {exc}") from exc
-    _check_json_bounds(obj, 0, [_MAX_JSON_KEYS])
+        obj = json.loads(
+            text,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite,
+        )
+    except RecordRejected:
+        raise
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise RecordRejected("record: invalid or unbounded JSON") from exc
+    try:
+        _check_json_bounds(obj, 0, [_MAX_JSON_KEYS])
+    except RecursionError as exc:
+        raise RecordRejected("record: JSON nesting exceeds bound") from exc
     return validate_record(obj, plan=plan)
 
 
@@ -974,23 +1166,33 @@ class StreamValidator:
         self._plan = plan
         self._last_seq: Dict[str, int] = {}
         self._last_slot: Dict[str, int] = {}
-        self._slot_digest: Dict[Tuple[str, int], str] = {}
+        self._last_slot_digest: Dict[str, str] = {}
         self._terminated: Dict[str, str] = {}
+        self._committed_run_ref: Optional[str] = None
+        self._committed_plan_id: Optional[str] = None
+        self._committed_plan_digest: Optional[str] = None
 
     @staticmethod
     def _key_of(stream: Mapping[str, Any]) -> str:
-        return "|".join(
-            (
-                str(stream["owner_ref"]),
-                str(stream["component"]),
-                str(stream["pid"]),
-                str(stream["generation"]),
-            )
-        )
+        return str(stream["binding_digest"])
 
-    def observe(self, data: Any) -> Dict[str, Any]:
+    def _preview(
+        self, data: Any
+    ) -> Tuple[Dict[str, Any], str, int, int, str]:
         normalized = validate_record(data, plan=self._plan)
+        if self._plan is None and self._committed_plan_id is not None:
+            if (
+                normalized["run_ref"] != self._committed_run_ref
+                or
+                normalized["plan_id"] != self._committed_plan_id
+                or normalized["plan_digest"] != self._committed_plan_digest
+            ):
+                raise StreamRejected(
+                    "stream validator: committed plan identity changed"
+                )
         key = self._key_of(normalized["stream"])
+        if key not in self._last_seq and len(self._last_seq) >= _MAX_PROCESS_COUNT:
+            raise StreamRejected("stream validator: fixed stream bound exceeded")
         if key in self._terminated:
             raise StreamRejected(
                 f"stream {key}: record after terminal "
@@ -1009,20 +1211,47 @@ class StreamValidator:
                 f"(last {self._last_slot[key]})"
             )
         digest = hashlib.sha256(encode_semantic(normalized)).hexdigest()
-        slot_id = (key, slot)
-        if slot_id in self._slot_digest:
-            if self._slot_digest[slot_id] != digest:
+        if key in self._last_slot and slot == self._last_slot[key]:
+            if self._last_slot_digest[key] != digest:
                 raise StreamRejected(
                     f"stream {key}: conflicting content for slot {slot}"
                 )
             raise StreamRejected(
                 f"stream {key}: duplicate record for slot {slot}"
             )
-        self._slot_digest[slot_id] = digest
+        return normalized, key, seq, slot, digest
+
+    def _commit(
+        self,
+        normalized: Mapping[str, Any],
+        key: str,
+        seq: int,
+        slot: int,
+        digest: str,
+    ) -> None:
+        if self._plan is None and self._committed_plan_id is None:
+            self._committed_run_ref = str(normalized["run_ref"])
+            self._committed_plan_id = str(normalized["plan_id"])
+            self._committed_plan_digest = str(normalized["plan_digest"])
         self._last_seq[key] = seq
         self._last_slot[key] = slot
-        if normalized["kind"] == RecordKind.TERMINAL:
+        self._last_slot_digest[key] = digest
+        if normalized["kind"] == RecordKind.TERMINAL or (
+            normalized["kind"] == RecordKind.LIFECYCLE
+            and normalized["event"]["code"]
+            in {
+                LifecycleCode.PROCESS_EXIT,
+                LifecycleCode.PROCESS_REPLACEMENT,
+                LifecycleCode.UNKNOWN_OWNERSHIP,
+                LifecycleCode.IDENTITY_UNAVAILABLE,
+                LifecycleCode.LIFECYCLE_UPDATE_REJECTED,
+            }
+        ):
             self._terminated[key] = str(normalized["event"]["code"])
+
+    def observe(self, data: Any) -> Dict[str, Any]:
+        normalized, key, seq, slot, digest = self._preview(data)
+        self._commit(normalized, key, seq, slot, digest)
         return normalized
 
 
@@ -1096,7 +1325,56 @@ class ProcessSource:
 
     capabilities: Tuple[str, ...] = ()
 
-    def prepare(self, binding: ProcessBinding) -> PreparedTarget:
+    def admit_binding(
+        self, expected: ProcessBinding
+    ) -> AdmittedProcessBinding:
+        """Ask this source's owner boundary to admit one expected binding."""
+        raise IdentityUnavailable()
+
+    def _mint_admitted_binding(
+        self,
+        expected: ProcessBinding,
+        owner_observation: Any,
+    ) -> AdmittedProcessBinding:
+        """Mint only after a source-specific owner observation is obtained.
+
+        Synthetic sources call this with an independently stored fixture-owner
+        observation. The plan binding itself is never an observation.
+        """
+        if not isinstance(expected, ProcessBinding) or not isinstance(
+            owner_observation, ProcessBinding
+        ):
+            raise IdentityUnavailable()
+        try:
+            validated = _validate_binding(expected.to_dict(), 0)
+        except (PlanRejected, TypeError, ValueError):
+            raise IdentityUnavailable() from None
+        if owner_observation != expected or validated != expected:
+            raise IdentityUnavailable()
+        return AdmittedProcessBinding(
+            expected, self, _RECEIPT_MINT_TOKEN
+        )
+
+    def _require_admitted_binding(
+        self,
+        receipt: Any,
+        expected: Optional[ProcessBinding] = None,
+    ) -> ProcessBinding:
+        if (
+            not isinstance(receipt, AdmittedProcessBinding)
+            or receipt._issuer is not self
+            or receipt.binding_digest != receipt.binding.binding_digest
+            or (expected is not None and receipt.binding != expected)
+        ):
+            raise IdentityUnavailable()
+        try:
+            if _validate_binding(receipt.binding.to_dict(), 0) != receipt.binding:
+                raise IdentityUnavailable()
+        except (PlanRejected, TypeError, ValueError):
+            raise IdentityUnavailable() from None
+        return receipt.binding
+
+    def prepare(self, receipt: AdmittedProcessBinding) -> PreparedTarget:
         raise NotImplementedError
 
     def query(self, target: PreparedTarget, context: QueryContext) -> Any:
@@ -1130,7 +1408,11 @@ class RecordSink:
     """Injected streaming record sink (supplied by #944)."""
 
     def write(self, data: bytes) -> int:
-        """Write one record; return bytes accepted (short ⇒ truncation)."""
+        """Accept one complete record or report an uncertain/short write.
+
+        An exact byte count acknowledges the complete record. Any short,
+        oversized, invalid, or exceptional result freezes the in-band stream.
+        """
         raise NotImplementedError
 
     @property
@@ -1176,8 +1458,16 @@ class SamplingResult:
 
     schema: str
     plan_id: str
+    plan_digest: str
     run_ref: str
     expected_samples: int
+    accepted_samples: int
+    accepted_gap_slots: int
+    accepted_gaps_by_reason: Mapping[str, int]
+    accepted_lifecycle_records: int
+    accepted_terminals: int
+    missing_obligations: int
+    failed_writes: int
     emitted_records: int
     missed_slots: int
     query_failed: int
@@ -1187,18 +1477,27 @@ class SamplingResult:
     completeness: str
     completeness_reasons: Tuple[str, ...]
     handle_cleanup: str
-    handle_cleanup_detail: str
+    handle_cleanup_detail: Optional[str]
     hard_deadline: str
     sampler_footprint: SamplerFootprint
     streams: Tuple[StreamSummary, ...]
     sink_error: Optional[str] = None
+    diagnostics: Tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "schema": self.schema,
             "plan_id": self.plan_id,
+            "plan_digest": self.plan_digest,
             "run_ref": self.run_ref,
             "expected_samples": self.expected_samples,
+            "accepted_samples": self.accepted_samples,
+            "accepted_gap_slots": self.accepted_gap_slots,
+            "accepted_gaps_by_reason": dict(self.accepted_gaps_by_reason),
+            "accepted_lifecycle_records": self.accepted_lifecycle_records,
+            "accepted_terminals": self.accepted_terminals,
+            "missing_obligations": self.missing_obligations,
+            "failed_writes": self.failed_writes,
             "emitted_records": self.emitted_records,
             "missed_slots": self.missed_slots,
             "query_failed": self.query_failed,
@@ -1208,11 +1507,12 @@ class SamplingResult:
             "completeness": self.completeness,
             "completeness_reasons": list(self.completeness_reasons),
             "handle_cleanup": self.handle_cleanup,
-            "handle_cleanup_detail": self.handle_cleanup_detail,
             "hard_deadline": self.hard_deadline,
             "sampler_footprint": self.sampler_footprint.to_dict(),
             "streams": [s.to_dict() for s in self.streams],
         }
+        if self.handle_cleanup_detail is not None:
+            out["handle_cleanup_detail"] = self.handle_cleanup_detail
         if self.sink_error is not None:
             out["sink_error"] = self.sink_error
         return out
@@ -1271,7 +1571,9 @@ def _as_cancel_flag(cancellation: Any) -> Callable[[], bool]:
 @dataclass
 class _StreamState:
     binding: ProcessBinding
+    receipt: Optional[AdmittedProcessBinding] = None
     target: Optional[PreparedTarget] = None
+    sampler_owned_target: bool = False
     prepared: bool = False
     seq: int = 0
     emitted: int = 0
@@ -1306,18 +1608,38 @@ class _Collector:
         self._valid_prefix = 0
         self._emitted_records = 0
         self._samples = 0
+        self._query_attempts = 0
         self._missed = 0
         self._query_failed = 0
-        self._expected = 0
+        self._expected = len(plan.bindings) * plan.expected_slots
+        self._accepted_gap_slots = 0
+        self._accepted_gaps_by_reason: Dict[str, int] = {
+            reason: 0 for reason in sorted(CLOSED_REASONS)
+        }
+        self._accepted_lifecycle_records = 0
+        self._accepted_terminals = 0
+        self._failed_writes = 0
+        self._terminal_failures = 0
+        self._terminal_attempts = 0
+        self._soft_deadline_exceeded = False
         self._reasons: List[str] = []
         self._sink_error: Optional[str] = None
         self._sink_dead = False
+        self._output_truncated = False
+        self._confirmed_bytes = 0
+        self._terminal_reserve_bytes = (
+            plan.limits.terminal_reserve_records * plan.limits.max_record_bytes
+        )
+        self._ordinary_byte_limit = (
+            plan.limits.max_total_bytes - self._terminal_reserve_bytes
+        )
+        self._diagnostic_counts: Dict[Tuple[str, str], int] = {}
         self._updates_used = 0
         self._t0_ms = 0
         self._cleanup_done = False
-        self._cleanup_result: Tuple[str, str] = (
+        self._cleanup_result: Tuple[str, Optional[str]] = (
             HandleCleanupStatus.NONE_OWNED,
-            "cleanup not run",
+            None,
         )
         for binding in plan.bindings:
             self._admit(binding, 0)
@@ -1328,7 +1650,39 @@ class _Collector:
         key = binding.stream_key()
         self._streams[key] = _StreamState(binding=binding, admit_slot=slot)
         self._order.append(key)
-        self._expected += max(0, self._plan.expected_slots - slot)
+
+    def _diagnose(self, stage: str, error: Optional[BaseException] = None) -> None:
+        stages = {
+            "owner_admission",
+            "prepare",
+            "query",
+            "sink",
+            "footprint",
+            "cleanup",
+            "terminal",
+        }
+        if stage not in stages:
+            stage = "query"
+        if error is None:
+            kind = "redacted"
+        elif isinstance(error, SinkError):
+            kind = "sink_error"
+        elif isinstance(error, OSError):
+            kind = "os_error"
+        elif isinstance(error, ValueError):
+            kind = "value_error"
+        elif isinstance(error, SamplingError):
+            kind = "sampling_error"
+        else:
+            kind = "other"
+        key = (stage, kind)
+        self._diagnostic_counts[key] = self._diagnostic_counts.get(key, 0) + 1
+
+    def _diagnostic_summary(self) -> Tuple[str, ...]:
+        return tuple(
+            f"{stage}:{kind}:{count}"
+            for (stage, kind), count in sorted(self._diagnostic_counts.items())
+        )
 
     def _phase_for(self, slot: int) -> PhaseBinding:
         for phase in self._plan.phases:
@@ -1342,12 +1696,14 @@ class _Collector:
         self, state: _StreamState, kind: str, slot: int, elapsed_ms: int
     ) -> Dict[str, Any]:
         plan = self._plan
-        phase = self._phase_for(min(slot, plan.expected_slots - 1))
+        phase_slot = plan.expected_slots - 1 if slot == plan.expected_slots else slot
+        phase = self._phase_for(phase_slot)
         record: Dict[str, Any] = {
             "schema": SCHEMA_ID,
             "kind": kind,
             "run_ref": plan.run_ref,
             "plan_id": plan.plan_id,
+            "plan_digest": plan.plan_digest,
             "source_ref": plan.source_ref,
             "artifact_ref": plan.artifact_ref,
             "stream": {
@@ -1355,6 +1711,7 @@ class _Collector:
                 "component": state.binding.component,
                 "pid": state.binding.pid,
                 "generation": state.binding.generation,
+                "binding_digest": state.binding.binding_digest,
             },
             "seq": state.seq,
             "slot": slot,
@@ -1363,7 +1720,6 @@ class _Collector:
             "workload_ref": phase.workload_ref,
             "wall_ms": self._clock.wall_ms(),
         }
-        state.seq += 1
         return record
 
     def _sample_record(
@@ -1403,7 +1759,7 @@ class _Collector:
         record = self._base(state, RecordKind.MISSED_SLOT, slot, elapsed_ms)
         event: Dict[str, Any] = {"code": code}
         if detail:
-            event["detail"] = detail[:_MAX_REASON_DETAIL_LEN]
+            event["detail"] = detail
         record["event"] = event
         return record
 
@@ -1415,13 +1771,19 @@ class _Collector:
         code: str,
         detail: str = "",
         handoff: str = "",
+        api_error: Optional[int] = None,
+        exit_code: Optional[int] = None,
     ) -> Dict[str, Any]:
         record = self._base(state, RecordKind.LIFECYCLE, slot, elapsed_ms)
         event: Dict[str, Any] = {"code": code}
         if detail:
-            event["detail"] = detail[:_MAX_REASON_DETAIL_LEN]
+            event["detail"] = detail
         if handoff:
-            event["handoff"] = handoff[:_MAX_REASON_DETAIL_LEN]
+            event["handoff"] = handoff
+        if api_error is not None:
+            event["api_error"] = api_error
+        if exit_code is not None:
+            event["exit_code"] = exit_code
         record["event"] = event
         return record
 
@@ -1433,50 +1795,121 @@ class _Collector:
         )
         event: Dict[str, Any] = {"code": code}
         if detail:
-            event["detail"] = detail[:_MAX_REASON_DETAIL_LEN]
+            event["detail"] = detail
         record["event"] = event
         return record
 
     # -- streaming emit ------------------------------------------------------
 
+    def _refuse_before_write(self, reason: str) -> None:
+        self._output_truncated = True
+        self._sink_error = reason
+        self._note(reason)
+
+    def _state_for_record(self, record: Mapping[str, Any]) -> _StreamState:
+        stream = record["stream"]
+        key = "|".join(
+            (
+                stream["owner_ref"],
+                stream["component"],
+                str(stream["pid"]),
+                stream["generation"],
+            )
+        )
+        state = self._streams.get(key)
+        if state is None or state.binding.binding_digest != stream["binding_digest"]:
+            raise StreamRejected("collector: accepted record has no fixed stream")
+        return state
+
+    def _accept_record(
+        self, normalized: Mapping[str, Any], state: _StreamState
+    ) -> None:
+        kind = normalized["kind"]
+        if kind == RecordKind.SAMPLE:
+            self._samples += 1
+            state.emitted += 1
+            return
+        if kind == RecordKind.TERMINAL:
+            self._accepted_terminals += 1
+            return
+        if kind == RecordKind.MISSED_SLOT:
+            self._missed += 1
+            state.missed += 1
+        else:
+            self._accepted_lifecycle_records += 1
+            state.emitted += 1
+            code = normalized["event"]["code"]
+            if code in (LifecycleCode.QUERY_FAILURE, LifecycleCode.UNKNOWN_OWNERSHIP):
+                self._query_failed += 1
+                state.query_failed += 1
+        reason = normalized["event"]["detail"]
+        self._accepted_gap_slots += 1
+        self._accepted_gaps_by_reason[reason] += 1
+
     def _emit(self, record: Dict[str, Any]) -> bool:
-        """Validate, encode, and stream one record. False ⇒ sink failed."""
-        normalized = self._validator.observe(record)
+        """Commit one complete record only after the sink acknowledges it."""
+        if self._sink_dead:
+            return False
+        if self._output_truncated and record.get("kind") != RecordKind.TERMINAL:
+            return False
+        normalized, key, seq, slot, digest = self._validator._preview(record)
+        state = self._state_for_record(normalized)
+        if seq != state.seq:
+            raise StreamRejected("collector: record sequence is not the next slot")
         transport = encode_transport(normalized)
         if len(transport) > self._plan.limits.max_record_bytes:
-            self._sink_error = (
-                f"sink_error=record_exceeds_max_record_bytes "
-                f"slot={normalized['slot']} bytes={len(transport)}"
-            )
-            self._sink_dead = True
+            if normalized["kind"] == RecordKind.TERMINAL:
+                self._terminal_failures += 1
+                self._diagnose("terminal")
+                self._refuse_before_write(Reason.SINK_TRUNCATED)
+            else:
+                self._refuse_before_write(Reason.SINK_TRUNCATED)
             return False
-        if (
-            self._sink.bytes_accepted + len(transport)
-            > self._plan.limits.max_total_bytes
-        ):
-            self._sink_error = (
-                "sink_error=max_total_bytes_exceeded "
-                f"accepted={self._sink.bytes_accepted}"
-            )
-            self._sink_dead = True
+
+        terminal = normalized["kind"] == RecordKind.TERMINAL
+        if terminal:
+            if self._terminal_attempts >= self._plan.limits.terminal_reserve_records:
+                self._terminal_failures += 1
+                self._diagnose("terminal")
+                self._refuse_before_write(Reason.SINK_TRUNCATED)
+                return False
+            byte_limit = self._plan.limits.max_total_bytes
+        else:
+            byte_limit = self._ordinary_byte_limit
+        if self._confirmed_bytes + len(transport) > byte_limit:
+            if terminal:
+                self._terminal_failures += 1
+                self._diagnose("terminal")
+            self._refuse_before_write(Reason.SINK_TRUNCATED)
             return False
+
+        if terminal:
+            self._terminal_attempts += 1
         try:
             accepted = self._sink.write(transport)
-        except (SinkError, OSError, ValueError) as exc:
-            self._sink_error = f"sink_error=write_failed {exc}"[:_MAX_REF_LEN]
+        except Exception as exc:  # noqa: BLE001 - preserve prefix, redact detail
+            self._failed_writes += 1
             self._sink_dead = True
+            self._sink_error = Reason.SINK_FAILED
+            self._note(Reason.SINK_FAILED)
+            self._diagnose("sink", exc)
             return False
-        if accepted != len(transport):
-            self._sink_error = (
-                f"sink_error=short_write accepted={accepted} "
-                f"expected={len(transport)}"
-            )
+        if type(accepted) is not int or accepted != len(transport):
+            self._failed_writes += 1
             self._sink_dead = True
+            self._sink_error = Reason.SINK_FAILED
+            self._note(Reason.SINK_FAILED)
+            self._diagnose("sink", ValueError())
             return False
+
+        self._validator._commit(normalized, key, seq, slot, digest)
+        state.seq += 1
+        self._confirmed_bytes += len(transport)
         self._transport.update(transport)
         self._semantic.update(encode_semantic(normalized))
         self._valid_prefix += 1
         self._emitted_records += 1
+        self._accept_record(normalized, state)
         return True
 
     def _kill_stream(self, state: _StreamState, code: str) -> None:
@@ -1489,10 +1922,31 @@ class _Collector:
         self, key: str, state: _StreamState, slot: int, elapsed_ms: int
     ) -> bool:
         if state.prepared and state.target is not None:
+            if (
+                state.receipt is None
+                or state.target.binding != state.receipt.binding
+            ):
+                self._emit(
+                    self._lifecycle_record(
+                        state,
+                        slot,
+                        elapsed_ms,
+                        LifecycleCode.UNKNOWN_OWNERSHIP,
+                        detail=Reason.UNKNOWN_OWNERSHIP,
+                    )
+                )
+                self._kill_stream(state, LifecycleCode.UNKNOWN_OWNERSHIP)
+                self._note(Reason.UNKNOWN_OWNERSHIP)
+                return False
             return True
         try:
-            state.target = self._source.prepare(state.binding)
+            receipt = self._source.admit_binding(state.binding)
+            ProcessSource._require_admitted_binding(
+                self._source, receipt, state.binding
+            )
+            state.receipt = receipt
         except IdentityUnavailable as exc:
+            self._diagnose("owner_admission", exc)
             self._emit(
                 self._lifecycle_record(
                     state,
@@ -1500,31 +1954,105 @@ class _Collector:
                     elapsed_ms,
                     LifecycleCode.IDENTITY_UNAVAILABLE,
                     detail=Reason.IDENTITY_UNAVAILABLE,
-                    handoff=exc.handoff,
+                    handoff=HANDOFF_IDENTITY_UNAVAILABLE,
                 )
             )
             self._kill_stream(state, LifecycleCode.IDENTITY_UNAVAILABLE)
             self._note(Reason.IDENTITY_UNAVAILABLE)
             return False
+        except Exception as exc:  # noqa: BLE001 - authority failure is closed
+            self._diagnose("owner_admission", exc)
+            self._emit(
+                self._lifecycle_record(
+                    state,
+                    slot,
+                    elapsed_ms,
+                    LifecycleCode.IDENTITY_UNAVAILABLE,
+                    detail=Reason.IDENTITY_UNAVAILABLE,
+                    handoff=HANDOFF_IDENTITY_UNAVAILABLE,
+                )
+            )
+            self._kill_stream(state, LifecycleCode.IDENTITY_UNAVAILABLE)
+            self._note(Reason.IDENTITY_UNAVAILABLE)
+            return False
+        try:
+            state.target = self._source.prepare(state.receipt)
+        except IdentityUnavailable as exc:
+            self._diagnose("prepare", exc)
+            self._emit(
+                self._lifecycle_record(
+                    state,
+                    slot,
+                    elapsed_ms,
+                    LifecycleCode.IDENTITY_UNAVAILABLE,
+                    detail=Reason.IDENTITY_UNAVAILABLE,
+                    handoff=HANDOFF_IDENTITY_UNAVAILABLE,
+                )
+            )
+            self._kill_stream(state, LifecycleCode.IDENTITY_UNAVAILABLE)
+            self._note(Reason.IDENTITY_UNAVAILABLE)
+            return False
+        except IdentityMismatch as exc:
+            self._diagnose("prepare", exc)
+            if exc.reason in (Reason.CREATION_MISMATCH, Reason.IMAGE_MISMATCH):
+                self._handle_outcome(
+                    key, state, slot, elapsed_ms, ProcessReplacement()
+                )
+            else:
+                self._emit(
+                    self._lifecycle_record(
+                        state,
+                        slot,
+                        elapsed_ms,
+                        LifecycleCode.UNKNOWN_OWNERSHIP,
+                        detail=Reason.UNKNOWN_OWNERSHIP,
+                    )
+                )
+                self._kill_stream(state, LifecycleCode.UNKNOWN_OWNERSHIP)
+                self._note(Reason.UNKNOWN_OWNERSHIP)
+            return False
         except SamplingError as exc:
+            self._diagnose("prepare", exc)
             self._emit(
                 self._lifecycle_record(
                     state,
                     slot,
                     elapsed_ms,
                     LifecycleCode.QUERY_FAILURE,
-                    detail=f"{Reason.ADAPTER_UNAVAILABLE}:{exc}"[
-                        :_MAX_REASON_DETAIL_LEN
-                    ],
+                    detail=Reason.ADAPTER_UNAVAILABLE,
                 )
             )
             self._kill_stream(state, LifecycleCode.QUERY_FAILURE)
             self._note(Reason.ADAPTER_UNAVAILABLE)
             return False
+        except Exception as exc:  # noqa: BLE001 - cleanup finally, propagate bugs
+            self._diagnose("prepare", exc)
+            raise
+        if isinstance(state.target, PreparedTarget):
+            state.sampler_owned_target = state.target.owned_handle is True
+        if (
+            not isinstance(state.target, PreparedTarget)
+            or state.receipt is None
+            or state.target.binding != state.receipt.binding
+        ):
+            self._emit(
+                self._lifecycle_record(
+                    state,
+                    slot,
+                    elapsed_ms,
+                    LifecycleCode.UNKNOWN_OWNERSHIP,
+                    detail=Reason.UNKNOWN_OWNERSHIP,
+                )
+            )
+            self._kill_stream(state, LifecycleCode.UNKNOWN_OWNERSHIP)
+            self._note(Reason.UNKNOWN_OWNERSHIP)
+            return False
         state.prepared = True
         return True
 
     def _note(self, reason: str) -> None:
+        if reason not in CLOSED_REASONS:
+            reason = Reason.QUERY_FAILED
         if reason not in self._reasons:
             self._reasons.append(reason)
 
@@ -1537,23 +2065,25 @@ class _Collector:
         outcome: Any,
     ) -> None:
         if isinstance(outcome, SampleCounters):
-            if self._samples >= self._plan.limits.max_samples_total:
-                self._note(Reason.LIMIT_EXCEEDED)
-                raise _LimitStop()
             self._emit(self._sample_record(state, slot, elapsed_ms, outcome))
-            state.emitted += 1
-            self._samples += 1
         elif isinstance(outcome, ProcessExit):
-            detail = Reason.PROCESS_EXITED
-            if outcome.exit_code is not None:
-                detail += f":exit_code={outcome.exit_code}"
-            self._emit(
+            exit_code = outcome.exit_code
+            if (
+                isinstance(exit_code, bool)
+                or not isinstance(exit_code, int)
+                or not 0 <= exit_code <= _MAX_DWORD
+            ):
+                exit_code = None
+            accepted = self._emit(
                 self._lifecycle_record(
-                    state, slot, elapsed_ms, LifecycleCode.PROCESS_EXIT,
-                    detail=detail,
+                    state,
+                    slot,
+                    elapsed_ms,
+                    LifecycleCode.PROCESS_EXIT,
+                    detail=Reason.PROCESS_EXITED,
+                    exit_code=exit_code,
                 )
             )
-            state.emitted += 1
             self._kill_stream(state, LifecycleCode.PROCESS_EXIT)
             self._note(Reason.PROCESS_EXITED)
         elif isinstance(outcome, ProcessReplacement):
@@ -1562,8 +2092,7 @@ class _Collector:
             )
             budgeted = self._updates_used < self._plan.limits.max_lifecycle_updates
             if permitted and budgeted:
-                self._updates_used += 1
-                self._emit(
+                accepted = self._emit(
                     self._lifecycle_record(
                         state,
                         slot,
@@ -1572,9 +2101,10 @@ class _Collector:
                         detail=Reason.PROCESS_REPLACED,
                     )
                 )
-                state.emitted += 1
                 self._kill_stream(state, LifecycleCode.PROCESS_REPLACEMENT)
                 self._note(Reason.PROCESS_REPLACED)
+                if accepted:
+                    self._updates_used += 1
             else:
                 why = (
                     Reason.BUDGET_EXHAUSTED if permitted
@@ -1589,17 +2119,24 @@ class _Collector:
                         detail=why,
                     )
                 )
-                state.emitted += 1
                 self._kill_stream(
                     state, LifecycleCode.LIFECYCLE_UPDATE_REJECTED
                 )
                 self._note(why)
         elif isinstance(outcome, QueryFailure):
-            detail = outcome.reason
-            if outcome.api_error is not None:
-                detail += f":api_error={outcome.api_error}"
-            if outcome.detail:
-                detail += f":{outcome.detail}"
+            detail = (
+                outcome.reason
+                if isinstance(outcome.reason, str)
+                and outcome.reason in CLOSED_REASONS
+                else Reason.QUERY_FAILED
+            )
+            api_error = outcome.api_error
+            if (
+                isinstance(api_error, bool)
+                or not isinstance(api_error, int)
+                or not 0 <= api_error <= _MAX_DWORD
+            ):
+                api_error = None
             self._emit(
                 self._lifecycle_record(
                     state,
@@ -1607,11 +2144,9 @@ class _Collector:
                     elapsed_ms,
                     LifecycleCode.QUERY_FAILURE,
                     detail=detail,
+                    api_error=api_error,
                 )
             )
-            state.emitted += 1
-            state.query_failed += 1
-            self._query_failed += 1
             self._note(Reason.QUERY_FAILED)
         elif isinstance(outcome, UnknownOwnership):
             self._emit(
@@ -1620,12 +2155,10 @@ class _Collector:
                     slot,
                     elapsed_ms,
                     LifecycleCode.UNKNOWN_OWNERSHIP,
-                    detail=outcome.detail or Reason.UNKNOWN_OWNERSHIP,
+                    detail=Reason.UNKNOWN_OWNERSHIP,
                 )
             )
-            state.emitted += 1
-            state.query_failed += 1
-            self._query_failed += 1
+            self._kill_stream(state, LifecycleCode.UNKNOWN_OWNERSHIP)
             self._note(Reason.UNKNOWN_OWNERSHIP)
         else:
             raise SamplingError(
@@ -1646,52 +2179,60 @@ class _Collector:
             workload_ref=phase.workload_ref,
         )
         try:
+            if (
+                state.receipt is None
+                or state.target.binding != state.receipt.binding
+            ):
+                self._handle_outcome(
+                    key,
+                    state,
+                    slot,
+                    elapsed_ms,
+                    UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP),
+                )
+                return
+            if (
+                self._clock.monotonic_ms() - self._t0_ms
+                > self._plan.limits.max_elapsed_ms
+            ):
+                self._note(Reason.LIMIT_EXCEEDED)
+                raise _LimitStop()
+            if self._query_attempts >= self._plan.limits.max_samples_total:
+                self._note(Reason.LIMIT_EXCEEDED)
+                raise _LimitStop()
+            self._query_attempts += 1
             outcome = self._source.query(state.target, context)
+            if (
+                self._clock.monotonic_ms() - self._t0_ms
+                > self._plan.limits.max_elapsed_ms
+            ):
+                self._soft_deadline_exceeded = True
+                self._note(Reason.LIMIT_EXCEEDED)
+        except _LimitStop:
+            raise
         except IdentityMismatch as exc:
-            outcome = UnknownOwnership(detail=f"identity_readback:{exc}"[
-                :_MAX_REASON_DETAIL_LEN
-            ])
+            self._diagnose("query", exc)
+            outcome = UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        except Exception as exc:  # noqa: BLE001 - cleanup finally, propagate bugs
+            self._diagnose("query", exc)
+            raise
         self._handle_outcome(key, state, slot, elapsed_ms, outcome)
 
     def _poll_lifecycle(self, slot: int) -> None:
         try:
             pending = self._source.pending_bindings()
-        except SamplingError:
+        except Exception as exc:  # noqa: BLE001 - no dynamic admission
+            self._diagnose("owner_admission", exc)
             self._note(Reason.QUERY_FAILED)
             return
-        for binding in pending:
-            if not isinstance(binding, ProcessBinding):
-                self._note(Reason.FOREIGN_BINDING)
-                continue
-            key = binding.stream_key()
-            if key in self._streams:
-                self._note(Reason.FOREIGN_BINDING)
-                continue
-            same_process = [
-                s
-                for s in self._streams.values()
-                if s.binding.owner_ref == binding.owner_ref
-                and s.binding.component == binding.component
-                and s.binding.pid == binding.pid
-            ]
-            continues_replacement = any(
-                s.terminal_code == LifecycleCode.PROCESS_REPLACEMENT
-                for s in same_process
-            )
-            need = (
-                "replace_generation" if continues_replacement else "add_child"
-            )
-            if need not in self._plan.permitted_lifecycle_updates:
-                self._note(Reason.LIFECYCLE_NOT_PERMITTED)
-                continue
-            if len(self._streams) >= self._plan.limits.max_processes:
-                self._note(Reason.BUDGET_EXHAUSTED)
-                continue
-            if self._updates_used >= self._plan.limits.max_lifecycle_updates:
-                self._note(Reason.BUDGET_EXHAUSTED)
-                continue
-            self._updates_used += 1
-            self._admit(binding, slot)
+        try:
+            has_pending = bool(pending)
+        except Exception as exc:  # noqa: BLE001
+            self._diagnose("owner_admission", exc)
+            self._note(Reason.QUERY_FAILED)
+            return
+        if has_pending:
+            self._note(Reason.FOREIGN_BINDING)
 
     # -- main loop ---------------------------------------------------------------
 
@@ -1727,6 +2268,10 @@ class _Collector:
                     break
                 now = self._clock.monotonic_ms()
                 elapsed = max(0, now - t0)
+                if elapsed > plan.limits.max_elapsed_ms:
+                    self._note(Reason.LIMIT_EXCEEDED)
+                    stopped_early = True
+                    break
                 self._poll_lifecycle(slot)
                 if now > deadline + plan.limits.slot_lateness_ms:
                     for key in self._order:
@@ -1740,8 +2285,8 @@ class _Collector:
                                 detail=Reason.SLOT_MISSED,
                             )
                         )
-                        state.missed += 1
-                        self._missed += 1
+                        if self._sink_dead or self._output_truncated:
+                            break
                     self._note(Reason.SLOT_MISSED)
                 else:
                     for key in self._order:
@@ -1749,14 +2294,28 @@ class _Collector:
                         if state.dead or state.admit_slot > slot:
                             continue
                         self._sample_stream(key, state, slot, elapsed)
-                        if self._sink_dead:
+                        if (
+                            self._sink_dead
+                            or self._output_truncated
+                            or self._soft_deadline_exceeded
+                        ):
                             break
-                if self._sink_dead:
+                elapsed_after_work = self._clock.monotonic_ms() - t0
+                if elapsed_after_work > plan.limits.max_elapsed_ms:
+                    self._soft_deadline_exceeded = True
+                    self._note(Reason.LIMIT_EXCEEDED)
+                if (
+                    self._sink_dead
+                    or self._output_truncated
+                    or self._soft_deadline_exceeded
+                ):
                     stopped_early = True
                     break
         except _LimitStop:
             stopped_early = True
         if self._sink_dead:
+            pass
+        elif self._output_truncated:
             self._truncate_terminals()
         elif stopped_early and self._cancelled():
             pass
@@ -1773,44 +2332,36 @@ class _Collector:
             state = self._streams[key]
             if state.dead:
                 continue
-            self._emit(
+            accepted = self._emit(
                 self._terminal_record(
                     state, elapsed, LifecycleCode.CANCELLATION,
                     detail=Reason.CANCELLED,
                 )
             )
-            self._kill_stream(state, LifecycleCode.CANCELLATION)
+            if accepted:
+                self._kill_stream(state, LifecycleCode.CANCELLATION)
+            elif self._sink_dead or self._output_truncated:
+                break
         self._note(Reason.CANCELLED)
 
     def _truncate_terminals(self) -> None:
-        reserve = self._plan.limits.terminal_reserve_records
-        used = 0
         elapsed = self._elapsed_now()
         for key in self._order:
-            if used >= reserve:
-                break
             state = self._streams[key]
             if state.dead:
                 continue
-            record = self._terminal_record(
-                state, elapsed, LifecycleCode.OUTPUT_TRUNCATION,
-                detail=Reason.SINK_TRUNCATED,
+            accepted = self._emit(
+                self._terminal_record(
+                    state,
+                    elapsed,
+                    LifecycleCode.OUTPUT_TRUNCATION,
+                    detail=Reason.SINK_TRUNCATED,
+                )
             )
-            try:
-                normalized = self._validator.observe(record)
-            except StreamRejected:
-                continue
-            try:
-                blob = encode_transport(normalized)
-                if self._sink.write(blob) == len(blob):
-                    self._transport.update(blob)
-                    self._semantic.update(encode_semantic(normalized))
-                    self._valid_prefix += 1
-                    self._emitted_records += 1
-            except (SinkError, OSError, ValueError):
-                continue
-            used += 1
-            self._kill_stream(state, LifecycleCode.OUTPUT_TRUNCATION)
+            if accepted:
+                self._kill_stream(state, LifecycleCode.OUTPUT_TRUNCATION)
+            if self._sink_dead or not accepted:
+                break
         self._note(Reason.SINK_TRUNCATED)
 
     def _complete_terminals(self) -> None:
@@ -1819,36 +2370,74 @@ class _Collector:
             state = self._streams[key]
             if state.dead:
                 continue
-            self._emit(
+            accepted = self._emit(
                 self._terminal_record(
                     state, elapsed, LifecycleCode.RUN_COMPLETE
                 )
             )
-            self._kill_stream(state, LifecycleCode.RUN_COMPLETE)
+            if accepted:
+                self._kill_stream(state, LifecycleCode.RUN_COMPLETE)
+            else:
+                break
 
     def _finish(
         self, hard_deadline: str, stopped_early: bool
     ) -> SamplingResult:
         try:
-            footprint = self._source.sampler_footprint()
-        except Exception:
-            footprint = SamplerFootprint()
-        if not isinstance(footprint, SamplerFootprint):
-            footprint = SamplerFootprint()
+            raw_footprint = self._source.sampler_footprint()
+        except Exception as exc:  # noqa: BLE001 - diagnostics are redacted
+            self._diagnose("footprint", exc)
+            raw_footprint = None
+        footprint_values: Dict[str, Optional[int]] = {}
+        footprint_valid = isinstance(raw_footprint, SamplerFootprint)
+        if not footprint_valid:
+            self._diagnose("footprint", ValueError())
+        for name in (
+            "working_set_bytes",
+            "private_commit_bytes",
+            "handle_count",
+        ):
+            value: Any = None
+            if footprint_valid:
+                try:
+                    value = getattr(raw_footprint, name)
+                except Exception as exc:  # noqa: BLE001
+                    self._diagnose("footprint", exc)
+                    value = None
+            if value is not None and (
+                type(value) is not int or value < 0
+            ):
+                self._diagnose("footprint", ValueError())
+                value = None
+            footprint_values[name] = value
+        footprint = SamplerFootprint(**footprint_values)
         cleanup, cleanup_detail = self._cleanup()
         complete = (
             not stopped_early
             and not self._sink_dead
+            and not self._output_truncated
             and self._missed == 0
             and self._query_failed == 0
-            and self._samples == self._expected
+            and self._samples + self._accepted_gap_slots == self._expected
+            and self._accepted_terminals == len(self._streams)
             and not self._reasons
         )
+        missing = self._expected - self._samples - self._accepted_gap_slots
+        if missing < 0 or sum(self._accepted_gaps_by_reason.values()) != self._accepted_gap_slots:
+            raise SamplingError("collector: obligation arithmetic failed")
         return SamplingResult(
             schema=SCHEMA_ID,
             plan_id=self._plan.plan_id,
+            plan_digest=self._plan.plan_digest,
             run_ref=self._plan.run_ref,
             expected_samples=self._expected,
+            accepted_samples=self._samples,
+            accepted_gap_slots=self._accepted_gap_slots,
+            accepted_gaps_by_reason=dict(self._accepted_gaps_by_reason),
+            accepted_lifecycle_records=self._accepted_lifecycle_records,
+            accepted_terminals=self._accepted_terminals,
+            missing_obligations=missing,
+            failed_writes=self._failed_writes,
             emitted_records=self._emitted_records,
             missed_slots=self._missed,
             query_failed=self._query_failed,
@@ -1874,36 +2463,40 @@ class _Collector:
                 for key in self._order
             ),
             sink_error=self._sink_error,
+            diagnostics=self._diagnostic_summary(),
         )
 
-    def _cleanup(self) -> Tuple[str, str]:
+    def _cleanup(self) -> Tuple[str, Optional[str]]:
         if self._cleanup_done:
             return self._cleanup_result
         self._cleanup_done = True
         owned = [
             s.target
             for s in self._streams.values()
-            if s.target is not None and s.target.owned_handle
+            if s.target is not None and s.sampler_owned_target
         ]
         if not owned:
             self._cleanup_result = (
                 HandleCleanupStatus.NONE_OWNED,
-                "no sampler-owned handles",
+                None,
             )
             return self._cleanup_result
-        failures: List[str] = []
+        failures = 0
         for target in owned:
             try:
                 self._source.release(target)
             except Exception as exc:  # noqa: BLE001 - cleanup must not raise
-                failures.append(f"{target.binding.stream_key()}:{exc}")
+                failures += 1
+                self._diagnose("cleanup", exc)
         if failures:
-            detail = ";".join(failures)[:_MAX_REASON_DETAIL_LEN]
-            self._cleanup_result = (HandleCleanupStatus.PARTIAL, detail)
+            self._cleanup_result = (
+                HandleCleanupStatus.PARTIAL,
+                Reason.QUERY_FAILED,
+            )
         else:
             self._cleanup_result = (
                 HandleCleanupStatus.OK,
-                f"released {len(owned)} sampler-owned",
+                None,
             )
         return self._cleanup_result
 
@@ -1945,8 +2538,14 @@ def collect_samples(
 # ---------------------------------------------------------------------------
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x00100000
+_PROCESS_READ_ONLY_RIGHTS = (
+    _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE
+)
 _ERROR_ACCESS_DENIED = 5
-_STILL_ACTIVE = 259
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+_WAIT_FAILED = 0xFFFFFFFF
 _TH32CS_SNAPTHREAD = 0x00000004
 _MAX_IMAGE_CHARS = 32768
 
@@ -2002,6 +2601,8 @@ def _load_windows_apis() -> Any:
         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME))
     kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetProcessId.argtypes = (wintypes.HANDLE,)
+    kernel32.GetProcessId.restype = wintypes.DWORD
     kernel32.QueryFullProcessImageNameW.argtypes = (
         wintypes.HANDLE, wintypes.DWORD,
         wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
@@ -2009,6 +2610,9 @@ def _load_windows_apis() -> Any:
     kernel32.GetExitCodeProcess.argtypes = (
         wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.GetCurrentProcess.argtypes = ()
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.CreateToolhelp32Snapshot.argtypes = (
@@ -2042,19 +2646,23 @@ def _filetime_to_int(creation: Any) -> int:
 
 @dataclass
 class _WindowsTarget(PreparedTarget):
+    receipt: Optional[AdmittedProcessBinding] = None
     handle: Optional[int] = None
     open_error: Optional[int] = None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "receipt" and "receipt" in self.__dict__:
+            raise AttributeError("Windows target receipt is immutable")
+        object.__setattr__(self, name, value)
 
 
 class WindowsQueryAdapter(ProcessSource):
     """Live Windows query engine behind an owner-supplied process source.
 
-    Opens each bound PID with ``PROCESS_QUERY_LIMITED_INFORMATION`` only —
-    never ALL_ACCESS, elevation, or memory-reading privileges — and verifies
-    creation-time/image readback against the trusted owner binding before
-    every query. A PID alone never identifies the owned process: without the
-    owner-issued creation/image/generation identity there is nothing to
-    verify against, and callers must surface identity-unavailable instead.
+    Opens each admitted PID with only the query-limited and synchronization
+    rights required by the read-only APIs and zero-time retained-handle wait.
+    It verifies the exact PID, creation time, image and issuer-bound receipt
+    before and after every counter read. A PID alone never authorizes access.
 
     Counter mapping (per MSDN): ``WorkingSetSize`` is current working-set
     bytes; ``PrivateUsage`` is private committed bytes, not private resident
@@ -2073,7 +2681,11 @@ class WindowsQueryAdapter(ProcessSource):
         "opt_thread_count",
     )
 
-    def __init__(self, optional_counters: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        optional_counters: Sequence[str] = (),
+        owner_handoff: Optional[Callable[[ProcessBinding], Any]] = None,
+    ) -> None:
         if sys.platform != "win32":
             raise AdapterUnavailable(
                 f"{Reason.ADAPTER_UNAVAILABLE}: live Windows query path "
@@ -2088,16 +2700,38 @@ class WindowsQueryAdapter(ProcessSource):
                     f"optional counter {name!r} is not supported"
                 )
         self._optional = tuple(optional_counters)
+        self._owner_handoff = owner_handoff
+        self._owned_handle_by_target: Dict[int, int] = {}
 
     # -- ProcessSource protocol ----------------------------------------------
 
-    def prepare(self, binding: ProcessBinding) -> PreparedTarget:
-        target = _WindowsTarget(binding=binding, owned_handle=True)
+    def admit_binding(
+        self, expected: ProcessBinding
+    ) -> AdmittedProcessBinding:
+        if self._owner_handoff is None:
+            raise IdentityUnavailable()
+        if not isinstance(expected, ProcessBinding):
+            raise IdentityUnavailable()
+        try:
+            expected = _validate_binding(expected.to_dict(), 0)
+        except (PlanRejected, TypeError, ValueError):
+            raise IdentityUnavailable() from None
+        try:
+            observation = self._owner_handoff(expected)
+        except Exception as exc:  # noqa: BLE001 - do not infer identity
+            raise IdentityUnavailable() from exc
+        return self._mint_admitted_binding(expected, observation)
+
+    def prepare(self, receipt: AdmittedProcessBinding) -> PreparedTarget:
+        binding = self._require_admitted_binding(receipt)
+        target = _WindowsTarget(
+            binding=binding, receipt=receipt, owned_handle=False
+        )
         self._reopen(target)
         return target
 
     def attach_verified_handle(
-        self, binding: ProcessBinding, handle: int
+        self, receipt: AdmittedProcessBinding, handle: int
     ) -> PreparedTarget:
         """Consume a same-process/duplicated handle supplied in-process.
 
@@ -2106,23 +2740,49 @@ class WindowsQueryAdapter(ProcessSource):
         against the trusted owner identity before use, and it is never
         closed here: ownership stays with the supplier.
         """
+        binding = self._require_admitted_binding(receipt)
+        if isinstance(handle, bool) or not isinstance(handle, int) or handle <= 0:
+            raise IdentityUnavailable()
         target = _WindowsTarget(
-            binding=binding, owned_handle=False, handle=int(handle)
+            binding=binding,
+            receipt=receipt,
+            owned_handle=False,
+            handle=int(handle),
         )
         self._verify(target)
         return target
 
     def query(self, target: PreparedTarget, context: QueryContext) -> Any:
-        assert isinstance(target, _WindowsTarget)
+        if not isinstance(target, _WindowsTarget):
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        try:
+            self._require_target_receipt(target)
+        except IdentityUnavailable:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
         if target.handle is None:
             self._reopen(target)
         if target.handle is None:
-            return self._unknown_all(target.open_error)
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
         try:
             self._verify(target)
-        except IdentityMismatch:
-            return self._classify_absence(target)
-        return self._read_counters(target)
+        except IdentityMismatch as exc:
+            return self._identity_outcome(exc)
+        except Exception:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        before = self._terminal_state(target)
+        if before is not None:
+            return before
+        try:
+            counters = self._read_counters(target)
+            self._verify(target)
+        except IdentityMismatch as exc:
+            return self._identity_outcome(exc)
+        except Exception:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        after = self._terminal_state(target)
+        if after is not None:
+            return after
+        return counters
 
     def sampler_footprint(self) -> SamplerFootprint:
         apis = self._apis
@@ -2137,30 +2797,60 @@ class WindowsQueryAdapter(ProcessSource):
         )
 
     def release(self, target: PreparedTarget) -> None:
-        assert isinstance(target, _WindowsTarget)
-        if not target.owned_handle or target.handle is None:
+        if not isinstance(target, _WindowsTarget):
+            return
+        owned_handles = getattr(self, "_owned_handle_by_target", {})
+        handle = owned_handles.pop(id(target), None)
+        if handle is None:
             return
         apis = self._apis
-        handle = target.handle
         target.handle = None
+        target.owned_handle = False
         if not apis["kernel32"].CloseHandle(handle):
-            raise AdapterUnavailable(
-                f"CloseHandle failed: {apis['ctypes'].get_last_error()}"
-            )
+            raise AdapterUnavailable(Reason.QUERY_FAILED)
 
     # -- internals ---------------------------------------------------------------
 
     def _reopen(self, target: _WindowsTarget) -> None:
+        binding = self._require_target_receipt(target)
+        owned_handles = getattr(self, "_owned_handle_by_target", None)
+        if owned_handles is None:
+            owned_handles = {}
+            self._owned_handle_by_target = owned_handles
+        existing = owned_handles.get(id(target))
+        if existing is not None:
+            target.handle = existing
+            target.owned_handle = True
+            return
         apis = self._apis
         handle = apis["kernel32"].OpenProcess(
-            _PROCESS_QUERY_LIMITED_INFORMATION, False, target.binding.pid
+            _PROCESS_READ_ONLY_RIGHTS, False, binding.pid
         )
         if not handle:
             target.handle = None
             target.open_error = apis["ctypes"].get_last_error()
             return
-        target.handle = int(handle)
+        handle_value = int(handle)
+        target.handle = handle_value
+        target.owned_handle = True
+        owned_handles[id(target)] = handle_value
         target.open_error = None
+
+    def _require_target_receipt(
+        self, target: _WindowsTarget
+    ) -> ProcessBinding:
+        receipt = target.receipt
+        if receipt is None or target.binding != receipt.binding:
+            raise IdentityUnavailable()
+        return self._require_admitted_binding(receipt, target.binding)
+
+    def _actual_pid(self, target: _WindowsTarget) -> int:
+        if target.handle is None:
+            raise IdentityMismatch(Reason.UNKNOWN_OWNERSHIP)
+        pid = int(self._apis["kernel32"].GetProcessId(target.handle))
+        if pid == 0:
+            raise IdentityMismatch(Reason.UNKNOWN_OWNERSHIP)
+        return pid
 
     def _readback_identity(self, target: _WindowsTarget) -> Tuple[str, str]:
         apis = self._apis
@@ -2189,26 +2879,59 @@ class WindowsQueryAdapter(ProcessSource):
         return format(_filetime_to_int(creation), "016x"), buf.value
 
     def _verify(self, target: _WindowsTarget) -> None:
+        binding = self._require_target_receipt(target)
+        actual_pid = self._actual_pid(target)
+        if actual_pid != binding.pid:
+            raise IdentityMismatch(Reason.UNKNOWN_OWNERSHIP)
         creation, image = self._readback_identity(target)
-        if creation != target.binding.creation_identity:
+        if creation != binding.creation_identity:
             raise IdentityMismatch(Reason.CREATION_MISMATCH)
-        if image != target.binding.image_identity:
+        if image != binding.image_identity:
             raise IdentityMismatch(Reason.IMAGE_MISMATCH)
 
-    def _classify_absence(self, target: _WindowsTarget) -> Any:
-        apis = self._apis
-        code = apis["wintypes"].DWORD()
-        if apis["kernel32"].GetExitCodeProcess(target.handle, apis["ctypes"].byref(code)):
-            if int(code.value) != _STILL_ACTIVE:
-                return ProcessExit(exit_code=int(code.value))
+    def _identity_outcome(self, mismatch: IdentityMismatch) -> Any:
+        if mismatch.reason in (Reason.CREATION_MISMATCH, Reason.IMAGE_MISMATCH):
+            return ProcessReplacement()
+        return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+
+    def _terminal_state(self, target: _WindowsTarget) -> Optional[Any]:
         try:
-            creation, image = self._readback_identity(target)
-        except SamplingError:
-            return UnknownOwnership(detail=Reason.QUERY_FAILED)
-        return ProcessReplacement(
-            observed_creation=creation[:_MAX_REF_LEN],
-            observed_image=image[:_MAX_IMAGE_ID_LEN],
-        )
+            self._require_target_receipt(target)
+        except IdentityUnavailable:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        if target.handle is None:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        try:
+            status = int(
+                self._apis["kernel32"].WaitForSingleObject(target.handle, 0)
+            )
+        except Exception:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        if status == _WAIT_TIMEOUT:
+            return None
+        if status == _WAIT_OBJECT_0:
+            code = self._apis["wintypes"].DWORD()
+            try:
+                ok = self._apis["kernel32"].GetExitCodeProcess(
+                    target.handle, self._apis["ctypes"].byref(code)
+                )
+            except Exception:
+                return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+            if not ok:
+                return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+            return ProcessExit(exit_code=int(code.value))
+        if status == _WAIT_FAILED:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+
+    def _classify_absence(self, target: _WindowsTarget) -> Any:
+        try:
+            self._verify(target)
+        except IdentityMismatch as exc:
+            return self._identity_outcome(exc)
+        except Exception:
+            return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
+        return UnknownOwnership(detail=Reason.UNKNOWN_OWNERSHIP)
 
     def _unknown_reading(self, name: str, api_error: Optional[int]) -> CounterReading:
         reason = Reason.ACCESS_DENIED if api_error == _ERROR_ACCESS_DENIED else Reason.QUERY_FAILED
@@ -2327,7 +3050,8 @@ class WindowsQueryAdapter(ProcessSource):
                     CounterName.CPU_TIME_MS, cpu,
                     CounterUnit.MILLISECONDS, CounterStatus.OK))
         if CounterName.THREAD_COUNT in self._optional:
-            threads = self._thread_count(target.binding.pid)
+            binding = self._require_target_receipt(target)
+            threads = self._thread_count(binding.pid)
             if threads is None:
                 readings.append(self._unknown_reading(
                     CounterName.THREAD_COUNT, apis["ctypes"].get_last_error()))
@@ -2340,10 +3064,13 @@ class WindowsQueryAdapter(ProcessSource):
 
 def create_windows_source(
     optional_counters: Sequence[str] = (),
+    owner_handoff: Optional[Callable[[ProcessBinding], Any]] = None,
 ) -> WindowsQueryAdapter:
     """Construct the live Windows query adapter (win32 only).
 
     Raises :class:`AdapterUnavailable` on other platforms; validation,
     encoding, and injected-fixture sampling never touch this path.
     """
-    return WindowsQueryAdapter(optional_counters=optional_counters)
+    return WindowsQueryAdapter(
+        optional_counters=optional_counters, owner_handoff=owner_handoff
+    )

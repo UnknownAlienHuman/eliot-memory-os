@@ -6,13 +6,16 @@ use std::sync::Arc;
 use eliot_native_worker::{
     AdmittedLifecycle, BoundedEvidenceSink, KERNEL_ADMISSION_REQUIRED, KernelCheckpointPort,
     KernelNativeWorkerClient, NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError,
-    PresentationEchoAdmission, SharedKernelTransport,
+    PresentationEchoAdmission, ReconcileSubmission, SharedKernelTransport,
     admitted_material::{ValidatedAdmittedMaterial, read_admitted_material},
-    derive_admitted_intent, dispatch_now_unix_ms, select_factory_for_admitted,
+    derive_admitted_intent, dispatch_now_unix_ms,
+    governed_action::{FinishState, RecordedEffect, ValidatedAction},
+    select_factory_for_admitted,
 };
 use eliot_native_worker_core::{
-    CapabilityAdmissionPort, CheckpointRequest, DurableCheckpointPort, DurableReplayPort,
-    JSON_ENCODING_PROFILE, PROTOCOL_VERSION, WorkerCore, WorkerError, WorkerFrame, WorkerFrameBody,
+    CapabilityAdmissionPort, CheckpointRequest, ClaimAdmissionRequest, DurableCheckpointPort,
+    DurableReplayPort, JSON_ENCODING_PROFILE, NativeWorkerRegistration, PROTOCOL_VERSION,
+    ReadinessSubmission, WorkerCore, WorkerError, WorkerFrame, WorkerFrameBody,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use eliot_process_executor::WindowsProcessExecutor;
@@ -213,6 +216,11 @@ fn run() -> i32 {
 /// coverage-gap record when the serve ends cancelled or unknown, whether
 /// the loop ends cleanly or fails.
 ///
+/// Issue #1911 adds the two receipts the A10.1/A10.8 steps needed and the
+/// binary never emitted: the fence+verifier-linked [`RecordedEffect`] for every
+/// admitted operation (drive and serve), and one terminal finish state for the
+/// run. Neither line is a stdout frame and neither changes the process exit.
+///
 /// `admission` is a handle to the exact admission port injected into
 /// `worker` above; the terminal coverage-gap checkpoint binds the granted
 /// lease/epoch/fence/revision that port admitted and the core sealed.
@@ -234,12 +242,51 @@ where
     // the first lifecycle submit; the validated action/contract provenance
     // is retained with the drive receipt below. No unchecked bypass route
     // remains: this entry is the only production caller of the drive.
-    match block_on(eliot_native_worker::drive_governed_material(
-        lifecycle, worker, material, process,
+    //
+    // The lifecycle is wrapped in a pure observation recorder for the
+    // duration of the drive only: `drive_governed_claimed` discards each
+    // submission's own observation, so without this seam the returned
+    // `ValidatedAction.state_fence` reached no production reader and the
+    // A10.1 steps 7-8 fence+verifier link was never made. The recorder
+    // delegates unchanged — it is not a second gate and admits nothing.
+    let mut recorder = RecordedLifecycle {
+        inner: lifecycle,
+        receipts: Vec::new(),
+    };
+    let drive_actions = match block_on(eliot_native_worker::drive_governed_material(
+        &mut recorder,
+        worker,
+        material,
+        process,
     )) {
-        Ok((actions, _ready)) => emit_governed_provenance(&actions),
-        Err(error) => return fail_drive(&error),
-    }
+        Ok((actions, _ready)) => actions,
+        // Refused at or before admission: nothing was attempted, so there is
+        // no observation and no finish to report.
+        Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+            return fail_drive(&error);
+        }
+        // Failed after admission (issue #1911, A10.1 steps 7-8 / A10.8): the
+        // operations that already returned keep their observations, and the run
+        // still finishes. Returning straight to `fail_drive` used to discard
+        // both, so a partial drive reported nothing about work it had done and
+        // no finish state at all.
+        Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+            let (effects, finish) = partial_drive_receipts(&actions, &recorder.receipts);
+            emit_governed_provenance(&actions);
+            emit_governed_effects(&effects);
+            if let Some(receipt) = &finish {
+                emit_finish(receipt);
+            }
+            return fail_drive(&error);
+        }
+    };
+    let receipts = recorder.receipts;
+    emit_governed_provenance(&drive_actions);
+    // `GOVERNED_DRIVE_OPS` is register, claim, reconcile, start_claimed and
+    // `drive_admitted_claimed` submits registration, claim, reconcile, then
+    // readiness, so positional call order pairs the fourth action
+    // (`start_claimed`) with the readiness receipt of its own submit.
+    emit_governed_effects(&recorded_effects(&drive_actions, &receipts));
     // Issue #1912: re-prove the explicit job envelope at the serve
     // boundary, so stdio serving binds the same principal/session,
     // `WorkScope`, epoch, fence, allowed effects, route, task/job budget,
@@ -261,20 +308,36 @@ where
             return deny_invalid_material(&format!("admitted epoch is not projectable: {error}"));
         }
     };
-    match block_on(worker.serve_stdio_governed(
+    let serve_outcome = block_on(worker.serve_stdio_governed(
         &material.action_envelopes,
         &material.admission.claim().work_scope_id,
         &fence,
         &epoch,
-    )) {
-        Ok(_) => {
-            // Issue #1912: a serve that ends cancelled or holding an
-            // unknown outcome leaves a visible coverage-gap record naming
-            // the retained claim/task/job and its durable retention, so
-            // verified partial work is never silently lost.
-            if let Some(gap) =
-                eliot_native_worker::CoverageGap::for_job_envelope(&envelope, worker.lifecycle())
-            {
+    ));
+    // Issue #1911: the serve action is retained instead of dropped, and its
+    // effect is recorded against the bounded loop outcome — the serve's own
+    // receipt is loop termination, so nothing stronger is claimed here.
+    let (serve_actions, serve_observation) = match &serve_outcome {
+        Ok(actions) => (
+            actions.clone(),
+            "stdio loop terminated at its own boundary".to_owned(),
+        ),
+        Err(error) => (Vec::new(), format!("stdio loop failed: {error}")),
+    };
+    emit_governed_effects(&recorded_effects(
+        &serve_actions,
+        &[serde_json::json!({ "outcome": serve_observation })],
+    ));
+    // Issue #1912 (and A3): a serve that ends — cleanly or with a failure —
+    // while the worker is cancelled or holding an unknown outcome leaves the
+    // visible coverage-gap record. Verified partial output stays under the
+    // original claim for reconciliation, so the gap is persisted-then-emitted
+    // exactly the same way on both paths instead of being silently lost
+    // behind the failure line. Any other lifecycle served nothing partial and
+    // keeps no gap.
+    let gap_finish =
+        match eliot_native_worker::CoverageGap::for_job_envelope(&envelope, worker.lifecycle()) {
+            Some(gap) => {
                 // Durable before reported: the verified partial output is
                 // first persisted as a claim-bound checkpoint through the
                 // already-injected `DurableCheckpointPort`, and only then is
@@ -283,28 +346,211 @@ where
                 let (durable, detail) =
                     persist_coverage_gap_checkpoint(worker, material, admission, &gap);
                 emit_coverage_gap(&gap, durable, &detail);
+                Some(gap.finish)
             }
-            0
-        }
+            None => None,
+        };
+    // Issue #1911 (A10.8): the run now ends in exactly one honest finish
+    // state instead of silently succeeding. This binary runs no verifier, so
+    // the production truth is `verifier_met = false` and
+    // `proof_admissible = false`; an observed coverage gap keeps its own
+    // `PARTIAL`/`CANCELLED` word instead of being overwritten. The process
+    // exit stays owned by the drive/serve failure projection below — no
+    // fragment maps a finish state to an exit.
+    if let Some(action) = terminal_action(&drive_actions, &serve_actions) {
+        emit_finish(&finish_receipt(action, false, false, gap_finish));
+    }
+    match serve_outcome {
+        Ok(_) => 0,
         Err(error) => {
-            // Issue #1912 (A3): a serve that fails while the worker is
-            // cancelled or holding an unknown outcome still leaves the
-            // visible coverage-gap record. Verified partial output stays
-            // under the original claim for reconciliation, so the gap is
-            // persisted-then-emitted exactly as on the clean path instead
-            // of being silently lost behind the failure line. Any other
-            // lifecycle served nothing partial and keeps the failure alone.
-            if let Some(gap) =
-                eliot_native_worker::CoverageGap::for_job_envelope(&envelope, worker.lifecycle())
-            {
-                let (durable, detail) =
-                    persist_coverage_gap_checkpoint(worker, material, admission, &gap);
-                emit_coverage_gap(&gap, durable, &detail);
-            }
             emit(ADMITTED_DRIVE_FAILED, &error.to_string());
             ADMITTED_DRIVE_FAILED_EXIT
         }
     }
+}
+
+/// Records each lifecycle submission's own observation, in submit order.
+///
+/// A10.1 step 7 requires the returned observation to be recorded against the
+/// admitted action; `drive_admitted_claimed` returns only the `WorkerReady`
+/// receipt and discards the four submission values. This thin recorder is the
+/// seam that hands them back: every method delegates unchanged and stores the
+/// `Ok` value, so the drive result, its refusal family, and its exit
+/// projection are byte-for-byte what they were without it.
+struct RecordedLifecycle<'a, L> {
+    inner: &'a mut L,
+    receipts: Vec<serde_json::Value>,
+}
+
+impl<L: AdmittedLifecycle> RecordedLifecycle<'_, L> {
+    fn observe(
+        &mut self,
+        result: Result<serde_json::Value, NativeWorkerError>,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        if let Ok(receipt) = &result {
+            self.receipts.push(receipt.clone());
+        }
+        result
+    }
+}
+
+impl<L: AdmittedLifecycle> AdmittedLifecycle for RecordedLifecycle<'_, L> {
+    fn submit_registration(
+        &mut self,
+        registration: &NativeWorkerRegistration,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        // The inner receipt is bound to a local first: nesting the delegate call
+        // inside `self.observe(..)` would borrow `*self` mutably twice in one
+        // expression and would not compile.
+        let receipt = self.inner.submit_registration(registration);
+        self.observe(receipt)
+    }
+
+    fn submit_claim(
+        &mut self,
+        admission: &ClaimAdmissionRequest,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        let receipt = self.inner.submit_claim(admission);
+        self.observe(receipt)
+    }
+
+    fn submit_reconcile(
+        &mut self,
+        submission: &ReconcileSubmission,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        let receipt = self.inner.submit_reconcile(submission);
+        self.observe(receipt)
+    }
+
+    fn submit_readiness(
+        &mut self,
+        submission: &ReadinessSubmission,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        let receipt = self.inner.submit_readiness(submission);
+        self.observe(receipt)
+    }
+}
+
+/// Pairs each validated action with its recorded observation (A10.1 steps 7-8).
+///
+/// Pure projection over the drive's own returned actions and the recorder's
+/// call-ordered receipts: `record_effect` is what stamps the admitted
+/// `state_fence` and the bound verifier onto the observation, which is the
+/// fence+verifier link. A receipt count below the action count can only mean a
+/// submission that never returned, so `zip` records exactly the pairs that
+/// both exist instead of inventing one.
+fn recorded_effects(
+    actions: &[ValidatedAction],
+    receipts: &[serde_json::Value],
+) -> Vec<RecordedEffect> {
+    actions
+        .iter()
+        .zip(receipts)
+        .map(|(action, receipt)| {
+            eliot_native_worker::governed_action::record_effect(
+                action,
+                &serde_json::to_string(receipt).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Projects what a partial governed drive already owns (issue #1911, A10.8).
+///
+/// Pure projection over the admitted actions and the recorder's call-ordered
+/// receipts, so the failure path reports the same fence+verifier-linked
+/// observations the success path does instead of dropping them:
+///
+/// - effects: exactly the pairs that both exist. A receipt count below the
+///   action count means a submission never returned, and `recorded_effects`
+///   `zip`s rather than inventing the missing observation;
+/// - finish: anchored on the last action that actually produced an
+///   observation, never on an action that did not run. This binary runs no
+///   verifier, so `verifier_met`/`proof_admissible` are both `false` and the
+///   word can only be a non-complete one — a partial drive can never report
+///   `VERIFIED_COMPLETE`. With no observation at all there is no honest finish
+///   and none is invented.
+fn partial_drive_receipts(
+    actions: &[ValidatedAction],
+    receipts: &[serde_json::Value],
+) -> (Vec<RecordedEffect>, Option<serde_json::Value>) {
+    let effects = recorded_effects(actions, receipts);
+    let finish = actions
+        .get(receipts.len().saturating_sub(1))
+        .map(|action| finish_receipt(action, false, false, None));
+    (effects, finish)
+}
+
+/// Emits the recorded effects as a sibling of the provenance receipt.
+///
+/// One compact stderr receipt line (never a stdout frame) so supervision reads
+/// the fence+verifier-linked observations next to the provenance they came
+/// from, without either line entering the frame stream.
+fn emit_governed_effects(effects: &[RecordedEffect]) {
+    let items: Vec<serde_json::Value> = effects
+        .iter()
+        .map(|effect| serde_json::to_value(effect).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "{{\"receipt\":\"GOVERNED_ACTION_EFFECT\",\"effects\":{}}}",
+        serde_json::Value::Array(items)
+    );
+}
+
+/// Picks the action whose terminal state the run's finish word describes.
+///
+/// The serve is the last externally effective operation, so its validated
+/// action is the terminal one whenever the governed serve admitted an
+/// envelope; otherwise the last driven action stands, since a run that never
+/// served still ends on its final driven operation.
+fn terminal_action<'a>(
+    drive_actions: &'a [ValidatedAction],
+    serve_actions: &'a [ValidatedAction],
+) -> Option<&'a ValidatedAction> {
+    serve_actions.last().or_else(|| drive_actions.last())
+}
+
+/// Builds the run's single honest finish receipt (A10.8).
+///
+/// Pure projection: the word comes from `finish_for_verdict`, which only
+/// returns `VERIFIED_COMPLETE` when a bound verifier actually met its proof.
+/// With the Kernel's `unknown:` verifier — or any unmet verdict — the word is
+/// `DEGRADED_NO_PROOF` or `FAILED_VERIFICATION`, and `complete` is carried from
+/// `FinishState::is_complete()` so no other path can print a completion claim.
+/// `observed_finish` is the coverage gap's own already-honest word; when one
+/// was observed it is preserved verbatim and never recomputed.
+fn finish_receipt(
+    action: &ValidatedAction,
+    verifier_met: bool,
+    proof_admissible: bool,
+    observed_finish: Option<FinishState>,
+) -> serde_json::Value {
+    let finish = observed_finish.unwrap_or_else(|| {
+        eliot_native_worker::governed_action::finish_for_verdict(
+            action,
+            verifier_met,
+            proof_admissible,
+        )
+    });
+    serde_json::json!({
+        "receipt": "GOVERNED_FINISH",
+        "operation": action.operation,
+        "scope_ref": action.scope_ref,
+        "applicable_authority": action.applicable_authority,
+        "verifier": action.verifier,
+        "verifier_met": verifier_met,
+        "proof_admissible": proof_admissible,
+        "finish": finish.as_str(),
+        "complete": finish.is_complete(),
+    })
+}
+
+/// Emits the terminal finish receipt line (never a stdout frame).
+fn emit_finish(receipt: &serde_json::Value) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{receipt}");
 }
 
 /// Retains the validated action/contract provenance with the drive receipt.
@@ -312,7 +558,7 @@ where
 /// Emits one compact stderr receipt line (never a stdout frame) pairing each
 /// driven operation with its derived impact class, scope, authority, and
 /// verifier, so supervision observes what the gate admitted end to end.
-fn emit_governed_provenance(actions: &[eliot_native_worker::governed_action::ValidatedAction]) {
+fn emit_governed_provenance(actions: &[ValidatedAction]) {
     let items: Vec<serde_json::Value> = actions
         .iter()
         .map(|action| {
@@ -567,8 +813,9 @@ mod tests {
     use eliot_native_worker::{
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
         NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, PresentationEchoAdmission,
-        ValidatedDispatchGrant, derive_admitted_intent, drive_admitted_claimed,
-        governed_action::ActionEnvelope, require_launch_grant, select_factory_for_admitted,
+        ReconcileSubmission, ValidatedDispatchGrant, derive_admitted_intent,
+        drive_admitted_claimed, governed_action::ActionEnvelope, require_launch_grant,
+        select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope,
@@ -595,8 +842,10 @@ mod tests {
     use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 
     use super::{
-        ADMITTED_DRIVE_FAILED_EXIT, KERNEL_ADMISSION_EXIT, PROVIDER_RUNTIME_DEFERRED, block_on,
-        deny_absent_material, deny_invalid_material, deny_transport, exit_for_drive_error,
+        ADMITTED_DRIVE_FAILED_EXIT, FinishState, KERNEL_ADMISSION_EXIT, PROVIDER_RUNTIME_DEFERRED,
+        RecordedLifecycle, ValidatedAction, block_on, deny_absent_material, deny_invalid_material,
+        deny_transport, exit_for_drive_error, finish_receipt, partial_drive_receipts,
+        recorded_effects, terminal_action,
     };
 
     /// Fake authenticated lifecycle: validates the exact presentation and
@@ -1317,20 +1566,20 @@ mod tests {
     }
 
     fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-        let body = serde_json::to_vec(frame).expect("frame");
-        let mut out = u32::try_from(body.len())
-            .expect("len")
-            .to_le_bytes()
-            .to_vec();
-        out.extend_from_slice(&body);
-        out
+        eliot_ipc::encode_frame(
+            &frame.to_ebp_frame().expect("EBP frame"),
+            eliot_ipc::TransportLimits::default(),
+        )
+        .expect("encoded EBP frame")
     }
 
     fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-        let (prefix, body) = bytes.split_at(4);
-        let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-        assert_eq!(length, body.len());
-        serde_json::from_slice(body).expect("response")
+        let frame = eliot_ipc::decode_frame(bytes, eliot_ipc::TransportLimits::default())
+            .expect("EBP response frame");
+        let eliot_protocol::ProtocolPayload::Json(response) = frame.payload else {
+            panic!("JSON worker response");
+        };
+        serde_json::from_value(response).expect("response")
     }
 
     type SliceDWorker = NativeWorker<
@@ -1572,7 +1821,12 @@ mod tests {
         let envelope = ActionEnvelope {
             operation: envelope_op.to_owned(),
             intent: format!("execute governed {envelope_op}"),
-            scope_ref: "scope-1911".to_owned(),
+            // The real Kernel producer copies the admitted claim's
+            // `work_scope_id` into `scope_ref`
+            // (`bins/eliot-kernel/src/dispatch_launch.rs`), and the product
+            // gate refuses any other value before the first submit. The
+            // fixture must carry the same scope its `claim_for` builds.
+            scope_ref: "scope-1".to_owned(),
             preconditions: "claim admitted; fence live".to_owned(),
             expected_effect: format!("bounded {envelope_op} effect"),
             invariants: "no ambient effects".to_owned(),
@@ -1686,6 +1940,30 @@ mod tests {
         }
     }
 
+    /// Same contract as [`refusal_detail`] for the governed drive entry, whose
+    /// error keeps a partial drive distinguishable from a pre-admission
+    /// refusal.
+    fn drive_refusal_detail<T>(
+        result: Result<T, eliot_native_worker::GovernedDriveFailure>,
+        what: &str,
+    ) -> String {
+        match result {
+            Ok(_) => panic!("{what} must refuse"),
+            // Every contour denial is a pre-admission refusal: these fixtures
+            // assert zero submits, so a partial-drive error would itself be the
+            // defect.
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                panic!("{what} must refuse before admission, got {actions:?} / {error:?}")
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                match error {
+                    NativeWorkerError::KernelAdmissionRequired(detail) => detail,
+                    other => panic!("expected the contour denial, got {other:?}"),
+                }
+            }
+        }
+    }
+
     fn action_currency() -> (serde_json::Value, serde_json::Value) {
         (
             serde_json::to_value(fence())
@@ -1728,6 +2006,194 @@ mod tests {
         remove_bat("governed-drive");
     }
 
+    /// A lifecycle that fails the readiness submit after the three submits
+    /// before it already returned, so the drive is partial: register, claim and
+    /// reconcile happened, `start_claimed` did not.
+    struct FailAtReadiness<'a, L> {
+        inner: &'a mut L,
+    }
+
+    impl<L: AdmittedLifecycle> AdmittedLifecycle for FailAtReadiness<'_, L> {
+        fn submit_registration(
+            &mut self,
+            registration: &NativeWorkerRegistration,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            self.inner.submit_registration(registration)
+        }
+
+        fn submit_claim(
+            &mut self,
+            admission: &ClaimAdmissionRequest,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            self.inner.submit_claim(admission)
+        }
+
+        fn submit_reconcile(
+            &mut self,
+            submission: &ReconcileSubmission,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            self.inner.submit_reconcile(submission)
+        }
+
+        fn submit_readiness(
+            &mut self,
+            _submission: &eliot_native_worker_core::ReadinessSubmission,
+        ) -> Result<serde_json::Value, NativeWorkerError> {
+            Err(NativeWorkerError::KernelAdmissionRequired(
+                "owner refused the readiness submit".to_owned(),
+            ))
+        }
+    }
+
+    /// A drive that fails after admission still owns what it completed
+    /// (issue #1911, A10.1 steps 7-8, A10.8).
+    ///
+    /// The admitted actions used to die with the `Err`, so the caller could not
+    /// report the three operations that had already returned, and the run ended
+    /// with no finish state at all. Both facts are asserted here against the
+    /// real drive, and the finish word is asserted non-complete.
+    #[test]
+    #[cfg(windows)]
+    fn partial_governed_drive_reports_completed_operations_and_finishes_honestly() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-partial", drive_carriers(&fence_json, &epoch_json));
+        let mut recorder = RecordedLifecycle {
+            inner: &mut lifecycle,
+            receipts: Vec::new(),
+        };
+        let failure = {
+            let mut failing = FailAtReadiness {
+                inner: &mut recorder,
+            };
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut failing,
+                &mut worker,
+                &material,
+                process,
+            ))
+        };
+        let (actions, error) = match failure {
+            Ok(_) => panic!("a refused readiness submit must fail the drive"),
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                (actions, error)
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                panic!("admission must precede the drive, got {error:?}")
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                NativeWorkerError::KernelAdmissionRequired(ref detail) if detail.contains("readiness")
+            ),
+            "the drive error is the readiness refusal itself, got {error:?}"
+        );
+        assert_eq!(
+            actions.len(),
+            4,
+            "every driven operation keeps its admitted action after a partial drive"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.operation.as_str())
+                .collect::<Vec<_>>(),
+            ["register", "claim", "reconcile", "start_claimed"],
+            "the retained actions keep drive order"
+        );
+
+        let receipts = recorder.receipts;
+        assert_eq!(
+            receipts.len(),
+            3,
+            "the three submits that returned are exactly the observations a partial drive owns"
+        );
+        let (effects, finish) = partial_drive_receipts(&actions, &receipts);
+        assert_eq!(
+            effects.len(),
+            3,
+            "one recorded effect per completed operation, and none invented for the fourth"
+        );
+        for (effect, action) in effects.iter().zip(actions.iter()) {
+            assert_eq!(effect.operation, action.operation);
+            assert_eq!(
+                effect.state_fence, action.state_fence,
+                "each retained effect keeps the admitted state fence it ran under"
+            );
+            assert_eq!(
+                effect.verifier, action.verifier,
+                "each retained effect keeps its bound verifier"
+            );
+        }
+
+        let Some(finish) = finish else {
+            panic!("a partial drive with observations must finish");
+        };
+        assert_eq!(
+            finish["operation"], "reconcile",
+            "the finish is anchored on the last operation that actually returned"
+        );
+        assert_eq!(finish["verifier_met"], false);
+        assert_eq!(finish["proof_admissible"], false);
+        assert_eq!(
+            finish["complete"], false,
+            "a partial drive can never claim completion"
+        );
+        assert_ne!(
+            finish["finish"], "VERIFIED_COMPLETE",
+            "no unmet verifier may be reported as verified"
+        );
+
+        // Non-vacuity: anchoring on the last ADMITTED action instead of the last
+        // OBSERVED one would name an operation that never ran.
+        let anchored_on_the_wrong_operation = actions
+            .last()
+            .map(|action| finish_receipt(action, false, false, None));
+        assert_eq!(
+            anchored_on_the_wrong_operation
+                .as_ref()
+                .map(|receipt| &receipt["operation"]),
+            Some(&serde_json::json!("start_claimed")),
+            "the unobserved operation is exactly what a last-admitted anchor would have named"
+        );
+        remove_bat("governed-partial");
+    }
+
+    /// A pre-admission refusal still owns nothing: no action, no observation
+    /// and therefore no invented finish.
+    #[test]
+    #[cfg(windows)]
+    fn a_pre_admission_refusal_retains_no_action_and_invents_no_finish() {
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-prerefuse", Vec::new());
+        let failure = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ));
+        let Err(failure) = failure else {
+            panic!("missing envelopes must refuse");
+        };
+        assert!(
+            failure.retained_actions().is_empty(),
+            "a refusal before admission owns no admitted action"
+        );
+        assert!(matches!(
+            failure,
+            eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(_)
+        ));
+        let (effects, finish) = partial_drive_receipts(failure.retained_actions(), &[]);
+        assert!(effects.is_empty());
+        assert!(
+            finish.is_none(),
+            "no observation means no honest finish, and none is invented"
+        );
+        assert!(lifecycle.registration.is_none() && lifecycle.claim.is_none());
+        remove_bat("governed-prerefuse");
+    }
+
     #[test]
     #[cfg(windows)]
     fn governed_drive_refuses_missing_mismatched_or_stale_envelopes_with_zero_submits() {
@@ -1735,7 +2201,7 @@ mod tests {
         // Missing: legacy bytes carry no carriers; nothing is submitted.
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
             governed_drive_parts("governed-missing", Vec::new());
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -1760,7 +2226,7 @@ mod tests {
                 &epoch_json,
             )],
         );
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -1789,7 +2255,7 @@ mod tests {
                 &epoch_json,
             )],
         );
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -2462,7 +2928,7 @@ mod tests {
             Vec::new(),
             "nonce-kernel-drive-missing-register",
         );
-        let detail = refusal_detail(
+        let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
@@ -2481,5 +2947,131 @@ mod tests {
         );
         assert_eq!(worker.lifecycle(), WorkerLifecycle::Created);
         let _ = std::fs::remove_file(&staged);
+    }
+
+    /// One Kernel-produced validated action (issue #1911 W3/W5 proof).
+    ///
+    /// `verifier` is the exact literal the real Kernel producer emits
+    /// (`bins/eliot-kernel/src/dispatch_launch.rs`) and `state_fence` is the
+    /// same admitted fence the rest of these fixtures carry, so the projection
+    /// under test is the one production actually feeds it.
+    fn kernel_produced_action(operation: &str) -> ValidatedAction {
+        ValidatedAction {
+            operation: operation.to_owned(),
+            impact: eliot_native_worker::governed_action::ImpactClass::Material,
+            scope_ref: "scope-kernel-drive-1".to_owned(),
+            applicable_authority: format!("kernel-authority-for-{operation}"),
+            state_fence: serde_json::to_value(fence())
+                .unwrap_or_else(|error| panic!("fence projects: {error:?}")),
+            verifier: "unknown:post-effect verifier is owned outside Kernel dispatch".to_owned(),
+        }
+    }
+
+    /// The four lifecycle observations `drive_admitted_claimed` submits, in
+    /// the submit order that pairs them with `GOVERNED_DRIVE_OPS`: the
+    /// `start_claimed` action is answered by its own readiness submit.
+    fn drive_submission_receipts() -> Vec<serde_json::Value> {
+        ["registration", "claim", "reconcile", "readiness"]
+            .into_iter()
+            .map(|kind| serde_json::json!({ "kind": kind }))
+            .collect()
+    }
+
+    #[test]
+    fn recorded_effects_pair_every_admitted_action_with_its_fence_bound_observation() {
+        let actions: Vec<ValidatedAction> = ["register", "claim", "reconcile", "start_claimed"]
+            .into_iter()
+            .map(kernel_produced_action)
+            .collect();
+        let receipts = drive_submission_receipts();
+        let effects = recorded_effects(&actions, &receipts);
+
+        // Every driven operation carries exactly one recorded effect, so the
+        // A10.1 steps 7-8 fence+verifier link exists for all of them.
+        assert_eq!(effects.len(), actions.len());
+        for (effect, action) in effects.iter().zip(&actions) {
+            assert_eq!(effect.state_fence, action.state_fence);
+            assert_eq!(effect.verifier, action.verifier);
+            assert_eq!(effect.scope_ref, action.scope_ref);
+            assert_eq!(effect.operation, action.operation);
+            assert_eq!(
+                effect.verifier,
+                "unknown:post-effect verifier is owned outside Kernel dispatch"
+            );
+            assert!(
+                effect.observation.contains("\"kind\""),
+                "the submission's own receipt is the recorded observation: {}",
+                effect.observation
+            );
+        }
+        // Positional pairing holds: the fourth action is answered by the
+        // readiness submit, never by the reconcile receipt.
+        assert!(effects[3].observation.contains("readiness"));
+        // A submission that never returned records nothing rather than
+        // inventing an observation for it.
+        assert_eq!(recorded_effects(&actions, &receipts[..2]).len(), 2);
+    }
+
+    #[test]
+    fn terminal_finish_is_honest_and_never_reports_verified_complete() {
+        let drive: Vec<ValidatedAction> = ["register", "claim", "reconcile", "start_claimed"]
+            .into_iter()
+            .map(kernel_produced_action)
+            .collect();
+        let serve = vec![kernel_produced_action("serve_stdio")];
+
+        // The serve is the last externally effective operation, so it is the
+        // terminal action; a run that never served ends on its last drive.
+        assert_eq!(
+            terminal_action(&drive, &serve).map(|action| action.operation.as_str()),
+            Some("serve_stdio")
+        );
+        assert_eq!(
+            terminal_action(&drive, &[]).map(|action| action.operation.as_str()),
+            Some("start_claimed")
+        );
+        assert!(terminal_action(&[], &[]).is_none());
+
+        // The Kernel-produced terminal action carries the explicit `unknown:`
+        // verifier, so production truth (no verifier runs in this binary)
+        // finishes DEGRADED_NO_PROOF and never claims completion.
+        let terminal = serve.first().expect("serve action");
+        let receipt = finish_receipt(terminal, false, false, None);
+        assert_eq!(receipt["receipt"], "GOVERNED_FINISH");
+        assert_eq!(receipt["operation"], "serve_stdio");
+        assert_eq!(receipt["verifier_met"], false);
+        assert_eq!(receipt["proof_admissible"], false);
+        assert_eq!(receipt["finish"], "DEGRADED_NO_PROOF");
+        assert_eq!(receipt["complete"], false);
+        assert!(!FinishState::DegradedNoProof.is_complete());
+
+        // An observed coverage gap keeps its own already-honest word verbatim
+        // and is never overwritten by the recomputed verdict.
+        assert_eq!(
+            finish_receipt(terminal, false, false, Some(FinishState::Partial))["finish"],
+            "PARTIAL"
+        );
+        assert_eq!(
+            finish_receipt(terminal, false, false, Some(FinishState::Cancelled))["finish"],
+            "CANCELLED"
+        );
+
+        // VERIFIED_COMPLETE is unreachable from the production inputs: the
+        // `unknown:` arm is answered before any completion branch, for every
+        // verdict pair this binary could ever pass.
+        for verifier_met in [false, true] {
+            for proof_admissible in [false, true] {
+                let receipt = finish_receipt(terminal, verifier_met, proof_admissible, None);
+                assert_ne!(receipt["finish"], "VERIFIED_COMPLETE");
+                assert_eq!(receipt["complete"], false);
+            }
+        }
+        // A bound (non-`unknown:`) verifier with an unmet verdict stays
+        // FAILED_VERIFICATION, also never completion.
+        let mut bound = terminal.clone();
+        bound.verifier = "verifier-1911".to_owned();
+        let unmet = finish_receipt(&bound, false, false, None);
+        assert_eq!(unmet["finish"], "FAILED_VERIFICATION");
+        assert_eq!(unmet["complete"], false);
     }
 }

@@ -563,8 +563,17 @@ impl FakeTarget {
         self
     }
 
+    /// Dispatch count for one phase class.
+    ///
+    /// `applies` stores the debug-form phase identity because its payload, the
+    /// per-member blob hash for example, is what stable member identity is
+    /// compared against; every other reader of `applies` needs that form. The
+    /// count therefore comes from `calls`: `apply_restore_effect` derives both
+    /// the call name and the debug phase identity from the same
+    /// `intent.phase` and pushes them adjacently after the same fault gates, so
+    /// entry `i` of `calls` is the call name of entry `i` of `applies`.
     fn apply_count(&self, call: &str) -> usize {
-        self.applies
+        self.calls
             .iter()
             .filter(|name| name.as_str() == call)
             .count()
@@ -1026,7 +1035,7 @@ fn source_active_and_foreign_destinations_rejected_before_effects() {
             &mut activated_target,
             &mut activated_journal
         ),
-        Err(BackupError::StaleRestoreLineage),
+        Err(BackupError::PlanMismatch),
         "non-advancing (active) destination lineage is refused"
     );
     assert!(
@@ -1346,6 +1355,14 @@ fn malformed_stale_and_out_of_order_resumed_states_are_rejected() {
     );
 
     let (bundle, plan, journal) = with_forged_completion(|record| {
+        // Completion stores `completed_phases` as the phase COUNT
+        // (`restore_phases(&bundle).len()`), but a resumed non-`Completed` row
+        // must store the INDEX of its own phase, and the completed row's phase
+        // is the last one, whose index is one less than that count. Putting the
+        // index back leaves this row structurally consistent with respect to
+        // the phase-index check, so the absent intent is the only thing left
+        // for the `ReceiptPersisted` arm to refuse.
+        record.completed_phases -= 1;
         record.state = RestoreJournalState::ReceiptPersisted;
         record.intent = None;
     });
@@ -1355,6 +1372,7 @@ fn malformed_stale_and_out_of_order_resumed_states_are_rejected() {
         Err(BackupError::RestoreJournalCorrupt),
         "negative mutation: receipt-before-intent execution is refused"
     );
+    assert!(target.calls.is_empty());
 
     let (bundle, plan, journal) = with_forged_completion(|record| {
         record.state = RestoreJournalState::Ready;
@@ -1391,9 +1409,10 @@ fn malformed_stale_and_out_of_order_resumed_states_are_rejected() {
     let mut target = FakeTarget::new(&bundle, &plan);
     assert_eq!(
         run(&bundle, &plan, &mut target, &mut journal.clone()),
-        Err(BackupError::RestoreJournalMismatch),
+        Err(BackupError::RestoreEvidenceLevelMismatch),
         "Completed with an inflated proof level is refused"
     );
+    assert!(target.calls.is_empty());
 
     let bundle = full_bundle();
     let plan = plan_for(&bundle, &manifest_string(&fixture_manifest(), "target_id"));
@@ -1479,6 +1498,16 @@ fn per_residency_member_denominator_survives_subset_crash_and_resume() {
     assert!(
         blob_applies.contains(&&first_hash),
         "stable member identities survive restart"
+    );
+    let second_hash = format!(
+        "{:?}",
+        RestorePhase::ImportSealedBlob {
+            hash: bundle.blobs[1].locator.hash.to_string(),
+        }
+    );
+    assert!(
+        blob_applies.contains(&&second_hash),
+        "the other member is not skipped for a duplicate"
     );
     let initial_order: Vec<&String> = resumed
         .applies
@@ -1866,6 +1895,7 @@ fn cancellation_before_and_after_possible_effect_keeps_reconciliation_without_ro
         early_journal.record().is_none(),
         "no intent exists, so nothing requires reconciliation"
     );
+    early_journal.inner.borrow_mut().faults = JournalFaults::default();
     let mut retried = FakeTarget::new(&bundle, &plan);
     run(&bundle, &plan, &mut retried, &mut early_journal.clone())
         .expect("retry after early cancellation completes cleanly");

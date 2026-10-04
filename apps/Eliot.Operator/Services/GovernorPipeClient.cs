@@ -241,13 +241,22 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         CancellationToken cancellationToken = default)
     {
         // The caller supplies the one prepared request, so the transmitted
-        // identity is the retained identity. Its binding is checked here:
-        // the key must be the digest of these exact operation bytes, so a
-        // corrupted or edited journal entry cannot travel under an identity
-        // that names a different operation. The key is checked, never
-        // re-derived into the request: rewriting it would rename a pending
-        // request's identity to match today's serializer instead of
-        // honouring the retained one.
+        // identity is the retained identity. Its binding is checked here by
+        // UserAutomationOperatorRequest.ValidateCurrentIdentity. For a
+        // business UserAutomation operation the key must be the digest of
+        // these exact operation bytes, so a corrupted or edited journal entry
+        // cannot travel under an identity that names a different operation.
+        // For the read-only get_context handshake
+        // (UserAutomationGetContextOperation) that validator requires a
+        // syntactically valid key and the absent expected_state_fence, and
+        // deliberately does NOT require digest
+        // equality: UserAutomationOperatorRequest.CreateContext() mints a
+        // fresh nonce per call, so that identity is not a digest of its own
+        // bytes. The key is checked, never re-derived into the request:
+        // rewriting it would rename a pending request's identity to match
+        // today's serializer instead of honouring the retained one. That
+        // handshake operation's shape is pinned by the closed decoder's `kind`
+        // mapping, not by this validator.
         request.ValidateCurrentIdentity();
         using var budget = new OperationBudget($"automation:{request.IdempotencyKey}", cancellationToken, _closing.Token);
         // Kernel/Host authenticates this route and supplies RequestMetadata,
@@ -1046,6 +1055,37 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 if (!soleHolder) _requestGate.Release();
             }
             if (soleHolder) _requestGate.Dispose();
+        }
+        else
+        {
+            // The gate could NOT be acquired inside the teardown allowance, so
+            // none of the holder discipline above applies - but that is a
+            // statement about the REQUEST GATE, not about the transport. Before
+            // this fix the non-acquired path fell straight through to
+            // `LifecycleDisposed` with `_connection` still published: the client
+            // declared itself fully disposed while a live pipe it owned was never
+            // invalidated, aborted or observed. Nothing would ever close that
+            // pipe, its nonce stayed un-invalidated, and any still-unwinding
+            // operation kept a destination the session had already disclaimed.
+            //
+            // `AbortConnectionAsync` is safe to call here without the gate: it
+            // detaches only the connection object this call captured (a
+            // `CompareExchange`, so a replacement established later is a
+            // different object and is never touched), aborts the pipe so pending
+            // operations unwind, bounds its own stream disposal by
+            // `TeardownAllowanceSeconds`, roots any still-pending completion
+            // instead of abandoning it, records its own cleanup limitation, and
+            // never throws - so it cannot replace the incompleteness already
+            // recorded above with a secondary failure.
+            //
+            // This runs BEFORE the broker binding is released below and before
+            // `LifecycleDisposed` is published, preserving the documented
+            // ordering: Governor pipe closed first, broker binding second.
+            var abandoned = Interlocked.Exchange(ref _connection, null);
+            if (abandoned is not null)
+            {
+                await AbortConnectionAsync(abandoned, OperatorHandoffInvalidation.ReconnectRequired, OperatorExchangeStages.Dispose).ConfigureAwait(false);
+            }
         }
         // The retained broker binding ends HERE, and this is the only site that
         // ends it. Disposal is the one deterministic end of this session: the

@@ -50,21 +50,27 @@
 //! verdict in either direction: a startup failure can be recovered from, and a
 //! later failure is recorded rather than assumed away. It re-evaluates only the
 //! named slot, so it can neither sweep every optional provider nor block on
-//! one. The one operation that legitimately affects every slot is owner
+//! one. [`reevaluate_demanded_capabilities`] drives that same single-slot
+//! reevaluation across the whole dependency set one admitted operation
+//! actually names — the Skill path needs both its source and its basis, not
+//! one of the two — and still reattaches only the slots that are currently
+//! unavailable. The one operation that legitimately affects every slot is owner
 //! generation replacement, which goes through
-//! [`StartupReadinessProjection::invalidate_for_replaced_generation`] and is
+//! [`StartupReadinessProjection::retire_generation_scoped_bindings`] and is
 //! driven by the existing owners, not by this module.
 //!
 //! # Late completions adopt deltas, never snapshots
 //!
 //! A local-read flight prepares its operation from an immutable snapshot but
-//! returns only what it actually observed: at most one [`LocalReadinessDelta`]
-//! bound to the exact slot, owner outcome, owner/fence identity and
+//! returns only what it actually observed: a bounded [`LocalReadinessDeltas`]
+//! set carrying at most one [`LocalReadinessDelta`] per declared capability,
+//! each bound to its exact slot, owner outcome, owner/fence identity and
 //! observation tokens captured for that work.
-//! [`StartupReadinessProjection::adopt_local_delta`] files it only while that
-//! basis is still current, through the existing single-slot reevaluation. A
-//! late or conflicting delta is refused without touching the loop's
-//! requirements, other slots or their history, while the flight's own
+//! [`StartupReadinessProjection::adopt_local_deltas`] files each one through
+//! the existing single-slot reevaluation while *that delta's own* basis is
+//! still current, so a stale source observation cannot erase a fresh basis
+//! result, and a late or conflicting delta is refused without touching the
+//! loop's requirements, other slots or their history, while the flight's own
 //! read/submit outcome still settles exactly once.
 //!
 //! Architecture traceability: A2.3 (dependencies are required, optional, or
@@ -75,6 +81,7 @@
 //! process survival) and I1.8 (one logical Governor with one authentic
 //! generation-bound session attach).
 
+use eliot_contracts::{EpochId, StateFence};
 use eliot_governor::CompositionReadiness;
 
 use crate::DaemonComposition;
@@ -99,17 +106,143 @@ use crate::startup_capability_bindings::{
 pub const MANDATORY_CORE_CAPABILITIES: &[DeclaredStartupCapability] =
     &[DeclaredStartupCapability::OwnerSessionBinding];
 
+/// The complete admitted owner-context identity for one generation.
+///
+/// #2647: this is the whole point of the repair. The previous basis was two
+/// scalars read off `DaemonStatus` — `snapshot.generation.value()` and
+/// `snapshot.authority_epoch.sequence.get()` — and those two numbers are a
+/// *projection* of the admitted identity, not the identity itself. Two
+/// different admitted owner contexts can project onto the same pair: a
+/// composition rebound from epoch `(lineage-A, sequence 1)` to
+/// `(lineage-B, sequence 1)` at the same resource generation, with different
+/// artifact, protected-snapshot or principal digests, is indistinguishable from
+/// the original under a scalar comparison. The admitted
+/// `KernelGenerationSnapshot` carries all of that identity in the same
+/// composition, so this type binds it and compares it whole.
+///
+/// It is deliberately the typed tuple rather than a digest. I5.20's
+/// `exact_fence` mode requires that *every* listed dependency revision match,
+/// and a digest derived from the tuple would still have to carry the domain
+/// identity and a derivation rule to be trustworthy; comparing the typed values
+/// directly needs neither, cannot collapse two lineages onto one value, and
+/// keeps `Eq` the whole comparison.
+///
+/// There is no public constructor. [`OwnerContextIdentity::observe`] is the only
+/// way to obtain one, so no caller can assemble an owner identity of its own —
+/// the same structural guarantee [`CoreOwnerState`] already relied on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerContextIdentity {
+    /// The exact State Fence the composition is admitted at: the full
+    /// `(lineage_id, sequence)` epoch tuple plus the resource generation.
+    fence: StateFence,
+    /// SHA-256 of the admitted Kernel artifact.
+    artifact_digest: String,
+    /// SHA-256 of the protected full handoff snapshot.
+    protected_snapshot_digest: String,
+    /// The authenticated Kernel principal identity.
+    principal: String,
+    /// The fixed Kernel service identity.
+    service: String,
+    /// The exact negotiated protocol string.
+    protocol: String,
+}
+
+impl OwnerContextIdentity {
+    /// Reads the admitted owner-context identity from the live composition.
+    fn observe(composition: &DaemonComposition) -> Self {
+        // `kernel_snapshot` is a borrow of the composition's own admitted
+        // snapshot: no IO, no lock, and no second readiness service. The fence
+        // is the snapshot's own `state_fence()`, so the identity and the fence
+        // can never disagree about which generation this is.
+        let snapshot = composition.kernel_snapshot();
+        Self {
+            fence: snapshot.state_fence(),
+            artifact_digest: snapshot.artifact_digest.clone(),
+            protected_snapshot_digest: snapshot.protected_snapshot_digest.clone(),
+            principal: snapshot.principal.clone(),
+            service: snapshot.service.clone(),
+            protocol: snapshot.protocol.clone(),
+        }
+    }
+
+    /// The complete State Fence this owner context was admitted at.
+    #[must_use]
+    pub const fn fence(&self) -> &StateFence {
+        &self.fence
+    }
+
+    /// The admitted authority epoch as the contract's own `(lineage_id,
+    /// sequence)` tuple.
+    ///
+    /// Retained proofs are compared through [`EpochId::is_same_authority`], the
+    /// contract's exact-tuple rule: equal sequences from different lineages are
+    /// unrelated and never authorize. That is the comparison item3 of this issue
+    /// requires, and it is why the tuple is exposed rather than the sequence.
+    #[must_use]
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.fence.authority_epoch
+    }
+
+    /// The resource generation, read from the fence rather than projected
+    /// separately, so there is exactly one generation in this module.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.fence.resource_generation.value()
+    }
+
+    /// The authority epoch sequence, read from the fence.
+    ///
+    /// The sequence alone is *not* an owner identity: two lineages issue
+    /// unrelated sequences at the same value. It is exposed only for the
+    /// existing wire strings and for the retained proofs that carry no epoch
+    /// object of their own; every equality decision uses the whole identity or
+    /// [`EpochId::is_same_authority`].
+    #[must_use]
+    pub fn authority_epoch_sequence(&self) -> u64 {
+        self.fence.authority_epoch.sequence.get()
+    }
+}
+
+impl std::fmt::Display for OwnerContextIdentity {
+    /// Renders a bounded, stable identity label.
+    ///
+    /// Digests are abbreviated to a 12-character prefix: this value appears
+    /// inside refusal reasons and readiness records, and a full 64-character
+    /// digest on each of three members would make those strings unreadable
+    /// without making the comparison any stronger — equality is decided on the
+    /// whole value, never on this rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lineage={:?} epoch_sequence={} generation={} artifact={}… protected_snapshot={}… principal={} service={} protocol={}",
+            self.fence.authority_epoch.lineage_id,
+            self.authority_epoch_sequence(),
+            self.generation(),
+            self.artifact_digest.chars().take(12).collect::<String>(),
+            self.protected_snapshot_digest
+                .chars()
+                .take(12)
+                .collect::<String>(),
+            self.principal,
+            self.service,
+            self.protocol,
+        )
+    }
+}
+
 /// Owner state the required-set mapping reads, at one observation.
 ///
-/// Every field is the composition's own reported value. There is no public
-/// constructor: [`observe_core_owner_state`] is the only way to obtain one, so
-/// the core verdict can never be evaluated from a caller-assembled flag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// #2647: the owner *identity* is now a member rather than two scalars, and the
+/// two scalar accessors read *through* it, so no code path can compare a
+/// projected number instead of the admitted identity. Every field is the
+/// composition's own reported value. There is no public constructor:
+/// [`observe_core_owner_state`] is the only way to obtain one, so the core
+/// verdict can never be evaluated from a caller-assembled flag.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreOwnerState {
-    /// Resource generation the composition's owners are admitted at.
-    pub generation: u64,
-    /// Authority epoch sequence the composition's owners are admitted at.
-    pub authority_epoch: u64,
+    /// The complete admitted owner-context identity: fence, artifact,
+    /// protected-snapshot and principal digests, service and protocol.
+    pub identity: OwnerContextIdentity,
     /// The composition's own startup phase. `Ready` is the exact Kernel and
     /// owner-recovery admission the Governor reports; anything else means
     /// mandatory recovery is unresolved.
@@ -121,6 +254,20 @@ pub struct CoreOwnerState {
     pub owner_set_admitted: bool,
 }
 
+impl CoreOwnerState {
+    /// The resource generation this owner context was admitted at.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.identity.generation()
+    }
+
+    /// The authority epoch sequence this owner context was admitted at.
+    #[must_use]
+    pub fn authority_epoch(&self) -> u64 {
+        self.identity.authority_epoch_sequence()
+    }
+}
+
 /// Reads the required-set mapping's owner facts from the live composition.
 ///
 /// The only constructor of [`CoreOwnerState`], and the only place this module
@@ -130,8 +277,7 @@ pub struct CoreOwnerState {
 pub fn observe_core_owner_state(composition: &DaemonComposition) -> CoreOwnerState {
     let status = composition.status();
     CoreOwnerState {
-        generation: status.generation,
-        authority_epoch: status.authority_epoch,
+        identity: OwnerContextIdentity::observe(composition),
         readiness: composition.readiness(),
         // `DaemonComposition::status` publishes `stale` exactly for a stale
         // dependent view. An allow-list rather than a `!= "stale"` test, so a
@@ -147,7 +293,7 @@ pub fn observe_core_owner_state(composition: &DaemonComposition) -> CoreOwnerSta
 /// was derived against. Fields are private and the only constructor takes the
 /// composition, so a caller cannot supply a required set of its own, cannot
 /// drop a mandatory capability, and cannot mark an unavailable slot bound.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreReadinessRequirements {
     mandatory: &'static [DeclaredStartupCapability],
     owner_state: CoreOwnerState,
@@ -355,6 +501,77 @@ impl LocalReadinessDelta {
     }
 }
 
+/// The bounded set of per-slot observations one demand produced.
+///
+/// A single-slot delta cannot express the dependency set one operation actually
+/// requires — the Skill path needs both its tool source and its installed-Skill
+/// basis — so a refresh that only observed one of the two leaves the other slot
+/// latched at its startup failure forever. This set carries what a real demand
+/// observed, and nothing else.
+///
+/// Bounded by construction: the set holds **at most one delta per declared
+/// capability**, so it can never hold more than
+/// [`DeclaredStartupCapability::COUNT`] entries. That bound is the declared
+/// denominator that already exists, so there is no separate numeric cap, no
+/// truncation and no drop-oldest policy: a demand visits each capability the
+/// operation names once, so the set is bounded by that operation's own
+/// dependency set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalReadinessDeltas {
+    deltas: Vec<LocalReadinessDelta>,
+}
+
+impl LocalReadinessDeltas {
+    /// The empty set: a demand that reevaluated nothing observed nothing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { deltas: Vec::new() }
+    }
+
+    /// How many slot observations the set carries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.deltas.len()
+    }
+
+    /// Whether the set carries no observation at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.deltas.is_empty()
+    }
+
+    /// Iterates the observations in the order the demand reevaluated them.
+    pub fn iter(&self) -> std::slice::Iter<'_, LocalReadinessDelta> {
+        self.deltas.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a LocalReadinessDeltas {
+    type Item = &'a LocalReadinessDelta;
+    type IntoIter = std::slice::Iter<'a, LocalReadinessDelta>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// What one demand-driven multi-slot refresh produced.
+///
+/// The two values travel together because they are one decision: the refusal is
+/// what the operation must settle, and the deltas are the observations that
+/// decision was taken from. A refused operation still has to file the exact
+/// outcome it observed for *every* slot it reevaluated, so a recovered source
+/// and a failed basis are both retained instead of one erasing the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DemandRefreshOutcome {
+    /// The exact capability-specific refusal when a capability the operation
+    /// named is still unavailable, or `None` when it may proceed.
+    pub refusal: Option<String>,
+    /// The bounded per-slot observations this refresh actually produced, each
+    /// bound to the basis the loop's own projection holds.
+    pub deltas: LocalReadinessDeltas,
+}
+
 /// How one local-read delta settled against the loop's current projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalDeltaAdoption {
@@ -499,8 +716,16 @@ impl StartupReadinessProjection {
         if observed.owner_state() == self.requirements.owner_state() {
             return Ok(());
         }
+        // #2647: the token is minted BEFORE the state it authorises, never
+        // after. `mint_token` can refuse, and a refusal that left `requirements`
+        // already replaced would return an error while the projection carried
+        // owner facts that no basis was ever minted against — a delta captured
+        // under the previous token would then compare equal against state this
+        // observation never reached. Minting first makes the failure leave the
+        // projection byte-identical to what every captured basis expects.
+        let minted = self.mint_token()?;
         self.requirements = observed;
-        self.owner_token = self.mint_token()?;
+        self.owner_token = minted;
         Ok(())
     }
 
@@ -520,9 +745,9 @@ impl StartupReadinessProjection {
         refresh: &CapabilityRefresh,
     ) -> Result<CapabilityRefreshOutcome, LocalAdoptionTokenExhausted> {
         let capability = refresh.capability;
+        let index = capability.index();
         let previously_bound = self.bindings.disposition(capability).is_bound();
-        let prior_before = self.prior_failures[capability.index()].clone();
-        self.remember_prior_failure(capability);
+        let prior_before = self.prior_failures[index].clone();
         let filed = disposition_for_refresh(refresh);
         let misattributed = match &refresh.observed {
             Ok(retained)
@@ -540,14 +765,29 @@ impl StartupReadinessProjection {
         } else {
             CapabilityRefreshOutcome::Unavailable { previously_bound }
         };
-        let disposition_before = self.bindings.disposition(capability).clone();
-        self.bindings.replace_disposition(capability, filed);
-        let disposition_changed = self.bindings.disposition(capability) != &disposition_before;
-        let history_changed = self.prior_failures[capability.index()] != prior_before;
+        // #2647: decide the whole prospective state first, without mutating.
+        // `disposition_for_refresh` and the bounded history rule are pure, so
+        // both the new disposition and the new prior-failure value can be
+        // computed from the current ledger; whether the slot actually moved is
+        // then known BEFORE anything is written, and the token is minted before
+        // the write it authorises. The failure path therefore mutates nothing:
+        // no disposition is half-filed, and no history is rewritten under a slot
+        // token that was never issued.
+        let prior_after = match self.bindings.disposition(capability).unbound_reason() {
+            Some(reason) => Some(reason.to_owned()),
+            // A slot that currently holds no failure reason keeps the failure it
+            // most recently moved past; only a slot moving away from a live
+            // `Unbound` disposition records that reason.
+            None => prior_before.clone(),
+        };
+        let disposition_changed = self.bindings.disposition(capability) != &filed;
+        let history_changed = prior_after != prior_before;
         if disposition_changed || history_changed {
             let minted = self.mint_token()?;
-            self.slot_tokens[capability.index()] = minted;
+            self.slot_tokens[index] = minted;
         }
+        self.prior_failures[index] = prior_after;
+        self.bindings.replace_disposition(capability, filed);
         Ok(outcome)
     }
 
@@ -561,7 +801,7 @@ impl StartupReadinessProjection {
     pub fn prepare_local_delta(&self, refresh: CapabilityRefresh) -> LocalReadinessDelta {
         let expected_slot_token = self.slot_tokens[refresh.capability.index()];
         LocalReadinessDelta {
-            expected_owner: *self.requirements.owner_state(),
+            expected_owner: self.requirements.owner_state().clone(),
             expected_owner_token: self.owner_token,
             expected_slot_token,
             refresh,
@@ -624,6 +864,35 @@ impl StartupReadinessProjection {
         Ok(LocalDeltaAdoption::Adopted { outcome })
     }
 
+    /// Adopts one demand's bounded delta set, delta by delta, and reports how
+    /// each one settled.
+    ///
+    /// Every delta is delegated to [`Self::adopt_local_delta`] unchanged, so
+    /// each one is judged against *its own* dependency set — the owner context
+    /// it was observed under and its own slot token — and neither one can gate,
+    /// suppress or overwrite another: a stale source delta is refused as stale
+    /// while a fresh basis result is still adopted in the same call, and vice
+    /// versa. One delta's success never short-circuits the next. An exhausted
+    /// token counter stops the walk at that delta and returns the error, so the
+    /// caller learns the set did not settle whole; the deltas already walked
+    /// stay adopted through the same single-slot filing, because a filed
+    /// observation is evidence rather than a transaction to roll back.
+    ///
+    /// The reported pairs name the declared slot each delta belongs to together
+    /// with its own [`LocalDeltaAdoption`], so a caller can report the exact
+    /// per-slot outcome without re-deriving which delta produced which row.
+    pub fn adopt_local_deltas(
+        &mut self,
+        deltas: &LocalReadinessDeltas,
+    ) -> Result<Vec<(DeclaredStartupCapability, LocalDeltaAdoption)>, LocalAdoptionTokenExhausted>
+    {
+        let mut settled = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            settled.push((delta.capability(), self.adopt_local_delta(delta)?));
+        }
+        Ok(settled)
+    }
+
     /// Retires every retained *generation-scoped* binding because the owner
     /// moved to a new generation, and returns how many slots were retired.
     ///
@@ -631,14 +900,17 @@ impl StartupReadinessProjection {
     /// generation-bound proof at once (I1.5, I14.14), so the affected slots are
     /// retired through their owner rather than left readable.
     ///
-    /// It is deliberately **not** a whole-ledger invalidation. The owner
-    /// session binding, the notification page and the Skill catalogue terms
-    /// carry no generation identity, and the authenticated owner session is the
-    /// one mandatory core capability: retiring it here would withhold core
-    /// readiness for the whole daemon on an ordinary generation advance, which
-    /// is the exact conflation this issue removes. Those three slots stay with
-    /// the owning owner that established them, which is also what
-    /// [`retained_matches_owner_generation`] already relies on.
+    /// It is deliberately **not** a whole-ledger invalidation. The notification
+    /// page and the Skill catalogue terms carry no generation identity, and the
+    /// authenticated owner session is the one mandatory core capability:
+    /// retiring it here would withhold core readiness for the whole daemon on
+    /// an ordinary generation advance, which is the exact conflation this issue
+    /// removes. Those three slots stay with the owning owner that established
+    /// them. A session proof from an earlier generation does not survive that
+    /// decision either: [`retained_matches_owner_generation`] compares the
+    /// generation and authority epoch the session was authenticated under
+    /// against the current owner context, so a replaced generation fails closed
+    /// for that one mandatory slot instead of erasing the rest of the ledger.
     ///
     /// It is not a refresh sweep: it does not re-attach, re-read or poll
     /// anything, and each retired slot keeps its prior disposition as bounded
@@ -649,26 +921,42 @@ impl StartupReadinessProjection {
         reason: &str,
     ) -> Result<usize, LocalAdoptionTokenExhausted> {
         let mut retired = 0_usize;
+        // #2647: multi-slot retirement is decided for every slot first, then
+        // minted for every slot that will move, and only then applied. The
+        // previous shape minted inside the mutation loop, so a refusal on the
+        // third slot left the first two retired and re-tokened while the rest
+        // still carried their old basis — a partially retokened ledger, where a
+        // delta captured before the call matches half the slots and not the
+        // other half. Two phases make the refusal all-or-nothing.
+        let mut planned = Vec::new();
         for capability in DeclaredStartupCapability::ALL {
             if !is_generation_scoped(capability) {
                 continue;
             }
-            let disposition_before = self.bindings.disposition(capability).clone();
-            let prior_before = self.prior_failures[capability.index()].clone();
-            self.remember_prior_failure(capability);
-            self.bindings.replace_disposition(
-                capability,
-                StartupBindingDisposition::Unbound(reason.to_owned()),
-            );
+            let index = capability.index();
+            let unbound = StartupBindingDisposition::Unbound(reason.to_owned());
+            let prior_before = self.prior_failures[index].clone();
+            let prior_after = match self.bindings.disposition(capability).unbound_reason() {
+                Some(existing) => Some(existing.to_owned()),
+                None => prior_before.clone(),
+            };
             // #2647: retirement is a real invalidation only where it changed
             // the slot; an already-retired slot keeps its basis valid.
-            let disposition_changed = self.bindings.disposition(capability) != &disposition_before;
-            let history_changed = self.prior_failures[capability.index()] != prior_before;
+            let disposition_changed = self.bindings.disposition(capability) != &unbound;
+            let history_changed = prior_after != prior_before;
             if disposition_changed || history_changed {
-                let minted = self.mint_token()?;
-                self.slot_tokens[capability.index()] = minted;
+                planned.push((capability, unbound, prior_after));
             }
             retired += 1;
+        }
+        let mut minted = Vec::with_capacity(planned.len());
+        for _ in &planned {
+            minted.push(self.mint_token()?);
+        }
+        for ((capability, unbound, prior_after), token) in planned.into_iter().zip(minted) {
+            self.prior_failures[capability.index()] = prior_after;
+            self.bindings.replace_disposition(capability, unbound);
+            self.slot_tokens[capability.index()] = token;
         }
         Ok(retired)
     }
@@ -702,10 +990,12 @@ impl StartupReadinessProjection {
     pub fn core_readiness_prerequisites_satisfied(&self) -> CoreReadiness {
         let owner = self.requirements.owner_state();
         let mut reasons = Vec::new();
-        if owner.generation == 0 || owner.authority_epoch == 0 {
+        if owner.generation() == 0 || owner.authority_epoch() == 0 {
             reasons.push(format!(
-                "composition owner state has no admitted generation/epoch (generation={} authority_epoch={})",
-                owner.generation, owner.authority_epoch
+                "composition owner state has no admitted generation/epoch (generation={} authority_epoch={} owner_context={})",
+                owner.generation(),
+                owner.authority_epoch(),
+                owner.identity
             ));
         }
         if !owner.owner_set_admitted {
@@ -719,7 +1009,8 @@ impl StartupReadinessProjection {
         }
         if owner.readiness != CompositionReadiness::Ready {
             reasons.push(format!(
-                "Governor recovery is not admitted at this generation (readiness={owner:?})"
+                "Governor recovery is not admitted at this generation (readiness={:?} owner_context={})",
+                owner.readiness, owner.identity
             ));
         }
         for capability in self.requirements.mandatory() {
@@ -876,8 +1167,10 @@ impl StartupReadinessProjection {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "core_readiness={verdict} owner_generation={} owner_authority_epoch={} degraded=[{degraded}] slots=[{slots}]",
-            owner.generation, owner.authority_epoch
+            "core_readiness={verdict} owner_generation={} owner_authority_epoch={} owner_lineage={:?} degraded=[{degraded}] slots=[{slots}]",
+            owner.generation(),
+            owner.authority_epoch(),
+            owner.identity.authority_epoch().lineage_id
         )
     }
 
@@ -885,21 +1178,16 @@ impl StartupReadinessProjection {
         self.requirements.mandatory().contains(&capability)
     }
 
-    /// Records the failure a slot is about to move past, if it had one.
-    ///
-    /// Bounded to one retained reason per slot: the immediately preceding
-    /// failure stays observable after the slot recovers, without turning the
-    /// projection into an unbounded failure log.
-    fn remember_prior_failure(&mut self, capability: DeclaredStartupCapability) {
-        if let Some(reason) = self
-            .bindings
-            .disposition(capability)
-            .unbound_reason()
-            .map(str::to_owned)
-        {
-            self.prior_failures[capability.index()] = Some(reason);
-        }
-    }
+    // #2647: `remember_prior_failure` was removed rather than kept as a helper.
+    // Its bounded-history rule (one retained reason per slot, preserved while
+    // the slot holds no live failure) is now computed as the prospective
+    // `prior_after` value inside `reevaluate_capability` and
+    // `retire_generation_scoped_bindings`, because both callers must know that
+    // value BEFORE deciding whether the slot moved and minting its token. A
+    // helper that writes the history as a side effect cannot be sequenced ahead
+    // of the token mint, which is exactly the ordering defect this issue
+    // removes; leaving it in place would have been a second way to mutate before
+    // the mint.
 
     /// Mints one fresh adoption token. The counter never wraps: exhaustion is
     /// an explicit error, never a silent return to an old token.
@@ -998,41 +1286,71 @@ pub fn emit_startup_readiness_record(
     );
 }
 
-/// Re-evaluates exactly one declared capability from evidence an admitted
-/// demand produced, and reports what the reevaluation changed.
+/// Re-evaluates every currently unavailable capability one admitted demand
+/// names, and reports both the refusal and the observations that produced it.
 ///
 /// This is the demand-driven refresh an operation triggers: the operation names
-/// the capability it actually needs, the owning caller supplies the re-run of
-/// that capability's real attach, and the owner's own outcome is filed here.
-/// Only the named slot is touched, so a demand never sweeps every optional
+/// the exact capability set it actually needs, the owning caller supplies the
+/// re-run of each capability's real attach, and every owner's own outcome is
+/// filed here through the existing single-slot
+/// [`StartupReadinessProjection::reevaluate_capability`]. Naming only one slot
+/// of a two-slot dependency set would leave the other one latched at its
+/// startup failure, so the whole named set is walked in order and each
+/// currently unavailable slot is refreshed independently — a source recovery
+/// never infers, and never substitutes for, a basis result.
+///
+/// Only the named slots are touched, so a demand never sweeps every optional
 /// provider and never blocks on one it does not use.
 ///
 /// `reattach` is called **only** when the slot is currently unavailable, so the
 /// healthy path performs no work at all and an available capability is never
-/// re-proved for an operation that already has it. This function performs no IO
-/// itself: the attach belongs to the owner, which is why it arrives as a closure
-/// rather than being called from here.
-pub fn reevaluate_demanded_capability<F>(
-    projection: &mut StartupReadinessProjection,
-    capability: DeclaredStartupCapability,
-    reattach: F,
-) -> Result<CapabilityRefreshOutcome, LocalAdoptionTokenExhausted>
+/// re-proved for an operation that already has it. A capability repeated in
+/// `required` is visited once. This function performs no IO itself: the attach
+/// belongs to the owner, which is why it arrives as a closure rather than being
+/// called from here.
+///
+/// The availability decision runs against a working copy of `snapshot`, so no
+/// shared state is mutated here, while each returned delta is prepared on
+/// `snapshot` itself — the basis the loop actually holds — and therefore proves
+/// its own owner and slot tokens. The refusal comes from the existing
+/// [`refuse_unavailable_capabilities`] against that working copy, so an empty
+/// `required` still refuses and the refusal still names the owner's exact
+/// fail-closed reason.
+pub fn reevaluate_demanded_capabilities<F>(
+    snapshot: &StartupReadinessProjection,
+    required: &[DeclaredStartupCapability],
+    mut reattach: F,
+) -> Result<DemandRefreshOutcome, LocalAdoptionTokenExhausted>
 where
-    F: FnOnce() -> Result<RetainedStartupBinding, String>,
+    F: FnMut(DeclaredStartupCapability) -> Result<RetainedStartupBinding, String>,
 {
-    if projection
-        .capability_available_for_operation(capability)
-        .is_available()
-    {
-        return Ok(CapabilityRefreshOutcome::Rebound {
-            previously_bound: true,
-        });
+    let mut working = snapshot.clone();
+    let mut deltas = LocalReadinessDeltas::empty();
+    // One visit per declared capability, bounded by the same declared
+    // denominator: a repeated name is neither retested nor reattached twice.
+    let mut visited = [false; DeclaredStartupCapability::COUNT];
+    for capability in required {
+        let index = capability.index();
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        if working
+            .capability_available_for_operation(*capability)
+            .is_available()
+        {
+            continue;
+        }
+        let refresh = CapabilityRefresh {
+            capability: *capability,
+            reason: StartupRefreshReason::CapabilityDemanded,
+            observed: reattach(*capability),
+        };
+        working.reevaluate_capability(&refresh)?;
+        deltas.deltas.push(snapshot.prepare_local_delta(refresh));
     }
-    projection.reevaluate_capability(&CapabilityRefresh {
-        capability,
-        reason: StartupRefreshReason::CapabilityDemanded,
-        observed: reattach(),
-    })
+    let refusal = refuse_unavailable_capabilities(&working, required);
+    Ok(DemandRefreshOutcome { refusal, deltas })
 }
 
 /// Returns the exact capability-specific refusal when any capability one
@@ -1093,12 +1411,25 @@ fn disposition_for_refresh(refresh: &CapabilityRefresh) -> StartupBindingDisposi
     }
 }
 
-/// Whether a declared slot's retained proof carries owner generation identity.
+/// Whether a declared slot's retained proof is revoked by a generation advance.
 ///
-/// The three that do are the two Dreamer route contexts and the agent-fabric
-/// descriptor. The owner session binding, the notification page and the Skill
-/// catalogue terms do not, and are left to the owning owner that established
-/// them; the check below never invents a revocation the owner did not report.
+/// This is the retirement scope, not the freshness check. It is `true` for
+/// exactly the three retained variants that carry generation identity and are
+/// revoked together when the owner moves:
+/// [`RetainedStartupBinding::DreamerIntakeRoute`],
+/// [`RetainedStartupBinding::DreamerModelRoute`] and
+/// [`RetainedStartupBinding::AgentFabric`].
+///
+/// It is `false` for the remaining four declared slots, for two distinct
+/// reasons. The owner session binding is compared rather than retired:
+/// [`retained_matches_owner_generation`] holds the generation and authority
+/// epoch its own authenticated attach proved against the current owner state,
+/// so a session admitted at an earlier generation or epoch fails closed for
+/// that one mandatory slot without withholding core readiness for the whole
+/// daemon here. The notification page and the Skill catalogue terms carry no
+/// generation or epoch at all, so they stay with the owning owner that
+/// established them; the check never invents a revocation the owner did not
+/// report.
 fn is_generation_scoped(capability: DeclaredStartupCapability) -> bool {
     matches!(
         capability,
@@ -1111,11 +1442,50 @@ fn is_generation_scoped(capability: DeclaredStartupCapability) -> bool {
 /// Whether a retained proof was admitted under the current owner generation.
 ///
 /// Only the retained evidence that actually carries generation or epoch
-/// identity is checked. The owner session binding string, the notification page
-/// and the Skill catalogue terms are not generation-scoped, so this returns
-/// `true` for them and lets the owning owner's own revocation or generation
-/// replacement decide their validity — the check never invents a revocation
-/// the owner did not report.
+/// identity is checked. The notification page and the Skill catalogue terms are
+/// not generation-scoped, so this returns `true` for them and lets the owning
+/// owner's own revocation decide their validity — the check never invents a
+/// revocation the owner did not report.
+///
+/// The owner session binding carries the exact generation and authority epoch
+/// its own authenticated attach proved, and it is compared here rather than
+/// trusted: "Session exists only while transport identity and semantic Session
+/// refer to the same State Fence/epoch" (I1.8). A retained session string from
+/// an earlier generation or epoch is therefore not current-generation evidence,
+/// which is what stops an old connection from keeping the one mandatory core
+/// capability readable after the owner moved.
+///
+/// #2647: the two Dreamer route variants carry a full `StateFence`, so they are
+/// now compared through [`EpochId::is_same_authority`] — the contract's own
+/// exact-tuple rule — against the live owner context's fence. Before this
+/// repair they were compared by `authority_epoch.sequence.get()` alone, so a
+/// proof admitted under `(lineage-A, sequence 1)` stayed readable after the
+/// owner rebound to `(lineage-B, sequence 1)`: equal sequences from different
+/// lineages are unrelated authority and never authorize. The generation
+/// comparison is unchanged; only the epoch comparison stopped discarding the
+/// lineage.
+///
+/// #2560 item 4: [`RetainedStartupBinding::OwnerSession`] no longer belongs to
+/// that list. It now carries the contract's own [`EpochId`] — the full
+/// `(lineage_id, sequence)` tuple — and is compared here through
+/// [`EpochId::is_same_authority`] exactly like the two Dreamer routes above,
+/// because I1.8's "the same State Fence/epoch" names the epoch, not the
+/// sequence. This closes the one mandatory slot's residual out of #2647, which
+/// recorded it as unwritable only because `startup_capability_bindings.rs` was
+/// outside that issue's two-file scope; #2560 owns that file and its audit item
+/// 4 asks for exactly this ("Bind `OwnerSessionBinding` to the exact
+/// generation/epoch/State Fence it proves … An old connection string alone is
+/// not current-generation evidence").
+///
+/// One variant still cannot be compared exactly and is NOT claimed to be:
+/// [`RetainedStartupBinding::AgentFabric`] wraps an
+/// [`AgentFabricDescriptor`](crate::AgentFabricDescriptor) that holds bare `u64`
+/// scalars and no epoch object, so there is no lineage in it to compare. Giving
+/// it one means changing the descriptor in `agent_fabric.rs` and its builder in
+/// `lib.rs`, which no audit item on this issue asks for. It keeps the scalar
+/// comparison and remains additionally covered by the projection-level owner
+/// token, which does advance on a rebind; the residual gap is recorded rather
+/// than papered over.
 fn retained_matches_owner_generation(
     retained: &RetainedStartupBinding,
     owner: &CoreOwnerState,
@@ -1123,15 +1493,25 @@ fn retained_matches_owner_generation(
     match retained {
         RetainedStartupBinding::DreamerIntakeRoute(metadata)
         | RetainedStartupBinding::DreamerModelRoute(metadata) => {
-            metadata.state_fence.resource_generation.value() == owner.generation
-                && metadata.state_fence.authority_epoch.sequence.get() == owner.authority_epoch
+            metadata
+                .state_fence
+                .authority_epoch
+                .is_same_authority(owner.identity.authority_epoch())
+                && metadata.state_fence.resource_generation.value() == owner.generation()
         }
         RetainedStartupBinding::AgentFabric(descriptor) => {
-            descriptor.generation == owner.generation
-                && descriptor.authority_epoch == owner.authority_epoch
+            descriptor.generation == owner.generation()
+                && descriptor.authority_epoch == owner.authority_epoch()
         }
-        RetainedStartupBinding::OwnerSession { .. }
-        | RetainedStartupBinding::NotificationSnapshot { .. }
+        RetainedStartupBinding::OwnerSession {
+            generation,
+            authority_epoch,
+            ..
+        } => {
+            *generation == owner.generation()
+                && authority_epoch.is_same_authority(owner.identity.authority_epoch())
+        }
+        RetainedStartupBinding::NotificationSnapshot { .. }
         | RetainedStartupBinding::SkillToolSource { .. }
         | RetainedStartupBinding::SkillToolBasis { .. } => true,
     }

@@ -380,3 +380,51 @@ path = "crates/foundation/eliot-contracts/src/lib.rs"
 topic = ""
 expect_routes = ["generic-source"]
 expect_absent_routes = ["improvement-learning"]
+
+# Issue #4606 lexical topic boundary controls. Required-handle expectations
+# retain the baseline and path authority while false cross-boundary topics stay
+# absent; real ORS/CLI topics and empty-topic owner paths keep their contracts.
+[[coverage.example]]
+path = "crates/smart/eliot-context-contracts/src/atom.rs"
+topic = "Propagate typed errors"
+expect_routes = ["generic-source", "memory-context"]
+expect_absent_routes = ["host-kernel", "human-surfaces"]
+expect_required_handles = ["A0.3", "I0.5", "A2.3", "I2.20", "I13", "I16"]
+
+[[coverage.example]]
+path = "crates/smart/eliot-context-contracts/src/atom.rs"
+topic = "Tighten validators"
+expect_routes = ["generic-source", "memory-context"]
+expect_absent_routes = ["host-kernel", "human-surfaces"]
+expect_required_handles = ["A0.3", "I0.5", "A2.3", "I2.20", "I13", "I16"]
+
+[[coverage.example]]
+path = "crates/smart/eliot-context-contracts/src/atom.rs"
+topic = "Resolve Clippy warnings"
+expect_routes = ["generic-source", "memory-context"]
+expect_absent_routes = ["host-kernel", "human-surfaces"]
+expect_required_handles = ["A0.3", "I0.5", "A2.3", "I2.20", "I13", "I16"]
+
+[[coverage.example]]
+path = "crates/smart/eliot-context-contracts/src/atom.rs"
+topic = "Inspect ORS"
+expect_routes = ["generic-source", "memory-context", "host-kernel"]
+expect_required_handles = ["A0.3", "I0.5", "A2.2", "I1.1", "I13", "I16"]
+
+[[coverage.example]]
+path = "crates/smart/eliot-context-contracts/src/atom.rs"
+topic = "Inspect CLI"
+expect_routes = ["generic-source", "memory-context", "human-surfaces"]
+expect_required_handles = ["A0.3", "I0.5", "A11", "I3", "I11", "I13", "I16"]
+
+[[coverage.example]]
+path = "bins/eliot-kernel/src/control_plane.rs"
+topic = ""
+expect_routes = ["generic-source", "host-kernel"]
+expect_required_handles = ["A0.3", "I0.5", "A2.3", "I2.20", "A2.2", "I1.1"]
+
+[[coverage.example]]
+path = "apps/Eliot.Operator/MainWindow.xaml"
+topic = ""
+expect_routes = ["generic-source", "human-surfaces"]
+expect_required_handles = ["A0.3", "I0.5", "A2.3", "I2.20", "A11", "I3", "I11"]

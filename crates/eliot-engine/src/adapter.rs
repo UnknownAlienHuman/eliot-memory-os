@@ -27,8 +27,14 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant, sleep};
 
 mod adapter_registry;
+mod process_adapter;
 
-pub use adapter_registry::AdapterRegistry;
+pub use adapter_registry::{AdapterRegistry, TestNoResultsAdapter};
+pub use process_adapter::{
+    BoxProcessDispatchFuture, PROCESS_ADAPTER_ID, ProcessAdapter, ProcessAdapterConfig,
+    ProcessAdapterRequest, ProcessDispatchError, ProcessDispatchOutcome, ProcessDispatchPort,
+    ProcessDispatchRequest, ProcessExecutionReceipt, process_receipt_summary,
+};
 
 pub type BoxAdapterFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
@@ -95,6 +101,7 @@ pub struct AdapterSupervisor {
     circuits: Arc<Mutex<BTreeMap<String, CircuitRecord>>>,
     hydrated_circuits: Arc<Mutex<BTreeSet<String>>>,
     semaphores: BTreeMap<String, Arc<Semaphore>>,
+    aggregate: Arc<Semaphore>,
     runtime_store: OperationRuntimeHandle,
 }
 
@@ -104,6 +111,12 @@ impl AdapterSupervisor {
     }
 
     pub fn with_runtime(registry: AdapterRegistry, runtime_store: OperationRuntimeHandle) -> Self {
+        let aggregate_capacity = registry
+            .manifests()
+            .iter()
+            .fold(0_usize, |total, manifest| {
+                total.saturating_add(manifest.limits.max_concurrent_requests)
+            });
         let semaphores = registry
             .manifests()
             .into_iter()
@@ -121,6 +134,9 @@ impl AdapterSupervisor {
             circuits: Arc::new(Mutex::new(BTreeMap::new())),
             hydrated_circuits: Arc::new(Mutex::new(BTreeSet::new())),
             semaphores,
+            aggregate: Arc::new(Semaphore::new(
+                aggregate_capacity.min(Semaphore::MAX_PERMITS),
+            )),
             runtime_store,
         }
     }
@@ -228,12 +244,24 @@ impl AdapterSupervisor {
             .get(adapter_id)
             .cloned()
             .ok_or_else(|| adapter_rejected("adapter semaphore is missing"))?;
-        let Ok(_permit) = semaphore.try_acquire_owned() else {
+        let queue_wait = Duration::from_millis(adapter.manifest().limits.timeout_ms);
+        let Ok(Ok(_permit)) = tokio::time::timeout(queue_wait, semaphore.acquire_owned()).await
+        else {
             return Ok(rejected_result(
                 &request,
                 AdapterResultStatus::Unavailable,
                 "busy",
                 "adapter concurrency is saturated; retry later",
+            ));
+        };
+        let Ok(Ok(_aggregate_permit)) =
+            tokio::time::timeout(queue_wait, Arc::clone(&self.aggregate).acquire_owned()).await
+        else {
+            return Ok(rejected_result(
+                &request,
+                AdapterResultStatus::Unavailable,
+                "busy",
+                "system-wide adapter concurrency is saturated; retry later",
             ));
         };
         let started = Instant::now();
@@ -1043,8 +1071,8 @@ impl Adapter for TestFailingAdapter {
         Box::pin(async move {
             Ok(rejected_result(
                 &request,
-                AdapterResultStatus::Failed,
-                "test_failure",
+                AdapterResultStatus::TransportFailure,
+                "transport_failure",
                 "intentional test adapter failure",
             ))
         })

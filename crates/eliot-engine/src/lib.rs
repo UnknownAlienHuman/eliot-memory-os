@@ -51,9 +51,12 @@ pub mod writer;
 pub use action::{ActionLeaseEvaluation, ActionLeaseService};
 pub use adapter::{
     Adapter, AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport,
-    AdapterRegistry, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture, HealthAdapter,
-    TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter,
-    normalize_result_to_observation, test_request,
+    AdapterRegistry, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture,
+    BoxProcessDispatchFuture, HealthAdapter, PROCESS_ADAPTER_ID, ProcessAdapter,
+    ProcessAdapterConfig, ProcessAdapterRequest, ProcessDispatchError, ProcessDispatchOutcome,
+    ProcessDispatchPort, ProcessDispatchRequest, ProcessExecutionReceipt, TestEchoAdapter,
+    TestFailingAdapter, TestLargeOutputAdapter, TestNoResultsAdapter, TestSlowAdapter,
+    normalize_result_to_observation, process_receipt_summary, test_request,
 };
 pub use admission::WriteAdmissionService;
 pub use antigravity::{

@@ -1937,6 +1937,24 @@ impl KernelComposition {
                     );
                     KernelBuildError::Ors(error)
                 })?;
+            // Issue #2653 W5: the restore-journal retention operation is an
+            // independently authorized maintenance pass, so it runs on this
+            // existing startup-reconciliation protected path (I14.22 names
+            // startup reconciliation a legitimate trigger) over the streams
+            // the journal's own durable index reports. Deliberately NOT mapped
+            // to KernelBuildError: a retention refusal degrades only the
+            // reclamation it names and must not cost the daemon its readiness.
+            // The gateway already observed the refusal with its own bounded
+            // reason, so this only records that composition reached the pass.
+            if generation_gateway
+                .recover_restore_journal_retention()
+                .is_err()
+            {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.restore_journal_retention_degraded",
+                );
+            }
             // Issue #1678 REQ9/A2/A7/A12: load every durable admission reservation
             // before the Kernel admits any overlapping work, so a reservation
             // staged before a crash is reloaded under its ORIGINAL identity rather

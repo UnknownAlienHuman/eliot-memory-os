@@ -723,11 +723,22 @@ pub struct SkillCandidate {
     pub evidence_refs: Vec<String>,
     pub dependency_versions: Vec<DependencyVersion>,
     pub candidate_scope: SkillScope,
+    /// Exact governance policy revision under which this candidate was
+    /// proposed. Two decisions taken under different policy revisions are
+    /// different candidates even when every other term matches, so the term
+    /// is structurally bound instead of left to the caller.
+    pub policy_revision: String,
+    /// Exact operation identity that produced this candidate. It enters
+    /// `candidate_digest`, so an exact replay of the same decision is
+    /// idempotent while a distinct operation identity produces a distinct
+    /// candidate instead of a byte-identical one.
+    pub operation_identity: String,
     pub candidate_digest: String,
     pub state_fence: StateFence,
 }
 
 impl SkillCandidate {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_view: &SkillLifecycleView,
         candidate_package_digest: String,
@@ -735,6 +746,8 @@ impl SkillCandidate {
         evidence_refs: Vec<String>,
         dependency_versions: Vec<DependencyVersion>,
         candidate_scope: SkillScope,
+        policy_revision: String,
+        operation_identity: String,
         state_fence: StateFence,
     ) -> Result<Self, SkillError> {
         let base_view_digest = base_view.identity_digest()?;
@@ -746,6 +759,8 @@ impl SkillCandidate {
             evidence_refs,
             dependency_versions,
             candidate_scope,
+            policy_revision,
+            operation_identity,
             candidate_digest: String::new(),
             state_fence,
         };
@@ -763,6 +778,8 @@ impl SkillCandidate {
             &self.evidence_refs,
             &self.dependency_versions,
             &self.candidate_scope,
+            &self.policy_revision,
+            &self.operation_identity,
             &self.state_fence,
         ))
     }
@@ -801,6 +818,11 @@ impl SkillCandidate {
             dependency.validate()?;
         }
         self.candidate_scope.validate()?;
+        // Policy revision and operation identity are mandatory binding terms:
+        // an unbound candidate could not be told apart from a decision taken
+        // under another policy revision or another operation identity.
+        text(&self.policy_revision, "candidate.policy_revision")?;
+        text(&self.operation_identity, "candidate.operation_identity")?;
         self.state_fence
             .validate()
             .map_err(|error| SkillError::Surface(error.to_string()))?;
@@ -1145,6 +1167,68 @@ impl SkillRegistry {
         Ok(derive_attempt_summary(receipt))
     }
 
+    /// Retains one admitted activation receipt in the stored view and returns
+    /// the owner's resulting position (issue #2663, audit 5856960648 item C5).
+    ///
+    /// This is the ACTIVATION counterpart of
+    /// [`Self::record_execution_evidence`], and it exists because nothing
+    /// retained an activation receipt. Every construction of the stored view's
+    /// `attempt_receipts` passed `Vec::new()` except
+    /// [`derive_lifecycle_view`](activation::derive_lifecycle_view), which is
+    /// fed the previous view's own set — so the field was self-perpetuating
+    /// empty, the daemon's retained-receipt conflict loop had nothing to
+    /// iterate, and the guard "changed material under one receipt identity
+    /// conflicts" was statically unreachable.
+    ///
+    /// The identity binding is exactly the one
+    /// [`Self::admit_material_attempt`] applies, so a receipt cannot be filed
+    /// under a Skill revision or package digest the stored view does not name.
+    ///
+    /// Conflict and idempotence are decided on the RECEIPT IDENTITY, not on
+    /// arrival: a retained row under the same `receipt_id` or `attempt_ref`
+    /// whose content differs is [`SkillError::RevisionConflict`] — a changed
+    /// record under a retained identity is a conflict, never a rewrite — while
+    /// a byte-identical replay returns the stored view unchanged, so exact
+    /// replay does not inflate `lifecycle_revision`. Only genuinely new
+    /// material advances the revision and re-records through
+    /// [`Self::record_view`], which keeps the same fence and
+    /// monotonically-advancing-revision rules every other owner write obeys.
+    ///
+    /// Usefulness is never established here, exactly as in
+    /// [`Self::admit_material_attempt`]: retaining the receipt records that the
+    /// attempt happened, not that it helped.
+    pub fn record_activation_attempt(
+        &mut self,
+        receipt: &SkillHarnessActivationReceipt,
+    ) -> Result<SkillLifecycleView, SkillError> {
+        receipt.validate()?;
+        let key = receipt.skill_id.as_str();
+        let previous = self.views.get(key).ok_or(SkillError::NotFound)?.clone();
+        if receipt.skill_revision != previous.skill_ref.registration.revision
+            || receipt.package_digest != previous.skill_ref.package_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let retained_index = previous.attempt_receipts.iter().position(|held| {
+            held.receipt_id == receipt.receipt_id || held.attempt_ref == receipt.attempt_ref
+        });
+        if let Some(index) = retained_index {
+            if previous.attempt_receipts[index] != *receipt {
+                return Err(SkillError::RevisionConflict);
+            }
+            return Ok(previous);
+        }
+        let mut view = previous;
+        view.attempt_receipts.push(receipt.clone());
+        view.lifecycle_revision = view
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or(SkillError::RevisionConflict)?;
+        view.validate()?;
+        self.record_view(view.clone())?;
+        Ok(view)
+    }
+
     /// Records one window of execution evidence through this lifecycle owner
     /// and returns only after the owner accepted it (issue #2663, I7.25).
     ///
@@ -1345,6 +1429,8 @@ impl SkillRegistry {
         evidence_refs: Vec<String>,
         dependencies: Vec<DependencyVersion>,
         candidate_scope: SkillScope,
+        policy_revision: String,
+        operation_identity: String,
         state_fence: StateFence,
     ) -> Result<SkillCandidate, SkillError> {
         let base = self.views.get(base_skill_id).ok_or(SkillError::NotFound)?;
@@ -1358,6 +1444,8 @@ impl SkillRegistry {
             evidence_refs,
             dependencies,
             candidate_scope,
+            policy_revision,
+            operation_identity,
             state_fence,
         )
     }
@@ -1455,6 +1543,11 @@ pub trait SkillLifecycleApi: Send + Sync {
     ) -> Result<Option<SkillLifecycleView>, SkillError>;
 
     /// Explicit fields mirror the public lifecycle/API contract.
+    ///
+    /// The returned `SkillCandidate` binds the caller's `policy_revision`
+    /// together with this request's own operation identity, so two proposals
+    /// that differ only in policy revision or in operation identity are
+    /// distinguishable candidates rather than byte-identical ones.
     #[allow(clippy::too_many_arguments)]
     async fn propose(
         &self,
@@ -1465,6 +1558,7 @@ pub trait SkillLifecycleApi: Send + Sync {
         evidence_refs: Vec<String>,
         dependencies: Vec<DependencyVersion>,
         scope: SkillScope,
+        policy_revision: String,
     ) -> Result<SkillCandidate, SkillError>;
 
     async fn promote(

@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -101,6 +102,16 @@ _DISPOSITIONS = frozenset({
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _SHELL_CHARS = frozenset(";&|$`()<>{}*?!~#%^\n\r\t\"'\\")
+# Observed libtest evidence only: the per-target summary line. The exact
+# "test <declared name> ... ok" line is matched per call, because the declared
+# capsule test name is a bound value and never a fixed pattern.
+_TEST_RESULT_RE = re.compile(
+    r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored", re.MULTILINE)
+# A reason in this set means the required evidence was absent or unreadable,
+# which is UNAVAILABLE; any other refusal is FAILED.
+_UNAVAILABLE_REASONS = frozenset({
+    "ARTIFACT_UNAVAILABLE", "ARTIFACT_SIZE_LIMIT", "CAPSULE_RESULT_UNAVAILABLE",
+})
 
 
 class LaneError(ValueError):
@@ -216,6 +227,8 @@ class FrozenBinding:
     capsule_operation: str
     capsule_stage: str
     capsule_oracle: str
+    capsule_test_target: str
+    capsule_test_name: str
     native_contract: str
     native_revision: str
     engine_implementation: str
@@ -303,6 +316,22 @@ def freeze_module(root: Path, module: str, entry: Mapping[str, Any]) -> FrozenBi
         bound = capsule.get(bound_key)
         if type(bound) is not int or bound <= 0 or bound > 1_073_741_824:
             raise LaneError("CAPSULE_BOUND_INVALID")
+    # The executable capsule identity, declared per entry and frozen here.
+    # A stage label is a ProofStage name, never a libtest name, so it can
+    # never select the declared capsule; the exact package test target and
+    # exact test name are the only thing ``wasm-test`` may filter on. An
+    # undeclared or malformed execution identity fails closed before any
+    # command exists rather than silently running the wrong tests.
+    execution = capsule.get("execution")
+    if type(execution) is not dict or set(execution) != {"package_test_target", "test_name"}:
+        raise LaneError("CAPSULE_EXECUTION_UNDECLARED")
+    capsule_test_target = _bounded_text(
+        execution.get("package_test_target"), "CAPSULE_TEST_TARGET")
+    if re.fullmatch(r"[a-z0-9_]{1,64}", capsule_test_target) is None:
+        raise LaneError("CAPSULE_TEST_TARGET_INVALID")
+    capsule_test_name = _bounded_text(execution.get("test_name"), "CAPSULE_TEST_NAME")
+    if re.fullmatch(r"[A-Za-z0-9_:]{1,128}", capsule_test_name) is None:
+        raise LaneError("CAPSULE_TEST_NAME_INVALID")
 
     native_contract = _bounded_text(entry.get("native_contract"), "NATIVE_CONTRACT")
     native_revision = _bounded_text(entry.get("native_revision"), "NATIVE_REVISION")
@@ -337,6 +366,8 @@ def freeze_module(root: Path, module: str, entry: Mapping[str, Any]) -> FrozenBi
         capsule_operation=capsule_operation,
         capsule_stage=capsule_stage,
         capsule_oracle=capsule_oracle,
+        capsule_test_target=capsule_test_target,
+        capsule_test_name=capsule_test_name,
         native_contract=native_contract,
         native_revision=native_revision,
         engine_implementation=engine_implementation,
@@ -390,6 +421,184 @@ def cache_identity(
         "dependency_digest": dependency_digest,
         "source_digest": source_digest,
     })
+
+
+CACHE_RECORD_SCHEMA = "eliot-wasm-component-lane-cache-v1"
+MAX_CACHE_RECORD_BYTES = 65_536
+
+
+def component_artifact_path(frozen: FrozenBinding, target_root: Path) -> Path:
+    """Exact component artifact that build_argv() produces under the isolated lane root.
+
+    ``dev`` lands in ``debug`` and ``release`` in ``release`` beneath the
+    lane target root; no other profile is addressable here, and the
+    workspace ``target/`` directory is never a fallback.
+    """
+    module = check_module_name(frozen.module)
+    if frozen.profile == "dev":
+        profile_dir = "debug"
+    elif frozen.profile == "release":
+        profile_dir = frozen.profile
+    else:
+        raise LaneError("INVALID_PROFILE")
+    return target_root / GUEST_TARGET / profile_dir / f"{module}.wasm"
+
+
+def bind_artifact(frozen: FrozenBinding, target_root: Path) -> dict[str, Any]:
+    """Observed artifact identity for one actual run: real path, size, SHA-256.
+
+    Read from disk on every build and test pass. A declared or expected
+    artifact is never reported; an absent, non-regular or symlinked artifact
+    is missing expected execution and fails closed here.
+    """
+    artifact_path = component_artifact_path(frozen, target_root)
+    if artifact_path.is_symlink() or not artifact_path.is_file():
+        raise LaneError("ARTIFACT_UNAVAILABLE")
+    digest, size = sha256_file(artifact_path)
+    return {"path": str(artifact_path), "sha256": digest, "bytes": size}
+
+
+def verify_capsule_execution(output: bytes, test_name: str) -> dict[str, int]:
+    """Return the observed libtest counts only when the declared capsule test ran.
+
+    A zero exit from a filtered harness proves nothing: ``--exact`` on a name
+    no test carries still exits 0 with ``0 passed``. The declared capsule test
+    must appear in the harness output as passed, and at least one harness
+    summary line must exist, or missing expected execution is non-green.
+    """
+    text = output.decode("utf-8", errors="replace")
+    summaries = _TEST_RESULT_RE.findall(text)
+    if not summaries:
+        raise LaneError("CAPSULE_RESULT_UNAVAILABLE")
+    executed = re.compile(
+        r"^test " + re.escape(test_name) + r" \.\.\. ok\s*$", re.MULTILINE)
+    if executed.search(text) is None:
+        raise LaneError("CAPSULE_TEST_NOT_EXECUTED")
+    passed = failed = ignored = 0
+    for outcome, summary_passed, summary_failed, summary_ignored in summaries:
+        if outcome != "ok":
+            failed += 1
+        passed += int(summary_passed)
+        failed += int(summary_failed)
+        ignored += int(summary_ignored)
+    if failed:
+        raise LaneError("CAPSULE_TEST_FAILED")
+    if passed < 1:
+        raise LaneError("CAPSULE_TEST_NOT_EXECUTED")
+    return {"passed": passed, "failed": failed, "ignored": ignored}
+
+
+def cache_store_root(controller_root: Path, cache_id: str) -> Path:
+    """Bounded per-lane cache store directory for one exact cache identity.
+
+    One directory per ``cache_identity()`` digest beneath the controller
+    allocated root: never the workspace ``target/`` directory and never a
+    lane target root, so incompatible active lanes cannot share it (I2.22).
+    """
+    if type(cache_id) is not str or re.fullmatch(r"[0-9a-f]{64}", cache_id) is None:
+        raise LaneError("INVALID_CACHE_IDENTITY")
+    if "target" in controller_root.parts:
+        raise LaneError("WORKSPACE_TARGET_REUSE_DENIED")
+    return controller_root / f"cache-{cache_id}"
+
+
+def read_cache_record(controller_root: Path, cache_id: str) -> dict[str, Any] | None:
+    """Return the recorded entry whose stored cache_identity equals cache_id, else None on a miss.
+
+    Every unusable cache state is a miss, never an error: absent,
+    unreadable, oversized, malformed, foreign schema, foreign identity, or
+    an artifact whose recorded ``path``/``sha256``/``bytes`` no longer match
+    the bytes on disk. A hit carries artifact lineage only and never a
+    stored test or verifier verdict (I2.22).
+    """
+    if type(cache_id) is not str or re.fullmatch(r"[0-9a-f]{64}", cache_id) is None:
+        raise LaneError("INVALID_CACHE_IDENTITY")
+    store = cache_store_root(controller_root, cache_id)
+    record_path = store / "record.json"
+    if store.is_symlink() or record_path.is_symlink():
+        return None
+    try:
+        raw = record_path.read_bytes()
+    except OSError:
+        return None
+    if not raw or len(raw) > MAX_CACHE_RECORD_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return None
+    if type(data) is not dict or data.get("schema") != CACHE_RECORD_SCHEMA:
+        return None
+    if data.get("cache_identity") != cache_id:
+        return None
+    artifact = data.get("artifact")
+    if type(artifact) is not dict:
+        return None
+    location = artifact.get("path")
+    if type(location) is not str or not location:
+        return None
+    path = Path(location)
+    if not path.is_absolute() or path.is_symlink():
+        return None
+    try:
+        digest, size = sha256_file(path)
+    except (OSError, LaneError):
+        return None
+    if type(artifact.get("sha256")) is not str or type(artifact.get("bytes")) is not int:
+        return None
+    if artifact["sha256"] != digest or artifact["bytes"] != size:
+        return None
+    return data
+
+
+def write_cache_record(
+    controller_root: Path, cache_id: str, record: Mapping[str, Any]
+) -> None:
+    """Record one verified artifact under its exact cache identity.
+
+    Canonical JSON lands through one atomic replace inside the bounded
+    ``cache_store_root(...)`` directory. A record is accepted only when it
+    binds that identity plus its module, artifact, and source; a rejected
+    record never becomes cache authority.
+    """
+    if type(cache_id) is not str or re.fullmatch(r"[0-9a-f]{64}", cache_id) is None:
+        raise LaneError("INVALID_CACHE_IDENTITY")
+    if type(record) is not dict:
+        raise LaneError("MALFORMED_CACHE_RECORD")
+    if record.get("cache_identity") != cache_id:
+        raise LaneError("CACHE_IDENTITY_MISMATCH")
+    for key in ("module", "artifact", "source"):
+        if record.get(key) is None:
+            raise LaneError("MALFORMED_CACHE_RECORD")
+    check_module_name(record["module"])
+    payload = dict(record)
+    payload["schema"] = CACHE_RECORD_SCHEMA
+    try:
+        blob = _canonical(payload)
+    except (TypeError, ValueError):
+        raise LaneError("MALFORMED_CACHE_RECORD") from None
+    if len(blob) > MAX_CACHE_RECORD_BYTES:
+        raise LaneError("CACHE_RECORD_SIZE_LIMIT")
+    store = cache_store_root(controller_root, cache_id)
+    if store.is_symlink():
+        raise LaneError("CACHE_ROOT_NOT_REGULAR")
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise LaneError("CACHE_STORE_UNAVAILABLE") from None
+    staged: str | None = None
+    try:
+        descriptor, staged = tempfile.mkstemp(dir=store, prefix=".record-", suffix=".tmp")
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(blob)
+        os.replace(staged, store / "record.json")
+    except OSError:
+        if staged is not None:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+        raise LaneError("CACHE_RECORD_WRITE_FAILED") from None
 
 
 def lane_target_root(
@@ -489,16 +698,19 @@ def build_argv(frozen: FrozenBinding, target_root: Path) -> list[str]:
 def test_argv(frozen: FrozenBinding, target_root: Path) -> list[str]:
     """Fixed declared-capsule-only test argv for one component.
 
-    Executes only the declared capsule stage through the owning package
-    test entrypoint (accepted #760/#758 capsule execution path), never
-    the workspace gate (#750 remains its owner).
+    Selects exactly the declared capsule proof test by its frozen package
+    test target and exact test name, never the ``ProofStage`` label: a stage
+    such as ``INVOCATION`` is not a libtest name, so passing it as a filter
+    matched no guest test and a zero exit proved no execution at all. The
+    workspace gate is never run from this leaf (#750 remains its owner).
     """
     check_module_name(frozen.module)
     argv = [
         "cargo", "test", "-p", frozen.module,
         "--target", GUEST_TARGET,
         "--target-dir", str(target_root),
-        "--", frozen.capsule_stage,
+        "--test", frozen.capsule_test_target,
+        "--", "--exact", frozen.capsule_test_name,
     ]
     _assert_exact_manifest_argv(argv, frozen.module)
     return argv
@@ -637,6 +849,8 @@ def make_receipt(
             "operation": frozen.capsule_operation,
             "stage": frozen.capsule_stage,
             "oracle": frozen.capsule_oracle,
+            "test_target": frozen.capsule_test_target,
+            "test_name": frozen.capsule_test_name,
             "report": dict(capsule_report) if capsule_report is not None else None,
         },
         "execution": {
@@ -805,8 +1019,10 @@ def self_test() -> None:
     2. A traversal/absolute/separator/shell-injection battery is rejected
        before any command exists.
 
-    No subprocess, no network, no repository mutation. The remaining
-    764 cases (1-2, 5-21 plus manual-dispatch evidence) stay deferred.
+    These checks are separate from the unit-test matrix, which covers the 19
+    offline cases 1-15 and 17-20. Cases 16 and 21 are deferred: both need the
+    out-of-scope workflow, and 21 also needs an authorized manual dispatch.
+    Neither test surface claims live component or workflow evidence.
     """
     fixture = {"eliot-context-compiler-wasm": {"manifest": "x"}}
     calls: list[list[str]] = []
@@ -879,39 +1095,184 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.select:
             if args.changed is None:
                 raise LaneError("CHANGESET_REQUIRED")
-            changed = _load_json_capped(args.changed, MAX_REGISTRY_BYTES, "CHANGESET")
+            evidence = _load_json_capped(args.changed, MAX_REGISTRY_BYTES, "CHANGESET")
+            # Controller-supplied frozen graph evidence only: exactly these
+            # five keys, never a default and never an implicit empty
+            # collection that could hide a required dependent.
+            if type(evidence) is not dict or set(evidence) != {
+                "paths", "shared_prefixes", "native_contract_prefixes",
+                "unrelated_prefixes", "dependents",
+            }:
+                raise LaneError("CHANGESET_EVIDENCE_MALFORMED")
+
+            def evidence_paths(value: object, *, required: bool) -> list[str]:
+                if type(value) is not list or len(value) > 256:
+                    raise LaneError("CHANGESET_EVIDENCE_MALFORMED")
+                if required and not value:
+                    raise LaneError("CHANGESET_EVIDENCE_MALFORMED")
+                for item in value:
+                    if type(item) is not str or not item or len(item) > 1024:
+                        raise LaneError("CHANGESET_EVIDENCE_MALFORMED")
+                return list(value)
+
+            def evidence_map(value: object) -> dict[str, list[str]]:
+                if type(value) is not dict or len(value) > 64:
+                    raise LaneError("CHANGESET_EVIDENCE_MALFORMED")
+                mapping: dict[str, list[str]] = {}
+                for key in value:
+                    if type(key) is not str or not key or len(key) > MAX_TEXT_FIELD:
+                        raise LaneError("CHANGESET_EVIDENCE_MALFORMED")
+                    mapping[key] = evidence_paths(value[key], required=False)
+                return mapping
+
             selection = select_affected(
-                registry, changed, shared_prefixes=(), native_contract_prefixes={},
-                unrelated_prefixes=(), dependents={},
+                registry, evidence_paths(evidence["paths"], required=True),
+                shared_prefixes=evidence_paths(evidence["shared_prefixes"], required=False),
+                native_contract_prefixes=evidence_map(evidence["native_contract_prefixes"]),
+                unrelated_prefixes=evidence_paths(evidence["unrelated_prefixes"], required=False),
+                dependents=evidence_map(evidence["dependents"]),
             )
-            payload.update(status="PASS", selected=list(selection.selected),
-                           disposition=selection.disposition, reason=selection.reason)
+            # Selection is planning evidence only. Both SELECTED and NO_WORK
+            # remain non-green; neither disposition fabricates execution.
+            payload.update(
+                status="FAIL",
+                selected=list(selection.selected), disposition=selection.disposition,
+                reason=selection.reason,
+            )
         else:
             module = args.build or args.test
             if not module:
                 raise LaneError("MODULE_REQUIRED")
             entry = resolve_module(registry, module)
             frozen = freeze_module(args.root, module, entry)
+            # "Build only the exact component manifest/dependencies for #870's
+            # target": the accepted component manifest is the build authority,
+            # so the exact-manifest argv runs in that manifest's own workspace
+            # root (a registered guest is not a root-workspace member) and
+            # never in the repository root.
+            manifest_root = (args.root / frozen.manifest_relpath).parent
+            try:
+                manifest_root.resolve().relative_to(args.root.resolve())
+            except ValueError:
+                raise LaneError("MANIFEST_PATH_REJECTED") from None
+            depends_on = entry.get("depends_on")
+            # dependency identity provenance: the registry entry's own declared
+            # module.toml depends_on set (owner #638), never a guessed list.
+            if type(depends_on) is not list or len(depends_on) > 64:
+                raise LaneError("INVALID_DEPENDENCY_IDENTITY")
+            for dependency in depends_on:
+                _bounded_text(dependency, "DEPENDENCY")
             wit_digest = _digest({"package": TYPED_PACKAGE_ID, "abi": TYPED_ABI_REVISION})
             source_digest = _digest({"base": args.base_sha, "head": args.head_sha})
+            dependency_digest = _digest({"depends_on": sorted(depends_on)})
+            cache_id = cache_identity(
+                frozen, wit_digest=wit_digest,
+                dependency_digest=dependency_digest, source_digest=source_digest,
+            )
+            controller_root = Path(tempfile.gettempdir()) / "eliot-wasm-lane"
+            # A hit reuses only the recorded artifact identity; it never skips
+            # the gate below.
+            record = read_cache_record(controller_root, cache_id)
+            cache_hit = record is not None
             target_root = lane_target_root(
-                Path(tempfile.gettempdir()) / "eliot-wasm-lane", args.root,
+                controller_root, args.root,
                 wit_digest=wit_digest, native_contract=frozen.native_contract,
                 native_revision=frozen.native_revision, profile=frozen.profile,
                 features_digest=_digest(sorted(frozen.features)), source_digest=source_digest,
             )
             lane_argv = build_argv(frozen, target_root) if args.build else test_argv(frozen, target_root)
+            artifact: dict[str, Any] | None = None
+            capsule_report: dict[str, Any] | None = None
+            reason: str | None = None
+            cold_s: float | None = None
+            warm_s: float | None = None
             if args.print_argv:
-                payload.update(status="PASS", module=module, argv=lane_argv,
-                               frozen_digest=frozen.digest,
-                               target_root=str(target_root))
+                # Constructs and reports the exact argv only: no tool runs, so
+                # no component can be claimed green.
+                disposition = "SKIPPED"
+                tool_status = "SKIPPED"
             else:
-                result = _run(lane_argv, args.root)
-                disposition = "BUILD_PASS" if (args.build and result.status == "OK") else (
-                    "TEST_PASS" if (args.test and result.status == "OK") else "FAILED")
-                payload.update(status="PASS" if result.status == "OK" else "FAIL",
-                               module=module, tool_status=result.status,
-                               disposition=disposition)
+                started = time.monotonic()
+                result = _run(lane_argv, manifest_root)
+                elapsed = time.monotonic() - started
+                tool_status = result.status
+                if result.status == "OK":
+                    disposition = "BUILD_PASS" if args.build else "TEST_PASS"
+                elif result.status == "TOOL_UNAVAILABLE":
+                    disposition = "UNAVAILABLE"
+                elif result.status == "TOOL_CANCELLED":
+                    disposition = "CANCELLED"
+                else:
+                    disposition = "FAILED"
+                if disposition == "BUILD_PASS":
+                    try:
+                        artifact = bind_artifact(frozen, target_root)
+                    except (LaneError, OSError) as error:
+                        # Missing expected execution is non-green.
+                        artifact = None
+                        disposition = "UNAVAILABLE"
+                        reason = str(error)
+                    else:
+                        write_cache_record(controller_root, cache_id, {
+                            "schema": CACHE_RECORD_SCHEMA,
+                            "cache_identity": cache_id,
+                            "module": frozen.module,
+                            "artifact": artifact,
+                            "source": {"base": args.base_sha, "head": args.head_sha},
+                        })
+                elif disposition == "TEST_PASS":
+                    # A zero exit is not execution evidence: bind the real
+                    # artifact the capsule ran against and require the
+                    # declared capsule test to appear as passed. Anything
+                    # missing stays a distinct non-green disposition.
+                    try:
+                        artifact = bind_artifact(frozen, target_root)
+                        counts = verify_capsule_execution(
+                            result.output, frozen.capsule_test_name)
+                    except (LaneError, OSError) as error:
+                        artifact = None
+                        disposition = (
+                            "UNAVAILABLE" if str(error) in _UNAVAILABLE_REASONS
+                            else "FAILED")
+                        reason = str(error)
+                    else:
+                        capsule_report = {
+                            "operation": frozen.capsule_operation,
+                            "stage": frozen.capsule_stage,
+                            "oracle": frozen.capsule_oracle,
+                            "tool_status": result.status,
+                            "executed_test": frozen.capsule_test_name,
+                            "executed_test_target": frozen.capsule_test_target,
+                            "artifact_sha256": artifact["sha256"],
+                            "passed": counts["passed"],
+                            "failed": counts["failed"],
+                            "ignored": counts["ignored"],
+                        }
+                if cache_hit:
+                    warm_s = elapsed
+                else:
+                    cold_s = elapsed
+            receipt = make_receipt(
+                frozen=frozen, base_sha=args.base_sha, head_sha=args.head_sha,
+                artifact=artifact, capsule_report=capsule_report,
+                disposition=disposition, cache_id=cache_id, cache_hit=cache_hit,
+                argv_digest=_digest(lane_argv),
+            )
+            # No workspace gate runs from this leaf (#750 owns it), so the
+            # comparable baseline stays explicitly unavailable.
+            bind_observations(
+                receipt, cold_s=cold_s, warm_s=warm_s,
+                baseline_s=None, baseline_provenance=None,
+            )
+            receipt.update(
+                status="PASS" if disposition in ("BUILD_PASS", "TEST_PASS") else "FAIL",
+                tool_status=tool_status, target_root=str(target_root),
+            )
+            if reason is not None:
+                receipt["reason"] = reason
+            if args.print_argv:
+                receipt.update(argv=list(lane_argv), frozen_digest=frozen.digest)
+            payload = receipt
     except LaneError as error:
         payload.update(status="FAIL", reason=str(error))
     if args.receipt_out is not None:
@@ -922,9 +1283,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.format == "json":
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     else:
+        execution = payload.get("execution")
+        disposition = payload.get("disposition") or (
+            execution.get("disposition") if type(execution) is dict else None
+        )
         print(f"WASM_COMPONENT_LANE: {payload.get('status')} "
-              f"reason={payload.get('reason', payload.get('disposition', 'OK'))} "
+              f"reason={payload.get('reason', disposition or 'OK')} "
               f"proof={payload['proof_ceiling']}")
+        if payload.get("schema") == RECEIPT_SCHEMA:
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return 0 if payload.get("status") == "PASS" else 1
 
 

@@ -2616,13 +2616,20 @@ impl KernelAuditChain {
     /// Exports a digest anchor over the current head to the anchor sink.
     ///
     /// Writes `anchor-<head_seq>.json` plus the stable `latest-anchor.json`
-    /// pointer (atomic rename), fsyncs the anchor file, and advances the
-    /// anchor hash chain.
+    /// pointer (atomic rename), fsyncs the anchor file and the directory that
+    /// names it, and advances the anchor hash chain.
+    ///
+    /// Anchor files are immutable: one is published create-new and never
+    /// rewritten, so retained Watchdog evidence cannot be replaced by a later
+    /// export. When an anchor for this `(chain_id, head_seq)` is already
+    /// retained, the export is an idempotent replay — the retained anchor is
+    /// verified against this chain and returned unchanged.
     ///
     /// # Errors
     ///
-    /// Returns [`KernelAuditError`] when the chain is empty or the sink
-    /// write fails.
+    /// Returns [`KernelAuditError`] when the chain is empty, when a retained
+    /// anchor for this head does not verify against this chain, or when the
+    /// sink write fails.
     pub fn export_anchor(&mut self, exported_at_ms: u64) -> Result<AuditAnchor, KernelAuditError> {
         if self.head_seq == 0 {
             return Err(KernelAuditError::EmptyChain);
@@ -2641,7 +2648,33 @@ impl KernelAuditChain {
         let bytes = canonical_json_bytes(&anchor)
             .map_err(|error| KernelAuditError::Serialization(error.to_string()))?;
         let path = self.anchor_dir.join(AuditAnchor::file_name(self.head_seq));
-        Self::write_sync(&path, &bytes)?;
+        // An anchor file is IMMUTABLE evidence in the Watchdog failure domain:
+        // it is published create-new and is never rewritten, because
+        // overwriting it would replace retained history with whatever this run
+        // happens to hold. An existing anchor for this `(chain_id, head_seq)`
+        // already states this head, so a re-export is an idempotent replay of a
+        // fact that is already durable: the RETAINED anchor is verified against
+        // this chain and returned unchanged. This run's `exported_at_ms` is
+        // metadata about the export, not part of the covered fact, so writing it
+        // would destroy retained evidence to add nothing. A retained anchor that
+        // does not verify here is a conflict and is refused.
+        match std::fs::read(&path) {
+            Ok(_) => {
+                let retained = Self::read_anchor(&path)?;
+                self.verify_anchor(&retained)?;
+                self.prev_anchor_hash.clone_from(&retained.anchor_digest);
+                return Ok(retained);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(KernelAuditError::Io {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+        Self::write_new_sync(&path, &bytes)?;
+        Self::sync_publication_dir(&self.anchor_dir)?;
         let staging = self.anchor_dir.join("latest-anchor.json.staging");
         Self::write_sync(&staging, &bytes)?;
         std::fs::rename(
@@ -2652,6 +2685,10 @@ impl KernelAuditChain {
             path: self.anchor_dir.clone(),
             reason: error.to_string(),
         })?;
+        // The `latest` name is a derived pointer over an immutable anchor, so it
+        // is republished every time; the durable fact that matters is the
+        // directory entry naming it, which only the directory sync establishes.
+        Self::sync_publication_dir(&self.anchor_dir)?;
         self.prev_anchor_hash.clone_from(&anchor.anchor_digest);
         Ok(anchor)
     }
@@ -2762,7 +2799,12 @@ impl KernelAuditChain {
         std::fs::rename(&staging, &path).map_err(|error| KernelAuditError::Io {
             path: path.clone(),
             reason: error.to_string(),
-        })
+        })?;
+        // The spool file's bytes were flushed before the rename; what is not yet
+        // durable is the directory entry that names them. Without this the
+        // rename can be lost while the caller is already counting on the entry
+        // existing, which is the crash boundary this spool exists to survive.
+        Self::sync_publication_dir(&dir)
     }
 
     /// Drops the pending spool entry for one operation, if any.
@@ -2842,8 +2884,89 @@ impl KernelAuditChain {
             })
     }
 
+    /// Writes one file's bytes and fsyncs them, REFUSING to overwrite.
+    ///
+    /// `create_new` is the whole point: an existing destination is an error
+    /// rather than something this call truncates away, so a create-new
+    /// publication cannot silently destroy retained bytes. Callers that accept
+    /// an idempotent byte replay compare first; this helper is the write half
+    /// of that rule, not a second copy of it.
+    fn write_new_sync(path: &Path, bytes: &[u8]) -> Result<(), KernelAuditError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| KernelAuditError::Io {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KernelAuditError::Io {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            })
+    }
+
+    /// Makes a just-renamed publication's NAME durable.
+    ///
+    /// Flushing a file proves the file's bytes; the directory entry that names
+    /// them is a separate durable fact, and it survives power loss only once the
+    /// directory itself is flushed. So publication is write + file sync +
+    /// atomic rename + directory sync, in that order, and this call is the last
+    /// step rather than an extra layer.
+    ///
+    /// It calls this crate's one directory-sync owner
+    /// ([`sync_parent_directory`](super::backup_restore_ports::sync_parent_directory))
+    /// instead of opening a second answer to "is the name durable yet". That
+    /// owner already handles the platform difference — a `FILE_FLAG_BACKUP_SEMANTICS`
+    /// handle on Windows, where an ordinary directory open is refused — and
+    /// already absorbs the three error kinds Windows may legitimately return
+    /// for a flush it cannot perform.
+    fn sync_publication_dir(dir: &Path) -> Result<(), KernelAuditError> {
+        super::backup_restore_ports::sync_parent_directory(dir).map_err(|error| {
+            KernelAuditError::Io {
+                path: dir.to_path_buf(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Resumes the anchor hash from the RETAINED, FULLY VERIFIED anchor set.
+    ///
+    /// Every retained `anchor-<seq>.json` is read (which checks its own
+    /// self-digest), matched against its own `head_seq`, and then verified
+    /// against the chain this process actually holds by
+    /// [`Self::verify_anchor`]: format version, self-digest, gapless covered
+    /// prefix, chain identity, and the covered head record's own digest. An
+    /// anchor that does not verify against the chain in hand fails closed
+    /// instead of being skipped, because a self-consistent anchor file that
+    /// describes a prefix this chain does not contain is exactly the
+    /// corruption, truncation or rollback an anchor exists to detect — and
+    /// adopting its digest would let the next export chain onto it.
+    ///
+    /// The verified set is then walked in ascending `head_seq` and each anchor's
+    /// `prev_anchor_hash` must equal the previous anchor's own digest (the
+    /// first carries [`KERNEL_AUDIT_GENESIS_ANCHOR_HASH`]), so a set that is
+    /// individually self-consistent but reordered, swapped or hand-edited
+    /// cannot be adopted. That linkage is what makes a MISSING anchor export
+    /// detectable: dropping one retained anchor breaks the chain at its
+    /// successor rather than silently shortening the history.
+    ///
+    /// Only after both checks does the highest retained anchor become
+    /// `prev_anchor_hash`, and only when it describes a prefix of this chain:
+    /// an anchor ahead of the retained head means the Watchdog root holds
+    /// evidence of history this work root no longer has, which is a recovery
+    /// disposition and never a silent resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelAuditError::Io`] when the anchor directory cannot be
+    /// read, and [`KernelAuditError::AnchorMismatch`] when any retained anchor
+    /// fails its own check, its chain verification, its linkage to the previous
+    /// retained anchor, or names a head this chain does not contain.
     fn resume_anchor_hash(&mut self) -> Result<(), KernelAuditError> {
-        let mut latest: Option<(u64, String)> = None;
+        let mut retained: Vec<AuditAnchor> = Vec::new();
         let entries =
             std::fs::read_dir(&self.anchor_dir).map_err(|error| KernelAuditError::Io {
                 path: self.anchor_dir.clone(),
@@ -2870,13 +2993,30 @@ impl KernelAuditChain {
                     reason: "anchor_file_name",
                 });
             }
-            if latest.as_ref().is_none_or(|(best, _)| seq > *best) {
-                latest = Some((seq, anchor.anchor_digest.clone()));
+            // A matching self-digest proves the file was not edited; only
+            // verification against the chain proves it describes THIS history.
+            self.verify_anchor(&anchor)?;
+            retained.push(anchor);
+        }
+        retained.sort_by_key(|anchor| anchor.head_seq);
+        let Some(highest) = retained.last() else {
+            return Ok(());
+        };
+        let mut expected_prev = KERNEL_AUDIT_GENESIS_ANCHOR_HASH.to_owned();
+        for anchor in &retained {
+            if anchor.prev_anchor_hash != expected_prev {
+                return Err(KernelAuditError::AnchorMismatch {
+                    reason: "anchor_linkage",
+                });
             }
+            expected_prev.clone_from(&anchor.anchor_digest);
         }
-        if let Some((_, digest)) = latest {
-            self.prev_anchor_hash = digest;
+        if highest.head_seq > self.head_seq {
+            return Err(KernelAuditError::AnchorMismatch {
+                reason: "anchor_ahead_of_chain",
+            });
         }
+        self.prev_anchor_hash.clone_from(&highest.anchor_digest);
         Ok(())
     }
 
@@ -3162,11 +3302,14 @@ impl crate::KernelComposition {
     /// with matching request/result digests completes the chain with the
     /// legs it still lacks, in causal order (submission before binding);
     /// the binding `durable_state` refreshes from the ORS original. No
-    /// record, no completion, or a digest mismatch drops the entry without
-    /// appending — the chain never carries a binding the ORS record does
-    /// not prove. Corrupt entries and failed appends stay visible through
-    /// the stable `KERNEL_AUDIT_APPEND_FAILED` terminal and keep their
-    /// spool file for the next pass.
+    /// record, a digest mismatch, or an UNREADABLE record drops the entry
+    /// without appending — the chain never carries a binding the ORS record
+    /// does not prove. A non-terminal ORS state is not in that list: it is
+    /// neither proof of a commit nor proof of a non-commit, so the entry is
+    /// retained and the condition surfaced instead of dropped. Corrupt entries
+    /// and failed appends stay visible through the stable
+    /// `KERNEL_AUDIT_APPEND_FAILED` terminal and keep their spool file for the
+    /// next pass.
     fn reconcile_pending_entry(&self, entry: Result<PendingResultBinding, KernelAuditError>) {
         let entry = match entry {
             Ok(entry) if entry.is_well_formed() => entry,
@@ -3189,6 +3332,11 @@ impl crate::KernelComposition {
             .ors
             .load_host_request(&operation_id, &entry.request_digest)
         else {
+            // An unavailable read is not evidence that the operation never
+            // committed; it is evidence that this pass cannot tell. The entry is
+            // kept for the next pass and the condition is surfaced rather than
+            // left silent.
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
             return;
         };
         let Some(stored) = stored else {
@@ -3201,7 +3349,15 @@ impl crate::KernelComposition {
             return;
         }
         if stored.state != HostRequestState::ResultReceived {
-            self.clear_pending_result_binding(&entry.operation_id);
+            // A non-terminal ORS state (claimed, queued, mid-transition) is NOT
+            // a non-commit: the completion this entry witnesses may still land,
+            // and the whole point of the pre-commit spool is to still be holding
+            // both drafts when it does. Dropping it here would discard the
+            // evidence for exactly the crash window the spool was created for,
+            // so the entry is RETAINED and reported as reconciliation-required
+            // until a matching terminal completion (or owner-issued terminal
+            // evidence) proves otherwise.
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
             return;
         }
         if stored.result_digest.as_deref() != Some(entry.result_digest.as_str()) {

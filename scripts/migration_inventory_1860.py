@@ -438,6 +438,22 @@ def resolve_owner_fallback(manifest_dir: str) -> str:
 
 
 def _surface_class(path: str) -> str:
+    # Issue #1860 W1: the prompt, install and generated-schema families are
+    # tested FIRST, ahead of every directory-prefix branch. They used to be
+    # evaluated last, which made all three provably unreachable for the paths
+    # that actually carry them: branch order returned "integration" for anything
+    # under integrations/, so all seven tracked
+    # integrations/claude/eliot/evals/*/prompt.md could never reach the prompt
+    # branch; "script" claimed every scripts/*.ps1 before the install branch was
+    # read; and the .wit fixtures under scripts/ and bins/ were taken by their
+    # directory prefix first. A classifier whose whole value is that its class
+    # matches reality cannot order its own rules so that three of them are dead.
+    if path.endswith("prompt.md") or "/prompts/" in path or "/evals/" in path:
+        return "prompt"
+    if path.endswith((".ps1", ".manifest")):
+        return "install"
+    if path.startswith("bins/eliot-wasm-host/wit/") or path.endswith(".wit"):
+        return "generated-schema"
     if path.startswith("bins/"):
         return "binary"
     if path.startswith("integrations/agent-skills/") or "/skills/" in path:
@@ -464,16 +480,10 @@ def _surface_class(path: str) -> str:
         return "tool"
     if path.startswith("workstreams/"):
         return "workstream"
-    if path.endswith("prompt.md") or "/prompts/" in path or "/evals/" in path:
-        return "prompt"
     if path.endswith(".rs"):
         return "source"
     if path.endswith("Cargo.toml") or path.endswith("Cargo.lock"):
         return "manifest"
-    if "release" in path.lower() or "install" in path.lower() or path.endswith((".ps1", ".manifest")):
-        return "install"
-    if path.startswith("bins/eliot-wasm-host/wit/") or path.endswith(".wit"):
-        return "generated-schema"
     return "other"
 
 
@@ -730,7 +740,15 @@ def run_self_tests() -> int:
     for probe, want in [("bins/eliotd/src/main.rs", "binary"), ("migrations/0001_bootstrap.surql.retired", "schema"),
                         ("config/architecture-boundaries.toml", "config"), (".github/workflows/x.yml", "ci"),
                         ("integrations/agent-skills/a/SKILL.md", "skill"), ("integrations/opencode/x.js", "integration"),
-                        ("docs/release/WINDOWS_X64_RELEASE.md", "docs"), ("scripts/build-eliot-windows-x64-release.ps1", "script")]:
+                        ("docs/release/WINDOWS_X64_RELEASE.md", "docs"), ("scripts/build-eliot-windows-x64-release.ps1", "install"),
+                        # Issue #1860 W1: each of these three families was unreachable
+                        # before the reorder, so each carries a probe that fails on the
+                        # pre-fix source rather than merely passing afterwards.
+                        ("integrations/claude/eliot/evals/auto-selection/prompt.md", "prompt"),
+                        ("crates/some/prompts/plan.md", "prompt"),
+                        ("integrations/opencode/x.manifest", "install"),
+                        ("bins/eliot-wasm-host/wit/guest.wit", "generated-schema"),
+                        ("scripts/testdata/wit-contract/positive/minimal-ok.wit", "generated-schema")]:
         assert _surface_class(probe) == want, f"class {probe}"
     print("MIGRATION_INVENTORY_1860_SELF_TEST: PASS")
     return 0

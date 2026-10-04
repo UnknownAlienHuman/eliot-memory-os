@@ -1,12 +1,14 @@
 //! Explicit startup capability binding ledger for the `eliotd` composition root
 //! (issue #18, item A).
 //!
-//! The composition root declares seven startup capabilities it must be bound to
-//! before it may report Governor readiness. Control flow alone cannot express
-//! that: a `?` on an attach call removes the daemon from the process, and a
-//! `let _context = …; Ok(())` proves a binding only by dropping the value that
-//! proves it. Both were rejected. This module makes each declared capability
-//! carry one explicit, retained disposition instead:
+//! The composition root declares seven startup capabilities, and each one must
+//! carry an explicit disposition. Whether those dispositions together mean the
+//! daemon may report Governor readiness is a separate question this module
+//! deliberately does not answer — see the #2560 note below. Control flow alone
+//! cannot record the dispositions: a `?` on an attach call removes the daemon
+//! from the process, and a `let _context = …; Ok(())` proves a binding only by
+//! dropping the value that proves it. Both were rejected. This module makes each
+//! declared capability carry one explicit, retained disposition instead:
 //!
 //! ```text
 //! Bound(RetainedStartupBinding)  — the exact admitted identity/descriptor the
@@ -48,7 +50,7 @@
 //! an admitted request requires, so a capability that did not bind stays
 //! visibly not-ready instead of being reported as ready.
 
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{EpochId, RequestMetadata};
 
 use crate::AgentFabricDescriptor;
 
@@ -130,18 +132,47 @@ impl DeclaredStartupCapability {
 /// The exact retained evidence that one attach produced.
 ///
 /// Each variant keeps the admitted identity or descriptor the attach proved,
-/// not a boolean: the value is retained by the composition root for the
-/// lifetime of the process and rendered into the startup readiness record, so
-/// nothing that proves a binding is dropped at the end of a helper.
+/// not a boolean: the value stays in its declared slot of the composition root's
+/// ledger and is rendered into the startup readiness record, so nothing that
+/// proves a binding is dropped at the end of a helper. A slot does not hold its
+/// value for the lifetime of the process — `StartupCapabilityBindings::replace_disposition`
+/// re-files it to `Unbound(reason)` when an owner retires or re-proves that
+/// attachment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetainedStartupBinding {
     /// The validated Kernel-issued session binding the composition was noted
     /// with. Identity refs only, never a secret.
+    ///
+    /// The generation and authority epoch are the exact identities the live
+    /// owner session was authenticated under, read from the composition's own
+    /// owner state. Session exists only while transport identity and the
+    /// semantic Session refer to the same State Fence/epoch (I1.8), so the
+    /// retained proof names which epoch it belongs to instead of reading as
+    /// current for every epoch the process ever lived through.
+    ///
+    /// #2560 item 4: `authority_epoch` is the contract's own [`EpochId`], not a
+    /// bare sequence. I1.8 says "the same State Fence/epoch", and an epoch in
+    /// this contract is the `(lineage_id, sequence)` tuple — the epoch-sequence
+    /// alone is not an identity, because two lineages issue unrelated sequences
+    /// at the same value (I6.10 exact-match; [`EpochId::is_same_authority`] is
+    /// the exact-tuple rule). A retained proof admitted under
+    /// `(lineage-A, sequence 1)` therefore cannot read as current after the
+    /// owner rebound to `(lineage-B, sequence 1)`, which is precisely the
+    /// "an old connection string alone is not current-generation evidence" case
+    /// the audit names. Storing the tuple here is what lets the comparison be
+    /// exact instead of scalar; keeping the scalar would move the same defect
+    /// one layer down.
     OwnerSession {
         /// Validated `sid=..;session=..` binding string.
         session_binding: String,
         /// Local connection correlation id.
         connection_id: String,
+        /// Resource generation the authenticated owner session was proven
+        /// under.
+        generation: u64,
+        /// Exact authority epoch the authenticated owner session was proven
+        /// under: the full `(lineage_id, sequence)` tuple, not the sequence.
+        authority_epoch: EpochId,
     },
     /// The verified canonical notification page noted into the board.
     NotificationSnapshot {
@@ -195,7 +226,12 @@ impl RetainedStartupBinding {
             Self::OwnerSession {
                 session_binding,
                 connection_id,
-            } => format!("session={session_binding} connection={connection_id}"),
+                generation,
+                authority_epoch,
+            } => format!(
+                "session={session_binding} connection={connection_id} generation={generation} authority_epoch={}/{}",
+                authority_epoch.lineage_id, authority_epoch.sequence
+            ),
             Self::NotificationSnapshot { record_count } => {
                 format!("record_count={record_count}")
             }
@@ -439,8 +475,10 @@ impl StartupCapabilityBindings {
     ///
     /// `slots` is built in [`DeclaredStartupCapability::ALL`] order and
     /// [`DeclaredStartupCapability::index`] is total over the same closed
-    /// denominator, so the lookup cannot miss; the assertion keeps the two
-    /// denominators from drifting apart silently.
+    /// denominator, so the lookup cannot miss. This function asserts nothing:
+    /// the bound on that index comes from `new`'s closed seven-parameter
+    /// signature, and `replace_disposition` debug-asserts that the slot array has
+    /// not diverged from the declared declaration order.
     #[must_use]
     pub fn disposition(&self, capability: DeclaredStartupCapability) -> &StartupBindingDisposition {
         &self.slots[capability.index()].disposition
@@ -470,8 +508,9 @@ impl StartupCapabilityBindings {
     }
 
     /// Returns the exact reason each unbound capability did not bind, in
-    /// declaration order. Empty exactly when
-    /// [`Self::every_declared_capability_bound`] holds.
+    /// declaration order. Empty exactly when every declared slot is `Bound`; a
+    /// proof filed under a foreign slot still leaves it empty while
+    /// [`Self::every_declared_capability_bound`] reads `false`.
     #[must_use]
     pub fn unbound_reasons(&self) -> Vec<(DeclaredStartupCapability, String)> {
         self.slots

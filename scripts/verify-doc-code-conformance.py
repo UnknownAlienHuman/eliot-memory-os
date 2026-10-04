@@ -12,11 +12,15 @@ from __future__ import annotations
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import doc_code_conformance_core as _core
 from doc_code_conformance_core import *  # noqa: F403
-from doc_code_conformance_lib import normative_references, traceability_retirement
+from doc_code_conformance_lib import (
+    normative_references,
+    stale_provenance,
+    traceability_retirement,
+)
 
 _base_audit = _core.audit
 _base_self_test = _core.self_test
@@ -152,20 +156,54 @@ def documentation_pipeline_findings(
     }
 
 
+def _run_detector(
+    detector: Callable[..., tuple[list[Finding], dict[str, int]]],  # noqa: F405
+    *args: Any,
+) -> tuple[list[Finding], dict[str, int]]:  # noqa: F405
+    """Run one detector, converting its own error type into exit code 2.
+
+    `TraceabilityError`, `ReferenceAuditError` and `ProvenanceError` are all
+    `RuntimeError` subclasses. None of them is in the core `except` tuple, so a
+    malformed config would otherwise escape as an uncaught traceback instead of
+    the documented exit code 2.
+    """
+
+    try:
+        return detector(*args)
+    except (
+        traceability_retirement.TraceabilityError,
+        normative_references.ReferenceAuditError,
+        stale_provenance.ProvenanceError,
+    ) as exc:
+        raise AuditError(f"conformance detector configuration is invalid: {exc}") from exc  # noqa: F405
+
+
 def audit(
     root: Path,
     cfg: dict[str, Any],
 ) -> tuple[list[Finding], dict[str, int]]:  # noqa: F405
     findings, metrics = _base_audit(root, cfg)
     pipeline_findings, pipeline_metrics = documentation_pipeline_findings(root, cfg)
-    traceability_findings, traceability_metrics = traceability_retirement.audit(root)
-    normative_findings, normative_metrics = normative_references.audit(root)
+    traceability_findings, traceability_metrics = _run_detector(
+        traceability_retirement.audit, root
+    )
+    normative_findings, normative_metrics = _run_detector(
+        normative_references.audit, root
+    )
+    # DCC-018 is repository-wide over the declared production roots; it does not
+    # consult the known-file retirement ledger, so a production file that is
+    # absent from config/doc-traceability-retirement.toml is still checked.
+    provenance_findings, provenance_metrics = _run_detector(
+        stale_provenance.audit, root, cfg
+    )
     findings.extend(pipeline_findings)
     findings.extend(traceability_findings)
     findings.extend(normative_findings)
+    findings.extend(provenance_findings)
     metrics.update(pipeline_metrics)
     metrics.update(traceability_metrics)
     metrics.update(normative_metrics)
+    metrics.update(provenance_metrics)
     return sorted(set(findings)), metrics
 
 
@@ -295,15 +333,17 @@ def self_test() -> None:
     try:
         traceability_retirement.self_test()
         normative_references.self_test()
+        stale_provenance.self_test()
     except (
         traceability_retirement.TraceabilityError,
         normative_references.ReferenceAuditError,
+        stale_provenance.ProvenanceError,
     ) as exc:
         raise AuditError(  # noqa: F405
             f"extended documentation conformance self-test failed: {exc}"
         ) from exc
 
-    print("DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=19")
+    print("DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=20")
 
 
 _core.audit = audit

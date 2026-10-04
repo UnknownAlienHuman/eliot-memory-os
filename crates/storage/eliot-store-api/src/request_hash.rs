@@ -23,9 +23,11 @@
 //! [`verify_ordering_scope_binding`] on legs carrying an ordering contract;
 //! a content commitment and a CAS expectation are different obligations.
 //!
-//! The input [`CanonicalRequestView`] is the full envelope-equivalent shape:
-//! Governor builds it from [`crate`] admission values, while Kernel/store
-//! build the identical view from their transported
+//! The input [`CanonicalRequestView`] is the complete hashed input: the
+//! admitted envelope's fields plus the two canonical derived fields
+//! (`semantic_source_revisions` and `ordering_scopes`). Governor builds it
+//! from [`crate`] admission values, while Kernel/store build the same view
+//! from their transported
 //! [`crate::StoreRequest::Apply`] values (`context` + `transition` +
 //! expected heads) via [`CanonicalRequestView::from_apply`]. The transition's
 //! own `identity.canonical_request_hash` is the digest output and is never
@@ -110,11 +112,13 @@ use crate::{
 /// malformed claimant so the error itself stays bounded.
 pub const MAX_DIGEST_DETAIL_CHARS: usize = 64;
 
-/// Full envelope-equivalent canonical hash input for issue #63.
-///
-/// The serde shape is intentionally field-identical to the Governor
-/// `CanonicalWriteEnvelope` (same names, same shared types), so hashing this
-/// view yields byte-identical bytes to hashing the admitted envelope.
+/// Complete canonical hash input for issue #63: the admitted envelope's
+/// fields (same names, same shared types) plus the two canonical derived
+/// fields [`CanonicalRequestView::semantic_source_revisions`] and
+/// [`CanonicalRequestView::ordering_scopes`]. Both are canonical renderings
+/// of envelope data the envelope already carries, so nothing is added to
+/// the published wire struct; Governor and Kernel/store therefore hash the
+/// same complete input.
 /// Kernel/store construct the same view from their transported apply values;
 /// no wire change is required because `StoreRequest::Apply` already carries
 /// every field (context, transition, expected revision heads, expected
@@ -231,6 +235,41 @@ impl CanonicalRequestView {
 /// before canonical JSON encoding; `semantic_commands` and the `security`
 /// chains keep their order.
 pub fn canonical_request_bytes(view: &CanonicalRequestView) -> Result<Vec<u8>, StoreError> {
+    let normalized = normalized_view(view);
+    // Duplicates are rejected on the carried values (the same typed refusal
+    // `PreparedTransition::validate` issues), so a post-admission scope
+    // duplication fails here before any lookup/transaction as well.
+    if normalized
+        .ordering_scopes
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err(StoreError::Duplicate {
+            field: "ordering_scopes",
+        });
+    }
+    canonical_json_bytes(&normalized).map_err(|error| StoreError::Serialization(error.to_string()))
+}
+
+/// Digest of the canonical encoding of a request exactly as presented.
+///
+/// Same normalization and encoding as [`canonical_request_bytes`], except
+/// that duplicate carried `ordering_scopes` are kept in the hashed bytes
+/// instead of refused, so no carried value is dropped or defaulted. For
+/// every request [`canonical_request_hash`] accepts the two digests are
+/// equal. For a request it refuses this is the request's only byte
+/// identity: a pre-stage refusal is retained and matched under it, so two
+/// byte-different refused requests never share one identity. It is never an
+/// admission digest.
+pub fn presented_request_hash(view: &CanonicalRequestView) -> Result<String, StoreError> {
+    let bytes = canonical_json_bytes(&normalized_view(view))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Sorts every set-like collection into canonical order (module-level
+/// ordering rule); ordered chains keep their order.
+fn normalized_view(view: &CanonicalRequestView) -> CanonicalRequestView {
     let mut normalized = view.clone();
     normalized
         .expected_revision_heads
@@ -245,20 +284,8 @@ pub fn canonical_request_bytes(view: &CanonicalRequestView) -> Result<Vec<u8>, S
     // Carried ordering scopes are execution-bearing set-like input (issue
     // #63 audit 5870555183): canonical order before hashing so emission
     // order cannot fork the digest, while any scope addition, removal, or
-    // substitution forks it. Duplicates are rejected on the carried values
-    // (the same typed refusal `PreparedTransition::validate` issues), so a
-    // post-admission scope duplication fails here before any
-    // lookup/transaction as well.
+    // substitution forks it.
     normalized.ordering_scopes.sort();
-    if normalized
-        .ordering_scopes
-        .windows(2)
-        .any(|pair| pair[0] == pair[1])
-    {
-        return Err(StoreError::Duplicate {
-            field: "ordering_scopes",
-        });
-    }
     normalized
         .event_projection_relation_intents
         .event_ids
@@ -271,7 +298,7 @@ pub fn canonical_request_bytes(view: &CanonicalRequestView) -> Result<Vec<u8>, S
         .event_projection_relation_intents
         .relation_kinds
         .sort();
-    canonical_json_bytes(&normalized).map_err(|error| StoreError::Serialization(error.to_string()))
+    normalized
 }
 
 /// Computes the provider-neutral canonical request hash (lowercase SHA-256).

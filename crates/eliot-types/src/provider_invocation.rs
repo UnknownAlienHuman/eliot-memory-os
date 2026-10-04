@@ -667,3 +667,168 @@ pub struct ProviderRouteReadinessGate {
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
 }
+
+// UNRESOLVED INGRESS ROW, recorded under #933. Placement note: this block is
+// anchored here, after :654 (the highest line number in this file that is
+// cited anywhere else in the repository), rather than at the declaration it
+// describes, so that no currently cited coordinate shifts. The subject is
+// `ProviderRoutePolicy` at :287-299, its `impl` at :301-416.
+//
+// Subject. `ProviderRoutePolicy` (:289) is a protected, authority-bearing
+// control type, not data. It carries `policy_id` (:290),
+// `policy_hash_blake3` (:291), `host` (:293) and the whole
+// `timeout_profile` (:295), and its accessors `policy_id()` (:378),
+// `policy_hash_blake3()` (:383) and `timeout_profile()` (:398) hand those
+// values to callers as governing facts.
+//
+// 1. The container it travels in is opaque. Its one direct production decode
+// site reads it out of `AdapterRequest.input`, and
+// `crates/eliot-types/src/adapter.rs:151` declares that member as a bare
+// `pub input: Value` — `serde_json::Value`, imported at that file's :6 —
+// sitting beside otherwise typed identity and authority fields
+// (`request_id` :147, `adapter_id` :148, `requested_capability` :149,
+// `context` :150). Correction to the record that motivated this row:
+// `crates/eliot-types/src/adapter.rs` carries no doc comment on
+// `AdapterRequest` or on any other item (that file has zero `///` and zero
+// `//!` lines across all 241 lines), so the opacity of `input` is established
+// by its declared type and by #933's own opaque-payload-versus-envelope-field
+// boundary prose — not by a doc comment on the declaration. The distinction
+// this row protects is real either way: `input` has no typed identity,
+// authority or status of its own, yet a policy that steers process lifetime
+// is read back out of it.
+//
+// 2. The decode site, re-measured: `crates/eliot-engine/src/adapter.rs:262-270`
+// — `request.input.get("provider_route_policy").cloned()` at :263-266, a missing
+// key rejected as "external adapter request has no provider route policy" at
+// :267-269, then `serde_json::from_value::<ProviderRoutePolicy>(route_policy)?`
+// at :270. It runs only for `AdapterClass::ExternalCandidate`, which is the
+// `if` guard at :262. The general request gate `validate_request`
+// (`crates/eliot-engine/src/adapter.rs:1218-1243`) checks adapter identity,
+// capability membership, forbidden authority and
+// `serde_json::to_vec(&request.input)?.len()` against `max_payload_bytes`
+// (:1239) — it never inspects the structure of `input`, so :270 is the only
+// thing standing between an opaque payload and a governing deadline.
+//
+// CORRECTION TO THE PREVIOUS TEXT OF THIS BLOCK, recorded rather than made
+// silently: the coordinates above and in point 3 were stated 22 lines low
+// (`:241-248`, `:248`, `:240`, `:1196-1221`, `:1216`, `:249-253`, `:257-259`,
+// `:263-272`, `:274-297`, `:255`, `:240-253`). Every one of them was wrong and
+// every one of them is now the measured line. The error is recorded because the
+// whole value of this block is that a reader can go and look, and a reader who
+// arrives 22 lines early finds a plausible-looking neighbouring statement
+// instead of a gap.
+//
+// 3. What the consumer obtains. `crates/eliot-engine/src/adapter.rs:271-275`
+// takes `route_policy.timeout_profile()` at :271 — `&ProviderTimeoutProfile`,
+// declared at `provider_invocation.rs:398` — and reads
+// `absolute_runtime_deadline_ms()` (:508), `cancellation_grace_ms()` (:513)
+// and `cleanup_grace_ms()` (:518) at :273/:274/:275, summing them into
+// `timeout_ms` (the sum closes at :278). That value becomes the absolute
+// `deadline` computed at `crates/eliot-engine/src/adapter.rs:279-281` and handed
+// to `AdapterExecutionContext` in the literal at :285-294 (its `deadline` field
+// at :289), and to `deadline_at` at :296-297, recorded as `phase_deadline_at` and
+// `absolute_deadline_at` on the runtime checkpoint at :318-319. It therefore
+// steers process lifetime and cleanup, not a label. `policy_id` and
+// `policy_hash_blake3` are NOT consulted by this consumer at all; the
+// identity members of the policy are carried but unread on this path.
+//
+// 4. There is no validator of its own in this file. This module contains no
+// `validate_*` function, no sealed-reference check and no digest check for
+// `ProviderRoutePolicy`. `route_policy_hash` (:418-440) is a private helper
+// whose only call site is `for_route` (:309), so a decoded policy's
+// `policy_hash_blake3` is never recomputed against its own budget here, and
+// `for_route` is a constructor, not a decoder check. A downstream partial
+// check exists outside this crate and is recorded here so the row is not
+// overstated: `validate_external_agent_execution_request`
+// (`crates/eliot-engine/src/external_agent/mod.rs:160`) rejects a
+// non-empty-`policy_id` and a `policy_hash_blake3` whose *length* is not 64
+// (:206-207), plus `timeout_profile_ref == policy_id` (:208), a host-name
+// suffix match (:209-211) and non-zero `absolute_runtime_deadline_ms` /
+// `output_limit_bytes` (:217-222). That is a shape and length check; the blake3
+// digest is never recomputed, so a self-consistent-looking forged digest of
+// length 64 satisfies it. This check runs before the adapter on the cognitive
+// path (`crates/eliot-app/src/cognitive_field_runner.rs:5203`) but is never
+// called on the smoke path that builds an `AdapterRequest`
+// (`crates/eliot-app/src/host_runtime/external_agent.rs:1784-2012`; its only
+// in-file callers are :265 and :2525), and it never runs at the engine decode
+// site of point 2.
+//
+// 5. The two in-scope construction sites of `AdapterRequest` do NOT have the
+// same provenance, and the difference is load-bearing.
+//   - `crates/eliot-app/src/host_runtime/external_agent.rs:1996`, with
+//     `input: serde_json::to_value(execution)?` at :2011, over an in-process
+//     `ExternalAgentExecutionRequest` whose policy was produced by
+//     `ProviderRoutePolicy::for_route` at :1953 and never round-tripped
+//     through text. No bytes, therefore no duplicate-key collapse on this
+//     path. It is not, strictly, a hand-written `Value` literal either: it is
+//     the serde projection of a typed request.
+//   - `crates/eliot-app/src/cognitive_field_runner.rs:5216`, with
+//     `input: serde_json::to_value(&execution)?` at :5231, where `execution`
+//     was decoded from raw file bytes at :5202 by `read_json`
+//     (`crates/eliot-app/src/cognitive_field_runner.rs:9123-9125`, which is
+//     `serde_json::from_slice(&fs::read(path)?)`). This path DOES have a
+//     raw-bytes ingress, and `serde_json` collapses duplicate members before
+//     `deny_unknown_fields` is consulted, so a duplicated policy member in
+//     that request file resolves last-wins with no surviving evidence of the
+//     duplicate. It also does not match the "in-process literal" description.
+// Both sites nonetheless carry the policy as a TYPED member of a typed
+// envelope: `ExternalAgentExecutionRequest`
+// (`crates/eliot-types/src/external_agent.rs:282` on `origin/main`,
+// `#[serde(deny_unknown_fields)]`; that file is under concurrent edit in this
+// working tree, so the declaration is named rather than pinned)
+// declares `pub provider_route_policy: ProviderRoutePolicy` (baseline :300).
+// So the honest
+// statement of the gap is not "unvalidated data from the wire" and not "a
+// lost-duplicate-evidence residual". It is: a protected control type is
+// presently sourced from an opaque payload whose authority depends on a
+// producer-side convention — place the policy at the `provider_route_policy`
+// key of the serialized request — that no decoder in `eliot-engine` enforces
+// beyond a successful typed decode, and whose erasure happens at exactly one
+// place, `AdapterRequest.input: Value`.
+//   - For completeness of the producer set: `AdapterRequest` is also built at
+//     `crates/eliot-engine/src/external_review.rs:679` (adapter_id
+//     `"test-echo"`, `input` a `json!` literal at :694-699 carrying no
+//     `provider_route_policy`, so that request takes the non-`ExternalCandidate`
+//     branch at `crates/eliot-engine/src/adapter.rs:276-277` and never reaches the
+//     decode), at `crates/eliot-engine/src/adapter.rs:878-879`
+//     `pub fn test_request`, which is a `pub` constructor and NOT `#[cfg(test)]`
+//     - so it is a third build site and not a test-only one - and at
+//     `crates/eliot-app/src/host_runtime/external_agent.rs:4752`
+//     inside a `#[cfg(test)]` module. None of the three is a further
+//     route-policy ingress.
+//
+// 6. Owner and disposition: UNRESOLVED, and deliberately not repaired here. The
+// causal owner is whoever decides that a protected route policy may travel
+// inside an opaque adapter payload — that is the adapter request contract at
+// `crates/eliot-engine/src/adapter.rs:262-278` together with the
+// opaque-payload-versus-envelope-field boundary declared at
+// `crates/eliot-types/src/adapter.rs:146-152`. The repair is outside this file
+// and outside #933's scope: #933 cannot add a new envelope member, mint a new
+// policy, or introduce an authorization gate here, because decoder closure and
+// authorization are separate gates (Work step 5) and third-party content must
+// not be given Eliot control semantics (Work step 6). No authorization
+// decision is made or implied by this comment; it records a boundary and a
+// named owner, nothing more.
+//
+// What this file's other types can and cannot reach, so the row delimits the
+// boundary rather than only listing the gap:
+//   - `ProviderInvocationAttempt` (:155) IS reached from raw bytes:
+//     `ProviderInvocationJournal::load`
+//     (`crates/eliot-engine/src/provider_invocation.rs:159-163`) reads
+//     `fs::read(&path)` and calls `serde_json::from_slice(&bytes)` at :162. Its
+//     duplicate-key refusal is therefore reachable in production today.
+//   - `ProviderRoutePolicy` is reached from a `Value`, never directly from raw
+//     bytes by name (point 2), but it is reached from raw bytes TRANSITIVELY
+//     on the cognitive path, because `read_json` decodes an
+//     `ExternalAgentExecutionRequest` whose member is a typed
+//     `ProviderRoutePolicy` (point 5). A `serde_json::Value` cannot hold a
+//     duplicate key at all, so by the time :248 runs, any duplicate has
+//     already been collapsed upstream — the collapse is unrecoverable there,
+//     not merely unguarded.
+//   - `ProviderReconciliationRecord` (:560), `ProviderRouteReadinessGate`
+//     (:637) and `ProviderResultCompleteness` (:86) have no production
+//     `from_slice`/`from_value`/`from_str`/`from_reader` decode site outside
+//     this crate; their closed-decode refusal is currently reachable only from
+//     tests. Falsifier: a decode reached through a type alias, a
+//     `Vec`/`Option` container decode, or a split across lines, which a
+//     same-line type-name-plus-decode-token search would miss.

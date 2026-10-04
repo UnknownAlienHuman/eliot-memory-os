@@ -392,7 +392,19 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            // The build's OWN admission contract set identity, not a placeholder. This
+            // envelope is a real submission, and `CanonicalWriteEnvelope::validate`
+            // (crate root, the `admission_contract_set_digest` arm) refuses any
+            // envelope whose field is not this receiving build's
+            // `supported_admission_contract_set_digest()`: the field IS the
+            // receiving-build support identity, so a hardcoded literal can never
+            // be admissible and every assertion after `validate` would be
+            // unreachable. The two other fixtures in this crate already bind it
+            // this way (crate root, the two `supported_admission_contract_set_digest`
+            // fixture builders); this one predates that check and still carried the
+            // old placeholder, so it could not admit anything.
+            admission_contract_set_digest: crate::supported_admission_contract_set_digest()
+                .expect("supported admission contract digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1928")
                 .expect("manifest digest"),
             semantic_commands: vec![NamedMutationRequest {

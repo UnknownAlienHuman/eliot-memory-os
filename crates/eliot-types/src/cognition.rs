@@ -374,17 +374,36 @@ pub struct CausalCandidate {
     /// `assigned_check` is the verifier-or-bounded-inquiry binding a critical
     /// action depends on: `validate_for_critical_action` already treats `None`
     /// as "no check assigned" and refuses, so absence is meaningful and must be
-    /// stated. Defaulting it let an omitted key decode as an unassigned check
-    /// on a candidate that never declared one. `intervention_outcomes` is the
-    /// append-only history `record_intervention_outcome` appends to; an absent
-    /// key decoded as "no outcome was ever recorded", which `validate_intervention_history`
-    /// then reads as a first-generation candidate. Both are now required keys;
-    /// absence is a typed missing-field error rather than a manufactured fact.
-    /// `CausalCandidate` has exactly one in-tree construction surface and no
-    /// published schema, so this is a compatible requiredness correction with
-    /// unchanged accepted and emitted bytes.
+    /// stated. Being an `Option<T>`, it decoded an omitted key as an unassigned
+    /// check on a candidate that never declared one. `intervention_outcomes` is
+    /// the append-only history `record_intervention_outcome` appends to; it is a
+    /// `Vec` that never carried `default`, so only an explicit empty array
+    /// reaches `validate_intervention_history`, which reads that as a
+    /// first-generation candidate. Both keys are required; absence is a typed
+    /// missing-field error, not a manufactured fact. `CausalCandidate` has no
+    /// in-tree struct literal or constructor and no published `JsonSchema`, so
+    /// this is a compatible requiredness correction with unchanged emitted bytes.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub assigned_check: Option<CausalCheckAssignment>,
     pub intervention_outcomes: Vec<CausalInterventionOutcomeRecord>,
+}
+
+/// Field decoder for a required-nullable key.
+///
+/// `Option<T>` under derived `Deserialize` makes an absent key decode as
+/// `None`, so the documented "required on the wire, explicitly nullable"
+/// `CausalCandidate::assigned_check` would silently accept an incomplete or
+/// older record as a current one, reading the absent key as an unassigned
+/// check rather than as a missing field. A `deserialize_with` field without
+/// `serde(default)` makes the derived visitor reject the missing key first,
+/// while this body keeps handling a present `CausalCheckAssignment` or an
+/// explicit `null` exactly as before.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl CausalCandidate {
@@ -951,29 +970,29 @@ pub struct TaskCognitionView {
     pub current_truth: Vec<ClaimSummary>,
     pub epistemic_state: EpistemicPacketState,
     pub causal_bridge: Vec<CausalBridgeHop>,
-    /// Explicit presence for the four optional cognition sections (#708).
+    /// Explicit presence for the three optional cognition sections (#708):
+    /// `experience_priors`, `negative_memory` and `procedural_skills`. `task_meaning`
+    /// is deliberately NOT among them: it keeps `default, skip_serializing_if =
+    /// "Option::is_none"`, so absence still decodes as "no task meaning frame".
     ///
-    /// `TaskCognitionView` is the read-back half of `OperatorSnapshot`, and the
-    /// operator snapshot is a *projection*: an absent `experience_priors` /
-    /// `negative_memory` / `procedural_skills` key must not be able to read back
-    /// as "this task has no experience priors, no negative memory, no
-    /// procedural skills". Those are different claims from "the producer did not
-    /// populate this section", and the three sections decide what an agent is
-    /// told about prior failures.
+    /// `TaskCognitionView` is the read-back half of `OperatorSnapshot`, a
+    /// *projection*: an absent `experience_priors` / `negative_memory` /
+    /// `procedural_skills` key must not read back as "this task has no experience
+    /// priors, no negative memory, no procedural skills". Those are different
+    /// claims from "the producer did not populate this section", and the three
+    /// sections decide what an agent is told about prior failures.
     ///
     /// Compatibility: `OperatorSnapshot` is produced by exactly one function,
     /// `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
     /// (the full `OperatorSnapshot` literal at :679 and both view literals at
     /// :385 and :438 set every field explicitly, including when the packet is
-    /// absent — those paths then use the explicit empty/`default` value, which
-    /// `Serialize` still writes), and read back by
-    /// `operator.rs::dispatch_operator_query` (:773) and
-    /// `crates/eliot-app/src/mcp_stdio/memory_grant.rs::merge_memory_grant_input`.
-    /// It is projected over the pipe, not persisted, so no durable
-    /// already-omitted payload exists. `Serialize` is untouched, so emitted
-    /// bytes are unchanged; this is a compatible requiredness correction whose
-    /// only effect is that a truncated or foreign snapshot fails with a typed
-    /// missing-field error instead of silently shrinking a view.
+    /// absent — those paths use the explicit empty/`default` value, which
+    /// `Serialize` still writes), and read back by `operator.rs::`
+    /// `dispatch_operator_query` (:773) and `memory_grant.rs::`
+    /// `attach_memory_grant_offers` (:179). Pipe-projected, never persisted, so no
+    /// durable already-omitted payload exists. `Serialize` is untouched, so emitted
+    /// bytes are unchanged; the only effect is that a truncated or foreign snapshot
+    /// fails with a typed missing-field error instead of silently shrinking a view.
     pub experience_priors: Vec<ExperienceBrief>,
     pub negative_memory: Vec<ClaimCard>,
     pub selected_memory: Vec<MemoryDecisionReceipt>,
@@ -1007,7 +1026,7 @@ pub struct MemoryInspectorView {
     /// lifecycle state".
     ///
     /// Compatibility: one producer, `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
-    /// (`MemoryInspectorView` literal at :438 sets all eleven fields), read back
+    /// (`MemoryInspectorView` literal at :438 sets all sixteen fields), read back
     /// in the same snapshot consumer. Projected, never persisted, so no durable
     /// omitted payload exists; `Serialize` is untouched. Compatible requiredness
     /// correction, unchanged accepted and emitted bytes.
@@ -1030,10 +1049,10 @@ pub struct AgentRoutingView {
     pub work_or_action_lease_refs: Vec<String>,
     pub route_policies: Vec<ContourRoutePolicy>,
     pub route_decisions: Vec<ContourRouteDecision>,
-    /// Explicit presence for the nine delegation/lease/result sections (#708).
+    /// Explicit presence for the ten delegation/lease/result sections (#708).
     ///
-    /// This is the routing half of `OperatorSnapshot`, and its defaulted fields
-    /// are exactly the authority-bearing ones: `task_role_leases`,
+    /// This is the routing half of `OperatorSnapshot`, and its required fields
+    /// include the authority-bearing ones: `task_role_leases`,
     /// `work_leases`, `worktree_leases`, `controller_leases` and
     /// `agent_result_dispositions` decide which authority and which write scope
     /// the operator surface shows. An omitted key decoded as "no live worktree
@@ -1071,19 +1090,19 @@ pub struct AutonomyRunView {
     ///
     /// `model_invocations_used`, `tool_calls_used` and `wall_time_used_seconds`
     /// are the budget denominators for an autonomy run, and `cost_or_tokens_used`
-    /// is the cost-authority record (A14.7). An omitted key decoded as
-    /// `0` / absent, i.e. "this run spent no model invocations, no tokens and no
-    /// time" — a measured-zero claim for a run whose actual consumption was
-    /// never recorded. `completion_proof` is the proof-bearing field: an absent
-    /// key decoded as "no completion proof", which is a *weaker* claim than the
+    /// is the cost-authority record (A14.7). Those three denominators never
+    /// carried `default`, so an omitted key was already refused there; the two
+    /// nullable members decoded an absent key as `None`, i.e. "no cost and no
+    /// completion proof was ever recorded" for a run whose actual consumption
+    /// was never measured. `completion_proof` is the proof-bearing field, so
+    /// that manufactured "no completion proof" is a *weaker* claim than the
     /// honest one but is still a proof-status claim manufactured by omission.
     /// `route_decision_refs` / `recovery_event_refs` /
-    /// `pause_resume_reassignment_refs` are the ordering and recovery
-    /// trajectory.
+    /// `pause_resume_reassignment_refs` are the ordering and recovery trajectory.
     ///
     /// Compatibility: one producer,
-    /// `crates/eliot-app/src/mcp_stdio/autonomy.rs::operator_run_view` (the
-    /// `AutonomyRunView` literal at :246 sets all eleven fields, including
+    /// `crates/eliot-app/src/mcp_stdio/autonomy.rs::autonomy_run_projection` (the
+    /// `AutonomyRunView` literal at :246 sets all thirteen fields, including
     /// `cost_or_tokens_used: Some(...)`). `eliot-store`'s
     /// `CanonicalAutonomyRunView` is a *separate* read-only projection type in
     /// `crates/eliot-store/src/canonical_projection_views.rs` and does not
@@ -1095,8 +1114,10 @@ pub struct AutonomyRunView {
     pub model_invocations_used: u32,
     pub tool_calls_used: u32,
     pub wall_time_used_seconds: u64,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub cost_or_tokens_used: Option<String>,
     pub pause_resume_reassignment_refs: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub completion_proof: Option<CompletionProof>,
     pub finish_status: String,
 }

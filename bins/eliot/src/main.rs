@@ -345,14 +345,29 @@ enum InstallationCommand {
         #[arg(long, value_parser = absolute_path)]
         staging_root: PathBuf,
     },
-    /// Report the unsupported canary-removal seam without mutating the machine.
+    /// Remove one exact installed canary through the installation owner.
+    ///
+    /// The owner resolves the frozen removal plan from the explicit `Remove`
+    /// authorization and then admits and drives that same plan; the durable
+    /// disposition it returns is printed and the exit code follows the
+    /// projected stage. Foreign, ambiguous, replaced, production and
+    /// last-known-good targets fail with typed errors before any destructive
+    /// path exists. The binary deletes nothing itself.
     RemoveCanary {
-        /// Optional transaction store, accepted only to make the refusal scope explicit.
+        /// Absolute path to an existing transaction redb file. Never created.
         #[arg(long, value_parser = absolute_path)]
-        store: Option<PathBuf>,
-        /// Optional transaction identity, accepted only to make the refusal scope explicit.
+        store: PathBuf,
+        /// Absolute path to the retained per-installation Host state root
+        /// locating the accepted registry.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Exact generation to remove; must equal the request's exact candidate.
         #[arg(long)]
-        transaction_id: Option<String>,
+        generation: String,
+        /// Absolute path to the explicit Remove authorization JSON
+        /// (`ManagedEnvironmentChangeRequest`).
+        #[arg(long, value_parser = absolute_path)]
+        request: PathBuf,
     },
     /// Resolve one exact installed canary into a frozen read-only removal plan.
     ///
@@ -387,7 +402,9 @@ enum InstallationCommand {
         /// locating the accepted registry.
         #[arg(long, value_parser = absolute_path)]
         host_state_root: PathBuf,
-        /// Absolute path to the frozen `CanaryRemovalPlan` JSON.
+        /// Absolute path to the frozen `CanaryRemovalPlanEnvelope` JSON, exactly
+        /// as `plan-canary-removal` printed it. A bare `CanaryRemovalPlan` is
+        /// not accepted: the envelope is the only self-describing document.
         #[arg(long, value_parser = absolute_path)]
         plan: PathBuf,
     },
@@ -697,6 +714,15 @@ enum DoctorCommand {
         /// Absolute path to the accepted release-surface manifest.
         #[arg(long, value_parser = absolute_path)]
         manifest: PathBuf,
+        /// Release payload install root of the active generation. Supplying it
+        /// together with --generation lets the report claim active-installation
+        /// verification; without them the comparison is an offline inspection of
+        /// the named bytes and says so.
+        #[arg(long, value_parser = absolute_path)]
+        install_root: Option<PathBuf>,
+        /// Canonical relative package generation identity of the active release.
+        #[arg(long)]
+        generation: Option<String>,
     },
 }
 
@@ -1234,7 +1260,11 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                 }
             }
         }
-        DoctorCommand::ReleaseSurface { manifest } => {
+        DoctorCommand::ReleaseSurface {
+            manifest,
+            install_root,
+            generation,
+        } => {
             let observed_at = match release_surface::observed_unix_seconds() {
                 Ok(value) => value,
                 Err(error) => {
@@ -1242,10 +1272,31 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
+            // The generation identity is a bounded path component, not free text
+            // spliced into a path: it is parsed through the same owner type the
+            // release generator binds it with.
+            let generation = match generation {
+                Some(raw) => match cli_handle(raw, "--generation") {
+                    Ok(generation) => Some(generation),
+                    Err(error) => {
+                        write_installation_error(
+                            "DOCTOR_RELEASE_SURFACE_INVALID",
+                            &error.to_string(),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                },
+                None => None,
+            };
             // The comparison is read-only by construction: this front door
             // decodes arguments and projects the report, and the gate never
             // regenerates, repairs, or re-signs the accepted manifest.
-            match release_surface::verify_release_surface(&manifest, observed_at) {
+            match release_surface::verify_release_surface(
+                &manifest,
+                install_root.as_deref(),
+                generation.as_ref(),
+                observed_at,
+            ) {
                 Ok(report) => {
                     let drift = report.drift_detected();
                     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2322,53 +2373,51 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
         } => run_installation_runtime_status(&host_state_root, deadline_ms),
         InstallationCommand::RemoveCanary {
             store,
-            transaction_id,
-        } => {
-            let scope = match (store, transaction_id) {
-                (Some(store), Some(transaction_id)) => {
-                    format!(" for transaction {transaction_id} in {}", store.display())
-                }
-                (Some(store), None) => format!(" for store {}", store.display()),
-                (None, Some(transaction_id)) => format!(" for transaction {transaction_id}"),
-                (None, None) => String::new(),
-            };
-            write_installation_error(
-                "INSTALLATION_REMOVE_CANARY_UNSUPPORTED",
-                &format!(
-                    "remove-canary{scope} is not implemented: no durable canary removal, activation, or generation-retirement API exists; no filesystem or SCM mutation was attempted"
-                ),
-            );
-            Ok(INVALID_REQUEST_EXIT)
-        }
+            host_state_root,
+            generation,
+            request,
+        } => Ok(canary_removal_entry::run_remove_canary(
+            &store,
+            &host_state_root,
+            &generation,
+            &request,
+        )),
         InstallationCommand::PlanCanaryRemoval {
             store,
             host_state_root,
             generation,
             request,
-        } => canary_removal_entry::run_plan_canary_removal(
+        } => Ok(canary_removal_entry::run_plan_canary_removal(
             &store,
             &host_state_root,
             &generation,
             &request,
-        ),
+        )),
         InstallationCommand::ApplyCanaryRemoval {
             store,
             host_state_root,
             plan,
-        } => canary_removal_entry::run_apply_canary_removal(&store, &host_state_root, &plan),
+        } => Ok(canary_removal_entry::run_apply_canary_removal(
+            &store,
+            &host_state_root,
+            &plan,
+        )),
         InstallationCommand::CanaryRemovalStatus {
             store,
             removal_transaction_id,
-        } => canary_removal_entry::run_canary_removal_status(&store, &removal_transaction_id),
+        } => Ok(canary_removal_entry::run_canary_removal_status(
+            &store,
+            &removal_transaction_id,
+        )),
         InstallationCommand::RecoverCanaryRemoval {
             store,
             host_state_root,
             removal_transaction_id,
-        } => canary_removal_entry::run_recover_canary_removal(
+        } => Ok(canary_removal_entry::run_recover_canary_removal(
             &store,
             &host_state_root,
             &removal_transaction_id,
-        ),
+        )),
         InstallationCommand::MaterializeSourceBundle {
             eliot_host,
             eliot_watchdog,

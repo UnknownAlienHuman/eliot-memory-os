@@ -463,7 +463,36 @@ pub(crate) async fn probe_generation(
         Map::new(),
     )
     .await?;
-    let record = take_schema_meta(&mut response, 0)?;
+    observed_schema_generation(&mut response)
+}
+
+/// The same schema-generation observation issued on the isolated
+/// health/admin lane (issue #1933, blocking defect 2).
+///
+/// Readiness and health must not queue behind — or consume a slot in — the
+/// canonical read/write sets, so these two probes enter
+/// [`client::RpcTransport::query_admin`] instead of the generic dispatch. The
+/// decode is shared with [`probe_generation`] so the two lanes cannot drift in
+/// how they classify an observed generation.
+pub(crate) async fn probe_generation_admin(
+    db: &client::RpcTransport,
+) -> Result<Option<String>, AdapterError> {
+    let mut response = db
+        .query_admin(
+            "read.schema_generation",
+            schema::READ_SCHEMA_META,
+            Map::new(),
+        )
+        .await?;
+    observed_schema_generation(&mut response)
+}
+
+/// Decodes one schema-generation observation, shared by the pooled-read and
+/// the isolated health/admin lanes.
+fn observed_schema_generation(
+    response: &mut client::RpcResults,
+) -> Result<Option<String>, AdapterError> {
+    let record = take_schema_meta(response, 0)?;
     if let Some(record) = &record {
         if record.migration_state == schema::MIGRATION_STATE_APPLYING {
             // A committed intent is not a generation. Readiness stays
@@ -523,7 +552,26 @@ pub(crate) async fn probe_readiness(
     adapter: &SurrealStoreAdapter,
 ) -> Result<SemanticReadiness, AdapterError> {
     let db = client(adapter).await?;
-    observe_readiness(db, &adapter.config).await
+    // Health/readiness is the isolated health/admin observation (issue #1933,
+    // blocking defect 2): both probes below ride `SessionRole::HealthAdmin`
+    // rather than the pooled read lane or the facade socket, so a saturated
+    // canonical write set cannot starve readiness and readiness never consumes
+    // a write slot.
+    observe_readiness_admin(db, &adapter.config).await
+}
+
+/// The readiness observation on the isolated health/admin lane.
+async fn observe_readiness_admin(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<SemanticReadiness, AdapterError> {
+    let observed = probe_generation_admin(db).await?;
+    let readiness = readiness_from_observation(observed, &config.expected_schema_generation);
+    if matches!(readiness, SemanticReadiness::Ready { .. }) {
+        let fence = receipt_reconciliation::read_fence_admin(db).await?;
+        return readiness_with_fence(readiness, fence, &config.expected_schema_generation);
+    }
+    Ok(readiness)
 }
 
 async fn observe_readiness(
@@ -863,6 +911,31 @@ pub(crate) async fn apply_prepared_with_authority(
     // this is not a new full-duration application-global gate.
     let _admission = adapter.exclusive_admission.ordinary_write().await;
 
+    // I5.9 / issue #1933 (blocking defect 1): the canonical transaction rides
+    // the bounded pooled normal-write lane, not the single facade socket.
+    //
+    // The bridge's `ClientClass::Write` lease bound and this pool's
+    // `SessionRole::NormalWrite` slot count are the same configured value —
+    // `ClientSetLimits::write_sessions` is built from the Kernel's
+    // `store_transaction_limit` and `bounded_client_set_limits` refuses any
+    // value outside the closed 1..=8 profile — so N concurrent outer write
+    // leases now mean N distinct class-specific write clients instead of N
+    // logical leases converging on one facade session.
+    //
+    // Both lanes send the identical parameterized `query` RPC with the same
+    // binding codec (`atomic_write::send_transaction`); only the session
+    // differs, so transaction semantics are unchanged. Correctness under
+    // concurrency never rested on the facade socket: the fence CAS and the
+    // `RevisionHead`/`OrderingHead` predicates inside the transaction are the
+    // authority, and they run identically on this lane.
+    //
+    // This deliberately does NOT install a concurrent execution generation:
+    // `install_concurrent_execution` refuses the unreserved lane
+    // (`unreserved_apply_admission`), so installing it here would reject every
+    // ordinary production canonical write. Routing the ordinary write onto the
+    // bounded pool is what closes the outer/physical capacity mismatch without
+    // changing which writes are admitted.
+    //
     // Boxed: the retry future holds the multi-kilobyte canonical
     // `PreparedTransition` across provider awaits, exceeding the default
     // future-size lint.
@@ -874,7 +947,7 @@ pub(crate) async fn apply_prepared_with_authority(
         expected_revision_heads,
         expected_ordering_heads,
         authorities,
-        TxLane::Facade,
+        TxLane::PooledWrite,
     ))
     .await
 }
@@ -884,11 +957,11 @@ pub(crate) async fn apply_prepared_with_authority(
 /// Runs the exact production attempt loop over the admitted #987 pooled
 /// read lane for pre-transaction reads and the pooled normal-write lane
 /// for the canonical transaction (one checked-out session per concurrent
-/// task). Since the rework, the production entry above is equally
-/// unguarded and arbitrates through the same fence CAS and head
-/// predicates; this seam never disables safety globally, never compiles
-/// outside `#[cfg(test)]`, and remains as additional pooled-lane
-/// coverage — never as the only concurrent path.
+/// task). Since issue #1933 the production entry above runs on the same
+/// pooled normal-write lane, so this seam is no longer the only overlapping
+/// path; it remains as additional pooled-lane coverage, never as a private
+/// alternate write path. It never disables safety globally and never
+/// compiles outside `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) async fn apply_prepared_without_write_guard(
     adapter: &SurrealStoreAdapter,
@@ -906,7 +979,10 @@ pub(crate) async fn apply_prepared_without_write_guard(
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
 
-    apply_with_retry(
+    // Boxed for the same reason as the production entry above: the attempt
+    // loop future exceeds the default future-size lint, and this seam runs the
+    // identical loop.
+    Box::pin(apply_with_retry(
         adapter,
         db,
         ctx,
@@ -915,7 +991,7 @@ pub(crate) async fn apply_prepared_without_write_guard(
         expected_ordering_heads,
         authorities,
         TxLane::PooledWrite,
-    )
+    ))
     .await
 }
 
@@ -1842,13 +1918,14 @@ fn validate_committed_projection_publications(
 /// The erasure protocol needs the same intent-before-dispatch gate as the
 /// reference store: a `record_erasure_intent` step freezes the intent the
 /// canonical transaction opens with BEFORE any destructive statement (see
-/// the intent-before-delete body in `atomic_write`). This gate refuses
+/// the intent-before-dispatch body in `atomic_write`). This gate refuses
 /// fail-closed with zero destructive effects when no recorded intent exists
 /// ([`StoreError::ReceiptNotFound`]), sealing the original per-surface
 /// outcomes for same-operation replay (idempotent on `operation_id`,
 /// `Unknown` preserved for reconciliation, no blind retry, no second
-/// ledger). Destructive statements delete only the selected surfaces for the
-/// exact subject/scope. All `SurrealQL` stays in `apply`/`schema` modules;
+/// ledger). Destructive statements scrub only the selected subject's erasable
+/// entries for the exact subject/scope. All `SurrealQL` stays in the
+/// `apply`/`schema` modules;
 /// this boundary carries store-api types only (plus the local intent/outcome
 /// model in `atomic_write`, since the neutral purge port is defined in a
 /// parallel subtask and is not yet on this base; the canonical erasure path
@@ -1864,7 +1941,7 @@ fn validate_committed_projection_publications(
 ///
 /// Issue #1712 admits the named dispatch: `apply_prepared_with_authority`
 /// routes an admitted `ApplyErasure` transition through this gate, so the
-/// intent-before-delete path is live.
+/// intent-before-dispatch path is live.
 ///
 /// Follow-up integration slice (NOT this contour): `GetEvidencePack`
 /// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
@@ -1876,10 +1953,22 @@ pub(crate) fn record_surreal_erasure_intent(
     Ok(intent)
 }
 
-/// Builds the pure intent-before-delete ordering assertion used by tests:
-/// the intent upsert opens the transaction before every destructive
-/// statement and the outcome seal closes it. Returns the byte offsets of
-/// the three sections inside the rendered template.
+/// Rendered-text discriminator for the destructive scrub `UPDATE` pair that
+/// [`atomic_write::erasure_transaction_template`] emits, one pair per
+/// store-owned surface (`TX_ERASURE_SCRUB_AUTHORITY` then
+/// `TX_ERASURE_SCRUB_EVIDENCE`). Those closed templates are private to
+/// `atomic_write`, so this assertion matches the statement text the bundle
+/// actually renders rather than a module-private name. The intent upsert and
+/// the outcome seal both open with `LET`, so the first occurrence of this
+/// prefix is the first destructive statement of the bundle.
+const ERASURE_SCRUB_UPDATE_PREFIX: &str = "UPDATE write_receipt SET ";
+
+/// Builds the pure in-transaction ordering assertion used by tests: the
+/// canonical bundle emits the intent upsert first, then the per-surface
+/// destructive scrub `UPDATE` pair, then the outcome seal, so no destructive
+/// effect commits ahead of the canonical receipt inside one `BEGIN`/`COMMIT`.
+/// Returns the byte offsets of those three sections inside the rendered
+/// template: intent upsert, first destructive scrub statement, outcome seal.
 #[allow(dead_code)]
 pub(crate) fn erasure_template_ordering(
     store_owned_surface_count: usize,
@@ -1888,17 +1977,17 @@ pub(crate) fn erasure_template_ordering(
     let intent_at = sql.find("erasure_intent").ok_or_else(|| {
         AdapterError::Serialization("erasure template is missing its intent step".to_owned())
     })?;
-    let delete_at = sql.find("DELETE").ok_or_else(|| {
-        AdapterError::Serialization("erasure template is missing its delete step".to_owned())
+    let scrub_at = sql.find(ERASURE_SCRUB_UPDATE_PREFIX).ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its scrub step".to_owned())
     })?;
     let outcome_at = sql.find("erasure_outcome").ok_or_else(|| {
         AdapterError::Serialization("erasure template is missing its outcome seal".to_owned())
     })?;
-    if intent_at < delete_at && delete_at < outcome_at {
-        Ok((intent_at, delete_at, outcome_at))
+    if intent_at < scrub_at && scrub_at < outcome_at {
+        Ok((intent_at, scrub_at, outcome_at))
     } else {
         Err(AdapterError::Serialization(
-            "erasure template orders intent before delete before outcome seal".to_owned(),
+            "erasure template orders intent before scrub before outcome seal".to_owned(),
         ))
     }
 }
@@ -2904,18 +2993,21 @@ mod admitted_operation_gate_tests {
 
 /// 688-B: memory + Surreal erasure execution (adapter contour).
 ///
-/// The intent-before-delete template asserts the whole protocol ordering —
-/// intent row first, destructive deletes second, outcome seal last — and
-/// the bindings assertion pins the sealed per-surface derivation (store
-/// surfaces purge, foreign surfaces stay incomplete, `Unknown` preserved).
-/// The live round-trip stays with integration (not this unit).
+/// The in-transaction ordering template asserts the whole protocol ordering —
+/// intent upsert first, the per-surface destructive scrub `UPDATE` pair
+/// second, outcome seal last — and the bindings assertion pins the sealed
+/// per-surface derivation (store surfaces purge, foreign surfaces stay
+/// incomplete, `Unknown` preserved). The live round-trip stays with
+/// integration (not this unit).
 #[cfg(test)]
 mod erasure_execution_tests {
     use super::atomic_write::{
         SurrealErasureIntent, SurrealErasureSurface, SurrealSurfaceOutcome,
         erasure_transaction_bindings, erasure_transaction_template,
     };
-    use super::{erasure_template_ordering, record_surreal_erasure_intent};
+    use super::{
+        ERASURE_SCRUB_UPDATE_PREFIX, erasure_template_ordering, record_surreal_erasure_intent,
+    };
 
     fn test_fence() -> Result<eliot_store_api::StateFence, Box<dyn std::error::Error>> {
         use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
@@ -2949,12 +3041,12 @@ mod erasure_execution_tests {
     }
 
     #[test]
-    fn erasure_template_records_intent_before_delete_before_outcome_seal()
+    fn erasure_template_records_intent_before_scrub_before_outcome_seal()
     -> Result<(), Box<dyn std::error::Error>> {
-        // Real template + real ordering gate: the intent step opens the
+        // Real template + real ordering gate: the intent upsert opens the
         // transaction before any destructive statement and the outcome seal
-        // closes it; destructive statements delete only the exact
-        // subject/scope pair.
+        // closes it; the destructive statements are one scrub `UPDATE` pair
+        // for the exact subject/scope per store-owned surface.
         let intent = record_surreal_erasure_intent(intent()?)
             .map_err(|error| format!("intent records: {error:?}"))?;
         let store_owned = intent
@@ -2966,10 +3058,15 @@ mod erasure_execution_tests {
         let sql = erasure_transaction_template(store_owned);
         assert!(sql.starts_with("BEGIN TRANSACTION;"));
         assert!(sql.ends_with("COMMIT TRANSACTION;"));
-        let (intent_at, delete_at, outcome_at) = erasure_template_ordering(store_owned)
+        let (intent_at, scrub_at, outcome_at) = erasure_template_ordering(store_owned)
             .map_err(|error| format!("ordering resolves: {error:?}"))?;
-        assert!(intent_at < delete_at && delete_at < outcome_at);
-        assert_eq!(sql.matches("DELETE").count(), store_owned);
+        assert!(intent_at < scrub_at && scrub_at < outcome_at);
+        // Two destructive scrub `UPDATE`s per store-owned surface: authority
+        // entries first, then evidence entries.
+        assert_eq!(
+            sql.matches(ERASURE_SCRUB_UPDATE_PREFIX).count(),
+            2 * store_owned
+        );
         assert!(sql.contains("$erasure_subject0"));
         assert!(sql.contains("$erasure_scope_expected0"));
         assert!(sql.contains("erasure_intent_conflict"));
@@ -2995,7 +3092,7 @@ mod erasure_execution_tests {
         // Same-operation replay keeps a preserved `Unknown` verbatim instead
         // of re-running destructive work or clearing it: the replay emits no
         // `erasure_subject{i}` bindings, so the rendered template carries no
-        // `DELETE` for the replayed surface.
+        // scrub `UPDATE` pair for the replayed surface.
         let prior = vec![SurrealSurfaceOutcome::Unknown {
             surface: SurrealErasureSurface::CanonicalPayload,
         }];
@@ -3018,10 +3115,17 @@ mod erasure_execution_tests {
             })
             .count();
         let replay_sql = erasure_transaction_template(replay_store_owned);
-        assert_eq!(replay_sql.matches("DELETE").count(), 0);
+        assert_eq!(
+            replay_sql.matches(ERASURE_SCRUB_UPDATE_PREFIX).count(),
+            0,
+            "replayed-Unknown renders no scrub UPDATE pair"
+        );
+        // Independent regression guard for the card's own prohibition: the
+        // canonical bundle renders no `DELETE` statement at all, so it must
+        // stay independently able to fail if one is ever re-added.
         assert!(
             !replay_sql.contains("DELETE"),
-            "replayed-Unknown renders no DELETE statement"
+            "canonical erasure bundle emits no DELETE statement"
         );
         // No intent, no template: the gate refuses before any provider I/O.
         let mut missing = intent.clone();

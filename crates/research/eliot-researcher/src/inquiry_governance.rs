@@ -9232,9 +9232,18 @@ fn retain_record_references(
                 }
             };
             let observed = match class {
-                LocatorClass::ExternalUri { .. } => {
+                LocatorClass::ExternalUri { .. }
+                    if matches!(
+                        presented.surface,
+                        RecordReferenceSurface::Locator | RecordReferenceSurface::SpanAnchor
+                    ) =>
+                {
                     "presents as an absolute external URL, which carries authority and therefore \
                      needs an exact url_handles entry"
+                }
+                LocatorClass::ExternalUri { .. } => {
+                    "names another source or artifact identity; its URL spelling does not admit \
+                     it, and only the manifest's source, evidence and artifact handles can do so"
                 }
                 LocatorClass::InternalUri { .. } => {
                     "is an internally owned identity, which is not a source identity and is \

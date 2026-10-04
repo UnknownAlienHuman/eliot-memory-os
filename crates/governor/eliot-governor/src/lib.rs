@@ -320,9 +320,10 @@ pub use selection_chain::{
     ADMISSION_STAGE_ID, ADMISSION_TRANSFORMER_REVISION, INITIAL_MEMBERSHIP_STAGE_ID,
     SELECTION_CHAIN_ORDERING_SCOPE, SELECTION_CHAIN_REVISION_KEY, SelectionChainError,
     SelectionStageObservation, UNATTRIBUTED_WITHHELD_REASON, commit_selection_chain,
-    disposition_keeps_membership, final_membership_matches, prepare_selection_chain,
-    seal_delivered_packet, selection_chain_envelope, selection_chain_head_expectation_key,
-    selection_chain_security_context, selection_claim_ceiling,
+    disposition_keeps_membership, drive_selection_chain, final_membership_matches,
+    prepare_selection_chain, seal_delivered_packet, selection_chain_envelope,
+    selection_chain_head_expectation_key, selection_chain_security_context,
+    selection_claim_ceiling,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;

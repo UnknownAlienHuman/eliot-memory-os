@@ -1,0 +1,12 @@
+{
+  "delegation_id": "delegation-1",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "origin": "codex_requested",
+  "review_kind": "architecture_audit",
+  "question": "does the requiredness correction hold?",
+  "work_lease_id": "00000000-0000-7000-8000-000000000003",
+  "evidence_refs": [],
+  "preferred_provider": "auto",
+  "created_at": "2026-09-07T12:00:00Z"
+}

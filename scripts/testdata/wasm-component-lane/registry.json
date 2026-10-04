@@ -1,5 +1,5 @@
 {
-  "_provenance": "TEST FIXTURE ONLY - not authority. Field provenance per entry mirrors accepted sources: manifest/module_manifest paths and Cargo package name from crates/smart/eliot-context-compiler-wasm/Cargo.toml (owner #638); world/interface/package from bins/eliot-wasm-host/wit/typed/context-admission.wit (owner #756); domain operation admit from crates/modules/eliot-wasm-runtime TypedWorld::domain_func (owner #760); toolchain channel 1.97.1 and target wasm32-wasip2 from rust-toolchain.toml (owner #870); engine wasmtime-component 47.0.4 from component_contract.rs (owner #760); stage INVOCATION from ProofStage (SCREAMING_SNAKE_CASE, owner #760); depends_on/owned_paths from module.toml (owner #638); native revision 0.1.0 from eliot-context-admission Cargo.toml. The canonical shared registry remains integrator-owned; disagreement is a ContractChallenge.",
+  "_provenance": "TEST FIXTURE ONLY - not authority. Field provenance per entry mirrors accepted sources: manifest/module_manifest paths and Cargo package name from crates/smart/eliot-context-compiler-wasm/Cargo.toml (owner #638); world/interface/package from bins/eliot-wasm-host/wit/typed/context-admission.wit (owner #756); domain operation admit from crates/modules/eliot-wasm-runtime TypedWorld::domain_func (owner #760); toolchain channel 1.97.1 and target wasm32-wasip2 from rust-toolchain.toml (owner #870); engine wasmtime-component 47.0.4 from component_contract.rs (owner #760); stage INVOCATION from ProofStage (SCREAMING_SNAKE_CASE, owner #760); depends_on/owned_paths from module.toml (owner #638); native revision 0.1.0 from eliot-context-admission Cargo.toml. capsule.execution names the owning package's declared-stage proof test, read from crates/smart/eliot-context-compiler-wasm/tests/proof.rs (owner #638); it is the only identity wasm-test may filter on, because a ProofStage label is not a libtest name and selects no test. The canonical shared registry remains integrator-owned; disagreement is a ContractChallenge.",
   "modules": {
     "eliot-context-compiler-wasm": {
       "manifest": "crates/smart/eliot-context-compiler-wasm/Cargo.toml",
@@ -15,7 +15,11 @@
         "oracle": "eliot-context-admission admit_context (native A-17a)",
         "max_input_bytes": 65536,
         "max_output_bytes": 65536,
-        "max_work": 1000
+        "max_work": 1000,
+        "execution": {
+          "package_test_target": "proof",
+          "test_name": "standalone_capsule_through_e_host"
+        }
       },
       "native_contract": "eliot-context-admission",
       "native_revision": "0.1.0",

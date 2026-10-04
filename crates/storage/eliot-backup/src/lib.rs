@@ -2621,6 +2621,7 @@ impl RestoreEvidence {
             return Err(BackupError::FinalizeEvidenceMismatch);
         }
         if self.provenance.plan_id != plan.plan_id
+            || self.provenance.transaction_id != plan.transaction()?.transaction_id
             || self.provenance.source_archive_id != bundle.manifest.backup_id
             || self.provenance.source_class != bundle.manifest.class
             || self.provenance.source_digest != bundle.bundle_sha256()?

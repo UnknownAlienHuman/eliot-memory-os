@@ -1831,6 +1831,7 @@ dependencies = [
  "eliot-instrument-runner",
  "eliot-instrument-rustc",
  "eliot-observability",
+ "eliot-platform",
  "eliot-process",
  "eliot-skills",
  "eliot-store",
@@ -2311,7 +2312,6 @@ name = "eliot-kernel"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "eliot-artifact",
  "eliot-authority",
  "eliot-backup",
  "eliot-contracts",
@@ -2356,7 +2356,6 @@ dependencies = [
  "eliot-authority",
  "eliot-config",
  "eliot-contracts",
- "eliot-influence",
  "eliot-ors",
  "eliot-platform",
  "eliot-process",

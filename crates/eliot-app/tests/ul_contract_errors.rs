@@ -683,8 +683,6 @@ fn write_test_config(
     let wal = slash(&runtime.join("control").join("control.redb"));
     let blobs = slash(&runtime.join("blobs"));
     let storage = format!("rocksdb:{}", slash(&runtime.join("unused-rocksdb")));
-    let repo = repository_root()?;
-    let surql = slash(&repo.join("crates/eliot-store/src/surql"));
     let exe = slash(surreal_exe);
     let bind = format!("127.0.0.1:{port}");
     let endpoint = format!("ws://127.0.0.1:{port}/rpc");
@@ -733,9 +731,6 @@ path = "{wal}"
 
 [blob_store]
 root = "{blobs}"
-
-[store]
-surql_dir = "{surql}"
 "#
     );
     fs::write(config_path, config)?;

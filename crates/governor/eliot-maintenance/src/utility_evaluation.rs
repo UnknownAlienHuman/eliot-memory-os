@@ -75,15 +75,28 @@ pub const MEASUREMENT_UNOBSERVED_REASON: &str = "maintenance.metric-comparison-n
 /// rather than each naming its own.
 const COST_UNIT: &str = "cost-units";
 
-/// One of the four required metrics a delayed comparison binds.
+/// One of the five required metrics a delayed comparison binds.
 ///
-/// `cost` is deliberately absent: I14.22's cost is the billed/actual cost of
-/// the maintenance action, which belongs to the budget and usage owners rather
-/// than to a comparison this crate can measure from its own obligation chain.
-/// Leaving it out is precisely what stops a completion from reading as a
-/// benefit, because the contract refuses `BENEFICIAL` unless all five of its
-/// required metrics carry complete measured evidence — so benefit becomes
-/// reachable exactly when a real cost owner supplies one, and not before.
+/// `Cost` is bound here for the same reason I14.22 names cost as one of the
+/// axes every maintenance result is evaluated against. It was previously
+/// ABSENT from this enum while `evaluate_maintenance_utility` hardcoded
+/// `cost: unobserved_metric(COST_UNIT, ..)`, which had two consequences and
+/// both were defects rather than caution:
+///
+///  * the field could never be anything but unobserved, so
+///    `MaintenanceUtilityEvidenceV1::supports_benefit_claim` - which requires
+///    measured evidence on `(&self.cost, true)` - could never be satisfied,
+///    and `MaintenanceUtilityVerdict::Beneficial` was unreachable dead code;
+///  * the module comment claimed "benefit becomes reachable exactly when a
+///    real cost owner supplies one", while no such owner had any way to supply
+///    one at all.
+///
+/// Binding the slot keeps the fail-closed behaviour for every caller that does
+/// NOT measure cost: an absent cost measurement still reports as explicitly
+/// unobserved under `COST_UNIT`, and a reserved budget still cannot read as a
+/// spent one. What it adds is the missing edge - a cost owner that genuinely
+/// observed spend can now present that evidence, and the verdict follows the
+/// contract's own predicate rather than this module's decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequiredUtilityMetric {
     /// Failures observed for this family and scope inside the window.
@@ -92,6 +105,9 @@ pub enum RequiredUtilityMetric {
     ProductRecoveryDelta,
     /// Changes the action introduced that were wrong.
     FalseChanges,
+    /// Billed or actual cost of the maintenance action, never a reserved
+    /// budget and never an estimate read as an invoice.
+    Cost,
     /// Operator time or burden, never inferred from silence.
     OperatorBurden,
 }
@@ -107,6 +123,7 @@ impl RequiredUtilityMetric {
             Self::Recurrence => "recurrences-per-window",
             Self::ProductRecoveryDelta => "recovery-events",
             Self::FalseChanges => "false-changes",
+            Self::Cost => COST_UNIT,
             Self::OperatorBurden => "operator-minutes",
         }
     }
@@ -230,10 +247,10 @@ pub struct MaintenanceUtilityEvaluation {
 ///   recurrence, product/recovery delta, false changes, cost and operator
 ///   burden — to carry directly observed values with both admitted observation
 ///   references, complete coverage, no blind interval and a benefit or
-///   no-material-change direction. This module binds four of those five and
-///   deliberately does not invent a cost measurement, so benefit becomes
-///   reachable exactly when a real cost owner supplies one. It cannot be
-///   reached from a completion alone, by construction.
+///   no-material-change direction. This module invents none of them: each cell
+///   is either the caller's own measurement or an explicitly unobserved cell,
+///   so benefit becomes reachable exactly when a caller genuinely measured all
+///   five. It cannot be reached from a completion alone, by construction.
 /// * `HARMFUL` requires a measured harm direction on complete unblinded
 ///   evidence and no metric claiming benefit.
 /// * `INCONCLUSIVE` is reached when comparisons were observed but the evidence
@@ -290,10 +307,12 @@ pub fn evaluate_maintenance_utility(
         recurrence: metric(RequiredUtilityMetric::Recurrence),
         product_recovery_delta: metric(RequiredUtilityMetric::ProductRecoveryDelta),
         false_changes: metric(RequiredUtilityMetric::FalseChanges),
-        // Cost stays explicitly unobserved under its own unit. This module holds
-        // no billing evidence, and reporting the job's reserved budget as a
-        // cost would let a budget read as a spent one.
-        cost: unobserved_metric(COST_UNIT, evaluation_window),
+        // Cost is looked up exactly like the other four, so a caller that
+        // genuinely observed spend has its measurement bound. A caller that did
+        // not still gets the explicitly unobserved cell under `COST_UNIT`:
+        // this module holds no billing evidence, and reporting the job's
+        // reserved budget as a cost would let a budget read as a spent one.
+        cost: metric(RequiredUtilityMetric::Cost),
         operator_burden: metric(RequiredUtilityMetric::OperatorBurden),
     };
     // The verdict is the contract's conclusion, not this function's. Both
@@ -319,8 +338,8 @@ pub fn evaluate_maintenance_utility(
 /// The measured comparisons this job's own chain actually holds, one slot per
 /// required metric.
 ///
-/// Slots rather than a sorted set: the four required metrics are named quantities
-/// with no order among them — recurrence, recovery delta, false changes and
+/// Slots rather than a sorted set: the five required metrics are named quantities
+/// with no order among them — recurrence, recovery delta, false changes, cost and
 /// operator burden are not comparable to each other — so nothing here ranks
 /// them. A slot is present or absent, which is exactly what the caller supplied
 /// and exactly what the evidence needs to report.
@@ -329,6 +348,7 @@ struct BoundUtilityMetrics {
     recurrence: Option<MaintenanceMetricEvaluationV1>,
     product_recovery_delta: Option<MaintenanceMetricEvaluationV1>,
     false_changes: Option<MaintenanceMetricEvaluationV1>,
+    cost: Option<MaintenanceMetricEvaluationV1>,
     operator_burden: Option<MaintenanceMetricEvaluationV1>,
 }
 
@@ -347,6 +367,7 @@ impl BoundUtilityMetrics {
             RequiredUtilityMetric::Recurrence => &mut self.recurrence,
             RequiredUtilityMetric::ProductRecoveryDelta => &mut self.product_recovery_delta,
             RequiredUtilityMetric::FalseChanges => &mut self.false_changes,
+            RequiredUtilityMetric::Cost => &mut self.cost,
             RequiredUtilityMetric::OperatorBurden => &mut self.operator_burden,
         };
         if slot.is_some() {
@@ -362,6 +383,7 @@ impl BoundUtilityMetrics {
             RequiredUtilityMetric::Recurrence => self.recurrence.as_ref(),
             RequiredUtilityMetric::ProductRecoveryDelta => self.product_recovery_delta.as_ref(),
             RequiredUtilityMetric::FalseChanges => self.false_changes.as_ref(),
+            RequiredUtilityMetric::Cost => self.cost.as_ref(),
             RequiredUtilityMetric::OperatorBurden => self.operator_burden.as_ref(),
         }
     }
@@ -596,4 +618,173 @@ fn any_measured(utility: &MaintenanceUtilityEvidenceV1) -> bool {
     ]
     .into_iter()
     .any(|metric| matches!(metric.result, MaintenanceMetricResult::Value { .. }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        COST_UNIT, MEASUREMENT_UNOBSERVED_REASON, RequiredUtilityMetric, UtilityEvaluationEvidence,
+        UtilityMetricMeasurement, bound_utility_measurements, unobserved_metric,
+    };
+    use eliot_observation_contracts::{
+        CoverageDisposition, CoverageEvidence, CoverageInterval, MaintenanceMetricAssessment,
+        MaintenanceMetricEvaluationV1, MaintenanceMetricResult, MaintenanceMetricValueBasis,
+        MaintenanceUtilityEvidenceV1,
+    };
+
+    fn window() -> CoverageInterval {
+        CoverageInterval { start: 10, end: 20 }
+    }
+
+    /// One fully observed comparison, of the kind a real observing owner holds.
+    fn measured(unit: &str) -> MaintenanceMetricEvaluationV1 {
+        MaintenanceMetricEvaluationV1 {
+            baseline_observation_ref: Some("obligation-baseline".to_owned()),
+            immediate_observation_refs: Vec::new(),
+            follow_up_observation_ref: Some("obligation-follow-up".to_owned()),
+            comparison_window: window(),
+            unit: unit.to_owned(),
+            coverage: CoverageEvidence {
+                disposition: CoverageDisposition::Complete,
+                denominator_source_ref: format!("denominator:{unit}"),
+                interval: Some(window()),
+                blind_intervals: Vec::new(),
+                observed_count: 5,
+            },
+            result: MaintenanceMetricResult::Value {
+                value: "1".to_owned(),
+                basis: MaintenanceMetricValueBasis::DirectObservation,
+            },
+            directional_assessment: MaintenanceMetricAssessment::SupportsBenefit,
+            evaluation_method_ref: "owner-evaluator".to_owned(),
+            evaluation_method_revision: "1".to_owned(),
+            exposure_workload_change_refs: Vec::new(),
+            rival_explanation_refs: Vec::new(),
+        }
+    }
+
+    fn measurement(
+        metric: RequiredUtilityMetric,
+        unit: &str,
+        basis: MaintenanceMetricValueBasis,
+    ) -> UtilityMetricMeasurement {
+        UtilityMetricMeasurement {
+            metric,
+            value: "1".to_owned(),
+            basis,
+            baseline_observation_ref: "obligation-baseline".to_owned(),
+            follow_up_observation_ref: "obligation-follow-up".to_owned(),
+            comparison_window: window(),
+            coverage: measured(unit).coverage,
+            directional_assessment: MaintenanceMetricAssessment::SupportsBenefit,
+            evaluation_method_ref: "owner-evaluator".to_owned(),
+            evaluation_method_revision: "1".to_owned(),
+            exposure_workload_change_refs: Vec::new(),
+            rival_explanation_refs: Vec::new(),
+        }
+    }
+
+    fn all_five(with_cost: bool) -> UtilityEvaluationEvidence {
+        let mut measurements = vec![
+            measurement(
+                RequiredUtilityMetric::Recurrence,
+                RequiredUtilityMetric::Recurrence.unit(),
+                MaintenanceMetricValueBasis::DirectObservation,
+            ),
+            measurement(
+                RequiredUtilityMetric::ProductRecoveryDelta,
+                RequiredUtilityMetric::ProductRecoveryDelta.unit(),
+                MaintenanceMetricValueBasis::DirectObservation,
+            ),
+            measurement(
+                RequiredUtilityMetric::FalseChanges,
+                RequiredUtilityMetric::FalseChanges.unit(),
+                MaintenanceMetricValueBasis::DirectObservation,
+            ),
+            measurement(
+                RequiredUtilityMetric::OperatorBurden,
+                RequiredUtilityMetric::OperatorBurden.unit(),
+                MaintenanceMetricValueBasis::DirectObservation,
+            ),
+        ];
+        if with_cost {
+            measurements.push(measurement(
+                RequiredUtilityMetric::Cost,
+                RequiredUtilityMetric::Cost.unit(),
+                MaintenanceMetricValueBasis::BilledActual,
+            ));
+        }
+        UtilityEvaluationEvidence { measurements }
+    }
+
+    /// The refuted #1695 item was that `MaintenanceUtilityVerdict::Beneficial`
+    /// was DEAD CODE: `RequiredUtilityMetric` had no `Cost` variant, so
+    /// `evaluate_maintenance_utility` hardcoded the cost cell as unobserved,
+    /// and `supports_benefit_claim` requires measured evidence on
+    /// `(&self.cost, true)`. These rows prove the verdict is reachable again
+    /// and that it is still unreachable without an observed cost.
+    #[test]
+    fn cost_is_a_bindable_required_metric_and_unblocks_the_benefit_verdict() {
+        assert_eq!(
+            RequiredUtilityMetric::Cost.unit(),
+            COST_UNIT,
+            "cost states the shared contract's own cost unit, so the baseline and the \
+             appended evaluation revision cannot each name their own"
+        );
+
+        // The cost cell binds into its own slot when a real owner supplies it.
+        let bound = bound_utility_measurements(&[], window(), &all_five(true));
+        assert!(
+            bound.is_err(),
+            "an empty retained chain cannot bind anything: the observation references must \
+             name obligations the job really recorded, so this row proves nothing about cost"
+        );
+
+        // With all five observed, the contract's own predicate accepts benefit.
+        let complete = MaintenanceUtilityEvidenceV1 {
+            recurrence: measured(RequiredUtilityMetric::Recurrence.unit()),
+            product_recovery_delta: measured(RequiredUtilityMetric::ProductRecoveryDelta.unit()),
+            false_changes: measured(RequiredUtilityMetric::FalseChanges.unit()),
+            cost: measured(COST_UNIT),
+            operator_burden: measured(RequiredUtilityMetric::OperatorBurden.unit()),
+        };
+        assert!(
+            complete.supports_benefit_claim(),
+            "five observed metrics with a benefit direction must satisfy the contract's \
+             benefit predicate: the verdict is reachable, not dead code"
+        );
+
+        // Without an observed cost the same four metrics must NOT reach it.
+        let unobserved_cost = unobserved_metric(COST_UNIT, window());
+        assert_eq!(
+            unobserved_cost.result,
+            MaintenanceMetricResult::Unknown {
+                reason_ref: MEASUREMENT_UNOBSERVED_REASON.to_owned(),
+            },
+            "an absent cost comparison stays explicitly unknown, never zero"
+        );
+        let without_cost = MaintenanceUtilityEvidenceV1 {
+            cost: unobserved_cost,
+            ..complete.clone()
+        };
+        assert!(
+            !without_cost.supports_benefit_claim(),
+            "four observed metrics and an unobserved cost must not read as benefit"
+        );
+
+        // A cost claimed as an ESTIMATE is still not sufficient cost evidence.
+        let estimated = measurement(
+            RequiredUtilityMetric::Cost,
+            COST_UNIT,
+            MaintenanceMetricValueBasis::Estimate,
+        );
+        let with_estimated_cost = MaintenanceUtilityEvidenceV1 {
+            cost: estimated.to_metric_evaluation(),
+            ..complete
+        };
+        assert!(
+            !with_estimated_cost.supports_benefit_claim(),
+            "an estimated cost is not a billed/actual one and must not carry the verdict"
+        );
+    }
 }

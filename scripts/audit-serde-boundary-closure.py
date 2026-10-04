@@ -56,6 +56,79 @@ TEST_REL = "scripts/tests/test_audit_serde_boundary_closure.py"
 # never a fallback for the source-validating check.
 REQUIRED_INVENTORY_SYMBOL = "check"
 
+# ---------------------------------------------------------------------------
+# Accepted #929 check(root) result contract.
+#
+# Closed required-key sets for the single API result this coordinator
+# consumes. A missing load-bearing field is a malformed result and is never
+# treated as an empty checked identity. Extra future fields are tolerated so
+# they may be consciously versioned; a key this adapter does not understand
+# never becomes closure evidence.
+#
+# Citations are to scripts/serde_boundary_inventory.py on this tree: ``check``
+# returns exactly ``{"rows", "digest", "header"}`` (:2979) and ``header`` is the
+# dict built at :2409-2433. Every name in the header set below is written there.
+# ---------------------------------------------------------------------------
+REQUIRED_CHECK_RESULT_KEYS = frozenset({"rows", "digest", "header"})
+REQUIRED_CHECK_HEADER_KEYS = frozenset(
+    {
+        "aggregate_digest",
+        "denominator_digest",
+        "candidate_count",
+        "classified_count",
+        "unknown_count",
+        "unassigned_count",
+        "base_sha",
+        "proof_ceiling",
+    }
+)
+# The exact row projection ``validate_against_artifact`` returns
+# (scripts/serde_boundary_inventory.py:2791, returned at :2917-2921 with the row
+# dict literal at :2918-2919): ``candidate_id`` and ``id`` are both set from
+# ``r["id"]``, so a row claiming two different identities is malformed API
+# output. ``repair_child`` is the row's OWN unassigned-allocation value
+# (:2215), returned unchanged because ``unassigned_count`` is computed from it
+# (:2392, emitted at :2428); requiring it is what lets the ``unassigned_count``
+# check below compare against the owner's field instead of inferring it.
+REQUIRED_CHECK_ROW_KEYS = frozenset(
+    {"candidate_id", "id", "disposition", "owner", "repair_child", "digest"}
+)
+
+# Shape of the digests #929 emits: lowercase 64-hex SHA-256 hexdigest
+# (``_sha256_text``, scripts/serde_boundary_inventory.py:452; aggregate at
+# :2461/:2539, denominator at :2286, row at :1122/:2210).
+#
+# Every ``:NNNN`` citation in this file is line-numbered against
+# scripts/serde_boundary_inventory.py as it stands WITH the two-file change this
+# delivery ships. Anchors before :325 are identical to HEAD; anchors after it
+# move by +3 because ``UNKNOWN_BASE_SENTINEL`` is declared there, so verify the
+# anchor text, not only the number.
+_HEX_DIGITS = frozenset("0123456789abcdef")
+_SHA256_HEX_LENGTH = 64
+
+# ``base_sha`` as #929 records it, and the ONLY form it can take beyond that:
+# #929 declares ``base_sha_source = "git-rev-parse-HEAD"`` (:320), writes that
+# command's stdout into ``base_sha`` (:2104), and on failure writes its published
+# degradation sentinel ``UNKNOWN_BASE_SENTINEL`` (:325, used at :2105-2106;
+# ``_run_git`` raises InventoryError on a non-zero exit, :485-489). The sentinel
+# is read from the owner module at the single admission point
+# (``accepted_unknown_base_sentinel``), never re-spelled here.
+#
+# This repository's object format is sha1 (measured: ``git rev-parse
+# --show-object-format`` reports sha1), so the printed output is 40 lowercase
+# hex. Those two forms are the complete domain; a 64-hex value is not one.
+_GIT_COMMIT_HEX_LENGTH = 40
+
+# Names of the #929 admission oracles, read from the owned module at the
+# single admission point (``accepted_proof_ceiling`` / ``accepted_dispositions``
+# / ``accepted_unknown_base_sentinel``). At that boundary none of the three is
+# read from a coordinator-side copy; the copy declared below is read by
+# ``evaluate_case_02_assignment`` and by the synthetic self-test vocabulary
+# only, never by the admission path.
+REQUIRED_PROOF_CEILING_SYMBOL = "PROOF_CEILING"
+REQUIRED_DISPOSITIONS_SYMBOL = "KNOWN_DISPOSITIONS"
+REQUIRED_UNKNOWN_BASE_SYMBOL = "UNKNOWN_BASE_SENTINEL"
+
 COVERED_DISPOSITIONS = frozenset(
     {"current-closed", "named-legacy", "exact-internal", "specific-owner"}
 )
@@ -69,6 +142,26 @@ KNOWN_DISPOSITIONS = frozenset(
         "unknown",
     }
 )
+
+# Synthetic ceiling, vocabulary and base-identity sentinel for the fake-API
+# self-test below. They are fixture values for refusal proofs, not second
+# authorities: the admitted ceiling, vocabulary and sentinel are the ones read
+# from the owned module at the single admission point in
+# ``load_checked_inventory``.
+_SELF_TEST_CEILING = "SELF_TEST_ACCEPTED_PROOF_CEILING"
+_SELF_TEST_VOCABULARY = frozenset(KNOWN_DISPOSITIONS)
+_SELF_TEST_SENTINEL = "SELF_TEST_ACCEPTED_UNKNOWN_BASE_SENTINEL"
+
+# Distinct sentinel oracles for the positive half of the owner-reader
+# self-test. They are values no other code path in this file uses, so a reader
+# that returned a hardcoded literal instead of the published value could not
+# accidentally match them.
+_OWNER_PUBLISHED_CEILING = "OWNER_PUBLISHED_CEILING_SENTINEL"
+_OWNER_PUBLISHED_SENTINEL = "OWNER_PUBLISHED_UNKNOWN_BASE_SENTINEL"
+_OWNER_PUBLISHED_VOCABULARY = frozenset(
+    {"owner-published-disposition-a", "owner-published-disposition-b"}
+)
+
 PROTECTED_FIELDS = frozenset(
     {
         "identity",
@@ -345,7 +438,10 @@ def load_inventory_module(root: Path) -> Any:
         )
     module = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)
+        exec(
+            compile(script.read_bytes(), str(script), "exec", dont_inherit=True),
+            module.__dict__,
+        )
     except Exception as error:
         raise InventoryUnavailable(
             f"inventory module failure: {INVENTORY_SCRIPT_REL}:1 "
@@ -377,6 +473,11 @@ def load_checked_inventory(root: Path) -> CheckedInventory:
     current-source closure evaluation before the 20 cases run. A missing
     or malformed artifact is reported by ``check`` itself through its
     typed InventoryError, not by a coordinator pre-check.
+
+    The admission oracles (proof ceiling, disposition vocabulary, base-identity
+    degradation sentinel) are read from that same imported module here and
+    nowhere else, so this stays the single admission point with one authority
+    per oracle.
     """
     module = load_inventory_module(root)
     check = getattr(module, REQUIRED_INVENTORY_SYMBOL)
@@ -392,98 +493,343 @@ def load_checked_inventory(root: Path) -> CheckedInventory:
             f"('{REQUIRED_INVENTORY_SYMBOL}(root)' raised "
             f"{type(error).__name__}: {error})"
         ) from error
-    return _validate_checked_result(result)
+    return _validate_checked_result(
+        result,
+        accepted_proof_ceiling(module),
+        accepted_dispositions(module),
+        accepted_unknown_base_sentinel(module),
+    )
 
 
-def _validate_checked_result(result: Any) -> CheckedInventory:
-    """Validate ``check(root)``'s exact contract without rescanning source.
+def _contract_failure(detail: str) -> InventoryUnavailable:
+    """One typed admission-phase refusal for a malformed #929 result.
 
-    Rejects malformed result/row shapes, missing or duplicate
-    identities, digest mismatch between the result and its header, and
-    header counts inconsistent with the returned rows. Legitimate
-    unknown/needs-repair rows pass through untouched: #929's
-    classification stays authoritative and this adapter replaces none
-    of it.
+    Every shape violation below is an API-contract failure of the same kind
+    as a missing header, so text and JSON keep one bounded cause category and
+    the run returns before ``reconcile`` evaluates any closure case.
+    """
+    return InventoryUnavailable(f"inventory contract failure: {detail}")
+
+
+def _is_sha256_digest(value: Any) -> bool:
+    """True only for the lowercase 64-hex SHA-256 values #929 emits.
+
+    The closed vocabulary of a digest is the shape itself: a non-empty string
+    is not an identity, and an uppercase or short form is not #929's.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == _SHA256_HEX_LENGTH
+        and _HEX_DIGITS.issuperset(value)
+    )
+
+
+def _is_checked_base_sha(value: Any, accepted_sentinel: str) -> bool:
+    """True only for a base identity #929 can actually emit.
+
+    #929 declares ``base_sha_source = "git-rev-parse-HEAD"``
+    (scripts/serde_boundary_inventory.py:320) and copies that command's stdout
+    into ``base_sha`` verbatim after ``.strip()`` (:2104), or writes its
+    published degradation sentinel ``UNKNOWN_BASE_SENTINEL`` (:325) when git
+    cannot resolve HEAD (:2105-2106; ``_run_git`` raises InventoryError on a
+    non-zero exit, :485-489).
+    ``git rev-parse --show-object-format`` reports ``sha1`` in this repository,
+    so that output is 40 lowercase hex — measured on this tree, which is the only
+    authority this predicate needs. The sentinel is not named here: it arrives as
+    ``accepted_sentinel``, read from the owned module by
+    :func:`accepted_unknown_base_sentinel`, so the degradation form has the same
+    single authority as the ceiling and the vocabulary. Those two forms are
+    therefore the complete domain. Anything else — blank, whitespace-only or
+    foreign-shaped — is not a checked source snapshot identity.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if value == accepted_sentinel:
+        return True
+    return len(value) == _GIT_COMMIT_HEX_LENGTH and _HEX_DIGITS.issuperset(value)
+
+
+def _missing_keys(mapping: Mapping[str, Any], required: frozenset[str]) -> list[str]:
+    return sorted(key for key in required if key not in mapping)
+
+
+def _require_int(header: Mapping[str, Any], name: str) -> int:
+    """Read one header count as a real integer, excluding Boolean.
+
+    ``isinstance(True, int)`` is true in Python, so ``type(value) is not int``
+    is the explicit Boolean rejection the accepted count contract requires.
+    """
+    value = header.get(name)
+    if type(value) is not int:
+        raise _contract_failure(
+            f"header {name} {value!r} is not a real integer count"
+        )
+    if value < 0:
+        raise _contract_failure(f"header {name} {value!r} is negative")
+    return value
+
+
+def accepted_proof_ceiling(module: Any) -> str:
+    """Read the accepted #929 proof ceiling from the owned module itself.
+
+    The constant is not re-spelled in this coordinator: the single source is
+    ``scripts/serde_boundary_inventory.py``. A module that no longer publishes
+    it cannot produce an admitted checked identity.
+    """
+    ceiling = getattr(module, REQUIRED_PROOF_CEILING_SYMBOL, None)
+    if not isinstance(ceiling, str) or not ceiling.strip():
+        raise _contract_failure(
+            f"{INVENTORY_SCRIPT_REL} publishes no "
+            f"{REQUIRED_PROOF_CEILING_SYMBOL} to admit against"
+        )
+    return ceiling
+
+
+def accepted_dispositions(module: Any) -> frozenset[str]:
+    """Read the accepted #929 disposition vocabulary from the owner module.
+
+    At this admission boundary the vocabulary comes from the imported module
+    and never from the coordinator-side ``KNOWN_DISPOSITIONS`` constant
+    declared lower in this file: a load-bearing admission refusal must follow
+    one authority (docs/architecture/
+    I18-27-oracle-ownership-and-test-change-governance.md). That constant is
+    pre-existing and is read only by ``evaluate_case_02_assignment`` (the
+    ``not in KNOWN_DISPOSITIONS`` test inside that case evaluator) and by the
+    synthetic self-test vocabulary ``_SELF_TEST_VOCABULARY``; it is not
+    consulted here and is left untouched because it belongs to a case evaluator,
+    outside this admission-boundary change. An owner-side vocabulary extension
+    is therefore admitted here and still FAILED by that case, which keeps
+    testing the coordinator copy, so the run fails closed on such a row instead
+    of passing silently. #929 publishes the vocabulary as
+    ``KNOWN_DISPOSITIONS = frozenset(DISPOSITIONS)``
+    (scripts/serde_boundary_inventory.py:101); any non-empty container of
+    strings is accepted so an owner-side republishing as a plain tuple stays
+    admissible. A module that publishes no usable vocabulary cannot produce an
+    admitted checked identity.
+    """
+    vocabulary = getattr(module, REQUIRED_DISPOSITIONS_SYMBOL, None)
+    if isinstance(vocabulary, (str, bytes)) or not isinstance(
+        vocabulary, (frozenset, set, tuple, list)
+    ):
+        raise _contract_failure(
+            f"{INVENTORY_SCRIPT_REL} publishes no {REQUIRED_DISPOSITIONS_SYMBOL} "
+            "container of disposition values to admit against"
+        )
+    members = frozenset(vocabulary)
+    if not members:
+        raise _contract_failure(
+            f"{INVENTORY_SCRIPT_REL} publishes an empty "
+            f"{REQUIRED_DISPOSITIONS_SYMBOL} vocabulary"
+        )
+    if not all(isinstance(value, str) for value in members):
+        raise _contract_failure(
+            f"{INVENTORY_SCRIPT_REL} {REQUIRED_DISPOSITIONS_SYMBOL} holds "
+            "non-string members"
+        )
+    return members
+
+
+def accepted_unknown_base_sentinel(module: Any) -> str:
+    """Read the accepted #929 base-identity degradation sentinel from the owner.
+
+    Same single-source rule as :func:`accepted_proof_ceiling`: the sentinel
+    literal is not re-spelled in this coordinator, because naming the oracle's
+    value here would encode it by assertion (docs/architecture/
+    I18-27-oracle-ownership-and-test-change-governance.md). #929 writes this
+    value as its ``base_sha`` degradation when ``git rev-parse HEAD`` fails
+    (scripts/serde_boundary_inventory.py:2105-2106, sentinel published at :325;
+    ``_run_git`` raises InventoryError on a non-zero exit, :485-489). A module
+    that publishes no usable sentinel cannot produce an admitted checked
+    identity.
+    """
+    sentinel = getattr(module, REQUIRED_UNKNOWN_BASE_SYMBOL, None)
+    if not isinstance(sentinel, str) or not sentinel.strip():
+        raise _contract_failure(
+            f"{INVENTORY_SCRIPT_REL} publishes no non-blank "
+            f"{REQUIRED_UNKNOWN_BASE_SYMBOL} to admit against"
+        )
+    return sentinel
+
+
+def _validate_checked_result(
+    result: Any,
+    accepted_ceiling: str,
+    accepted_vocabulary: frozenset[str],
+    accepted_base_sentinel: str,
+) -> CheckedInventory:
+    """Validate ``check(root)``'s exact identity contract without rescanning.
+
+    This is the admission boundary the 20 closure cases sit behind: a
+    ``CheckedInventory`` is constructed only from a result carrying the
+    identities #929 actually returns.
+
+    - the result digest, ``header.aggregate_digest`` and
+      ``header.denominator_digest`` are lowercase 64-hex SHA-256 values, not
+      merely non-empty strings, and the result digest still equals
+      ``header.aggregate_digest``. ``check`` returns
+      ``fresh["header"]["aggregate_digest"]`` under ``digest``
+      (scripts/serde_boundary_inventory.py:2979); the aggregate is a
+      ``_sha256_text`` digest (:2461, :2539) and the denominator digest is
+      ``_sha256_text`` (:2286);
+    - ``base_sha`` is a non-blank value in the measured domain of #929's base
+      identity (see ``_is_checked_base_sha``): 40 lowercase hex, or the owner's
+      published degradation sentinel, which is read from the owned module by
+      ``accepted_unknown_base_sentinel`` and never re-spelled here;
+    - ``proof_ceiling`` EQUALS the ceiling published by the owned module, not
+      merely a string (``PROOF_CEILING`` at :89, written into the header at
+      :2413);
+    - a row carries both identity fields the current API returns — the
+      projection sets ``candidate_id`` and ``id`` from the same ``r["id"]``
+      (:2918) — they are non-blank, and they agree: two conflicting identities
+      are a refusal, never an ``or``-collapse onto the first truthy one;
+    - the disposition is inside the closed vocabulary the owned module
+      publishes (read at the single admission point by
+      ``accepted_dispositions``, never re-spelled here), checked at the adapter
+      boundary, so a foreign value is malformed API output rather than a later
+      closure-case verdict;
+    - ``owner`` must be a non-blank string. The projection copies ``r["owner"]``
+      verbatim (:2919), and #929 itself emits non-blank owners including the
+      placeholder forms ``"unknown"`` (:1904) and ``"UNASSIGNED"`` (:2069), so
+      this is a shape rule only: a blank owner is refused rather than presented
+      as checked owner evidence, and #929's classification of the row is not
+      re-decided here;
+    - the row ``digest`` is the candidate's lowercase 64-hex SHA-256
+      (:1122/:2210/:2919), never merely a non-empty string;
+    - ``repair_child`` is a real string, because ``unassigned_count`` is derived
+      from it rather than from any inference;
+    - every count in the required header key set is a real, non-negative
+      ``int`` (a Boolean is refused), and all four of ``candidate_count``,
+      ``classified_count``, ``unknown_count`` and ``unassigned_count`` are
+      compared for EQUALITY against the returned rows. ``unassigned_count`` is
+      compared against the count of returned rows whose own ``repair_child`` is
+      ``""`` or ``"UNASSIGNED"`` — the owner's predicate at
+      scripts/serde_boundary_inventory.py:2392, over a field the accepted
+      projection returns (:2917-2921) — so the count is never inferred from
+      ``owner`` or ``disposition``, which would encode the oracle by assertion.
+
+    Legitimate ``unknown``/``needs-repair`` rows pass through untouched:
+    #929's classification stays authoritative and this adapter replaces none
+    of it. Every refusal here is an ``inventory contract failure`` raised
+    before ``reconcile`` runs, so no closure case is ever presented as
+    current on top of an unadmitted identity.
     """
     if not isinstance(result, Mapping):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) returned "
-            f"{type(result).__name__}, expected a mapping with "
-            "rows/digest/header"
+        raise _contract_failure(
+            f"check(root) returned {type(result).__name__}, expected a "
+            "mapping with rows/digest/header"
         )
-    rows_raw = result.get("rows")
+    absent = _missing_keys(result, REQUIRED_CHECK_RESULT_KEYS)
+    if absent:
+        raise _contract_failure(
+            f"check(root) result is missing load-bearing field(s) {absent}"
+        )
+    rows_raw = result["rows"]
     if not isinstance(rows_raw, list):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no rows list"
+        raise _contract_failure("check(root) result has no rows list")
+    digest = result["digest"]
+    if not _is_sha256_digest(digest):
+        raise _contract_failure(
+            f"result digest {digest!r} is not a lowercase 64-hex SHA-256 "
+            "aggregate identity"
         )
-    digest = result.get("digest")
-    if not isinstance(digest, str) or not digest:
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no "
-            "aggregate digest"
-        )
-    header = result.get("header")
+    header = result["header"]
     if not isinstance(header, Mapping):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no header "
-            "mapping"
+        raise _contract_failure("check(root) result has no header mapping")
+    absent = _missing_keys(header, REQUIRED_CHECK_HEADER_KEYS)
+    if absent:
+        raise _contract_failure(
+            f"header is missing load-bearing field(s) {absent}"
         )
-    if header.get("aggregate_digest") != digest:
-        raise InventoryUnavailable(
-            "inventory contract failure: result digest does not match "
-            "header aggregate_digest"
+    if header["aggregate_digest"] != digest:
+        raise _contract_failure(
+            "result digest does not match header aggregate_digest"
         )
-    denominator = header.get("denominator_digest")
-    if not isinstance(denominator, str) or not denominator:
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no denominator_digest"
+    denominator = header["denominator_digest"]
+    if not _is_sha256_digest(denominator):
+        raise _contract_failure(
+            f"header denominator_digest {denominator!r} is not a lowercase "
+            "64-hex SHA-256 identity"
         )
-    candidate_count = header.get("candidate_count")
-    if not isinstance(candidate_count, int) or candidate_count != len(rows_raw):
-        raise InventoryUnavailable(
-            "inventory contract failure: header candidate_count "
-            f"{candidate_count!r} != returned rows {len(rows_raw)}"
+    base_sha = header["base_sha"]
+    if not _is_checked_base_sha(base_sha, accepted_base_sentinel):
+        raise _contract_failure(
+            f"header base_sha {base_sha!r} is not a non-blank "
+            f"#{INVENTORY_ISSUE} source snapshot identity"
         )
-    base_sha = header.get("base_sha")
-    if not isinstance(base_sha, str):
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no base_sha"
-        )
-    proof_ceiling = header.get("proof_ceiling")
-    if not isinstance(proof_ceiling, str):
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no proof_ceiling"
+    proof_ceiling = header["proof_ceiling"]
+    if proof_ceiling != accepted_ceiling:
+        raise _contract_failure(
+            f"header proof_ceiling {proof_ceiling!r} is not the accepted "
+            f"#{INVENTORY_ISSUE} ceiling {accepted_ceiling!r}"
         )
     rows: list[InventoryRow] = []
     seen: set[str] = set()
+    unknown_rows = 0
+    unassigned_rows = 0
     for entry in rows_raw:
         if not isinstance(entry, Mapping):
-            raise InventoryUnavailable(
-                "inventory contract failure: row is "
-                f"{type(entry).__name__}, expected a mapping"
+            raise _contract_failure(
+                f"row is {type(entry).__name__}, expected a mapping"
             )
-        cid = entry.get("candidate_id") or entry.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise InventoryUnavailable(
-                "inventory contract failure: row without candidate identity"
+        absent = _missing_keys(entry, REQUIRED_CHECK_ROW_KEYS)
+        if absent:
+            raise _contract_failure(
+                f"row is missing load-bearing field(s) {absent}"
             )
+        candidate_id = entry["candidate_id"]
+        row_id = entry["id"]
+        for name, value in (("candidate_id", candidate_id), ("id", row_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise _contract_failure(
+                    f"row {name} {value!r} is not a non-blank identity"
+                )
+        if candidate_id != row_id:
+            raise _contract_failure(
+                f"row carries conflicting identities (candidate_id="
+                f"{candidate_id!r}, id={row_id!r}); the checked result admits "
+                "exactly one identity per row"
+            )
+        cid = candidate_id
         if cid in seen:
-            raise InventoryUnavailable(
-                f"inventory contract failure: duplicate row {cid}"
-            )
+            raise _contract_failure(f"duplicate row {cid}")
         seen.add(cid)
-        disposition = entry.get("disposition")
-        owner = entry.get("owner")
-        row_digest = entry.get("digest")
+        disposition = entry["disposition"]
         if (
             not isinstance(disposition, str)
-            or not isinstance(owner, str)
-            or not isinstance(row_digest, str)
+            or disposition not in accepted_vocabulary
         ):
-            raise InventoryUnavailable(
-                f"inventory contract failure: row {cid} has malformed "
-                "disposition/owner/digest"
+            raise _contract_failure(
+                f"row {cid} has disposition {disposition!r} outside the "
+                f"#{INVENTORY_ISSUE} vocabulary published by "
+                f"{REQUIRED_DISPOSITIONS_SYMBOL}"
             )
+        if disposition == "unknown":
+            unknown_rows += 1
+        owner = entry["owner"]
+        if not isinstance(owner, str) or not owner.strip():
+            raise _contract_failure(
+                f"row {cid} has blank owner {owner!r}; #{INVENTORY_ISSUE} does "
+                "not return an empty checked owner"
+            )
+        row_digest = entry["digest"]
+        if not _is_sha256_digest(row_digest):
+            raise _contract_failure(
+                f"row {cid} digest {row_digest!r} is not a lowercase 64-hex "
+                "SHA-256 identity"
+            )
+        # ``repair_child`` is the owner's own unassigned-allocation field: it is
+        # carried into every row at scripts/serde_boundary_inventory.py:2215 and
+        # is what the ``unassigned`` predicate at :2392 reads. The projection
+        # returns it (:2917-2921), so ``unassigned_count`` is compared against
+        # this value and never inferred from ``owner``/``disposition``.
+        repair_child = entry["repair_child"]
+        if not isinstance(repair_child, str):
+            raise _contract_failure(
+                f"row {cid} repair_child {repair_child!r} is not a string; "
+                f"#{INVENTORY_ISSUE} carries a real owner value there"
+            )
+        if repair_child in ("", "UNASSIGNED"):
+            unassigned_rows += 1
         rows.append(
             InventoryRow(
                 candidate_id=cid,
@@ -492,6 +838,53 @@ def _validate_checked_result(result: Any) -> CheckedInventory:
                 digest=row_digest,
             )
         )
+    candidate_count = _require_int(header, "candidate_count")
+    if candidate_count != len(rows_raw):
+        raise _contract_failure(
+            f"header candidate_count {candidate_count} != returned rows "
+            f"{len(rows_raw)}"
+        )
+    # ``candidate_count`` and ``classified_count`` are both ``len(rows)`` in
+    # #929's header (scripts/serde_boundary_inventory.py:2425-2426) over the
+    # ``rows`` list whose projection is returned at :2917-2921, so both are
+    # exactly checkable against what ``check(root)`` returned.
+    classified_count = _require_int(header, "classified_count")
+    if classified_count != len(rows_raw):
+        raise _contract_failure(
+            f"header classified_count {classified_count} != returned rows "
+            f"{len(rows_raw)}"
+        )
+    # ``unknown_count`` counts rows whose disposition is ``unknown``
+    # (scripts/serde_boundary_inventory.py:2393, emitted at :2427). Disposition
+    # IS part of the returned projection (:2918), so this count is
+    # derivable from the returned rows and is compared against them.
+    unknown_count = _require_int(header, "unknown_count")
+    if unknown_count != unknown_rows:
+        raise _contract_failure(
+            f"header unknown_count {unknown_count} != {unknown_rows} returned "
+            "unknown rows"
+        )
+    # ``unassigned_count`` counts the rows whose ``repair_child`` is "" or
+    # "UNASSIGNED" — the owner's own predicate at
+    # scripts/serde_boundary_inventory.py:2392, emitted into the header at :2428.
+    # ``repair_child`` is carried by the accepted projection (:2917-2921), so
+    # this count is derived from the owner's OWN field in the returned rows and
+    # is compared for equality exactly like ``unknown_count``. It is deliberately
+    # NOT inferred from ``owner`` or ``disposition``: those pairs happen to agree
+    # on the current base (:1902-1905, :1916-1919, :2067-2070), but encoding that
+    # mapping here would make this adapter a second authority for the oracle.
+    unassigned_count = _require_int(header, "unassigned_count")
+    if unassigned_count != unassigned_rows:
+        raise _contract_failure(
+            f"header unassigned_count {unassigned_count} != {unassigned_rows} "
+            "returned rows whose repair_child is \"\" or \"UNASSIGNED\""
+        )
+    # ``ready_children``/``blocked_children`` (:2429-2430) are counts of
+    # allocation children, not of rows. ``check(root)`` returns only
+    # ``rows``/``digest``/``header`` (:2979) and its header carries these two
+    # counts but no allocation entries, so they are deliberately absent from
+    # REQUIRED_CHECK_HEADER_KEYS rather than bounded against per-child data this
+    # adapter never receives.
     return CheckedInventory(
         rows=tuple(rows),
         aggregate_digest=digest,
@@ -1048,7 +1441,11 @@ def build_self_test_input() -> ReconciliationInput:
         aggregate_digest="selftest-aggregate",
         denominator_digest="selftest-denominator",
         base_sha="selftest-base",
-        proof_ceiling="SOURCE_INVENTORY_AND_OWNERSHIP_ONLY",
+        # This binding is built in memory for the case evaluators, never
+        # admitted through ``_validate_checked_result``; its ceiling is the
+        # synthetic self-test value so no second copy of the #929 constant
+        # lives in this file.
+        proof_ceiling=_SELF_TEST_CEILING,
         candidate_count=len(rows),
     )
     return ReconciliationInput(
@@ -1093,7 +1490,351 @@ def build_self_test_input() -> ReconciliationInput:
     )
 
 
+def _self_test_valid_checked_result() -> dict[str, Any]:
+    """One minimal result carrying exactly the contract #929 returns.
+
+    The single row's ``repair_child`` is ``""`` (the owner's own unallocated form,
+    scripts/serde_boundary_inventory.py:1905), so ``unassigned_count`` is 1 and
+    the fixture is internally consistent: it stays admitted, and every refusal
+    below is attributable to the one mutated field.
+    """
+    aggregate = hashlib.sha256(b"selftest-aggregate").hexdigest()
+    denominator = hashlib.sha256(b"selftest-denominator").hexdigest()
+    row_digest = hashlib.sha256(b"selftest-row").hexdigest()
+    return {
+        "rows": [
+            {
+                "candidate_id": "selftest.row",
+                "id": "selftest.row",
+                "disposition": "unknown",
+                "owner": "#930",
+                "digest": row_digest,
+                "repair_child": "",
+            }
+        ],
+        "digest": aggregate,
+        "header": {
+            "aggregate_digest": aggregate,
+            "denominator_digest": denominator,
+            "candidate_count": 1,
+            "classified_count": 1,
+            "unknown_count": 1,
+            "unassigned_count": 1,
+            "base_sha": "0" * 40,
+            "proof_ceiling": _SELF_TEST_CEILING,
+        },
+    }
+
+
+def _self_test_admission_refusals() -> int:
+    """Prove malformed #929 results are refused before any closure case.
+
+    Each entry is one concrete shape the accepted API never returns, and the
+    synthetic valid result above is admitted first, so a refusal is
+    attributable to the fixture's own mutation rather than to a broken
+    payload. Cases are written so the refusal named in the label is the one
+    that fires; where a shape is refused by more than one check, its label says
+    which one it is written for (see the missing-count case).
+    """
+    def mutate(change) -> dict[str, Any]:
+        payload = _self_test_valid_checked_result()
+        change(payload)
+        return payload
+
+    def set_header(name: str, value: Any):
+        def change(payload: dict[str, Any]) -> None:
+            payload["header"][name] = value
+        return change
+
+    def set_row(name: str, value: Any):
+        def change(payload: dict[str, Any]) -> None:
+            payload["rows"][0][name] = value
+        return change
+
+    def drop_row(name: str):
+        def change(payload: dict[str, Any]) -> None:
+            del payload["rows"][0][name]
+        return change
+
+    def both_row_identities(left: str, right: str):
+        def change(payload: dict[str, Any]) -> None:
+            payload["rows"][0]["candidate_id"] = left
+            payload["rows"][0]["id"] = right
+        return change
+
+    def duplicate_row(payload: dict[str, Any]) -> None:
+        # Counts stay consistent with the two returned rows, so the only
+        # remaining defect is the repeated identity.
+        payload["rows"].append(dict(payload["rows"][0]))
+        payload["header"]["candidate_count"] = 2
+        payload["header"]["classified_count"] = 2
+        payload["header"]["unknown_count"] = 2
+        payload["header"]["unassigned_count"] = 2
+
+    def contradicting_unassigned_count(payload: dict[str, Any]) -> None:
+        # The row becomes an unallocated one (the owner's own "UNASSIGNED" form,
+        # scripts/serde_boundary_inventory.py:2070) while the header still
+        # reports zero, so the count/row-set EQUALITY is the only defect left.
+        payload["rows"][0]["repair_child"] = "UNASSIGNED"
+        payload["header"]["unassigned_count"] = 0
+
+    def set_aggregate_identity(value: str):
+        def change(payload: dict[str, Any]) -> None:
+            # Both places #929 writes the aggregate identity, so this case
+            # exercises the digest SHAPE refusal and not the equality check.
+            payload["digest"] = value
+            payload["header"]["aggregate_digest"] = value
+        return change
+
+    def disagreeing_aggregate_identity(payload: dict[str, Any]) -> None:
+        # Two well-formed lowercase 64-hex identities that are not the same
+        # value: the shape refusal cannot fire here, only the equality one.
+        payload["digest"] = hashlib.sha256(b"selftest-aggregate-other").hexdigest()
+        payload["header"]["aggregate_digest"] = hashlib.sha256(
+            b"selftest-denominator"
+        ).hexdigest()
+
+    def foreign_disposition(payload: dict[str, Any]) -> None:
+        # The returned counts stay consistent with the mutated row set (that
+        # row is no longer ``unknown``), so the vocabulary membership refusal
+        # is the only thing left that can fire.
+        payload["rows"][0]["disposition"] = "invented"
+        payload["header"]["unknown_count"] = 0
+
+    def blank_identity(name: str, value: str):
+        """Blank one identity field, or both with the SAME value.
+
+        The blank check runs over both fields before the equality check, so a
+        case that blanks one field — or both with one shared value, which keeps
+        them non-conflicting — can only be refused by the blank-identity rule.
+        """
+        def change(payload: dict[str, Any]) -> None:
+            if name == "both":
+                payload["rows"][0]["candidate_id"] = value
+                payload["rows"][0]["id"] = value
+            else:
+                payload["rows"][0][name] = value
+        return change
+
+    cases: tuple[tuple[str, Any], ...] = (
+        # Conflicting row identity: the old ``candidate_id or id`` collapse
+        # admitted one of these two silently.
+        (
+            "conflicting candidate_id/id",
+            mutate(both_row_identities("selftest.row", "selftest.other")),
+        ),
+        (
+            "blank candidate_id and id",
+            mutate(blank_identity("both", "   ")),
+        ),
+        (
+            "blank id",
+            mutate(blank_identity("id", "")),
+        ),
+        (
+            "duplicate row identity",
+            mutate(duplicate_row),
+        ),
+        # Non-digest identities.
+        (
+            "non-digest result/aggregate identity",
+            mutate(set_aggregate_identity("x")),
+        ),
+        (
+            "result digest disagreeing with header aggregate_digest",
+            mutate(disagreeing_aggregate_identity),
+        ),
+        (
+            "non-digest denominator identity",
+            mutate(set_header("denominator_digest", "y")),
+        ),
+        (
+            "non-digest row identity",
+            mutate(set_row("digest", "")),
+        ),
+        (
+            "uppercase row digest is not #929's lowercase form",
+            mutate(set_row("digest", hashlib.sha256(b"selftest-row").hexdigest().upper())),
+        ),
+        # Absent or foreign-shaped base identity: a whitespace-only value and a
+        # hex width this repository's git never prints.
+        ("blank base_sha", mutate(set_header("base_sha", ""))),
+        (
+            "whitespace-only base_sha",
+            mutate(set_header("base_sha", "   ")),
+        ),
+        (
+            "base_sha at a hex width git never prints",
+            mutate(set_header("base_sha", "0" * 41)),
+        ),
+        # Foreign ceiling and foreign disposition.
+        (
+            "foreign proof ceiling",
+            mutate(set_header("proof_ceiling", "NOT_THE_929_CEILING")),
+        ),
+        (
+            "foreign disposition",
+            mutate(foreign_disposition),
+        ),
+        # Boolean, negative and inconsistent counts.
+        (
+            "Boolean accepted as an integer count",
+            mutate(set_header("candidate_count", True)),
+        ),
+        (
+            "candidate_count contradicting the row set",
+            mutate(set_header("candidate_count", 2)),
+        ),
+        (
+            "negative unassigned_count",
+            mutate(set_header("unassigned_count", -1)),
+        ),
+        (
+            "classified_count contradicting the row set",
+            mutate(set_header("classified_count", 999)),
+        ),
+        (
+            "unknown_count contradicting the row set",
+            mutate(set_header("unknown_count", 0)),
+        ),
+        (
+            "unassigned_count contradicting the returned rows",
+            mutate(contradicting_unassigned_count),
+        ),
+        (
+            "non-string repair_child",
+            mutate(set_row("repair_child", 7)),
+        ),
+        # Blank row identity material.
+        ("blank owner", mutate(set_row("owner", ""))),
+        # Missing load-bearing fields.
+        ("missing row identity field", mutate(drop_row("id"))),
+        ("row missing repair_child", mutate(drop_row("repair_child"))),
+        (
+            "missing load-bearing header key (non-count)",
+            mutate(lambda payload: payload["header"].pop("proof_ceiling")),
+        ),
+        (
+            # ``unknown_count`` is in REQUIRED_CHECK_HEADER_KEYS, so the absent
+            # key is caught by that closed set before ``_require_int`` is ever
+            # reached; the label names the check that actually fires.
+            "missing header count field (refused by the required header key set)",
+            mutate(lambda payload: payload["header"].pop("unknown_count")),
+        ),
+    )
+    admitted = _validate_checked_result(
+        _self_test_valid_checked_result(),
+        _SELF_TEST_CEILING,
+        _SELF_TEST_VOCABULARY,
+        _SELF_TEST_SENTINEL,
+    )
+    if admitted.candidate_count != 1 or len(admitted.rows) != 1:
+        raise AssertionError("self-test valid #929 result was not admitted as-is")
+    if admitted.rows[0].disposition != "unknown":
+        raise AssertionError(
+            "self-test admission dropped a legitimate unknown finding row"
+        )
+    for label, payload in cases:
+        try:
+            _validate_checked_result(
+                payload, _SELF_TEST_CEILING, _SELF_TEST_VOCABULARY,
+                _SELF_TEST_SENTINEL,
+            )
+        except InventoryUnavailable as error:
+            if not str(error).startswith("inventory contract failure:"):
+                raise AssertionError(
+                    f"self-test refusal {label} left its typed cause: {error}"
+                ) from error
+            continue
+        except Exception as error:  # noqa: BLE001 - see the message below
+            # A malformed result must be refused by a typed contract failure,
+            # never by an incidental KeyError/TypeError from a later read.
+            raise AssertionError(
+                f"self-test case {label} raised {type(error).__name__}: {error} "
+                "instead of a typed contract refusal"
+            ) from error
+        raise AssertionError(f"self-test admitted malformed result: {label}")
+
+    # ``_require_int``'s negative rule: every count read goes through it before
+    # any comparison against the returned rows, so a negative count is refused
+    # there and not by the equality check. The ``negative unassigned_count``
+    # payload case above already proves that end to end (its refusal message is
+    # the negative rule's); this direct probe pins the reader itself, so the rule
+    # is asserted at its own source rather than only through a payload whose
+    # firing check also depends on the caller reading the counts in that order.
+    try:
+        _require_int({"negative_count": -1}, "negative_count")
+    except InventoryUnavailable as error:
+        if not str(error).startswith("inventory contract failure:"):
+            raise AssertionError(
+                f"self-test negative-count refusal left its typed cause: {error}"
+            ) from error
+        return len(cases) + 1
+    raise AssertionError("self-test admitted a negative header count")
+
+
+def _self_test_owner_contract_failures() -> int:
+    """Prove every oracle reader follows the owner module, and refuses without it.
+
+    ``--self-test`` never imports ``scripts/serde_boundary_inventory.py``, so
+    the readers are exercised directly against bare stub objects: one that
+    publishes nothing (every reader must refuse with the typed cause) and one
+    that publishes only the three oracles (every reader must return exactly the
+    published values, never a coordinator-side substitute). No fake inventory
+    module and no filesystem fixture is involved.
+    """
+
+    class _PublishingStub:
+        PROOF_CEILING = _OWNER_PUBLISHED_CEILING
+        KNOWN_DISPOSITIONS = _OWNER_PUBLISHED_VOCABULARY
+        UNKNOWN_BASE_SENTINEL = _OWNER_PUBLISHED_SENTINEL
+
+    refusals = 0
+    for label, read in (
+        ("proof ceiling", accepted_proof_ceiling),
+        ("disposition vocabulary", accepted_dispositions),
+        ("base-identity sentinel", accepted_unknown_base_sentinel),
+    ):
+        try:
+            read(object())
+        except InventoryUnavailable as error:
+            if not str(error).startswith("inventory contract failure:"):
+                raise AssertionError(
+                    f"self-test owner {label} refusal left its typed cause: {error}"
+                ) from error
+            refusals += 1
+            continue
+        raise AssertionError(
+            f"self-test admitted a module publishing no owner {label}"
+        )
+
+    published = _PublishingStub()
+    for label, read, expected in (
+        ("proof ceiling", accepted_proof_ceiling, _OWNER_PUBLISHED_CEILING),
+        (
+            "disposition vocabulary",
+            accepted_dispositions,
+            _OWNER_PUBLISHED_VOCABULARY,
+        ),
+        (
+            "base-identity sentinel",
+            accepted_unknown_base_sentinel,
+            _OWNER_PUBLISHED_SENTINEL,
+        ),
+    ):
+        returned = read(published)
+        if returned != expected:
+            raise AssertionError(
+                f"self-test owner {label} reader returned {returned!r} instead "
+                f"of the published {expected!r}"
+            )
+        refusals += 1
+    return refusals
+
+
 def self_test() -> ReconciliationResult:
+    refusals = _self_test_admission_refusals()
+    owner_refusals = _self_test_owner_contract_failures()
     data = build_self_test_input()
     # Prove the lexical core really runs: the fixtures above must contain one
     # unknown field and one raw duplicate.
@@ -1115,7 +1856,9 @@ def self_test() -> ReconciliationResult:
         raise AssertionError("self-test digest is not deterministic")
     print(
         "SERDE_BOUNDARY_CLOSURE_SELF_TEST: PASS "
-        f"(20/20 cases; digest {result.canonical_digest[:16]})"
+        f"(20/20 cases; {refusals} malformed-#929-result refusals; "
+        f"{owner_refusals} owner-contract refusals; "
+        f"digest {result.canonical_digest[:16]})"
     )
     return result
 

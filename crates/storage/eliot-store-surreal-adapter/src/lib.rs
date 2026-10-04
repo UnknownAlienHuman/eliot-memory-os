@@ -35,6 +35,7 @@ mod write_scheduler;
 use std::fmt;
 use std::num::NonZeroUsize;
 
+pub use crate::client::TransportIncarnationEvidence;
 pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
 pub use backup_restore::{
     MAX_ADMISSION_AGE_MS, MAX_RESTORE_BATCH_MEMBERS, MAX_RESTORE_BYTES, MAX_RESTORE_DURATION_MS,
@@ -45,7 +46,8 @@ pub use backup_restore::{
     validate_restore_batch,
 };
 pub use backup_snapshot::{
-    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, capture_ecxf_source,
+    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, SnapshotBudgetDiagnostics,
+    SnapshotBudgetDimension, capture_ecxf_source,
 };
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
@@ -152,6 +154,17 @@ impl fmt::Debug for SurrealStoreAdapter {
 }
 
 impl SurrealStoreAdapter {
+    /// Runs one bounded snapshot-owner maintenance pass when accounting is
+    /// usable, and returns its charge diagnostics for the supervised owner loop.
+    ///
+    /// This hook performs no provider I/O and does not retain captured data in
+    /// the diagnostics. Its clock observation and the expiry transitions use
+    /// the existing write-execution clock domain, sampled after the registry
+    /// lock has been acquired.
+    pub fn maintain_snapshot_owner(&self) -> Result<SnapshotBudgetDiagnostics, StoreError> {
+        crate::backup_snapshot::snapshot_owner_maintenance_diagnostics()
+    }
+
     /// Builds an adapter with the given connection and generation settings.
     ///
     /// Construction binds the instance to the active generated operation
@@ -545,6 +558,59 @@ impl SurrealStoreAdapter {
         if let Some(Ok(transport)) = self.client.get() {
             transport.provider().clear_authenticated_version();
         }
+    }
+
+    /// Physical evidence for the client generation requests currently use.
+    ///
+    /// This is the adapter's half of the issue #1933 generation binding: the
+    /// bridge's logical `ClientSetPolicy::generation` counter only means
+    /// something because it can be compared against the transport/session-pool
+    /// incarnation actually serving the request. Returns `None` before the
+    /// first connection, which the bridge treats as "no physical generation
+    /// proven yet" rather than as generation zero.
+    pub fn client_incarnation(&self) -> Option<TransportIncarnationEvidence> {
+        let transport = self.client.get()?.as_ref().ok()?;
+        Some(transport.incarnation_evidence())
+    }
+
+    /// Explicitly replaces the physical client generation (issue #1933).
+    ///
+    /// This is the operation I5.9 requires a broken generation to go through:
+    /// it builds and authenticates a complete replacement facade session plus
+    /// a complete replacement bounded session pool over the SAME retained,
+    /// ownership-verified provider child, then publishes it in one atomic
+    /// swap. Requests already in flight keep the previous generation and drain
+    /// against it; no request that starts afterwards can reach it.
+    ///
+    /// It deliberately does NOT start a second provider process. The upstream
+    /// server binary is a Host-managed dependency generation (I5.9
+    /// "Canonical-store process generation replacement"), and two server
+    /// processes may never open the same production data root — replacing a
+    /// broken *client* generation is a client concern, not a process one.
+    ///
+    /// Fails closed. When the replacement cannot be built or authenticated,
+    /// nothing is published and the error is returned, so a caller that keeps
+    /// its broken-generation latch never admits traffic on the failed
+    /// generation. A successful replacement also re-proves the authenticated
+    /// provider version, which [`Self::note_connection_loss`] had forgotten.
+    pub async fn replace_client_generation(
+        &self,
+    ) -> Result<TransportIncarnationEvidence, AdapterError> {
+        let transport = match self.client.get() {
+            Some(Ok(transport)) => transport,
+            // Never connected, or a cached startup failure: there is no
+            // provider owner to rebuild sessions over. The caller keeps its
+            // latch and reports the original transport failure.
+            Some(Err(error)) => return Err(error.clone()),
+            None => return Err(AdapterError::ProviderUnavailable),
+        };
+        let evidence = transport
+            .replace_incarnation(&self.config, self.client_limits)
+            .await?;
+        // Re-prove the identity the replacement just proved by authenticating,
+        // so a generation that no longer exists can never be claimed live.
+        transport.provider().clear_authenticated_version();
+        Ok(evidence)
     }
 
     /// Observes the database's semantic readiness against the configured

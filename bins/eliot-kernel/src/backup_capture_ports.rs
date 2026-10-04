@@ -37,6 +37,17 @@
 //! read from the owner that declares them, and an owner that refuses is
 //! reported as a refusal rather than smoothed over.
 //!
+//! ONE SUSPENDED-STATE SOURCE. The capture bundle carries a producer's CLAIM
+//! about the ORS suspended frontier ([`CapturePorts::suspended_count`]) beside
+//! the ORS snapshot that claim is about. The claim is never trusted and never
+//! re-derived here: the frontier itself is read exactly once, from the ORS
+//! owner's own validated fence ([`owner_suspended_recovery_refs`]), and the
+//! claim is refused when it disagrees with that derivation — at this boundary,
+//! before any `CaptureRequest` can be constructed. The number that passes
+//! source validation is therefore the same number the capture state is decided
+//! from, and a caller cannot have one value validated while another chooses the
+//! report disposition.
+//!
 //! What this file deliberately does NOT own: any live owner channel, any
 //! global cross-store transaction, stop-the-world barrier, or distributed
 //! snapshot service. The ORS and canonical export are not one cross-store
@@ -386,6 +397,13 @@ impl SnapshotRelation {
 /// Every reference is caller-supplied owner evidence validated by
 /// `validate_shapes` and re-checked at each coordinator gate. No live owner
 /// handle, database read path, or snapshot service travels in this struct.
+///
+/// [`Self::suspended_count`] is the ONE place a producer states what it thinks
+/// the suspended frontier is, and it is a claim rather than a second owner:
+/// [`require_suspended_claim_matches_owner_frontier`] refuses it here whenever
+/// the ORS owner's own derivation of the same snapshot says otherwise. Nothing
+/// else in this bundle states suspended state, and no value here decides the
+/// capture disposition.
 pub struct CapturePorts<'a> {
     /// Admitted caller authentication behind the capture.
     pub caller: &'a CaptureCallerAuth,
@@ -407,7 +425,19 @@ pub struct CapturePorts<'a> {
     pub artifacts: &'a [BackupArtifact],
     /// Logical ORS snapshot fence, when the class carries one.
     pub ors_snapshot: Option<&'a OrsSnapshotFence>,
-    /// Count of suspended recovery entries derived from the ORS snapshot.
+    /// The PRODUCER'S claim about the suspended-recovery frontier carried by
+    /// [`Self::ors_snapshot`].
+    ///
+    /// THIS IS A CLAIM, NEVER A SECOND OWNER. The frontier itself has exactly
+    /// one owner and exactly one derivation: the ORS owner's own validated
+    /// pending operations ([`owner_suspended_recovery_refs`]). This number does
+    /// not compute, cache, extend, or decide anything — a bundle that omits or
+    /// invents a frontier can only be caught by comparing this claim with the
+    /// owner, which is why
+    /// [`require_suspended_claim_matches_owner_frontier`] refuses disagreement
+    /// at this boundary and before any `CaptureRequest` exists. An absent ORS
+    /// snapshot therefore admits exactly one claim, zero: this is not a
+    /// "none claimed" default that a nonzero value may contradict silently.
     pub suspended_count: u64,
     /// Bounded Watchdog spool fence, when the class carries one.
     pub watchdog_spool: Option<&'a WatchdogSpoolFence>,
@@ -542,6 +572,61 @@ pub fn owner_suspended_recovery_refs(
         .into_iter()
         .map(|entry| entry.historical_ref)
         .collect())
+}
+
+/// Refuses a port bundle whose claimed suspended count disagrees with the ORS
+/// owner's own validated frontier, AT THE PORT BOUNDARY.
+///
+/// This is where the capture stops having two answers to one question. Inside
+/// `backup_capture.rs`, `observed_unresolved_frontier` still re-derives the
+/// frontier from the OWNED snapshot on the built [`CaptureRequest`]; that stays
+/// correct for a request that was assembled some other way. What this check
+/// removes is the earlier window: a bundle could pass source validation on one
+/// number and let a second, separately supplied number choose the report
+/// disposition, because the count used to reach source validation and the count
+/// used downstream were two values. Here the number that survives validation
+/// and the number the frontier is decided from are the SAME value by
+/// construction, because the claim cannot cross this boundary without equalling
+/// the owner's own derivation.
+///
+/// The refusal is the disagreement itself and never silently prefers one side.
+/// A bundle that reports zero suspended entries while its ORS snapshot declares
+/// pending operations is refused even though the owner's frontier is
+/// authoritative: preferring the owner would hide that the producer and the
+/// ORS owner disagree, which is precisely the condition a caller must not be
+/// able to pass off as a clean capture.
+///
+/// The comparison is `==` on purpose. A count that happens to agree with the
+/// owner's frontier length states nothing about the identities behind it and
+/// claims nothing beyond agreement; the owner-side derivation remains the only
+/// place suspended entries become entries.
+///
+/// # CALLER
+///
+/// [`backup_capture::request_from_ports`] — it calls this immediately after
+/// `validate_shapes` and before it constructs any `CaptureRequest`, which is
+/// what makes the boundary effective. This function is the port-side half of
+/// that check and is declared here, next to the claim it validates, because
+/// `backup_capture.rs` owns the request construction it guards (#959).
+pub fn require_suspended_claim_matches_owner_frontier(
+    ports: &CapturePorts<'_>,
+) -> Result<(), KernelCaptureError> {
+    let observed = match ports.ors_snapshot {
+        Some(snapshot) => owner_suspended_recovery_refs(snapshot)?.len(),
+        // An absent ORS snapshot is an empty owner frontier, so the only claim
+        // that can agree with it is zero.
+        None => 0,
+    };
+    // Widening the owner's derived length back to `u64` is lossless, so it can
+    // never turn a real frontier into a claim that appears to agree with it.
+    let observed = observed as u64;
+    if ports.suspended_count != observed {
+        return Err(KernelCaptureError::OwnerEvidenceInvalid(format!(
+            "capture.suspended_count {} does not match the ORS owner's validated suspended frontier of {observed} entries",
+            ports.suspended_count
+        )));
+    }
+    Ok(())
 }
 
 /// One disposition for every member an OWNER declared, read from that owner's

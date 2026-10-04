@@ -5390,6 +5390,40 @@ pub struct PreparedMaintenanceAdmission {
     pub decision_ref: String,
 }
 
+/// The custody identity of one maintenance scope reference.
+///
+/// A maintenance scope reference names the resource INSTANCE a job ran
+/// against, so it carries that instance's resource generation:
+/// `service:lineage@sequence:generation`. Custody, though, is held by the
+/// resource and not by one generation of it, so the conflict guard in
+/// `adopt_maintenance_admission` has to compare everything except the
+/// generation.
+///
+/// Comparing the full reference instead - which is what this cell did - makes
+/// the guard unable to fire for exactly the case it exists for: when the
+/// resource generation advances, the older job's reference necessarily carries
+/// the OLD generation, so `prior.scope_ref == prepared.scope_ref` is false and
+/// a new `MaintenanceJob` is admitted while the older job's effects are still
+/// unsettled and its resource custody unreleased. The obligation this guard
+/// carries is explicit that "a generation change invalidates old applicability
+/// but does not settle an older job's possible effects or release its resource
+/// custody; reconcile that obligation before allowing conflicting work."
+///
+/// Only a trailing all-digit segment is treated as the generation. A reference
+/// in any other shape is returned unchanged, so an unrecognised spelling keeps
+/// comparing exactly as before rather than being silently widened into a
+/// broader custody claim.
+fn maintenance_custody_scope(scope_ref: &str) -> &str {
+    let Some((head, generation)) = scope_ref.rsplit_once(':') else {
+        return scope_ref;
+    };
+    if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
+        head
+    } else {
+        scope_ref
+    }
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
@@ -5497,6 +5531,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Retains one admitted activation receipt in the existing Skill lifecycle
+    /// owner and returns its resulting position.
+    ///
+    /// The activation counterpart of [`Self::record_skill_execution_evidence`],
+    /// and a narrow write seam for the same reason: no unrestricted
+    /// `owners_mut` exists, so admitting a Skill activation without retaining
+    /// its receipt would have to go through this one method too. Without it the
+    /// stored view's `attempt_receipts` was always empty (issue #2663,
+    /// audit 5856960648 item C5).
+    ///
+    /// This is an in-process owner write. It does not imply durable
+    /// persistence or restart recovery for the observation, exactly as for the
+    /// execution-evidence seam above.
+    #[allow(clippy::result_large_err)]
+    pub fn record_skill_activation_attempt(
+        &mut self,
+        receipt: &eliot_skill::SkillHarnessActivationReceipt,
+    ) -> Result<SkillLifecycleView, eliot_skill::SkillError> {
+        self.owners.skill.record_activation_attempt(receipt)
+    }
+
     /// Prepares this composition's existing maintenance admission under its
     /// current state and fence (issue #1693).
     ///
@@ -5581,7 +5636,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `Completed`, `Failed`) releases its scope. Any other prior job for the
     /// same family and scope — an older generation's unsettled effects as much
     /// as a same-generation duplicate — is refused until that obligation is
-    /// reconciled.
+    /// reconciled. "Same scope" here is the custody scope compared by
+    /// [`maintenance_custody_scope`], which is the scope reference without its
+    /// resource generation: comparing the full reference made this guard
+    /// unreachable for an older generation, which is the case it names.
     ///
     /// # Errors
     ///
@@ -5628,7 +5686,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     | MaintenanceJobState::Completed
                     | MaintenanceJobState::Failed
             );
-            if prior.family == prepared.family && prior.scope_ref == prepared.scope_ref && !settled
+            if prior.family == prepared.family
+                && maintenance_custody_scope(&prior.scope_ref)
+                    == maintenance_custody_scope(&prepared.scope_ref)
+                && !settled
             {
                 return Err(CompositionError::Recovery(
                     "an older maintenance job for this family and scope is not settled: reconcile its effects and release its resource custody before admitting conflicting work"
@@ -10076,6 +10137,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///   for owner readback.
     /// - Changed content under the retained transition identity returns
     ///   `IdentityConflict` before transport.
+    /// - The exact request is retained before transport, including when the
+    ///   port refuses or returns invalid evidence. No acknowledgement can
+    ///   leave that operation identity available for different content.
     /// - An `UnknownOutcome` retains the exact request with its owner snapshot
     ///   until exact reconciliation; the crossing stays unadmitted, never
     ///   active.
@@ -10090,6 +10154,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let port = self.authority_port()?;
         let presented = PresentedAuthorityRequest::RootTransition(Box::new(request.clone()));
         let retained_receipt = self.require_admissible_transition(&presented)?;
+        self.retain_presentation(presented.clone())?;
         let receipt = match port.activate_root_transition(request) {
             Ok(receipt) => receipt,
             Err(P07PortError::UnknownOutcome { snapshot_id }) => {
@@ -14221,9 +14286,101 @@ mod tests {
 
         fn activate_root_transition(
             &self,
-            _request: &eliot_authority::RootTransitionActivationRequest,
+            request: &eliot_authority::RootTransitionActivationRequest,
         ) -> Result<eliot_authority::RootTransitionActivationReceipt, P07PortError> {
-            Err(P07PortError::Unavailable)
+            match self.behavior.lock().expect("script lock").clone() {
+                ScriptedAuthorityBehavior::UnknownAck => Err(P07PortError::UnknownOutcome {
+                    snapshot_id: request.snapshot_id().clone(),
+                }),
+                _ => Err(P07PortError::Unavailable),
+            }
+        }
+    }
+
+    fn root_transition_request_fixture(fence: &StateFence) -> RootTransitionActivationRequest {
+        let record = eliot_authority::RootTransitionRecord {
+            transition_id: "transition:test".to_owned(),
+            operation_id: "operation:root-transition".to_owned(),
+            idempotency_key: "idempotency:root-transition".to_owned(),
+            parent_grant_id: "grant-parent".to_owned(),
+            child_grant_id: "grant-child".to_owned(),
+            parent_grant_commitment: "a".repeat(64),
+            child_grant_commitment: "b".repeat(64),
+            from_authority_root_ref: "authority:parent-root".to_owned(),
+            to_authority_root_ref: "authority:child-root".to_owned(),
+            issuer: "principal:issuer".to_owned(),
+            graph_snapshot_id: "snap-1".to_owned(),
+            predecessor_graph_revision: 1,
+            expected_next_graph_revision: 2,
+            admitted_at_revision: 2,
+            policy_revision: "policy:1".to_owned(),
+            deadline_unix_ms: 1_900_000_000_000,
+            effect_ceiling: EffectClass::ReversibleMutation,
+            semantic_decision_ref: "decision:root-transition".to_owned(),
+            binding: grant_activation_fixture("grant-parent", fence).binding,
+        };
+        let subject = eliot_receipts::AuthorityRequestSubject::new(
+            "principal:issuer",
+            "session:test",
+            "scope:test",
+        )
+        .expect("structural subject");
+        // Structural test input only: this fixture issues no decision or
+        // receipt, and cannot establish an admitted graph crossing.
+        RootTransitionActivationRequest::new(record, subject).expect("structural request")
+    }
+
+    #[test]
+    fn root_transition_keeps_exact_identity_after_transport_failure() {
+        for behavior in [
+            ScriptedAuthorityBehavior::Unavailable,
+            ScriptedAuthorityBehavior::UnknownAck,
+        ] {
+            let observed = snapshot();
+            let fence = observed.state_fence();
+            let expected =
+                KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+            let script = Arc::new(ScriptedAuthorityPort {
+                behavior: Mutex::new(behavior.clone()),
+            });
+            let mut composition = GovernorComposition::new(
+                Arc::new(fake_kernel(observed)),
+                Some(script),
+                &expected,
+                QueueLimits::default(),
+            )
+            .expect("composition");
+            let request = root_transition_request_fixture(&fence);
+            let expected_state = match behavior {
+                ScriptedAuthorityBehavior::UnknownAck => AuthorityPresentationState::UnknownOutcome,
+                _ => AuthorityPresentationState::Pending,
+            };
+            for _ in 0..2 {
+                assert!(matches!(
+                    composition.activate_root_transition(&request),
+                    Err(CompositionError::Authority(
+                        P07PortError::Unavailable | P07PortError::UnknownOutcome { .. }
+                    ))
+                ));
+                let retained = composition
+                    .authority_presentations
+                    .get(&request.ledger_key())
+                    .expect("request retained before transport");
+                assert_eq!(
+                    retained.request(),
+                    &PresentedAuthorityRequest::RootTransition(Box::new(request.clone()))
+                );
+                assert_eq!(retained.state(), &expected_state);
+                assert!(retained.transition_receipt().is_none());
+            }
+            let mut changed = request.record().clone();
+            changed.to_authority_root_ref = "authority:changed-root".to_owned();
+            let changed = RootTransitionActivationRequest::new(changed, request.subject().clone())
+                .expect("changed structural request");
+            assert!(matches!(
+                composition.activate_root_transition(&changed),
+                Err(CompositionError::Authority(P07PortError::IdentityConflict))
+            ));
         }
     }
 
@@ -14771,5 +14928,56 @@ mod tests {
             binding.binding_digest, mutated_binding.binding_digest,
             "invocation change must move the binding digest"
         );
+    }
+
+    /// AUD3 (#1693): the conflict guard compared the FULL scope reference,
+    /// which embeds the resource generation, so it could never fire for the
+    /// cross-generation case it names: the older job necessarily carries the
+    /// old generation, the two references differ, and a new job was admitted
+    /// while the older job's effects were unsettled and its custody unreleased.
+    ///
+    /// The custody scope is the reference without its generation, so an older
+    /// generation's unsettled job now conflicts exactly as a same-generation
+    /// duplicate does.
+    #[test]
+    fn maintenance_custody_scope_ignores_only_the_resource_generation() {
+        let older = "eliotd:lineage-primary@7:41";
+        let newer = "eliotd:lineage-primary@7:42";
+        assert_ne!(
+            older, newer,
+            "the fixture must really differ by generation, or this row proves nothing"
+        );
+        assert_eq!(
+            maintenance_custody_scope(older),
+            maintenance_custody_scope(newer),
+            "an older generation's job holds the same resource custody as the new one"
+        );
+
+        // A different lineage or a different epoch sequence is a DIFFERENT
+        // resource, so its custody must not be folded into this one.
+        assert_ne!(
+            maintenance_custody_scope(older),
+            maintenance_custody_scope("eliotd:lineage-other@7:41"),
+            "another lineage holds its own custody"
+        );
+        assert_ne!(
+            maintenance_custody_scope(older),
+            maintenance_custody_scope("eliotd:lineage-primary@8:41"),
+            "another epoch sequence holds its own custody"
+        );
+
+        // A reference in an unrecognised shape compares exactly as before: it is
+        // never silently widened into a broader custody claim.
+        for unrecognised in [
+            "scope-without-a-generation",
+            "service:lineage@7:not-a-number",
+            "service:lineage@7:",
+        ] {
+            assert_eq!(
+                maintenance_custody_scope(unrecognised),
+                unrecognised,
+                "an unrecognised scope spelling must keep comparing exactly"
+            );
+        }
     }
 }

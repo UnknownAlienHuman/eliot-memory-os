@@ -6393,7 +6393,8 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "a".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest()?.digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -7277,7 +7278,7 @@ mod tests {
     /// Pinned digest of the Governor chain envelope, asserted independently
     /// by `eliot-canonical` (see its `golden_chain_envelope` test).
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "8914234dc11ebe11fceea995149accadf22a51e1cb8ac242a39e676873fe9f71";
 
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
@@ -7321,7 +7322,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest.digest.clone(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
@@ -7332,7 +7334,7 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: vec![EventId::new("event-golden-chain-1")?],
-                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                projection_kinds: vec!["CurrentEpistemicPosition".to_owned()],
                 relation_kinds: vec!["relation-golden-chain-1".to_owned()],
             },
             security: eliot_store_api::SecurityContext::default(),
@@ -7970,7 +7972,8 @@ mod tests {
             reason: "user requested deletion".to_owned(),
             requester: "user:test".to_owned(),
             approval_refs: approvals,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: erasure_set_digest()?,
             security: eliot_store_api::SecurityContext::default(),
             event_projection_relation_intents: EventProjectionRelationIntents {
@@ -8244,7 +8247,8 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: class,
             requested_effect_ceiling: effect,
-            admission_contract_set_digest: "a".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).

@@ -15,13 +15,20 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 use crate::EngineError;
-use eliot_types::{AdapterCapability, CapabilityManifest};
+use crate::runtime_supervision::AdapterExecutionContext;
+use eliot_store::BlobStore;
+use eliot_types::{
+    AdapterCapability, AdapterClass, AdapterHealth, AdapterLimits, AdapterRequest, AdapterResult,
+    AdapterResultStatus, CapabilityManifest,
+};
 
 use super::adapter_rejected;
-use super::{Adapter, AdapterRegistryReport, AdapterSupervisor};
 use super::{
-    HealthAdapter, TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter,
+    Adapter, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture, HealthAdapter,
+    ProcessAdapter, ProcessAdapterConfig, ProcessDispatchPort, TestEchoAdapter, TestFailingAdapter,
+    TestLargeOutputAdapter, TestSlowAdapter,
 };
+use super::{healthy, manifest, rejected_result};
 
 #[derive(Clone)]
 pub struct AdapterRegistry {
@@ -42,6 +49,25 @@ impl AdapterRegistry {
         registry.register(TestFailingAdapter::new())?;
         registry.register(TestSlowAdapter::new())?;
         registry.register(TestLargeOutputAdapter::new())?;
+        registry.register(TestNoResultsAdapter::new())?;
+        Ok(registry)
+    }
+
+    /// `builtin()` plus one registered deterministic process adapter.
+    ///
+    /// This is the registration path issue #1819 A1 names. It is separate from
+    /// [`Self::builtin`] on purpose: `builtin()` has no Blob Store and no Kernel
+    /// process dispatch port, and inventing a default executable for it would be
+    /// inventing a contract. The two are supplied here, by the owner that has
+    /// them, and the adapter is then registered like every other adapter, so it
+    /// receives its own queue, concurrency budget, circuit and output limits.
+    pub fn builtin_with_process(
+        config: ProcessAdapterConfig,
+        dispatch: Arc<dyn ProcessDispatchPort>,
+        blob_store: Arc<BlobStore>,
+    ) -> Result<Self, EngineError> {
+        let mut registry = Self::builtin()?;
+        registry.register(ProcessAdapter::new(config, dispatch, blob_store))?;
         Ok(registry)
     }
 
@@ -149,5 +175,73 @@ impl AdapterRegistry {
 impl Default for AdapterRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Semantic no-results builtin: `I10.17` fixes semantic `no results` as an outcome distinct
+/// from transport/integrity failure, so this adapter reports `NoResults` without ever
+/// counting toward the circuit breaker.
+pub struct TestNoResultsAdapter {
+    manifest: CapabilityManifest,
+}
+
+impl TestNoResultsAdapter {
+    pub fn new() -> Self {
+        Self {
+            manifest: manifest(
+                "test-no-results",
+                "Test No Results Adapter",
+                AdapterClass::InternalTest,
+                vec![
+                    AdapterCapability::HealthCheck,
+                    AdapterCapability::ExecuteTest,
+                ],
+                AdapterLimits::default(),
+            ),
+        }
+    }
+}
+
+impl Default for TestNoResultsAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Adapter for TestNoResultsAdapter {
+    fn id(&self) -> &str {
+        &self.manifest.adapter_id
+    }
+
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    fn health(&self) -> BoxAdapterFuture<'_, AdapterHealth> {
+        Box::pin(async move {
+            Ok(healthy(
+                &self.manifest,
+                "test no results adapter registered",
+            ))
+        })
+    }
+
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        _context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
+        Box::pin(async move {
+            Ok(rejected_result(
+                &request,
+                AdapterResultStatus::NoResults,
+                "no_results",
+                "intentional semantic no-results response",
+            ))
+        })
+    }
+
+    fn shutdown(&self) -> BoxAdapterFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
 }

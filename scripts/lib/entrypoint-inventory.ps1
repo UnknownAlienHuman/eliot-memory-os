@@ -100,6 +100,54 @@ function Get-EnvMember([object]$JsonObject) {
     return $null
 }
 
+<#
+.SYNOPSIS
+Classify whether a declared launch command names a concrete artifact or only a
+placeholder the host is expected to expand at install time.
+
+.DESCRIPTION
+A command that still carries an expansion marker is not an observed installed
+command. It is a DESIRED INPUT recorded in a source template: only the host's own
+installed configuration can say what the marker resolved to, which file it named,
+and whether that file exists with the approved digest. Recording such a command as
+an observed installed disposition claims an installation fact this function never
+read, so the placeholder forms are reported as UNRESOLVED_TEMPLATE_INPUT and the
+evidence class is stated as source-template rather than installed.
+
+Markers recognised: shell/host expansion sigils (`$`, `%`, `{env:...}`) and the
+`${CLAUDE_PLUGIN_ROOT}` / `${PLUGIN_ROOT}` plugin-root placeholders.
+#>
+function Get-EntrypointCommandResolution([string]$Command) {
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        return [ordered]@{
+            state = 'ABSENT'
+            resolved_command = $null
+            detail = 'No command is declared for this surface.'
+        }
+    }
+    $markers = [System.Collections.Generic.List[string]]::new()
+    if ($Command -match '\$') { $markers.Add('$') }
+    if ($Command -match '%') { $markers.Add('%') }
+    if ($Command -match '\{env:[^}]+\}') { $markers.Add('{env:...}') }
+    if ($Command -match '\$\{[A-Za-z_][A-Za-z0-9_]*\}') { $markers.Add('${...}') }
+    if ($markers.Count -gt 0) {
+        return [ordered]@{
+            state = 'UNRESOLVED_TEMPLATE_INPUT'
+            resolved_command = $null
+            detail = ("Declared command still carries an expansion marker (" + ($markers -join ', ') +
+                '). This is a desired source-template input, not an observed installed command: the ' +
+                'value, existence, absolute path, installation owner and digest of the referenced ' +
+                'executable and client declaration are NOT read by this inventory and must be proved ' +
+                'by the installed host configuration readback.')
+        }
+    }
+    return [ordered]@{
+        state = 'LITERAL'
+        resolved_command = $Command
+        detail = 'Declared command is a literal path with no expansion marker; its existence and digest are still proved only by the installed readback.'
+    }
+}
+
 function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceCommit, [string]$BundleRoot, [object]$FrontDoorBridge) {
     if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
         throw 'entrypoint inventory requires the repository root'
@@ -148,17 +196,25 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     if (($claudeArgs -join "`0") -cne ($claudeExpectedArgs -join "`0")) {
         throw 'Claude Code MCP server argv drifted from the inventoried bytes: integrations/claude/eliot/.mcp.json'
     }
+    # ${CLAUDE_PLUGIN_ROOT} is expanded by the installed Claude plugin at launch
+    # time. This function reads the source template, not the installed plugin
+    # root, so the command is recorded as an unresolved template input rather than
+    # an observed installed command.
+    $claudeResolution = Get-EntrypointCommandResolution ([string]$claudeServer.command)
     $claudeBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches ${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
         entrypoint = 'Claude Code MCP stdio profile SPINE_FUNCTIONAL'
         cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/claude/eliot/.mcp.json'
         packaged_config = $null
-        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the Claude plugin install, not the Windows bundle.'
+        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the Claude plugin install, not the Windows bundle. This is a SOURCE TEMPLATE, not the installed plugin root.'
         source_sha256 = [string]$claudeMcp.sha256
         source_bytes = [int64]$claudeMcp.bytes
         staged_sha256 = $null
         staged_bytes = $null
+        command_resolution_state = [string]$claudeResolution.state
+        command_resolution_detail = [string]$claudeResolution.detail
+        installed_command_observed = ([string]$claudeResolution.state -eq 'LITERAL')
         command = [string]$claudeServer.command
         args = @($claudeArgs)
         configured_environment = Get-EnvMember $claudeServer
@@ -246,20 +302,34 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     if (($opencodeCommand -join "`0") -cne ($opencodeExpected -join "`0")) {
         throw 'OpenCode MCP server command drifted from the inventoried bytes: integrations/opencode/opencode.json'
     }
+    # The OpenCode command names the Bridge executable only through a host
+    # environment marker. Nothing here reads the merged user config or the
+    # environment, so the marker is recorded as an unresolved template input and
+    # the surface is NOT reported as an observed installed disposition.
+    $opencodeResolution = Get-EntrypointCommandResolution ([string]$opencodeCommand[0])
+    $declarationArg = @($opencodeCommand | Where-Object { [string]$_ -match 'client-declaration' })
+    $declarationValue = if ($declarationArg.Count -gt 0) { [string]$opencodeCommand[$opencodeCommand.Count - 1] } else { $null }
+    $declarationResolution = Get-EntrypointCommandResolution $declarationValue
     $opencodeBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches the installation-owned Bridge executable resolved through {env:ELIOT_AGENT_BRIDGE_EXE} with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration {env:ELIOT_AGENT_BRIDGE_DECLARATION}); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
         entrypoint = 'OpenCode MCP stdio profile SPINE_FUNCTIONAL'
         cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/opencode/opencode.json'
         packaged_config = $null
-        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the OpenCode host install, not the Windows bundle.'
+        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the OpenCode host install, not the Windows bundle. This is a SOURCE TEMPLATE, not the merged installed user configuration.'
         source_sha256 = [string]$opencode.sha256
         source_bytes = [int64]$opencode.bytes
         staged_sha256 = $null
         staged_bytes = $null
         command = [string]$opencodeCommand[0]
+        command_resolution_state = [string]$opencodeResolution.state
+        command_resolution_detail = [string]$opencodeResolution.detail
+        client_declaration = $declarationValue
+        client_declaration_resolution_state = [string]$declarationResolution.state
+        client_declaration_resolution_detail = [string]$declarationResolution.detail
+        installed_command_observed = ($opencodeResolution.state -eq 'LITERAL' -and $declarationResolution.state -eq 'LITERAL')
         args = @($opencodeCommand | Select-Object -Skip 1)
-        configured_environment = 'No MCP env member; command resolves the Bridge executable through ELIOT_AGENT_BRIDGE_EXE and the client declaration through ELIOT_AGENT_BRIDGE_DECLARATION.'
+        configured_environment = 'No MCP env member in the tracked template; the template resolves the Bridge executable through ELIOT_AGENT_BRIDGE_EXE and the client declaration through ELIOT_AGENT_BRIDGE_DECLARATION. Neither variable is read, resolved or digest-checked here.'
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
         behavior = $opencodeBehavior
         canonical_route = 'OpenCode agent-bridge declaration and Kernel canonical configuration route.'

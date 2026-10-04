@@ -175,12 +175,16 @@ impl fmt::Display for SessionRole {
 /// is immutable after pool construction.
 struct SessionSlot {
     cell: OnceCell<RpcSession>,
+    /// Per-role request deadline for every session this slot will ever
+    /// connect (issue #1933). Immutable with the slot.
+    request_timeout: Duration,
 }
 
 impl SessionSlot {
-    fn new() -> Self {
+    fn new(request_timeout: Duration) -> Self {
         Self {
             cell: OnceCell::new(),
+            request_timeout,
         }
     }
 }
@@ -294,13 +298,28 @@ impl SessionPool {
             limits.admin_sessions() as usize,
         ];
         let connect_timeout = Duration::from_millis(owner.config.connect_timeout_ms.max(1));
+        // Per-role REQUEST deadlines (issue #1933, blocking defect 4).
+        //
+        // These are the same admitted per-class deadlines the bridge's
+        // `ClientSetPolicy` publishes: read and normal-write classes are
+        // bounded by the configured query timeout, and the isolated
+        // health/admin class by the configured connect timeout. Before this,
+        // every session of every role applied the single generic query
+        // timeout, so a health/readiness probe ran under a deadline nobody had
+        // admitted for it and the three class deadline fields controlled no
+        // physical request at all.
+        let request_timeouts = [
+            Duration::from_millis(owner.config.query_timeout_ms.max(1)),
+            Duration::from_millis(owner.config.query_timeout_ms.max(1)),
+            Duration::from_millis(owner.config.connect_timeout_ms.max(1)),
+        ];
         let mut slots = Vec::with_capacity(counts.iter().sum());
         let mut roles = Vec::with_capacity(SessionRole::ALL.len());
         let mut role_base = [0usize; 3];
         for (index, count) in counts.iter().enumerate() {
             role_base[index] = slots.len();
             for _ in 0..*count {
-                slots.push(SessionSlot::new());
+                slots.push(SessionSlot::new(request_timeouts[index]));
             }
             roles.push(RoleState::new(*count));
         }
@@ -407,7 +426,9 @@ impl SessionPool {
         let deadline = Instant::now() + self.inner.connect_timeout;
         if let Err(error) = slot
             .cell
-            .get_or_try_init(|| RpcSession::connect(&self.inner.owner, deadline))
+            .get_or_try_init(|| {
+                RpcSession::connect(&self.inner.owner, deadline, slot.request_timeout)
+            })
             .await
         {
             self.return_unchecked_slot(role, index);
@@ -1211,7 +1232,7 @@ mod pool_behavior_tests {
         let mut probed = h
             .transport()
             .query_admin(
-                "proof.987.admin_dispatch",
+                "read.schema_generation",
                 "RETURN $value;",
                 Map::from_iter([("value".into(), Value::String("admin-lane".into()))]),
             )

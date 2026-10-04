@@ -557,10 +557,13 @@ fn dreamer_pause_refusal(
             detail: format!(
                 "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
                  its ledger record is ordered inside, so its coverage by the open \
-                 unknown-commit record set observed at revision {} cannot be proven and \
-                 dependent durable admission stays closed",
+                 unknown-commit record set observed at owner-issued family revision {} cannot \
+                 be proven and dependent durable admission stays closed",
                 proof.rendered(),
-                observed.binding().revision
+                observed
+                    .binding()
+                    .revision
+                    .map_or_else(|| "unreadable".to_owned(), |revision| revision.to_string())
             ),
         });
     }
@@ -7846,7 +7849,17 @@ impl KernelStoreGateway {
         // permitting it. `Self::paused_ordering_scopes` is the visible
         // Problem State; this reads the same checked observation as the
         // admission input, not the display projection.
-        if effect == DreamerOperationEffect::Mutation {
+        //
+        // The observation's owner-issued family revision is carried out of the
+        // gate and re-read from ORS immediately before the send. A family that
+        // moved past the revision this clearance was decided under means a pause
+        // was published after the read that cleared this operation, so the
+        // clearance is stale and the send is refused rather than dispatched on
+        // it. This is the durable counterpart of the mirror's local
+        // newer-entry rule: because the revision is the owner's own counter,
+        // it also catches a pause published by another gateway or process,
+        // which an in-process counter never could.
+        let cleared_pause_revision = if effect == DreamerOperationEffect::Mutation {
             let observed = self.paused_scopes.observe(self.commit_ors.as_deref());
             if let Some(error) = observed.unavailable_error() {
                 return Err(error.into());
@@ -7854,6 +7867,21 @@ impl KernelStoreGateway {
             if let Some(refusal) = dreamer_pause_refusal(&observed, &identity, &scope_proof, effect)
             {
                 return Err(refusal.into());
+            }
+            observed.binding().revision
+        } else {
+            None
+        };
+        if let (Some(cleared), Some(ors)) = (cleared_pause_revision, self.commit_ors.as_deref()) {
+            let current = ors
+                .unknown_commit_recovery_revision()
+                .map_err(|error| DreamerJobGatewayError::GatewayRefusal(error.to_string()))?;
+            if current != cleared {
+                return Err(DreamerJobGatewayError::GatewayRefusal(format!(
+                    "the unknown-commit pause family moved from revision {cleared} to {current} \
+                     after this mutation was cleared, so the clearance is stale and no send was \
+                     dispatched"
+                )));
             }
         }
         let result = match self.store.dreamer_job_recovery(context, request).await {
@@ -8112,7 +8140,21 @@ impl KernelStoreGateway {
             // Missing, unavailable or inconclusive: the record and its pauses
             // stay unresolved. No resend, no rollback, no false no-effect.
             Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
-                self.paused_scopes.record_paused(ordering_scopes, key);
+                // The record stays OPEN here, so no new stage advanced the
+                // family; the stamp is the owner-issued revision as it stands,
+                // which still orders this pause against any scan read before it.
+                if let Some(ors) = self.commit_ors.as_deref() {
+                    let revision = ors.unknown_commit_recovery_revision().map_err(|error| {
+                        CommitRecoveryError::OrsUnavailable {
+                            detail: format!(
+                                "the unknown-commit family revision could not be read while \
+                                 stamping a pause that is already durable: {error}"
+                            ),
+                        }
+                    })?;
+                    self.paused_scopes
+                        .record_paused(revision, ordering_scopes, key);
+                }
                 return Ok(());
             }
             // A substituted receipt or a digest divergence is a conflict and
@@ -8609,8 +8651,15 @@ impl KernelStoreGateway {
         let record = open_record_for(identity, ordering_scopes)?;
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
         // Only a durably staged record marks a scope paused, and the mirror
-        // keeps the pausing key with the entry.
-        self.paused_scopes.record_paused(ordering_scopes, key);
+        // keeps the pausing key with the entry. The stamp is the owner-issued
+        // family revision that stage advanced to, read back from ORS rather
+        // than minted here, so a release decided on an older revision cannot
+        // erase this pause.
+        let staged_revision = ors
+            .unknown_commit_recovery_revision()
+            .map_err(ors_unavailable)?;
+        self.paused_scopes
+            .record_paused(staged_revision, ordering_scopes, key);
         Ok(DreamerCommitUncertain::UnknownCommitOpen {
             idempotency_key: key.to_owned(),
             paused_scopes: ordering_scopes.to_owned(),

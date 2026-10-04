@@ -21,6 +21,56 @@ use eliot_researcher::{
 
 const GOLDEN: &str = include_str!("data/evidence_portfolio.json");
 
+#[test]
+fn raw_source_derivation_requires_its_own_admitted_identity() {
+    use eliot_researcher::source_admissibility::{admits_record_reference, record_references};
+
+    let raw_source = "eliot://evidence/raw-parent";
+    let mut params = source_params("derived-source");
+    params.transformed_from = Some(raw_source.to_owned());
+    params.transform_verified = true;
+    let derived = SourceRecord::new(params).expect("vetted derived record");
+    let references = record_references(&derived);
+    let derivation = references
+        .iter()
+        .find(|reference| reference.reference == raw_source)
+        .expect("derivation participates in both eligibility and diagnostic gates");
+    assert_eq!(derivation.surface.wire_name(), "raw_source_derivation");
+
+    let mut allowed = eliot_researcher::manifest(
+        "derivation-run",
+        fence(),
+        vec![derived.handle.clone()],
+        "root-revision-1",
+        "propulsion",
+        "project",
+    )
+    .expect("sealed reference manifest");
+    allowed.validate().expect("valid run-bound manifest");
+    assert!(!admits_record_reference(derivation, &allowed));
+    allowed.url_handles.push(raw_source.to_owned());
+    allowed = allowed.seal().expect("URL-only manifest");
+    allowed.validate().expect("valid URL-only manifest");
+    assert!(!admits_record_reference(derivation, &allowed));
+    allowed.source_handles.push(raw_source.to_owned());
+    allowed = allowed.seal().expect("admitted raw source identity");
+    allowed
+        .validate()
+        .expect("valid raw source identity manifest");
+    assert!(admits_record_reference(derivation, &allowed));
+    allowed.stale_or_revoked_handles.push(raw_source.to_owned());
+    allowed = allowed.seal().expect("revoked raw source identity");
+    allowed.validate().expect("valid revoked manifest");
+    assert!(!admits_record_reference(derivation, &allowed));
+
+    let original = SourceRecord::new(source_params("original-source")).expect("raw record");
+    assert!(
+        record_references(&original)
+            .iter()
+            .all(|reference| reference.surface.wire_name() != "raw_source_derivation")
+    );
+}
+
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 

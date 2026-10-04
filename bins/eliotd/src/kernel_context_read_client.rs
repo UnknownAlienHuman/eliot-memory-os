@@ -86,13 +86,13 @@ use eliot_context_candidates::{
     ProjectionSchema, ProjectionState as CandidateProjectionState, construct_context_candidates,
 };
 use eliot_context_contracts::{
-    AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
-    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, ResolvedContextRecipe,
-    SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
-    canonical_render_serializer,
+    AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionResult,
+    AdmissionRuleIdentity, AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding,
+    ContextError, ContextOutcome, ContextRecipe, DecisionContextIncomplete,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger,
+    HeadroomDimension, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
+    QualityRefusal, QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
@@ -102,7 +102,8 @@ use eliot_governor::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
     KernelGenerationSnapshotProvider, KernelPortError, ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT,
     ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
-    ROLE_TASK_FRAME, SevenRoleInputs,
+    ROLE_TASK_FRAME, SelectionChainError, SelectionStageObservation, SevenRoleInputs,
+    prepare_selection_chain, seal_delivered_packet,
 };
 use eliot_improvement::PresentedLearning;
 use eliot_kernel_core::module::control_reserve_front_door::ControlReleaseEvidence;
@@ -114,6 +115,9 @@ use eliot_protocol::{
 use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService};
 use eliot_runtime_contracts::{
     CapacityBottleneck, CapacityPermitBinding, frozen_bottleneck_owner_map,
+};
+use eliot_security_contracts::{
+    SelectionChainSeal, SelectionInfluenceState, SelectionIntegrityReceipt, SelectionStageKind,
 };
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignSourceRevisionLookup, CanonicalReadClient,
@@ -1454,6 +1458,18 @@ pub enum PacketCompositionError {
     /// never stripped or reclassified to make the ordinary path apply.
     #[error("packet admission needs the composed learning-and-headroom entry: {0}")]
     ComposedAdmissionEntryMissing(&'static str),
+    /// #1728: the immutable selection chain for this compilation could not be
+    /// prepared or sealed from the facts the recorded admission decision and
+    /// the delivered packet actually carry.
+    ///
+    /// The chain is the delivery's evidence, not decoration on it: I12.13 makes
+    /// an uninstrumented or truncated membership history an explicit chain gap,
+    /// never an inferred-safe one. A packet whose history cannot be recorded is
+    /// therefore not handed back as a fully evidenced normal packet at all. The
+    /// Governor's own typed refusal crosses this boundary wrapped, so the exact
+    /// failed binding stays distinguishable; nothing is collapsed into a string.
+    #[error("packet selection chain refused: {0}")]
+    SelectionChain(Box<SelectionChainError>),
 }
 
 /// Why the live resource-owner join for one packet's headroom was refused.
@@ -1887,6 +1903,53 @@ pub struct PacketAdmissionParts {
     pub measurements: Vec<AdmissionMeasurement>,
 }
 
+/// The immutable selection-chain evidence one packet compilation produced.
+///
+/// #1728 (I12.13 `Selection integrity`): every membership-changing
+/// transformation — ranking, pruning, deduplication, summarization, context
+/// compilation and export — appends an immutable stage to ONE chain receipt, and
+/// the chain's final output is sealed against the exact delivered bytes. This is
+/// that one chain, built here from the admission decision this compilation
+/// actually recorded plus the bytes it actually emitted, and returned before this
+/// composition returns. I12.13's requirement that a stage APPEND rather than
+/// overwrite is satisfied by ordering: this stage is appended after the owner's
+/// admission stage and never restates or edits it.
+///
+/// It is evidence, not authority, and it is not durable by being computed. This
+/// module owns no Store, no transport and no write capability, so nothing here is
+/// appended here and nothing here is committed. A caller that wants the chain in
+/// canonical state drives these values through the ONE existing Kernel-fenced
+/// canonical write path — `eliot_governor::drive_selection_chain`, or the
+/// `eliot_governor::selection_chain_envelope` /
+/// `eliot_governor::commit_selection_chain` pair it wraps — supplying the
+/// `RequestIdentity` and the chain head it observed, neither of which this
+/// read-side composition can invent. No second audit database and no new append
+/// path is introduced.
+pub struct PacketSelectionChain {
+    /// The one append-only chain: the initial candidate set as it stood *before*
+    /// admission could alter it, the admission/prune boundary that recorded every
+    /// removal with the admission owner's own omission reason, and the
+    /// context-compilation/export boundary whose output is the delivered packet.
+    ///
+    /// `chain_untrusted_influence` is the maximum over those stages, so the
+    /// admission stage's `Unknown` survives this boundary instead of being
+    /// laundered by a later deterministic stage, and the packet's claim ceiling
+    /// read from this chain is lowered accordingly.
+    pub receipt: SelectionIntegrityReceipt,
+    /// The seal binding this chain to the exact delivered packet bytes and the
+    /// exact expansion handles that travelled with them.
+    pub seal: SelectionChainSeal,
+    /// The expansion handles the seal was taken against.
+    ///
+    /// These are NOT a membership list and are deliberately not in membership
+    /// order: they are the omission owner's expansion handles, deduplicated and
+    /// sorted here so the seal's own uniqueness rule holds by construction. They
+    /// travel beside the seal rather than inside it because the seal binds their
+    /// identities, not their meaning: the caller that submits the append resolves
+    /// each one through the omission owner that issued it.
+    pub expansion_handle_ids: Vec<String>,
+}
+
 impl PacketAdmissionBundle {
     /// Builds the one validated admission closure for a packet compilation
     /// from owner-minted pieces (#2564 I3).
@@ -2097,17 +2160,24 @@ impl KernelContextReadClient {
     /// ordering reasons that made the previous parameter set unsatisfiable are
     /// gone: the admission closure is closed AFTER the candidate atom set it must
     /// cover exists, and the scorecard is requested AFTER the admitted set it
-    /// grades exists. The production invoker is the campaign packet composition
+    /// grades exists.
+    ///
+    /// The INTENDED production caller is the campaign packet composition
     /// (`bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result`),
-    /// which now holds the admitted binding, the owner recipe, and the
-    /// owner-issued `SafetyFloorIdentity` — the floor is resolved there through
-    /// `eliot_context::campaign_publication::context_safety_floor_identity` and
-    /// checked by this edge's own admission join. The remaining suppliers
-    /// (seven-role acquisitions, candidate policy, priority policy, admission
-    /// rule record, measurement profile, per-atom measurements, quality card,
-    /// assembly policy, measurement callback) are still absent, so the packet
-    /// keeps its unbound-closure gap; the per-identity account is recorded on
-    /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+    /// which is the route that already holds the admitted binding, the owner
+    /// recipe and the owner-issued `SafetyFloorIdentity` — the floor is resolved
+    /// there through `eliot_context::campaign_publication::context_safety_floor_identity`.
+    /// Holding those three is what makes that route the intended caller; it is
+    /// not a claim that the route calls this function. As of this change this
+    /// function has NO production call site anywhere in the tree: the campaign
+    /// route reports `CampaignPacketGapCode::AdmissionClosureUnbound` instead of
+    /// invoking it, because the remaining suppliers (seven-role acquisitions,
+    /// candidate policy, priority policy, admission rule record, measurement
+    /// profile, per-atom measurements, quality card, assembly policy,
+    /// measurement callback) still have no producer there. Whether and when that
+    /// route gains the call is decided and recorded in
+    /// `bins/eliotd/src/campaign_packet.rs`, which owns that decision; it is not
+    /// asserted from here.
     ///
     /// #1869: `presented` is the owner-issued learning authority for THIS
     /// compilation, when the owner issued any. It is the Governor's live
@@ -2255,6 +2325,33 @@ impl KernelContextReadClient {
     /// any backdated one, and `crate::unix_ms` is the same single source the
     /// revalidation already used. No new clock, port or global time source is
     /// introduced.
+    ///
+    /// #1728: the third return value is the packet's own
+    /// [`PacketSelectionChain`] — the one append-only selection chain from the
+    /// initial candidate set, through the admission/prune boundary, to this
+    /// compilation's own context-compilation/export boundary, sealed against the
+    /// exact bytes this function returns. It is produced from the recorded
+    /// [`AdmissionInput`] and [`AdmissionResult`] plus the delivered packet,
+    /// before this function returns, by [`record_packet_selection_chain`].
+    ///
+    /// It is produced here rather than by a later reader because the last stage
+    /// of the chain is a claim about a specific boundary: it names this
+    /// compilation, its measured serializer configuration and the bytes it
+    /// emitted. A consumer holding only the delivered packet cannot recover which
+    /// stage removed a rival, so it cannot author that stage after the fact; it
+    /// can only read the one this boundary recorded. This is a property of what is
+    /// available where, not a claim that this is the only place the chain could
+    /// ever be produced, and it is not a claim that anything has been committed.
+    ///
+    /// The chain is returned as plain values and is not durable by being
+    /// computed: this composition owns no Store, no transport and no write
+    /// capability, so nothing here is appended or committed here. A caller that
+    /// wants it in canonical state submits it through the ONE existing
+    /// Kernel-fenced canonical write path. Nothing in this signature mints Kernel
+    /// semantic authorship, and no unrestricted append path is added.
+    ///
+    /// This function still has no production call site; the chain is evidence a
+    /// caller would carry, not a record any live route writes today.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
@@ -2276,8 +2373,14 @@ impl KernelContextReadClient {
         quality: impl FnOnce(&AdmittedContextSet) -> Result<QualityScorecard, PacketCompositionError>,
         assembly: &AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-    ) -> Result<(ActiveUnderstandingViewResult, MaterialRankTraceDelivery), PacketCompositionError>
-    {
+    ) -> Result<
+        (
+            ActiveUnderstandingViewResult,
+            MaterialRankTraceDelivery,
+            PacketSelectionChain,
+        ),
+        PacketCompositionError,
+    > {
         if seven.scope_id.as_str() != request.binding.scope_id.as_str()
             || seven.state_fence != request.binding.state_fence
         {
@@ -2421,7 +2524,11 @@ impl KernelContextReadClient {
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input, &headroom, presented)?;
+        // #1728: the recorded decision leaves the admission cell as its own
+        // value, not only as its admitted projection, because the selection
+        // chain below is prepared from the decision the owner recorded.
+        let (admitted, delivery, admission_result) =
+            admit_packet_candidates(&input, &headroom, presented)?;
         // The selection happened under the reservation. The revalidation clock
         // is read HERE, after the selection and after the delivery record, and
         // immediately before the revalidation — not precomputed by the caller at
@@ -2454,6 +2561,24 @@ impl KernelContextReadClient {
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         recheck_packet_headroom(&assembled, recipe, &headroom)?;
+        // #1728: the packet's membership history is recorded HERE, while the
+        // facts it binds still exist in this frame: the admission input the
+        // candidate stage produced, the admission decision the admission owner
+        // recorded, and the delivered bytes this compilation emitted. The
+        // per-member removal rows are that owner's rows, taken verbatim from the
+        // recorded decision rather than re-derived from the surviving set, so no
+        // later reader has to guess which stage removed a rival.
+        //
+        // What this call does NOT do is decide anything durable. It computes the
+        // chain and its seal and returns them; committing them is the caller's
+        // decision through the one canonical write path.
+        //
+        // It runs before the headroom release below so a chain refusal keeps the
+        // same held-permit semantics every other refusal on this path already
+        // has: the owner still holds what it issued and terminates it through
+        // its own port.
+        let selection_chain =
+            record_packet_selection_chain(&input, &admission_result, recipe, &assembled)?;
         // Release through the owner's own port. The evidence is DISCARDED here
         // for the same pre-existing reason the Context-side release
         // instructions are: no production caller of this composition consumes a
@@ -2461,7 +2586,7 @@ impl KernelContextReadClient {
         // release — the owner's own release path has already returned every
         // slot — and the capacity is returned through its issuer either way.
         let _released_by_owner = headroom_join.release();
-        Ok((assembled, delivery))
+        Ok((assembled, delivery, selection_chain))
     }
 }
 
@@ -2718,11 +2843,25 @@ fn composition_failure(
 /// reason, plus the visible and suppressed counts and the full rank-trace
 /// handle. [`check_delivered_traces`] binds it to the assembled packet
 /// location; it is never dropped.
+///
+/// #1728: the third return value is the recorded [`AdmissionResult`] itself,
+/// not its admitted projection. `record_packet_selection_chain` prepares the
+/// selection chain from the decision the admission owner recorded, so the
+/// per-material removal reasons and the boundary's own untrusted-influence
+/// statement in that chain are the owner's own rows rather than a second
+/// derivation from the surviving set.
 fn admit_packet_candidates(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
     presented: Option<PresentedLearning<'_>>,
-) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
+) -> Result<
+    (
+        AdmittedContextSet,
+        MaterialRankTraceDelivery,
+        AdmissionResult,
+    ),
+    PacketCompositionError,
+> {
     // #1725 AUD3: the entry is chosen from owner-derived evidence, never assumed.
     // `Some` exists only when the Governor issued a learning admission AND the
     // caller re-verified it live, and `VerifiedLearningAdmission` has a private
@@ -2754,6 +2893,14 @@ fn admit_packet_candidates(
     result
         .validate_for(input)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    // #1728: the RECORDED admission decision itself leaves this function, not
+    // only its admitted projection. The selection chain is prepared from the
+    // `AdmissionResult` the admission owner actually produced — its omission
+    // records, its per-material disposition evidence and its own untrusted
+    // influence statement — and never from a set re-derived here. The clone is
+    // taken after `validate_for`, so the value that leaves is the one whose
+    // contract already holds against this exact `input`.
+    let recorded = result.clone();
     let delivery = MaterialRankTraceDelivery::new(&result, traces)
         .map_err(PacketCompositionError::TraceDelivery)?;
     let admitted = match result.outcome {
@@ -2762,7 +2909,7 @@ fn admit_packet_candidates(
             return Err(PacketCompositionError::AdmissionIncomplete(Box::new(gaps)));
         }
     };
-    Ok((admitted, delivery))
+    Ok((admitted, delivery, recorded))
 }
 
 /// Binds one per-material rank-trace delivery record to the assembled packet.
@@ -2818,6 +2965,182 @@ fn check_delivered_traces(
         return Err(ContextError::SelectionIntegrityMismatch);
     }
     Ok(())
+}
+
+/// Stable stage identity of the context-compilation/export boundary.
+///
+/// `eliot_governor::selection_chain` owns the identities of the two stages it
+/// builds itself (`INITIAL_MEMBERSHIP_STAGE_ID`, `ADMISSION_STAGE_ID`). The
+/// compile stage is different: `prepare_selection_chain` takes its identity as a
+/// caller-supplied fact, precisely because the compilation boundary is the
+/// caller's own and only the caller knows which boundary ran. This constant is
+/// that name, stable across packets so the stage is recognisable in a chain
+/// rather than a fresh anonymous identity per compilation. It is a wiring name,
+/// not a second authority over stage naming.
+const PACKET_COMPILE_STAGE_ID: &str = "eliotd-context-compile";
+
+/// Prepares and seals this compilation's selection chain from the facts it
+/// actually produced (#1728).
+///
+/// The inputs are the recorded decision on both sides of the admission boundary
+/// and the delivered packet, and nothing else:
+///
+/// - `input` is the [`AdmissionInput`] this compilation closed, so the chain's
+///   ordinal-zero stage binds the candidate set as it stood BEFORE admission
+///   could alter it, rather than a set restated afterwards;
+/// - `result` is the [`AdmissionResult`] the admission owner recorded, so the
+///   per-member removal rows, the suppressed/budget omission references and the
+///   admission stage's own untrusted-influence statement are that owner's rows
+///   and not a second derivation from the surviving set;
+/// - `recipe` is the recipe instance both stages ran under;
+/// - `assembled` is the delivered packet, whose measured serializer
+///   configuration and exact serialized bytes are what the final stage names and
+///   what the seal binds.
+///
+/// # What this function does NOT check, and who does
+///
+/// The compile stage below declares that this boundary changed no membership.
+/// That declaration is not re-proved here, because it is already established by
+/// the two owners that own the fact, both of which ran in this composition
+/// before this call:
+///
+/// - `assemble_active_view` builds a `SelectionIntegrityProof` whose
+///   `admitted_ids` are read from the admission owner's own set and whose
+///   `rendered_ids` are read from the projection, then `validate`s it. That
+///   proves exact set equality AND one occurrence per identity, from two
+///   independent projections. `ActiveUnderstandingView::validate_against`
+///   re-checks the same equality against the admitted set directly.
+/// - `ActiveUnderstandingViewResult::verify_boundaries` — called on the line
+///   immediately above this one — proves that every rendered atom's
+///   `source_id`, `source_revision` and `source_digest` equal the recorded
+///   boundary unit's, and that no rendered atom is missing or extra.
+///
+/// A set comparison restated here would be weaker than both: it would compare
+/// `&str` instead of `ArtifactId`, would re-derive a weaker form of the same
+/// equality, and would still not compare revision or representation. It would be
+/// a second place to be wrong about a fact two stricter owners already hold. It
+/// would also guard a list the chain never sees: `prepare_selection_chain` takes
+/// `(input, result, recipe, compile_observation)` and is never handed
+/// `view.rendered`, so the compile stage's output membership is the owner's
+/// derivation from the ADMITTED members, not from the projection. An
+/// ORDER-sensitive comparison here would be wrong rather than merely redundant:
+/// the assembly owner documents that only the recorded order of `admitted_ids`
+/// differs from the presentation order of the projection.
+///
+/// # Errors
+///
+/// Returns [`PacketCompositionError::SelectionChain`] when the chain or the seal
+/// refuses a binding; the Governor's typed [`SelectionChainError`] crosses this
+/// boundary wrapped, so the exact failed binding stays distinguishable. Nothing
+/// here degrades into a partial chain: an uninstrumented or truncated membership
+/// history is an explicit gap, never inferred safe.
+fn record_packet_selection_chain(
+    input: &AdmissionInput,
+    result: &AdmissionResult,
+    recipe: &ContextRecipe,
+    assembled: &ActiveUnderstandingViewResult,
+) -> Result<PacketSelectionChain, PacketCompositionError> {
+    // This boundary's own contribution to the chain is the compile-stage
+    // observation below and the seal over the delivered bytes — nothing else.
+    // `prepare_selection_chain` builds the ordinal-zero and ordinal-one stages
+    // from `input`/`result` and appends this boundary's stage from the
+    // observation, so every value on the following lines is either a fact this
+    // compilation measured or a fact the admission owner recorded.
+    //
+    // The compile stage's disclosure closure is the SAME recipe instance the
+    // admission stage ran under: this compilation admitted and then rendered
+    // inside one recipe, so this is the owner's own re-derivation for both
+    // stages and not a second closure minted here. The recipe was already
+    // validated above, so this recomputation is the value that validation agreed
+    // with rather than a fresh acceptance of an unchecked body.
+    let disclosure_closure_ref = recipe
+        .canonical_policy_digest()
+        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    // The configuration revision of this stage is the serializer triple the
+    // Context render owner ACTUALLY measured these delivered bytes under. A
+    // later reader therefore sees which configuration emitted this packet,
+    // rather than a constant standing in for a configuration nobody ran.
+    let measurement = &assembled.view.measurement;
+    let transformer_identity_and_config_revision = format!(
+        "eliot-context-assembly/assemble_active_view@{}/{}/{}",
+        measurement.serializer_id,
+        measurement.serializer_version,
+        measurement.serializer_options_digest
+    );
+    let observation = SelectionStageObservation {
+        stage_id: PACKET_COMPILE_STAGE_ID,
+        stage: SelectionStageKind::ContextCompile,
+        transformer_identity_and_config_revision: &transformer_identity_and_config_revision,
+        disclosure_closure_ref: &disclosure_closure_ref,
+        // The suppression and omission references are deliberately ABSENT here.
+        // They belong to the admission boundary: `prepare_selection_chain`
+        // already took them from `result.evidence.omissions` for the
+        // admission/prune stage. Repeating them on the compile stage would
+        // attribute the admission owner's suppressions to the compilation,
+        // which is the misattribution the issue forbids. This boundary
+        // suppressed no counterevidence and forced no budget or policy omission
+        // of its own, because it changed no membership.
+        suppressed_counterevidence_refs: Vec::new(),
+        budget_or_policy_omission_refs: Vec::new(),
+        // This stage's OWN statement about its OWN membership: it changed no
+        // membership, so untrusted input did not change it. That rests on the
+        // assembly and boundary owners' proofs described in this function's doc,
+        // not on a check performed here. It does NOT resolve the admission stage's
+        // `Unknown`: `prepare_selection_chain` takes the maximum across stages, so
+        // the chain ceiling — and the packet claim ceiling read from it — stays
+        // `Unknown`, and a later deterministic stage can never launder an earlier
+        // finding.
+        untrusted_influence: SelectionInfluenceState::Absent,
+        influence_evidence_refs: Vec::new(),
+        // No authored per-member row, because this boundary authored no
+        // membership change. `build_stage` derives `Retained` for every admitted
+        // member from the membership itself and refuses the whole chain
+        // (`UnattributedRemoval`) if a member ever leaves the membership without
+        // a row from the boundary that removed it. So an empty row set is not
+        // taken on trust: it means this boundary claims no removal, and the
+        // Governor's own stage builder is what would refuse the chain if the
+        // membership did not agree. Inventing a row here to make a divergence
+        // disappear is exactly what this stage must never do.
+        member_dispositions: Vec::new(),
+    };
+    let receipt = prepare_selection_chain(input, result, recipe, Some(&observation))
+        .map_err(|error| PacketCompositionError::SelectionChain(Box::new(error)))?;
+    // The expansion handles are the omission owner's own records of what this
+    // compilation withheld: `OmissionRecord::expansion` is the handle that
+    // reopens one permitted omitted unit, and it exists only for an omission the
+    // owner recorded. They are deduplicated and sorted through a `BTreeSet` so
+    // the seal's own `expansion_handle_ids` uniqueness rule holds by construction
+    // instead of depending on the owner never having issued the same handle twice.
+    let expansion_handle_ids: Vec<String> = {
+        let mut handles: BTreeSet<String> = BTreeSet::new();
+        for omission in &result.evidence.omissions {
+            if let Some(expansion) = &omission.expansion {
+                handles.insert(expansion.handle_id.as_str().to_owned());
+            }
+        }
+        handles.into_iter().collect()
+    };
+    // The membership the seal carries is `receipt.final_output_refs` — the LAST
+    // stage's output members, which for this chain is the ADMITTED order because
+    // this stage authored no disposition. That order is the admission owner's
+    // ranking order and is deliberately NOT sorted, deduplicated or normalised
+    // anywhere on this path: the seal contract compares the sealed ordered
+    // membership against the chain's ordered final membership exactly, so
+    // reordering it here would either fail that comparison or, worse, make the
+    // seal describe a packet ordering this compilation never emitted. Only the
+    // expansion handles above are sorted, and they are not a membership list.
+    //
+    // `serialized_bytes` are the exact bytes the assembly owner handed to the
+    // measurement callback — the bytes this packet consists of — so the seal
+    // binds the delivered CONTENT rather than a re-serialization of it that would
+    // agree with itself.
+    let seal = seal_delivered_packet(&receipt, &assembled.serialized_bytes, &expansion_handle_ids)
+        .map_err(|error| PacketCompositionError::SelectionChain(Box::new(error)))?;
+    Ok(PacketSelectionChain {
+        receipt,
+        seal,
+        expansion_handle_ids,
+    })
 }
 
 /// Renders the observed scope-head revision of one acquisition closure.

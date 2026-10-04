@@ -2226,6 +2226,81 @@ pub fn classify_disconnect(after_write_started: bool) -> DeliveryOutcome {
     DeliveryOutcome::UnknownOutcome
 }
 
+/// Byte-boundary usability of one connected endpoint (I7.2 framing, I14.24).
+///
+/// A named pipe is one byte stream with a single frame boundary sequence
+/// (4-byte little-endian length, then exactly that many body bytes). `write_all`
+/// and `read_exact` may finish only part of that sequence when a timeout or a
+/// dropped future wins, and the partial progress lives in locals of the
+/// operation, not in this owner. A later frame on the same stream would
+/// therefore resume at an unknown byte offset: a partially written body is
+/// completed by the *next* frame's bytes, and a partially read body is
+/// re-interpreted as a fresh length prefix.
+///
+/// This state therefore marks the endpoint unusable *before* the first awaited
+/// byte and clears it only after a transfer that is known to end exactly on a
+/// frame boundary. It lives on the connection owner, so dropping the in-flight
+/// future cannot bypass it; only dropping and reconnecting the endpoint, which
+/// installs a fresh owner, restores usability. `InProgress` additionally
+/// rejects a concurrent second operation while one is still pending, so the
+/// retained mark never depends on which future was polled last.
+///
+/// Peer authentication does not repair byte continuity: an authenticated peer
+/// proves *who* is on the other end, never *where* the frame boundary is.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionBoundaryState {
+    /// No frame I/O has been started, or the last transfer ended exactly on a
+    /// known frame boundary.
+    Usable,
+    /// A frame transfer is pending on this endpoint. A concurrent operation is
+    /// rejected rather than interleaving bytes into the pending frame.
+    InProgress,
+    /// A prefix or body transfer ended at an unknown byte boundary (partial
+    /// write, partial read, timeout, cancellation, or a dropped future). The
+    /// stream must be dropped and reconnected.
+    Unusable,
+}
+
+#[cfg(windows)]
+impl ConnectionBoundaryState {
+    /// Rejects a start while another transfer is pending or the endpoint is
+    /// already poisoned. Callers validate the frame and the limits *before*
+    /// calling this, so a pre-I/O rejection never poisons an untouched stream.
+    fn begin(self) -> Result<Self, TransportError> {
+        match self {
+            Self::Usable => Ok(Self::InProgress),
+            Self::InProgress | Self::Unusable => Err(TransportError::UnknownOutcome),
+        }
+    }
+
+    /// Completes a transfer that is known to end exactly on a frame boundary:
+    /// a full prefix, a full body, or a dead pipe with nothing left to reuse.
+    /// A transfer that fails with a framing rejection also consumed exactly one
+    /// whole frame, so it resolves to `Usable` too.
+    fn complete(self) -> Self {
+        match self {
+            Self::Usable | Self::InProgress => Self::Usable,
+            Self::Unusable => Self::Unusable,
+        }
+    }
+
+    /// Retains or takes the poison: a transfer that ends at an unknown byte
+    /// boundary leaves the endpoint unusable until it is dropped and
+    /// reconnected.
+    fn fail(self) -> Self {
+        match self {
+            Self::Usable | Self::InProgress | Self::Unusable => Self::Unusable,
+        }
+    }
+
+    /// True while an operation holds the endpoint, including one whose future
+    /// was dropped mid-transfer.
+    fn permits_io(self) -> bool {
+        matches!(self, Self::Usable | Self::InProgress)
+    }
+}
+
 /// Validates a fully qualified local Windows pipe name without accepting path-like input.
 pub fn validate_pipe_name(name: &str) -> Result<(), TransportError> {
     const PREFIX: &str = r"\\.\pipe\eliot\";
@@ -2487,6 +2562,7 @@ pub struct NamedPipeServer {
     inner: tokio::net::windows::named_pipe::NamedPipeServer,
     peer: PeerIdentity,
     evidence: Option<eliot_platform_windows::NamedPipePeerEvidence>,
+    boundary: ConnectionBoundaryState,
 }
 
 #[cfg(windows)]
@@ -2555,6 +2631,7 @@ impl NamedPipeServer {
                 reason: PeerIdentityUnavailable::ProviderProofNotComposed,
             },
             evidence: None,
+            boundary: ConnectionBoundaryState::Usable,
         })
     }
 
@@ -2588,6 +2665,7 @@ impl NamedPipeServer {
                 reason: PeerIdentityUnavailable::ProviderProofNotComposed,
             },
             evidence: None,
+            boundary: ConnectionBoundaryState::Usable,
         })
     }
 
@@ -2596,6 +2674,18 @@ impl NamedPipeServer {
             .await
             .map_err(|_| TransportError::Timeout)?
             .map_err(|error| TransportError::Io(error.to_string()))
+    }
+
+    /// Re-arms the frame boundary for a newly connected client.
+    ///
+    /// The pipe instance is reusable across connections, so a poisoned
+    /// endpoint is recovered here rather than by the caller dropping the whole
+    /// server. A fresh connection establishes a fresh usable byte stream; it
+    /// does *not* resolve the delivery uncertainty of the operation that
+    /// poisoned the previous one, which the caller must still reconcile under
+    /// its own identity.
+    fn admit_next_client(&mut self) {
+        self.boundary = ConnectionBoundaryState::Usable;
     }
 
     /// Connects and authenticates the client PID, process image, SID and
@@ -2610,6 +2700,7 @@ impl NamedPipeServer {
         use std::os::windows::io::{AsRawHandle, BorrowedHandle};
         self.wait_for_client(timeout).await?;
         windows_transport::read_authentication_preface(&mut self.inner, timeout).await?;
+        self.admit_next_client();
         let raw = self.inner.as_raw_handle();
         // SAFETY: `raw` is the live connected server handle owned by
         // `self.inner`, which is borrowed as `&mut self` for the whole
@@ -2641,6 +2732,7 @@ impl NamedPipeServer {
         use std::os::windows::io::{AsRawHandle, BorrowedHandle};
         self.wait_for_client(timeout).await?;
         windows_transport::read_authentication_preface(&mut self.inner, timeout).await?;
+        self.admit_next_client();
         let raw = self.inner.as_raw_handle();
         // SAFETY: `raw` is the live connected server handle owned by
         // `self.inner`, which is borrowed as `&mut self` for the whole
@@ -2681,22 +2773,64 @@ impl NamedPipeServer {
             .map_err(|_| TransportError::UnauthenticatedPeer)
     }
 
+    /// Sends one frame over a boundary-known endpoint. A successful write
+    /// proves transport delivery only.
+    ///
+    /// An endpoint left at an unknown byte boundary by an earlier partial
+    /// transfer is rejected before any encode or allocation, so frame B is
+    /// never appended into the missing body of frame A.
     pub async fn send_frame(
         &mut self,
         frame: &Frame,
         limits: TransportLimits,
     ) -> Result<DeliveryOutcome, TransportError> {
         require_authenticated_peer(&self.peer)?;
-        let wire = encode_frame(frame, limits)?;
-        windows_transport::send_wire(&mut self.inner, &wire, limits.operation_timeout).await
+        self.boundary = self.boundary.begin()?;
+        let wire = match encode_frame(frame, limits) {
+            Ok(wire) => wire,
+            Err(error) => {
+                // Pre-I/O validation failure never touched the stream.
+                self.boundary = self.boundary.complete();
+                return Err(error);
+            }
+        };
+        let outcome =
+            windows_transport::send_wire(&mut self.inner, &wire, limits.operation_timeout).await;
+        // Only a complete transfer ends exactly on a frame boundary, and
+        // a hard error is a known-dead pipe with nothing left to reuse; both
+        // clear the mark. Only an unknown outcome poisons it.
+        self.boundary = match outcome {
+            Ok(DeliveryOutcome::Delivered) | Err(_) => self.boundary.complete(),
+            Ok(DeliveryOutcome::UnknownOutcome) => self.boundary.fail(),
+        };
+        outcome
     }
 
+    /// Receives one frame with the negotiated length and byte bounds from a
+    /// boundary-known endpoint.
     pub async fn receive_frame(
         &mut self,
         limits: TransportLimits,
     ) -> Result<Frame, TransportError> {
         require_authenticated_peer(&self.peer)?;
-        windows_transport::receive_wire(&mut self.inner, limits).await
+        self.boundary = self.boundary.begin()?;
+        let limits = match limits.validate() {
+            Ok(limits) => limits,
+            Err(error) => {
+                // Pre-I/O validation failure never touched the stream.
+                self.boundary = self.boundary.complete();
+                return Err(error);
+            }
+        };
+        let result = windows_transport::receive_wire(&mut self.inner, limits).await;
+        // A framing rejection consumed exactly one whole frame, so the byte
+        // boundary survives it; only a transport-level failure (timeout,
+        // partial prefix/body, dropped future) leaves it unknown.
+        self.boundary = match &result {
+            Ok(_) | Err(TransportError::Protocol(_)) => self.boundary.complete(),
+            Err(_) => self.boundary.fail(),
+        };
+        result
     }
 }
 
@@ -2774,18 +2908,29 @@ impl NamedPipeTransport {
         self.inner.selected_peer_profile(peers)
     }
 
-    /// Sends one frame. A successful write proves transport delivery only.
+    /// Sends one frame over a boundary-known endpoint. A successful write
+    /// proves transport delivery only.
+    ///
+    /// After a partial write, a timeout, or cancellation the endpoint keeps an
+    /// unknown byte boundary and is rejected here instead of appending this
+    /// frame into the missing body of the previous one.
     pub async fn send_frame(
         &mut self,
         frame: &Frame,
         limits: TransportLimits,
     ) -> Result<DeliveryOutcome, TransportError> {
         self.inner.require_authenticated()?;
+        self.inner.require_known_boundary()?;
         let wire = encode_frame(frame, limits)?;
         self.inner.send(&wire, limits.operation_timeout).await
     }
 
     /// Sends one frame while allowing the owning operation to cancel it.
+    ///
+    /// Cancellation leaves the endpoint at an unknown byte boundary: the bytes
+    /// already written are not resynchronised by the next frame, and the
+    /// possibly-delivered operation keeps its exact `UnknownOutcome` identity
+    /// rather than being reported as `NotSent`.
     pub async fn send_frame_with_cancel<F>(
         &mut self,
         frame: &Frame,
@@ -2796,6 +2941,7 @@ impl NamedPipeTransport {
         F: Future<Output = ()>,
     {
         self.inner.require_authenticated()?;
+        self.inner.require_known_boundary()?;
         let wire = encode_frame(frame, limits)?;
         self.inner
             .send_with_cancel(&wire, limits.operation_timeout, cancellation)
@@ -2803,11 +2949,16 @@ impl NamedPipeTransport {
     }
 
     /// Receives one frame with the negotiated length and byte bounds.
+    ///
+    /// A prefix or body consumed by a timed-out earlier read is not available
+    /// again, so this endpoint is rejected rather than reinterpreting the
+    /// remaining body bytes as a fresh length prefix.
     pub async fn receive_frame(
         &mut self,
         limits: TransportLimits,
     ) -> Result<Frame, TransportError> {
         self.inner.require_authenticated()?;
+        self.inner.require_known_boundary()?;
         self.inner.receive(limits).await
     }
 }
@@ -2815,9 +2966,9 @@ impl NamedPipeTransport {
 #[cfg(windows)]
 mod windows_transport {
     use super::{
-        AUTHENTICATION_PREFACE, DeliveryOutcome, Duration, Frame, PeerIdentity,
-        PeerIdentityUnavailable, ProtocolError, TransportError, TransportLimits, decode_frame,
-        map_platform_error, require_authenticated_peer,
+        AUTHENTICATION_PREFACE, ConnectionBoundaryState, DeliveryOutcome, Duration, Frame,
+        PeerIdentity, PeerIdentityUnavailable, ProtocolError, TransportError, TransportLimits,
+        decode_frame, map_platform_error, require_authenticated_peer,
     };
     use std::os::windows::io::{AsRawHandle, BorrowedHandle};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -2829,6 +2980,7 @@ mod windows_transport {
         evidence: Option<eliot_platform_windows::NamedPipePeerEvidence>,
         kernel_front_door_proof: Option<eliot_platform_windows::KernelFrontDoorServerProof>,
         kernel_front_door_observed_extra_sid: Option<String>,
+        boundary: ConnectionBoundaryState,
     }
 
     impl Inner {
@@ -2961,14 +3113,29 @@ mod windows_transport {
                 .map_err(|error| TransportError::Io(error.to_string()))
         }
 
+        /// Sends one wire image, marking the endpoint before the first awaited
+        /// byte and clearing the mark only on a complete transfer.
         pub async fn send(
             &mut self,
             wire: &[u8],
             timeout: Duration,
         ) -> Result<DeliveryOutcome, TransportError> {
-            send_wire(&mut self.client, wire, timeout).await
+            self.boundary = self.boundary.begin()?;
+            let outcome = send_wire(&mut self.client, wire, timeout).await;
+            self.boundary = match outcome {
+                Ok(DeliveryOutcome::Delivered) | Err(_) => self.boundary.complete(),
+                Ok(DeliveryOutcome::UnknownOutcome) => self.boundary.fail(),
+            };
+            outcome
         }
 
+        /// Sends one wire image while allowing the owning operation to cancel
+        /// it, or while the returned future is dropped by its caller.
+        ///
+        /// A cancelled write is not a completed write: some prefix or body
+        /// bytes may already have reached the peer, so the endpoint is left
+        /// `Unusable` on every path other than `Delivered`. The mark is on this
+        /// owner, so it survives dropping this future.
         pub async fn send_with_cancel<F>(
             &mut self,
             wire: &[u8],
@@ -2978,10 +3145,11 @@ mod windows_transport {
         where
             F: Future<Output = ()>,
         {
+            self.boundary = self.boundary.begin()?;
             let write = self.client.write_all(wire);
             tokio::pin!(write);
             tokio::pin!(cancellation);
-            tokio::select! {
+            let outcome = tokio::select! {
                 result = tokio::time::timeout(timeout, &mut write) => match result {
                     Ok(Ok(())) => Ok(DeliveryOutcome::Delivered),
                     Ok(Err(_error)) => Ok(DeliveryOutcome::UnknownOutcome),
@@ -2989,11 +3157,34 @@ mod windows_transport {
                 },
                 // The write may have reached the peer before cancellation won.
                 () = &mut cancellation => Ok(DeliveryOutcome::UnknownOutcome),
-            }
+            };
+            self.boundary = match outcome {
+                Ok(DeliveryOutcome::Delivered) | Err(_) => self.boundary.complete(),
+                Ok(DeliveryOutcome::UnknownOutcome) => self.boundary.fail(),
+            };
+            outcome
         }
 
+        /// Receives one frame, marking the endpoint before the first awaited
+        /// byte and clearing the mark only when a whole frame was consumed.
         pub async fn receive(&mut self, limits: TransportLimits) -> Result<Frame, TransportError> {
-            receive_wire(&mut self.client, limits).await
+            self.boundary = self.boundary.begin()?;
+            let result = receive_wire(&mut self.client, limits).await;
+            self.boundary = match &result {
+                Ok(_) | Err(TransportError::Protocol(_)) => self.boundary.complete(),
+                Err(_) => self.boundary.fail(),
+            };
+            result
+        }
+
+        /// Rejects a frame operation on an endpoint whose byte boundary is not
+        /// known, before any encode, allocation, or awaited I/O.
+        pub fn require_known_boundary(&self) -> Result<(), TransportError> {
+            if self.boundary.permits_io() {
+                Ok(())
+            } else {
+                Err(TransportError::UnknownOutcome)
+            }
         }
     }
 
@@ -3017,6 +3208,7 @@ mod windows_transport {
             evidence: None,
             kernel_front_door_proof: None,
             kernel_front_door_observed_extra_sid: None,
+            boundary: ConnectionBoundaryState::Usable,
         })
     }
 
@@ -3465,12 +3657,32 @@ mod tests {
                 "version": {"major": 1, "minor": 0, "patch": 0},
                 "artifact_id": "a".repeat(64),
                 "protocols": ["eliot.agent-bridge.v1"],
+                "capabilities": [],
                 "required_capabilities": ["agent.bridge.activate"],
                 "optional_capabilities": [],
                 "advisory_capabilities": [],
                 "state_owner": "eliot-host",
                 "failure_domain": "agent-bridge",
-                "hot_replace": false
+                "owner": "eliot-agent-bridge",
+                "hot_replace": false,
+                "startup_after": [],
+                "drain_before": [],
+                "invalidation_triggers": [],
+                "supervision_plan": "one_for_one",
+                "child_restart": "transient",
+                "restart_intensity": "3/10m",
+                "resource_profile": "background-medium",
+                "privacy_classes": ["PUBLIC"],
+                "permissions": [],
+                "health_contract": "health/agent-bridge-v1",
+                "checkpoint_contract": "checkpoint/agent-bridge-v1",
+                "compatibility_state": "rebuildable",
+                "independent_test_profile": "module/agent-bridge",
+                "contract_fixture_set": "eliot.agent-bridge.v1/agent-bridge",
+                "affected_test_tags": ["agent-bridge"],
+                "architecture": [],
+                "telemetry": "telemetry/agent-bridge-v1",
+                "removal_boundary": "eliot-agent-bridge"
             },
             "module_generation": {
                 "module_id": AGENT_BRIDGE_MODULE_ID,
@@ -3721,9 +3933,12 @@ mod tests {
         );
         let mut wrong_kind = peer_challenge_frame("server-connection", &challenge)?;
         wrong_kind.kind = FrameKind::Event;
-        assert_eq!(
-            decode_peer_challenge_frame(&wrong_kind, "server-connection"),
-            Err(TransportError::SessionFenced)
+        assert!(
+            matches!(
+                decode_peer_challenge_frame(&wrong_kind, "server-connection"),
+                Err(TransportError::Protocol(_))
+            ),
+            "a challenge on a non-canonical frame kind must be refused with a typed reason"
         );
         let mut wrong_type = peer_challenge_frame("server-connection", &challenge)?;
         wrong_type.message_type = MessageType::Start;
@@ -3828,6 +4043,192 @@ mod tests {
             fenced.accept_client_hello(&hello_frame, &declaration),
             Err(TransportError::SessionFenced)
         );
+        Ok(())
+    }
+
+    /// Builds the server-owned handshake policy for one registered generation.
+    ///
+    /// The policy is the evidence side of the comparison: the registered
+    /// current generation, the admitted capability/effect sets and the launch
+    /// nonce the server owner selected. A client assertion is never copied
+    /// into it, which is what makes the fencing arms below meaningful.
+    fn handshake_policy_for(
+        declaration: &AgentBridgeClientDeclaration,
+        generation: ModuleGeneration,
+    ) -> ServerHandshakePolicy {
+        ServerHandshakePolicy {
+            protocol_range: declaration.protocol_range,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            module_generation: generation,
+            launch_nonce: "launch-nonce-1".to_owned(),
+            allowed_capabilities: vec![
+                "agent.bridge.activate".to_owned(),
+                "agent.bridge.inspect".to_owned(),
+            ],
+            allowed_privacy_classes: vec!["PUBLIC".to_owned()],
+            allowed_effects: vec!["effect.read".to_owned()],
+            session_principal_binding: "kernel:agent-bridge".to_owned(),
+            control_channel: "control-channel-1".to_owned(),
+            heartbeat_ms: 1_000,
+            config_snapshot: serde_json::json!({"revision": 1}),
+            max_frame: 4_194_304,
+        }
+    }
+
+    /// An authenticated peer identity, reused across the refusal arms.
+    fn bridge_peer() -> Result<PeerIdentity, Box<dyn std::error::Error>> {
+        Ok(PeerIdentity::authenticated_for_test(
+            ProcessBinding::from_observation(41, 99, r"C:\Eliot\bridge.exe")?,
+            "S-1-5-21-1000".to_owned(),
+            "4".to_owned(),
+        )?)
+    }
+
+    /// Acceptance (#1876): an old generation and a foreign authority epoch are
+    /// explicitly fenced at the handshake, and a fenced session cannot reattach.
+    ///
+    /// Both refusals happen against a valid, authenticated peer identity and an
+    /// internally consistent `ClientHello`, so neither is an incidental decode
+    /// failure: the generation the client asserts is simply not the generation
+    /// the server owner registered.
+    #[test]
+    fn server_handshake_fences_old_generation_and_foreign_epoch() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let peer = bridge_peer()?;
+        let client = declaration.client_hello("launch-nonce-1")?;
+
+        // The registered current generation: the same module, one generation
+        // ahead and one authority-epoch sequence ahead of the client claim.
+        let mut current = declaration.module_generation.clone();
+        current.generation = eliot_contracts::ResourceGeneration::new(2)?;
+        current.state_fence.authority_epoch = test_epoch(8);
+        let policy = handshake_policy_for(&declaration, current);
+
+        assert_eq!(
+            Session::establish_with_server("old-generation", peer.clone(), &client, &policy),
+            Err(TransportError::SessionFenced),
+            "an old generation must be refused, not admitted against the current one"
+        );
+
+        // A foreign lineage is a different authority, not a newer sequence of
+        // the same one. The client stays internally consistent by carrying the
+        // foreign epoch in both the claim and its registered generation fence.
+        let mut foreign = declaration.client_hello("launch-nonce-1")?;
+        let foreign_epoch: EpochId = serde_json::from_value(serde_json::json!({
+            "lineage_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "sequence": 9
+        }))?;
+        foreign.authority_epoch = foreign_epoch.clone();
+        foreign.module_generation.state_fence.authority_epoch = foreign_epoch;
+        foreign.validate()?;
+        assert_eq!(
+            Session::establish_with_server("foreign-epoch", peer.clone(), &foreign, &policy),
+            Err(TransportError::SessionFenced),
+            "a foreign authority lineage must be refused"
+        );
+
+        // A wrong launch nonce is the same class of self-assertion: the nonce
+        // is owner-issued material, never a client claim.
+        let wrong_nonce = declaration.client_hello("substituted-nonce")?;
+        assert_eq!(
+            Session::establish_with_server("wrong-nonce", peer.clone(), &wrong_nonce, &policy),
+            Err(TransportError::SessionFenced),
+            "a substituted launch nonce must be refused"
+        );
+
+        // The current generation is admitted, and once fenced it cannot
+        // reattach: a later reconnect attempt on the same identity fails.
+        let mut session = Session::establish_with_server(
+            "current-generation",
+            peer,
+            &client,
+            &handshake_policy_for(&declaration, declaration.module_generation.clone()),
+        )
+        .map_err(|error| format!("the registered current generation must be admitted: {error}"))?
+        .session;
+        assert_eq!(session.state, SessionState::Open);
+        session.fence();
+        assert_eq!(session.state, SessionState::Fenced);
+        assert_eq!(
+            session.begin_reconnect(),
+            Err(TransportError::SessionFenced),
+            "a fenced session must not reattach"
+        );
+        Ok(())
+    }
+
+    /// Acceptance (#1876): an unsupported artifact hash and an unregistered
+    /// claimed capability are rejected with a recorded reason, and a correctly
+    /// registered current generation receives a hello reporting only its own
+    /// allowed capabilities and effects.
+    #[test]
+    fn server_handshake_rejects_unregistered_claims_and_reports_only_allowed() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let peer = bridge_peer()?;
+        let policy = handshake_policy_for(&declaration, declaration.module_generation.clone());
+
+        // An artifact hash no registered generation supports. The client keeps
+        // its own three artifact fields consistent, so the refusal is the
+        // registry comparison rather than a self-inconsistent hello.
+        let mut foreign_artifact = declaration.client_hello("launch-nonce-1")?;
+        let artifact = eliot_contracts::ArtifactId::new("b".repeat(64))?;
+        foreign_artifact.artifact_hash = artifact.clone();
+        foreign_artifact.module_contract.artifact_id = artifact.clone();
+        foreign_artifact.module_generation.artifact_id = artifact;
+        foreign_artifact.validate()?;
+        assert_eq!(
+            Session::establish_with_server(
+                "foreign-artifact",
+                peer.clone(),
+                &foreign_artifact,
+                &policy
+            ),
+            Err(TransportError::SessionFenced),
+            "an artifact hash outside the registered generation must be refused"
+        );
+
+        // A claimed capability outside the admitted set, refused with the
+        // field-level reason the front door records.
+        let mut unregistered = declaration.client_hello("launch-nonce-1")?;
+        unregistered
+            .capabilities
+            .push("agent.bridge.unregistered".to_owned());
+        match Session::establish_with_server("unregistered", peer, &unregistered, &policy) {
+            Err(TransportError::Protocol(eliot_protocol::ProtocolError::InvalidField {
+                field,
+                ..
+            })) => assert_eq!(
+                field, "client.capabilities",
+                "the refusal must name the claim it refused"
+            ),
+            other => {
+                return Err(
+                    format!("an unregistered capability must be refused, got {other:?}").into(),
+                );
+            }
+        }
+
+        // A correctly registered current generation is admitted, and the hello
+        // reports only what the client asked for AND the server admitted: the
+        // policy's extra admitted capability is never echoed back.
+        let hello = Session::establish_with_server(
+            "admitted",
+            bridge_peer()?,
+            &declaration.client_hello("launch-nonce-1")?,
+            &policy,
+        )?
+        .server_hello;
+        assert_eq!(
+            hello.allowed_capabilities,
+            vec!["agent.bridge.activate".to_owned()],
+            "the hello reports only the requested-and-admitted capability set"
+        );
+        assert_eq!(
+            hello.allowed_effects,
+            vec!["effect.read".to_owned()],
+            "effects come from the server owner, never from the client claim"
+        );
+        assert_eq!(hello.rejection_reason, None);
         Ok(())
     }
 
@@ -4400,5 +4801,177 @@ mod tests {
         let generic = NamedPipeTransport::connect_authenticated;
         let extra_sid = NamedPipeTransport::kernel_front_door_observed_extra_sid;
         let _ = (specialized, generic, extra_sid);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_or_partial_transfer_poisons_the_frame_boundary() {
+        use ConnectionBoundaryState::{InProgress, Unusable, Usable};
+
+        // A clean endpoint accepts exactly one operation at a time.
+        assert_eq!(Usable.begin(), Ok(InProgress));
+        // A pending operation rejects a concurrent one instead of interleaving
+        // bytes into the pending frame.
+        assert_eq!(InProgress.begin(), Err(TransportError::UnknownOutcome));
+        // A poisoned endpoint is rejected before any encode or allocation.
+        assert_eq!(Unusable.begin(), Err(TransportError::UnknownOutcome));
+        // The poison survives every later transition, so a late or duplicate
+        // completion cannot silently re-arm the same byte stream.
+        assert_eq!(Unusable.complete(), Unusable);
+        assert_eq!(Unusable.fail(), Unusable);
+        // Only a transfer known to end on a frame boundary re-arms it.
+        assert_eq!(InProgress.complete(), Usable);
+        assert_eq!(Usable.complete(), Usable);
+        // An unknown boundary always poisons, including a pending one.
+        assert_eq!(InProgress.fail(), Unusable);
+        assert_eq!(Usable.fail(), Unusable);
+        // A poisoned endpoint blocks I/O; a pending one has not yet.
+        assert!(!Unusable.permits_io());
+        assert!(Usable.permits_io());
+        assert!(InProgress.permits_io());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn poisoned_client_endpoint_blocks_the_next_send() -> TestResult {
+        use std::io::ErrorKind;
+
+        let name = format!(
+            r"\\.\pipe\eliot\test-poison-client\{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
+        let mut server = NamedPipeServer::create(&name, &expectation)?;
+        let server_expectation = expectation.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        // The one peer for this pipe instance: it authenticates the client and
+        // then holds the connection open without ever sending a frame.
+        let server_task = tokio::spawn(async move {
+            server
+                .wait_for_authenticated_client(Duration::from_secs(5), &server_expectation)
+                .await
+                .map_err(|error| error.to_string())?;
+            released
+                .await
+                .map_err(|_| ErrorKind::BrokenPipe.to_string())?;
+            Ok::<_, String>(())
+        });
+        let mut client =
+            NamedPipeTransport::connect_authenticated(&name, Duration::from_secs(5), &expectation)
+                .await?;
+        // A stalled peer needs a bounded operation timeout; the production
+        // default is far longer than this state-model regression needs.
+        let stalled = TransportLimits {
+            operation_timeout: Duration::from_millis(100),
+            ..TransportLimits::default()
+        };
+
+        // The client consumed part of a length prefix and then timed out, so
+        // its byte boundary is unknown.
+        assert_eq!(
+            client.receive_frame(stalled).await,
+            Err(TransportError::Timeout)
+        );
+        // Every later operation is rejected before consuming further bytes, so
+        // the leftover prefix byte can never be read as a fresh length and the
+        // possibly-delivered frame is never appended after it.
+        assert_eq!(
+            client.send_frame(&heartbeat(), stalled).await,
+            Err(TransportError::UnknownOutcome)
+        );
+        assert_eq!(
+            client
+                .send_frame_with_cancel(&heartbeat(), stalled, std::future::pending::<()>())
+                .await,
+            Err(TransportError::UnknownOutcome)
+        );
+        assert_eq!(
+            client.receive_frame(stalled).await,
+            Err(TransportError::UnknownOutcome)
+        );
+        // Dropping the poisoned endpoint and re-binding a fresh one restores a
+        // trustworthy boundary: a new owner always installs `Usable`, so
+        // recovery never depends on clearing a poisoned owner in place.
+        assert_eq!(
+            ConnectionBoundaryState::Usable.begin(),
+            Ok(ConnectionBoundaryState::InProgress)
+        );
+        let _ = release.send(());
+        server_task.await??;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn partial_prefix_read_blocks_the_next_server_frame() -> TestResult {
+        use std::io::ErrorKind;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = format!(
+            r"\\.\pipe\eliot\test-poison-server\{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
+        let mut server = NamedPipeServer::create(&name, &expectation)?;
+        let server_expectation = expectation.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            server
+                .wait_for_authenticated_client(Duration::from_secs(5), &server_expectation)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(server)
+        });
+        // The one peer for this pipe instance: it presents the preface, writes
+        // one byte of a 4-byte length prefix, then stops writing entirely.
+        let peer_task = tokio::spawn(async move {
+            let mut client = ClientOptions::new()
+                .open(name)
+                .map_err(|error| error.to_string())?;
+            client
+                .write_all(AUTHENTICATION_PREFACE)
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .write_all(&[0x01])
+                .await
+                .map_err(|error| error.to_string())?;
+            released
+                .await
+                .map_err(|_| ErrorKind::BrokenPipe.to_string())?;
+            Ok::<_, String>(())
+        });
+        let mut server = server_task.await??;
+        let stalled = TransportLimits {
+            operation_timeout: Duration::from_millis(100),
+            ..TransportLimits::default()
+        };
+
+        // The server consumed part of a length prefix and then timed out.
+        assert_eq!(
+            server.receive_frame(stalled).await,
+            Err(TransportError::Timeout)
+        );
+        // It then rejects both directions without consuming further bytes.
+        assert_eq!(
+            server.receive_frame(stalled).await,
+            Err(TransportError::UnknownOutcome)
+        );
+        assert_eq!(
+            server.send_frame(&heartbeat(), stalled).await,
+            Err(TransportError::UnknownOutcome)
+        );
+        // The retained mark is exactly the one the server carries.
+        assert_eq!(server.boundary, ConnectionBoundaryState::Unusable);
+        let _ = release.send(());
+        peer_task.await??;
+        Ok(())
     }
 }

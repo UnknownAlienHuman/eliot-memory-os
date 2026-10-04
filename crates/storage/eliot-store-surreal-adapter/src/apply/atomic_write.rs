@@ -105,15 +105,20 @@ const TX_ERASURE_OUTCOME: &str = "LET $erasure_outcome_existing = (SELECT VALUE 
 /// Reads one sealed erasure-outcome row by exact operation id.
 const READ_ERASURE_OUTCOME: &str = "SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id);";
 
-/// Session lane carrying one canonical transaction (S-CONC-TX, issue #989).
+/// Session lane for a canonical transaction (S-CONC-TX, issue #989).
 ///
-/// Production canonical writes use the pre-pool facade session. The explicit
-/// test/private seam routes through the admitted #987 pooled normal-write
-/// lane so concurrent tasks execute on real separate sessions; no other lane
-/// may carry a canonical transaction.
+/// There is deliberately only ONE admitted lane. While a second `Facade`
+/// variant existed, a canonical transaction could be pointed at the single
+/// facade socket, so the bridge's bounded write-client set and the sessions
+/// actually serving writes were two independent things: N outer write leases
+/// all converged on one socket while the bounded `SessionRole::NormalWrite`
+/// pool sat unused in production (issue #1933, blocking defect 1). Removing the
+/// variant makes "a canonical transaction rides the bounded write pool" a
+/// property of the type, not a choice a caller can make — production, reserved
+/// and test callers alike.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TxLane {
-    Facade,
+    /// The admitted #987 bounded normal-write lane.
     PooledWrite,
 }
 
@@ -684,10 +689,13 @@ fn expected_head_predicates(
     Ok((sql, bindings))
 }
 
-/// Sends one assembled canonical transaction on the selected lane.
+/// Sends one assembled canonical transaction on the bounded normal-write lane.
 ///
-/// Both lanes use the identical parameterized `query` RPC and binding codec;
-/// only the session differs (facade vs pooled normal-write).
+/// The single admitted lane uses the identical parameterized `query` RPC and
+/// binding codec the facade path used; only the session differs. The match is
+/// kept explicit so the lane stays visible at the point the transaction leaves
+/// the process, and so a future second lane has to be added here as a decision
+/// rather than appearing at a call site.
 async fn send_transaction(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -695,8 +703,8 @@ async fn send_transaction(
     bindings: Map<String, Value>,
     lane: TxLane,
 ) -> Result<client::RpcResults, AdapterError> {
+    let _ = config;
     match lane {
-        TxLane::Facade => client::query(db, config, "transaction.apply", sql, bindings).await,
         TxLane::PooledWrite => db.query_write("transaction.apply", sql, bindings).await,
     }
 }

@@ -192,6 +192,27 @@ pub(super) async fn read_fence(
         Map::new(),
     )
     .await?;
+    observed_fence(&mut response)
+}
+
+/// The same fence observation issued on the isolated health/admin lane
+/// (issue #1933, blocking defect 2).
+///
+/// Used only by the readiness/health probe. The canonical write path keeps
+/// [`read_fence`] on the pooled read lane: the commit proof must stay on the
+/// read clients that the write path already bounds, while health must not.
+pub(super) async fn read_fence_admin(
+    db: &client::RpcTransport,
+) -> Result<Option<FenceRecord>, AdapterError> {
+    let mut response = db
+        .query_admin("read.canonical_fence", schema::READ_FENCE, Map::new())
+        .await?;
+    observed_fence(&mut response)
+}
+
+/// Decodes one fence observation, shared by the pooled-read and the isolated
+/// health/admin lanes so the two cannot drift.
+fn observed_fence(response: &mut client::RpcResults) -> Result<Option<FenceRecord>, AdapterError> {
     // S1 #775 real-provider compatibility: a never-defined fence table
     // observes absent-table, which preflight translates into `None`. Draining
     // leaves statement values untouched, so every other observation decodes
@@ -200,7 +221,7 @@ pub(super) async fn read_fence(
     if !errors.is_empty() && errors.iter().all(|error| client::is_absent_table(error)) {
         return Ok(None);
     }
-    take_optional::<FenceRecord>(&mut response, 0)
+    take_optional::<FenceRecord>(response, 0)
 }
 
 /// Reads one committed receipt for the success-path commit proof (S-CONC-TX,

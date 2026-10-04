@@ -279,6 +279,9 @@ pub(crate) async fn execute_named(
 
     let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
     let payload = named_read_payload(adapter, db, &query, &state_fence, &revision_heads).await?;
+    if query.operation == NamedReadOperation::GetUserAutomationState {
+        revalidate_read_snapshot(db, &adapter.config, fence.as_ref(), &revision_heads).await?;
+    }
     let response = NamedReadResponse {
         operation: query.operation,
         state_fence,
@@ -287,6 +290,41 @@ pub(crate) async fn execute_named(
     };
     response.validate()?;
     Ok(response)
+}
+
+/// Refuses to publish an automation payload unless the owner state it was read
+/// from is still the snapshot its read revision names (#2808).
+///
+/// The fence, the revision heads and the automation rows are separate provider
+/// reads, so the payload's owner-issued `read_revision` (the digest of the
+/// heads read first) proves nothing about the rows on its own. The fence
+/// record (State Fence plus the next commit sequence every canonical commit
+/// advances) and the head set are therefore re-read after the rows: equality
+/// proves no commit or fence change landed between the head read and the row
+/// read, so `COMPLETE` and any minted continuation describe rows of that one
+/// revision. Any movement is a stale snapshot and returns
+/// [`StoreError::RevisionConflict`] instead of a mixed-snapshot response; the
+/// caller re-reads under the successor revision.
+async fn revalidate_read_snapshot(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    fence: Option<&FenceRecord>,
+    heads: &[RevisionHead],
+) -> Result<(), AdapterError> {
+    let fence_after = read_fence(db, config).await?;
+    let heads_after = read_all_revision_heads(db, config).await?;
+    let head_set = |heads: &[RevisionHead]| {
+        let mut set: Vec<(String, u64)> = heads
+            .iter()
+            .map(|head| (head.key.as_str().to_owned(), head.revision))
+            .collect();
+        set.sort();
+        set
+    };
+    if fence_after.as_ref() != fence || head_set(heads) != head_set(&heads_after) {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    Ok(())
 }
 
 /// Resolves the read fence for one named read (pure, shared by all reads).

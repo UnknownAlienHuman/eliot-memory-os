@@ -239,3 +239,62 @@ pub struct AdapterHealth {
     #[serde(with = "time::serde::rfc3339")]
     pub checked_at: OffsetDateTime,
 }
+// ---------------------------------------------------------------------------
+// PRODUCTION INGRESS RECORD (issue #933, Work step 7). Gathered at the END of
+// the file on purpose. Anchoring this block above its declaration reads better,
+// but it shifts every later line number, and this crate's line coordinates are
+// cited from other crates' acceptance suites, from the generated inventory and
+// from the control plane - while `main` itself is moving underneath the lane.
+// A record whose own coordinates are wrong is worse than one that is merely
+// further from its declaration, and this block names its declaration explicitly.
+//
+// Record applies to:
+//   AdapterRequest::input  and  AdapterResult::output
+
+// OPAQUE, UNTRUSTED, BOUNDED DATA - never an envelope.
+//
+// `input` carries adapter call data only. It must never be read as, or
+// promoted into, a protected envelope, control or authority field; the
+// typed siblings of this member (`request_id`, `adapter_id`,
+// `requested_capability`, `context`) are the carriers of identity and
+// authority. The `#[serde(deny_unknown_fields)]` above closes THIS struct's
+// own field set and constrains nothing inside this `Value`.
+//
+// RECORDED, UNRESOLVED. The causal owner is #933's own opaque-vs-envelope
+// boundary decision plus the `eliot-engine` adapter request contract; this
+// file owns neither, so the row is named here, not repaired here. One
+// present-day production consumer does read control meaning out of this
+// opaque payload: it lifts the protected `ProviderRoutePolicy` (policy
+// identity `policy_id` / `policy_hash_blake3`, declared at
+// `crates/eliot-types/src/provider_invocation.rs:289`) out of
+// `input["provider_route_policy"]` with `serde_json::from_value`, at
+// `crates/eliot-engine/src/adapter.rs:263-270`, and that policy's
+// `timeout_profile()` then steers the adapter's absolute deadline and its
+// cancellation and cleanup grace. That is a measured property of the tree,
+// NOT a sanctioned property of this payload.
+//
+// MITIGATING FACT, AS MEASURED, NOT OVERSTATED: both present-day
+// `AdapterRequest` construction sites
+// (`crates/eliot-app/src/cognitive_field_runner.rs:5231`,
+// `crates/eliot-app/src/host_runtime/external_agent.rs:2011`) build `input`
+// in process with `serde_json::to_value` over a typed Rust value, never
+// from untrusted wire text. So today there is no duplicate-key collapse and
+// no untrusted-text path into this member. The exposure is exactly this:
+// the boundary is a producer-side convention that no decoder here enforces,
+// so the first producer that sources `input` from text inherits the problem
+// silently.
+//
+// No envelope member, no new policy, no authorization gate, no second
+// parser and no `Value` preprocessing step is added for this row: #933
+// Work steps 5 and 6 keep decoder closure and authorization as separate
+// gates and forbid imposing ELIOT control semantics on third-party content.
+// OPAQUE ADAPTER-PRODUCED DATA - never an envelope.
+//
+// `output` is data produced by the adapter call, byte-bounded by
+// `AdapterLimits::max_output_bytes` in the `eliot-engine` supervisor
+// (`enforce_output_limit`, which may replace this member with a spill
+// descriptor and set `output_blob`), not by this declaration. It must never
+// be read as a protected envelope, control or authority field: `status`,
+// `error`, `observations` and the identity members of this result are the
+// typed carriers of control meaning, and the same opaque-payload rule
+// recorded on `AdapterRequest::input` applies here.

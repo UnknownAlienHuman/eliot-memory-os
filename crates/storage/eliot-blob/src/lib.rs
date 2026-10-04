@@ -2337,6 +2337,28 @@ struct BlobStoreCore<P, C, K, A, L> {
     aead: RwLock<A>,
     live_sets: Mutex<L>,
     shards: ShardLocks,
+    /// Publication obligations whose durable journal record this service could
+    /// not write. The volume rejected the journal replace, so the record a
+    /// later re-entry decodes carries no obligation; retention here is what
+    /// keeps the boundary in front of the next attempt.
+    ///
+    /// The lifecycle, stated as it actually is rather than as a bound it does not
+    /// have. An entry is dropped when its own boundary is settled through
+    /// [`BlobStoreCore::forget_unrecorded_publication`], and it is inserted at
+    /// most once per `(operation_id, idempotency_key, destination)` triple. There
+    /// is no cap, no eviction heuristic and no sweep, so the honest bound is:
+    ///
+    /// * one operation may hold up to three entries — its payload, its metadata
+    ///   and its commit destination;
+    /// * an operation that records an obligation and is never re-entered keeps
+    ///   its entry for the life of this `BlobStoreCore`, and the set therefore
+    ///   grows monotonically with the number of operations that recorded an
+    ///   unpersistable obligation and were then abandoned.
+    ///
+    /// That is deliberate: an entry only ever causes an owner to be asked about a
+    /// boundary again, and dropping one on a heuristic could release an operation
+    /// whose boundary nobody has proven.
+    unrecorded_publications: Mutex<Vec<BlobPublicationObligation>>,
     issuer_anchor: BlobIssuerTrustAnchor,
 }
 
@@ -2378,6 +2400,19 @@ fn publication_fence(error: &BlobError) -> BlobPublicationFence {
         },
         _ => BlobPublicationFence::Unconfirmed,
     }
+}
+
+/// Storage identity one publication obligation must bind to.
+///
+/// A journal written before the storage-identity binding carries none and can
+/// neither settle a publication nor produce an obligation for it.
+fn publication_locator(journal: &StageJournal) -> Result<BlobLocator, BlobError> {
+    journal.locator.clone().ok_or_else(|| {
+        BlobError::PlanGap(
+            "stage journal predates the storage identity a publication obligation requires"
+                .to_owned(),
+        )
+    })
 }
 
 impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L>
@@ -2467,6 +2502,7 @@ where
             aead: RwLock::new(aead),
             live_sets: Mutex::new(live_sets),
             shards: ShardLocks::new(),
+            unrecorded_publications: Mutex::new(Vec::new()),
             issuer_anchor,
         })
     }
@@ -3255,11 +3291,11 @@ where
     ///
     /// The obligation is durable and bound to the original operation, so every
     /// re-entry re-observes it and refuses to advance. Only the owner can
-    /// settle it, either by an exact operation-bound publication/durability
-    /// reconciliation or by re-establishing the boundary under this same
-    /// identity; the current platform port exposes neither, so the missing
-    /// capability stays unresolved here instead of being certified by the
-    /// caller. See #730/#946.
+    /// settle it, either through an exact operation-bound publication/durability
+    /// reconciliation or by the existing durable replace on the exact
+    /// destination under this same identity. A failed replace leaves this
+    /// obligation unresolved instead of letting the caller certify it. See
+    /// #730/#946.
     fn fenced_publication_error(
         journal: &StageJournal,
         obligation: &BlobPublicationObligation,
@@ -3317,30 +3353,184 @@ where
         }
     }
 
-    /// Durably records one unresolved publication obligation under the
-    /// operation's own journal and returns the error the caller must surface.
+    /// Records one unresolved publication obligation under the operation's own
+    /// journal and returns the error the caller must surface.
     ///
     /// The primary failure is never replaced: if persisting the obligation also
     /// fails, that failure is retained as additional cleanup evidence beside
-    /// the original error. Losing the record must not silently release the
-    /// operation, so an unrecordable obligation keeps the operation fenced.
+    /// the original error, and that composite may drop the cleanup observation
+    /// again when it does not validate. Losing the record must not silently
+    /// release the operation, so an obligation this journal could not persist is
+    /// retained in this service process under the same operation identity, and it
+    /// can only be discharged by an owner `platform_replace` that returns
+    /// success. Three re-entry shapes bind and settle what was retained — the
+    /// commit-record branch, the journal-reload branch and the `reconcile` sweep.
+    /// The other two receipt shapes, the within-scope dedup branch and the fresh
+    /// publish, only refuse: they have no journal to bind it to, so an obligation
+    /// there is re-observed as a refusal rather than settled. The retention is
+    /// dropped once that boundary is settled.
+    ///
+    /// The retention is process-local, and the scope of the guarantee is exactly
+    /// as wide as that. Within this service the obligation is re-observed and
+    /// cannot be discharged without the owner performing the durable write. It
+    /// does not survive a restart, because the volume rejected the very write
+    /// that would have carried it. After a restart the journal on the volume
+    /// still reads `pending_publication: None` and the retention is empty, so a
+    /// payload or metadata boundary is re-derived from the journal and the
+    /// matching destination is routed through the same owner re-establishment.
+    /// An owner refusal re-records the obligation durably when possible; if that
+    /// write is also refused, process-local retention keeps it in front of the
+    /// next same-service entry.
+    ///
+    /// A `CommitWrite` boundary is different because a commit record can already
+    /// exist after its create reports an unconfirmed durability result. On replay,
+    /// the commit-present branch first proves the journal's operation identity,
+    /// settles any recorded or retained obligation, and—unless the journal
+    /// already carries `CommitDurable`, `Ready`, or `Cleaned`—asks the owner to
+    /// replace the exact bounded commit bytes under that same identity. Success
+    /// advances an earlier journal checkpoint to `CommitDurable` and persists it
+    /// before a receipt can be returned; an existing later checkpoint is
+    /// preserved. Refusal remains unresolved and preserves the journal. If the
+    /// obligation never reached the volume and the service restarted, this
+    /// checkpoint makes the existing commit record recoverable without treating
+    /// its mere presence or byte equality as durability evidence.
+    ///
+    /// The refusal is not one uniform error class, and the difference is whether
+    /// a replacement obligation could be written. An owner refusal of the durable
+    /// write records one first, carrying the owner's newest fence, and that error
+    /// is what reaches the caller. An attempt that fails before that — a locator
+    /// the journal predates, or a destination that was never installed — records
+    /// nothing, so the obligation already in hand is still the durable record and
+    /// the refusal is rebuilt from it, capacity-typed. The two receipt shapes that
+    /// have no journal at all report `UnknownPublishOutcome` instead, because
+    /// they have no obligation fence to build a capacity failure from; that is the
+    /// card's other typed unresolved outcome, not a weakening.
     fn record_publication_obligation(
         &self,
         journal_path: &WorkScopePath,
         journal: &mut StageJournal,
-        obligation: BlobPublicationObligation,
+        obligation: &BlobPublicationObligation,
         primary: BlobError,
     ) -> BlobError {
-        journal.pending_publication = Some(obligation);
+        journal.pending_publication = Some(obligation.clone());
         match self.persist_journal(journal_path, journal, true) {
             Ok(()) => primary,
-            Err(persist_error) => retain_cleanup_evidence(persist_error, primary),
+            Err(persist_error) => {
+                // The journal replace failed, so nothing durable carries this
+                // obligation and the journal a later re-entry decodes would walk
+                // straight past the fence. Retention is what keeps the boundary
+                // in front of the next attempt, and it is observed before the
+                // composite is built and never read from it, because that
+                // composite may drop the cleanup observation and revert to a
+                // plain capacity failure that fences nothing.
+                //
+                // A poisoned retention lock is deliberately not branched on: it
+                // must not degrade the primary capacity failure into a generic
+                // provider error, and it must not discard the journal persist
+                // failure either. Both are retained below and returned as the
+                // composite, which is this caller's refusal. What that refusal
+                // still guarantees is narrower than "cannot be released": without
+                // the retained entry, the operation can be released once some
+                // re-entry actually re-establishes the boundary through a
+                // successful owner `platform_replace`. It cannot be released
+                // *without* one, because the journal record on the volume is
+                // untouched and every re-entry reaches the same publication and
+                // asks the owner about the same boundary.
+                let _retention = self.retain_unrecorded_publication(obligation);
+                retain_cleanup_evidence(persist_error, primary)
+            }
         }
     }
 
-    /// Advances one publication phase. Matching destination bytes settle an
-    /// *interrupted* publication whose durability boundary the owner already
-    /// reported; they never settle an obligation this journal still carries.
+    /// Retains an obligation whose durable journal record could not be written.
+    ///
+    /// Retention is bound to the obligation's own operation identity, so
+    /// re-entering the same operation re-observes the refusal instead of
+    /// resolving it, and it is dropped again by
+    /// [`BlobStoreCore::forget_unrecorded_publication`] once the owner has
+    /// settled that boundary.
+    fn retain_unrecorded_publication(
+        &self,
+        obligation: &BlobPublicationObligation,
+    ) -> Result<(), BlobError> {
+        let Ok(mut retained) = self.unrecorded_publications.lock() else {
+            return Err(BlobError::Provider(
+                "blob publication retention lock poisoned".to_owned(),
+            ));
+        };
+        let known = retained.iter().any(|candidate| {
+            candidate.operation_id == obligation.operation_id
+                && candidate.idempotency_key == obligation.idempotency_key
+                && candidate.destination == obligation.destination
+        });
+        if known {
+            return Ok(());
+        }
+        retained.push(obligation.clone());
+        Ok(())
+    }
+
+    /// Every obligation this service retained for one operation identity.
+    ///
+    /// Retrieval covers the whole insertion key, not just the operation: an
+    /// insertion is keyed by `(operation_id, idempotency_key, destination)`, so
+    /// every retained obligation is returned and every one of them is re-bound
+    /// on re-entry. A poisoned lock reports an error rather than an empty set:
+    /// it must never be read as "nothing is owed" and release the operation.
+    fn retained_publications(
+        &self,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Vec<BlobPublicationObligation>, BlobError> {
+        let Ok(retained) = self.unrecorded_publications.lock() else {
+            return Err(BlobError::Provider(
+                "blob publication retention lock poisoned".to_owned(),
+            ));
+        };
+        Ok(retained
+            .iter()
+            .filter(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.idempotency_key == idempotency_key
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Drops one obligation from the retained set once the owner has settled it
+    /// and the cleared journal is already durable.
+    ///
+    /// Retention exists only to carry an obligation the volume never let the
+    /// journal record. A settled obligation must not outlive its settlement, or
+    /// every later re-entry would re-bind a discharged boundary and discharge it
+    /// again with an extra durable write of an already-durable destination.
+    fn forget_unrecorded_publication(
+        &self,
+        obligation: &BlobPublicationObligation,
+    ) -> Result<(), BlobError> {
+        let Ok(mut retained) = self.unrecorded_publications.lock() else {
+            return Err(BlobError::Provider(
+                "blob publication retention lock poisoned".to_owned(),
+            ));
+        };
+        retained.retain(|candidate| {
+            !(candidate.operation_id == obligation.operation_id
+                && candidate.idempotency_key == obligation.idempotency_key
+                && candidate.destination == obligation.destination)
+        });
+        Ok(())
+    }
+
+    /// Advances one publication phase. An obligation this journal still carries
+    /// outranks everything below — but that ordering is a property of the call
+    /// site, not of this function: nothing here reads `journal.pending_publication`,
+    /// and every caller settles or refuses an outstanding obligation through
+    /// `settle_pending_publication` before reaching this. Matching destination
+    /// bytes establish identity and integrity only: they are never promoted to a
+    /// durable phase, and are settled either by an owner verdict — which the
+    /// current platform port exposes no method for, so that path stays
+    /// unavailable rather than being invented — or by re-establishing that
+    /// destination's durability boundary under the same operation identity.
     #[allow(clippy::too_many_arguments)]
     fn settle_publication(
         &self,
@@ -3353,7 +3543,14 @@ where
         stage: BlobCapacityStage,
     ) -> Result<(), BlobError> {
         if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
-            return Ok(());
+            return self.reestablish_publication_durability(
+                journal_path,
+                journal,
+                destination,
+                expected_sha256,
+                hard_ceiling,
+                stage,
+            );
         }
         if !self.exact_bytes_at(source, expected_sha256, hard_ceiling)? {
             return Err(BlobError::UnknownPublishOutcome {
@@ -3361,12 +3558,7 @@ where
                 state: journal.state,
             });
         }
-        let Some(locator) = journal.locator.clone() else {
-            return Err(BlobError::PlanGap(
-                "stage journal predates the storage identity a publication obligation requires"
-                    .to_owned(),
-            ));
-        };
+        let locator = publication_locator(journal)?;
         match self.publish_or_verify(&PublishVerification {
             source,
             destination,
@@ -3391,9 +3583,236 @@ where
                     fence,
                 };
                 obligation.validate()?;
-                Err(self.record_publication_obligation(journal_path, journal, obligation, error))
+                Err(self.record_publication_obligation(journal_path, journal, &obligation, error))
             }
         }
+    }
+
+    /// Re-establishes one destination's durability boundary under the same
+    /// operation identity.
+    ///
+    /// This is the only settlement a matching destination admits. The bytes are
+    /// read back from the destination, confirmed to be the exact bytes the
+    /// operation expects, and installed again through the platform's existing
+    /// durable replace, so the owner performs the durable write for this
+    /// destination under this identity instead of being assumed to have done so
+    /// already. A failed re-establishment is the same fenced outcome an
+    /// unproven publication is: the obligation is recorded under the original
+    /// identity and the phase is not advanced.
+    fn reestablish_publication_durability(
+        &self,
+        journal_path: &WorkScopePath,
+        journal: &mut StageJournal,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+        stage: BlobCapacityStage,
+    ) -> Result<(), BlobError> {
+        let locator = publication_locator(journal)?;
+        let bytes = self.read_bounded_file(destination, hard_ceiling)?;
+        if sha256_hex(&bytes) != expected_sha256 {
+            // The destination stopped being this operation's object between the
+            // identity check and the re-establishment; nothing is installed.
+            return Err(BlobError::UnknownPublishOutcome {
+                operation_id: journal.operation_id.clone(),
+                state: journal.state,
+            });
+        }
+        if let Err(error) = self.platform_replace(destination, &bytes) {
+            let identity = BlobCapacityIdentity::Journal {
+                operation_id: journal.operation_id.clone(),
+                idempotency_key: journal.idempotency_key.clone(),
+                locator: Some(locator.clone()),
+            };
+            let (primary, fence) = match bind_platform_capacity_with_effect(
+                error,
+                stage,
+                identity,
+                Some(BlobCapacityEffect::DurabilityUnconfirmed {
+                    state: journal.state,
+                    possible_effect: true,
+                }),
+            ) {
+                Ok(bound) => {
+                    let fence = publication_fence(&bound);
+                    (bound, fence)
+                }
+                Err(InvalidCapacityEvidence) => (
+                    BlobError::UnknownPublishOutcome {
+                        operation_id: journal.operation_id.clone(),
+                        state: journal.state,
+                    },
+                    BlobPublicationFence::Unconfirmed,
+                ),
+            };
+            let obligation = BlobPublicationObligation {
+                operation_id: journal.operation_id.clone(),
+                idempotency_key: journal.idempotency_key.clone(),
+                locator: Some(locator),
+                stage,
+                destination: destination.normalized_identity().to_owned(),
+                expected_sha256: expected_sha256.to_owned(),
+                state_before: journal.state,
+                fence,
+            };
+            obligation.validate()?;
+            return Err(self.record_publication_obligation(
+                journal_path,
+                journal,
+                &obligation,
+                primary,
+            ));
+        }
+        if stage == BlobCapacityStage::CommitWrite {
+            match journal.state {
+                PublishState::JournalPrepared
+                | PublishState::PayloadDurable
+                | PublishState::MetadataDurable => {
+                    journal.state = PublishState::CommitDurable;
+                }
+                // Preserve a later checkpoint if a caller has already advanced
+                // it; re-establishing this boundary must never regress state.
+                PublishState::CommitDurable | PublishState::Ready | PublishState::Cleaned => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The exact destination and bounded ceiling one recorded obligation names.
+    ///
+    /// An obligation carries a normalized in-root identity rather than a typed
+    /// path, so the pair is resolved from the identities this journal and its own
+    /// operation already establish: its two publication targets and its own
+    /// derived commit record, each read under the same ceiling the phase that
+    /// published it used. Stage and destination are cross-checked together, so an
+    /// obligation naming one phase's stage with another phase's destination
+    /// resolves to nothing and is refused instead of being discharged by a write
+    /// to a boundary it never named. An unresolved obligation is not given an
+    /// invented bound; the caller refuses it.
+    fn obligation_target(
+        journal: &StageJournal,
+        obligation: &BlobPublicationObligation,
+    ) -> Option<(WorkScopePath, u64)> {
+        let payload = (journal.final_payload.clone(), MAX_BLOB_ENVELOPE_BYTES);
+        let metadata = (journal.final_metadata.clone(), MAX_METADATA_BYTES);
+        let commit =
+            Self::operation_path_from(&journal.operation_id, &journal.idempotency_key, "commit")
+                .ok()
+                .map(|path| ((path, MAX_JOURNAL_BYTES), BlobCapacityStage::CommitWrite));
+        [
+            Some((payload, BlobCapacityStage::PayloadPublication)),
+            Some((metadata, BlobCapacityStage::MetadataPublication)),
+            commit,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|((path, _), stage)| {
+            *stage == obligation.stage && path.normalized_identity() == obligation.destination
+        })
+        .map(|((path, ceiling), _)| (path, ceiling))
+    }
+
+    /// Settles every publication obligation this operation still carries.
+    ///
+    /// A carried obligation names exactly one boundary that is still owed, and it
+    /// is a question to settle rather than a permanent wall. The owner is asked
+    /// about that one boundary first, under this operation identity and only for
+    /// the destination *and* stage the obligation itself names: matching bytes
+    /// never settle it, the settlement is the owner's own replace returning
+    /// success, and a failure to re-establish it is exactly the fenced outcome the
+    /// obligation describes — in one of two classes, split by whether a
+    /// replacement obligation could be recorded at all. Each settlement clears the
+    /// journal's single slot and
+    /// persists that clearance before the next one is bound, so only the boundary
+    /// still owed is ever in flight and a journal that still names a boundary
+    /// stays fenced on re-entry.
+    fn settle_pending_publication(
+        &self,
+        journal_path: &WorkScopePath,
+        journal: &mut StageJournal,
+    ) -> Result<(), BlobError> {
+        while let Some(obligation) = journal.pending_publication.clone() {
+            let Some((destination, hard_ceiling)) = Self::obligation_target(journal, &obligation)
+            else {
+                return Err(Self::fenced_publication_error(journal, &obligation));
+            };
+            // A failed re-establishment is always a fenced refusal, but the error
+            // class differs with how far the attempt got, and the difference is
+            // whether a replacement obligation could be written at all.
+            //
+            // The three preconditions the callee needs — a storage identity this
+            // journal carries, a destination that exists, and those bytes being
+            // this operation's own — are checked here first. If one fails,
+            // nothing was recorded and the obligation still in hand is the durable
+            // record, so the refusal is rebuilt from it and stays capacity-typed.
+            // Matching the callee's error variants instead would not work: a
+            // `platform_replace` refusal can itself be `NotFound` or `PlanGap`.
+            //
+            // Otherwise the callee's only remaining exit is an owner refusal of the
+            // durable write, and that attempt records a replacement obligation
+            // before it returns — carrying the owner's newest fence, including any
+            // file/directory-flush refinement it reported this time. That error is
+            // passed through unchanged, so the caller sees the same evidence as the
+            // record just written.
+            let Ok(destination_bytes) = self.read_bounded_file(&destination, hard_ceiling) else {
+                return Err(Self::fenced_publication_error(journal, &obligation));
+            };
+            if publication_locator(journal).is_err()
+                || sha256_hex(&destination_bytes) != obligation.expected_sha256
+            {
+                return Err(Self::fenced_publication_error(journal, &obligation));
+            }
+            self.reestablish_publication_durability(
+                journal_path,
+                journal,
+                &destination,
+                &obligation.expected_sha256,
+                hard_ceiling,
+                obligation.stage,
+            )?;
+            // The owner performed the durable write for that boundary, so the
+            // obligation is settled. The clearance is persisted before the next
+            // boundary is considered: a journal that still names one stays fenced.
+            journal.pending_publication = None;
+            self.persist_journal(journal_path, journal, true)?;
+            // Only now is the retained copy dischargeable: the journal on the
+            // volume is durable and no longer names this boundary.
+            self.forget_unrecorded_publication(&obligation)?;
+        }
+        Ok(())
+    }
+
+    /// Settles everything this operation still owes before any phase advances.
+    ///
+    /// Two sources, in order. First the journal's own durable obligation, if the
+    /// record on the volume carries one — that is the obligation this service
+    /// wrote and owes, and it is discharged before anything else is considered.
+    /// Then the obligations this service retained for the operation because the
+    /// volume never let their journal record be written; each is bound in turn,
+    /// because the journal carries a single slot and one durable settlement
+    /// happens between bindings.
+    ///
+    /// Every binding, from either source, passes the same obligation-ownership
+    /// check a durable record passes, and every discharge is the owner's own
+    /// `platform_replace` returning success. Callers must have proven that
+    /// `journal` belongs to the operation they are recovering before calling
+    /// this: settling performs durable writes and overwrites the journal.
+    fn settle_retained_publications(
+        &self,
+        journal_path: &WorkScopePath,
+        journal: &mut StageJournal,
+    ) -> Result<(), BlobError> {
+        self.settle_pending_publication(journal_path, journal)?;
+        let retained = self.retained_publications(
+            journal.operation_id.as_str(),
+            journal.idempotency_key.as_str(),
+        )?;
+        for obligation in retained {
+            journal.pending_publication = Some(obligation);
+            journal.validate()?;
+            self.settle_pending_publication(journal_path, journal)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3402,12 +3821,7 @@ where
         journal_path: &WorkScopePath,
         journal: &mut StageJournal,
     ) -> Result<(), BlobError> {
-        // A publication obligation the owner never proved outranks every phase
-        // below: no equality check, no phase advance, and no journal deletion
-        // may resolve it on this or any later re-entry.
-        if let Some(obligation) = journal.pending_publication.clone() {
-            return Err(Self::fenced_publication_error(journal, &obligation));
-        }
+        self.settle_pending_publication(journal_path, journal)?;
         let temp_payload = journal.temp_payload.clone();
         let final_payload = journal.final_payload.clone();
         let expected_payload_sha256 = journal.expected_payload_sha256.clone();
@@ -3514,7 +3928,7 @@ where
                 return Err(self.record_publication_obligation(
                     journal_path,
                     journal,
-                    obligation,
+                    &obligation,
                     bound,
                 ));
             }
@@ -3543,7 +3957,7 @@ where
                 return Err(self.record_publication_obligation(
                     journal_path,
                     journal,
-                    obligation,
+                    &obligation,
                     error,
                 ));
             }
@@ -3602,6 +4016,12 @@ where
         let mut journal: StageJournal =
             serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
         journal.validate()?;
+        // The sweep is a second entry into the same operation, so an obligation
+        // whose durable journal record could not be written must be settled here
+        // exactly as it is on the `stage` path. Without this the sweep would ask
+        // the owner about a boundary this journal still owes and could release an
+        // operation the volume never let it record.
+        self.settle_retained_publications(path, &mut journal)?;
         self.finish_journal(path, &mut journal)
     }
 
@@ -3861,6 +4281,75 @@ where
             {
                 return Err(BlobError::IdempotencyConflict);
             }
+            // A commit record on disk does not prove this operation's create
+            // completed its durability boundary: the journal that owes that
+            // boundary is still the authority, and it outranks the record.
+            //
+            // `stage_locked` has four sites that issue a receipt, and they do not
+            // all have the same power. Two of them settle: this branch, and the
+            // journal-reload branch below, both through
+            // `settle_retained_publications`. Two of them can only refuse: the
+            // within-scope dedup branch and the fresh-publish branch further
+            // down, because neither can settle a boundary it has no journal for
+            // or no prior record of. The `reconcile` sweep is a third settler.
+            //
+            // Where this branch has no journal at all it relies on a precondition
+            // rather than proving it: a retained obligation means the journal that
+            // would carry it is still on the volume, because the journal is
+            // deleted only after a fully settled commit. That is why this check
+            // refuses instead of settling, and why the two refuse-only sites
+            // restate it as a refusal rather than assume it.
+            if self.platform_stat(&journal_path)? != BlobPathState::Missing {
+                let journal_bytes = self.read_bounded_file(&journal_path, MAX_JOURNAL_BYTES)?;
+                let mut journal: StageJournal = serde_json::from_slice(&journal_bytes)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                journal.validate()?;
+                // Prove this journal belongs to *this* request before settling
+                // anything. Settling performs durable owner writes, overwrites the
+                // journal on the volume and evicts retention entries, all keyed by
+                // the journal's own identity — so acting on an unproven journal
+                // would mutate a different operation. `journal_path` is derived
+                // from this request's context, so identity equality already proves
+                // ownership; `StageJournal::validate` above proved only that the
+                // record is self-consistent. The sibling journal-reload branch
+                // rejects the same mismatch with the same reason.
+                if journal.operation_id != request.context.operation.operation_id.as_str()
+                    || journal.idempotency_key != request.context.operation.idempotency_key
+                {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                self.settle_retained_publications(&journal_path, &mut journal)?;
+                if !matches!(
+                    journal.state,
+                    PublishState::CommitDurable | PublishState::Ready | PublishState::Cleaned
+                ) {
+                    self.reestablish_publication_durability(
+                        &journal_path,
+                        &mut journal,
+                        &commit_path,
+                        &sha256_hex(&bytes),
+                        MAX_JOURNAL_BYTES,
+                        BlobCapacityStage::CommitWrite,
+                    )?;
+                    self.persist_journal(&journal_path, &journal, true)?;
+                }
+            } else if let Some(obligation) = self
+                .retained_publications(
+                    request.context.operation.operation_id.as_str(),
+                    request.context.operation.idempotency_key.as_str(),
+                )?
+                .into_iter()
+                .next()
+            {
+                // A boundary this operation still owes outlived the journal that
+                // recorded it. The recovery state is unrecoverable, so the
+                // operation stays unreleasable instead of being released on a
+                // commit record that cannot answer for that boundary.
+                return Err(BlobError::UnknownPublishOutcome {
+                    operation_id: obligation.operation_id,
+                    state: obligation.state_before,
+                });
+            }
             // Operation identity wins over a rotated request scope: the
             // committed scope is authoritative for this operation.
             let commit_scope = ResidencyScope {
@@ -3909,6 +4398,14 @@ where
             {
                 return Err(BlobError::IdempotencyConflict);
             }
+            // A publication obligation whose durable journal record could not be
+            // written never reached the volume, so the journal decoded above
+            // carries none and recovery would walk straight past the fence.
+            // Settle what this service retained for this proven operation
+            // identity first; each binding passes the obligation-ownership check a
+            // durable record passes, and the same settlement-or-refusal route then
+            // governs this and every later re-entry.
+            self.settle_retained_publications(&journal_path, &mut journal)?;
             self.finish_journal(&journal_path, &mut journal)?;
             // Converge to the journal's own scope: a same-operation replay
             // under a rotated key recovers the already-published object
@@ -3950,6 +4447,25 @@ where
             let verified = self.verify_metadata_receipt(&stored)?;
             let ready = stored.ready(verified, &self.issuer_anchor, sha256_hex(&metadata_bytes))?;
             self.verify_payload(&ready, &request.bytes, &scope)?;
+            // This branch never recovers a journal, so it cannot settle what this
+            // service retained for the operation. A retained obligation means a
+            // boundary is still owed, and no owner write has been performed for it
+            // here, so the operation stays unreleasable rather than being released
+            // on a matching object. Reported with the obligation's own recorded
+            // state, because this site has no journal to bound.
+            if let Some(obligation) = self
+                .retained_publications(
+                    request.context.operation.operation_id.as_str(),
+                    request.context.operation.idempotency_key.as_str(),
+                )?
+                .into_iter()
+                .next()
+            {
+                return Err(BlobError::UnknownPublishOutcome {
+                    operation_id: obligation.operation_id,
+                    state: obligation.state_before,
+                });
+            }
             return Ok(ready);
         }
 
@@ -4143,6 +4659,25 @@ where
         let verified = self.verify_metadata_receipt(&metadata)?;
         let ready = metadata.ready(verified, &self.issuer_anchor, metadata_sha256)?;
         self.verify_payload(&ready, &request.bytes, &scope)?;
+        // Fourth receipt site, and the only one that publishes rather than
+        // recovers: it built this operation's journal in this call, so the
+        // journal carries no obligation to settle. A retained obligation for the
+        // same identity would mean an earlier attempt left a boundary unproven and
+        // nothing has discharged it since, so refuse rather than release. Same
+        // refusal as the within-scope dedup branch, for the same reason.
+        if let Some(obligation) = self
+            .retained_publications(
+                request.context.operation.operation_id.as_str(),
+                request.context.operation.idempotency_key.as_str(),
+            )?
+            .into_iter()
+            .next()
+        {
+            return Err(BlobError::UnknownPublishOutcome {
+                operation_id: obligation.operation_id,
+                state: obligation.state_before,
+            });
+        }
         Ok(ready)
     }
 
@@ -6424,8 +6959,12 @@ mod tests {
         ));
     }
 
+    /// Discovery: `MemoryPlatform::rename_no_replace_durable` fails and reports
+    /// `PayloadPublication`. That stage names no durability boundary of its own,
+    /// so `bind_platform_capacity_with_effect` applies the caller's effect for
+    /// this publication leg instead of the port's weaker statement.
     #[test]
-    fn publication_capacity_keeps_possible_effect_for_reconciliation() {
+    fn publication_failure_without_port_boundary_reports_unconfirmed_durability() {
         let root = unique_test_root();
         let platform = MemoryPlatform {
             fail_rename: true,
@@ -6440,19 +6979,34 @@ mod tests {
         let BlobError::StorageCapacity { failure } = error else {
             panic!("expected typed publication capacity failure");
         };
+        // `PayloadPublication` names no durability boundary, so the caller's stage
+        // for this leg stands rather than the port's.
         assert_eq!(failure.stage, BlobCapacityStage::PayloadPublication);
-        assert!(matches!(
+        // The port could only say `PossiblePublication`; the caller's effect
+        // applies, because a failed publication may have installed a destination
+        // whose durability is unconfirmed. This is the service's own statement, not
+        // a durable phase and not a receipt.
+        assert_eq!(
             failure.evidence.effect,
-            BlobCapacityEffect::PossiblePublication { .. }
-        ));
+            BlobCapacityEffect::DurabilityUnconfirmed {
+                state: PublishState::JournalPrepared,
+                possible_effect: true,
+            }
+        );
         assert_eq!(
             failure.recovery,
             BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
         );
+        assert!(failure.validate().is_ok());
     }
 
+    /// Discovery: `MemoryPlatform::remove_durable` fails at the cleanup leg, after
+    /// the commit marker is already durable. `bind_cleanup_capacity` retains the
+    /// port's typed evidence and states the honest row: the removal was observed
+    /// and did not report success, so the result is `Failed` with its evidence
+    /// attached — not `Unknown`, which would claim nobody observed it at all.
     #[test]
-    fn cleanup_capacity_retains_last_durable_phase_and_unknown_cleanup() {
+    fn cleanup_capacity_retains_last_durable_phase_and_failed_cleanup() {
         let root = unique_test_root();
         let platform = MemoryPlatform {
             fail_remove: true,
@@ -6474,7 +7028,21 @@ mod tests {
                 state: PublishState::CommitDurable
             }
         ));
-        assert_eq!(failure.cleanup, BlobCapacityCleanup::Unknown);
+        // Pinned as the whole row, not just the verdict: `Failed` at the `Cleanup`
+        // stage, carrying the evidence the port actually reported. `Unknown` would
+        // assert that the removal's outcome was unobserved, which this failure did
+        // observe.
+        assert_eq!(failure.cleanup, BlobCapacityCleanup::Failed);
+        assert_eq!(failure.cleanup_stage, Some(BlobCapacityStage::Cleanup));
+        let cleanup_evidence = failure
+            .cleanup_evidence
+            .expect("a failed cleanup must retain the port's typed evidence");
+        assert_eq!(
+            cleanup_evidence.effect,
+            BlobCapacityEffect::PossiblePublication {
+                state: PublishState::CommitDurable
+            }
+        );
         assert_eq!(
             failure.recovery,
             BlobCapacityRecovery::ReconcileSameOperationThenRevalidate

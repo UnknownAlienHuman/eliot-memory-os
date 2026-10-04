@@ -70,7 +70,8 @@ use eliotd::startup_capability_bindings::{
     StartupCapabilityBindings,
 };
 use eliotd::startup_readiness::{
-    LocalDeltaAdoption, LocalDeltaConflict, LocalReadinessDelta, StartupReadinessProjection,
+    CapabilityRefresh, CoreOwnerState, DemandRefreshOutcome, LocalDeltaAdoption,
+    LocalDeltaConflict, LocalReadinessDeltas, StartupReadinessProjection, StartupRefreshReason,
 };
 use eliotd::testd_terminal_completion::{
     TestdOwnerDrainOutcome, ack_testd_owner_terminal_completion,
@@ -180,6 +181,16 @@ enum RunLoopExit {
         result_sha256: String,
         detail: String,
     },
+    /// #2559 D1: a ticket the Kernel has CLAIMED is awaiting resolution or its
+    /// terminal disposition is unresolved. This is deliberately a separate
+    /// variant from `ShutdownActivationUnknown`: at this stage no
+    /// `AgentActivationResolutionResult` exists, so there is no honest
+    /// `result_sha256` to carry, and reporting clean shutdown here would drop a
+    /// Kernel-owned ticket from daemon shutdown evidence.
+    ShutdownActivationClaimedUnknown {
+        ticket_id: String,
+        detail: String,
+    },
 }
 
 /// Typed dispatch failure so the shutdown drain can distinguish an ambiguous
@@ -280,9 +291,36 @@ struct ActivationResolvedTicket {
     owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
+/// Which stage one activation flight has actually reached.
+///
+/// #2559 D1. The flight used to carry `Option<RetainedActivationIdentity>`,
+/// which cannot express "a ticket is claimed and waiting" because that stage
+/// has a ticket identity and NO result digest yet. `None` therefore meant two
+/// different things - "no activation at all" and "claimed, result-less" - and
+/// the drain read both as clean shutdown, so a claimed ticket could be dropped
+/// from daemon shutdown evidence while the Kernel still owned it.
+///
+/// The stage is set the moment the transition is known, outside the opaque
+/// future, and it is NEVER advanced by a timeout: a digest only ever comes from
+/// a real `AgentActivationResolutionResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivationStage {
+    /// The claim request is outstanding. No ticket identity exists yet, so
+    /// there is nothing to retain and nothing to reconcile: this stage is
+    /// genuinely equivalent to "no activation work owned".
+    Claiming,
+    /// The Kernel returned a valid ticket and the resolve-wait step is
+    /// outstanding. `ticket_id` is the ORIGINAL claimed identity, retained
+    /// verbatim; there is no result digest because none exists.
+    ClaimedWaiting { ticket_id: String },
+    /// Semantic resolution produced a result and the submit step is
+    /// outstanding. Both identities are real and are carried verbatim.
+    ResolvedSubmitting(RetainedActivationIdentity),
+}
+
 struct ActivationFlightState {
     future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>>,
-    retained: Option<RetainedActivationIdentity>,
+    stage: ActivationStage,
 }
 
 /// Sole owner of activation state in `run_loop`. `Idle` means no activation
@@ -355,9 +393,16 @@ fn install_activation_resolve(
     flight: &mut ActivationFlight,
     ticket: AgentActivationResolutionTicket,
 ) {
+    // #2559 D1: the ticket identity is retained HERE, where the claim has
+    // settled and the ticket is in hand - not inside the opaque future, which
+    // is what made a claimed ticket indistinguishable from no activation when
+    // the drain budget expired. `ticket_id` is cloned from the caller's own
+    // ticket; nothing is recomputed and no digest is invented, because at this
+    // stage no `AgentActivationResolutionResult` exists yet.
+    let ticket_id = ticket.ticket_id.clone();
     *flight = ActivationFlight::InFlight(ActivationFlightState {
         future: start_activation_resolve(Arc::clone(kernel), Arc::clone(composition), ticket),
-        retained: None,
+        stage: ActivationStage::ClaimedWaiting { ticket_id },
     });
 }
 
@@ -458,17 +503,21 @@ enum LocalReadCompletion {
 
 /// What one settled local-read step produced.
 ///
-/// #2647: the step returns its poll outcome plus at most one bounded readiness
-/// delta — only the observation this flight's own attach or re-read actually
-/// produced. An empty claim or an ordinary read with no refresh carries no
-/// delta, so settling it cannot overwrite newer owner observations the loop
-/// recorded while the flight was outstanding. There is no second owner and no
-/// shared handle.
+/// #2647: the step returns its poll outcome plus the bounded readiness deltas
+/// this flight actually observed — only what its own attach or demand-driven
+/// re-read really produced, one per declared slot the demand names. An empty
+/// claim, an ordinary read with no refresh and a demand that reevaluated
+/// nothing all carry none, so settling it cannot overwrite newer owner
+/// observations the loop recorded while the flight was outstanding. A demand
+/// that needs more than one capability (the Skill path needs both its tool
+/// source and its installed-Skill basis) therefore returns one delta per slot
+/// rather than a single observation that cannot express both outcomes. There is
+/// no second owner and no shared handle.
 struct LocalReadStep {
     /// The poll outcome the loop acts on.
     outcome: LocalReadPollOutcome,
-    /// The readiness observation this flight produced, if any.
-    delta: Option<LocalReadinessDelta>,
+    /// The bounded per-slot readiness observations this flight produced.
+    deltas: LocalReadinessDeltas,
 }
 
 struct LocalReadFlightState {
@@ -829,26 +878,40 @@ pub(super) fn run() -> Result<(), String> {
     // until a later pass satisfies the core prerequisites. The producer is still
     // built once per generation, from the validated ready response and the real
     // owner session only.
+    //
+    // #2560 lifecycle: this pre-loop construction and the heartbeat's recovery
+    // of the same generation share ONE bundle exchange
+    // (`supervision_ready_evidence`) and ONE producer construction
+    // (`construct_supervision_producer`). A withheld core verdict is not
+    // terminal in general, but the heartbeat reaches that recovery only when a core
+    // prerequisite the transition owner does not write itself changes on its own
+    // evidence: the one mandatory owner-session slot is written by the startup bind
+    // and by the owner-replacement re-proof, and neither of those runs for a merely
+    // withheld verdict. When `observe_readiness_transition` does report
+    // `CoreAdmissible`, the heartbeat then runs that same one exchange and builds
+    // that same one producer.
+    let supervision_launch = SupervisionLaunchIdentity {
+        daemon_artifact_id: format!("eliotd-exe:{}", launch.executable_sha256),
+        daemon_config_digest: launch.config_sha256.clone(),
+        launch_nonce: launch.launch_nonce.clone(),
+    };
+    // #2560 card MAKE: the existing exact-generation idempotent `report_ready`
+    // runs ONCE and constructs exactly ONE producer. This pre-loop block is that
+    // one exchange, and it publishes a producer only when it SUCCEEDED — which is
+    // what `run_loop` uses to seed its exact-generation key, so the heartbeat
+    // never repeats an exchange that already ran. A withheld verdict publishes
+    // neither exchange nor producer, so no key is seeded and the first admissible
+    // pass still runs the one exchange.
     let supervision_progress = if startup_readiness
         .core_readiness_prerequisites_satisfied()
         .is_satisfied()
     {
-        let ready_supervision = kernel.report_ready().map_err(|error| error.to_string())?;
-        let session_facts = kernel.owner_session_facts().ok_or_else(|| {
-            "daemon has no validated Kernel session binding for supervision progress".to_owned()
-        })?;
-        Some(
-            eliotd::SupervisionProgressProducer::new(eliotd::SupervisionProducerDeps {
-                daemon_artifact_id: format!("eliotd-exe:{}", launch.executable_sha256),
-                daemon_config_digest: launch.config_sha256.clone(),
-                launch_nonce: launch.launch_nonce.clone(),
-                process_pid: std::process::id(),
-                transport_session_evidence: session_facts.session_binding().to_owned(),
-                transport_connection_evidence: session_facts.connection_id().to_owned(),
-                ready: ready_supervision,
-            })
-            .map_err(|error| format!("daemon supervision producer: {error}"))?,
-        )
+        let (transport, ready) = supervision_ready_evidence(&kernel)?;
+        Some(construct_supervision_producer(
+            &supervision_launch,
+            transport,
+            ready,
+        )?)
     } else {
         None
     };
@@ -901,6 +964,13 @@ pub(super) fn run() -> Result<(), String> {
         &composition_status,
         capability_summary.has_restrictions(),
     );
+    // #2560 republication: the retained Governor capability model partition is
+    // the startup observation of restricted capabilities, and the heartbeat
+    // republishes the readiness record with this same retained value instead of
+    // re-deriving (or dropping) it. That predicate is pure over `&self`, so the
+    // evaluation the startup record consumed and the value the heartbeat carries
+    // are the same fact; dispatch reads that same value.
+    let capability_model_restricted = capability_summary.has_restrictions();
     // #2560: the same evaluation that produced the ready/degraded record reaches
     // diagnostics, so stdout, diagnostics and dispatch cannot disagree.
     eliotd::startup_readiness::emit_startup_readiness_record(&startup_readiness, &readiness);
@@ -946,6 +1016,8 @@ pub(super) fn run() -> Result<(), String> {
         Arc::clone(&kernel),
         Arc::clone(&composition),
         supervision_progress,
+        supervision_launch,
+        capability_model_restricted,
         startup_readiness,
         startup_maintenance_observations,
     ));
@@ -965,6 +1037,21 @@ pub(super) fn run() -> Result<(), String> {
     let mut shutdown_activation_unknown = false;
     let final_result = match (loop_result, shutdown_result) {
         (Ok(RunLoopExit::Shutdown), Ok(())) => Ok(()),
+        // #2559 D1: a claimed-but-unresolved ticket is NOT a clean shutdown.
+        // It reuses the same non-clean `WithActivationUnknown` terminal outcome
+        // as the submit-unknown case because that is exactly what it is - an
+        // activation whose terminal disposition the daemon cannot prove - while
+        // the message names the ticket and states that no result digest exists,
+        // so the record cannot be read as a submit that happened.
+        (Ok(RunLoopExit::ShutdownActivationClaimedUnknown { ticket_id, detail }), Ok(())) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with a claimed activation ticket unresolved, ticket {ticket_id}, no result digest exists: {detail}"
+                ),
+            ))
+        }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
                 ticket_id,
@@ -985,6 +1072,18 @@ pub(super) fn run() -> Result<(), String> {
         (Err(failure), Ok(())) => {
             shutdown_activation_unknown = failure.activation_unknown.is_some();
             Err(report_terminal_failure(&kernel, failure.message))
+        }
+        (
+            Ok(RunLoopExit::ShutdownActivationClaimedUnknown { ticket_id, detail }),
+            Err(shutdown_error),
+        ) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with a claimed activation ticket unresolved, ticket {ticket_id}, no result digest exists: {detail}; shutdown: {shutdown_error}"
+                ),
+            ))
         }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
@@ -1051,9 +1150,29 @@ fn bind_declared_startup_capabilities(
     // the capability records why it did not bind.
     let owner_session_binding = match kernel.owner_session_facts() {
         Some(facts) => {
+            // #2560: the retained owner-session proof names the exact
+            // generation and authority epoch the live authenticated session was
+            // proven under, read from the composition's own owner state through
+            // the readiness module's only constructor
+            // (`observe_core_owner_state`). I1.8: a session exists only while
+            // transport identity and the semantic Session refer to the same
+            // State Fence/epoch, so the proof has to carry which epoch it
+            // belongs to instead of reading as current for every epoch this
+            // process ever lived through. The values are not parsed out of the
+            // binding string and never invented.
+            //
+            // #2560 item 4: the epoch is the contract's own `EpochId` — the full
+            // `(lineage_id, sequence)` tuple read through the owner identity's
+            // own accessor, not `authority_epoch_sequence()`. The sequence alone
+            // is not an identity: two lineages issue unrelated sequences at the
+            // same value, and a proof admitted under `(lineage-A, 1)` must not
+            // read as current after the owner rebound to `(lineage-B, 1)`.
+            let owner_state = eliotd::startup_readiness::observe_core_owner_state(composition);
             let retained = RetainedStartupBinding::OwnerSession {
                 session_binding: facts.session_binding().to_owned(),
                 connection_id: facts.connection_id().to_owned(),
+                generation: owner_state.generation(),
+                authority_epoch: owner_state.identity.authority_epoch().clone(),
             };
             composition.note_owner_session_binding(facts);
             Ok(retained)
@@ -1640,9 +1759,17 @@ async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut supervision_progress: Option<eliotd::SupervisionProgressProducer>,
+    // #2560 lifecycle: the launch identity travels with the producer rather
+    // than being re-derived at each construction site, so the pre-loop build and
+    // the heartbeat's recovery of the same generation build byte-identical
+    // `SupervisionProducerDeps` through one function.
+    supervision_launch: SupervisionLaunchIdentity,
+    // The retained startup capability-model partition, reused verbatim by every
+    // later readiness evaluation and republication.
+    capability_model_restricted: bool,
     // #2560/#2647: sole owner of the readiness projection. A local-read
     // flight prepares from an immutable snapshot and returns only the bounded
-    // delta it actually observed, so there is one authoritative copy and a
+    // deltas it actually observed, so there is one authoritative copy and a
     // late completion can never overwrite newer owner observations.
     startup_readiness: StartupReadinessProjection,
     startup_maintenance_observations: [MaintenanceObservation; 2],
@@ -1652,6 +1779,42 @@ async fn run_loop(
     // heartbeat observation and local-read adoption use short synchronous
     // borrows and release them before any await.
     let startup_readiness = Rc::new(RefCell::new(startup_readiness));
+    // #2560: what this loop remembers between readiness observations — the owner
+    // identity it observed last, and the readiness record it published last. Both
+    // are this loop's own copies of facts it cannot re-derive from the projection
+    // (its stored owner facts are private to its own module), neither holds a
+    // verdict, and neither decides anything. The baseline identity is read here
+    // through the same public accessor the transition owner uses, at the point
+    // where this loop is the composition's only possible holder, so the first
+    // heartbeat compares against a real observation instead of inventing one.
+    let observed_owner = {
+        let guard = composition.lock().await;
+        eliotd::startup_readiness::observe_core_owner_state(&guard)
+    };
+    // #2560: seed this loop's exact-generation key. The pre-loop block publishes a
+    // producer ONLY when its `daemon_ready` exchange succeeded, so a retained
+    // producer is itself the proof that exchange already ran, and the identity to
+    // record is the one observed here through the same accessor. A withheld
+    // pre-loop verdict published neither exchange nor producer, so it seeds no
+    // key and the first admissible pass still runs the one exchange.
+    let supervision_exchange_owner = supervision_progress.as_ref().map(|_| {
+        (
+            observed_owner.generation(),
+            observed_owner.authority_epoch(),
+        )
+    });
+    let readiness_record = Rc::new(RefCell::new(LoopReadinessRecord {
+        observed_owner: Some(observed_owner),
+        published_report: startup_readiness.borrow().report(),
+        // No stdout record has been published by this loop yet, so the first
+        // heartbeat publishes once to establish it. The pre-loop block remains the
+        // first line a reader ever sees.
+        published_line: String::new(),
+        // The one pre-loop exchange above already ran for the identity it was
+        // issued for, so that identity is the key the heartbeat starts from. A
+        // withheld pre-loop verdict published no exchange and leaves it `None`.
+        supervision_exchange_owner,
+    }));
     // Sole owner of activation state. No second owner and no second
     // concurrent activation exist: the timer starts work only when idle and
     // the in-flight step is polled only in its own branch below.
@@ -1805,15 +1968,17 @@ async fn run_loop(
                     &mut solo_poll_last_refusal,
                     &mut fair_pull_recovery_flight,
                     &mut fair_pull_recovery_last_refusal,
+                    // #2559 D3: the campaign-packet flight keeps its own queue,
+                    // claim, compile and result legs, the Task Controller
+                    // flight keeps its own queue and attempt type, and Finish
+                    // keeps its own submit leg. All three now drain inside the
+                    // shared bounded budget instead of behind three further
+                    // fresh ones, so `exit` already accounts for all of them.
+                    &mut campaign_packet_flight,
+                    &mut task_controller_flight,
+                    &mut finish_flight,
                 )
                 .await?;
-                // #1862: the campaign-packet flight keeps its own queue, claim,
-                // compile and result legs, and the Task Controller flight keeps
-                // its own queue and attempt type. Both drain on their own
-                // bounded budgets after the shared flights settle.
-                drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
-                drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
-                drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -1833,20 +1998,56 @@ async fn run_loop(
                     &mut watchdog_export_drain_flight,
                     &mut flight,
                 );
-                // Campaign packets ride the same tick under their own gate and
-                // are never consumed by the query poller.
-                maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
-                // Task Controller uses a separate queue and attempt type;
-                // start it on the same cadence without sharing the local-read
-                // completion branch.
-                maybe_start_task_controller_poll(
-                    &kernel,
-                    &composition,
-                    &mut task_controller_flight,
-                );
-                // Finish uses a separate queue and attempt type; start it on the
-                // same cadence without sharing the local-read completion branch.
-                maybe_start_finish_poll(&kernel, &composition, &mut finish_flight);
+                // #2560 required items 3/7: the remaining authenticated
+                // governed dispatch on this tick is gated on the SAME core
+                // readiness answer, read from the same loop projection the
+                // flights above and the heartbeat re-observe. Each of these three
+                // polls claims from a Kernel queue and commits governed effects,
+                // so a withheld core prerequisite must stop them from starting at
+                // all rather than letting them start, discover the withheld
+                // admission and escalate — which is exactly what the TestD owner
+                // drain used to do.
+                //
+                // The solo poll, the fair-pull recovery poll, the idle
+                // maintenance trigger and the improvement intake stay ungated.
+                // Stated from what the code actually does, because an earlier
+                // draft of this comment claimed the gate would be CIRCULAR —
+                // that fair-pull recovery repairs the readiness it is gated on —
+                // and that claim is false. Nothing either flight writes feeds any
+                // of the five conditions the core verdict checks: they write
+                // `solo_state`, the solo projections under `state_root`, the
+                // semantic-revision store, and the `AgentFabric` slot alone.
+                // The real reason these two stay ungated is narrower: each
+                // already refuses itself unless the composition is `Ready`,
+                // which is ONE of the five core conditions, and the other four
+                // (zero generation or epoch, an unstarted composition, a stale
+                // dependent view, and an unbound mandatory owner session) do not
+                // by themselves produce an effect here, because the solo chain's
+                // ports are unbound and the deepest reachable point is a pair of
+                // authenticated Kernel reads followed by a typed
+                // missing-prerequisite refusal at `require_model_route`. That is
+                // a property of unbound ports, not of the readiness gate, so it
+                // is the thing to re-examine when those ports bind.
+                if readiness_projection
+                    .core_readiness_prerequisites_satisfied()
+                    .is_satisfied()
+                {
+                    // Campaign packets ride the same tick under their own gate and
+                    // are never consumed by the query poller.
+                    maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
+                    // Task Controller uses a separate queue and attempt type;
+                    // start it on the same cadence without sharing the local-read
+                    // completion branch.
+                    maybe_start_task_controller_poll(
+                        &kernel,
+                        &composition,
+                        &mut task_controller_flight,
+                    );
+                    // Finish uses a separate queue and attempt type; start it on
+                    // the same cadence without sharing the local-read completion
+                    // branch.
+                    maybe_start_finish_poll(&kernel, &composition, &mut finish_flight);
+                }
                 // Issue #1108: start at most one tracked Kernel verification
                 // flight. The poll snapshots its head plus the expected
                 // revisions under a short try-lock; the verified drive holds
@@ -1854,7 +2055,12 @@ async fn run_loop(
                 // sole-path seam resolves session halves on
                 // `&DaemonComposition`) and both adopts revalidate before
                 // dequeuing, so ticks never overlap a drive.
-                maybe_start_solo_poll(&kernel, &composition, &mut solo_poll_flight);
+                maybe_start_solo_poll(
+                    &kernel,
+                    &composition,
+                    &startup_readiness,
+                    &mut solo_poll_flight,
+                );
                 // Issue #1683 W5: the bounded fair-pull recovery poll rides
                 // this same cadence branch and is started on every tick. It is
                 // the fallback that survives a lost release notification, so
@@ -1865,6 +2071,7 @@ async fn run_loop(
                 maybe_start_fair_pull_recovery(
                     &kernel,
                     &composition,
+                    &startup_readiness,
                     &mut fair_pull_recovery_flight,
                 );
                 // #1688 (I14.22): the idle trigger rides this cadence branch
@@ -2041,7 +2248,10 @@ async fn run_loop(
                     &kernel,
                     &composition,
                     &startup_readiness,
+                    &readiness_record,
                     &mut supervision_progress,
+                    &supervision_launch,
+                    capability_model_restricted,
                     matches!(flight, ActivationFlight::InFlight(_)),
                     &mut health_heartbeat_flight,
                     &mut health_heartbeat_failure_guard,
@@ -2194,6 +2404,26 @@ fn settle_activation_dispatch_completion(
 /// under their own gate: both must start even while an activation is in
 /// flight, so their gates are checked before the activation early-continue.
 /// The activation claim itself still starts only when its flight is idle.
+///
+/// #2560 required item 3/7: every readiness-dependent dispatch flight below is
+/// gated on ONE answer, read from the loop's own authoritative projection
+/// instance — `core_readiness_prerequisites_satisfied()` over the mandatory
+/// capability set plus the composition's own owner set, generation/fence and
+/// recovery preconditions. It is the same snapshot the heartbeat re-observes and
+/// the Skill/Notification demand paths refresh, so dispatch and reporting can
+/// never disagree, and there is no second readiness source here.
+///
+/// Only CORE readiness gates these flights. An OPTIONAL slot being unavailable
+/// never stops an unrelated admitted read, claim or drain: the operation that
+/// actually consumes that capability refuses specifically, through
+/// `reevaluate_demanded_capabilities`, and every other flight keeps starting.
+/// The Watchdog export drain is the one flight below that stays ungated: it is
+/// the policy-allowed observation window the Kernel already admitted over the
+/// authenticated front door, not a request-serving dispatch, and health,
+/// shutdown and inspection stay observable while core readiness is withheld.
+/// Each of these four flights still has its own idle/in-flight gate, and no
+/// flight is stopped here for its own sake — only withheld core readiness holds
+/// dispatch.
 fn start_tick_work(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -2204,20 +2434,30 @@ fn start_tick_work(
     watchdog_export_drain_flight: &mut WatchdogExportDrainFlight,
     flight: &mut ActivationFlight,
 ) {
-    maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
-    maybe_start_observe_poll(kernel, observe_flight);
-    maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
-    maybe_start_watchdog_export_drain(kernel, composition, watchdog_export_drain_flight);
-    if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
-        *flight = ActivationFlight::InFlight(ActivationFlightState {
-            // #1115: the claim reads the daemon's current named dependency
-            // discriminator from the composition before requesting, so the
-            // Kernel-side `NotReady` supersede gate sees an authenticated
-            // observation instead of an implicit one.
-            future: start_activation_claim(kernel, composition),
-            retained: None,
-        });
+    if startup_readiness
+        .core_readiness_prerequisites_satisfied()
+        .is_satisfied()
+    {
+        maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
+        maybe_start_observe_poll(kernel, observe_flight);
+        maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
+        if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
+            *flight = ActivationFlight::InFlight(ActivationFlightState {
+                // #1115: the claim reads the daemon's current named dependency
+                // discriminator from the composition before requesting, so the
+                // Kernel-side `NotReady` supersede gate sees an authenticated
+                // observation instead of an implicit one.
+                future: start_activation_claim(kernel, composition),
+                // #2559 D1: the claim request is outstanding, so no ticket
+                // identity exists yet and `Claiming` is the honest stage. It is
+                // a distinct variant from the claimed/waiting stage rather than
+                // a shared "nothing retained" value, so the drain can tell them
+                // apart instead of inferring one from the other.
+                stage: ActivationStage::Claiming,
+            });
+        }
     }
+    maybe_start_watchdog_export_drain(kernel, composition, watchdog_export_drain_flight);
 }
 
 /// Notes one claimed activation on the supervision Claim channel when a
@@ -3120,16 +3360,366 @@ async fn note_blocked_automation_notification(
     }
 }
 
+/// What one heartbeat pass concluded about this daemon's owner state.
+///
+/// #2560: exactly one owner in this file turns a re-read of the owner facts
+/// into an operational decision, so nothing else in the file has to interpret a
+/// verdict. Process survival is never progress and a local observation never
+/// substitutes for a Kernel fact: each arm below names what the existing
+/// `observe_owner` actually observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReadinessTransition {
+    /// The owner identity this loop last observed is unchanged and the core
+    /// verdict is exactly what it was before this pass. The pass still re-read
+    /// the owner facts and re-derived the verdict; it re-attaches nothing, files
+    /// no slot and builds no producer, and no readiness record is republished.
+    Unchanged,
+    /// The core readiness prerequisites were unmet and now hold. The generation
+    /// became admissible, so one `daemon_ready` reconciliation and one
+    /// supervision producer may be rebuilt.
+    CoreAdmissible,
+    /// The core readiness prerequisites held and now do not. The generation is
+    /// no longer admitted: the retained supervision lineage is retired and the
+    /// readiness-dependent dispatch flights stop starting.
+    CoreWithheld {
+        /// The unmet preconditions this projection currently names.
+        reasons: Vec<String>,
+    },
+    /// The observed owner context itself moved. Every generation-scoped proof is
+    /// revoked by that event, and the retained owner session is re-proven from
+    /// the live authenticated owner so the mandatory core slot cannot latch on
+    /// the generation it was admitted under.
+    OwnerReplaced {
+        /// The exact owner change this observation made, naming the owner facts
+        /// it was decided from.
+        reason: String,
+    },
+}
+
+/// Names one readiness transition for the loop's own record.
+fn readiness_transition_name(transition: &ReadinessTransition) -> &'static str {
+    match transition {
+        ReadinessTransition::Unchanged => "unchanged",
+        ReadinessTransition::CoreAdmissible => "core_admissible",
+        ReadinessTransition::CoreWithheld { .. } => "core_withheld",
+        ReadinessTransition::OwnerReplaced { .. } => "owner_replaced",
+    }
+}
+
+/// What the run loop remembers between readiness observations.
+///
+/// #2560: this holds no verdict, decides nothing and is not a second readiness
+/// service. It is the loop's own record of the two facts a pass cannot re-derive
+/// from the projection alone: the owner identity the loop last observed — the
+/// projection's own stored owner facts are private to its module, and
+/// `CoreOwnerState` is `Copy`, so the loop keeps that copy — and the exact
+/// readiness record most recently written through the existing stdout seam, so
+/// republication can tell what actually changed instead of writing on every
+/// tick.
+struct LoopReadinessRecord {
+    /// The owner identity this loop last observed through
+    /// `observe_core_owner_state`, or `None` only before the first observation.
+    observed_owner: Option<CoreOwnerState>,
+    /// The projection report most recently published through the existing
+    /// diagnostics seam.
+    published_report: String,
+    /// The exact stdout record most recently published, rendered through the
+    /// same `ReadyMessage` the seam writes.
+    published_line: String,
+    /// The `(generation, authority_epoch)` owner identity the last SUCCESSFUL
+    /// `daemon_ready` exchange was issued for, or `None` while this loop has not
+    /// completed one.
+    ///
+    /// This is the card's exact-generation key (#2560: the existing
+    /// exact-generation idempotent `report_ready` runs "once" and constructs
+    /// "exactly one" producer). It is written only where an exchange SUCCEEDED,
+    /// so a refused exchange leaves it untouched and the next tick still retries,
+    /// and it is compared against the composition's own observed identity — the
+    /// same `observe_core_owner_state` pair `observe_readiness_transition`
+    /// compares — so the key opens only when that identity MOVES. `readiness`,
+    /// `view_fresh` and `owner_set_admitted` are deliberately NOT part of the
+    /// key: they are withheld-prerequisite inputs, not identity, so folding them
+    /// in would re-issue the exchange on a readiness or view-freshness flicker.
+    supervision_exchange_owner: Option<(u64, u64)>,
+}
+
+/// Decides what one real owner-state change means operationally, exactly once per
+/// heartbeat.
+///
+/// #2560 required items 1, 3 and 5. The two decisions are made from two
+/// different observations and neither is nested inside the other:
+///
+/// 1. The core verdict is read BEFORE the owner re-observation and again AFTER
+///    it, unconditionally. `CoreWithheld { reasons }` and `CoreAdmissible` are
+///    classified from that pair alone, so a slot whose availability changed on its
+///    OWN evidence — a demand-driven re-evaluation or adoption the loop performed
+///    between heartbeats — is reported even though the owner context itself never
+///    moved. The withholding reasons are the ones this projection currently names.
+/// 2. The owner identity is then compared against the identity this loop observed
+///    last pass. `OwnerReplaced` is reported ONLY when the resource generation or
+///    the authority epoch actually moved, because only those two revoke a
+///    generation-scoped proof (I1.5, I14.14). `view_fresh`, the owner-set
+///    admission flag and the Governor readiness label are health facts, not
+///    identity: a healthy/degraded flicker with no generation advance must never
+///    unbind a retained proof. When the identity did move, every
+///    generation-scoped retained proof is revoked through the existing
+///    `retire_generation_scoped_bindings` with a reason naming the owner facts it
+///    was decided from, and the one mandatory owner-session slot is re-proven from
+///    the live authenticated owner through the existing `reevaluate_capability`
+///    (I1.8: a session exists only while transport identity and the semantic
+///    Session refer to the same State Fence/epoch, so a session proven under an
+///    earlier epoch must be re-proven rather than silently reading as current, and
+///    must never be left latched unavailable either). The Kernel client is the live
+///    authenticated owner here: `owner_session_facts` is the bytes its own
+///    handshake validated, and its absence is the owner's own revocation report,
+///    filed as `OwnerInvalidated`.
+/// 3. A real identity move is reported as `OwnerReplaced` even when the verdict
+///    also moved, because the lineage has to be re-derived for the new generation
+///    — and the heartbeat retires and recovers on exactly those arms, so the
+///    superset costs nothing and losing the retirement would be unsafe.
+///
+/// What this pass always costs, stated exactly: one composition guard the
+/// caller awaited before calling, one owner-fact read, one `observe_owner`
+/// call, two core-verdict derivations, one identity comparison, and one
+/// assignment of the observed identity. It re-attaches no capability, files no
+/// slot and constructs no producer unless the identity actually moved.
+///
+/// The caller AWAITS the composition before calling this, then holds the guard
+/// for the whole classification. A best-effort `try_lock` would report
+/// `Unchanged` when another flight held the composition, and because this
+/// decision is edge-triggered a missed pass delays a real retirement by a tick
+/// and lets that tick renew supervision against an owner state it never read.
+/// Taking the guard at the caller rather than here also keeps the readiness
+/// projection's `RefCell` borrow out of any await.
+fn observe_readiness_transition(
+    projection: &mut StartupReadinessProjection,
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    record: &Rc<RefCell<LoopReadinessRecord>>,
+) -> Result<ReadinessTransition, String> {
+    // 1. the verdict this projection is reporting right now, and the owner facts
+    //    behind it, both captured before this pass refreshes anything. Each borrow
+    //    of the loop's record is a complete statement, so the previous identity is
+    //    copied out and the new one written back without ever holding two borrows.
+    let core_before = projection.core_readiness_prerequisites_satisfied();
+    let observed = eliotd::startup_readiness::observe_core_owner_state(composition);
+    let previous = record.borrow().observed_owner.clone();
+    projection
+        .observe_owner(composition)
+        .map_err(|error| format!("startup readiness owner observation: {error}"))?;
+    // The verdict is re-derived unconditionally, so an availability change that
+    // arrived on its own evidence between passes is seen here rather than being
+    // hidden behind the owner-identity comparison below.
+    let core_after = projection.core_readiness_prerequisites_satisfied();
+    let verdict = match (core_before.is_satisfied(), core_after) {
+        (true, eliotd::startup_readiness::CoreReadiness::Withheld { reasons }) => {
+            ReadinessTransition::CoreWithheld { reasons }
+        }
+        (false, eliotd::startup_readiness::CoreReadiness::Satisfied) => {
+            ReadinessTransition::CoreAdmissible
+        }
+        _ => ReadinessTransition::Unchanged,
+    };
+    // 2. identity, not health: only an admitted owner-context change
+    //    revokes a generation-scoped proof. The observed identity is recorded for
+    //    the next pass before this returns, so the comparison is always against
+    //    the previous pass's own observation.
+    record.borrow_mut().observed_owner = Some(observed.clone());
+    // This loop pre-fills its record with a real observation and every pass
+    // restores one, so a previous identity is always present. Without one there
+    // is no prior identity to have moved, so this pass reports only its verdict.
+    let Some(prior) = previous else {
+        return Ok(verdict);
+    };
+    // #2647: the comparison is the whole admitted owner context, not the two
+    // scalars it used to be. A rebind from `(lineage-A, sequence 1)` to
+    // `(lineage-B, sequence 1)` at the same resource generation, or a change of
+    // artifact, protected-snapshot or principal digest, is a different admitted
+    // owner context that leaves the previous pass's generation-scoped proofs
+    // describing a context that no longer exists. Comparing scalars reported
+    // those passes as unchanged and kept every retained proof readable across
+    // the replacement; I14.14 is explicit that after a cutover an old request is
+    // rejected as stale, and the same is true of a proof retained under the old
+    // epoch's lineage.
+    let identity_moved = prior.identity != observed.identity;
+    if !identity_moved {
+        return Ok(verdict);
+    }
+    // The admitted owner context was replaced or rebound. Every
+    // generation-scoped proof (both Dreamer route contexts and the agent-fabric
+    // descriptor) carries owner generation identity, so that event revokes all
+    // of them at once. The reason names the identity the loop observed before
+    // and the one it observes now, which is exactly what this comparison read.
+    let reason = format!(
+        "owner generation/epoch advanced: generation {} -> {} authority_epoch {} -> {} owner_context {} -> {}",
+        prior.generation(),
+        observed.generation(),
+        prior.authority_epoch(),
+        observed.authority_epoch(),
+        prior.identity,
+        observed.identity
+    );
+    let retired = projection
+        .retire_generation_scoped_bindings(&reason)
+        .map_err(|error| format!("daemon owner replacement retirement: {error}"))?;
+    // The one mandatory slot is re-proven from the live authenticated owner, or
+    // fails closed with the owner's own reason when the Kernel reports no
+    // validated session for the current context.
+    let (observed_binding, refresh_reason) = match kernel.owner_session_facts() {
+        Some(facts) => (
+            Ok(RetainedStartupBinding::OwnerSession {
+                session_binding: facts.session_binding().to_owned(),
+                connection_id: facts.connection_id().to_owned(),
+                generation: observed.generation(),
+                authority_epoch: observed.identity.authority_epoch().clone(),
+            }),
+            StartupRefreshReason::OwnerRevisionAdvanced,
+        ),
+        None => (
+            Err(
+                "Kernel reports no validated owner session binding for the current owner context"
+                    .to_owned(),
+            ),
+            StartupRefreshReason::OwnerInvalidated,
+        ),
+    };
+    projection
+        .reevaluate_capability(&CapabilityRefresh {
+            capability: DeclaredStartupCapability::OwnerSessionBinding,
+            reason: refresh_reason,
+            observed: observed_binding,
+        })
+        .map_err(|error| format!("daemon owner session re-proof: {error}"))?;
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.owner_context_replaced",
+        retired_generation_scoped = retired,
+        refresh_reason = startup_refresh_reason_name(refresh_reason),
+        reason = %reason,
+        "a real admitted owner-context replacement or rebind revoked every generation-scoped proof and re-proved the mandatory owner session from the live authenticated owner"
+    );
+    Ok(ReadinessTransition::OwnerReplaced { reason })
+}
+
+/// Names one startup refresh reason for the loop's own record.
+fn startup_refresh_reason_name(reason: StartupRefreshReason) -> &'static str {
+    match reason {
+        StartupRefreshReason::OwnerRevisionAdvanced => "owner_revision_advanced",
+        StartupRefreshReason::CapabilityDemanded => "capability_demanded",
+        StartupRefreshReason::OwnerInvalidated => "owner_invalidated",
+    }
+}
+
+/// The launch-identity facts the one supervision producer is built from.
+///
+/// #2560: the pre-loop construction and the heartbeat's recovery of a now
+/// admissible generation must produce byte-identical `SupervisionProducerDeps`,
+/// so these three locally observed launch facts travel together into one
+/// construction function instead of being re-derived at each site.
+#[derive(Clone)]
+struct SupervisionLaunchIdentity {
+    daemon_artifact_id: String,
+    daemon_config_digest: String,
+    launch_nonce: String,
+}
+
+/// The authenticated transport evidence a supervision producer must cite.
+///
+/// Both halves come from the Kernel client's own validated handshake
+/// (`owner_session_facts`), never from a constant or a parsed literal.
+struct SupervisionTransportEvidence {
+    session_binding: String,
+    connection_id: String,
+}
+
+/// Runs the existing `daemon_ready` reconciliation and returns the exact
+/// Kernel-authored bundle plus the transport evidence that bundle must be cited
+/// with.
+///
+/// This is the ONE readiness exchange in this file, shared by the pre-loop
+/// construction and the heartbeat's recovery: it mints no bundle locally, never
+/// counts process survival as progress, and never assumes the answer.
+fn supervision_ready_evidence(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<(SupervisionTransportEvidence, eliotd::DaemonReadySupervision), String> {
+    let ready = kernel.report_ready().map_err(|error| error.to_string())?;
+    let session_facts = kernel.owner_session_facts().ok_or_else(|| {
+        "daemon has no validated Kernel session binding for supervision progress".to_owned()
+    })?;
+    Ok((
+        SupervisionTransportEvidence {
+            session_binding: session_facts.session_binding().to_owned(),
+            connection_id: session_facts.connection_id().to_owned(),
+        },
+        ready,
+    ))
+}
+
+/// Builds the one supervision producer for the current generation.
+///
+/// #2560: the single construction site for `SupervisionProgressProducer`. Its
+/// inputs are the locally observed launch identity, the Kernel client's own
+/// validated transport evidence, and the Kernel-authored `daemon_ready` bundle —
+/// exactly the identity that bundle authorizes, with nothing invented and no
+/// locally minted lineage, head or lease.
+fn construct_supervision_producer(
+    launch: &SupervisionLaunchIdentity,
+    transport: SupervisionTransportEvidence,
+    ready: eliotd::DaemonReadySupervision,
+) -> Result<eliotd::SupervisionProgressProducer, String> {
+    eliotd::SupervisionProgressProducer::new(eliotd::SupervisionProducerDeps {
+        daemon_artifact_id: launch.daemon_artifact_id.clone(),
+        daemon_config_digest: launch.daemon_config_digest.clone(),
+        launch_nonce: launch.launch_nonce.clone(),
+        process_pid: std::process::id(),
+        transport_session_evidence: transport.session_binding,
+        transport_connection_evidence: transport.connection_id,
+        ready,
+    })
+    .map_err(|error| format!("daemon supervision producer: {error}"))
+}
+
+/// Recovers the one supervision lineage for a generation that became admissible
+/// again and has no completed `daemon_ready` exchange behind it.
+///
+/// `DaemonKernelClient::report_ready` is a blocking one-shot that builds and
+/// enters its own current-thread runtime, so it cannot be called from inside the
+/// run loop's own runtime (tokio refuses a nested `block_on`). It therefore runs
+/// on this runtime's existing blocking pool, exactly as this file's existing
+/// Kernel one-shot exchanges do, and this heartbeat awaits the result in the same
+/// single flight: no new thread, no second scheduler, no detached task and no
+/// waiter-only timeout. The producer is built by the same construction function
+/// the pre-loop path uses, so a recovered lineage is byte-identical to the one
+/// that would have been built had the generation been admissible at startup.
+async fn recover_supervision_producer(
+    kernel: &Arc<DaemonKernelClient>,
+    launch: &SupervisionLaunchIdentity,
+) -> Result<eliotd::SupervisionProgressProducer, String> {
+    let evidence_kernel = Arc::clone(kernel);
+    let joined = tokio::task::spawn_blocking(move || supervision_ready_evidence(&evidence_kernel))
+        .await
+        .map_err(|error| format!("daemon supervision ready reconciliation: {error}"))?;
+    let (transport, ready) = joined?;
+    construct_supervision_producer(launch, transport, ready)
+}
+
 /// Starts one health tick when its slot is idle. The activation state is
 /// captured with the timer event, and the sole supervision producer travels
 /// with the future until its ordered acknowledgement sequence completes. The
 /// stream's repeated-failure guard travels the same way (#740 A14), so a
 /// standing per-tick refusal cannot emit unbounded records.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the heartbeat start hands the flight every owner handle it must own for the whole tick; bundling them would hide which handle the flight may outlive (#2560)"
+)]
 fn maybe_start_health_heartbeat_tick(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     startup_readiness: &SharedStartupReadiness,
+    readiness_record: &Rc<RefCell<LoopReadinessRecord>>,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    supervision_launch: &SupervisionLaunchIdentity,
+    capability_model_restricted: bool,
     activation_in_flight: bool,
     flight: &mut HealthHeartbeatFlight,
     failure_guard: &mut RepeatedFailureGuard,
@@ -3140,19 +3730,32 @@ fn maybe_start_health_heartbeat_tick(
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
     let startup_readiness = Rc::clone(startup_readiness);
+    let readiness_record = Rc::clone(readiness_record);
+    let supervision_launch = supervision_launch.clone();
     let mut producer = supervision_progress.take();
     let owns_supervision_producer = producer.is_some();
     let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
     *flight = HealthHeartbeatFlight::InFlight(HealthHeartbeatFlightState {
         future: Box::pin(async move {
-            let result = run_health_heartbeat_tick(
+            // The step's own generator is boxed inside the already-boxed flight
+            // future so this tick's generator stays small: the step now carries
+            // the readiness transition, the supervision lifecycle and the
+            // republication, and inlining it here would embed all of that in the
+            // loop's own select-arm state. Same idiom as `start_task_controller_poll`
+            // and `start_finish_poll`, the two other flight starters that box their
+            // own step's future inside the already-boxed flight future. No new task,
+            // thread or scheduler; the flight was already one polled future.
+            let result = Box::pin(run_health_heartbeat_tick(
                 &kernel,
                 &composition,
-                producer.as_mut(),
+                &mut producer,
                 activation_in_flight,
                 &startup_readiness,
+                &readiness_record,
+                &supervision_launch,
+                capability_model_restricted,
                 &mut failure_guard,
-            )
+            ))
             .await;
             HealthHeartbeatCompletion {
                 result,
@@ -3178,6 +3781,17 @@ async fn next_health_heartbeat_completion(
 /// activity observed during its event cut after the completed tick's ordered
 /// Claim/Dispatch/Apply acknowledgements. Failed ticks do not apply deferred
 /// activity because there will be no next heartbeat in this loop.
+///
+/// #2560 lifecycle, decided deliberately rather than left accidental: the tick
+/// owns the producer, so a tick that retires it (withheld core verdict, replaced
+/// owner context) hands back `None`, and a tick that recovers it hands back a
+/// producer built for the CURRENT generation. `completion.supervision_progress`
+/// is therefore the authoritative post-tick answer in both directions. Activity
+/// buffered while the tick ran describes the lineage that existed during that
+/// event cut, so when the tick retired that lineage the buffer is cleared and
+/// dropped rather than replayed onto a lineage that never observed the work — the
+/// same treatment a generation with no producer already gets, and the reason a
+/// replacement generation starts from work it can actually attest to.
 fn settle_health_heartbeat_completion(
     completion: HealthHeartbeatCompletion,
     flight: &mut HealthHeartbeatFlight,
@@ -3227,18 +3841,53 @@ fn emit_cache_health_from_store_poll(health: &StoreHealth) {
 /// #18 item A: the health poll runs unconditionally, so liveness stays observed
 /// even for a generation that never reported ready; only the progress renewal
 /// is absent, because the Kernel authored no supervision lineage for it.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one health tick stays whole: observation, readiness transition, supervision retirement or recovery, and the change-gated republication must read the same owner snapshot in order, and a step failure fails closed rather than discarding a tick (#2560)"
+)]
 async fn run_health_heartbeat_tick(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
-    supervision_progress: Option<&mut eliotd::SupervisionProgressProducer>,
+    // #2560 lifecycle: the retained producer is owned here, not merely borrowed.
+    // A withheld core verdict or a replaced owner context retires it before the
+    // submit point below, so no supervision progress is renewed against a
+    // generation the daemon no longer holds. A generation with no completed
+    // `daemon_ready` exchange behind it rebuilds exactly one from the same
+    // Kernel-authored bundle the pre-loop path uses, once per owner identity; a
+    // producer retired from the same identity is not rebuilt, because that
+    // exchange already succeeded.
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     activation_in_flight: bool,
     startup_readiness: &SharedStartupReadiness,
+    readiness_record: &Rc<RefCell<LoopReadinessRecord>>,
+    supervision_launch: &SupervisionLaunchIdentity,
+    capability_model_restricted: bool,
     failure_guard: &mut RepeatedFailureGuard,
 ) -> Result<(), String> {
     let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
         .await
         .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
     emit_cache_health_from_store_poll(&health);
+    // #2560 required item 1: this tick's ONE operational readiness decision.
+    // The transition owner re-reads the composition's own owner facts through the
+    // existing `observe_owner`, compares the core verdict before and after that
+    // re-read, compares the observed generation/epoch identity against the one
+    // this loop observed last pass, and only on a real identity advance retires
+    // generation-scoped proofs and re-proves the mandatory owner session. It
+    // attaches no capability and files no optional slot, so a slow optional
+    // attach never blocks here. Every pass does cost one awaited composition
+    // guard, one owner read, one `observe_owner`, two verdict derivations and one
+    // identity comparison — a steady state pays exactly that and reports
+    // `Unchanged`.
+    let transition = {
+        // Await the composition FIRST, then take the projection borrow, so no
+        // `RefCell` borrow is ever held across an await point and the owner
+        // observation this classifies can never be skipped.
+        let guard = composition.lock().await;
+        let mut readiness_projection = startup_readiness.borrow_mut();
+        observe_readiness_transition(&mut readiness_projection, &guard, kernel, readiness_record)?
+    };
     // #1688 (I14.22): the Kernel health poll is this daemon's one admitted
     // self-observation per heartbeat, so it is the admitted-observation
     // trigger. The evidence identities are the observed health status and the
@@ -3252,26 +3901,27 @@ async fn run_health_heartbeat_tick(
     // admitted decision whose family route cannot start is still persisted.
     // The canonical write itself happens after this lock is released, so no
     // Kernel exchange ever crosses the composition mutex (issue #18 N3).
-    let (readiness_verdict, readiness_report, blocked_automation) = {
+    let (readiness_verdict, readiness_report, published_status, blocked_automation) = {
         let guard = composition.lock().await;
-        let mut readiness_projection = startup_readiness.borrow_mut();
-        // #2560: re-read the composition's own owner facts once per heartbeat.
-        // This performs no capability IO and re-files no slot, so a slow
-        // optional attach never blocks here and an unchanged owner does no work.
-        // Generation-scoped retained proofs are re-checked against the observed
-        // generation/epoch, so a proof admitted at an earlier generation reads
-        // as unavailable instead of staying usable because it was retained.
-        // #2647: an identical observation retires no in-flight delta basis;
-        // only a real owner-context change does.
-        readiness_projection
-            .observe_owner(&guard)
-            .map_err(|error| format!("startup readiness owner observation: {error}"))?;
+        let readiness_projection = startup_readiness.borrow();
+        // #2560: the same single evaluation the startup record used, over the
+        // same loop projection, with the retained capability-model partition
+        // this generation was admitted under. Its verdict is what diagnostics,
+        // republication and dispatch all read below.
         let readiness_verdict = eliotd::startup_readiness::evaluate_startup_readiness(
             &readiness_projection,
             &guard.status(),
-            false,
+            capability_model_restricted,
         );
         let readiness_report = readiness_projection.report();
+        // The status projection the existing stdout seam publishes, built from
+        // that one verdict over the live composition status.
+        let published_status = DaemonStatus {
+            ready: readiness_verdict.ready,
+            degraded: readiness_verdict.degraded,
+            health: readiness_verdict.health.clone(),
+            ..guard.status()
+        };
         // Same tolerance as `DaemonComposition::note_maintenance_trigger`: a
         // rejected evaluation is an explicit typed gap, never a daemon-killing
         // error, and the trigger stays durable for the next eligible pass.
@@ -3287,9 +3937,8 @@ async fn run_health_heartbeat_tick(
             // pinned-scanner canonical receipt" and its registered execution
             // owner is recorded as unavailable with the reason "no runtime scan
             // owner is admitted: `docs/DEPENDENCY_POLICY.md` pins the scanner to
-            // cargo-deny 0.20.2 plus a verified executable digest ... and no
-            // eliotd Kernel operation or Rust owner exposes a scan result to the
-            // daemon" (`maintenance_family_catalog.rs:1441-1457`). The digest
+            // cargo-deny 0.20.2 plus a verified executable digest ... and no eliotd Kernel operation or Rust owner exposes a scan result to
+            // the daemon" (`maintenance_family_catalog.rs:1441-1457`). The digest
             // this site observes is `StoreHealth::manifest_digest` — the store
             // API's own operation-manifest identity returned by the health
             // poll — not a scanner receipt, advisory-set digest or policy
@@ -3337,7 +3986,12 @@ async fn run_health_heartbeat_tick(
                 None
             }
         };
-        (readiness_verdict, readiness_report, blocked_automation)
+        (
+            readiness_verdict,
+            readiness_report,
+            published_status,
+            blocked_automation,
+        )
     };
     if let Some((fence, decision, evidence)) = blocked_automation {
         note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
@@ -3357,8 +4011,170 @@ async fn run_health_heartbeat_tick(
             readiness = %readiness_report,
         );
     }
-    if let Some(producer) = supervision_progress {
+    // #2560 required items 2 and 3, the supervision lifecycle:
+    //
+    // * `CoreWithheld`/`OwnerReplaced` — a transition EDGE: the retained producer
+    //   is dropped HERE, before the submit point, so this tick renews nothing. The
+    //   daemon keeps its health, shutdown and policy-allowed inspection legs; only
+    //   the readiness-dependent dispatch flights are withheld, and that gate reads
+    //   the same projection.
+    // * recovery needs no transition edge at all: the condition is "no lineage is
+    //   retained AND the core prerequisites hold in the post-transition snapshot
+    //   dispatch reads AND no exchange has already succeeded for the identity now
+    //   observed". A WITHHELD generation therefore never reaches that condition at
+    //   all; the generation this recovers is an ADMISSIBLE one with no lineage and
+    //   no completed exchange — a pre-loop verdict that withheld the exchange, or an
+    //   earlier attempt that was refused — and it gets that one exact attempt on a
+    //   later tick. While a lineage IS retained the condition is false.
+    // * the exact-generation key is what makes "once" real. A producer retired on
+    //   `CoreWithheld` is NOT rebuilt for the same identity: the exchange already
+    //   succeeded for it, so that generation simply renews nothing until the owner
+    //   identity MOVES, at which point `OwnerReplaced` has already retired the
+    //   generation-scoped proofs and the moved identity's exchange runs once. A
+    //   readiness or view-freshness flicker therefore costs no exchange and issues
+    //   no second lease for one identity.
+    // * `Unchanged`: the tick re-reads the owner facts, re-derives the verdict,
+    //   evaluates the maintenance trigger, records cache health and, when a
+    //   lineage is retained, renews supervision exactly as before. It re-attaches
+    //   nothing, files no slot and builds no producer.
+    if matches!(
+        transition,
+        ReadinessTransition::CoreWithheld { .. } | ReadinessTransition::OwnerReplaced { .. }
+    ) && supervision_progress.take().is_some()
+    {
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.supervision_producer_retired",
+            transition = readiness_transition_name(&transition),
+            readiness = %readiness_report,
+            "core readiness moved; the retained supervision lineage is retired and no progress is renewed"
+        );
+    }
+    // The recovery condition is deliberately NOT a transition edge: it is the
+    // post-transition admission state, the absence of a lineage, AND the absence
+    // of a completed exchange for the identity now observed. A replacement that
+    // failed to re-prove its owner session never reaches it, because that
+    // generation is not admitted.
+    //
+    // The third term is the card's exact-generation key. `report_ready` is the
+    // exact-generation idempotent exchange that constructs exactly one producer,
+    // so once it has SUCCEEDED for an identity this tick must not ask again for
+    // that identity: the key is read back from the loop's own record, compared
+    // against the same owner pair the transition owner just compared, and only a
+    // MOVED identity (or a refused exchange, which writes nothing) opens it. A
+    // withheld generation never reaches here at all, because the condition
+    // requires a SATISFIED verdict.
+    let observed_owner = readiness_record.borrow().observed_owner.clone();
+    let exchange_already_ran = observed_owner.as_ref().is_some_and(|observed| {
+        readiness_record.borrow().supervision_exchange_owner
+            == Some((observed.generation(), observed.authority_epoch()))
+    });
+    let recovery_reachable = supervision_progress.is_none()
+        && readiness_verdict.core_satisfied()
+        && !exchange_already_ran;
+    if recovery_reachable {
+        // Boxed so this tick's own generator stays small: the reconciliation
+        // awaits the Kernel's blocking pool, and inlining its future here would
+        // carry it across every later await in this function. Boxing changes no
+        // behaviour and adds no task, thread or scheduler.
+        match Box::pin(recover_supervision_producer(kernel, supervision_launch)).await {
+            Ok(producer) => {
+                // The exchange SUCCEEDED for the identity just observed, so this
+                // is where the exact-generation key is written. A later tick with
+                // that same identity does not re-issue; a moved identity does.
+                if let Some(observed) = observed_owner {
+                    readiness_record.borrow_mut().supervision_exchange_owner =
+                        Some((observed.generation(), observed.authority_epoch()));
+                }
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.supervision_producer_recovered",
+                    transition = readiness_transition_name(&transition),
+                    readiness = %readiness_report,
+                    "the same generation became admissible; one daemon_ready reconciliation and one lineage"
+                );
+                *supervision_progress = Some(producer);
+            }
+            Err(reason) => {
+                // #740 A14: this is a standing per-tick path only while the
+                // core verdict is SATISFIED, no lineage is retained and no exchange has
+                // already succeeded for this identity — a withheld generation never
+                // reaches it — and each attempt is one idempotent reconciliation, so the
+                // record is guard-gated like every other per-tick refusal here. A refused
+                // exchange writes no key, so the next tick retries it. No producer is
+                // invented, no lease is issued and supervision simply stays unrenewed.
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "supervision-ready-reconciliation",
+                        &reason,
+                    )
+                    .emit();
+                }
+            }
+        }
+    }
+    if let Some(producer) = supervision_progress.as_mut() {
         submit_supervision_heartbeat(kernel, producer, &health, activation_in_flight).await?;
+    }
+    // #2560 required item 8: republication through the EXISTING seams only, from
+    // the same snapshot dispatch reads. `ready_message`/`write_json` is the
+    // daemon's existing stdout status record, and
+    // `eliotd::startup_readiness::emit_startup_readiness_record` is the existing
+    // DIAGNOSTICS seam that records one readiness line through the daemon's
+    // `tracing` pipeline — neither is a second service, registry, transport or
+    // format here, and nothing new is added.
+    //
+    // The record is the same record the pre-loop block publishes: the product
+    // proof comes from the composition's own ProductProof/FinishService
+    // acceptance owner on exactly the same call and projection as at startup, so
+    // a republished line carries the same fields a reader already parses, and the
+    // only `None` is the genuine refusal path where that owner declines to build
+    // a record at all.
+    let product_proof = {
+        let guard = composition.lock().await;
+        match guard.product_proof_status() {
+            Ok((record, rollup)) => Some(ProductProofStatusWire::project(&record, &rollup)),
+            Err(error) => {
+                tracing::warn!(target: "eliotd::diagnostics", "product proof status unavailable: {error}");
+                None
+            }
+        }
+    };
+    // The change guard covers what this tick is about to PUBLISH, not only the
+    // projection's own report line. `ReadyMessage::Ready` carries service,
+    // protocol, generation, authority_epoch, health, degraded and product_proof;
+    // of those, the projection report renders only the core verdict, the owner
+    // generation and epoch and the degraded set, so the composition's own
+    // `..status()` spread and the product proof reach stdout only through the
+    // rendered line. Comparing both therefore fires on every field the
+    // republished record carries, so a composition-status-only change can no
+    // longer leave stdout byte-identical while dispatch reads the new verdict.
+    // Note the record has no `ready` field — the `Ready` variant IS the
+    // readiness — and `published_status.ready` reaches the diagnostics seam
+    // below from inside this same guarded block.
+    let message = ready_message(&published_status, product_proof);
+    let rendered = serde_json::to_string(&message)
+        .map_err(|error| format!("daemon readiness record rendering: {error}"))?;
+    let mut published = readiness_record.borrow_mut();
+    if published.published_report != readiness_report || published.published_line != rendered {
+        write_json(&message)?;
+        let _ = eliotd::diagnostics::emit_daemon_readiness(
+            published_status.ready,
+            published_status.degraded,
+        );
+        eliotd::startup_readiness::emit_startup_readiness_record(
+            &startup_readiness.borrow(),
+            &readiness_verdict,
+        );
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.startup_readiness_republished",
+            transition = readiness_transition_name(&transition),
+            readiness = %readiness_report,
+        );
+        published.published_report = readiness_report;
+        published.published_line = rendered;
     }
     Ok(())
 }
@@ -3615,7 +4431,7 @@ fn start_activation_dispatch(
         });
     ActivationFlightState {
         future,
-        retained: Some(retained),
+        stage: ActivationStage::ResolvedSubmitting(retained),
     }
 }
 
@@ -3672,6 +4488,9 @@ async fn drain_flights_on_shutdown(
     solo_poll_last_refusal: &mut Option<String>,
     fair_pull_recovery_flight: &mut FairPullRecoveryFlight,
     fair_pull_recovery_last_refusal: &mut Option<String>,
+    campaign_packet_flight: &mut CampaignPacketFlight,
+    task_controller_flight: &mut TaskControllerFlight,
+    finish_flight: &mut FinishFlight,
 ) -> Result<RunLoopExit, RunLoopFailure> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -3701,6 +4520,13 @@ async fn drain_flights_on_shutdown(
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
             && matches!(fair_pull_recovery_flight, FairPullRecoveryFlight::Idle)
+            // #2559 D3: these three were previously drained AFTER this
+            // function returned, each under its own fresh
+            // `SHUTDOWN_ACTIVATION_DRAIN`. They are part of the same drain now,
+            // so an all-idle drain means all of them are idle.
+            && matches!(campaign_packet_flight, CampaignPacketFlight::Idle)
+            && matches!(task_controller_flight, TaskControllerFlight::Idle)
+            && matches!(finish_flight, FinishFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -3778,6 +4604,30 @@ async fn drain_flights_on_shutdown(
             }
             testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
+            }
+            // #2559 D3: these three settle inside the shared drain, so a
+            // campaign packet, a Task Controller attempt and a Finish submit
+            // are polled concurrently with every other flight under the ONE
+            // absolute deadline. Previously they were polled only after this
+            // loop returned, which let a dependency one of them needed make no
+            // progress while it waited, and which spent up to three further
+            // two-second budgets in sequence.
+            campaign_packet_completion =
+                next_campaign_packet_completion(campaign_packet_flight) => {
+                    settle_campaign_packet_completion(
+                        campaign_packet_completion,
+                        campaign_packet_flight,
+                    )?;
+                }
+            task_controller_completion =
+                next_task_controller_completion(task_controller_flight) => {
+                    settle_task_controller_completion(
+                        task_controller_completion,
+                        task_controller_flight,
+                    )?;
+                }
+            finish_completion = next_finish_completion(finish_flight) => {
+                settle_finish_completion(finish_completion, finish_flight)?;
             }
             watchdog_export_drain_completion =
                 next_watchdog_export_drain_completion(watchdog_export_drain_flight) => {
@@ -3879,6 +4729,20 @@ async fn drain_flights_on_shutdown(
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
                 *fair_pull_recovery_flight = FairPullRecoveryFlight::Idle;
+                // #2559 D3: the campaign-packet, Task Controller and Finish
+                // flights are dropped here, on the SAME single absolute
+                // deadline as every other flight, instead of behind three
+                // further `timeout(SHUTDOWN_ACTIVATION_DRAIN, ...)` calls that
+                // each granted a fresh budget after this loop had stopped
+                // polling them. The honest classification of a dropped
+                // campaign/Task-Controller/Finish step - claimed vs submitted vs
+                // committed-but-unacknowledged - is NOT invented here; these
+                // flight states still carry no retained operation identity, and
+                // that absence is defect 2 and defect 4 of this issue, not
+                // something this budget fix may paper over.
+                *campaign_packet_flight = CampaignPacketFlight::Idle;
+                *task_controller_flight = TaskControllerFlight::Idle;
+                *finish_flight = FinishFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
                 return Ok(exit);
@@ -3908,16 +4772,44 @@ fn discard_shutdown_heartbeat_completion(
 }
 
 /// Resolves the activation disposition when the shared shutdown budget ends.
-/// Only a dispatch flight owns a result identity; claim and resolve flights
-/// remain result-less and preserve the prior shutdown disposition.
+///
+/// #2559 D1. The disposition is now decided by the flight's real STAGE, not by
+/// whether a result digest happened to exist:
+///
+/// * `Claiming` - the claim request itself is outstanding, so no ticket
+///   identity exists and there is genuinely nothing owned. Preserves the prior
+///   disposition, which is the honest answer rather than a manufactured unknown.
+/// * `ClaimedWaiting` - the Kernel owns a claimed ticket whose terminal
+///   disposition is unresolved. This is NOT clean: the ticket is reported
+///   under its ORIGINAL identity with NO result digest, because inventing one
+///   would assert a submit that never happened.
+/// * `ResolvedSubmitting` - a real result exists and its submit is outstanding,
+///   so both identities are carried verbatim exactly as before.
+///
+/// The claimed/waiting case is deliberately a distinct exit rather than a reuse
+/// of `ShutdownActivationUnknown`, whose `result_sha256` field has no honest
+/// value to fill at that stage.
 fn activation_exit_after_drain_timeout(
     flight: &mut ActivationFlight,
     activation_exit: RunLoopExit,
 ) -> RunLoopExit {
     match std::mem::replace(flight, ActivationFlight::Idle) {
         ActivationFlight::Idle => activation_exit,
-        ActivationFlight::InFlight(state) => match state.retained {
-            Some(identity) => {
+        ActivationFlight::InFlight(state) => match state.stage {
+            ActivationStage::Claiming => activation_exit,
+            ActivationStage::ClaimedWaiting { ticket_id } => {
+                let _ = eliotd::diagnostics::emit_drain(
+                    eliotd::diagnostics::DrainOutcome::ActivationClaimedUnknown,
+                    &ticket_id,
+                    "",
+                );
+                RunLoopExit::ShutdownActivationClaimedUnknown {
+                    ticket_id,
+                    detail: "daemon shutdown drain timed out with a claimed activation ticket still awaiting resolution; original ticket identity retained with no result digest, the Kernel-owned ticket must expire or reconcile"
+                        .to_owned(),
+                }
+            }
+            ActivationStage::ResolvedSubmitting(identity) => {
                 let _ = eliotd::diagnostics::emit_drain(
                     eliotd::diagnostics::DrainOutcome::ActivationUnknown,
                     &identity.ticket_id,
@@ -3930,7 +4822,6 @@ fn activation_exit_after_drain_timeout(
                         .to_owned(),
                 }
             }
-            None => activation_exit,
         },
     }
 }
@@ -4548,7 +5439,7 @@ fn settle_local_read_completion(
                 target: "eliotd::diagnostics",
                 event = "eliotd.local_read_settled",
                 outcome = local_read_outcome_name(&step.outcome),
-                delta = local_read_delta_name(step.delta.as_ref()),
+                deltas = %local_read_delta_names(&step.deltas),
             );
             *flight = LocalReadFlight::Idle;
             Ok(())
@@ -4557,15 +5448,19 @@ fn settle_local_read_completion(
     }
 }
 
-/// Settles one completed local-read poll step and adopts the bounded delta the
-/// step observed into the run loop's single authoritative projection (#2647).
+/// Settles one completed local-read poll step and adopts the bounded delta set
+/// the step observed into the run loop's single authoritative projection (#2647).
 ///
 /// Same settle contract as [`settle_local_read_completion`]; the only
-/// difference is that a demand-driven capability observation the step produced
-/// is filed through checked adoption — current basis only, one slot, loop
-/// requirements and unrelated slots preserved — instead of replacing the whole
-/// projection. A stale delta is refused without touching readiness, and the
-/// step's own read/submit outcome still settles exactly once either way.
+/// difference is that the demand-driven capability observations the step
+/// produced are filed through checked adoption — current basis only, per-slot,
+/// loop requirements and unrelated slots preserved — instead of replacing the
+/// whole projection. Each delta is judged on its OWN owner/slot basis, so a
+/// stale `SkillToolSource` observation is refused while a fresh
+/// `SkillToolBasis` result in the same set is still adopted, and vice versa. A
+/// refused set leaves the loop's projection exactly as the heartbeat and earlier
+/// adoptions left it, and the step's own read/submit outcome still settles
+/// exactly once either way.
 fn settle_local_read_completion_updating_readiness(
     completion: LocalReadCompletion,
     flight: &mut LocalReadFlight,
@@ -4574,23 +5469,47 @@ fn settle_local_read_completion_updating_readiness(
     let LocalReadCompletion::Settled(Ok(step)) = &completion else {
         return settle_local_read_completion(completion, flight);
     };
-    // Adopt the flight's own observation, if it made one, before the outcome
-    // settles. Adoption is synchronous and touches at most one slot; a refused
-    // delta leaves the loop's projection exactly as the heartbeat and earlier
-    // adoptions left it.
-    if let Some(delta) = &step.delta {
-        let adoption = startup_readiness
-            .adopt_local_delta(delta)
-            .map_err(|error| format!("daemon local-read delta adoption: {error}"))?;
-        tracing::info!(
-            target: "eliotd::diagnostics",
-            event = "eliotd.local_read_delta_adoption",
-            outcome = local_read_outcome_name(&step.outcome),
-            adoption = local_delta_adoption_name(&adoption),
-            readiness = %startup_readiness.report(),
-        );
+    // Adopt the flight's own observations, if it made any. Adoption is
+    // synchronous and touches only the slots this demand actually reevaluated.
+    //
+    // #2647: the adoption result is HELD, not propagated with `?`. The previous
+    // shape returned the token-exhaustion error straight out of this function,
+    // which meant the completed read/submit outcome below was never settled, the
+    // flight was never returned to `Idle`, the `eliotd.local_read_settled` record
+    // was never emitted, and the `?` at the loop's call site failed the whole
+    // daemon closed. A readiness-control failure is a control-plane refusal: the
+    // operation that already completed must still settle exactly once and must
+    // not be repeated or left installed. Both errors are therefore reported, and
+    // settlement is attempted first so a failing outcome is never masked by a
+    // readiness refusal.
+    let adoption = if step.deltas.is_empty() {
+        Ok(Vec::new())
+    } else {
+        startup_readiness
+            .adopt_local_deltas(&step.deltas)
+            .map_err(|error| format!("daemon local-read delta adoption: {error}"))
+    };
+    if let Ok(settled) = &adoption {
+        for (capability, adoption) in settled {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.local_read_delta_adoption",
+                outcome = local_read_outcome_name(&step.outcome),
+                capability = capability.as_str(),
+                adoption = local_delta_adoption_name(adoption),
+                readiness = %startup_readiness.report(),
+            );
+        }
     }
-    settle_local_read_completion(completion, flight)
+    // The borrow of `completion` ends here; the outcome settles exactly once
+    // whatever the adoption verdict was.
+    let settlement = settle_local_read_completion(completion, flight);
+    match (settlement, adoption) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(adoption_error)) => Err(format!("{error}; {adoption_error}")),
+    }
 }
 
 /// Names one settled local-read poll outcome for the loop's own record.
@@ -4603,12 +5522,16 @@ fn local_read_outcome_name(outcome: &LocalReadPollOutcome) -> &'static str {
     }
 }
 
-/// Names the readiness delta one settled local-read step carried, if any.
-fn local_read_delta_name(delta: Option<&LocalReadinessDelta>) -> &'static str {
-    match delta {
-        Some(delta) => delta.capability().as_str(),
-        None => "none",
-    }
+/// Names the readiness deltas one settled local-read step carried.
+///
+/// Bounded by the operation's own dependency set, so this never grows past the
+/// slots that demand really reevaluated; an empty observation names nothing.
+fn local_read_delta_names(deltas: &LocalReadinessDeltas) -> String {
+    deltas
+        .iter()
+        .map(|delta| delta.capability().as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Names one local-read delta adoption disposition for the loop's own record.
@@ -4679,12 +5602,12 @@ async fn run_local_read_poll(
         // #2647: an empty claim observed nothing, so it carries no delta.
         return Ok(LocalReadStep {
             outcome: LocalReadPollOutcome::IdleBackoff,
-            delta: None,
+            deltas: LocalReadinessDeltas::empty(),
         });
     };
-    let step = |outcome: LocalReadPollOutcome, delta: Option<LocalReadinessDelta>| LocalReadStep {
+    let step = |outcome: LocalReadPollOutcome, deltas: LocalReadinessDeltas| LocalReadStep {
         outcome,
-        delta,
+        deltas,
     };
     // The Skill plan captures the admitted fence under a short guard, performs
     // canonical acceptance I/O with no composition lock, then commits against
@@ -4711,11 +5634,26 @@ async fn run_local_read_poll(
     // same idempotent submit leg, so a capability refusal is never a dropped
     // pair.
     if eliotd::skill_dispatch::is_skill_tool(&tool) {
-        // #2647: one demand-driven attempt per flight. The attach runs at most
-        // once here; its observation travels with the step whether this demand
-        // is refused or served, and the loop adopts it only while the
-        // snapshot's basis is still current.
-        let (refused, delta) = skill_capability_refusal(&startup_readiness)?;
+        // #2560: one demand-driven refresh per flight over the WHOLE operation
+        // dependency set, not one slot at a time. A Skill request needs both its
+        // tool source and its installed-Skill basis, so each currently
+        // unavailable one is reevaluated independently here — the basis through
+        // its own reconciliation owner, never inferred from a source binding —
+        // and both exact outcomes travel back with the step. The decision runs
+        // against the flight's immutable snapshot, so it mutates no shared
+        // state, and the loop adopts each returned observation only while that
+        // observation's own basis is still current.
+        //
+        // The composition guard is taken for this refresh only — both owners are
+        // in-process reads — and released before the plan below takes it again,
+        // so no composition guard is ever held across the plan's canonical reads
+        // or its awaits.
+        let refreshed = {
+            let guard = composition.lock().await;
+            skill_capability_refusal(&startup_readiness, &guard)?
+        };
+        let refused = refreshed.refusal;
+        let deltas = refreshed.deltas;
         if let Some(refusal) = refused {
             let body = eliotd::skill_dispatch::skill_result_body(
                 &envelope,
@@ -4730,7 +5668,7 @@ async fn run_local_read_poll(
                 LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
                 LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
             };
-            return Ok(step(outcome, delta));
+            return Ok(step(outcome, deltas));
         }
         // #2664: the execute leg also reads the owner-retained execution
         // position, and that read is a plain in-process owner lookup. It runs
@@ -4765,7 +5703,7 @@ async fn run_local_read_poll(
             LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
             LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
-        return Ok(step(outcome, delta));
+        return Ok(step(outcome, deltas));
     }
     // #1187 W1/A1: a claimed pair naming the broker-owned operator read
     // capability is served here, not forwarded on the Kernel `local_read` leg,
@@ -4835,40 +5773,63 @@ async fn run_local_read_poll(
     // and claiming one would be false: none of the four gates admits that
     // capability, and no producer presents it either.
     if eliotd::is_controlboard_read_tool(&tool) {
-        let body = match eliotd::notification_board_attach::fetch_notification_snapshot(kernel)
-            .await
-        {
-            Ok(snapshot) => {
-                let mut guard = composition.lock().await;
-                let kernel_fence = kernel.snapshot().state_fence();
-                let composition_fence = guard.kernel_snapshot().state_fence();
-                if snapshot.state_fence != kernel_fence || snapshot.state_fence != composition_fence
-                {
-                    eliotd::controlboard_notification_refresh_refusal_body(
-                        &envelope,
-                        &attempt,
-                        "Kernel or composition state fence changed before notification attach",
-                    )
-                } else {
-                    guard.note_notification_snapshot(snapshot.records);
-                    eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+        // #2560: this leg attaches a startup capability on EVERY pass and
+        // re-evaluates readiness from the real fetch result — success and
+        // failure alike. The retained `NotificationSnapshot` proof is the exact
+        // record count the fetch actually returned, in the same variant and
+        // shape the startup attach produces, so a snapshot the startup attach
+        // could not establish is established by a later real fetch and a later
+        // real failure is retained as the owner's own refusal instead of being
+        // invisible to the ledger.
+        let (body, observed) =
+            match eliotd::notification_board_attach::fetch_notification_snapshot(kernel).await {
+                Ok(snapshot) => {
+                    let record_count = snapshot.records.len();
+                    let mut guard = composition.lock().await;
+                    let kernel_fence = kernel.snapshot().state_fence();
+                    let composition_fence = guard.kernel_snapshot().state_fence();
+                    if snapshot.state_fence != kernel_fence
+                        || snapshot.state_fence != composition_fence
+                    {
+                        // The fetch returned a page, but this pair's own service
+                        // leg refused it because the owner moved under the fetch.
+                        // The retained proof files the refusal this demand really
+                        // observed rather than the page that leg did not consume.
+                        let reason =
+                            "Kernel or composition state fence changed before notification attach";
+                        (
+                            eliotd::controlboard_notification_refresh_refusal_body(
+                                &envelope, &attempt, reason,
+                            ),
+                            Err(reason.to_owned()),
+                        )
+                    } else {
+                        guard.note_notification_snapshot(snapshot.records);
+                        (
+                            eliotd::serve_controlboard_view(&guard, &envelope, &attempt),
+                            Ok(RetainedStartupBinding::NotificationSnapshot { record_count }),
+                        )
+                    }
                 }
-            }
-            Err(reason) => {
-                eliotd::controlboard_notification_refresh_refusal_body(&envelope, &attempt, &reason)
-            }
-        };
+                Err(reason) => (
+                    eliotd::controlboard_notification_refresh_refusal_body(
+                        &envelope, &attempt, &reason,
+                    ),
+                    Err(reason),
+                ),
+            };
         let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
             LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
             LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
-        // #2647: this leg builds a board over the composition and reads it; it
-        // attaches no startup capability and re-evaluates no readiness, so the
-        // flight observed nothing and carries no delta. Settling it therefore
-        // cannot overwrite owner observations the loop recorded meanwhile, the
-        // same contract the ordinary forwarded read below settles under.
-        return Ok(step(outcome, None));
+        // The observation travels with the step and the loop adopts it only
+        // while its own basis is still current, so settling this leg still
+        // cannot overwrite newer owner observations recorded meanwhile.
+        return Ok(step(
+            outcome,
+            notification_snapshot_deltas(&startup_readiness, observed)?,
+        ));
     }
     // #2857: an admitted `eliot.query` whose explicit intent mode is
     // `context_reconstruction` is the one request that owns Context
@@ -4920,7 +5881,7 @@ async fn run_local_read_poll(
             LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
             LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
-        return Ok(step(outcome, None));
+        return Ok(step(outcome, LocalReadinessDeltas::empty()));
     }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
@@ -4931,56 +5892,198 @@ async fn run_local_read_poll(
         LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
     };
     // #2647: an ordinary forwarded read produces no readiness observation.
-    Ok(step(outcome, None))
+    Ok(step(outcome, LocalReadinessDeltas::empty()))
 }
 
-/// Re-evaluates the Skill startup capabilities this demand names, and returns
-/// the exact refusal when one of them is still unavailable afterwards (#2560).
+/// Files one real notification-fetch observation for the loop to adopt (#2560).
 ///
-/// The demand-driven refresh runs against a working copy of the flight's
-/// immutable snapshot, so the refusal decision observes the real attach
-/// outcome without mutating any shared state (#2647). The observation the
-/// attach actually produced — if it ran at all — travels back as the step's
-/// bounded delta, bound to this snapshot's basis; the loop adopts it only
-/// while that basis is still current.
+/// The demand-driven refresh is the existing
+/// [`eliotd::startup_readiness::reevaluate_demanded_capabilities`] seam, so the
+/// closure hands back the outcome this fetch already produced and performs no
+/// second fetch: one demand, one real fetch, one exact observation. Success
+/// files the same `NotificationSnapshot { record_count }` variant and shape the
+/// startup attach produces; failure files the owner's own refusal, so a snapshot
+/// the startup attach could not establish is established by a later real fetch
+/// and a later real failure is never invisible to the ledger.
 ///
-/// Thin seam over [`eliotd::startup_readiness::reevaluate_demanded_capability`]:
-/// the real owner attach is supplied here because this is the module that owns
-/// it, and the readiness module stays IO-free.
-fn skill_capability_refusal(
+/// The returned set is empty exactly when the slot already carries a currently
+/// usable proof: the projection's own availability answer is then already the
+/// one this fetch did not contradict, and re-filing a bound proof would rewrite
+/// history for nothing. Every other case carries this fetch's own observation,
+/// bound to the basis the loop's projection holds.
+fn notification_snapshot_deltas(
     snapshot: &StartupReadinessProjection,
-) -> Result<(Option<String>, Option<LocalReadinessDelta>), String> {
-    let mut working = snapshot.clone();
-    let mut observed: Option<Result<RetainedStartupBinding, String>> = None;
-    eliotd::startup_readiness::reevaluate_demanded_capability(
-        &mut working,
-        DeclaredStartupCapability::SkillToolSource,
-        || {
-            let outcome = attach_skill_tool_source().map(|admitted_definition_version| {
-                RetainedStartupBinding::SkillToolSource {
-                    admitted_definition_version,
-                }
-            });
-            observed = Some(outcome.clone());
-            outcome
+    observed: Result<RetainedStartupBinding, String>,
+) -> Result<LocalReadinessDeltas, String> {
+    // The required slice above names only the one slot this fetch refreshes, so the
+    // seam calls this closure for that slot alone and it hands back the single outcome
+    // the fetch already produced, whether it succeeded or failed. Every other declared
+    // slot is enumerated below so the closure stays total over the seven-slot ledger.
+    eliotd::startup_readiness::reevaluate_demanded_capabilities(
+        snapshot,
+        &[DeclaredStartupCapability::NotificationSnapshot],
+        |capability| match capability {
+            DeclaredStartupCapability::NotificationSnapshot => observed.clone(),
+            DeclaredStartupCapability::OwnerSessionBinding
+            | DeclaredStartupCapability::DreamerIntake
+            | DeclaredStartupCapability::DreamerModel
+            | DeclaredStartupCapability::AgentFabric
+            | DeclaredStartupCapability::SkillToolSource
+            | DeclaredStartupCapability::SkillToolBasis => Err(format!(
+                "notification refresh attaches NotificationSnapshot only; {} is not in its demand",
+                capability.as_str()
+            )),
         },
     )
-    .map_err(|error| format!("daemon skill capability refresh: {error}"))?;
-    let refusal = eliotd::startup_readiness::refuse_unavailable_capabilities(
-        &working,
+    .map(|outcome| outcome.deltas)
+    .map_err(|error| format!("daemon notification capability refresh: {error}"))
+}
+
+/// Re-evaluates the whole Skill startup-capability dependency set this demand
+/// names, and returns the exact refusal plus the bounded observations it produced
+/// (#2560, audit 5899795164 items 1-5).
+///
+/// A Skill operation needs BOTH its tool source and its installed-Skill basis,
+/// so `required` is exactly those two declared slots and each currently
+/// unavailable one is reevaluated independently here:
+///
+/// * `SkillToolSource` re-runs the existing [`attach_skill_tool_source`] owner
+///   (the production canonical registry through the Governor hook), producing
+///   the same `SkillToolSource { admitted_definition_version }` proof the
+///   startup attach produces;
+/// * `SkillToolBasis` re-runs the existing installed-Skill/tool-basis
+///   reconciliation owner `DaemonComposition::skill_reconcile_tool_basis`
+///   against the live composition, producing the same
+///   `SkillToolBasis { marked_stale }` proof the startup path produces. Basis
+///   success is never inferred from a successful source binding, and nothing
+///   else is re-run.
+///
+/// The decision runs against a working copy of the flight's immutable snapshot,
+/// so it mutates no shared state (#2647) while each returned observation is
+/// prepared on that snapshot's own basis. A recovered source with a still-failed
+/// basis therefore returns the Basis-specific refusal and BOTH exact outcomes,
+/// and a request that finds both slots recovered proceeds without a second
+/// `daemon_ready` call and without a second supervision producer.
+///
+/// Thin seam over
+/// [`eliotd::startup_readiness::reevaluate_demanded_capabilities`]: the real
+/// owner attaches are supplied here because this is the module that owns them,
+/// and the readiness module stays IO-free.
+fn skill_capability_refusal(
+    snapshot: &StartupReadinessProjection,
+    composition: &DaemonComposition,
+) -> Result<DemandRefreshOutcome, String> {
+    eliotd::startup_readiness::reevaluate_demanded_capabilities(
+        snapshot,
         &[
             DeclaredStartupCapability::SkillToolSource,
             DeclaredStartupCapability::SkillToolBasis,
         ],
-    );
-    let delta = observed.map(|observed| {
-        snapshot.prepare_local_delta(eliotd::startup_readiness::CapabilityRefresh {
-            capability: DeclaredStartupCapability::SkillToolSource,
-            reason: eliotd::startup_readiness::StartupRefreshReason::CapabilityDemanded,
-            observed,
-        })
-    });
-    Ok((refusal, delta))
+        |capability| match capability {
+            DeclaredStartupCapability::SkillToolSource => {
+                attach_skill_tool_source().map(|admitted_definition_version| {
+                    RetainedStartupBinding::SkillToolSource {
+                        admitted_definition_version,
+                    }
+                })
+            }
+            DeclaredStartupCapability::SkillToolBasis => {
+                match composition.skill_reconcile_tool_basis() {
+                    Ok(marked_stale) => {
+                        tracing::info!(
+                            target: "eliotd::diagnostics",
+                            event = "eliotd.skill_tool_basis_reconciled",
+                            marked_stale,
+                            "the Skill operation's demand re-ran the installed-Skill tool-basis reconciliation owner"
+                        );
+                        Ok(RetainedStartupBinding::SkillToolBasis { marked_stale })
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            DeclaredStartupCapability::OwnerSessionBinding
+            | DeclaredStartupCapability::NotificationSnapshot
+            | DeclaredStartupCapability::DreamerIntake
+            | DeclaredStartupCapability::DreamerModel
+            | DeclaredStartupCapability::AgentFabric => Err(format!(
+                "skill capability refresh attaches SkillToolSource and SkillToolBasis only; {} is not in its demand",
+                capability.as_str()
+            )),
+        },
+    )
+    .map_err(|error| format!("daemon skill capability refresh: {error}"))
+}
+
+/// Files the agent-fabric descriptor this demand event actually observed
+/// (#2560, audit 5899795164 item 6, corrected by the reachability trace).
+///
+/// The two production demand events that exercise the fabric owner are the solo
+/// verification poll and the fair-pull recovery poll: each builds a fresh
+/// per-operation fabric, and each therefore depends on the retained descriptor
+/// being current at the generation it is operating at. This is the REFRESH owner
+/// for that declared slot and it is deliberately not a gate: those operations
+/// build their own fabric per operation and already refuse themselves unless the
+/// composition's own admission says `Ready`, so withholding them on a stale
+/// startup descriptor would block governed work for no admission reason. All
+/// this does is keep the declared ledger honest about what the owner has
+/// actually reported.
+///
+/// `attach_agent_fabric` re-runs through the existing
+/// `reevaluate_demanded_capabilities` seam, which calls it only while the slot is
+/// currently unavailable, files the exact outcome on the loop's own projection
+/// and prepares the observation against that same projection's basis. Adoption is
+/// then per-slot, so this can never rewrite an unrelated slot or the loop's owner
+/// requirements. A repeated identical observation settles as `Duplicate` and is
+/// not recorded again, so a permanently unavailable descriptor produces one
+/// record per real change rather than one per poll.
+fn agent_fabric_demand_refresh(
+    startup_readiness: &SharedStartupReadiness,
+    composition: &DaemonComposition,
+) -> Result<(), String> {
+    let deltas = {
+        let snapshot = startup_readiness.borrow();
+        eliotd::startup_readiness::reevaluate_demanded_capabilities(
+            &snapshot,
+            &[DeclaredStartupCapability::AgentFabric],
+            // The required slice above names only the fabric slot, so the seam calls this
+            // closure for that slot alone and the owner re-runs once. Every other declared
+            // slot is enumerated below so the closure stays total over the seven-slot ledger.
+            |capability| match capability {
+                DeclaredStartupCapability::AgentFabric => attach_agent_fabric(composition),
+                DeclaredStartupCapability::OwnerSessionBinding
+                | DeclaredStartupCapability::NotificationSnapshot
+                | DeclaredStartupCapability::DreamerIntake
+                | DeclaredStartupCapability::DreamerModel
+                | DeclaredStartupCapability::SkillToolSource
+                | DeclaredStartupCapability::SkillToolBasis => Err(format!(
+                    "agent-fabric refresh attaches AgentFabric only; {} is not in its demand",
+                    capability.as_str()
+                )),
+            },
+        )
+        .map_err(|error| format!("daemon agent-fabric capability refresh: {error}"))?
+        .deltas
+    };
+    if deltas.is_empty() {
+        return Ok(());
+    }
+    let mut projection = startup_readiness.borrow_mut();
+    let settled = projection
+        .adopt_local_deltas(&deltas)
+        .map_err(|error| format!("daemon agent-fabric delta adoption: {error}"))?;
+    for (capability, adoption) in &settled {
+        if matches!(adoption, LocalDeltaAdoption::Duplicate) {
+            continue;
+        }
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.agent_fabric_delta_adoption",
+            capability = capability.as_str(),
+            adoption = local_delta_adoption_name(adoption),
+            readiness = %projection.report(),
+        );
+    }
+    Ok(())
 }
 
 /// Submits one forwarded local-read result body, retrying once with the
@@ -5499,19 +6602,6 @@ async fn submit_campaign_packet_result_idempotent(
     }
 }
 
-async fn drain_campaign_packet_on_shutdown(
-    flight: &mut CampaignPacketFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, CampaignPacketFlight::Idle);
-    let CampaignPacketFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(CampaignPacketCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
 /// Outcome of one production Task Controller poll step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskControllerPollOutcome {
@@ -5646,9 +6736,27 @@ enum SoloPollFlight {
 fn start_solo_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
+    startup_readiness: SharedStartupReadiness,
 ) -> Pin<Box<dyn std::future::Future<Output = SoloPollCompletion>>> {
     let kernel = Arc::clone(kernel);
     Box::pin(async move {
+        // #2560: this is one of the two real demand events for the agent-fabric
+        // owner. The refresh runs against the loop's own projection before the
+        // poll does anything, so the declared ledger records what this
+        // generation's owner actually reported. A refresh that cannot file its
+        // observation is recorded and does not change the poll's own outcome:
+        // this is ledger maintenance, not a new gate.
+        {
+            let guard = composition.lock().await;
+            if let Err(error) = agent_fabric_demand_refresh(&startup_readiness, &guard) {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.agent_fabric_refresh_incomplete",
+                    error = %error,
+                    "the solo poll's agent-fabric observation could not be filed; the poll's own admission gate decides its outcome"
+                );
+            }
+        }
         let result = eliotd::solo_poll_queue_async(&composition, &kernel)
             .await
             .map_err(|error| error.to_string());
@@ -5659,11 +6767,16 @@ fn start_solo_poll(
 fn maybe_start_solo_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
+    startup_readiness: &SharedStartupReadiness,
     flight: &mut SoloPollFlight,
 ) {
     if matches!(flight, SoloPollFlight::Idle) {
         *flight = SoloPollFlight::InFlight(SoloPollFlightState {
-            future: start_solo_poll(kernel, Arc::clone(composition)),
+            future: start_solo_poll(
+                kernel,
+                Arc::clone(composition),
+                Rc::clone(startup_readiness),
+            ),
         });
     }
 }
@@ -5751,9 +6864,25 @@ enum FairPullRecoveryFlight {
 fn start_fair_pull_recovery(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
+    startup_readiness: SharedStartupReadiness,
 ) -> Pin<Box<dyn std::future::Future<Output = FairPullRecoveryCompletion>>> {
     let kernel = Arc::clone(kernel);
     Box::pin(async move {
+        // #2560: the recovery poll is the second real demand event for the
+        // agent-fabric owner, because restoring a released solo fabric reads the
+        // same retained descriptor. Ledger maintenance only: the flight keeps
+        // starting on every tick under its own in-flight gate, exactly as before.
+        {
+            let guard = composition.lock().await;
+            if let Err(error) = agent_fabric_demand_refresh(&startup_readiness, &guard) {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.agent_fabric_refresh_incomplete",
+                    error = %error,
+                    "the recovery poll's agent-fabric observation could not be filed; the poll's own recovery gate decides its outcome"
+                );
+            }
+        }
         let result = eliotd::solo_fair_pull_recovery(&composition, &kernel)
             .await
             .map_err(|error| error.to_string());
@@ -5770,11 +6899,16 @@ fn start_fair_pull_recovery(
 fn maybe_start_fair_pull_recovery(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
+    startup_readiness: &SharedStartupReadiness,
     flight: &mut FairPullRecoveryFlight,
 ) {
     if matches!(flight, FairPullRecoveryFlight::Idle) {
         *flight = FairPullRecoveryFlight::InFlight(FairPullRecoveryFlightState {
-            future: start_fair_pull_recovery(kernel, Arc::clone(composition)),
+            future: start_fair_pull_recovery(
+                kernel,
+                Arc::clone(composition),
+                Rc::clone(startup_readiness),
+            ),
         });
     }
 }
@@ -5916,17 +7050,6 @@ async fn run_finish_poll(
     }
 }
 
-async fn drain_finish_on_shutdown(flight: &mut FinishFlight) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, FinishFlight::Idle);
-    let FinishFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(FinishCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
-}
-
 async fn run_task_controller_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -5990,19 +7113,6 @@ async fn run_task_controller_poll(
                 "Kernel Task Controller result submit: {first_error}; retry: {second_error}"
             )),
         },
-    }
-}
-
-async fn drain_task_controller_on_shutdown(
-    flight: &mut TaskControllerFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, TaskControllerFlight::Idle);
-    let TaskControllerFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(TaskControllerCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 
@@ -8273,7 +9383,7 @@ mod tests {
         );
         let mut flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
-            retained: None,
+            stage: ActivationStage::Claiming,
         });
         assert_eq!(
             decide_activation_tick(&flight),
@@ -8333,7 +9443,7 @@ mod tests {
         };
         let mut flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
-            retained: Some(retained.clone()),
+            stage: ActivationStage::ResolvedSubmitting(retained.clone()),
         });
 
         let failure = settle_activation_dispatch_completion(
@@ -8356,7 +9466,7 @@ mod tests {
 
         let mut hard_flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
-            retained: Some(RetainedActivationIdentity {
+            stage: ActivationStage::ResolvedSubmitting(RetainedActivationIdentity {
                 ticket_id,
                 result_sha256,
             }),
@@ -8371,6 +9481,81 @@ mod tests {
 
         assert!(matches!(hard_flight, ActivationFlight::Idle));
         assert!(hard.activation_unknown.is_none());
+    }
+
+    /// #2559 D1: the claimed/waiting stage is what the old
+    /// `retained: Option<_>` could not express, so this is the regression the
+    /// audit's counterexample depends on. A ticket the Kernel has already
+    /// returned must NOT settle as clean shutdown, and the disposition must
+    /// name the ORIGINAL ticket identity while carrying NO result digest -
+    /// because no `AgentActivationResolutionResult` exists at that stage and
+    /// inventing one would assert a submit that never happened.
+    #[test]
+    fn a_claimed_waiting_ticket_is_not_clean_shutdown_and_invents_no_result_digest() {
+        let ticket_id = "ticket-claimed-waiting".to_owned();
+        let mut flight = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            stage: ActivationStage::ClaimedWaiting {
+                ticket_id: ticket_id.clone(),
+            },
+        });
+
+        let exit = activation_exit_after_drain_timeout(&mut flight, RunLoopExit::Shutdown);
+
+        match exit {
+            RunLoopExit::ShutdownActivationClaimedUnknown {
+                ticket_id: reported,
+                detail,
+            } => {
+                assert_eq!(reported, ticket_id, "original ticket identity, verbatim");
+                assert!(detail.contains("no result digest"));
+                // A claimed ticket must not be able to smuggle a result digest
+                // into the record at all.
+                assert!(!detail.contains("result sha"));
+            }
+            other => panic!("a claimed ticket must not settle as {other:?}"),
+        }
+        // The drain consumed the flight, so nothing is left claiming ownership.
+        assert!(matches!(flight, ActivationFlight::Idle));
+    }
+
+    /// #2559 D1: the other two stages keep their own honest answers. `Claiming`
+    /// owns no ticket, so it preserves the prior disposition; `ResolvedSubmitting`
+    /// carries both real identities exactly as before. Without this, the D1 fix
+    /// could pass while accidentally making the claim stage non-clean or
+    /// dropping a real result digest.
+    #[test]
+    fn claiming_and_submitting_stages_keep_their_own_dispositions() {
+        let mut claiming = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            stage: ActivationStage::Claiming,
+        });
+        assert!(matches!(
+            activation_exit_after_drain_timeout(&mut claiming, RunLoopExit::Shutdown),
+            RunLoopExit::Shutdown
+        ));
+
+        let result_sha256 = "e".repeat(64);
+        let mut submitting = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            stage: ActivationStage::ResolvedSubmitting(RetainedActivationIdentity {
+                ticket_id: "ticket-submitting".to_owned(),
+                result_sha256: result_sha256.clone(),
+            }),
+        });
+        match activation_exit_after_drain_timeout(&mut submitting, RunLoopExit::Shutdown) {
+            RunLoopExit::ShutdownActivationUnknown {
+                ticket_id,
+                result_sha256: reported,
+                ..
+            } => {
+                assert_eq!(ticket_id, "ticket-submitting");
+                assert_eq!(reported, result_sha256, "real digest retained verbatim");
+            }
+            other => {
+                panic!("a submitting flight must keep its unknown disposition, got {other:?}")
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,175 @@
+{
+  "meta": {
+    "issue": 931,
+    "family": "T02",
+    "source_file": "crates/eliot-types/src/runtime_supervision.rs",
+    "schema_version_descendants_at_root_exit": "eliot-descendants-at-root-exit-v1",
+    "bounds": {
+      "MAX_DESCENDANTS_AT_ROOT_EXIT": 64,
+      "MAX_DESCENDANT_IMAGE_PATH_CHARS": 4096,
+      "MAX_DESCENDANT_DETAIL_CHARS": 512,
+      "MAX_DESCENDANT_IMAGE_SHA256_CHARS": 128
+    },
+    "raw_text_only": true,
+    "rules_exercised": [
+      {
+        "handle": "docs/architecture/APPENDIX-P-rust-public-boundary-interfaces.md:12",
+        "quote": "authority, scope, effect, privacy, ordering and receipt fields are never silently defaulted;"
+      },
+      {
+        "handle": "docs/architecture/APPENDIX-P-rust-public-boundary-interfaces.md:13",
+        "quote": "closed control variants fail when unknown; additive reason/telemetry values preserve Unknown(raw);"
+      },
+      {
+        "handle": "docs/architecture/I05-16-common-durable-fields.md:46",
+        "quote": "Fields that do not apply remain explicit `None`; they are not silently omitted from the semantic model."
+      },
+      {
+        "handle": "docs/architecture/I07-20-agent-facing-error-contract.md:24-26",
+        "quote": "state/conflict — STALE_STATE_FENCE, STALE_AUTHORITY_EPOCH, STALE_PROJECTION, OBSERVATION_GAP, SCOPE_CONFLICT, CONFLICT_OPEN, CRITICAL_ATTENTION_OPEN, SEQUENCE_GAP_OPEN, TRANSITION_DIGEST_MISMATCH, AMBIGUOUS_RESULT, DESCENDANT_CLOSURE_INCOMPLETE;"
+      },
+      {
+        "handle": "docs/architecture/I07-20-agent-facing-error-contract.md:42-46",
+        "quote": "instrument/evidence — INSTRUMENT_UNAVAILABLE, INSTRUMENT_FAILED, INSTRUMENT_PARSER_INCOMPATIBLE, INSTRUMENT_EVIDENCE_INCOMPLETE, INSTRUMENT_OUTPUT_TRUNCATED, PROCESS_TREE_CLEANUP_FAILED,"
+      },
+      {
+        "handle": "docs/architecture/I07-20-agent-facing-error-contract.md:24-46",
+        "quote": "The registry carries `DESCENDANT_CLOSURE_INCOMPLETE` under state/conflict and `PROCESS_TREE_CLEANUP_FAILED` under instrument/evidence, which is why an untrusted descendant capture and a proven incomplete one are two different facts and not one boolean."
+      }
+    ]
+  },
+  "cases": {
+    "pos_valid_capture": {
+      "kind": "process_reap_receipt",
+      "expect": "accept",
+      "why": "this row is the audit's counterexample with its one illegal capture `root_pid` repaired to 10 in both the receipt and the capture, plus one live descendant with a non-empty `image_path`; it is the baseline every refusal row below differs from by exactly one value.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_zero_root_pid_in_capture": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the `captured.root_pid != 0` bound: it carries TASK.md's reproducible counterexample verbatim, whose only illegal value is the capture's `root_pid` of 0.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":null,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":0,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[]}}"
+    },
+    "refuse_zero_descendant_pid": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the `pid != 0` bound on a descendant snapshot; the single descendant's `pid` is 0 and nothing else differs from the baseline capture.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":0,\"start_ticks\":1000,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-0.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":0},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_duplicate_descendant_pid": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the no-duplicate-descendant-PID bound; the two descendants repeat `pid` 20 and are otherwise valid and in non-decreasing order.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20-copy.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_unsorted_descendants": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the sorted-descendant-list bound; the two distinct valid descendants appear in descending `pid` order.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":21,\"start_ticks\":1021,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-21.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":210},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"},{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_descendant_pid_equals_root_pid": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the `pid != root_pid` bound; the single descendant's `pid` equals the capture's `root_pid` of 10.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":10,\"start_ticks\":1010,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-10.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":100},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_empty_image_path": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the non-empty `image_path` bound; the single descendant's `image_path` is the empty string.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_oversized_image_path": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the `MAX_DESCENDANT_IMAGE_PATH_CHARS` bound; the single descendant's `image_path` is one character longer than that bound.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_empty_image_sha256": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the non-empty optional `image_sha256` bound; the single descendant's `image_sha256` is present and spelled as the empty string rather than absent.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"\"}]}}"
+    },
+    "refuse_oversized_image_sha256": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the `MAX_DESCENDANT_IMAGE_SHA256_CHARS` bound; the single descendant's `image_sha256` is longer than that bound.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababc\"}]}}"
+    },
+    "refuse_oversized_detail": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the `MAX_DESCENDANT_DETAIL_CHARS` bound on a `failed` capture; the record's `detail` is one character longer than that bound and its `root_pid` is non-zero.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"failed\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"error_kind\":\"access_denied\",\"detail\":\"ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}}"
+    },
+    "refuse_unknown_schema_version": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the pinned descendant-capture `schema_version`; the capture's version is the next generation of that literal rather than the one this build owns.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v2\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}}"
+    },
+    "refuse_unknown_nested_field": {
+      "kind": "process_reap_receipt",
+      "expect": "refuse",
+      "why": "this row is for the closed capture struct: it carries exactly one member the struct does not declare, alongside an otherwise valid capture.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"captured\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"descendants\":[{\"pid\":20,\"start_ticks\":1020,\"image_path\":\"C:\\\\Windows\\\\System32\\\\descendant-20.exe\",\"file_identity\":{\"volume_serial_number\":4660,\"file_index\":200},\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}],\"unknown_nested_capture_member\":true}}"
+    },
+    "pos_valid_failed_capture": {
+      "kind": "process_reap_receipt",
+      "expect": "accept",
+      "why": "this row is for the `failed` capture shape as a well-formed record: a bounded `detail`, a non-zero optional `root_pid` and a declared `error_kind` spelling.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"job_object_name\":\"job-1\",\"root_pid\":10,\"process_count_before\":1,\"process_count_after\":0,\"graceful_attempted\":true,\"forced_termination\":true,\"stdout_closed\":true,\"stderr_closed\":true,\"all_tasks_joined\":true,\"elapsed_ms\":1,\"terminal_error_codes\":[],\"descendants_at_root_exit\":{\"kind\":\"failed\",\"schema_version\":\"eliot-descendants-at-root-exit-v1\",\"root_pid\":10,\"root_exit_code\":0,\"capture_elapsed_ms\":1,\"error_kind\":\"access_denied\",\"detail\":\"access denied enumerating descendant pids\"}}"
+    },
+    "pos_checkpoint_no_optionals": {
+      "kind": "operation_runtime_checkpoint",
+      "expect": "accept",
+      "why": "this row is for explicit absence on every optional identifier of the checkpoint: each is spelled as JSON `null` rather than omitted or filled with an empty string.",
+      "text": "{\"schema_version\":\"eliot-operation-runtime-v1\",\"operation_id\":\"op-1\",\"invocation_id\":null,\"adapter_id\":null,\"generation\":1,\"phase\":\"running\",\"dispatch_state\":\"proven\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"root_pid\":null,\"root_process_start_ticks\":null,\"root_executable_sha256\":null,\"job_object_name\":null,\"active_process_count\":1,\"stdin_bytes\":0,\"stdout_bytes\":128,\"stderr_bytes\":0,\"phase_started_at\":\"2026-10-01T00:00:00Z\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"absolute_deadline_at\":\"2026-10-01T02:00:00Z\",\"restart_count\":0,\"restart_window_started_at\":null,\"role_lease_id\":null,\"role_lease_epoch\":null,\"runtime_contract_sha256\":null,\"last_error_class\":null,\"last_evidence_refs\":[]}"
+    },
+    "refuse_checkpoint_empty_invocation_id": {
+      "kind": "operation_runtime_checkpoint",
+      "expect": "refuse",
+      "why": "this row is for the optional `invocation_id` identifier: it is present as the empty string, which is an absent identifier rather than a weaker one.",
+      "text": "{\"schema_version\":\"eliot-operation-runtime-v1\",\"operation_id\":\"op-1\",\"invocation_id\":\"\",\"adapter_id\":\"adapter-1\",\"generation\":1,\"phase\":\"running\",\"dispatch_state\":\"proven\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"root_pid\":10,\"root_process_start_ticks\":1010,\"root_executable_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"job_object_name\":\"job-1\",\"active_process_count\":1,\"stdin_bytes\":0,\"stdout_bytes\":128,\"stderr_bytes\":0,\"phase_started_at\":\"2026-10-01T00:00:00Z\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"absolute_deadline_at\":\"2026-10-01T02:00:00Z\",\"restart_count\":0,\"restart_window_started_at\":null,\"role_lease_id\":\"lease-role-1\",\"role_lease_epoch\":3,\"runtime_contract_sha256\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",\"last_error_class\":null,\"last_evidence_refs\":[\"evidence-1\"]}"
+    },
+    "refuse_checkpoint_empty_adapter_id": {
+      "kind": "operation_runtime_checkpoint",
+      "expect": "refuse",
+      "why": "this row is for the optional `adapter_id` identifier: it is present as the empty string, which is an absent identifier rather than a weaker one.",
+      "text": "{\"schema_version\":\"eliot-operation-runtime-v1\",\"operation_id\":\"op-1\",\"invocation_id\":\"invocation-1\",\"adapter_id\":\"\",\"generation\":1,\"phase\":\"running\",\"dispatch_state\":\"proven\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"root_pid\":10,\"root_process_start_ticks\":1010,\"root_executable_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"job_object_name\":\"job-1\",\"active_process_count\":1,\"stdin_bytes\":0,\"stdout_bytes\":128,\"stderr_bytes\":0,\"phase_started_at\":\"2026-10-01T00:00:00Z\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"absolute_deadline_at\":\"2026-10-01T02:00:00Z\",\"restart_count\":0,\"restart_window_started_at\":null,\"role_lease_id\":\"lease-role-1\",\"role_lease_epoch\":3,\"runtime_contract_sha256\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",\"last_error_class\":null,\"last_evidence_refs\":[\"evidence-1\"]}"
+    },
+    "refuse_checkpoint_empty_job_object_name": {
+      "kind": "operation_runtime_checkpoint",
+      "expect": "refuse",
+      "why": "this row is for the optional `job_object_name` identifier: it is present as the empty string, which is an absent identifier rather than a weaker one.",
+      "text": "{\"schema_version\":\"eliot-operation-runtime-v1\",\"operation_id\":\"op-1\",\"invocation_id\":\"invocation-1\",\"adapter_id\":\"adapter-1\",\"generation\":1,\"phase\":\"running\",\"dispatch_state\":\"proven\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"root_pid\":10,\"root_process_start_ticks\":1010,\"root_executable_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"job_object_name\":\"\",\"active_process_count\":1,\"stdin_bytes\":0,\"stdout_bytes\":128,\"stderr_bytes\":0,\"phase_started_at\":\"2026-10-01T00:00:00Z\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"absolute_deadline_at\":\"2026-10-01T02:00:00Z\",\"restart_count\":0,\"restart_window_started_at\":null,\"role_lease_id\":\"lease-role-1\",\"role_lease_epoch\":3,\"runtime_contract_sha256\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",\"last_error_class\":null,\"last_evidence_refs\":[\"evidence-1\"]}"
+    },
+    "refuse_checkpoint_empty_role_lease_id": {
+      "kind": "operation_runtime_checkpoint",
+      "expect": "refuse",
+      "why": "this row is for the optional `role_lease_id` identifier on the checkpoint: it is present as the empty string, which is an absent identifier rather than a weaker one.",
+      "text": "{\"schema_version\":\"eliot-operation-runtime-v1\",\"operation_id\":\"op-1\",\"invocation_id\":\"invocation-1\",\"adapter_id\":\"adapter-1\",\"generation\":1,\"phase\":\"running\",\"dispatch_state\":\"proven\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"root_pid\":10,\"root_process_start_ticks\":1010,\"root_executable_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"job_object_name\":\"job-1\",\"active_process_count\":1,\"stdin_bytes\":0,\"stdout_bytes\":128,\"stderr_bytes\":0,\"phase_started_at\":\"2026-10-01T00:00:00Z\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"absolute_deadline_at\":\"2026-10-01T02:00:00Z\",\"restart_count\":0,\"restart_window_started_at\":null,\"role_lease_id\":\"\",\"role_lease_epoch\":3,\"runtime_contract_sha256\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",\"last_error_class\":null,\"last_evidence_refs\":[\"evidence-1\"]}"
+    },
+    "refuse_checkpoint_empty_runtime_contract_sha256": {
+      "kind": "operation_runtime_checkpoint",
+      "expect": "refuse",
+      "why": "this row is for the optional `runtime_contract_sha256` digest on the checkpoint: it is present as the empty string, which is an absent digest rather than a weaker one.",
+      "text": "{\"schema_version\":\"eliot-operation-runtime-v1\",\"operation_id\":\"op-1\",\"invocation_id\":\"invocation-1\",\"adapter_id\":\"adapter-1\",\"generation\":1,\"phase\":\"running\",\"dispatch_state\":\"proven\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"root_pid\":10,\"root_process_start_ticks\":1010,\"root_executable_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"job_object_name\":\"job-1\",\"active_process_count\":1,\"stdin_bytes\":0,\"stdout_bytes\":128,\"stderr_bytes\":0,\"phase_started_at\":\"2026-10-01T00:00:00Z\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"absolute_deadline_at\":\"2026-10-01T02:00:00Z\",\"restart_count\":0,\"restart_window_started_at\":null,\"role_lease_id\":\"lease-role-1\",\"role_lease_epoch\":3,\"runtime_contract_sha256\":\"\",\"last_error_class\":null,\"last_evidence_refs\":[\"evidence-1\"]}"
+    },
+    "pos_operation_detail_no_lease": {
+      "kind": "runtime_operation_detail",
+      "expect": "accept",
+      "why": "this row is for explicit absence of the optional lease on a `RuntimeOperationDetail`: `role_lease_id` and `role_lease_epoch` are both spelled as JSON `null`.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"phase\":\"running\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"root_pid\":10,\"active_process_count\":1,\"stdin_state\":\"open\",\"stdout_state\":\"open\",\"stderr_state\":\"open\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"role_lease_id\":null,\"role_lease_epoch\":null}"
+    },
+    "refuse_operation_detail_empty_role_lease_id": {
+      "kind": "runtime_operation_detail",
+      "expect": "refuse",
+      "why": "this row is for the optional `role_lease_id` identifier on `RuntimeOperationDetail`: it is present as the empty string, which is an absent identifier rather than a weaker one.",
+      "text": "{\"operation_id\":\"op-1\",\"generation\":1,\"phase\":\"running\",\"last_progress_at\":\"2026-10-01T00:00:05Z\",\"phase_deadline_at\":\"2026-10-01T01:00:00Z\",\"root_pid\":10,\"active_process_count\":1,\"stdin_state\":\"open\",\"stdout_state\":\"open\",\"stderr_state\":\"open\",\"cancellation_state\":\"not_requested\",\"reconciliation_state\":\"not_required\",\"role_lease_id\":\"\",\"role_lease_epoch\":3}"
+    }
+  }
+}

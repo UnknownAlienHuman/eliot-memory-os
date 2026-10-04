@@ -1,6 +1,6 @@
 //! WASM-host CLI argument/config contract: deterministic profile/transport parsing and value assembly only.
 //! Architecture: A2.3, A9.1, A12.3; ARCH-AUTH-01, ARCH-DRM-01, ARCH-SEC-02.
-//! Implementation: I1.3, I2.19, I3.9, I14.19, P.13; no Dreamer, semantic/canonical-write, runtime/provider, policy, retry, or authority ownership.
+//! Implementation: I1.3, I2.19, I3.9, I14.19; no Dreamer, semantic/canonical-write, runtime/provider, policy, retry, or authority ownership.
 
 use std::fmt;
 
@@ -39,12 +39,19 @@ impl fmt::Display for Profile {
     }
 }
 
-/// The local-only transports understood by the binary contract.
+/// The local-only transports understood by the binary contract. A selection is
+/// parsed and carried in [`CliConfig::transport`]; no in-crate consumer reads
+/// it, because the ordinary loop takes its material from the owner-staged
+/// delivery set (`request_loop.rs:6166-6169`), never from this choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
-    /// Length-delimited local standard input/output.
+    /// Local standard input/output spelling. The live result path frames
+    /// stdout as one serialized JSON object per line under
+    /// `MAX_RESULT_FRAME_BYTES` (`request_loop.rs:3058-3071`), not as a
+    /// length-delimited frame.
     Stdio,
-    /// Local loopback, reserved for an injected transport owner.
+    /// Local loopback spelling, accepted and carried exactly like `Stdio`.
+    /// There is no injected transport owner in this host to consume it.
     Loopback,
 }
 
@@ -75,7 +82,8 @@ pub enum CliError {
     MissingExperimentalWorld,
     /// A governed component was supplied without its world selection.
     MissingGovernedWorld,
-    /// The experimental world spelling is not a frozen typed world.
+    /// The `--world` spelling on a typed lane (experimental or governed) is
+    /// not a frozen typed world.
     UnknownWorld(String),
 }
 
@@ -110,7 +118,9 @@ impl std::str::FromStr for Profile {
     }
 }
 
-/// Parsed profile, local transport, and optional explicit experimental selection.
+/// Parsed profile, local transport, and the optional explicit selections:
+/// one experimental or governed typed artifact (never both), the typed world
+/// that artifact needs, and the one-shot guest-execution argument set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliConfig {
     /// Selected profile.
@@ -132,29 +142,51 @@ pub struct CliConfig {
     /// bytes on stdout. `None` unless `--guest-exec` is passed with its full
     /// argument set. This is how a reaped child executes an admitted guest:
     /// the parent spawns this binary with these exact arguments through the
-    /// P03 staged intent, so every value here is admission-bound, never
-    /// ambient.
+    /// P03 staged intent (`wasm_dispatch.rs:1285-1305`), so every value here
+    /// is admission-bound, never ambient.
     pub guest_exec: Option<GuestExecArgs>,
 }
 
 /// Bounded argument set for one-shot admitted guest execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestExecArgs {
-    /// Component artifact file (bounded, preflighted, digest-checked).
+    /// Component artifact file. The child requires an explicit absolute path
+    /// for it (`guest_exec.rs:212-214`), then bounds, preflights and
+    /// digest-checks the bytes it reads.
     pub artifact: std::path::PathBuf,
-    /// Raw input file (bounded).
+    /// Raw input file (bounded), and required to be absolute too
+    /// (`guest_exec.rs:223-225`), so no read resolves against the working
+    /// directory.
     pub input: std::path::PathBuf,
-    /// Expected SHA-256 hex of the artifact bytes (TOCTOU check on read).
+    /// Expected SHA-256 hex of the artifact bytes (TOCTOU check on read):
+    /// re-hashed from the bytes actually read, twice — against the bounded
+    /// preflight digest (`guest_exec.rs:219-221`) and against the buffer
+    /// handed to validation (`guest_exec.rs:161-164`).
     pub artifact_digest: String,
-    /// Output byte ceiling enforced by the guest Store.
+    /// Output byte ceiling. NOT a Store limiter: the Store's limiter carries
+    /// memory, table and instance counts only
+    /// (`wasmtime_provider.rs:489-497`), so this ceiling is compared against
+    /// the lifted return value after the call, inside
+    /// `invoke_component_with_epoch_driver` (`wasmtime_provider.rs:461`): the
+    /// guard `value.len() as u64 <= limits.max_output_bytes` at `:561`, and
+    /// the `EngineTermination::OutputLimit` refusal it takes at `:565-569`.
+    /// That refusal is this in-process provider's only `OutputLimit` site; the
+    /// P03 child contour mints its own from a truncated capture
+    /// (`child_engine.rs:173-178`). The child also gates its own stdout
+    /// emission against the same ceiling (`guest_exec.rs:286-288`).
     pub max_output_bytes: u64,
-    /// Fuel ceiling enforced by the guest Store.
+    /// Fuel ceiling enforced by the guest Store (`wasmtime_provider.rs:514`).
     pub max_fuel: u64,
-    /// Memory byte ceiling enforced by the guest Store.
+    /// Memory byte ceiling enforced by the guest Store's limiter
+    /// (`wasmtime_provider.rs:490`).
     pub max_memory_bytes: u64,
-    /// Wall deadline (ms) enforced by the epoch driver.
+    /// Wall deadline (ms) enforced by the epoch driver, which carries this
+    /// computed instant (`wasmtime_provider.rs:530`) and interrupts through
+    /// the Store epoch.
     pub wall_deadline_ms: u64,
-    /// Epoch deadline ticks enforced by the epoch driver.
+    /// Epoch deadline ticks: armed on the guest Store with
+    /// `set_epoch_deadline` (`wasmtime_provider.rs:519`) and advanced by the
+    /// epoch driver, which is what interrupts the guest.
     pub epoch_deadline_ticks: u64,
 }
 
@@ -468,8 +500,10 @@ where
 
 /// Parses one guest-execution numeric ceiling: present, non-empty, and a
 /// valid `u64`. Zero and over-ceiling values are rejected later by
-/// guest-execution validation with a process exit code, keeping parse
-/// errors (malformed text) distinct from admission errors (bad values).
+/// guest-execution validation with a process exit code — `GUEST_EXEC_BAD_LIMITS`
+/// and status `EXIT_DENIED` (1) for a zero ceiling or epoch ticks above
+/// `MAX_EPOCH_DEADLINE_TICKS` (`guest_exec.rs:165-175`, `:129-136`) — keeping
+/// parse errors (malformed text) distinct from admission errors (bad values).
 fn parse_guest_limit(
     flag: &'static str,
     arguments: &[String],
@@ -533,26 +567,43 @@ mod tests {
 
     #[test]
     fn guest_exec_args_fail_closed() {
-        // Missing artifact piece.
+        // Missing artifact piece. Draining the flag and its value leaves every
+        // remaining token pairing cleanly as flag/value, so the parse loop
+        // cannot refuse on its own: the only reachable refusal is the assembled
+        // `--guest-exec` missing-artifact requirement. The exact detail is
+        // pinned, for the same reason as the ceiling case below — a refusal
+        // raised anywhere else fails here instead of being satisfied by any
+        // `MalformedArgument`.
         let mut argv = guest_argv();
         argv.drain(3..5);
-        assert!(matches!(
+        assert_eq!(
             parse_args(argv),
-            Err(CliError::MalformedArgument(_))
-        ));
-        // Non-numeric ceiling.
+            Err(CliError::MalformedArgument(
+                "--guest-exec requires --guest-exec-artifact".to_owned()
+            ))
+        );
+        // Non-numeric ceiling VALUE: `argv[14]` is the `--guest-exec-max-memory`
+        // value, so this reaches `parse_guest_limit`'s `u64` parse rather than
+        // the unknown-argument arm. The expected detail is bound from the flag
+        // name exactly as the production path formats it, so a mutation that
+        // drifts back to a flag index fails here instead of being satisfied by
+        // any `MalformedArgument`.
+        let flag = "--guest-exec-max-memory";
+        let expected = format!("{flag} requires a u64 value");
         let mut argv = guest_argv();
-        argv[13] = "lots".to_owned();
-        assert!(matches!(
-            parse_args(argv),
-            Err(CliError::MalformedArgument(_))
-        ));
-        // Stray guest piece without the mode flag.
+        argv[14] = "lots".to_owned();
+        assert_eq!(parse_args(argv), Err(CliError::MalformedArgument(expected)));
+        // Stray guest piece without the mode flag. Removing `--guest-exec`
+        // leaves a complete, individually well-formed guest argument set, so
+        // the loop accepts every token and the refusal must come from the
+        // assembled guest mode, for the reason the parse names.
         let mut argv = guest_argv();
         argv.remove(2);
-        assert!(matches!(
+        assert_eq!(
             parse_args(argv),
-            Err(CliError::MalformedArgument(_))
-        ));
+            Err(CliError::MalformedArgument(
+                "guest execution arguments require --guest-exec".to_owned()
+            ))
+        );
     }
 }

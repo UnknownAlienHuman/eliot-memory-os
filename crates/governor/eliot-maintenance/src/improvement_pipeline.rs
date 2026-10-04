@@ -671,7 +671,12 @@ impl ImprovementProposal {
         text(&self.target_capability, "target_capability")?;
         text(&self.target_generation, "target_generation")?;
         text(&self.expected_delta, "expected_delta")?;
-        text(&self.risk_ceiling, "risk_ceiling")?;
+        // A blank risk qualifier is UNSUPPORTED, not absent. `risk_ceiling` names a
+        // closed typed policy value with exactly one admitted member, so a value
+        // that carries no qualifier at all is the same closed-set violation as
+        // `unbounded` and must not be reported as a missing field. Checked here,
+        // before the input profile, so no later field check can relabel it.
+        check_risk_ceiling_present(&self.risk_ceiling)?;
         text(&self.effect_ceiling, "effect_ceiling")?;
         text(&self.budget_ref, "budget_ref")?;
         text(&self.deadline_ref, "deadline_ref")?;
@@ -4327,9 +4332,39 @@ fn commitment_of(normalized: &ImprovementProposal) -> Result<ProposalCommitment,
     })
 }
 
+/// Refuses a `risk_ceiling` that carries no qualifier at all.
+///
+/// `risk_ceiling` is a closed typed policy value, not free text, and its only
+/// member is [`IMPROVEMENT_RISK_CEILING_BOUNDED`]. A blank or whitespace-only
+/// value is therefore the same closed-set violation as `unbounded` and refuses
+/// with the same typed failure; reporting it as a missing field would claim the
+/// field is absent from the record when the record carries the field and its
+/// value is simply not a member of the closed set.
+///
+/// This is the single statement of that rule, called both from
+/// [`ImprovementProposal::validate`] and from the commitment profile, so every
+/// path that reads or canonicalizes a proposal refuses a blank risk ceiling the
+/// same way instead of only the admission path doing so.
+fn check_risk_ceiling_present(value: &str) -> Result<(), PipelineError> {
+    if value.trim().is_empty() {
+        return Err(PipelineError::UnsupportedRiskCeiling {
+            encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// Validates the admitted input, count, string, and total-size profile before
 /// any clone, sort, or serialization happens.
 fn check_commitment_profile(proposal: &ImprovementProposal) -> Result<(), PipelineError> {
+    // Checked ahead of the generic string profile below, which reports a blank
+    // value of this field as `MissingField`. A caller that canonicalizes a
+    // proposal WITHOUT running `ImprovementProposal::validate` — the gate in
+    // `admit_improvement_candidate_without_execution_evidence`, and therefore the
+    // daemon route's re-profile of a proposal the admitting path already refused
+    // — reaches the closed-set failure here instead of a missing-field error that
+    // contradicts what the admitting path reported for the same bytes.
+    check_risk_ceiling_present(&proposal.risk_ceiling)?;
     for (field, value) in [
         ("proposal_id", proposal.proposal_id.as_str()),
         ("candidate_id", proposal.candidate_id.as_str()),
@@ -4467,4 +4502,1428 @@ fn bounded_text(value: &str, field: &'static str, limit: usize) -> Result<(), Pi
         return Err(PipelineError::InputProfileCeiling(field));
     }
     Ok(())
+}
+
+/// What the joined-input proofs below establish, and what they deliberately do not.
+///
+/// One complete, individually valid group of seven inputs reaches exactly ONE
+/// `ImprovementTerminalDisposition::CanaryAdmitted` carrying an inspectable,
+/// non-authorizing handoff, and every substitution below turns exactly one field
+/// and refuses with that relation's own typed `PipelineError` before any handoff
+/// exists. Two groups that are each individually valid cannot be spliced into
+/// one accepted result, and every assertion reads a value or a typed error the
+/// pipeline actually returns.
+///
+/// Every case enters through the one public pipeline entry point, and no
+/// production step is reached any other way. What comes from outside that
+/// entry point is fixture construction: the retained-prior fixture and the
+/// expected side of one assertion are built by this module's own private
+/// helpers `canonical_proposal`, `commitment_of`, `discriminator_of` and
+/// `material_equality_of`, which only normalize, commit and derive values
+/// from records the test itself constructs, and which are never used to
+/// invoke a production step.
+/// The private joined-input view, its only constructor, and the private result
+/// mapper are neither named nor reached here and their visibility is never
+/// widened: naming them would assert through a seam this issue closed, and every
+/// relation they carry is observable as a typed refusal of that entry point.
+/// The one consequence is stated rather than hidden — the result mapper's
+/// re-check of the admitted verdict against those same records admits no caller
+/// that could make it disagree, so it cannot be driven into disagreement from
+/// outside and is therefore asserted here only through the dispositions the
+/// public entry point actually returns.
+///
+/// Two named cases are deliberately ABSENT, because on current `main` they are
+/// not constructible without a product change this issue forbids:
+///
+/// 1. An unrelated, nonblank `run_ref`. `ActivationEvidence.run_ref` and
+///    `ImprovementEvidenceView.run_ref` are only checked for presence and
+///    boundedness (`check_evaluation_shape` and the closing
+///    `check_admission_evidence_join` step). Neither is compared with the other
+///    or with any other record, so an unrelated, nonblank, in-bounds run
+///    reference still reaches `CanaryAdmitted` and the handoff then publishes two
+///    unrelated run references. Asserting a refusal here would assert a check
+///    that does not exist, so the case below states the presence and the ceiling
+///    the code really enforces and nothing more.
+///
+/// A BLANK `risk_ceiling` is no longer such a case: `risk_ceiling` is a closed
+/// typed policy value whose only member is `IMPROVEMENT_RISK_CEILING_BOUNDED`,
+/// so a blank or whitespace-only qualifier is unsupported rather than absent and
+/// refuses with `PipelineError::UnsupportedRiskCeiling`, the same typed failure
+/// `unbounded` and every other nonblank wrong value produce.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::improvement_admission::{
+        IMPROVEMENT_ADMISSION_AUTHORITY, ImprovementPulseOutcome, improvement_admission_policy,
+    };
+
+    /// One complete, individually valid joined group.
+    ///
+    /// The group is valid because every relation the join checks agrees INSIDE
+    /// it: proposal, plan, evaluation evidence, rollback contract, candidate
+    /// view, admission review and policy all name the same operation and
+    /// idempotency namespace, the same candidate, campaign, closure identity and
+    /// closure digest, the same bounded experiment and content revision, and the
+    /// same rollback owner; the plan's scope, budget and deadline ARE the
+    /// admitted ones rather than a narrowing of them; and the admission review
+    /// carries a retained prior record, which this fixture must carry because an
+    /// absent retained record is assessed as `NoRetainedPrior`, disposes as
+    /// no-progress, and can never reach the admitted branch.
+    ///
+    /// `tag` names the group, so the explicit A/B counterexample builds two
+    /// INDEPENDENTLY valid groups instead of mixing halves of one.
+    struct Fixture {
+        proposal: ImprovementProposal,
+        experiment: ExperimentPlan,
+        evidence: ActivationEvidence,
+        rollback: RollbackContract,
+        candidate: ImprovementCandidateView,
+        admission_evidence: ImprovementEvidenceView,
+        policy: ImprovementAdmissionPolicy,
+    }
+
+    impl Fixture {
+        /// The seven borrowed inputs of one pure pipeline run.
+        fn inputs(&self) -> ImprovementPipelineInputs<'_> {
+            ImprovementPipelineInputs {
+                proposal: &self.proposal,
+                experiment: &self.experiment,
+                evidence: &self.evidence,
+                rollback: &self.rollback,
+                candidate: &self.candidate,
+                admission_evidence: &self.admission_evidence,
+                policy: &self.policy,
+            }
+        }
+
+        /// Runs the one production entry point over this group.
+        fn run(&self) -> Result<ImprovementTerminalDisposition, PipelineError> {
+            run_improvement_candidate_pipeline(self.inputs())
+        }
+
+        /// Returns the typed refusal this group must produce.
+        ///
+        /// `Ok` is a test failure here, not a weaker pass: a positive result is
+        /// the thing every substitution below has to make impossible.
+        fn refusal(&self) -> PipelineError {
+            match self.run() {
+                Err(error) => error,
+                Ok(disposition) => panic!("joined input must refuse, got {disposition:?}"),
+            }
+        }
+
+        /// Returns the one non-authorizing handoff this group must reach.
+        fn admitted(&self) -> ImprovementCanaryHandoff {
+            match self.run() {
+                Ok(ImprovementTerminalDisposition::CanaryAdmitted { handoff }) => *handoff,
+                Ok(other) => panic!("joined input must admit for one canary, got {other:?}"),
+                Err(error) => panic!("joined input must admit for one canary, got {error:?}"),
+            }
+        }
+
+        /// Runs the gate-only entry point and returns its typed refusal.
+        ///
+        /// This is the second public entry point, and it deliberately does NOT
+        /// run `ImprovementProposal::validate`; it canonicalizes the proposal
+        /// instead. The daemon route calls it with the same proposal bytes the
+        /// admitting path already refused, so the two entries must name the same
+        /// violation for the same record.
+        fn gate_refusal(&self) -> PipelineError {
+            match admit_improvement_candidate_without_execution_evidence(
+                &self.proposal,
+                &self.experiment,
+                &self.candidate,
+                &self.admission_evidence,
+                &self.policy,
+            ) {
+                Err(error) => error,
+                Ok(disposition) => panic!("gate must refuse, got {disposition:?}"),
+            }
+        }
+    }
+
+    fn fixture(tag: &str) -> Fixture {
+        Fixture {
+            proposal: proposal(tag),
+            experiment: plan(tag),
+            evidence: evidence(tag),
+            rollback: rollback(tag),
+            candidate: candidate(tag),
+            admission_evidence: admission_review(tag),
+            // The production policy record, so the admission owner and the
+            // rollback owner are this owner's own decision and not literals
+            // restated here.
+            policy: improvement_admission_policy(
+                &format!("op-2702-{tag}"),
+                &format!("idem-2702-{tag}"),
+                &format!("rollback-owner-2702-{tag}"),
+            ),
+        }
+    }
+
+    fn proposal(tag: &str) -> ImprovementProposal {
+        ImprovementProposal {
+            proposal_id: format!("proposal-2702-{tag}"),
+            candidate_id: format!("cand-2702-{tag}"),
+            campaign_id: format!("campaign-2702-{tag}"),
+            closure_id: format!("closure-2702-{tag}"),
+            closure_digest: format!("sha256-closure-2702-{tag}"),
+            evidence_refs: vec![format!("evidence-2702-{tag}")],
+            target_capability: format!("capability-2702-{tag}"),
+            target_generation: format!("generation-2702-{tag}"),
+            mechanism: MechanismDeclaration {
+                mechanism_id: format!("mechanism-2702-{tag}"),
+                hypothesis: format!("hypothesis-2702-{tag}"),
+                causal_link: format!("causal-link-2702-{tag}"),
+                declared_ref: format!("declared-ref-2702-{tag}"),
+                declared_before_results: true,
+            },
+            expected_delta: format!("expected-delta-2702-{tag}"),
+            risk_ceiling: IMPROVEMENT_RISK_CEILING_BOUNDED.to_string(),
+            effect_ceiling: IMPROVEMENT_EFFECT_CEILING.to_string(),
+            budget_ref: format!("budget-2702-{tag}"),
+            deadline_ref: format!("deadline-2702-{tag}"),
+            privacy_class: "internal".to_string(),
+            invalidation_set: vec![
+                "invalidation-cache".to_string(),
+                "invalidation-store".to_string(),
+            ],
+            operation_ref: format!("op-2702-{tag}"),
+            idempotency_key: format!("idem-2702-{tag}"),
+            source_identity: format!("source-2702-{tag}"),
+            runtime_identity: format!("runtime-2702-{tag}"),
+            data_identity: format!("data-2702-{tag}"),
+        }
+    }
+
+    fn plan(tag: &str) -> ExperimentPlan {
+        ExperimentPlan {
+            experiment_id: format!("exp-2702-{tag}"),
+            testd_owner_id: TESTD_OWNER.to_string(),
+            evaluator_id: format!("{VERIFIER_OWNER_FAMILY}-eval-{tag}"),
+            scope_ref: format!("scope-2702-{tag}"),
+            budget_ref: format!("budget-2702-{tag}"),
+            deadline_ref: format!("deadline-2702-{tag}"),
+            operation_ref: format!("op-2702-{tag}"),
+            idempotency_key: format!("idem-2702-{tag}"),
+            scope_refinement: None,
+        }
+    }
+
+    fn evidence(tag: &str) -> ActivationEvidence {
+        ActivationEvidence {
+            evidence_id: format!("activation-evidence-2702-{tag}"),
+            verifier_id: format!("{VERIFIER_OWNER_FAMILY}-eval-{tag}"),
+            independent: true,
+            verifier_passed: true,
+            raw_evidence_ref: format!("raw-evidence-2702-{tag}"),
+            run_ref: format!("run-2702-{tag}"),
+            content_revision_ref: format!("revision-2702-{tag}"),
+            execution: ImprovementEvidenceExecution::Executed,
+            bound_candidate_id: format!("cand-2702-{tag}"),
+            bound_experiment_id: format!("exp-2702-{tag}"),
+        }
+    }
+
+    fn rollback(tag: &str) -> RollbackContract {
+        RollbackContract {
+            rollback_ref: format!("rollback-2702-{tag}"),
+            disable_ref: format!("disable-2702-{tag}"),
+            reopen_ref: format!("reopen-2702-{tag}"),
+            expiry_ref: format!("expiry-2702-{tag}"),
+            rollback_owner_id: format!("rollback-owner-2702-{tag}"),
+            forward_repair_ref: format!("forward-repair-2702-{tag}"),
+            // Deliberately WIDER than the proposal's own invalidation set: wider
+            // rollback coverage is a repair-path fact and must never widen what
+            // the handoff is allowed to invalidate.
+            invalidation_set: vec![
+                "invalidation-cache".to_string(),
+                "invalidation-store".to_string(),
+                "invalidation-index".to_string(),
+            ],
+        }
+    }
+
+    fn candidate(tag: &str) -> ImprovementCandidateView {
+        ImprovementCandidateView {
+            candidate_id: format!("cand-2702-{tag}"),
+            campaign_id: format!("campaign-2702-{tag}"),
+            closure_id: format!("closure-2702-{tag}"),
+            closure_digest: format!("sha256-closure-2702-{tag}"),
+            promotion_input_id: Some(format!("promotion-input-2702-{tag}")),
+            promotion_digest: Some(format!("sha256-promotion-2702-{tag}")),
+            admitted_scope_ref: Some(format!("scope-2702-{tag}")),
+            proof_ceiling: IMPROVEMENT_PROOF_CEILING.to_string(),
+            requested_effect: IMPROVEMENT_REQUESTED_EFFECT.to_string(),
+            direct_promotion: false,
+            active_permit: None,
+            promotion_receipt: None,
+            operation_ref: format!("op-2702-{tag}"),
+            idempotency_key: format!("idem-2702-{tag}"),
+        }
+    }
+
+    fn admission_review(tag: &str) -> ImprovementEvidenceView {
+        ImprovementEvidenceView {
+            // A DIFFERENT principal from the experiment evaluator, related to it
+            // by the typed binding to the same candidate, experiment and content
+            // revision rather than by an identity comparison.
+            verifier_id: format!("{VERIFIER_OWNER_FAMILY}-review-{tag}"),
+            bound_candidate_id: format!("cand-2702-{tag}"),
+            bound_experiment_id: format!("exp-2702-{tag}"),
+            content_revision_ref: format!("revision-2702-{tag}"),
+            run_ref: format!("review-run-2702-{tag}"),
+            independent: true,
+            verifier_passed: true,
+            pulse: ImprovementPulseOutcome::Pass,
+            pulse_ref: Some(format!("pulse-evidence-2702-{tag}")),
+            harm_observed: false,
+            outcome_unknown: false,
+            closure_valid: true,
+            closure_stale: false,
+            rollback_ref: Some(format!("rollback-2702-{tag}")),
+            disable_ref: Some(format!("disable-2702-{tag}")),
+            reopen_ref: Some(format!("reopen-2702-{tag}")),
+            rollback_owner_id: format!("rollback-owner-2702-{tag}"),
+            expiry_ref: Some(format!("expiry-2702-{tag}")),
+            retained_prior_proposal: Some(retained_prior(tag)),
+        }
+    }
+
+    /// The retained prior record of one group: a different bounded experiment
+    /// under a different operation AND a different idempotency key, with its own
+    /// discriminator projection and its own owner-issued evidence reference.
+    ///
+    /// Built through this module's own normalizer, commitment, discriminator and
+    /// material-equality projections instead of a hand-written digest string, so
+    /// the retained record is byte-for-byte the record this module commits for
+    /// those prior bytes and no fixture invents a digest nothing can reproduce.
+    /// It therefore carries the CURRENT discriminator domain and encoding
+    /// revision and the current material-equality domain and revision, so
+    /// `unestablished_projection` and `material_repeat` can compare it at all; it
+    /// repeats neither the operation identity nor the idempotency key of the
+    /// current group, so `same_operation_replay` does not claim an exact replay or
+    /// an identity conflict; its whole material-equality key differs, so
+    /// `material_repeat` does not call it a repeated experiment; and its declared
+    /// evidence refs are not a superset of the current ones, so
+    /// `changed_discriminator` finds a changed projection AND owner-issued
+    /// evidence the retained record did not declare. That combination is exactly
+    /// the one the admission gate releases as an ordinary new candidate.
+    fn retained_prior(tag: &str) -> RetainedImprovementProposal {
+        let prior = format!("prior-{tag}");
+        let normalized = match canonical_proposal(&proposal(&prior)) {
+            Ok(normalized) => normalized,
+            Err(error) => panic!("the fixture's prior proposal must normalize, got {error:?}"),
+        };
+        let experiment = plan(&prior);
+        RetainedImprovementProposal {
+            commitment: match commitment_of(&normalized) {
+                Ok(commitment) => commitment,
+                Err(error) => {
+                    panic!("the fixture's prior proposal must commit, got {error:?}")
+                }
+            },
+            discriminator: discriminator_of(&normalized),
+            material_equality: material_equality_of(&normalized, &experiment),
+            experiment_plan: experiment,
+        }
+    }
+
+    #[test]
+    fn one_valid_joined_fixture_reaches_the_non_authorizing_canary_handoff() {
+        let group = fixture("a");
+        let handoff = group.admitted();
+
+        assert_eq!(handoff.wire_revision, IMPROVEMENT_PIPELINE_WIRE_REVISION);
+        assert_eq!(check_handoff_wire_revision(&handoff), Ok(()));
+        assert_eq!(handoff.proposal_id, "proposal-2702-a");
+        assert_eq!(handoff.candidate_id, "cand-2702-a");
+        assert_eq!(handoff.campaign_id, "campaign-2702-a");
+        assert_eq!(handoff.closure_id, "closure-2702-a");
+        assert_eq!(handoff.closure_digest, "sha256-closure-2702-a");
+        assert_eq!(handoff.experiment_id, "exp-2702-a");
+        assert_eq!(handoff.operation_ref, "op-2702-a");
+        assert_eq!(handoff.idempotency_key, "idem-2702-a");
+        // The scope is the candidate owner's PROVED admitted scope, not a string
+        // derived from the candidate identity.
+        assert_eq!(handoff.experiment_scope_ref, "scope-2702-a");
+        assert_eq!(handoff.budget_ref, "budget-2702-a");
+        assert_eq!(handoff.deadline_ref, "deadline-2702-a");
+        assert_eq!(handoff.evidence_id, "activation-evidence-2702-a");
+        assert_eq!(
+            handoff.evidence_verifier_id,
+            "instrument-verifier-20-1111-eval-a"
+        );
+        assert_eq!(
+            handoff.admission_evaluator_id,
+            "instrument-verifier-20-1111-review-a"
+        );
+        assert_eq!(handoff.evidence_run_ref, "run-2702-a");
+        assert_eq!(handoff.admission_run_ref, "review-run-2702-a");
+        assert_eq!(handoff.evidence_content_revision_ref, "revision-2702-a");
+        assert_eq!(handoff.admission_content_revision_ref, "revision-2702-a");
+        assert_eq!(handoff.raw_evidence_ref, "raw-evidence-2702-a");
+        assert_eq!(handoff.admission_pulse_ref, "pulse-evidence-2702-a");
+        assert_eq!(handoff.admission_owner_id, IMPROVEMENT_ADMISSION_AUTHORITY);
+        assert_eq!(handoff.rollback_owner_id, "rollback-owner-2702-a");
+        assert_eq!(handoff.rollback_ref, "rollback-2702-a");
+        assert_eq!(handoff.disable_ref, "disable-2702-a");
+        assert_eq!(handoff.reopen_ref, "reopen-2702-a");
+        assert_eq!(handoff.expiry_ref, "expiry-2702-a");
+        assert_eq!(handoff.forward_repair_ref, "forward-repair-2702-a");
+        assert_eq!(handoff.activation_owner_id, KERNEL_CANARY_OWNER);
+        // The PROPOSAL's own admitted set, never the rollback's wider coverage,
+        // even though this rollback contract covers three targets.
+        assert_eq!(
+            handoff.invalidation_set,
+            vec![
+                "invalidation-cache".to_string(),
+                "invalidation-store".to_string()
+            ]
+        );
+        // The one commitment this crate computes for these bytes, carried through
+        // unchanged: no second digest, no fallback, no legacy value.
+        //
+        // What the handoff must answer is "is this commitment the commitment OF
+        // THIS PROPOSAL", and re-deriving it here with `proposal_digest` cannot
+        // answer that: production computes that very value from that very input,
+        // so a deterministic function would only be compared with itself. The
+        // binding is proved by MUTATION instead — a second proposal differing in
+        // exactly one content field, whose commitment must then differ.
+        let mut mutated = proposal("a");
+        mutated.expected_delta = "expected-delta-2702-b".to_string();
+        let mutated_normalized = match canonical_proposal(&mutated) {
+            Ok(normalized) => normalized,
+            Err(error) => panic!("the mutated fixture proposal must normalize, got {error:?}"),
+        };
+        let mutated_commitment = match commitment_of(&mutated_normalized) {
+            Ok(commitment) => commitment,
+            Err(error) => panic!("the mutated fixture proposal must commit, got {error:?}"),
+        };
+        // The operation and idempotency identities are held constant, so the
+        // difference below is content and is not an identity swap in disguise.
+        assert_eq!(
+            mutated_commitment.operation_ref,
+            handoff.proposal_commitment.operation_ref
+        );
+        assert_eq!(
+            mutated_commitment.idempotency_key,
+            handoff.proposal_commitment.idempotency_key
+        );
+        // One content field changed, so this is NOT the admitted handoff's
+        // commitment: the digest is bound to the proposal's own bytes.
+        assert_ne!(
+            mutated_commitment.digest,
+            handoff.proposal_commitment.digest
+        );
+        assert_eq!(
+            handoff.proposal_commitment.algorithm,
+            IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM
+        );
+        assert_eq!(
+            handoff.proposal_commitment.domain,
+            IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN
+        );
+        // The discriminator projection is bound to the same bytes by the same
+        // argument, not by recomputation: the mutated proposal projects the
+        // mutated content, and that projection is not the handoff's projection.
+        let mutated_discriminator = discriminator_of(&mutated_normalized);
+        assert_eq!(
+            mutated_discriminator.expected_delta,
+            "expected-delta-2702-b"
+        );
+        assert_ne!(
+            mutated_discriminator.expected_delta,
+            handoff.proposal_discriminator.expected_delta
+        );
+        // The readable projection is populated but is not the join and is not a
+        // permit.
+        assert!(!handoff.handoff_projection.is_empty());
+        assert!(!handoff.execution_authorized);
+    }
+
+    /// The negative half of the retained-record requirement, so the claim above is
+    /// proven and not merely asserted: the SAME complete group with no retained
+    /// prior record cannot reach the admitted branch, because an absent retained
+    /// record is assessed as no-retained-prior and disposes as no progress.
+    /// The reason text is produced by production from the retained commitment, so
+    /// this pins the disposition and the owner it charges rather than restating
+    /// that prose.
+    #[test]
+    fn an_absent_retained_prior_record_never_reaches_the_canary_branch() {
+        let mut group = fixture("a");
+        group.admission_evidence.retained_prior_proposal = None;
+
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::NoProgress { owner_id, .. }) => {
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => {
+                panic!("absent retained record must dispose as no progress, got {other:?}")
+            }
+            Err(error) => {
+                panic!("absent retained record must dispose as no progress, got {error:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_admitted_handoff_never_authorizes_execution_and_a_spliced_one_is_refused() {
+        let group = fixture("a");
+        let disposition = match group.run() {
+            Ok(disposition) => disposition,
+            Err(error) => panic!("the valid fixture must decide, got {error:?}"),
+        };
+        let handoff = match &disposition {
+            ImprovementTerminalDisposition::CanaryAdmitted { handoff } => handoff.as_ref(),
+            other => panic!("the valid fixture must be canary-admitted, got {other:?}"),
+        };
+        assert!(!handoff.execution_authorized);
+
+        // The read view the daemon's own handoff check assembles: the handoff's
+        // three identity objects plus the exact plan this run passed. Copied, not
+        // derived, so the decision below is proved against the handoff itself.
+        let current = ImprovementCurrentProposal {
+            candidate_id: handoff.candidate_id.clone(),
+            commitment: handoff.proposal_commitment.clone(),
+            discriminator: handoff.proposal_discriminator.clone(),
+            material_equality: handoff.proposal_material_equality.clone(),
+            experiment_plan: group.experiment.clone(),
+        };
+        let decision = match improvement_terminal_decision(
+            "cand-2702-a",
+            1,
+            &group.proposal,
+            &group.experiment,
+            &group.evidence,
+            Some(&current),
+            &disposition,
+        ) {
+            Ok(decision) => decision,
+            Err(error) => panic!("an admitted run must be recordable, got {error:?}"),
+        };
+        assert_eq!(decision.candidate_id, "cand-2702-a");
+        assert_eq!(decision.experiment_id, "exp-2702-a");
+        assert_eq!(
+            decision.proposal_commitment,
+            Some(handoff.proposal_commitment.clone())
+        );
+        // The disposition is carried VERBATIM, and this is how that is checked
+        // without comparing a value with its own clone:
+        // `improvement_terminal_decision` takes the disposition by reference and
+        // clones it into the record, so `assert_eq!(decision.disposition,
+        // disposition)` held by construction and could never fail. What CAN fail
+        // is a record that substituted a branch, dropped the handoff, or rewrote
+        // any handoff field on the way in. The identities below are literals this
+        // module's own fixture builders state, so the admitted branch is pinned
+        // without consulting the run's output at all; the equality then pins the
+        // transport itself, handoff for handoff.
+        match &decision.disposition {
+            ImprovementTerminalDisposition::CanaryAdmitted { handoff: recorded } => {
+                assert_eq!(recorded.candidate_id, "cand-2702-a");
+                assert_eq!(recorded.experiment_id, "exp-2702-a");
+                assert_eq!(recorded.rollback_owner_id, "rollback-owner-2702-a");
+                assert_eq!(**recorded, *handoff);
+            }
+            other => panic!("the decision must record the admitted branch, got {other:?}"),
+        }
+
+        // The same record with execution authority spliced into it is refused as
+        // a verdict that disagrees with its own evidence: no shape and no
+        // matching digest establishes execution.
+        let mut authorized = handoff.clone();
+        authorized.execution_authorized = true;
+        let spliced = ImprovementTerminalDisposition::CanaryAdmitted {
+            handoff: Box::new(authorized),
+        };
+        match improvement_terminal_decision(
+            "cand-2702-a",
+            1,
+            &group.proposal,
+            &group.experiment,
+            &group.evidence,
+            Some(&current),
+            &spliced,
+        ) {
+            Err(UnboundDecisionRecord::UnverifiableVerdict { relation }) => assert_eq!(
+                relation,
+                "decision-admitted: handoff-claims-execution-authority"
+            ),
+            other => {
+                panic!("a handoff claiming execution authority must be refused, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn substituted_candidate_campaign_and_closure_identities_refuse() {
+        let mut group = fixture("a");
+        group.candidate.candidate_id = "cand-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: candidate-identity-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.candidate.campaign_id = "campaign-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: campaign-identity-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.candidate.closure_id = "closure-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: closure-identity-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.candidate.closure_digest = "sha256-closure-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: closure-digest-mismatch",
+            }
+        );
+    }
+
+    #[test]
+    fn substituted_operation_and_idempotency_identity_refuse_on_both_joins() {
+        // Proposal to candidate: the candidate view no longer declares the
+        // operation or idempotency namespace the proposal committed.
+        let mut group = fixture("a");
+        group.candidate.operation_ref = "op-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: operation-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.candidate.idempotency_key = "idem-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: idempotency-mismatch",
+            }
+        );
+
+        // Proposal to experiment: the plan binds another operation or idempotency
+        // namespace than the proposal it runs.
+        let mut group = fixture("a");
+        group.experiment.operation_ref = "op-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: operation-idempotency-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.experiment.idempotency_key = "idem-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: operation-idempotency-mismatch",
+            }
+        );
+    }
+
+    #[test]
+    fn substituted_experiment_identity_refuses_on_both_evidence_records() {
+        // The experiment evaluation bound to another bounded experiment.
+        let mut group = fixture("a");
+        group.evidence.bound_experiment_id = "exp-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "experiment-evaluation: experiment-binding-mismatch",
+            }
+        );
+
+        // The independent admission review bound to another bounded experiment.
+        let mut group = fixture("a");
+        group.admission_evidence.bound_experiment_id = "exp-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: experiment-binding-mismatch",
+            }
+        );
+
+        // And the candidate identity each of the two records claims.
+        let mut group = fixture("a");
+        group.evidence.bound_candidate_id = "cand-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "experiment-evaluation: candidate-binding-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.bound_candidate_id = "cand-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: candidate-binding-mismatch",
+            }
+        );
+    }
+
+    #[test]
+    fn an_unrelated_evaluator_refuses_before_any_admission() {
+        // A competent verifier of the same owner family that the plan did not
+        // declare. Family membership is not competence for THIS run.
+        let mut group = fixture("a");
+        group.evidence.verifier_id = "instrument-verifier-20-1111-unrelated".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "experiment-evaluation: evaluator-is-not-the-competent-planned-evaluator",
+            }
+        );
+
+        // An evaluator outside the Instrument verifier family, declared by the
+        // plan itself: routing refuses it before the evaluation is joined.
+        let mut group = fixture("a");
+        group.experiment.evaluator_id = "governor-2702-a".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "experiment-evaluation: evaluator-is-not-the-instrument-verifier-family",
+            }
+        );
+
+        // The experiment's executor is the Testd owner and nothing else.
+        let mut group = fixture("a");
+        group.experiment.testd_owner_id = "governor-2702-a".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "experiment-execution: executor-is-not-the-testd-owner",
+            }
+        );
+    }
+
+    #[test]
+    fn the_admission_reviewer_may_not_be_the_executor_the_admission_owner_or_the_rollback_owner() {
+        let mut group = fixture("a");
+        group.admission_evidence.verifier_id = TESTD_OWNER.to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: reviewer-is-the-experiment-executor",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.verifier_id = IMPROVEMENT_ADMISSION_AUTHORITY.to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: reviewer-is-the-governor-admission-owner",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.verifier_id = "rollback-owner-2702-a".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: reviewer-is-the-rollback-owner",
+            }
+        );
+    }
+
+    #[test]
+    fn substituted_content_revision_refuses_on_the_two_evidence_records() {
+        // The independent evaluation graded a different content revision than the
+        // admission review observed.
+        let mut group = fixture("a");
+        group.evidence.content_revision_ref = "revision-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: content-revision-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.content_revision_ref = "revision-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: content-revision-mismatch",
+            }
+        );
+    }
+
+    /// What the join really binds about a run reference, and what it does not.
+    ///
+    /// It requires every run reference to be present and bounded, and it binds
+    /// the two evidence records to the same candidate, experiment, content
+    /// revision and evaluators. It does NOT compare `evidence.run_ref` with
+    /// `admission_evidence.run_ref`, nor either of them with the plan: no relation
+    /// between two run references exists in this module, so a nonblank unrelated
+    /// run reference is not refused here and an in-bounds one is not a second
+    /// run of the same experiment either way. This test therefore states the
+    /// presence and the ceiling the code really enforces and asserts nothing
+    /// about an equality check that would not exist.
+    #[test]
+    fn a_run_binding_must_be_present_and_bounded_on_both_evidence_records() {
+        let mut group = fixture("a");
+        group.evidence.run_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::MissingField("evidence.run_ref")
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.run_ref = String::new();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::MissingField("admission_evidence.run_ref")
+        );
+
+        // Past the admitted reference ceiling the same field is a profile
+        // refusal, not an absent one.
+        let mut group = fixture("a");
+        group.admission_evidence.run_ref = "r".repeat(IMPROVEMENT_MAX_REFERENCE_BYTES + 1);
+        assert_eq!(
+            group.refusal(),
+            PipelineError::InputProfileCeiling("admission_evidence.run_ref")
+        );
+    }
+
+    /// Widening needs the owner-proved admitted scope to be a comparison at all.
+    ///
+    /// `check_proposal_experiment_join` runs `check_scope_refinement` only when
+    /// the candidate view carries a nonblank `admitted_scope_ref`. This fixture
+    /// does, so the substitutions below reach the refinement relation itself
+    /// rather than the `missing-admitted-scope` block an unscoped candidate
+    /// produces instead.
+    #[test]
+    fn a_widened_scope_budget_or_deadline_refuses_without_owner_proven_narrowing() {
+        let mut group = fixture("a");
+        group.experiment.scope_ref = "scope-2702-wide".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: unproven-narrowed-scope-budget-or-deadline",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.experiment.budget_ref = "budget-2702-wide".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: unproven-narrowed-scope-budget-or-deadline",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.experiment.deadline_ref = "deadline-2702-wide".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: unproven-narrowed-scope-budget-or-deadline",
+            }
+        );
+    }
+
+    #[test]
+    fn owner_proven_narrowing_still_admits_inside_the_admitted_contract() {
+        let handoff = narrowing_fixture().admitted();
+        // The handoff's scope stays the owner-proved ADMITTED scope; only the
+        // plan's own budget and deadline references are the narrowed ones.
+        assert_eq!(handoff.experiment_scope_ref, "scope-2702-a");
+        assert_eq!(handoff.budget_ref, "budget-2702-a-narrow");
+        assert_eq!(handoff.deadline_ref, "deadline-2702-a-narrow");
+        assert_eq!(handoff.experiment_id, "exp-2702-a");
+        assert!(!handoff.execution_authorized);
+    }
+
+    /// The narrowed-scope fixture the refinement cases start from: the admitted
+    /// scope, budget and deadline, the narrowed references the plan actually
+    /// uses, one owner-issued resource ceiling, and the owner's own refinement
+    /// evidence with each narrowing relation stated.
+    fn narrowing_fixture() -> Fixture {
+        let mut group = fixture("a");
+        group.experiment.scope_ref = "scope-2702-a-narrow".to_string();
+        group.experiment.budget_ref = "budget-2702-a-narrow".to_string();
+        group.experiment.deadline_ref = "deadline-2702-a-narrow".to_string();
+        group.experiment.scope_refinement = Some(AdmittedScopeRefinement {
+            admitted_scope_ref: "scope-2702-a".to_string(),
+            admitted_budget_ref: "budget-2702-a".to_string(),
+            admitted_deadline_ref: "deadline-2702-a".to_string(),
+            refined_scope_ref: "scope-2702-a-narrow".to_string(),
+            refined_budget_ref: "budget-2702-a-narrow".to_string(),
+            refined_deadline_ref: "deadline-2702-a-narrow".to_string(),
+            resource_ceilings: vec![AdmittedResourceCeiling {
+                dimension: "tokens".to_string(),
+                ceiling_ref: "ceiling-tokens-2702-a".to_string(),
+            }],
+            refinement_owner_id: "owner-2702-a".to_string(),
+            refinement_ref: "refinement-ref-2702-a".to_string(),
+            scope_within_admitted: true,
+            budget_within_ceiling: true,
+            deadline_not_widened: true,
+        });
+        group
+    }
+
+    #[test]
+    fn refinement_evidence_that_declares_a_widening_or_a_foreign_binding_refuses() {
+        let mut widened = narrowing_fixture();
+        if let Some(refinement) = widened.experiment.scope_refinement.as_mut() {
+            refinement.scope_within_admitted = false;
+        }
+        assert_eq!(
+            widened.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: refinement-declares-widening",
+            }
+        );
+
+        let mut widened_budget = narrowing_fixture();
+        if let Some(refinement) = widened_budget.experiment.scope_refinement.as_mut() {
+            refinement.budget_within_ceiling = false;
+        }
+        assert_eq!(
+            widened_budget.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: refinement-declares-widening",
+            }
+        );
+
+        let mut widened_deadline = narrowing_fixture();
+        if let Some(refinement) = widened_deadline.experiment.scope_refinement.as_mut() {
+            refinement.deadline_not_widened = false;
+        }
+        assert_eq!(
+            widened_deadline.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: refinement-declares-widening",
+            }
+        );
+
+        // Refinement evidence that re-establishes another admitted contract, or
+        // names a refined set the plan does not actually use, is refused as an
+        // unbound refinement rather than read as the owner's narrowing.
+        let mut foreign_admitted = narrowing_fixture();
+        if let Some(refinement) = foreign_admitted.experiment.scope_refinement.as_mut() {
+            refinement.admitted_scope_ref = "scope-2702-other".to_string();
+        }
+        assert_eq!(
+            foreign_admitted.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: refinement-admitted-binding-mismatch",
+            }
+        );
+
+        let mut foreign_refined = narrowing_fixture();
+        if let Some(refinement) = foreign_refined.experiment.scope_refinement.as_mut() {
+            refinement.refined_scope_ref = "scope-2702-other".to_string();
+        }
+        assert_eq!(
+            foreign_refined.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-experiment: refinement-refined-binding-mismatch",
+            }
+        );
+    }
+
+    #[test]
+    fn a_wrong_rollback_owner_or_a_disagreeing_repair_reference_refuses() {
+        let mut group = fixture("a");
+        group.rollback.rollback_owner_id = "rollback-owner-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-policy: rollback-owner-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.rollback_owner_id = "rollback-owner-2702-b".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-evidence: rollback-owner-mismatch",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.rollback_ref = Some("rollback-2702-b".to_string());
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-evidence: rollback-reference-disagreement",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.disable_ref = Some("disable-2702-b".to_string());
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-evidence: disable-reference-disagreement",
+            }
+        );
+
+        // The reopen reference is bound exactly as the rollback, disable and
+        // expiry references are: a declared review reference that names a
+        // different reopen handle than the rollback contract is a disagreement,
+        // not a second valid way to reopen. The admitted twin for an UNCHANGED
+        // `reopen_ref` is already bound by
+        // `one_valid_joined_fixture_reaches_the_non_authorizing_canary_handoff`,
+        // which admits this same fixture and carries `reopen-2702-a` into the
+        // handoff, so it is not repeated here.
+        let mut group = fixture("a");
+        group.admission_evidence.reopen_ref = Some("reopen-2702-b".to_string());
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-evidence: reopen-reference-disagreement",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.admission_evidence.expiry_ref = Some("expiry-2702-b".to_string());
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-evidence: expiry-reference-disagreement",
+            }
+        );
+    }
+
+    /// Every repair reference and the owner the rollback contract REQUIRES, and
+    /// the typed gap production produces for each one.
+    ///
+    /// `check_rollback_join` calls `check_rollback_contract` FIRST: before it
+    /// compares the owner with the policy and with the admission review, and
+    /// before it compares the declared references. A contract that names no
+    /// repair path is therefore refused as a gap and never reaches those
+    /// comparisons, so each case below states what the gap check really returns
+    /// rather than what a neighbouring join would return for the same field.
+    ///
+    /// All six references and the owner are refused by `.trim().is_empty()`, so
+    /// an all-whitespace value IS the gap and not a merely unusual one: it names
+    /// no contract and no owner, and it is never read as agreement.
+    ///
+    /// The admitted twin for every case below is the SAME unchanged fixture:
+    /// `one_valid_joined_fixture_reaches_the_non_authorizing_canary_handoff`
+    /// admits it and carries `rollback-2702-a`, `disable-2702-a`, `reopen-2702-a`,
+    /// `expiry-2702-a`, `forward-repair-2702-a`, `rollback-owner-2702-a` and a
+    /// three-member invalidation set into that handoff, so it is not repeated.
+    #[test]
+    fn every_required_rollback_reference_and_owner_must_be_present() {
+        let gap_detail = "missing-rollback: rollback contract required before experiment";
+        let mut group = fixture("a");
+        group.rollback.rollback_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-disable: disable contract required before experiment";
+        let mut group = fixture("a");
+        group.rollback.disable_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-reopen: reopen contract required before experiment";
+        let mut group = fixture("a");
+        group.rollback.reopen_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-expiry: expiry must bind the admitted operation";
+        let mut group = fixture("a");
+        group.rollback.expiry_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        let gap_detail = "missing-forward-repair: forward repair required before experiment";
+        let mut group = fixture("a");
+        group.rollback.forward_repair_ref = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        // The OWNER is a gap of exactly this kind, not the owner mismatch a
+        // different owner produces: the gap check runs first, so a blank owner
+        // is never compared against the policy at all.
+        let gap_detail = "missing-rollback-owner: rollback owner required before experiment";
+        let mut group = fixture("a");
+        group.rollback.rollback_owner_id = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+    }
+
+    /// The invalidation set is required, ceiled and member-bounded, and those
+    /// three refusals are three DIFFERENT variants with three different payloads,
+    /// so they are stated separately rather than flattened into one rollback
+    /// gap.
+    ///
+    /// The admitted twin is again the unchanged fixture: the positive handoff
+    /// above carries that fixture's three-member set while the handoff itself
+    /// keeps the proposal's own two targets.
+    #[test]
+    fn a_rollback_invalidation_set_must_be_present_ceiled_and_member_bounded() {
+        // An absent set is the named gap, and it is a gap rather than the
+        // coverage relation a set that covers too little produces.
+        let gap_detail = "missing-invalidation: invalidation set required before experiment";
+        let mut group = fixture("a");
+        group.rollback.invalidation_set = Vec::new();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::RollbackContractGap {
+                detail: gap_detail.to_string(),
+            }
+        );
+
+        // One member past the admitted set ceiling is a PROFILE refusal on the
+        // set's own field name, not a gap: the contract does name a repair path,
+        // and this run refuses to carry a set that large. The members stay
+        // distinct so nothing here depends on the duplicate-set check, which
+        // this refusal never reaches.
+        let mut wide_set = fixture("a");
+        let mut wide_members: Vec<String> = Vec::new();
+        for index in 0..=IMPROVEMENT_MAX_SET_MEMBERS {
+            wide_members.push(format!("invalidation-wide-{index}"));
+        }
+        wide_set.rollback.invalidation_set = wide_members;
+        assert_eq!(
+            wide_set.refusal(),
+            PipelineError::InputProfileCeiling("rollback.invalidation_set")
+        );
+
+        // A member that names no target is a MISSING FIELD on the set, not a gap
+        // and not the coverage relation: the set is present and within its
+        // ceiling, so the member itself is what is read, and coverage is only
+        // considered after every member passes.
+        let mut blank_member = fixture("a");
+        blank_member.rollback.invalidation_set[0] = "   ".to_string();
+        assert_eq!(
+            blank_member.refusal(),
+            PipelineError::MissingField("rollback.invalidation_set")
+        );
+
+        // Past the reference ceiling that same member is a profile refusal, so
+        // the set ceiling and the member ceiling are two rules and not one rule
+        // stated twice.
+        let mut wide_member = fixture("a");
+        wide_member.rollback.invalidation_set[0] = "w".repeat(IMPROVEMENT_MAX_REFERENCE_BYTES + 1);
+        assert_eq!(
+            wide_member.refusal(),
+            PipelineError::InputProfileCeiling("rollback.invalidation_set")
+        );
+    }
+
+    #[test]
+    fn an_uncovered_required_invalidation_target_refuses() {
+        let mut group = fixture("a");
+        group.rollback.invalidation_set = vec!["invalidation-cache".to_string()];
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "rollback-proposal: required-invalidation-not-covered",
+            }
+        );
+
+        // A rollback that covers MORE than the proposal requires still admits, and
+        // the handoff keeps the proposal's own two targets: wider coverage is a
+        // repair-path fact, not permission to invalidate anything else.
+        let group = fixture("a");
+        assert_eq!(
+            group.admitted().invalidation_set,
+            vec![
+                "invalidation-cache".to_string(),
+                "invalidation-store".to_string()
+            ]
+        );
+        // Admitted for one canary, and admitted without authority to run it.
+        assert!(!group.admitted().execution_authorized);
+    }
+
+    #[test]
+    fn the_risk_ceiling_must_be_exactly_the_supported_bounded_value() {
+        // There is no risk-ceiling enum and no `unbounded` constant in this
+        // crate: the field is a bare `String` and the only admitted value is this
+        // word, so `unbounded` is spelled as the literal that used to satisfy the
+        // removed substring marker.
+        assert_eq!(IMPROVEMENT_RISK_CEILING_BOUNDED, "bounded");
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "unbounded".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "bounded-until-ok".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "Bounded".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "bounded ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        // The blank qualifier refuses with the SAME typed failure as `unbounded`:
+        // `risk_ceiling` is a closed typed policy value with one admitted member,
+        // so a value carrying no qualifier at all is unsupported, not absent, and
+        // is never reported as a missing field.
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "   ".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = String::new();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+
+        // A tab/CR/LF-only qualifier is the same blank case, refused the same way.
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "\t\r\n".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn both_public_entry_points_refuse_a_blank_risk_ceiling_identically() {
+        // The admitting path and the gate are two public entry points over the
+        // same seven records, and the daemon route re-proposes the identical
+        // bytes through the gate after the admitting path refuses — the gate's
+        // own typed error is the one a caller then receives. If the two named
+        // different violations for one record, the route would report a missing
+        // field for a field that is present, contradicting what the admitting
+        // path said about the very same bytes.
+        for blank in ["", "   ", "\t\r\n"] {
+            let mut group = fixture("a");
+            group.proposal.risk_ceiling = blank.to_string();
+            let expected = PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            };
+            assert_eq!(
+                group.refusal(),
+                expected,
+                "admitting path must refuse a blank risk ceiling as unsupported, blank={blank:?}"
+            );
+            assert_eq!(
+                group.gate_refusal(),
+                expected,
+                "gate must refuse a blank risk ceiling as unsupported, blank={blank:?}"
+            );
+        }
+
+        // DELIBERATE BOUNDARY, not an oversight: this entry point does not enforce the
+        // full closed risk set, because its own contract says it applies the
+        // gate's rules and not the admission preconditions. What it does not do
+        // is misreport a field that IS present as absent — and that is the whole
+        // of what this change alters. A nonblank wrong qualifier reaches the
+        // admitting path first on the real route, which refuses it as
+        // unsupported before the gate is ever called, so widening the gate here
+        // would be a second set of admission rules in a function that documents
+        // it has none.
+        let mut group = fixture("a");
+        group.proposal.risk_ceiling = "unbounded".to_string();
+        assert_eq!(
+            group.refusal(),
+            PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            }
+        );
+        assert!(!matches!(
+            group.gate_refusal(),
+            PipelineError::UnsupportedRiskCeiling { .. }
+        ));
+    }
+
+    #[test]
+    fn two_valid_groups_cannot_form_one_accepted_mixed_result() {
+        // Both halves are individually complete and individually admitted: this
+        // is a counterexample about MIXING, not about either group.
+        let group_a = fixture("a");
+        let group_b = fixture("b");
+        assert_eq!(group_a.admitted().candidate_id, "cand-2702-a");
+        assert_eq!(group_b.admitted().candidate_id, "cand-2702-b");
+        // Both are admitted handoffs, so both are non-authorizing records: the
+        // mixing question never changes what an admission is allowed to grant.
+        assert!(!group_a.admitted().execution_authorized);
+        assert!(!group_b.admitted().execution_authorized);
+
+        // The explicit A/B counterexample: proposal, plan, evaluation evidence
+        // and rollback contract of group A, with the independently valid candidate
+        // view, admission review and policy of group B.
+        let mut mixed = fixture("a");
+        mixed.candidate = group_b.candidate.clone();
+        mixed.admission_evidence = group_b.admission_evidence.clone();
+        mixed.policy = group_b.policy.clone();
+        assert_eq!(
+            mixed.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: candidate-identity-mismatch",
+            }
+        );
+
+        // The other half of the same mixture: group A's own proposal, plan,
+        // evaluation, rollback, candidate and policy, with group B's admission
+        // review.
+        let mut mixed_review = fixture("a");
+        mixed_review.admission_evidence = group_b.admission_evidence.clone();
+        assert_eq!(
+            mixed_review.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "admission-evidence: candidate-binding-mismatch",
+            }
+        );
+
+        // And group B's own records are still refused against group A's proposal
+        // in the other direction, so the join is symmetric in what it refuses.
+        let mut mixed_plan = fixture("b");
+        mixed_plan.proposal = group_a.proposal.clone();
+        assert_eq!(
+            mixed_plan.refusal(),
+            PipelineError::UnboundRelation {
+                relation: "proposal-candidate: candidate-identity-mismatch",
+            }
+        );
+    }
+
+    #[test]
+    fn a_distinct_properly_linked_admission_reviewer_still_admits() {
+        let handoff = fixture("a").admitted();
+
+        // Two different reviewer principals, related by the typed binding to the
+        // same candidate, experiment and content revision rather than by identity
+        // equality.
+        assert_ne!(handoff.evidence_verifier_id, handoff.admission_evaluator_id);
+        assert_eq!(
+            handoff.evidence_verifier_id,
+            "instrument-verifier-20-1111-eval-a"
+        );
+        assert_eq!(
+            handoff.admission_evaluator_id,
+            "instrument-verifier-20-1111-review-a"
+        );
+        assert_eq!(
+            handoff.admission_content_revision_ref,
+            handoff.evidence_content_revision_ref
+        );
+        assert_eq!(handoff.candidate_id, "cand-2702-a");
+        assert_eq!(handoff.experiment_id, "exp-2702-a");
+        assert!(!handoff.execution_authorized);
+    }
+
+    #[test]
+    fn the_admitted_branch_is_unreachable_without_an_admitted_pulse_reference() {
+        let mut without_pulse = fixture("a");
+        without_pulse.admission_evidence.pulse_ref = None;
+        // With no pulse evidence there is no handoff at all: the gate names the
+        // missing evidence and the owner that must supply it instead of
+        // admitting.
+        match without_pulse.run() {
+            Ok(ImprovementTerminalDisposition::Inconclusive { missing, owner_id }) => {
+                assert_eq!(
+                    missing,
+                    "missing-product-pulse: pulse evidence ref required"
+                );
+                assert_eq!(owner_id, "instrument-verifier-20-1111-review-a");
+            }
+            other => panic!("a review without pulse evidence must not admit, got {other:?}"),
+        }
+
+        // A pulse reference the owner never issued is the same absence: the gate
+        // reads it as blank, and a handoff is not produced.
+        let mut blank_pulse = fixture("a");
+        blank_pulse.admission_evidence.pulse_ref = Some("   ".to_string());
+        match blank_pulse.run() {
+            Ok(ImprovementTerminalDisposition::Inconclusive { missing, .. }) => {
+                assert_eq!(
+                    missing,
+                    "missing-product-pulse: pulse evidence ref required"
+                );
+            }
+            other => panic!("a blank pulse reference must not admit, got {other:?}"),
+        }
+
+        // Control: the same group with the owner-issued reference admits, and its
+        // handoff carries that exact pulse evidence and no execution authority.
+        let control = fixture("a");
+        assert_eq!(
+            control.admitted().admission_pulse_ref,
+            "pulse-evidence-2702-a"
+        );
+        // The control's handoff is an admitted handoff too, so it carries the
+        // owner's pulse evidence AND no execution authority.
+        assert!(!control.admitted().execution_authorized);
+    }
 }

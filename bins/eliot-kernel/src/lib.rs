@@ -3954,12 +3954,17 @@ impl KernelComposition {
     /// staged ticket when one is already staged, i.e. reconcile-by-identity).
     /// A failed commit latches reconciliation-pending and propagates, so an
     /// unknown durable outcome never mints a second successor. Non-renewing
-    /// decisions return the unchanged head with their complete receipt and no
-    /// commit. On `Renewed` the receipt is `None` by construction: the caller
-    /// completes it with the committed successor receipt digest plus the
-    /// published live-receipt digest via `daemon_renewal_receipt_for_decision`
-    /// after live-receipt publication, so a renewal can never ship without
-    /// its publication evidence.
+    /// decisions return the unchanged head with their receipt and no commit.
+    /// An exact replay of a recorded renewal is non-renewing here: it commits
+    /// nothing and creates no successor, so it returns the unchanged head (which
+    /// is already that renewal's successor) and a receipt that admits no
+    /// successor and carries no digest; the echoed `predecessor -> successor`
+    /// transition travels in the decision, built from the retained original
+    /// predecessor rather than from this head (I14-15 line 17). On `Renewed` the
+    /// receipt is `None` by construction: the caller completes it with the
+    /// committed successor receipt digest plus the published live-receipt digest
+    /// via `daemon_renewal_receipt_for_decision` after live-receipt publication,
+    /// so a renewal can never ship without its publication evidence.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_arguments,
@@ -4024,6 +4029,17 @@ impl KernelComposition {
             request, &current, progress, policy, now_ms, context,
         )?;
         if decision.outcome != DaemonSupervisionRenewalOutcome::Renewed {
+            // Issue #88 A2, step 3. A REPLAY OF A COMMITTED RENEWAL
+            // (`ExactReplay`) and a GENUINE NO-SUCCESSOR DECISION (`NotDue`,
+            // `DegradedNoRenewal`, `ReconciliationRequired`) are distinguished
+            // inside `daemon_renewal_receipt_for_decision`: the replay echoes
+            // the recorded transition in its decision, but this tick created
+            // nothing, so its receipt admits no successor and carries neither
+            // the committed successor's ORS digest nor a live-receipt digest.
+            // `current_snapshot` is that committed successor — the successor is
+            // never re-derived from it, and no digest is invented for a
+            // publication this tick did not perform. Both outcomes commit
+            // nothing and return the unchanged head.
             let receipt = daemon_renewal_receipt_for_decision(&decision, None, None)?;
             return Ok((current_snapshot, decision, Some(receipt)));
         }
@@ -5702,6 +5718,14 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/local_read_claim.rs"]
 mod local_read_claim_tests;
+
+// #901's private-boundary proof is NOT registered here. Its five capsules live
+// as inline `#[cfg(test)]` modules inside the five #901-owned modules themselves
+// (`process_execution.rs`, `daemon_process_launch.rs`, `daemon_live_receipt.rs`,
+// `daemon_supervision.rs`, `supervision_lease_authority.rs`), which is where this
+// issue's exclusive mutable scope puts them: `src/lib.rs` is explicitly outside
+// that scope, and an earlier delivery that added five `#[cfg(test)] #[path = ...]`
+// registrations here was refused for exactly that widening.
 
 // Store implementation E2E belongs to the Store/Host boundary. Kernel tests
 // exercise only the neutral descriptor and route/fence behavior.

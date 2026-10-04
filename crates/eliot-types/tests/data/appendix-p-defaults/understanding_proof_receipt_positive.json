@@ -1,0 +1,15 @@
+{
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "accepted": true,
+  "validation_errors": [],
+  "checked_refs": [],
+  "code_task": true,
+  "codecortex_report_refs": [],
+  "files_to_change": [
+    "crates/eliot-types/src/lifecycle.rs"
+  ],
+  "files_to_inspect": [
+    "crates/eliot-types/src/memory.rs"
+  ]
+}

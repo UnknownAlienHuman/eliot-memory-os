@@ -90,6 +90,10 @@ pub enum SecurityContractError {
     #[error("selection initial candidate membership does not bind its {field} digest")]
     SelectionInitialMembershipDigest { field: &'static str },
     #[error(
+        "selection final membership declares {declared} members, but the chain's last stage outputs {staged} in its final order"
+    )]
+    SelectionFinalMembershipBroken { staged: usize, declared: usize },
+    #[error(
         "selection stage {stage_id} at ordinal {ordinal} introduces member {member_ref} without admitted source evidence"
     )]
     SelectionMemberFabricated {
@@ -466,6 +470,49 @@ fn member_refs(members: &[SelectionMember]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Member identities in the exact order the producer emitted them.
+///
+/// [`member_refs`] is order-insensitive because most questions about membership
+/// are about the set. A question about what a producer *emitted* is not, so the
+/// declared final membership ([`SelectionIntegrityReceipt::validate`]) and the
+/// seal's own ordered membership ([`SelectionChainSeal::verify_against`]) both
+/// compare this view. The chain-head digest is a third, independent binding: it
+/// digests the whole ordered stage list, so member order is covered there by
+/// recomputation rather than by calling this helper.
+fn ordered_member_refs(members: &[SelectionMember]) -> Vec<String> {
+    members
+        .iter()
+        .map(|member| member.member_ref.clone())
+        .collect()
+}
+
+/// Reports whether `expected` appears in `observed` as an exact ordered
+/// subsequence.
+///
+/// Every member must match by identity, revision and representation, and none
+/// may be reordered within the run it is taken from. This is the ordering half
+/// of the join check: a join may interleave its parents' contributions, but it
+/// may not silently reorder, re-revise or re-represent a member inside one
+/// parent's contribution, because that is the same breaking linkage change a
+/// predecessor link already refuses (#1728 step 2). Which stages may be joined
+/// at all is a separate question answered in [`validate_stage_link`].
+fn membership_is_ordered_subsequence(
+    expected: &[SelectionMember],
+    observed: &[SelectionMember],
+) -> bool {
+    let mut cursor = 0;
+    for member in expected {
+        let Some(offset) = observed[cursor..]
+            .iter()
+            .position(|candidate| candidate == member)
+        else {
+            return false;
+        };
+        cursor += offset + 1;
+    }
+    true
+}
+
 fn validate_members(
     members: &[SelectionMember],
     field: &'static str,
@@ -552,6 +599,17 @@ fn validate_disposition(
 /// names the immediately preceding stage and reproduces its complete output
 /// membership, or names a join over the complete output memberships of two or
 /// more earlier stages.
+///
+/// Both forms are exact, but not equally new. The predecessor form was already
+/// exact before #1728 step 2: it compares the whole ordered member list against
+/// the named predecessor's output and refuses any addition, loss or
+/// re-revision. What step 2 closed is the join form, which previously compared
+/// only the union of the named parents' *member references* against the join
+/// input and so accepted a join that re-revised a parent member or reversed one
+/// parent's contribution inside the interleaved input. A join now requires each
+/// parent's complete output membership to appear in the join input unchanged
+/// and in the same relative order, with nothing outside the named parents, and
+/// every named parent to be a live contribution that continues the chain head.
 fn validate_stage_link(
     receipt: &SelectionIntegrityReceipt,
     stage: &SelectionStage,
@@ -592,7 +650,21 @@ fn validate_stage_link(
             {
                 return Err(broken());
             }
+            // A join continues the chain it sits in. The stage immediately
+            // before it is the chain's current membership, so leaving it out of
+            // the parents abandons that membership's decisions and re-derives
+            // the input from older history instead (#1728 step 2).
+            let Some(head) = receipt.transformation_stages.get(ordinal - 1) else {
+                return Err(broken());
+            };
+            if !parent_stage_ids
+                .iter()
+                .any(|parent| parent == &head.stage_id)
+            {
+                return Err(broken());
+            }
             let mut covered = BTreeSet::new();
+            let mut memberships = Vec::with_capacity(parent_stage_ids.len());
             for parent_stage_id in parent_stage_ids {
                 let Some(parent) = receipt
                     .transformation_stages
@@ -604,7 +676,55 @@ fn validate_stage_link(
                 if parent.ordinal >= ordinal {
                     return Err(broken());
                 }
-                covered.extend(member_refs(&parent.output_members));
+                // Each parent contributes its complete output membership, in
+                // that parent's order, with every member's identity, revision
+                // and representation intact. Interleaving parents is allowed;
+                // reordering, re-revising or dropping part of one parent's
+                // contribution is the same breaking linkage change a
+                // predecessor link refuses.
+                if !membership_is_ordered_subsequence(&parent.output_members, &stage.input_members)
+                {
+                    return Err(broken());
+                }
+                let membership = member_refs(&parent.output_members);
+                covered.extend(membership.iter().copied());
+                memberships.push(membership);
+            }
+            // Every named parent must be a live contribution: no parent's output
+            // membership may be contained in another's. A nested parent
+            // contributes nothing to this join's union, so the membership the
+            // join assembles is reachable without naming it at all - and the
+            // only members naming it can add beyond its superset are exactly
+            // the ones a later stage already removed with a recorded reason.
+            // Naming it therefore re-attributes those removals to the older
+            // stage, which is a stage overwriting an earlier membership
+            // decision.
+            //
+            // I12.13 `Selection integrity` (line 163): "A stage may append but
+            // never overwrite an earlier membership decision." Requiring the
+            // immediately preceding stage above is necessary but not
+            // sufficient: a join may name the head *and* a stale ancestor, and
+            // the constructed chain `prune(a,b,c) -> (a,b); expand(a,b) -> (b);
+            // join(stage-prune, stage-branch)` still resurrects `a` over the
+            // branch's recorded `Removed("branch did not carry a")`. Liveness is
+            // what separates that from a real merge.
+            //
+            // The boundary this leaves is deliberate and is what a merge is: a
+            // join over two live branches may restore a member one branch
+            // dropped, because the other branch still holds it and both parents
+            // contribute members the other lacks. There is no way inside the
+            // existing disposition algebra to say "re-admitted", so a join that
+            // does that honestly has to express the restoration as an `Admitted`
+            // disposition with source evidence on a member the join did *not*
+            // receive, which keeps the head as the only source of its input.
+            for (index, membership) in memberships.iter().enumerate() {
+                let nested = memberships
+                    .iter()
+                    .enumerate()
+                    .any(|(other, candidate)| other != index && membership.is_subset(candidate));
+                if nested {
+                    return Err(broken());
+                }
             }
             if covered == input {
                 Ok(())
@@ -770,6 +890,23 @@ impl SelectionIntegrityReceipt {
             "rejected_candidate_refs",
         )?;
         unique(self.final_output_refs.iter(), "final_output_refs")?;
+        // The reference lists are membership collections too: an unbounded
+        // admitted, rejected or final list would make the evidence a chain
+        // carries finite in its stages but open in its own header (#1728
+        // step 7).
+        for (refs, field) in [
+            (&self.admitted_candidate_refs, "admitted_candidate_refs"),
+            (&self.rejected_candidate_refs, "rejected_candidate_refs"),
+            (&self.final_output_refs, "final_output_refs"),
+        ] {
+            if refs.len() > MAX_SELECTION_MEMBERS {
+                return Err(SecurityContractError::SelectionMemberLimitExceeded {
+                    field,
+                    count: refs.len(),
+                    bound: MAX_SELECTION_MEMBERS,
+                });
+            }
+        }
         if self
             .admitted_candidate_refs
             .iter()
@@ -868,6 +1005,22 @@ impl SelectionIntegrityReceipt {
     }
 
     /// Validates the final membership backing and the chain influence ceiling.
+    ///
+    /// The final membership is not a free-standing claim: it is the chain's
+    /// last stage output, in the order that stage emitted it. Every membership
+    /// change belongs to a stage (I12.13 line 145), so a receipt whose declared
+    /// final list is not exactly that membership would drop or introduce
+    /// members at the last boundary with nothing to account for it. An
+    /// all-rejected chain is honest about this by ending on an empty output
+    /// membership.
+    ///
+    /// This check compares declared refs against staged refs only. It never
+    /// sees a rendered atom, so it does **not** prove admitted/rendered
+    /// equality at the delivery boundary; that equality is proved at the
+    /// assembly boundary by
+    /// `eliot_context_contracts::SelectionIntegrityProof::validate` and, for
+    /// the bytes a consumer acts on, by `SelectionChainSeal`'s
+    /// `packet_bytes_digest`.
     fn validate_outcome(&self) -> Result<(), SecurityContractError> {
         if self.final_output_refs.iter().any(|item| {
             !self.admitted_candidate_refs.contains(item)
@@ -879,6 +1032,23 @@ impl SelectionIntegrityReceipt {
                 })
         }) {
             return Err(SecurityContractError::SelectionIntegrityViolation);
+        }
+        // Redundant, not live: `validate_stages` owns the empty-list refusal
+        // for `transformation_stages` and `validate` runs it before this
+        // function, so a validated receipt always has a last stage. This arm
+        // keeps the projection total without a panic should that ordering ever
+        // change.
+        let Some(last_stage) = self.transformation_stages.last() else {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "transformation_stages",
+            });
+        };
+        let staged_final_refs = ordered_member_refs(&last_stage.output_members);
+        if self.final_output_refs != staged_final_refs {
+            return Err(SecurityContractError::SelectionFinalMembershipBroken {
+                staged: staged_final_refs.len(),
+                declared: self.final_output_refs.len(),
+            });
         }
         let observed = self
             .transformation_stages
@@ -1046,13 +1216,28 @@ fn import_legacy_stage_v1(
 /// A v1 stage that emitted a member it did not consume is refused as
 /// unattributable, because v1 recorded no relation for it.
 ///
+/// The v1 wire's own `final_output_refs` list is **not** authoritative and is
+/// not copied verbatim. Its order is derived instead: the imported record's
+/// final membership is the projected last stage's ordered output, which is the
+/// only order the projected stages actually emitted and the order
+/// [`SelectionIntegrityReceipt::validate`] and [`SelectionChainSeal`] bind. A v1
+/// receipt whose `final_output_refs` is a permutation of that membership
+/// therefore imports with the derived order instead of being refused for an
+/// order mismatch, so the migration stays consistent rather than judging an
+/// input class its own contract never described. Membership is still checked:
+/// a v1 `final_output_refs` naming a different set of members than the
+/// projected chain is refused with
+/// [`SecurityContractError::SelectionIntegrityViolation`] rather than silently
+/// rewritten.
+///
 /// The imported record is validated before it is returned, so this function can
 /// never manufacture a stage-continuous chain.
 ///
 /// # Errors
 ///
 /// Returns a typed error when a member lacks an owner-supplied binding, a
-/// legacy stage is not attributable to its input members, or the projected
+/// legacy stage is not attributable to its input members, the legacy final
+/// membership disagrees with the projected chain's members, or the projected
 /// record fails [`SelectionIntegrityReceipt::validate`].
 pub fn import_legacy_selection_receipt_v1(
     legacy: &LegacySelectionIntegrityReceiptV1,
@@ -1090,6 +1275,35 @@ pub fn import_legacy_selection_receipt_v1(
             &bound,
         )?);
     }
+    // The v1 wire's own `final_output_refs` list is no longer copied verbatim.
+    // It is an unverified peer claim whose order v1 recorded independently of
+    // the stage list it also recorded, while every membership change belongs to
+    // a stage (I12.13 line 145). The imported chain therefore states its final
+    // membership as the projected last stage's ordered output - the same order
+    // `validate_outcome` and `SelectionChainSeal` bind - and the legacy list is
+    // used only as a membership claim to check against it. Copying it would make
+    // the imported record order-inconsistent with its own history, and refusing
+    // order-mismatched bytes would reject a class of v1 input this migration is
+    // meant to import rather than judge.
+    let Some(last_stage) = stages.last() else {
+        return Err(SecurityContractError::EmptyCollection {
+            field: "transformation_stages",
+        });
+    };
+    let final_output_refs = ordered_member_refs(&last_stage.output_members);
+    // Order is not authoritative in the legacy field; membership is. A v1 final
+    // list whose members differ from the projected chain is a disagreement
+    // about membership, not about order, so it is refused rather than silently
+    // rewritten into a membership the source never claimed.
+    let legacy_final: BTreeSet<&str> = legacy
+        .final_output_refs
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let derived_final: BTreeSet<&str> = final_output_refs.iter().map(String::as_str).collect();
+    if legacy_final != derived_final {
+        return Err(SecurityContractError::SelectionIntegrityViolation);
+    }
     let receipt = SelectionIntegrityReceipt {
         schema: SELECTION_INTEGRITY_SCHEMA.to_owned(),
         contract_version: crate::CONTRACT_VERSION,
@@ -1101,7 +1315,7 @@ pub fn import_legacy_selection_receipt_v1(
         admitted_candidate_refs: legacy.admitted_candidate_refs.clone(),
         rejected_candidate_refs: legacy.rejected_candidate_refs.clone(),
         transformation_stages: stages,
-        final_output_refs: legacy.final_output_refs.clone(),
+        final_output_refs,
         chain_untrusted_influence: SelectionInfluenceState::Unknown,
         state_fence: legacy.state_fence.clone(),
         revision: legacy.revision,
@@ -1285,13 +1499,19 @@ impl SelectionChainSeal {
         // Order is part of the claim: the sealed ordered membership must be
         // exactly the chain's declared final membership, and its digest must
         // recompute from those very members.
+        //
+        // The third clause binds the seal's own ordered refs to its own
+        // ordered members, so it must compare the members in the order they
+        // were emitted. A sorted view (`member_refs`, a `BTreeSet`) would be
+        // the wrong comparison here: the chain's last stage emits the admitted
+        // ranking order, which is normally not lexicographic, so requiring a
+        // sorted match would refuse every honest non-alphabetical admission at
+        // the delivery boundary. The comparison is still exact - order and
+        // count must both agree - so a seal whose refs do not correspond to its
+        // own members is still refused.
         if self.final_output_refs != receipt.final_output_refs
             || self.final_output_digest != selection_member_digest(&self.final_output_members)?
-            || self.final_output_refs
-                != member_refs(&self.final_output_members)
-                    .iter()
-                    .map(|member| (*member).to_owned())
-                    .collect::<Vec<String>>()
+            || self.final_output_refs != ordered_member_refs(&self.final_output_members)
         {
             return Err(SecurityContractError::SelectionSealFinalMembership);
         }
@@ -1336,6 +1556,23 @@ impl SelectionChainSeal {
             self.membership_page_refs.iter(),
             "seal.membership_page_refs",
         )?;
+        // A seal is evidence a consumer must read back, so its own reference
+        // lists are bounded by the same existing constant as the membership
+        // they accompany: a page cap bounds what is named, never what a chain
+        // may drop to stay under it.
+        for (refs, field) in [
+            (&self.final_output_refs, "seal.final_output_refs"),
+            (&self.expansion_handle_ids, "seal.expansion_handle_ids"),
+            (&self.membership_page_refs, "seal.membership_page_refs"),
+        ] {
+            if refs.len() > MAX_SELECTION_MEMBERS {
+                return Err(SecurityContractError::SelectionMemberLimitExceeded {
+                    field,
+                    count: refs.len(),
+                    bound: MAX_SELECTION_MEMBERS,
+                });
+            }
+        }
         for reference in self
             .expansion_handle_ids
             .iter()
@@ -1363,4 +1600,971 @@ impl SelectionChainSeal {
 #[must_use]
 pub fn selection_claim_ceiling(receipt: &SelectionIntegrityReceipt) -> SelectionInfluenceState {
     receipt.chain_untrusted_influence
+}
+
+/// Negative and boundary fixtures for the selection-chain refusals of #1728.
+///
+/// Every fixture builds its digests with the production
+/// [`selection_member_digest`], [`selection_chain_head_digest`] and
+/// [`ordered_member_refs`] functions, and every counterexample recomputes the
+/// digest of the membership it tampers with. A refusal asserted here is
+/// therefore attributable to the linkage, membership or bound under test, not
+/// to an incidental digest mismatch.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "these are fixtures whose whole subject is a refusal: a fixture that unwrapped instead would not be able to state which variant it expected"
+)]
+mod selection_chain_continuity_fixtures {
+    use super::*;
+    use crate::SelectionStageKind;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const STAGE_ONE: &str = "stage-1";
+    const STAGE_TWO: &str = "stage-2";
+
+    fn fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(1).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            ResourceGeneration::genesis(),
+        )
+    }
+
+    fn member(member_ref: &str) -> SelectionMember {
+        SelectionMember {
+            member_ref: member_ref.to_owned(),
+            member_revision: format!("{member_ref}-rev-1"),
+            representation_ref: format!("{member_ref}-repr-1"),
+        }
+    }
+
+    fn members(member_refs: &[&str]) -> Vec<SelectionMember> {
+        member_refs.iter().map(|item| member(item)).collect()
+    }
+
+    fn digest(members: &[SelectionMember]) -> String {
+        selection_member_digest(members).expect("canonical membership digest")
+    }
+
+    fn retained(member_ref: &str) -> SelectionMemberDisposition {
+        SelectionMemberDisposition {
+            member_ref: member_ref.to_owned(),
+            disposition: SelectionMemberDispositionKind::Retained,
+            reason: None,
+            derived_output_ref: None,
+            source_evidence_ref: None,
+        }
+    }
+
+    fn removed(member_ref: &str, reason: &str) -> SelectionMemberDisposition {
+        SelectionMemberDisposition {
+            // The kind must be set here, not inherited: `Retained` with a
+            // reason is exactly the incoherent pair `validate_disposition`
+            // refuses, so inheriting it from `retained` would make every
+            // removal in this module malformed.
+            disposition: SelectionMemberDispositionKind::Removed,
+            reason: Some(reason.to_owned()),
+            ..retained(member_ref)
+        }
+    }
+
+    fn admitted(member_ref: &str, evidence_ref: &str) -> SelectionMemberDisposition {
+        SelectionMemberDisposition {
+            member_ref: member_ref.to_owned(),
+            disposition: SelectionMemberDispositionKind::Admitted,
+            reason: None,
+            derived_output_ref: None,
+            source_evidence_ref: Some(evidence_ref.to_owned()),
+        }
+    }
+
+    fn stage(
+        stage_id: &str,
+        ordinal: usize,
+        input_link: Option<SelectionStageLink>,
+        kind: SelectionStageKind,
+        input_members: &[SelectionMember],
+        output_members: &[SelectionMember],
+        dispositions: Vec<SelectionMemberDisposition>,
+    ) -> SelectionStage {
+        SelectionStage {
+            stage_id: stage_id.to_owned(),
+            ordinal,
+            input_link,
+            stage: kind,
+            transformer_identity_and_config_revision: format!("transformer-{stage_id}-rev-1"),
+            input_digest: digest(input_members),
+            input_members: input_members.to_vec(),
+            output_digest: digest(output_members),
+            output_members: output_members.to_vec(),
+            member_dispositions: dispositions,
+            suppressed_counterevidence_refs: Vec::new(),
+            budget_or_policy_omission_refs: Vec::new(),
+            untrusted_input_influenced_membership: SelectionInfluenceState::Absent,
+            influence_evidence_refs: Vec::new(),
+            disclosure_closure_ref: format!("closure-{stage_id}"),
+            state_fence: fence(),
+        }
+    }
+
+    fn predecessor(stage_id: &str) -> SelectionStageLink {
+        SelectionStageLink::FromPredecessor {
+            predecessor_stage_id: stage_id.to_owned(),
+        }
+    }
+
+    /// Assembles a receipt whose declared final membership is the chain's own
+    /// last stage output, which is the shape every honest producer emits.
+    fn chain(
+        transformation_stages: Vec<SelectionStage>,
+        initial_candidate_members: &[SelectionMember],
+    ) -> SelectionIntegrityReceipt {
+        let final_output_refs = transformation_stages
+            .last()
+            .map(|last| ordered_member_refs(&last.output_members))
+            .unwrap_or_default();
+        SelectionIntegrityReceipt {
+            schema: SELECTION_INTEGRITY_SCHEMA.to_owned(),
+            contract_version: crate::CONTRACT_VERSION,
+            selection_id: "selection-1".to_owned(),
+            root_context_ref: "root-context-1".to_owned(),
+            recipe_revision: "recipe-rev-1".to_owned(),
+            initial_candidate_digest: digest(initial_candidate_members),
+            initial_candidate_members: initial_candidate_members.to_vec(),
+            admitted_candidate_refs: ordered_member_refs(initial_candidate_members),
+            rejected_candidate_refs: Vec::new(),
+            transformation_stages,
+            final_output_refs,
+            chain_untrusted_influence: SelectionInfluenceState::Absent,
+            state_fence: fence(),
+            revision: 1,
+        }
+    }
+
+    /// Prune-then-compile chain: ordinal zero drops `doc-c`, ordinal one hands
+    /// the surviving pair to context compilation unchanged.
+    fn prune_chain() -> SelectionIntegrityReceipt {
+        let initial = members(&["doc-a", "doc-b", "doc-c"]);
+        let pruned = members(&["doc-a", "doc-b"]);
+        chain(
+            vec![
+                stage(
+                    STAGE_ONE,
+                    0,
+                    None,
+                    SelectionStageKind::Prune,
+                    &initial,
+                    &pruned,
+                    vec![
+                        retained("doc-a"),
+                        retained("doc-b"),
+                        removed("doc-c", "policy budget ceiling"),
+                    ],
+                ),
+                stage(
+                    STAGE_TWO,
+                    1,
+                    Some(predecessor(STAGE_ONE)),
+                    SelectionStageKind::ContextCompile,
+                    &pruned,
+                    &pruned,
+                    vec![retained("doc-a"), retained("doc-b")],
+                ),
+            ],
+            &initial,
+        )
+    }
+
+    /// Renders the tampered `input_members` as ordinal one. The stage's own
+    /// digest is recomputed from them, so a refusal can only come from the
+    /// linkage and not from a stale digest.
+    fn with_second_stage_input(
+        receipt: &SelectionIntegrityReceipt,
+        input: &[SelectionMember],
+    ) -> SelectionIntegrityReceipt {
+        let mut tampered = receipt.clone();
+        tampered.transformation_stages[1] = stage(
+            STAGE_TWO,
+            1,
+            Some(predecessor(STAGE_ONE)),
+            SelectionStageKind::ContextCompile,
+            input,
+            input,
+            input
+                .iter()
+                .map(|member| retained(&member.member_ref))
+                .collect(),
+        );
+        tampered.final_output_refs = ordered_member_refs(input);
+        tampered
+    }
+
+    fn link_broken(stage_id: &str, ordinal: usize) -> SecurityContractError {
+        SecurityContractError::SelectionStageLinkBroken {
+            stage_id: stage_id.to_owned(),
+            ordinal,
+        }
+    }
+
+    #[test]
+    fn predecessor_link_refuses_every_breaking_membership_change() {
+        let valid = prune_chain();
+        assert!(
+            valid.validate().is_ok(),
+            "the fixture chain is the honest case"
+        );
+
+        let dropped = with_second_stage_input(&valid, &members(&["doc-a"]));
+        assert_eq!(
+            validate_selection_pipeline(&dropped).expect_err("dropped member"),
+            link_broken(STAGE_TWO, 1)
+        );
+
+        let re_admitted = members(&["doc-a", "doc-b", "doc-c"]);
+        let added = with_second_stage_input(&valid, &re_admitted);
+        assert_eq!(
+            validate_selection_pipeline(&added).expect_err("re-added member"),
+            link_broken(STAGE_TWO, 1)
+        );
+
+        let reordered_input = members(&["doc-b", "doc-a"]);
+        let reordered = with_second_stage_input(&valid, &reordered_input);
+        assert_eq!(
+            validate_selection_pipeline(&reordered).expect_err("reordered membership"),
+            link_broken(STAGE_TWO, 1)
+        );
+
+        let mut mutated_member = member("doc-b");
+        mutated_member.member_revision = "doc-b-rev-2".to_owned();
+        let mut mutated_input = members(&["doc-a"]);
+        mutated_input.push(mutated_member);
+        let mutated = with_second_stage_input(&valid, &mutated_input);
+        assert_eq!(
+            validate_selection_pipeline(&mutated).expect_err("re-revised member"),
+            link_broken(STAGE_TWO, 1)
+        );
+    }
+
+    #[test]
+    fn predecessor_link_refuses_a_wrong_predecessor_and_a_link_at_ordinal_zero() {
+        let mut wrong_predecessor = prune_chain();
+        wrong_predecessor.transformation_stages[1].input_link = Some(predecessor("stage-unknown"));
+        assert_eq!(
+            wrong_predecessor
+                .validate()
+                .expect_err("unknown predecessor"),
+            link_broken(STAGE_TWO, 1)
+        );
+
+        let mut link_at_zero = prune_chain();
+        link_at_zero.transformation_stages[0].input_link = Some(predecessor(STAGE_ONE));
+        assert_eq!(
+            link_at_zero.validate().expect_err("link at ordinal zero"),
+            link_broken(STAGE_ONE, 0)
+        );
+    }
+
+    /// Branch then join: ordinal zero reranks to `[doc-a, doc-c]`, ordinal one
+    /// expands that branch to `[doc-c, doc-b]` from named evidence, and ordinal
+    /// two joins both parents back into one membership.
+    fn join_chain() -> SelectionIntegrityReceipt {
+        let initial = members(&["doc-a", "doc-b", "doc-c"]);
+        let reranked = members(&["doc-a", "doc-c"]);
+        let expanded = members(&["doc-c", "doc-b"]);
+        let joined = members(&["doc-a", "doc-c", "doc-b"]);
+        chain(
+            vec![
+                stage(
+                    "stage-rerank",
+                    0,
+                    None,
+                    SelectionStageKind::Rerank,
+                    &initial,
+                    &reranked,
+                    vec![
+                        retained("doc-a"),
+                        removed("doc-b", "rerank displaced doc-b"),
+                        retained("doc-c"),
+                    ],
+                ),
+                stage(
+                    "stage-expansion",
+                    1,
+                    Some(predecessor("stage-rerank")),
+                    SelectionStageKind::ClusterExpansion,
+                    &reranked,
+                    &expanded,
+                    vec![
+                        removed("doc-a", "expansion branch dropped doc-a"),
+                        retained("doc-c"),
+                        admitted("doc-b", "evidence-doc-b"),
+                    ],
+                ),
+                stage(
+                    "stage-join",
+                    2,
+                    Some(join_link()),
+                    SelectionStageKind::ContextCompile,
+                    &joined,
+                    &joined,
+                    vec![retained("doc-a"), retained("doc-b"), retained("doc-c")],
+                ),
+            ],
+            &initial,
+        )
+    }
+
+    fn join_link() -> SelectionStageLink {
+        SelectionStageLink::FromJoin {
+            parent_stage_ids: vec!["stage-rerank".to_owned(), "stage-expansion".to_owned()],
+        }
+    }
+
+    /// Renders the tampered `input` as the joining ordinal. As with
+    /// [`with_second_stage_input`], the stage digests are recomputed, so the
+    /// join link is the only thing left that can refuse.
+    fn with_join_input(
+        receipt: &SelectionIntegrityReceipt,
+        input: &[SelectionMember],
+    ) -> SelectionIntegrityReceipt {
+        let mut tampered = receipt.clone();
+        tampered.transformation_stages[2] = stage(
+            "stage-join",
+            2,
+            Some(join_link()),
+            SelectionStageKind::ContextCompile,
+            input,
+            input,
+            input
+                .iter()
+                .map(|member| retained(&member.member_ref))
+                .collect(),
+        );
+        tampered.final_output_refs = ordered_member_refs(input);
+        tampered
+    }
+
+    #[test]
+    fn join_link_preserves_each_parents_complete_contribution() {
+        let valid = join_chain();
+        assert!(valid.validate().is_ok(), "interleaving parents is a join");
+
+        let dropped = with_join_input(&valid, &members(&["doc-a", "doc-c"]));
+        assert_eq!(
+            validate_selection_pipeline(&dropped).expect_err("join dropped a parent member"),
+            link_broken("stage-join", 2)
+        );
+
+        let foreign = with_join_input(&valid, &members(&["doc-a", "doc-c", "doc-b", "doc-d"]));
+        assert_eq!(
+            validate_selection_pipeline(&foreign).expect_err("join added a foreign member"),
+            link_broken("stage-join", 2)
+        );
+
+        // Same membership set, but `doc-c` now precedes `doc-b`, which reverses
+        // the order the expansion parent emitted. The union of the parents is
+        // unchanged, so a set comparison alone would accept this chain.
+        let reordered = with_join_input(&valid, &members(&["doc-a", "doc-b", "doc-c"]));
+        assert_eq!(
+            validate_selection_pipeline(&reordered)
+                .expect_err("join reordered a parent contribution"),
+            link_broken("stage-join", 2)
+        );
+
+        // Same member identities, but `doc-c` is carried at a revision no
+        // parent ever emitted.
+        let mut mutated_input = members(&["doc-a", "doc-c", "doc-b"]);
+        mutated_input[1].member_revision = "doc-c-rev-2".to_owned();
+        let mutated = with_join_input(&valid, &mutated_input);
+        assert_eq!(
+            validate_selection_pipeline(&mutated).expect_err("join re-revised a parent member"),
+            link_broken("stage-join", 2)
+        );
+    }
+
+    #[test]
+    fn final_membership_is_the_last_stage_output_in_order() {
+        let valid = prune_chain();
+        let staged = ordered_member_refs(&valid.transformation_stages[1].output_members);
+        assert!(valid.validate().is_ok());
+
+        let mut truncated = valid.clone();
+        truncated.final_output_refs = staged[..1].to_vec();
+        assert_eq!(
+            validate_selection_pipeline(&truncated).expect_err("final membership truncated"),
+            SecurityContractError::SelectionFinalMembershipBroken {
+                staged: staged.len(),
+                declared: staged.len() - 1,
+            }
+        );
+
+        // A member the receipt admits but no stage ever produced reaches the
+        // final set through the admitted-candidate escape only.
+        let mut forged = valid.clone();
+        forged.admitted_candidate_refs.push("doc-forged".to_owned());
+        forged.final_output_refs.push("doc-forged".to_owned());
+        assert_eq!(
+            validate_selection_pipeline(&forged).expect_err("forged final member"),
+            SecurityContractError::SelectionFinalMembershipBroken {
+                staged: staged.len(),
+                declared: staged.len() + 1,
+            }
+        );
+
+        let mut reordered = valid;
+        reordered.final_output_refs = staged.iter().rev().cloned().collect();
+        assert_eq!(
+            reordered
+                .validate()
+                .expect_err("reordered final membership"),
+            SecurityContractError::SelectionFinalMembershipBroken {
+                staged: staged.len(),
+                declared: staged.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_final_member_no_stage_produced_stays_an_integrity_violation() {
+        let mut unknown = prune_chain();
+        unknown.final_output_refs.push("doc-unknown".to_owned());
+        assert_eq!(
+            unknown.validate().expect_err("undeclared final member"),
+            SecurityContractError::SelectionIntegrityViolation
+        );
+    }
+
+    #[test]
+    fn an_all_rejected_chain_records_an_empty_final_membership() {
+        let initial = members(&["doc-a", "doc-b"]);
+        let mut rejected = chain(
+            vec![stage(
+                STAGE_ONE,
+                0,
+                None,
+                SelectionStageKind::Prune,
+                &initial,
+                &[],
+                vec![
+                    removed("doc-a", "policy ceiling"),
+                    removed("doc-b", "policy ceiling"),
+                ],
+            )],
+            &initial,
+        );
+        rejected.admitted_candidate_refs = Vec::new();
+        rejected.rejected_candidate_refs = ordered_member_refs(&initial);
+        rejected.final_output_refs = Vec::new();
+        assert!(rejected.final_output_refs.is_empty());
+        assert!(rejected.validate().is_ok());
+    }
+
+    #[test]
+    fn chain_evidence_is_finite() {
+        let bounded = retained_chain(MAX_SELECTION_STAGES);
+        assert!(bounded.validate().is_ok());
+
+        let over = retained_chain(MAX_SELECTION_STAGES + 1);
+        assert_eq!(
+            over.validate().expect_err("stage count above the bound"),
+            SecurityContractError::SelectionStageLimitExceeded {
+                count: MAX_SELECTION_STAGES + 1,
+                bound: MAX_SELECTION_STAGES,
+            }
+        );
+
+        let oversized: Vec<SelectionMember> = (0..=MAX_SELECTION_MEMBERS)
+            .map(|index| member(&format!("doc-{index}")))
+            .collect();
+        let mut wide = prune_chain();
+        wide.transformation_stages[1] = stage(
+            STAGE_TWO,
+            1,
+            Some(predecessor(STAGE_ONE)),
+            SelectionStageKind::ContextCompile,
+            &oversized,
+            &oversized,
+            vec![retained("doc-0")],
+        );
+        assert_eq!(
+            wide.validate()
+                .expect_err("stage membership above the bound"),
+            SecurityContractError::SelectionMemberLimitExceeded {
+                field: "stage.input_members",
+                count: MAX_SELECTION_MEMBERS + 1,
+                bound: MAX_SELECTION_MEMBERS,
+            }
+        );
+
+        let mut unbounded_header = prune_chain();
+        unbounded_header.admitted_candidate_refs = (0..=MAX_SELECTION_MEMBERS)
+            .map(|index| format!("admitted-{index}"))
+            .collect();
+        assert_eq!(
+            unbounded_header
+                .validate()
+                .expect_err("header above the bound"),
+            SecurityContractError::SelectionMemberLimitExceeded {
+                field: "admitted_candidate_refs",
+                count: MAX_SELECTION_MEMBERS + 1,
+                bound: MAX_SELECTION_MEMBERS,
+            }
+        );
+    }
+
+    /// Builds a chain of `stage_count` no-op rerank stages over one member, each
+    /// continuing exactly its predecessor.
+    fn retained_chain(stage_count: usize) -> SelectionIntegrityReceipt {
+        let initial = members(&["doc-a"]);
+        let carried = members(&["doc-a"]);
+        let stages = (0..stage_count)
+            .map(|ordinal| {
+                let stage_id = format!("stage-{ordinal}");
+                let input_link =
+                    (ordinal > 0).then(|| predecessor(&format!("stage-{}", ordinal - 1)));
+                stage(
+                    &stage_id,
+                    ordinal,
+                    input_link,
+                    SelectionStageKind::Rerank,
+                    &carried,
+                    &carried,
+                    vec![retained("doc-a")],
+                )
+            })
+            .collect();
+        chain(stages, &initial)
+    }
+
+    fn seal_of(
+        receipt: &SelectionIntegrityReceipt,
+        delivered: &[u8],
+        handles: &[String],
+    ) -> SelectionChainSeal {
+        let final_output_members = receipt
+            .transformation_stages
+            .last()
+            .expect("a validated chain carries a last stage")
+            .output_members
+            .clone();
+        SelectionChainSeal {
+            selection_id: receipt.selection_id.clone(),
+            chain_head_digest: selection_chain_head_digest(
+                receipt,
+                receipt.transformation_stages.len() - 1,
+            )
+            .expect("chain head digest"),
+            recipe_revision: receipt.recipe_revision.clone(),
+            final_output_refs: receipt.final_output_refs.clone(),
+            final_output_digest: digest(&final_output_members),
+            final_output_members,
+            packet_bytes_digest: sha256_hex(delivered),
+            expansion_handle_ids: handles.to_vec(),
+            membership_page_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chain_head_and_seal_are_private_to_their_owning_attempt() {
+        let base = prune_chain();
+        let delivered = b"packet-bytes";
+        let handles = vec!["expansion-1".to_owned()];
+        let base_seal = seal_of(&base, delivered, &handles);
+        assert!(base_seal.verify_against(&base, delivered, &handles).is_ok());
+
+        let mut foreign = prune_chain();
+        foreign.selection_id = "selection-2".to_owned();
+        foreign.root_context_ref = "root-context-2".to_owned();
+        let foreign_head = foreign
+            .derive_chain_head(foreign.revision, "append-foreign")
+            .expect("foreign chain head");
+        assert_eq!(
+            base.verify_chain_head(&foreign_head)
+                .expect_err("another attempt's head"),
+            SecurityContractError::SelectionChainHeadIdentity
+        );
+
+        // The same chain identity compiled for a different root context is
+        // still another attempt's history: the recomputed head digest binds the
+        // root context, so the head cannot travel between them.
+        let mut sibling = prune_chain();
+        sibling.root_context_ref = "root-context-2".to_owned();
+        let sibling_head = sibling
+            .derive_chain_head(sibling.revision, "append-sibling")
+            .expect("sibling chain head");
+        assert_eq!(
+            base.verify_chain_head(&sibling_head)
+                .expect_err("another root context's head"),
+            SecurityContractError::SelectionChainHeadDigest
+        );
+
+        let mut beyond = base
+            .derive_chain_head(base.revision, "append-base")
+            .expect("base chain head");
+        beyond.chain_head_ordinal = base.transformation_stages.len();
+        assert_eq!(
+            base.verify_chain_head(&beyond)
+                .expect_err("head past the chain"),
+            SecurityContractError::SelectionChainHeadOrdinal {
+                expected: base.transformation_stages.len(),
+                observed: base.transformation_stages.len(),
+            }
+        );
+
+        let foreign_seal = seal_of(&foreign, delivered, &handles);
+        assert_eq!(
+            foreign_seal
+                .verify_against(&base, delivered, &handles)
+                .expect_err("another attempt's seal"),
+            SecurityContractError::SelectionSealIdentity
+        );
+
+        let mut swapped_bytes = base_seal;
+        swapped_bytes.packet_bytes_digest = sha256_hex(b"other-packet-bytes");
+        assert_eq!(
+            swapped_bytes
+                .verify_against(&base, b"packet-bytes", &handles)
+                .expect_err("changed packet bytes"),
+            SecurityContractError::SelectionSealPacketBytes
+        );
+    }
+
+    /// The constructed resurrection of #1728: ordinal zero prunes `doc-c`,
+    /// ordinal one drops `doc-a` from the live membership and records why, and
+    /// ordinal two joins ordinal zero with ordinal one to put `doc-a` back.
+    fn resurrection_chain() -> SelectionIntegrityReceipt {
+        let initial = members(&["doc-a", "doc-b", "doc-c"]);
+        let pruned = members(&["doc-a", "doc-b"]);
+        let branch = members(&["doc-b"]);
+        chain(
+            vec![
+                stage(
+                    "stage-prune",
+                    0,
+                    None,
+                    SelectionStageKind::Prune,
+                    &initial,
+                    &pruned,
+                    vec![
+                        retained("doc-a"),
+                        retained("doc-b"),
+                        removed("doc-c", "policy ceiling"),
+                    ],
+                ),
+                stage(
+                    "stage-branch",
+                    1,
+                    Some(predecessor("stage-prune")),
+                    SelectionStageKind::ClusterExpansion,
+                    &pruned,
+                    &branch,
+                    vec![
+                        removed("doc-a", "branch did not carry doc-a"),
+                        retained("doc-b"),
+                    ],
+                ),
+                stage(
+                    "stage-join",
+                    2,
+                    Some(SelectionStageLink::FromJoin {
+                        parent_stage_ids: vec!["stage-prune".to_owned(), "stage-branch".to_owned()],
+                    }),
+                    SelectionStageKind::ContextCompile,
+                    &pruned,
+                    &pruned,
+                    vec![retained("doc-a"), retained("doc-b")],
+                ),
+            ],
+            &initial,
+        )
+    }
+
+    #[test]
+    fn a_join_may_not_resurrect_a_member_the_head_removed() {
+        let forged = resurrection_chain();
+        // I12.13 line 163: "A stage may append but never overwrite an earlier
+        // membership decision." The head is ordinal one, whose own output is
+        // the membership after it decided against `doc-a`; the joining ordinal
+        // re-attributes `doc-a` to ordinal zero instead.
+        let head = member_refs(&forged.transformation_stages[1].output_members);
+        assert!(!head.contains("doc-a"), "the head removed doc-a");
+        assert!(
+            member_refs(&forged.transformation_stages[2].input_members).contains("doc-a"),
+            "the join puts doc-a back"
+        );
+        // Ordinal one is a strict narrowing of ordinal zero, so it is not a
+        // live branch: it holds nothing ordinal zero does not already hold.
+        let pruned = member_refs(&forged.transformation_stages[0].output_members);
+        assert!(head.is_subset(&pruned) && head != pruned);
+        assert_eq!(
+            validate_selection_pipeline(&forged).expect_err("resurrected member"),
+            link_broken("stage-join", 2)
+        );
+    }
+
+    #[test]
+    fn a_join_of_two_live_branches_still_merges() {
+        let live = join_chain();
+        // The two parents each hold a member the other does not, so there is a
+        // merge to perform and neither parent is redundant.
+        let reranked = member_refs(&live.transformation_stages[0].output_members);
+        let expanded = member_refs(&live.transformation_stages[1].output_members);
+        assert!(!reranked.is_subset(&expanded) && !expanded.is_subset(&reranked));
+        assert!(
+            live.validate().is_ok(),
+            "interleaving two live parents is still a join"
+        );
+    }
+
+    /// Ordinal zero prunes `doc-c`, ordinal one branches to `[doc-b, doc-d]`,
+    /// ordinal two narrows that branch to `[doc-d]`, and ordinal three joins
+    /// the two *ancestors* while leaving ordinal two's decision behind.
+    fn head_skipping_join_chain() -> SelectionIntegrityReceipt {
+        let initial = members(&["doc-a", "doc-b", "doc-c"]);
+        let pruned = members(&["doc-a", "doc-b"]);
+        let branch_one = members(&["doc-b", "doc-d"]);
+        let branch_two = members(&["doc-d"]);
+        let rejoined = members(&["doc-a", "doc-b", "doc-d"]);
+        chain(
+            vec![
+                stage(
+                    "stage-prune",
+                    0,
+                    None,
+                    SelectionStageKind::Prune,
+                    &initial,
+                    &pruned,
+                    vec![
+                        retained("doc-a"),
+                        retained("doc-b"),
+                        removed("doc-c", "policy ceiling"),
+                    ],
+                ),
+                stage(
+                    "stage-branch-one",
+                    1,
+                    Some(predecessor("stage-prune")),
+                    SelectionStageKind::ClusterExpansion,
+                    &pruned,
+                    &branch_one,
+                    vec![
+                        removed("doc-a", "branch one dropped doc-a"),
+                        retained("doc-b"),
+                        admitted("doc-d", "evidence-doc-d"),
+                    ],
+                ),
+                stage(
+                    "stage-branch-two",
+                    2,
+                    Some(predecessor("stage-branch-one")),
+                    SelectionStageKind::Rerank,
+                    &branch_one,
+                    &branch_two,
+                    vec![
+                        removed("doc-b", "branch two dropped doc-b"),
+                        retained("doc-d"),
+                    ],
+                ),
+                stage(
+                    "stage-join",
+                    3,
+                    Some(SelectionStageLink::FromJoin {
+                        parent_stage_ids: vec![
+                            "stage-prune".to_owned(),
+                            "stage-branch-one".to_owned(),
+                        ],
+                    }),
+                    SelectionStageKind::ContextCompile,
+                    &rejoined,
+                    &rejoined,
+                    vec![retained("doc-a"), retained("doc-b"), retained("doc-d")],
+                ),
+            ],
+            &initial,
+        )
+    }
+
+    #[test]
+    fn a_join_must_continue_the_chain_head() {
+        let skipping = head_skipping_join_chain();
+        // Neither named parent is nested in the other, so redundancy is not the
+        // cause of this refusal: the joining ordinal simply drops the head.
+        let pruned = member_refs(&skipping.transformation_stages[0].output_members);
+        let branch_one = member_refs(&skipping.transformation_stages[1].output_members);
+        assert!(!pruned.is_subset(&branch_one) && !branch_one.is_subset(&pruned));
+        assert_eq!(
+            validate_selection_pipeline(&skipping).expect_err("join past the head"),
+            link_broken("stage-join", 3)
+        );
+    }
+
+    /// Ordinal zero reranks to a deliberately non-lexicographic admitted order
+    /// and ordinal one hands it to context compilation unchanged. This is the
+    /// shape a production compile stage emits: the chain's last stage carries
+    /// the admitted ranking order, not a sorted list.
+    fn non_sorted_admitted_chain() -> SelectionIntegrityReceipt {
+        let initial = members(&["doc-a", "doc-b", "doc-c"]);
+        let reranked = members(&["doc-c", "doc-a"]);
+        chain(
+            vec![
+                stage(
+                    "stage-rerank",
+                    0,
+                    None,
+                    SelectionStageKind::Rerank,
+                    &initial,
+                    &reranked,
+                    vec![
+                        retained("doc-a"),
+                        removed("doc-b", "rerank displaced doc-b"),
+                        retained("doc-c"),
+                    ],
+                ),
+                stage(
+                    "stage-compile",
+                    1,
+                    Some(predecessor("stage-rerank")),
+                    SelectionStageKind::ContextCompile,
+                    &reranked,
+                    &reranked,
+                    vec![retained("doc-c"), retained("doc-a")],
+                ),
+            ],
+            &initial,
+        )
+    }
+
+    #[test]
+    fn a_seal_binds_the_admitted_order_not_a_sorted_order() {
+        let receipt = non_sorted_admitted_chain();
+        assert!(receipt.validate().is_ok(), "the chain is the honest case");
+        let delivered = b"non-sorted-packet-bytes";
+        let handles: Vec<String> = Vec::new();
+        let seal = seal_of(&receipt, delivered, &handles);
+
+        let mut sorted = seal.final_output_refs.clone();
+        sorted.sort();
+        assert_ne!(
+            sorted, seal.final_output_refs,
+            "the fixture must carry a non-lexicographic admitted order"
+        );
+        assert_eq!(
+            seal.final_output_refs,
+            ordered_member_refs(&seal.final_output_members),
+            "the seal binds its own emitted order"
+        );
+        assert!(
+            seal.verify_against(&receipt, delivered, &handles).is_ok(),
+            "a non-sorted admitted order seals"
+        );
+
+        // Same members, reversed: the sealed refs still name the chain's
+        // declared final membership, and the digest is recomputed over the
+        // reversed members, so only the ordered correspondence between the
+        // seal's refs and its own members can refuse this.
+        let mut reversed = seal_of(&receipt, delivered, &handles);
+        reversed.final_output_members.reverse();
+        reversed.final_output_digest = digest(&reversed.final_output_members);
+        assert_eq!(reversed.final_output_refs, receipt.final_output_refs);
+        assert_eq!(
+            reversed
+                .verify_against(&receipt, delivered, &handles)
+                .expect_err("sealed refs do not match its own members in order"),
+            SecurityContractError::SelectionSealFinalMembership
+        );
+    }
+
+    /// One v1 receipt whose final membership the projected chain agrees with.
+    fn legacy_v1(
+        initial: &[&str],
+        admitted: &[&str],
+        final_output_refs: &[&str],
+    ) -> LegacySelectionIntegrityReceiptV1 {
+        LegacySelectionIntegrityReceiptV1 {
+            selection_id: "selection-legacy-1".to_owned(),
+            initial_candidate_refs: initial.iter().map(|item| (*item).to_owned()).collect(),
+            admitted_candidate_refs: admitted.iter().map(|item| (*item).to_owned()).collect(),
+            rejected_candidate_refs: Vec::new(),
+            transformation_stages: Vec::new(),
+            final_output_refs: final_output_refs
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect(),
+            untrusted_structure_changed_membership: false,
+            state_fence: fence(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn a_legacy_final_membership_imports_in_the_derived_order() {
+        let legacy = legacy_v1(
+            &["doc-a", "doc-b"],
+            &["doc-a", "doc-b"],
+            // A permutation of the same membership: order only.
+            &["doc-b", "doc-a"],
+        );
+        let bindings = members(&["doc-a", "doc-b"]);
+        let imported = import_legacy_selection_receipt_v1(&legacy, &bindings)
+            .expect("an order-mismatched v1 final membership still imports");
+        let projected = ordered_member_refs(
+            &imported
+                .transformation_stages
+                .last()
+                .expect("the projection always has a last stage")
+                .output_members,
+        );
+        assert_eq!(imported.final_output_refs, projected);
+        assert_eq!(
+            imported.final_output_refs,
+            ordered_member_refs(&imported.initial_candidate_members),
+            "the derived order is the projected chain's emitted order"
+        );
+        assert_ne!(
+            imported.final_output_refs, legacy.final_output_refs,
+            "the v1 list's own order must not be copied verbatim"
+        );
+        // The one-way legacy disposition is untouched by this change.
+        assert_eq!(
+            imported.chain_untrusted_influence,
+            SelectionInfluenceState::Unknown
+        );
+        assert!(imported.validate().is_ok());
+    }
+
+    #[test]
+    fn a_legacy_migration_still_refuses_an_unbound_member() {
+        let legacy = legacy_v1(
+            &["doc-a", "doc-b"],
+            &["doc-a", "doc-b"],
+            &["doc-a", "doc-b"],
+        );
+        let bindings = members(&["doc-a"]);
+        assert_eq!(
+            import_legacy_selection_receipt_v1(&legacy, &bindings).expect_err("an unbound member"),
+            SecurityContractError::SelectionLegacyMemberUnbound {
+                member_ref: "doc-b".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_legacy_final_membership_that_disagrees_on_members_is_refused() {
+        // `doc-z` is a membership claim the projected chain never produced; only
+        // the list's ORDER is not authoritative, so this is a refusal rather
+        // than a silent rewrite.
+        let legacy = legacy_v1(&["doc-a", "doc-b"], &["doc-a"], &["doc-a", "doc-z"]);
+        let bindings = members(&["doc-a", "doc-b"]);
+        assert_eq!(
+            import_legacy_selection_receipt_v1(&legacy, &bindings)
+                .expect_err("final membership the chain never produced"),
+            SecurityContractError::SelectionIntegrityViolation
+        );
+    }
 }

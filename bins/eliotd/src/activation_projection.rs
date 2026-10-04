@@ -459,21 +459,9 @@ fn map_governor_outcome_to_protocol_inner(
 /// loop instead of answering the ticket. Return a `StaleFence` terminal
 /// result carrying the observed fence, so the Kernel fails closed without
 /// creating a Session and the daemon stays alive for the next claim. Never
-/// produces a binding.
-#[cfg(test)]
-pub fn stale_fence_for_resolved_mismatch(
-    ticket: &AgentActivationResolutionTicket,
-    observed_state_fence: eliot_contracts::StateFence,
-    resolved_at_unix_ms: u64,
-) -> Result<AgentActivationResolutionResult, DaemonError> {
-    stale_fence_for_resolved_mismatch_with_observation(
-        ticket,
-        observed_state_fence,
-        resolved_at_unix_ms,
-        None,
-    )
-}
-
+/// produces a binding. `successor_observation` is the fresh successor
+/// dependency observation for a successor ticket (`None` for an initial ticket)
+/// and supplies the owner revision exactly as the mapping does.
 pub fn stale_fence_for_resolved_mismatch_with_observation(
     ticket: &AgentActivationResolutionTicket,
     observed_state_fence: eliot_contracts::StateFence,
@@ -508,14 +496,9 @@ pub fn stale_fence_for_resolved_mismatch_with_observation(
 /// for the next claim. Never produces a binding and never retries the ticket.
 /// If the fallback itself cannot bind (e.g. the deadline passed under the
 /// resolver), the caller keeps the original readiness error unchanged.
-#[cfg(test)]
-pub fn failed_internal_for_unready_governor(
-    ticket: &AgentActivationResolutionTicket,
-    resolved_at_unix_ms: u64,
-) -> Result<AgentActivationResolutionResult, DaemonError> {
-    failed_internal_for_unready_governor_with_observation(ticket, resolved_at_unix_ms, None)
-}
-
+/// `successor_observation` is the fresh successor dependency observation for a
+/// successor ticket (`None` for an initial ticket) and supplies the owner
+/// revision exactly as the mapping does.
 pub fn failed_internal_for_unready_governor_with_observation(
     ticket: &AgentActivationResolutionTicket,
     resolved_at_unix_ms: u64,
@@ -547,21 +530,9 @@ pub fn failed_internal_for_unready_governor_with_observation(
 /// disposition and the daemon stays alive for the next claim. The failed
 /// outcome kind is carried in the bounded failure handle; the full mapping
 /// error stays in daemon diagnostics. Never produces a binding and never
-/// retries the same ticket.
-#[cfg(test)]
-pub fn failed_internal_for_mapping_failure(
-    ticket: &AgentActivationResolutionTicket,
-    outcome_kind: &str,
-    resolved_at_unix_ms: u64,
-) -> Result<AgentActivationResolutionResult, DaemonError> {
-    failed_internal_for_mapping_failure_with_observation(
-        ticket,
-        outcome_kind,
-        resolved_at_unix_ms,
-        None,
-    )
-}
-
+/// retries the same ticket. `successor_observation` is the fresh successor
+/// dependency observation for a successor ticket (`None` for an initial ticket)
+/// and supplies the owner revision exactly as the mapping does.
 pub fn failed_internal_for_mapping_failure_with_observation(
     ticket: &AgentActivationResolutionTicket,
     outcome_kind: &str,
@@ -981,8 +952,9 @@ mod projection_tests {
         let ticket = test_ticket(100);
         let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
         assert_ne!(observed, ticket.state_fence);
-        let result = stale_fence_for_resolved_mismatch(&ticket, observed.clone(), 50)
-            .expect("stale fence result");
+        let result =
+            stale_fence_for_resolved_mismatch_with_observation(&ticket, observed.clone(), 50, None)
+                .expect("stale fence result");
         assert!(matches!(
             result.disposition,
             AgentActivationResolutionDisposition::StaleFence { .. }
@@ -1003,8 +975,13 @@ mod projection_tests {
         // The helper must not hide a fence match as StaleFence: an observed
         // fence equal to the ticket fence is rejected by protocol validation.
         let ticket = test_ticket(100);
-        let err = stale_fence_for_resolved_mismatch(&ticket, ticket.state_fence.clone(), 50)
-            .expect_err("equal fence must reject");
+        let err = stale_fence_for_resolved_mismatch_with_observation(
+            &ticket,
+            ticket.state_fence.clone(),
+            50,
+            None,
+        )
+        .expect_err("equal fence must reject");
         assert!(err.to_string().contains("observed_state_fence"));
     }
 
@@ -1019,7 +996,8 @@ mod projection_tests {
         let err = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect_err("must reject");
         assert!(err.to_string().contains("not_before_unix_ms"));
         let result =
-            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 50).expect("fallback result");
+            failed_internal_for_mapping_failure_with_observation(&ticket, "NOT_READY", 50, None)
+                .expect("fallback result");
         assert!(matches!(
             result.disposition,
             AgentActivationResolutionDisposition::FailedInternal { .. }
@@ -1034,8 +1012,13 @@ mod projection_tests {
         // #202: the fallback carries the failed outcome kind in its bounded
         // failure handle and never produces a binding.
         let ticket = test_ticket(100);
-        let result = failed_internal_for_mapping_failure(&ticket, "SCOPE_AMBIGUOUS", 50)
-            .expect("fallback result");
+        let result = failed_internal_for_mapping_failure_with_observation(
+            &ticket,
+            "SCOPE_AMBIGUOUS",
+            50,
+            None,
+        )
+        .expect("fallback result");
         match &result.disposition {
             AgentActivationResolutionDisposition::FailedInternal { failure_handle } => {
                 assert!(failure_handle.contains("SCOPE_AMBIGUOUS"));
@@ -1053,8 +1036,8 @@ mod projection_tests {
         // error: distinct from every other negative, never transient, and
         // never a binding.
         let ticket = test_ticket(100);
-        let result =
-            failed_internal_for_unready_governor(&ticket, 50).expect("unready fallback result");
+        let result = failed_internal_for_unready_governor_with_observation(&ticket, 50, None)
+            .expect("unready fallback result");
         match &result.disposition {
             AgentActivationResolutionDisposition::FailedInternal { failure_handle } => {
                 assert!(failure_handle.contains("governor-not-ready"));
@@ -1073,7 +1056,7 @@ mod projection_tests {
         // deadline; a ticket that expired under the resolver stays an error.
         let ticket = test_ticket(100);
         assert!(
-            failed_internal_for_unready_governor(&ticket, 100).is_err(),
+            failed_internal_for_unready_governor_with_observation(&ticket, 100, None).is_err(),
             "resolved_at at the deadline must not bind"
         );
     }
@@ -1100,15 +1083,17 @@ mod projection_tests {
             "tampered ticket must not map"
         );
         assert!(
-            stale_fence_for_resolved_mismatch(&ticket, observed, 50).is_err(),
+            stale_fence_for_resolved_mismatch_with_observation(&ticket, observed, 50, None)
+                .is_err(),
             "tampered ticket must not yield StaleFence"
         );
         assert!(
-            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 50).is_err(),
+            failed_internal_for_mapping_failure_with_observation(&ticket, "NOT_READY", 50, None)
+                .is_err(),
             "tampered ticket must not yield mapping-failure FailedInternal"
         );
         assert!(
-            failed_internal_for_unready_governor(&ticket, 50).is_err(),
+            failed_internal_for_unready_governor_with_observation(&ticket, 50, None).is_err(),
             "tampered ticket must not yield unready FailedInternal"
         );
     }
@@ -1150,15 +1135,17 @@ mod projection_tests {
                 "typed mapping consumed a malformed-wire ticket"
             );
             assert!(
-                stale_fence_for_resolved_mismatch(bad, observed.clone(), 50).is_err(),
+                stale_fence_for_resolved_mismatch_with_observation(bad, observed.clone(), 50, None)
+                    .is_err(),
                 "stale-fence fallback consumed a malformed-wire ticket"
             );
             assert!(
-                failed_internal_for_unready_governor(bad, 50).is_err(),
+                failed_internal_for_unready_governor_with_observation(bad, 50, None).is_err(),
                 "unready-Governor fallback consumed a malformed-wire ticket"
             );
             assert!(
-                failed_internal_for_mapping_failure(bad, "NOT_READY", 50).is_err(),
+                failed_internal_for_mapping_failure_with_observation(bad, "NOT_READY", 50, None)
+                    .is_err(),
                 "mapping-failure fallback consumed a malformed-wire ticket"
             );
         }
@@ -1193,15 +1180,17 @@ mod projection_tests {
         );
         let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
         assert!(
-            stale_fence_for_resolved_mismatch(&ticket, observed, 50).is_err(),
+            stale_fence_for_resolved_mismatch_with_observation(&ticket, observed, 50, None)
+                .is_err(),
             "stale-fence fallback consumed an unknown-version ticket"
         );
         assert!(
-            failed_internal_for_unready_governor(&ticket, 50).is_err(),
+            failed_internal_for_unready_governor_with_observation(&ticket, 50, None).is_err(),
             "unready-Governor fallback consumed an unknown-version ticket"
         );
         assert!(
-            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 50).is_err(),
+            failed_internal_for_mapping_failure_with_observation(&ticket, "NOT_READY", 50, None)
+                .is_err(),
             "mapping-failure fallback consumed an unknown-version ticket"
         );
     }
@@ -1225,11 +1214,13 @@ mod projection_tests {
             "resolved_at at the deadline must not bind"
         );
         assert!(
-            stale_fence_for_resolved_mismatch(&ticket, observed, 100).is_err(),
+            stale_fence_for_resolved_mismatch_with_observation(&ticket, observed, 100, None)
+                .is_err(),
             "stale-fence fallback at the deadline must not bind"
         );
         assert!(
-            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 100).is_err(),
+            failed_internal_for_mapping_failure_with_observation(&ticket, "NOT_READY", 100, None)
+                .is_err(),
             "mapping-failure fallback at the deadline must not bind"
         );
     }
@@ -1239,7 +1230,8 @@ mod projection_tests {
         // #204 scenario 10 (wrong-ticket half): a result bound to one ticket
         // never validates against another ticket identity.
         let ticket = test_ticket(100);
-        let result = failed_internal_for_unready_governor(&ticket, 50).expect("fallback result");
+        let result = failed_internal_for_unready_governor_with_observation(&ticket, 50, None)
+            .expect("fallback result");
         result.validate_against(&ticket).expect("valid binding");
         let mut other = test_ticket(100);
         other.ticket_id = "ticket-other".to_owned();

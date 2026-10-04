@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 mod backup_restore;
 mod backup_snapshot;
@@ -67,10 +68,54 @@ use session_pool::{SessionPool, SessionRole};
 pub(crate) const RPC_PROTOCOL_VERSION: &str = "eliot.s03.rpc.v1";
 type RpcSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-pub(crate) struct RpcTransport {
+/// One published physical client generation of a single retained provider
+/// child (I5.9, issue #1933).
+///
+/// A generation is the facade session plus the whole bounded session pool.
+/// Replacing a broken generation publishes a NEW `TransportIncarnation` — new
+/// facade socket, new pool, every pool slot cold — instead of advancing a
+/// counter over the same sockets. In-flight requests keep the `Arc` they
+/// already checked out and drain against it; only requests that start after
+/// the swap reach the new generation.
+struct TransportIncarnation {
+    /// Monotonic physical generation number; `1` is the first published set.
+    generation: u64,
+    /// The pre-pool facade session for this generation.
     session: RpcSession,
-    provider: Arc<ProviderOwner>,
+    /// The bounded read/normal-write/health-admin session set.
     pool: SessionPool,
+}
+
+impl fmt::Debug for TransportIncarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransportIncarnation")
+            .field("generation", &self.generation)
+            .field("session", &self.session)
+            .field("pool", &self.pool)
+            .finish()
+    }
+}
+
+/// The authenticated provider transport, published as a replaceable
+/// generation.
+///
+/// The retained provider process is the bridge's single Host-managed
+/// dependency generation (I5.9 "Canonical-store process generation
+/// replacement"), so a broken *client* generation is replaced by rebuilding
+/// the sessions over the SAME proved owner — never by starting a second
+/// process against a data root already claimed by the first.
+pub(crate) struct RpcTransport {
+    provider: Arc<ProviderOwner>,
+    incarnation: std::sync::RwLock<Arc<TransportIncarnation>>,
+}
+
+/// Physical identity of the currently published client generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportIncarnationEvidence {
+    /// Monotonic generation of the published facade/pool set.
+    pub transport_generation: u64,
+    /// Retained provider process id backing this generation.
+    pub provider_process_id: u32,
 }
 
 impl RpcTransport {
@@ -78,13 +123,76 @@ impl RpcTransport {
     pub(crate) fn provider(&self) -> &Arc<ProviderOwner> {
         &self.provider
     }
+
+    /// Returns the currently published generation.
+    ///
+    /// A poisoned lock still yields the last published generation: the write
+    /// side only ever swaps in a fully built, authenticated incarnation, so a
+    /// panic mid-swap cannot leave the set missing.
+    fn incarnation(&self) -> Arc<TransportIncarnation> {
+        self.incarnation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Physical evidence for the generation a request would currently use.
+    pub(crate) fn incarnation_evidence(&self) -> TransportIncarnationEvidence {
+        TransportIncarnationEvidence {
+            transport_generation: self.incarnation().generation,
+            provider_process_id: self.provider.provider_process_id,
+        }
+    }
+
+    /// Explicitly replaces the broken client generation (issue #1933).
+    ///
+    /// Builds and authenticates a complete replacement generation — a new
+    /// facade session and a whole new pool whose every slot is cold — over the
+    /// same retained, ownership-verified provider child, and publishes it in
+    /// one atomic swap. Requests already holding the previous generation drain
+    /// against it; no new request reaches it afterwards.
+    ///
+    /// Fails closed: when the replacement cannot be built or authenticated,
+    /// nothing is published and the error is returned, so the caller keeps its
+    /// broken-generation latch instead of advancing a number over sockets that
+    /// are still down.
+    pub(crate) async fn replace_incarnation(
+        &self,
+        config: &SurrealAdapterConfig,
+        limits: crate::config::ClientSetLimits,
+    ) -> Result<TransportIncarnationEvidence, AdapterError> {
+        let deadline = Instant::now() + Duration::from_millis(config.connect_timeout_ms.max(1));
+        // Authenticate before publishing: an unauthenticated generation must
+        // never become reachable by a new request.
+        let session = RpcSession::connect(
+            &self.provider,
+            deadline,
+            Duration::from_millis(config.query_timeout_ms.max(1)),
+        )
+        .await?;
+        let pool = SessionPool::new(Arc::clone(&self.provider), limits);
+        let next = self.incarnation().generation.saturating_add(1);
+        let replacement = Arc::new(TransportIncarnation {
+            generation: next,
+            session,
+            pool,
+        });
+        let evidence = TransportIncarnationEvidence {
+            transport_generation: next,
+            provider_process_id: self.provider.provider_process_id,
+        };
+        *self
+            .incarnation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
+        Ok(evidence)
+    }
 }
 impl fmt::Debug for RpcTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RpcTransport")
             .field("provider", &self.provider)
-            .field("session", &self.session)
-            .field("pool", &self.pool)
+            .field("incarnation", &self.incarnation())
             .finish()
     }
 }
@@ -234,7 +342,7 @@ struct RpcRequest<'a> {
 impl RpcTransport {
     #[cfg(test)]
     async fn version(&self) -> Result<Value, AdapterError> {
-        self.session.version().await
+        self.incarnation().session.version().await
     }
 
     #[cfg(test)]
@@ -244,7 +352,10 @@ impl RpcTransport {
         method: &'static str,
         params: Value,
     ) -> Result<Value, AdapterError> {
-        self.session.request(operation, method, params).await
+        self.incarnation()
+            .session
+            .request(operation, method, params)
+            .await
     }
 
     /// Establishes the provider owner, its first authenticated session, and
@@ -259,12 +370,20 @@ impl RpcTransport {
         limits: crate::config::ClientSetLimits,
     ) -> Result<Self, AdapterError> {
         let (provider, deadline) = ProviderOwner::start(config, Arc::clone(process_lease)).await?;
-        let session = RpcSession::connect(&provider, deadline).await?;
+        let session = RpcSession::connect(
+            &provider,
+            deadline,
+            Duration::from_millis(config.query_timeout_ms.max(1)),
+        )
+        .await?;
         let pool = SessionPool::new(Arc::clone(&provider), limits);
         Ok(Self {
-            session,
             provider,
-            pool,
+            incarnation: std::sync::RwLock::new(Arc::new(TransportIncarnation {
+                generation: 1,
+                session,
+                pool,
+            })),
         })
     }
     pub(crate) async fn validate_liveness(
@@ -306,7 +425,8 @@ impl RpcTransport {
         bindings: serde_json::Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
         let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
-        let value = self
+        let incarnation = self.incarnation();
+        let value = incarnation
             .session
             .request(
                 operation,
@@ -343,6 +463,7 @@ impl RpcTransport {
     ) -> Result<RpcResults, AdapterError> {
         if is_pool_read_operation(operation) {
             return self
+                .incarnation()
                 .pool
                 .query_bounded(SessionRole::Read, operation, statement, bindings, ceiling)
                 .await;
@@ -366,7 +487,8 @@ impl RpcTransport {
         ceiling: ResponseCeiling,
     ) -> Result<RpcResults, AdapterError> {
         let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
-        let value = self
+        let incarnation = self.incarnation();
+        let value = incarnation
             .session
             .request_bounded(
                 operation,
@@ -385,12 +507,13 @@ impl RpcTransport {
         Ok(results)
     }
 
-    /// Returns the fixed bounded session set under this transport's provider
-    /// generation. Production observation entrypoint for the #2030
-    /// occupancy/admission queries (994/14 follow-up binding); read-only
-    /// snapshots never check anything out.
-    pub(crate) fn session_pool(&self) -> &SessionPool {
-        &self.pool
+    /// Returns the bounded session set of the currently published generation.
+    ///
+    /// Cheap to obtain (the pool is an `Arc`), and a caller that keeps the
+    /// returned handle keeps THAT generation's set alive for its in-flight
+    /// requests even if a replacement is published meanwhile.
+    pub(crate) fn session_pool(&self) -> SessionPool {
+        self.incarnation().pool.clone()
     }
 
     /// Executes one closed named read operation on a pooled read-lane
@@ -411,38 +534,62 @@ impl RpcTransport {
         if !is_pool_read_operation(operation) {
             return self.query_facade(operation, statement, bindings).await;
         }
-        self.pool
+        self.incarnation()
+            .pool
             .query(SessionRole::Read, operation, statement, bindings)
             .await
     }
 
     /// Executes one closed named normal-write operation on a pooled
-    /// write-lane session. Store transaction semantics are unchanged; the
-    /// reserved-write execution (#993) runs canonical transactions here so
-    /// concurrent tasks execute on separate sessions, while the
-    /// compatibility path keeps the facade session.
+    /// write-lane session.
+    ///
+    /// This is the production canonical-transaction lane (issue #1933): the
+    /// bounded `SessionRole::NormalWrite` set is sized from the same configured
+    /// store transaction limit that bounds the bridge's write leases, so
+    /// concurrent canonical writes execute on distinct physical sessions
+    /// instead of serializing on one facade socket. Store transaction semantics
+    /// are unchanged — only the session differs.
     pub(crate) async fn query_write(
         &self,
         operation: &'static str,
         statement: &str,
         bindings: serde_json::Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
-        self.pool
+        self.incarnation()
+            .pool
             .query(SessionRole::NormalWrite, operation, statement, bindings)
             .await
     }
 
     /// Executes one protected health/admin operation on the isolated admin
-    /// lane, outside normal read/write admission. Staged for the wire child
-    /// (#991); test-only until it arrives.
-    #[cfg(test)]
+    /// lane, outside normal read/write admission (I5.9, issue #1933).
+    ///
+    /// This is the production provider-session boundary for health, readiness
+    /// and other version/schema/backup/health observations. It is deliberately
+    /// NOT reachable from the generic [`RpcTransport::query`] dispatch: health
+    /// traffic is routed here explicitly by the readiness/health probes so it
+    /// can never land on the read pool or the facade socket, and therefore can
+    /// never consume a canonical write slot (I5.9 "health/admin client —
+    /// isolated version/schema/backup/health operations").
+    ///
+    /// Admission is exact-operation and closed: a name outside
+    /// [`ADMIN_OPERATIONS`] is refused with
+    /// [`AdapterError::NamedOperationUnavailable`] instead of silently
+    /// widening the protected lane. Extending the mapping is an explicit new
+    /// entry here, recorded as its own decision, never a name-prefix match.
     pub(crate) async fn query_admin(
         &self,
         operation: &'static str,
         statement: &str,
         bindings: serde_json::Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
-        self.pool
+        if !is_admin_operation(operation) {
+            return Err(AdapterError::NamedOperationUnavailable {
+                operation: operation.to_owned(),
+            });
+        }
+        self.incarnation()
+            .pool
             .query(SessionRole::HealthAdmin, operation, statement, bindings)
             .await
     }
@@ -490,6 +637,28 @@ fn is_pool_read_operation(operation: &str) -> bool {
     POOL_READ_OPERATIONS.contains(&operation)
 }
 
+/// Closed allowlist of health/admin named operations admitted on the isolated
+/// [`SessionRole::HealthAdmin`] lane (issue #1933, blocking defect 2).
+///
+/// Only the two observations the production readiness/health probes actually
+/// issue are listed: the recorded schema generation and the canonical fence.
+/// Both are read-only version/schema observations, and both are exactly the
+/// operations that must stay off the read pool and off the facade socket so
+/// that a saturated canonical write set cannot starve health, and health can
+/// never consume a write slot.
+///
+/// The list is deliberately disjoint in *intent* from
+/// [`POOL_READ_OPERATIONS`] even though two names appear in both: the same
+/// named read may be issued on the read pool by a canonical read path and on
+/// the admin lane by a health probe. Which lane a name rides is decided by the
+/// caller that owns the operation, never by the name alone, so admitting a
+/// name here cannot move a canonical read off the read pool.
+const ADMIN_OPERATIONS: &[&str] = &["read.schema_generation", "read.canonical_fence"];
+
+fn is_admin_operation(operation: &str) -> bool {
+    ADMIN_OPERATIONS.contains(&operation)
+}
+
 const fn millis(ms: u64) -> Duration {
     Duration::from_millis(if ms == 0 { 1 } else { ms })
 }
@@ -508,7 +677,7 @@ use {
     std::{ffi::OsString, path::Path, process::Stdio},
     tokio::{
         process::Command,
-        time::{Instant, sleep, timeout},
+        time::{sleep, timeout},
     },
     uuid::Uuid,
 };

@@ -1,39 +1,168 @@
 {
   "header": {
-    "aggregate_sha256": "9b0084a62aa1fdd2733a23a1f0e451474791881465a47eabaca1cf375c1ac0b5",
+    "aggregate_sha256": "5583357ef7916cf989e4f82a4bcd522faef7a68c715179bbbfa3d9708bff87a9",
+    "artifact_denominator": [
+      {
+        "executable": "debug/deps/sample_package-1111111111111111",
+        "features": [],
+        "file_identity": {
+          "device": 1,
+          "inode": 1,
+          "mtime_ns": 1,
+          "size": 54
+        },
+        "filenames": [
+          "debug/deps/sample_package-1111111111111111"
+        ],
+        "ignored_test_count": 1,
+        "package_id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
+        "package_name": "sample-package",
+        "profile": {
+          "debug_assertions": true,
+          "debuginfo": 2,
+          "opt_level": "0",
+          "overflow_checks": true,
+          "test": true
+        },
+        "sha256": "a952b4669e432dccf930ec5d55eae7ff528ba625a151596934939e6289e41f2c",
+        "target_kind": "lib",
+        "target_name": "sample_package"
+      }
+    ],
+    "artifact_denominator_sha256": "fa3d38d44df6c935f268d8ba681536a5d209d662966c802cd13b284b48d88085",
+    "cargo_build_finished_success": true,
+    "cargo_build_sha256": "a9e44f1e7bf5d815b602c077382bc4f71c2e497a4c3675e68c876b23d0c1517d",
     "cargo_lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "command_profile": {
+      "build_argv": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "libtest_list_suffix": [
+        "--list",
+        "--ignored",
+        "--format",
+        "terse"
+      ],
+      "metadata_argv": [
+        "cargo",
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1"
+      ],
+      "target_root": ".eliot/integration/ignored-test-inventory/target"
+    },
     "compiled_count": 1,
+    "compiled_graph_complete": true,
     "complete": true,
     "counts_by_state": {
       "CLASSIFIED": 1
     },
-    "duration_observation_ms": 12,
+    "duration_observation_ms": null,
+    "identity_complete": true,
+    "metadata_sha256": "d718b4f3e49b36523551860ab5348b34b555b8b728b28ff878904771591d45e8",
     "proof_ceiling": "IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY",
+    "row_classification_complete": true,
+    "row_classification_status": "complete",
     "row_count": 1,
+    "rule_table": {
+      "sha256": "06200df7c45c64cb834882595f5f6f64b19666b39bc4cd4fd296073d9a84738d",
+      "version": "1.2.0"
+    },
     "schema": "eliot.integration.ignored-test-inventory.v1",
     "source_count": 1,
+    "source_denominator": [
+      {
+        "cfg_evidence": [],
+        "declaration": null,
+        "file_identity": {
+          "device": 1,
+          "inode": 1,
+          "mtime_ns": 1,
+          "size": 154
+        },
+        "module_path": [],
+        "package_id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
+        "package_name": "sample-package",
+        "path": "crates/sample-package/src/lib.rs",
+        "resolution": "resolved",
+        "sha256": "bdf1917753dc7ef53b16299329750f73a7d9b1edf1445fb4e820612362659128",
+        "target_kind": "lib",
+        "target_name": "sample_package"
+      }
+    ],
+    "source_denominator_complete": true,
+    "source_denominator_sha256": "7b28b8400f40e0619f8e16e80049d6599375e859b8d4187d57f90092ca5ee7c6",
     "source_identity": {
       "head": "666da5cbc905c95ab9ac5e932dc3178f8ee3762a",
-      "tracked_tree_clean": true
+      "initial_head": "666da5cbc905c95ab9ac5e932dc3178f8ee3762a",
+      "initial_tracked_tree_clean": true,
+      "initial_untracked_tree_clean": true,
+      "stable": true,
+      "tracked_tree_clean": true,
+      "untracked_tree_clean": true,
+      "working_tree_clean": true
     },
-    "tool_version": "0.1.0"
+    "target_denominator": [
+      {
+        "bench_enabled": null,
+        "doctest_enabled": true,
+        "package_id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
+        "package_name": "sample-package",
+        "required_features": [],
+        "required_features_satisfied": true,
+        "src_path": "crates/sample-package/src/lib.rs",
+        "target_kind": "lib",
+        "target_name": "sample_package",
+        "test_disposition": "test_enabled",
+        "test_enabled": true
+      }
+    ],
+    "target_denominator_sha256": "401a8e29c8412318c82f687a7fdda5e9a47aaaa84fb9508b8bb2016d0b67eaa3",
+    "tool_version": "0.5.0",
+    "toolchain": {
+      "channel": "1.97.1",
+      "commit_hash": "1111111111111111111111111111111111111111",
+      "host": "x86_64-pc-windows-msvc",
+      "initial": {
+        "channel": "1.97.1",
+        "commit_hash": "1111111111111111111111111111111111111111",
+        "host": "x86_64-pc-windows-msvc",
+        "release": "1.97.1",
+        "rustc_verbose_sha256": "c65381345c9f0fdd6ec9e3311a3dc06b7b838795fefb446f194b346c7f77dbc4",
+        "rustc_version": "rustc 1.97.1 (111111111 2026-09-28)",
+        "toolchain_file_sha256": "5d959dfcc98b53886ee772ba216c4f9a1b31f093b46b5b263c0d084af54e821d"
+      },
+      "release": "1.97.1",
+      "rustc_verbose_sha256": "c65381345c9f0fdd6ec9e3311a3dc06b7b838795fefb446f194b346c7f77dbc4",
+      "rustc_version": "rustc 1.97.1 (111111111 2026-09-28)",
+      "stable": true,
+      "toolchain_file_sha256": "5d959dfcc98b53886ee772ba216c4f9a1b31f093b46b5b263c0d084af54e821d"
+    }
   },
   "rows": [
     {
       "attribute_digest": "0db9d47e375012b1a631bf03f889249ad280c4aa43ffbf850d047f13b17b9653",
       "attribute_text": "#[test]\n#[ignore = \"requires local authenticated SurrealDB store\"]",
       "cfg_evidence": [],
-      "executable": "target/debug/deps/sample_package-1111111111111111",
-      "executable_digest": "6e36a4016c37f17b270745694e01bfcb98bbda0311193691b7f8bfcb28c16fc9",
+      "executable": "debug/deps/sample_package-1111111111111111",
+      "executable_digest": "a952b4669e432dccf930ec5d55eae7ff528ba625a151596934939e6289e41f2c",
       "ignore_reason": "requires local authenticated SurrealDB store",
+      "isolation": [],
       "package_id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
       "package_name": "sample-package",
       "remediation_owner": "declared-environment-owner",
       "requirements": [
         "STORE"
       ],
-      "row_digest": "4dfe26e746e03f8eca824e222ae9d5be1e48671d1e80ee3242e130fe5b717153",
-      "source_digest": "a2a16df9e279919e44132dd9243bd94ccae4c3cac46169acd11adc9e44aad0e8",
+      "row_digest": "7621fabe50427c82d94997ea5921ee9b074a356e4eaa17894ae079b0bd828dba",
+      "source_digest": "bdf1917753dc7ef53b16299329750f73a7d9b1edf1445fb4e820612362659128",
       "source_line": 5,
       "source_path": "crates/sample-package/src/lib.rs",
       "state": "CLASSIFIED",

@@ -18,9 +18,10 @@ use super::anchored_review_bridge::{
     ANCHORED_REVIEW_SUBMIT_OPERATION,
 };
 use super::daemon_request_dispatch::{
-    DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
-    NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
-    USER_AUTOMATION_PREFLIGHT_SELECTOR, USER_AUTOMATION_RUNTIME_OPERATION,
+    ACTIVATE_ROOT_TRANSITION_OPERATION, DAEMON_STARTUP_EVIDENCE_OPERATION,
+    NOTIFICATION_STATE_MUTATION_OPERATION, NOTIFICATION_STATE_READ_OPERATION,
+    USER_AUTOMATION_OPERATOR_OPERATION, USER_AUTOMATION_PREFLIGHT_SELECTOR,
+    USER_AUTOMATION_RUNTIME_OPERATION,
 };
 use super::daemon_request_dispatch::{
     STORAGE_REPLACEMENT_OPERATION, STORAGE_REPLACEMENT_RESUME_OPERATION,
@@ -1567,6 +1568,9 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "revoke_grant"
             | "activate_introduction"
             | "revoke_introduction"
+            // #2875: only the shared P-07 operation identity reaches the
+            // typed root-transition arm; nearby spellings remain closed.
+            | ACTIVATE_ROOT_TRANSITION_OPERATION
             | "publish_wasm_dispatch_bundle"
             // Issue #1780 W2: the Notify launch grant, the delivery gate that
             // proves the owner created or updated the canonical record before
@@ -1721,18 +1725,23 @@ pub(crate) fn is_wasm_port_grant_operation(operation: &str) -> bool {
 
 #[cfg(test)]
 mod daemon_operation_tests {
-    use super::{DAEMON_STARTUP_EVIDENCE_OPERATION, is_daemon_operation};
+    use super::{
+        ACTIVATE_ROOT_TRANSITION_OPERATION, DAEMON_STARTUP_EVIDENCE_OPERATION, is_daemon_operation,
+    };
     use crate::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 
     #[test]
-    fn generation_and_startup_routes_are_in_the_authenticated_daemon_matrix() {
+    fn root_transition_and_generation_routes_are_in_the_daemon_matrix() {
         assert!(is_daemon_operation(
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
         ));
         assert!(is_daemon_operation(DAEMON_STARTUP_EVIDENCE_OPERATION));
+        assert!(is_daemon_operation(ACTIVATE_ROOT_TRANSITION_OPERATION));
         assert!(is_daemon_operation(
             super::super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
         ));
+        assert!(!is_daemon_operation("activate_root_transitio"));
+        assert!(!is_daemon_operation("activate_root_transitions"));
         assert!(!is_daemon_operation(
             "daemon_generation_registry_active_query"
         ));

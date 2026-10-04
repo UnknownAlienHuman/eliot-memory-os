@@ -15,6 +15,16 @@
 //! - store boundary: `Unavailable` (and every other [`StoreError`]
 //!   discriminant) keeps its exact [`StoreReadFailure`] identity and never
 //!   becomes a successful empty/current result;
+//! - coverage matrix: one request identity and one client draw three distinct
+//!   answers from the source's own row count — a page past the bound is
+//!   `Partial`, a page exactly at the bound is a successful `Current` carrying
+//!   rows, and a page with no rows at all is a successful `Current` carrying
+//!   NONE — while a page that publishes no coverage statement (bare null, or an
+//!   in-bound page with no `truncated` member) is `Unknown`. So a bounded subset
+//!   can never be published as a current or empty result, a genuinely empty
+//!   scope can never be reported as an unobserved one, and a page that declines
+//!   to state a verdict is refused rather than read as an empty success. The
+//!   page's own fence statement is proved before its coverage is read;
 //! - restart/rebuild: a generation cutover fails closed with typed
 //!   `FenceMismatch`, and a rebuilt client serves the new generation only;
 //! - closed contract: intent dimensions are enums, selectors are bounded
@@ -33,13 +43,17 @@ use eliot_contracts::{
     ResourceGeneration, SourceId, StateFence,
 };
 use eliot_read::{
-    BranchEnvironmentScope, EliotResourceUri, FreshnessPolicy, NamedParameters, QueryIntent,
-    QueryMode, QueryRequest, ReadApi, ReadError, ReadOrderingBinding, ReadService,
-    RequiredAssurance, ResourceRequest, StateRequest, StoreReadFailure, TimeScope,
+    BranchEnvironmentScope, DeclaredResultSelector, EliotResourceUri, FreshnessPolicy,
+    NamedParameters, QueryIntent, QueryMode, QueryRequest, ReadApi, ReadCoverage, ReadError,
+    ReadOrderingBinding, ReadOutcome, ReadService, RequiredAssurance, ResourceRequest,
+    StateRequest, StoreReadFailure, TimeScope,
 };
 use eliot_store_api::{
-    CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
-    RevisionHead, RevisionKey, ScopeId, StoreError,
+    CanonicalReadClient, EXPERIENCE_BANK_READ_NAME, EXPERIENCE_PAGE_MATCHED_TOTAL,
+    EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE, EXPERIENCE_PAGE_TRUNCATED,
+    ExperienceRangePage, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
+    experience_bank_read_request, named_read_operation_name, validate_experience_read_params,
 };
 use serde_json::{Value, json};
 
@@ -100,14 +114,20 @@ fn scope_id() -> Result<ScopeId, StoreError> {
     ScopeId::new("scope-proof")
 }
 
-fn current_position_intent() -> QueryIntent {
+/// Closed proof intent for one query mode. The four remaining dimensions are
+/// the exact-fence, request-scope shape every proof in this file binds to.
+fn proof_intent(mode: QueryMode) -> QueryIntent {
     QueryIntent {
-        mode: QueryMode::CurrentPosition,
+        mode,
         time_scope: TimeScope::DeclaredFence,
         branch_environment_scope: BranchEnvironmentScope::RequestScope,
         freshness_policy: FreshnessPolicy::ExactFence,
         required_assurance: RequiredAssurance::InputReconstructionOnly,
     }
+}
+
+fn current_position_intent() -> QueryIntent {
+    proof_intent(QueryMode::CurrentPosition)
 }
 
 fn state_request(consistency: ReadConsistency, minimum: u64) -> Result<StateRequest, StoreError> {
@@ -143,6 +163,67 @@ fn query_request(consistency: ReadConsistency, minimum: u64) -> Result<QueryRequ
     })
 }
 
+/// Page bound the experience range proofs request.
+///
+/// Deliberately below the Store's own ceiling
+/// ([`MAX_EXPERIENCE_PAGE_RECORDS`]): both Store projectors fetch one probe row
+/// past the bound (`eliot-store-memory` `experience_range_payload`,
+/// `eliot-store-surreal-adapter` `experience_bank_range_payload`), so a scope
+/// holding more than the requested bound declares `truncated` while a scope
+/// inside it does not. Requesting the ceiling would make every larger scope
+/// truncate.
+const PROOF_PAGE_BOUND: u16 = 4;
+
+/// Dependency minimum the experience read declares, equal to the revision the
+/// in-test client actually serves, so it is observed rather than assumed.
+const PROOF_PAGE_MINIMUM: u64 = 1;
+
+/// Builds one bounded experience-bank range query through the Store's own
+/// request builder.
+///
+/// Nothing about the operation or the page bound is written here: the Store's
+/// [`experience_bank_read_request`] is the single place that selects the range
+/// read, its scope requirement and its closed `max_records` selector, so this
+/// request is built from that one request's operation, scope, consistency and
+/// parameters. The range read is not a state operation, so it reaches the owner
+/// through an explicit query intent rather than a [`StateRequest`].
+fn experience_page_query(fence: &StateFence) -> Result<QueryRequest, Box<dyn std::error::Error>> {
+    let store_read = experience_bank_read_request(scope_id()?, PROOF_PAGE_BOUND, fence.clone())?;
+    let mut dependencies = BTreeMap::new();
+    dependencies.insert(scope_key()?, PROOF_PAGE_MINIMUM);
+    Ok(QueryRequest {
+        intent: proof_intent(QueryMode::HistoricalReconstruction),
+        operation: store_read.operation,
+        scope_id: store_read.scope_id,
+        consistency: store_read.consistency,
+        dependency_revisions: dependencies,
+        // A range enumeration declares no conflict-serialization head: its
+        // coherence is proven by the scope revision head it binds plus the
+        // request fence, and the declaration is explicit so the resolved
+        // identity records the absence instead of leaving it unstated.
+        ordering: ReadOrderingBinding::without_order_dependency(),
+        parameters: NamedParameters::from_map(store_read.parameters)?,
+        provenance_handles: Vec::new(),
+    })
+}
+
+/// What the in-test store holds for an experience scope, which is the only
+/// thing that decides the coverage statement the projected page carries.
+#[derive(Clone, Copy)]
+enum ExperienceSource {
+    /// The store holds `rows` records for the scope and projects a bounded
+    /// page over them, declaring truncation only while rows remain past the
+    /// requested bound.
+    Rows(usize),
+    /// The store answers the read with a bare JSON null: no page, so no
+    /// coverage statement at all.
+    Absent,
+    /// The store answers with an in-bound page that carries zero rows and
+    /// proves the read's own fence, but states no `truncated` member: rows
+    /// are accounted for and whether any remain past the bound is unsaid.
+    WithoutVerdict,
+}
+
 /// Shared dispatch counters owned by the test while the service owns the
 /// client: every store call is observable, so caching would be visible as a
 /// missing dispatch.
@@ -158,7 +239,8 @@ struct DispatchCounts {
 /// gates mirror the production adapters, heads carry the served revision,
 /// and the payload echoes scope, served revision, and fence generation.
 /// Nothing is canned: tests mutate `revision`, `flip_heads`, `unavailable`,
-/// `wrong_fence`, and `wrong_operation` to drive each matrix cell.
+/// `wrong_fence`, `wrong_operation`, `experience` and `page_fence` to drive
+/// each matrix cell.
 struct OwnerProofClient {
     fence: StateFence,
     revision: Arc<AtomicU64>,
@@ -167,6 +249,12 @@ struct OwnerProofClient {
     wrong_fence: Option<StateFence>,
     wrong_operation: AtomicBool,
     counts: DispatchCounts,
+    /// What this client answers an experience range read with. `None` keeps
+    /// the single scope-revision-view payload every other test here proves.
+    experience: Option<ExperienceSource>,
+    /// Fence the projected experience page itself publishes, when it is not
+    /// the fence the read was dispatched under.
+    page_fence: Option<StateFence>,
 }
 
 impl OwnerProofClient {
@@ -187,7 +275,56 @@ impl OwnerProofClient {
             wrong_fence: None,
             wrong_operation: AtomicBool::new(false),
             counts,
+            experience: None,
+            page_fence: None,
         }
+    }
+
+    /// Client whose experience scope holds `rows` records.
+    ///
+    /// The row count is the only thing that decides whether the bounded page
+    /// this client projects is truncated, exactly as in the Store's own
+    /// projector: more rows than the requested bound means a declared
+    /// truncated page, and no more than the bound means a whole one.
+    fn with_experience(fence: StateFence, rows: usize) -> Self {
+        Self {
+            experience: Some(ExperienceSource::Rows(rows)),
+            ..Self::new(fence)
+        }
+    }
+
+    /// Projects one bounded experience range page through the Store's own page
+    /// producer.
+    ///
+    /// The bound is the one the Store's own `validate_experience_read_params`
+    /// decodes back out of the incoming request, and truncation is declared
+    /// only while rows remain past it — so the verdict this page draws cannot
+    /// be `Partial` unless the source really holds more rows than the read
+    /// asked for. The page publishes the read's own fence unless `page_fence`
+    /// overrides it, which is how a page projected under another identity is
+    /// served. The continuation cursor is left absent: only the Store mints
+    /// one, and this proof never invents a cursor it cannot verify.
+    fn experience_page(
+        &self,
+        request: &NamedReadRequest,
+        rows: usize,
+        bound_fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let decoded = validate_experience_read_params(&request.parameters)?;
+        let served = rows.min(usize::from(decoded.max_records));
+        Ok(ExperienceRangePage {
+            records: (0..served)
+                .map(|ordinal| json!(format!("bank-record-{ordinal}")))
+                .collect(),
+            matched_total: served,
+            truncated: rows > served,
+            next_cursor: None,
+            state_fence: self
+                .page_fence
+                .clone()
+                .unwrap_or_else(|| bound_fence.clone()),
+        }
+        .payload())
     }
 
     fn served_revision(&self) -> u64 {
@@ -213,6 +350,28 @@ impl OwnerProofClient {
     }
 }
 
+/// Projects an in-bound experience page that states no coverage verdict.
+///
+/// Written from the Store's own exported page keys with the
+/// [`EXPERIENCE_PAGE_TRUNCATED`] member left out entirely, so it is a shape no
+/// Store projector emits: `ExperienceRangePage::truncated` is a REQUIRED member
+/// with no `#[serde(default)]`
+/// (`crates/storage/eliot-store-api/src/experience_store.rs:528`, unlike the
+/// defaulted `next_cursor` on the next four lines), so a page that omits it
+/// cannot be decoded back into the Store's own page type. It carries no records
+/// and a `matched_total` of zero, which makes it the negative twin of the
+/// successful empty page: the two differ only in whether the verdict is stated.
+/// This function decides nothing about the owner's answer — the fence it
+/// publishes is the read's own, and the verdict is the production path's to
+/// give or withhold.
+fn page_without_coverage_verdict(bound_fence: &StateFence) -> Value {
+    json!({
+        EXPERIENCE_PAGE_RECORDS: Vec::<Value>::new(),
+        EXPERIENCE_PAGE_MATCHED_TOTAL: 0,
+        EXPERIENCE_PAGE_STATE_FENCE: bound_fence,
+    })
+}
+
 impl CanonicalReadClient for OwnerProofClient {
     async fn revision_heads(
         &self,
@@ -231,7 +390,11 @@ impl CanonicalReadClient for OwnerProofClient {
     ) -> Result<NamedReadResponse, StoreError> {
         self.counts.execute_calls.fetch_add(1, Ordering::SeqCst);
         request.validate()?;
-        if request.operation != NamedReadOperation::GetScopeRevisionView {
+        // An experience range read is served only by a client that holds rows
+        // for that scope; every other operation keeps the single
+        // scope-revision-view shape the rest of this file proves.
+        let experience = self.experience;
+        if experience.is_none() && request.operation != NamedReadOperation::GetScopeRevisionView {
             return Err(StoreError::UnknownOperation);
         }
         if self.unavailable.load(Ordering::SeqCst) {
@@ -254,15 +417,21 @@ impl CanonicalReadClient for OwnerProofClient {
             .clone()
             .unwrap_or_else(|| self.fence.clone());
         let revision = self.revision.load(Ordering::SeqCst);
-        let response = NamedReadResponse {
-            operation,
-            state_fence: fence.clone(),
-            revision_heads: vec![self.head(scope_key()?, revision)],
-            payload: json!({
+        let payload = match experience {
+            Some(ExperienceSource::Absent) => Value::Null,
+            Some(ExperienceSource::WithoutVerdict) => page_without_coverage_verdict(&fence),
+            Some(ExperienceSource::Rows(rows)) => self.experience_page(&request, rows, &fence)?,
+            None => json!({
                 "scope": scope.as_str(),
                 "revision": revision,
                 "generation": fence.resource_generation.value(),
             }),
+        };
+        let response = NamedReadResponse {
+            operation,
+            state_fence: fence.clone(),
+            revision_heads: vec![self.head(scope_key()?, revision)],
+            payload,
         };
         response.validate()?;
         Ok(response)
@@ -396,6 +565,196 @@ fn unavailable_is_typed_never_empty_success() -> Result<(), Box<dyn std::error::
     assert_eq!(result, Err(ReadError::Store(StoreReadFailure::Unavailable)));
     let query = block_on(service.query(&ctx, query_request(ReadConsistency::Eventual, 0)?));
     assert_eq!(query, Err(ReadError::Store(StoreReadFailure::Unavailable)));
+    Ok(())
+}
+
+/// Proves the three answers a bounded experience page can draw stay distinct.
+///
+/// One request identity, one client, one projector — the ONLY thing that
+/// changes between the three cells below is how many rows the source holds, so
+/// nothing but the source's own coverage statement can separate them:
+///
+/// 1. a scope holding one row past the requested bound declares a truncated
+///    page, which is refused as `Partial`: a bounded subset is never published
+///    as a complete answer;
+/// 2. a scope exactly at the bound declares a whole page and the read
+///    SUCCEEDS carrying the bound's worth of rows;
+/// 3. a scope holding no rows declares a whole EMPTY page and the read also
+///    SUCCEEDS carrying none.
+///
+/// Cells 1 and 3 are the contrast `cards/1144.md:42-44` asks for: `Partial`
+/// must stay distinct from `Unknown` AND from a successful empty result, so a
+/// genuinely empty scope has to be tellable apart from a scope whose rows ran
+/// past the bound. That is the silent-death mode — a read that succeeds and
+/// reports nothing because the scope was larger than the bound, with the
+/// verdict never raised. Cells 2 and 3 are exactly what closes it: they differ
+/// in nothing but the row count, so the `truncated` member the owner reads is
+/// the only thing standing between the two, and both cells assert that member
+/// on the served payload rather than assuming it. The refusal-only neighbours
+/// (`Unknown`, and a page that states no verdict at all) are proved in
+/// `experience_page_without_coverage_verdict_is_unknown`.
+#[test]
+fn experience_page_outcomes_stay_distinct() -> Result<(), Box<dyn std::error::Error>> {
+    // The requested bound stays below the Store's own ceiling: both Store
+    // projectors probe one row past the bound, so asking for the ceiling
+    // itself would declare every larger scope truncated.
+    const { assert!(PROOF_PAGE_BOUND < MAX_EXPERIENCE_PAGE_RECORDS) };
+    let fence_one = fence(1)?;
+    let ctx = metadata(&fence_one, "experience-page")?;
+    let request = experience_page_query(&fence_one)?;
+    // The operation the owner gates coverage on carries the Store's own
+    // spelling of the range read; the bound came from the Store's own builder.
+    assert_eq!(
+        named_read_operation_name(request.operation),
+        EXPERIENCE_BANK_READ_NAME
+    );
+    let at_bound = usize::from(PROOF_PAGE_BOUND);
+
+    // (1) One row past the requested bound: the source declares a truncated
+    // page, so the owner refuses it as `Partial`. This is the cell that fails
+    // if the coverage gate is bypassed — with no gate the read would succeed
+    // here too, and the truncated scope would be published as a complete one.
+    let client = OwnerProofClient::with_experience(fence_one.clone(), at_bound + 1);
+    let service = ReadService::new(client);
+    let partial = block_on(service.bound_query(&ctx, request.clone()));
+    assert_eq!(partial, Err(ReadError::Outcome(ReadOutcome::Partial)));
+
+    // (2) Exactly the bound: the very same read succeeds, and a successful read
+    // is the only way this owner's `Current` is reachable — `ReadOutcome` has
+    // no `Current` construction site, so the variant cannot be asserted to
+    // exist, only the success that implies it.
+    let client = OwnerProofClient::with_experience(fence_one.clone(), at_bound);
+    let service = ReadService::new(client);
+    let carried = block_on(service.bound_query(&ctx, request.clone()))?;
+    assert_eq!(
+        carried.view.payload.get(EXPERIENCE_PAGE_TRUNCATED),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        carried.identity.coverage(),
+        ReadCoverage::BoundedByDeclaredSelector {
+            selector: DeclaredResultSelector::MaxRecords,
+            declared_bound: u32::from(PROOF_PAGE_BOUND),
+        }
+    );
+    // The declared minimum is the revision this read actually observed.
+    assert_eq!(
+        carried.identity.observed_revision_heads()[0].revision,
+        PROOF_PAGE_MINIMUM
+    );
+
+    // (3) No rows at all: the source's own declared EMPTY page. This is a
+    // successful read carrying zero rows, and the `?` IS the assertion of
+    // that — an `Unknown` or `Partial` answer fails the test instead of
+    // passing as an empty success, so this cell cannot observe a default
+    // error path. Every member is read back off the served payload: the rows
+    // really are absent, and the verdict the owner refused to publish for
+    // cell 1 is present and false here.
+    let client = OwnerProofClient::with_experience(fence_one.clone(), 0);
+    let service = ReadService::new(client);
+    let empty = block_on(service.bound_query(&ctx, request.clone()))?;
+    assert_eq!(
+        empty.view.payload.get(EXPERIENCE_PAGE_RECORDS),
+        Some(&json!([]))
+    );
+    assert_eq!(
+        empty.view.payload.get(EXPERIENCE_PAGE_MATCHED_TOTAL),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        empty.view.payload.get(EXPERIENCE_PAGE_TRUNCATED),
+        Some(&json!(false))
+    );
+    // The empty page is bound to the very same declared coverage identity as
+    // the rows page: an in-bound page that happens to hold nothing is still an
+    // observed page read, not an unobserved one.
+    assert_eq!(empty.identity.coverage(), carried.identity.coverage());
+    assert_eq!(
+        empty.identity.observed_revision_heads()[0].revision,
+        carried.identity.observed_revision_heads()[0].revision
+    );
+
+    // The two successes are different facts about one and the same request:
+    // one carries the bound's worth of rows, the other carries none. Nothing
+    // about the request, the client or the projector differs between them, so
+    // if a projector ever stopped declaring truncation on an over-bound
+    // scope, cell 1 stops answering `Partial` and this pair stops being the
+    // only thing that tells "genuinely empty" from "silently truncated".
+    assert_ne!(
+        carried.view.payload.get(EXPERIENCE_PAGE_RECORDS),
+        empty.view.payload.get(EXPERIENCE_PAGE_RECORDS)
+    );
+    Ok(())
+}
+
+/// Proves a page that states no coverage verdict is `Unknown`, never an empty
+/// success.
+///
+/// The successful-empty cell above needs its refusal-only neighbour, and the
+/// sharpest one is a page that carries zero rows, proves the read's own fence,
+/// and simply never says whether rows remain past the bound. The Store's
+/// `ExperienceRangePage::truncated` is a REQUIRED member with no
+/// `#[serde(default)]` (`crates/storage/eliot-store-api/src/experience_store.rs:528`,
+/// unlike the defaulted `next_cursor` at :533), so no Store projector emits
+/// such a page and `classify_payload_coverage` cannot decode it back into the
+/// Store's page type: the decode at `crates/governor/eliot-read/src/lib.rs:2224`
+/// fails and maps to `ReadOutcome::Unknown` on the next line. The bare-null
+/// page draws the same `Unknown` from the earlier arm at :2218. This is the
+/// property worth pinning, and it is a refusal rather than a gap: a page that
+/// declines to state a verdict cannot be published as an authoritative empty
+/// result, because "no rows" and "no statement" are not the same fact. If a
+/// future page type ever defaulted that member, the decode arm stops firing and
+/// this test fails instead of the distinction quietly collapsing into an empty
+/// success.
+#[test]
+fn experience_page_without_coverage_verdict_is_unknown() -> Result<(), Box<dyn std::error::Error>> {
+    let fence_one = fence(1)?;
+    let ctx = metadata(&fence_one, "experience-verdict")?;
+    let request = experience_page_query(&fence_one)?;
+
+    // No page statement at all: the source answered with nothing, which is
+    // `Unknown`.
+    let mut absent = OwnerProofClient::with_experience(fence_one.clone(), 0);
+    absent.experience = Some(ExperienceSource::Absent);
+    let service = ReadService::new(absent);
+    let unobserved = block_on(service.bound_query(&ctx, request.clone()));
+    assert_eq!(unobserved, Err(ReadError::Outcome(ReadOutcome::Unknown)));
+
+    // Zero rows, a proven fence, and no `truncated` member: the same refusal,
+    // reached through the decode arm instead of the null arm.
+    let mut verdictless = OwnerProofClient::with_experience(fence_one.clone(), 0);
+    verdictless.experience = Some(ExperienceSource::WithoutVerdict);
+    let service = ReadService::new(verdictless);
+    let undescribed = block_on(service.bound_query(&ctx, request));
+    assert_eq!(undescribed, Err(ReadError::Outcome(ReadOutcome::Unknown)));
+    // The refusal came from the decode arm, not from an earlier one: the page's
+    // own fence WAS proven, so it is not `CoverageFenceUnproven` — and nothing
+    // in it claimed rows past the bound, so it is not `Partial` either. Both
+    // neighbours of this answer are asserted absent, which is what makes
+    // `Unknown` the third distinct state rather than a restatement of the
+    // other two.
+    assert_ne!(undescribed, Err(ReadError::CoverageFenceUnproven));
+    assert_ne!(undescribed, Err(ReadError::Outcome(ReadOutcome::Partial)));
+    Ok(())
+}
+
+/// Proves the page's own fence statement is read before its coverage.
+///
+/// The page served here is truncated AND published under another fence. Its
+/// `truncated` flag is a true statement about rows that are not this read's
+/// rows, so the owner must refuse the page before it reads that flag: the
+/// answer is the owner-level fact that the page proves nothing about this
+/// bound identity, and explicitly NOT `Partial`.
+#[test]
+fn experience_page_fence_precedes_coverage() -> Result<(), Box<dyn std::error::Error>> {
+    let fence_one = fence(1)?;
+    let ctx = metadata(&fence_one, "experience-fence")?;
+    let request = experience_page_query(&fence_one)?;
+    let past_bound = usize::from(PROOF_PAGE_BOUND) + 1;
+    let mut foreign = OwnerProofClient::with_experience(fence_one, past_bound);
+    foreign.page_fence = Some(fence(2)?);
+    let result = block_on(ReadService::new(foreign).bound_query(&ctx, request));
+    assert_eq!(result, Err(ReadError::CoverageFenceUnproven));
     Ok(())
 }
 

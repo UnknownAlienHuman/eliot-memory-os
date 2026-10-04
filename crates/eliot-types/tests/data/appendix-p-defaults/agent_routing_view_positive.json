@@ -1,0 +1,17 @@
+{
+  "host_session_refs": [],
+  "task_role_lease_refs": [],
+  "work_or_action_lease_refs": [],
+  "route_policies": [],
+  "route_decisions": [],
+  "host_sessions": [],
+  "task_role_leases": [],
+  "controller_leases": [],
+  "operation_jobs": [],
+  "agent_results": [],
+  "agent_result_dispositions": [],
+  "work_items": [],
+  "work_leases": [],
+  "worktree_leases": [],
+  "work_conflicts": []
+}
