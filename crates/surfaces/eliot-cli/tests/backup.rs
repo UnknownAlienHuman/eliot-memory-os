@@ -1437,7 +1437,7 @@ fn assert_both_projections_come_from_one_typed_value() {
 
     assert_declared_key_sets(&wire);
     assert_typed_values_appear_in_both_projections(&outcome, &wire, &human);
-    assert_nested_identity_values_are_printed(&outcome, &human);
+    assert_nested_identity_values_are_printed(&outcome, &human, &wire);
 }
 
 /// The JSON projection's own key set is exactly the 24 declared fields of
@@ -1534,56 +1534,142 @@ fn assert_typed_values_appear_in_both_projections(
         );
     }
 
-    for (pointer, typed) in [
-        ("/effect", owned(serde_json::to_string(&outcome.effect))),
+    // Both spellings are derived from the typed value itself and never hardcoded:
+    //
+    // - `serde_json::to_value(..)` is the form serde's derived `Serialize` puts
+    //   on the wire, because `EffectClass`, `ProofCeiling` and `BackupStage` are
+    //   plain unit-variant enums (`eliot-receipts/src/lib.rs:194` and `:174`,
+    //   `eliot-protocol/src/backup.rs:525`), and a unit variant serializes as its
+    //   renamed string — NOT as the JSON string literal `"CANDIDATE"`. This is the
+    //   member the `/effect` check below pins, and it is the same derived
+    //   implementation that serializes `BackupOperationOutcome` itself, so the
+    //   form asserted here is by construction the form the struct projects.
+    // - `serde_json::to_string(..)` is the renderer-facing form
+    //   `render_backup_outcome_human` prints (`eliot-cli/src/backup.rs:1150-1160`),
+    //   which quotes the token. The two spellings are asserted to agree with each
+    //   other, not assumed to: the wire member carries the bare token and the
+    //   human line carries the quoted one, and this test fails if either moves.
+    //
+    // The renderer side is unchanged by that distinction — `serde_json::to_string`
+    // of a unit-variant enum still produces `"CANDIDATE"`, exactly as before.
+    for (pointer, wire_form, rendered_form) in [
+        (
+            "/effect",
+            owned(serde_json::to_value(outcome.effect)),
+            owned(serde_json::to_string(&outcome.effect)),
+        ),
         (
             "/proof_ceiling",
+            owned(serde_json::to_value(outcome.proof_ceiling)),
             owned(serde_json::to_string(&outcome.proof_ceiling)),
         ),
         (
             "/proof_level",
+            owned(serde_json::to_value(outcome.proof_level)),
             owned(serde_json::to_string(&outcome.proof_level)),
         ),
     ] {
         assert_eq!(
-            wire.pointer(pointer).and_then(Value::as_str),
-            Some(typed.as_str()),
-            "the JSON projection must carry the typed form at {pointer}"
+            wire.pointer(pointer),
+            Some(&wire_form),
+            "the JSON projection must carry the typed serde form at {pointer}"
+        );
+        // The wire member is the BARE token: a nested JSON object or an array
+        // here would mean the projection stopped being a scalar enum and started
+        // embedding structure the renderer does not print.
+        assert_eq!(
+            wire_form,
+            Value::String(rendered_form.trim_matches('"').to_owned()),
+            "the wire member at {pointer} must be the bare typed token"
         );
         assert!(
-            human.contains(&typed),
-            "the human projection must contain the typed form {typed} from \
-             {pointer}:\n{human}"
+            human.contains(&rendered_form),
+            "the human projection must contain the rendered typed form {rendered_form} \
+             from {pointer}:\n{human}"
         );
     }
 }
 
-/// The nested identity's own six values are printed too, beside the outer
-/// operation identity they distinguish.
-fn assert_nested_identity_values_are_printed(outcome: &BackupOperationOutcome, human: &str) {
+/// The nested identity's own six values are projected, and the ones the renderer
+/// prints appear in the human projection beside the outer operation identity they
+/// distinguish.
+///
+/// The split is the product's own: `render_backup_outcome_human` prints the
+/// result identity at `backup.rs:1181-1193` and prints `capture_receipt` from
+/// the OUTER field at `backup.rs:1170-1172`. It deliberately does not print the
+/// nested `capture_receipt`, because the two are the same owner fact by contract
+/// (`backup.rs:973-975`), so a renderer that printed both would report one
+/// receipt twice. Each leg is therefore asserted where it actually lives: the
+/// nested values against the JSON projection (where they are fully carried), and
+/// the capture receipt against its own exact human LINE rather than as a
+/// substring search that a second occurrence elsewhere could satisfy.
+fn assert_nested_identity_values_are_printed(
+    outcome: &BackupOperationOutcome,
+    human: &str,
+    wire: &Value,
+) {
     let Some(identity) = outcome.result_identity.as_ref() else {
         panic!("this fixture populates the nested typed identity");
     };
-    for value in [
-        identity.operation_id.as_str(),
-        identity.request_digest.as_str(),
-        identity.operation_namespace.as_str(),
-        identity.archive_digest.as_str(),
-        required(
-            identity.capture_receipt.as_ref(),
-            "identity.capture_receipt",
-        )
-        .as_str(),
-        required(
-            identity.validity_attestation.as_ref(),
-            "identity.validity_attestation",
-        )
-        .as_str(),
+    let nested = match wire.pointer("/result_identity") {
+        Some(Value::Object(object)) => Value::Object(object.clone()),
+        _ => panic!("result_identity must project as a JSON object"),
+    };
+    for (member, value) in [
+        ("operation_id", identity.operation_id.as_str()),
+        ("request_digest", identity.request_digest.as_str()),
+        ("operation_namespace", identity.operation_namespace.as_str()),
+        ("archive_digest", identity.archive_digest.as_str()),
+        (
+            "capture_receipt",
+            required(
+                identity.capture_receipt.as_ref(),
+                "identity.capture_receipt",
+            )
+            .as_str(),
+        ),
+        (
+            "validity_attestation",
+            required(
+                identity.validity_attestation.as_ref(),
+                "identity.validity_attestation",
+            )
+            .as_str(),
+        ),
+    ] {
+        assert_eq!(
+            nested.get(member).and_then(Value::as_str),
+            Some(value),
+            "the JSON result_identity must carry {member} verbatim"
+        );
+    }
+
+    // The rendered lines, exactly as the renderer spells them. Each is a whole
+    // line, so a value appearing anywhere else in the output cannot satisfy one.
+    // The capture receipt is rendered from the OUTER field and must therefore be
+    // exactly the nested identity's own receipt: the two are the same owner fact,
+    // and this is the assertion that keeps the fixture honest about it.
+    let capture_receipt = required(outcome.capture_receipt.as_ref(), "outcome.capture_receipt");
+    let validity_attestation = required(
+        identity.validity_attestation.as_ref(),
+        "identity.validity_attestation",
+    );
+    assert_eq!(
+        identity.capture_receipt.as_deref(),
+        Some(capture_receipt.as_str()),
+        "the nested and outer capture receipts are the same owner fact and must agree"
+    );
+    for line in [
+        format!("answer_operation_id: {}", identity.operation_id),
+        format!("request_digest: {}", identity.request_digest),
+        format!("operation_namespace: {}", identity.operation_namespace),
+        format!("answer_archive_digest: {}", identity.archive_digest),
+        format!("capture_receipt: {capture_receipt}"),
+        format!("validity_attestation: {validity_attestation}"),
     ] {
         assert!(
-            human.contains(value),
-            "the human projection must contain the nested identity value \
-             {value:?}:\n{human}"
+            human.lines().any(|printed| printed == line),
+            "the human projection must render the exact line {line:?}:\n{human}"
         );
     }
 }
@@ -1680,6 +1766,12 @@ fn assert_renderer_projects_verbatim_and_emits_a_derived_line_set() {
     canary.clone_into(&mut planted.reason);
     let planted_human = render_backup_outcome_human(&planted);
 
+    // The renderer prints the capture receipt ONCE, from the outer field
+    // (`backup.rs:1170-1172`), because the nested identity's own receipt is the
+    // same owner fact (`backup.rs:973-975`). The value asserted here is therefore
+    // the shared one and there is deliberately no second, distinct nested
+    // spelling: a fixture carrying two different receipts for one owner fact is a
+    // shape `apply_verify_evidence` cannot produce.
     for identity in [
         "synthetic-archive-963",
         "synthetic-source-963",
@@ -1690,7 +1782,6 @@ fn assert_renderer_projects_verbatim_and_emits_a_derived_line_set() {
         "synthetic-operation-namespace-963",
         "synthetic-archive-digest-963",
         "synthetic-validity-attestation-963",
-        "synthetic-nested-capture-receipt-963",
     ] {
         assert!(
             planted_human.contains(identity),
@@ -1727,16 +1818,23 @@ fn assert_renderer_projects_verbatim_and_emits_a_derived_line_set() {
         "rendering is deterministic: one value, one projection"
     );
 
-    // Content length does not change the line set; only the two declared arrays
-    // do, and they contribute exactly one line per element.
+    // Content length changes neither line set, whatever their element counts.
+    // The two declared arrays are not symmetric, and the difference is the
+    // renderer's own (read at `backup.rs:1218-1229`): `gates_passed` is joined
+    // into ONE comma-separated line however many gates it carries, while
+    // `missing_obligations` emits one `missing_obligation:` line per element.
+    // So ONE more obligation adds exactly one line however long its text is, and
+    // one more gate adds none. Both halves are asserted, because an assertion
+    // that only counts obligations cannot detect a renderer that started wrapping
+    // the gate list, and one that only counts gates cannot detect a renderer that
+    // started collapsing the obligation list.
     let mut wide = outcome;
     for gate in &mut wide.gates_passed {
         gate.push_str("-extended-well-past-any-sane-bound");
     }
     wide.gates_passed.push("synthetic-gate-three".to_owned());
-    for obligation in &mut wide.missing_obligations {
-        obligation.push_str("-extended-well-past-any-sane-bound");
-    }
+    wide.missing_obligations
+        .push("synthetic-missing-obligation-three-extended-well-past-any-sane-bound".to_owned());
     let wide_human = render_backup_outcome_human(&wide);
     assert_eq!(
         wide.gates_passed.len(),
@@ -1744,9 +1842,44 @@ fn assert_renderer_projects_verbatim_and_emits_a_derived_line_set() {
         "the fixture really did add a third gate"
     );
     assert_eq!(
-        wide_human.lines().count(),
-        human.lines().count() + 1,
-        "one more gate adds exactly one line however long its text is"
+        wide.missing_obligations.len(),
+        3,
+        "the fixture really did add a third obligation"
+    );
+    assert_eq!(
+        rendered_labels(&wide_human),
+        expected_line_labels(&wide),
+        "widening every element's text changes no line at all"
+    );
+    assert_eq!(
+        wide_human
+            .lines()
+            .filter(|line| line.starts_with("gates_passed:"))
+            .count(),
+        1,
+        "the gate list is always exactly one joined line, however many gates it \
+         holds:\n{wide_human}"
+    );
+    assert_eq!(
+        wide_human
+            .lines()
+            .filter(|line| line.starts_with("missing_obligation:"))
+            .count(),
+        wide.missing_obligations.len(),
+        "each outstanding obligation is its own line, so one more obligation adds \
+         exactly one line however long its text is:\n{wide_human}"
+    );
+    assert!(
+        wide_human.lines().any(|line| {
+            line == "missing_obligation: synthetic-missing-obligation-three-extended-well-past-any-sane-bound"
+        }),
+        "the third obligation is rendered verbatim, not truncated:\n{wide_human}"
+    );
+    assert!(
+        wide_human.lines().any(|line| {
+            line.starts_with("gates_passed: ") && line.contains("synthetic-gate-three")
+        }),
+        "the third gate is joined into the gate line verbatim:\n{wide_human}"
     );
 }
 
@@ -1835,13 +1968,23 @@ fn expected_line_labels(outcome: &BackupOperationOutcome) -> Vec<String> {
 
 /// The closed typed result identity with all six fields populated by obviously
 /// synthetic values.
+///
+/// Its `capture_receipt` is the SAME owner fact as the outer
+/// `capture_receipt` of [`outcome_with_every_field_present`], because the product
+/// contract makes the two the same reference (`eliot-cli/src/backup.rs:973-975`)
+/// and the renderer prints the receipt from the OUTER field only
+/// (`backup.rs:1170-1172`). The agreement is therefore a real constraint on this
+/// fixture, not decoration, and it is asserted rather than assumed: see
+/// `assert_nested_identity_values_are_printed`, which checks the nested value
+/// appears in the JSON projection and the outer value appears as its own exact
+/// human line.
 fn synthetic_result_identity() -> eliot_cli::backup::BackupResultIdentity {
     eliot_cli::backup::BackupResultIdentity {
         operation_id: "synthetic-answer-operation-963".to_owned(),
         request_digest: "synthetic-request-digest-963".to_owned(),
         operation_namespace: "synthetic-operation-namespace-963".to_owned(),
         archive_digest: "synthetic-archive-digest-963".to_owned(),
-        capture_receipt: Some("synthetic-nested-capture-receipt-963".to_owned()),
+        capture_receipt: Some("synthetic-capture-receipt-963".to_owned()),
         validity_attestation: Some("synthetic-validity-attestation-963".to_owned()),
     }
 }
@@ -1849,6 +1992,17 @@ fn synthetic_result_identity() -> eliot_cli::backup::BackupResultIdentity {
 /// One `BackupOperationOutcome` with EVERY field present, so the JSON key set,
 /// the human line set and value containment are exercised on the widest shape
 /// the type admits.
+///
+/// The nested identity's `capture_receipt` and the outer `capture_receipt` carry
+/// the SAME owner fact by contract (`eliot-cli/src/backup.rs:973-975`: the outer
+/// field "is the human-facing echo of the same owner fact as `result_identity`'s
+/// `capture_receipt`, and the two always agree"), and
+/// `apply_verify_evidence` (`backup.rs:2325,2329`) sets both from the same
+/// `evidence.capture_receipt`. They therefore hold the same value here, so the
+/// widest-shape fixture is a shape production can actually produce. The
+/// agreement is asserted, not assumed: `assert_nested_identity_values_are_printed`
+/// fails if a future fixture diverges them, and the renderer leg that matters
+/// (`capture_receipt:` printed from the outer field) is asserted by exact line.
 fn outcome_with_every_field_present() -> BackupOperationOutcome {
     BackupOperationOutcome {
         operation: eliot_cli::backup::BACKUP_VERIFY_OPERATION.to_owned(),
@@ -2143,6 +2297,10 @@ fn guard_one_transport(cli_src: &PathBuf, bin_src: &PathBuf) {
 /// rather than asserted away here. The property the issue names is an IMPORT,
 /// and this asserts the surface sources, the surface manifest and the binary's
 /// sources are all free of it.
+///
+/// The "this scan really read the tree" floor is stated as an equality over the
+/// two named trees plus the manifest, not as a fixed total, so it stays a real
+/// check when an unrelated module is added to or removed from either crate.
 fn guard_two_no_legacy_facade_source(cli_manifest: &PathBuf, cli_src: &PathBuf, bin_src: &PathBuf) {
     // Spelled so this test file never carries the retired name in plain text.
     let retired = format!("eliot-{}", "engine");
@@ -2155,21 +2313,45 @@ fn guard_two_no_legacy_facade_source(cli_manifest: &PathBuf, cli_src: &PathBuf, 
     if manifest_hits > 0 {
         hits.push((relative_to_repo(cli_manifest), manifest_hits));
     }
-    for root in [cli_src.to_owned(), bin_src.to_owned()] {
-        for path in rust_files_under(&root) {
-            let text = read_lossy(&path).to_lowercase();
-            scanned += 1;
-            let count = lines_containing(&text, &retired);
-            if count > 0 {
-                hits.push((relative_to_repo(&path), count));
-            }
+    // Each tree is walked ONCE and its module count recorded, so the assertions
+    // below can state exactly what the scan read instead of guessing at a total.
+    let cli_tree = rust_files_under(cli_src);
+    let binary_tree = rust_files_under(bin_src);
+    let cli_modules = cli_tree.len();
+    let binary_modules = binary_tree.len();
+    for path in cli_tree.into_iter().chain(binary_tree) {
+        let text = read_lossy(&path).to_lowercase();
+        scanned += 1;
+        let count = lines_containing(&text, &retired);
+        if count > 0 {
+            hits.push((relative_to_repo(&path), count));
         }
     }
 
+    // The floor is expressed in terms of the trees the property names, not as a
+    // magic total. A single absolute count couples this guard to how many modules
+    // either crate happens to have today: deleting or merging an unrelated module
+    // in `bins/eliot` (the canary-removal work did exactly that to
+    // `canary_removal_entry.rs` and `main.rs`) breaks an import-absence scan whose
+    // subject never changed. What must hold is that the scan really read BOTH
+    // named trees, that each really yielded sources, and that the CLI surface's
+    // own two modules are among them — so a wrong path or an empty tree still
+    // fails loudly instead of looking clean.
     assert!(
-        scanned >= 20,
-        "the legacy-facade scan must read the real crate and binary sources, \
-         read {scanned} files"
+        scanned >= cli_modules + binary_modules,
+        "the legacy-facade scan must read every file of both scanned trees, \
+         read {scanned} of an expected {cli_modules} (CLI surface) + \
+         {binary_modules} (binary)"
+    );
+    assert!(
+        cli_modules >= 2,
+        "the CLI surface crate must contribute its own modules to the scan, got {cli_modules}"
+    );
+    assert_eq!(
+        scanned,
+        1 + cli_modules + binary_modules,
+        "the scan must read the manifest and exactly the two trees' Rust sources, \
+         without double counting or skipping any"
     );
     assert_eq!(
         hits.len(),
@@ -2225,23 +2407,10 @@ fn guard_three_no_raw_untyped_backup_success(backup_rs: &PathBuf) {
         "the raw ok token must be declared exactly once, as the wire \
          acknowledgement"
     );
-    let reported_states = quoted_strings(&text, "pub const BACKUP_STATE_");
-    assert_eq!(
-        reported_states,
-        vec![
-            "verified",
-            "invalid",
-            "refused",
-            "blocked",
-            "unknown",
-            "cancelled",
-            "candidate",
-        ],
-        "the reported states are the closed BACKUP_STATE_* vocabulary"
-    );
-    for state in &reported_states {
-        assert!(state != "ok", "`ok` must never be a reported backup state");
-    }
+    // The full closed vocabulary, asserted by EXACT identifier AND initializer,
+    // so neither a renamed constant, a changed literal, a dropped member nor a
+    // new one passes unnoticed.
+    closed_reported_state_vocabulary(&text);
 
     // What the shipped code really does with `ok` is NOT report it. It opens an
     // UNPROVEN branch: the unknown state is its own placeholder, and the graded
@@ -2255,10 +2424,17 @@ fn guard_three_no_raw_untyped_backup_success(backup_rs: &PathBuf) {
         "a restore-test ok reply is graded by the owner's receipt, not by the \
          token"
     );
+    // The restore-test grading function `restore_test_state` states the same rule
+    // exhaustively, and each arm is pinned individually: a `,`-terminated line
+    // cannot be written for an arm that ends in `}` (as these do), so a combined
+    // spelling would assert a formatting detail the product never promised.
     assert!(
-        text.contains("BACKUP_WIRE_OK => BACKUP_STATE_CANDIDATE,"),
+        text.contains("BACKUP_WIRE_OK if owner_returned_receipt => BACKUP_STATE_CANDIDATE"),
         "the only other ok rung is the rehearsed candidate, still not a success"
     );
+    // The closed set of `ok` match arms is asserted with the vocabulary above,
+    // because the two properties are one claim: `ok` is neither a member of the
+    // reported vocabulary nor reachable as a reported state.
 
     // Exactly one `Forwarded` construction: the shared typed helper, which
     // refuses an outcome whose operation identity does not match the request and
@@ -2287,9 +2463,74 @@ fn guard_three_no_raw_untyped_backup_success(backup_rs: &PathBuf) {
     );
 }
 
-/// Property 4 — no new authority. The Kernel's closed backup entry admits
-/// exactly its four declared selectors, and the surface exposes exactly three
-/// backup command selectors with no fourth operation name anywhere on it.
+/// The closed `BACKUP_STATE_*` vocabulary of reported states, and the CLOSED set
+/// of `ok` match arms, as one property: `ok` is neither a member of the reported
+/// vocabulary nor reachable as a reported state.
+///
+/// These two are asserted together because they are one claim, and separating
+/// them is how the vocabulary check came to be vacuous in the first place. The
+/// declaration scan is line-anchored (`declared_constants`), so it cannot return
+/// an empty list the way a whole-file quote-pair split did — an empty result now
+/// fails the exact comparison below loudly instead of comparing `[]` against the
+/// seven expected states and passing.
+///
+/// `candidate` IS this vocabulary's weakest success member; `ok` is deliberately
+/// absent from it. The arm scan is closed over the WHOLE file so a seventh site
+/// is caught wherever it is added, and every arm is required to end in
+/// `BACKUP_STATE_UNKNOWN`, in an `if`-guarded `BACKUP_STATE_CANDIDATE`, or in a
+/// block that opens an unproven branch.
+fn closed_reported_state_vocabulary(text: &str) {
+    let reported_states = declared_constants(text, "BACKUP_STATE_");
+    assert_eq!(
+        reported_states,
+        vec![
+            ("BACKUP_STATE_VERIFIED".to_owned(), "verified".to_owned()),
+            ("BACKUP_STATE_INVALID".to_owned(), "invalid".to_owned()),
+            ("BACKUP_STATE_REFUSED".to_owned(), "refused".to_owned()),
+            ("BACKUP_STATE_BLOCKED".to_owned(), "blocked".to_owned()),
+            ("BACKUP_STATE_UNKNOWN".to_owned(), "unknown".to_owned()),
+            ("BACKUP_STATE_CANCELLED".to_owned(), "cancelled".to_owned()),
+            ("BACKUP_STATE_CANDIDATE".to_owned(), "candidate".to_owned()),
+        ],
+        "the reported states are the closed BACKUP_STATE_* vocabulary, by exact \
+         identifier and initializer"
+    );
+    for (name, value) in &reported_states {
+        assert!(
+            value != "ok",
+            "`ok` must never be a reported backup state, but {name} is"
+        );
+    }
+
+    let ok_arms: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            line.starts_with("BACKUP_WIRE_OK if") || line.starts_with("BACKUP_WIRE_OK =>")
+        })
+        .collect();
+    assert_eq!(
+        ok_arms.len(),
+        6,
+        "exactly six `ok` arms may exist, so a new one is a deliberate change:\n{}",
+        ok_arms.join("\n")
+    );
+    assert_eq!(
+        lines_containing(text, "BACKUP_WIRE_OK if"),
+        1,
+        "only the receipt-graded rung may guard an `ok` arm with the owner's receipt"
+    );
+    for (_, state) in &reported_states {
+        assert!(
+            !ok_arms
+                .iter()
+                .any(|arm| arm.ends_with(&format!("=> {state},"))),
+            "no `ok` arm may report the state {state} directly; the shipped arms \
+             are the unknown state and the receipt-graded candidate"
+        );
+    }
+}
+
 fn guard_four_no_new_backup_authority(dispatch: &PathBuf, cli_lib: &PathBuf, bin_src: &PathBuf) {
     let dispatch_text = read_lossy(dispatch);
 
@@ -2330,7 +2571,7 @@ fn guard_four_no_new_backup_authority(dispatch: &PathBuf, cli_lib: &PathBuf, bin
 
     // The surface's own command selectors: exactly three.
     let cli_text = read_lossy(cli_lib);
-    let selectors: Vec<String> = quoted_strings(&cli_text, "\"backup-");
+    let selectors: Vec<String> = string_literals(&cli_text, "backup-");
     assert!(
         !selectors.is_empty(),
         "the scan must find the surface's backup command selectors"
@@ -2361,37 +2602,90 @@ fn guard_four_no_new_backup_authority(dispatch: &PathBuf, cli_lib: &PathBuf, bin
 
     // No fourth operation selector is spelled on the binary that drives the
     // surface either: it routes through the closed constants.
-    let mut scanned = 0usize;
-    for path in rust_files_under(bin_src) {
-        let text = read_lossy(&path);
-        scanned += 1;
+    //
+    // This scan must read the binary's WHOLE tree rather than a fixed floor of
+    // five files, for the same reason guard 2 does: the subject is the absence of
+    // a selector, so the only thing that keeps the assertion real is that every
+    // module that exists was read. A fixed floor lets the last few modules go
+    // unscanned the moment the binary is split up.
+    let binary_tree = rust_files_under(bin_src);
+    let scanned = binary_tree.len();
+    for path in &binary_tree {
+        let text = read_lossy(path);
         assert_eq!(
-            quoted_strings(&text, "\"backup."),
+            string_literals(&text, "backup."),
             Vec::<String>::new(),
             "{} must not spell a backup operation selector; it routes through \
              the closed constants",
-            relative_to_repo(&path)
+            relative_to_repo(path)
         );
     }
     assert!(
-        scanned >= 5,
-        "the operation-selector scan must read the binary's sources, read \
-         {scanned} files"
+        scanned > 1,
+        "the operation-selector scan must read the binary's whole source tree, \
+         read {scanned} files"
     );
 }
 
-/// Every double-quoted string literal in `haystack` that begins with `prefix`,
-/// in source order. The text is split on the quote character and the segments
-/// between quote PAIRS are the literals, which is exact for Rust source.
-fn quoted_strings(haystack: &str, prefix: &str) -> Vec<String> {
-    let parts: Vec<&str> = haystack.split('"').collect();
+/// Every string literal in `haystack` whose content begins with `prefix`, in
+/// source order. The scan is per-LINE and anchors on an opening quote, so an
+/// unrelated edit that introduces a quote in a comment, a raw string or a
+/// character literal cannot silently desynchronise the pairing and make the
+/// result empty — the exact failure mode that made this scan report zero
+/// selectors while the three selectors were still declared in the source.
+fn string_literals(haystack: &str, prefix: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    let mut index = 1usize;
-    while index < parts.len() {
-        if parts[index].starts_with(prefix) {
-            found.push(parts[index].to_owned());
+    for line in haystack.lines() {
+        let mut cursor = 0usize;
+        while let Some(offset) = line[cursor..].find('"') {
+            let open = cursor + offset + 1;
+            let Some(length) = line[open..].find('"') else {
+                break;
+            };
+            let literal = &line[open..open + length];
+            if literal.starts_with(prefix) {
+                found.push(literal.to_owned());
+            }
+            cursor = open + length + 1;
         }
-        index += 2;
+    }
+    found
+}
+
+/// Every declared `&str` constant in `haystack` whose identifier begins with
+/// `prefix`, paired with its initializer, in source order.
+///
+/// The scan is line-oriented and anchored on the `pub const <PREFIX>` spelling,
+/// which is the real declaration form in `backup.rs`. It does NOT rely on
+/// brace counting or on splitting the whole file on quotes: both break the moment
+/// an unrelated edit introduces an apostrophe, a raw string, a character literal
+/// or an unbalanced brace, and a helper that can silently return an EMPTY list
+/// turns a real closed-vocabulary assertion into a vacuous one — which is exactly
+/// what happened when the quote-pair scan stopped finding its seven states. A
+/// missing declaration is therefore an empty result here, and the caller's exact
+/// comparison turns that into a loud failure rather than a passing test.
+fn declared_constants(haystack: &str, prefix: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for line in haystack.lines() {
+        let Some(rest) = line.trim().strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name_and_type, initializer)) = rest.split_once('=') else {
+            continue;
+        };
+        // The declaration is `pub const NAME: TYPE = VALUE;`; the TYPE carries no
+        // `=`, so the first `=` is the initializer's and the name is whatever
+        // precedes the first `:` of the declaration.
+        let name = name_and_type
+            .split(':')
+            .next()
+            .unwrap_or(name_and_type)
+            .trim();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let initializer = initializer.trim().trim_end_matches(';').trim();
+        found.push((name.to_owned(), initializer.trim_matches('"').to_owned()));
     }
     found
 }

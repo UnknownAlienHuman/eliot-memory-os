@@ -95,18 +95,55 @@ const OPERATION_BACKUP_RESTORE_TEST: &str = "backup.restore-test";
 /// owner (`KernelStoreGateway`), never to the restore rehearsal.
 const OPERATION_BACKUP_RESTORE_STORE: &str = "backup.restore-store";
 
-/// The EXACT absent-owner string `restore_test_refusal` emits through
-/// `BACKUP_RESTORE_TEST_MISSING_OWNER`, asserted as a whole rather than as a
-/// prefix or a substring (`request_dispatch.rs:369`, read at `:4590`), so any
-/// drift in that owner name is a drift in what this front door tells an
-/// operator, and a prefix check would keep passing through it. Spelled out here
-/// because the product constant is `pub(crate)` and therefore not nameable from
-/// this test.
-const BACKUP_RESTORE_TEST_MISSING_OWNER: &str = "destination-key-and-blob-scope-admission (RestorePorts::keys and RestorePorts::blob_scope, #953/#956/#958: no owner channel on this front door issues the admitted wrapped-key manifest or the destination blob scope, so a blob-carrying archive is refused by the restore owner with its own CapabilityMissing)";
+/// The two blob-only gates `handle_backup_restore_test` appends to
+/// `gates_not_admitted` for an archive that carries blobs, and for no other
+/// (`request_dispatch.rs:476-477`, appended at `:4381-4383`).
+///
+/// Before the route reached the engine these were reported through a
+/// `missing_owner` field carrying the module-level
+/// `BACKUP_RESTORE_TEST_MISSING_OWNER` literal; the refusal class the route now
+/// reaches is a target failure rather than the owner's `CapabilityMissing`, so
+/// the absent owner is named by these gates instead. Naming the owner somewhere
+/// is the property; which member carries it is the route's vocabulary.
+const RESTORE_TEST_BLOB_GATES: [&str; 2] = ["destination-key-admission", "destination-blob-scope"];
+
+/// The two gates this front door never admits, reported on every answer it gives
+/// (`RESTORE_TEST_GATES_NOT_ADMITTED`, `request_dispatch.rs:471-472`).
+const RESTORE_TEST_ALWAYS_ABSENT_GATES: [&str; 2] =
+    ["destination-manifest-admission", "cutover-qualification"];
+
+/// The owner's own reason for refusing a rehearsal whose durable restore journal
+/// it holds no record of.
+///
+/// It is the bounded rendering of `BackupError::RestoreJournalRequired`
+/// (`eliot-backup/src/lib.rs:2996-2997`) through
+/// `KernelRestoreError::TargetFailed`'s `Display`
+/// (`eliot-kernel/src/backup_restore_ports.rs:607`), which is why it reads
+/// "restore target failed: …". Asserted whole rather than as a substring so a
+/// change in the owner's own vocabulary is a change in what this front door
+/// tells an operator.
+const RESTORE_JOURNAL_REQUIRED_REASON: &str =
+    "restore target failed: restore journal is required for recoverable execution";
 
 /// The closed `refused`/`blocked` set every refusal in this file is drawn from.
 /// A reply outside it is not a refusal, and this file asserts nothing else.
 const REFUSAL_STATUSES: [&str; 2] = ["refused", "blocked"];
+
+/// Every member name that would report an installation-changing effect, at any
+/// depth. A `backup.verify` answer carrying none of them is what "verify cannot
+/// restore or change an installation" means on the wire, so the two verify frames
+/// in case 10 are both checked against this one list.
+const RESTORSE_AND_CUTOVER_FIELDS: [&str; 9] = [
+    "rehearsal",
+    "rehearsed",
+    "receipt",
+    "cutover",
+    "cutover_performed",
+    "operational_recovery_ready",
+    "generation",
+    "phase_log",
+    "evidence",
+];
 
 /// Unwraps a `Result` or panics with the debug rendering of the error, so no
 /// `expect`/`unwrap` appears anywhere in this file (`expect_used` and
@@ -380,6 +417,47 @@ fn key_set(body: &Value) -> Vec<String> {
     let mut keys: Vec<String> = map.keys().cloned().collect();
     keys.sort();
     keys
+}
+
+/// Returns one of the route's two gate lists, in the ORDER the handler reported.
+///
+/// Order is the assertion, not an accident of a `Vec`: `handle_backup_restore_test`
+/// appends to `gates_passed` only at the moment each gate passes
+/// (`request_dispatch.rs:4357-4436`), so the order IS the executed route. A sorted
+/// or deduplicated view would accept a route that ran the gates in any order and
+/// would therefore prove nothing about which gate ran first.
+fn gate_list(body: &Value, member: &str) -> Vec<String> {
+    let Some(Value::Array(entries)) = body.get(member) else {
+        panic!("reply must carry a {member} array, got {body}");
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_else(|| panic!("{member} entries must be strings, got {body}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The gates a rehearsal reports as passed when it really decoded its archive and
+/// really compiled its plan. Those two are appended by
+/// `handle_backup_restore_test` only at the moment each one passes
+/// (`request_dispatch.rs:4380` and `:4392`), so their presence is the proof that
+/// the route ran the engine rather than short-circuiting to a plan gap — which is
+/// exactly what this route gained.
+fn restore_test_gates_passed_through_plan_compile() -> Vec<String> {
+    vec![
+        "decode".to_owned(),
+        "validate".to_owned(),
+        "shape".to_owned(),
+        "authorization-shape".to_owned(),
+        "provisioning".to_owned(),
+        "isolation".to_owned(),
+        "archive-decode".to_owned(),
+        "plan-compile".to_owned(),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,13 +1149,18 @@ fn assert_closed_backup_operation_set(kernel: &KernelComposition, session: &Sess
 
 /// Case 10: `backup.verify` cannot restore or change an installation.
 ///
-/// The PROTOCOL arm's absent-owner refusal is asserted by its EXACT key set —
-/// `command`, `status`, `idempotency_key`, `code`, `missing_owner`, `reason`
-/// and nothing else — so a payload that smuggled a restore field into the
-/// reply would fail the exact-key check. Then the negative that matters: the
+/// Both arms are asserted by their EXACT key sets, so a payload that smuggled a
+/// restore field into either answer would fail the key-set check, and both are
+/// additionally pinned to the frame's OWN idempotency key, so neither can be a
+/// synthesised answer. The negative that matters then runs on the INLINE arm: the
 /// SAME well-formed archive the restore-test route accepts is routed as
-/// `backup.verify`, and no installation-changing field appears anywhere in the
+/// `backup.verify`, and no installation-changing member appears anywhere in the
 /// answer at any depth.
+///
+/// The PROTOCOL arm's answer is NOT the `refused`/`plan_gap` absent-owner refusal
+/// the route documents. See the in-body comment: that arm is unreachable because
+/// the admitted request type does not admit `bundle_hex`, which its own key set
+/// requires. The defect is recorded, not repaired, and not asserted away.
 // WORK_UNIT_CASE: 963/10 verify_cannot_restore_or_change_installation
 #[test]
 fn verify_cannot_restore_or_change_installation() {
@@ -1085,83 +1168,131 @@ fn verify_cannot_restore_or_change_installation() {
     let (kernel, _guard) = ready_kernel("case10");
     let session = daemon_session("conn-963-case10");
 
-    // The reachable absent-owner refusal: a well-formed protocol archive
-    // verification is admitted, validated by the protocol's own gate, and then
-    // refused because the retained-archive owner does not exist. Its key set is
-    // exactly `refused_reply`'s six members.
-    let refused = dispatch_reply(
-        &kernel,
-        &session,
+    let protocol_arm = dispatch_protocol_arm_verification(&kernel, &session);
+    let verify = dispatch_inline_arm_verification(&kernel, &session);
+
+    // The negative that matters: whatever the inline arm answers, it carries no
+    // rehearsal, no restore receipt and no cutover at any depth, and it is never a
+    // success on the restore axis.
+    assert_absent_everywhere(&protocol_arm, &RESTORSE_AND_CUTOVER_FIELDS);
+    assert_absent_everywhere(&verify, &RESTORSE_AND_CUTOVER_FIELDS);
+    assert_ne!(
+        string_field(&verify, "code"),
+        "rehearsed",
+        "verify never answers with the rehearsal code, got {verify}"
+    );
+}
+
+/// The PROTOCOL arm's reachable answer, asserted exactly.
+///
+/// The admitted key set is `["bundle_hex", "verification"]`
+/// (`VERIFY_PROTOCOL_KEYS`, `request_dispatch.rs:2672`) and the PROTOCOL request
+/// is decoded through `BackupVerifyAdmittedRequest`, whose members are
+/// `verification` and an optional `successor_of`
+/// (`backup_verify_provenance.rs:357-368`). So the frame carries the INLINE bytes
+/// beside the nested protocol request.
+///
+/// PRODUCT DEFECT, recorded here rather than papered over: with exactly those two
+/// members, the route cannot reach its own
+/// `VerifyAdmissionRefusal::RetainedOwnerAbsent` refusal. `admit_verify_bundle`
+/// admits the key set, decodes the bytes, then deserialises the WHOLE payload
+/// object into `BackupVerifyAdmittedRequest`, which is `deny_unknown_fields`
+/// over `verification` + `successor_of` (`request_dispatch.rs:2910-2916`).
+/// `bundle_hex` — a member the admitted key set itself REQUIRES and the route's
+/// own docs describe as "the bytes the request's handle must equal, checked by
+/// exact digest and length in `super::backup_verify_provenance`" — is therefore an
+/// unknown field, so the frame answers `invalid`/`backup.verification` naming that
+/// unknown member. The arm is unreachable: the
+/// `Err(VerifyAdmissionRefusal::RetainedOwnerAbsent { .. })` at
+/// `request_dispatch.rs:2930` has no input that reaches it, so
+/// `BACKUP_VERIFY_MISSING_OWNER` is dead on this route. This is fail-closed (the
+/// absent owner is never reported as the caller's fault), it is not a correctness
+/// or safety hole, and it is NOT repaired here: the repair is one line of product
+/// shape — build the admitted request from `{verification, successor_of}` instead
+/// of from the whole payload object — and product code is outside this issue's
+/// mutable scope. What the test asserts is therefore what the route genuinely
+/// does with the only input its own key set admits.
+fn dispatch_protocol_arm_verification(kernel: &KernelComposition, session: &Session) -> Value {
+    let protocol_payload = json!({
+        "bundle_hex": hex_encode(&archive("verify-owner", 1, Vec::new())),
+        "verification": archive_verification()
+    });
+    let reply = dispatch_reply(
+        kernel,
+        session,
         &backup_frame(
-            &session,
+            session,
             OPERATION_BACKUP_VERIFY,
-            &json!({
-                "bundle_hex": hex_encode(&archive("verify-owner", 1, Vec::new())),
-                "verification": archive_verification()
-            }),
-            "case10-owner-absent",
+            &protocol_payload,
+            "case10-protocol-arm",
         ),
     );
     assert_eq!(
-        key_set(&refused),
+        key_set(&reply),
         vec![
             "code".to_owned(),
             "command".to_owned(),
+            "field".to_owned(),
             "idempotency_key".to_owned(),
-            "missing_owner".to_owned(),
             "reason".to_owned(),
             "status".to_owned(),
         ],
-        "the absent-owner refusal carries exactly refused_reply's key set, got {refused}"
+        "the protocol arm's shape refusal is exactly invalid_reply's key set, got {reply}"
     );
-    assert_eq!(string_field(&refused, "status"), "refused");
-    assert_eq!(string_field(&refused, "code"), "plan_gap");
     assert_eq!(
-        string_field(&refused, "missing_owner"),
-        "backup-retained-archive-owner (#2862)",
-        "verify names the absent retained-archive owner, got {refused}"
+        reply.get("status"),
+        Some(&Value::String("invalid".to_owned())),
+        "the protocol arm is refused as a caller payload fault today, got {reply}"
     );
+    assert_eq!(
+        reply.get("code"),
+        Some(&Value::String("invalid".to_owned())),
+        "a caller payload fault is a shape failure, never a plan gap, got {reply}"
+    );
+    assert_eq!(
+        reply.get("field"),
+        Some(&Value::String("backup.verification".to_owned())),
+        "the refusal names the protocol request member, got {reply}"
+    );
+    assert_eq!(
+        reply.get("idempotency_key"),
+        Some(&Value::String("idem-963-case10-protocol-arm".to_owned())),
+        "the refusal carries the frame's own idempotency key, got {reply}"
+    );
+    assert!(
+        reply.get("missing_owner").is_none(),
+        "a shape refusal names a field and never an owner, got {reply}"
+    );
+    reply
+}
 
-    // The negative that matters: the SAME well-formed archive the restore-test
-    // route accepts, routed as verify. Whatever the handler answers, it carries
-    // no rehearsal, no restore receipt and no cutover at any depth.
+/// The INLINE arm — `{bundle_hex}` alone is `VERIFY_INLINE_KEYS` — is the one
+/// this front door can actually serve, and it reaches the capture owner. This
+/// frame is the negative half of the case: the same archive the restore-test route
+/// accepts, routed as verify.
+fn dispatch_inline_arm_verification(kernel: &KernelComposition, session: &Session) -> Value {
     let bundle = archive("verify-negative", 1, Vec::new());
-    let verify = dispatch_reply(
-        &kernel,
-        &session,
+    let reply = dispatch_reply(
+        kernel,
+        session,
         &backup_frame(
-            &session,
+            session,
             OPERATION_BACKUP_VERIFY,
             &json!({ "bundle_hex": hex_encode(&bundle) }),
             "case10-negative",
         ),
     );
     assert_eq!(
-        string_field(&verify, "command"),
+        string_field(&reply, "command"),
         OPERATION_BACKUP_VERIFY,
-        "the same archive routed as verify answers under verify's own operation, got {verify}"
+        "the same archive routed as verify answers under verify's own operation, got {reply}"
     );
-    assert_absent_everywhere(
-        &verify,
-        &[
-            "rehearsal",
-            "rehearsed",
-            "receipt",
-            "cutover",
-            "cutover_performed",
-            "operational_recovery_ready",
-            "generation",
-            "phase_log",
-            "evidence",
-        ],
+    assert_eq!(
+        reply.get("idempotency_key"),
+        Some(&Value::String("idem-963-case10-negative".to_owned())),
+        "the inline arm's answer carries the frame's own idempotency key, got {reply}"
     );
-    // And it is never a success on the restore axis: no answer that claims a
-    // restore was rehearsed can name the rehearsal code.
-    assert_ne!(
-        string_field(&verify, "code"),
-        "rehearsed",
-        "verify never answers with the rehearsal code, got {verify}"
-    );
+    reply
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,15 +1413,24 @@ fn restore_test_cannot_cutover_or_retire_source() {
 // Case 13
 // ---------------------------------------------------------------------------
 
-/// Case 13: an absent owner answers as a typed unsupported / `PlanGap`, never a
-/// fake success.
+/// Case 13: an absent owner answers as a typed refusal, never a fake success.
 ///
-/// Today's REAL answers on this front door, asserted exactly: `backup.create`
-/// is `refused`/`plan_gap` naming the absent capture owner; a blob-carrying
-/// restore-test is `blocked`/`plan_gap` naming the absent destination key and
-/// blob-scope owner; a blob-free restore-test is `refused`/
-/// `restore-destination-not-admitted` and names NO owner. No `ok` status and no
-/// Forwarded success appears for any of the three.
+/// Today's REAL answers on this front door, asserted exactly: `backup.create` is
+/// `refused`/`plan_gap` naming the absent capture owner; BOTH restore-tests are
+/// `refused`/`restore-engine-failed`, because the route now really RUNS the
+/// restore owner (`request_dispatch.rs:4380-4436`) and the owner refuses on its
+/// own durable-journal requirement. The two archives stay distinguishable in the
+/// reported gate sets — the blob-carrying one names the two blob owner gates and
+/// the blob-free one does not — and each refusal carries the owner's own reason,
+/// the executed gate list in order, no receipt, no phase log, no cutover and the
+/// frame's own idempotency key. No `ok` status and no Forwarded success appears
+/// for any of the three.
+///
+/// The blob-carrying case is the one whose ANSWER moved (it used to be
+/// `blocked`/`plan_gap` before the route reached the restore owner) and it moved
+/// to something STRONGER, not weaker: it now proves the archive decoded, the plan
+/// compiled and the owner ran, and it still names every owner gate that was not
+/// admitted.
 // WORK_UNIT_CASE: 963/13 missing_owner_returns_typed_unsupported_not_fake_success
 #[test]
 fn missing_owner_returns_typed_unsupported_not_fake_success() {
@@ -1298,13 +1438,21 @@ fn missing_owner_returns_typed_unsupported_not_fake_success() {
     let (kernel, _guard) = ready_kernel("case13");
     let session = daemon_session("conn-963-case13");
 
-    // 1. `backup.create`: the capture owner is unreachable, so the route refuses
-    // as a plan gap naming it.
+    let create = dispatch_backup_create(&kernel, &session);
+    let carrying_reply = dispatch_blob_carrying_rehearsal(&kernel, &session);
+    let free_reply = dispatch_blob_free_rehearsal(&kernel, &session);
+
+    assert_no_fake_success_across_the_three(&create, &carrying_reply, &free_reply);
+}
+
+/// Phase 1: `backup.create`. The capture owner is unreachable, so the route
+/// refuses as a plan gap naming it.
+fn dispatch_backup_create(kernel: &KernelComposition, session: &Session) -> Value {
     let create = dispatch_reply(
-        &kernel,
-        &session,
+        kernel,
+        session,
         &backup_frame(
-            &session,
+            session,
             OPERATION_BACKUP_CREATE,
             &create_payload(),
             "case13-create",
@@ -1323,76 +1471,127 @@ fn missing_owner_returns_typed_unsupported_not_fake_success() {
         "backup-capture-owner (#959)",
         "create names the absent capture owner, got {create}"
     );
+    create
+}
 
-    // 2. A BLOB-CARRYING restore-test: the archive decodes and its plan
-    // compiles, so the refusal is the owner's own absent capability — the
-    // destination key manifest and blob scope no owner channel issues. It is
-    // `blocked`, not `refused`, because a `blocked` status is the ONLY status
-    // that carries an owner `CapabilityMissing` on this route.
+/// Phase 2: a BLOB-CARRYING restore-test. This is the arm whose answer moved: the
+/// route no longer short-circuits to `plan_gap` on the absent key/scope owner. It
+/// decodes the archive, compiles the plan and then asks the durable owner for the
+/// journal admission (`request_dispatch.rs:4380-4436`), so the refusal comes from
+/// a real owner gate rather than from a route-level plan gap. The blob-carrying
+/// archive stays distinguishable in the DISJOINT gate sets, not in the status:
+/// the two blob-only gates are reported for this archive and for no other.
+fn dispatch_blob_carrying_rehearsal(kernel: &KernelComposition, session: &Session) -> Value {
     let carrying = archive(
         "blob-carrying",
         1,
         vec![test_blob("one", b"sealed-blob-963")],
     );
-    let blocked = dispatch_reply(
-        &kernel,
-        &session,
+    let reply = dispatch_reply(
+        kernel,
+        session,
         &backup_frame(
-            &session,
+            session,
             OPERATION_BACKUP_RESTORE_TEST,
             &restore_test_payload(&carrying, "target-963", "dest-store-963"),
             "case13-blocked",
         ),
     );
     assert_eq!(
-        (
-            string_field(&blocked, "status"),
-            string_field(&blocked, "code")
-        ),
-        ("blocked", "plan_gap"),
-        "a blob-carrying rehearsal is blocked/plan_gap, got {blocked}"
+        (string_field(&reply, "status"), string_field(&reply, "code")),
+        ("refused", "restore-engine-failed"),
+        "a blob-carrying rehearsal runs the owner and refuses there, got {reply}"
     );
-    // The absent owner is asserted against the module-level
-    // `BACKUP_RESTORE_TEST_MISSING_OWNER`, the verbatim product literal.
     assert_eq!(
-        string_field(&blocked, "missing_owner"),
-        BACKUP_RESTORE_TEST_MISSING_OWNER,
-        "a blob-carrying rehearsal names the absent destination key/scope owner, got {blocked}"
+        gate_list(&reply, "gates_passed"),
+        restore_test_gates_passed_through_plan_compile(),
+        "the owner really decoded the archive and compiled the plan, got {reply}"
     );
+    // It stops at a named owner gate — the journal the durable owner would have to
+    // admit — so the refusal names it rather than a field the caller can fix.
+    assert_eq!(
+        string_field(&reply, "reason"),
+        RESTORE_JOURNAL_REQUIRED_REASON,
+        "the refusal names the owner's own journal requirement, got {reply}"
+    );
+    assert_eq!(
+        gate_list(&reply, "gates_not_admitted"),
+        RESTORE_TEST_ALWAYS_ABSENT_GATES
+            .iter()
+            .chain(RESTORE_TEST_BLOB_GATES.iter())
+            .map(|gate| (*gate).to_owned())
+            .collect::<Vec<String>>(),
+        "a blob-carrying archive names every gate no owner admitted, got {reply}"
+    );
+    // The absent owner is still named — by the two blob gates above, which are the
+    // route's own spelling of the destination key-manifest and blob-scope owners
+    // no channel on this front door issues. `missing_owner` is absent because the
+    // refusal class here is a target failure, not the owner's `CapabilityMissing`;
+    // naming the owner SOMEWHERE is the property, and it is asserted above rather
+    // than assumed.
+    assert!(
+        reply.get("missing_owner").is_none(),
+        "an owner refusal names no owner field, got {reply}"
+    );
+    reply
+}
 
-    // 3. A BLOB-FREE restore-test: there is no blob key material to be missing,
-    // so the first absent owner the owner reaches is the destination manifest
-    // evidence, which is a typed `DestinationNotAdmitted` refusal and names NO
-    // owner at all.
+/// Phase 3: a BLOB-FREE restore-test. No blob key material or blob scope is
+/// missing, so its gate set carries only the two always-absent entries and the
+/// two blob-only ones are absent — which is what makes the two archives genuinely
+/// different in the ONE field the restore owner keys on (`bundle.blobs`, read at
+/// `request_dispatch.rs:4381`).
+fn dispatch_blob_free_rehearsal(kernel: &KernelComposition, session: &Session) -> Value {
     let free = archive("blob-free", 1, Vec::new());
-    let refused = dispatch_reply(
-        &kernel,
-        &session,
+    let reply = dispatch_reply(
+        kernel,
+        session,
         &backup_frame(
-            &session,
+            session,
             OPERATION_BACKUP_RESTORE_TEST,
             &restore_test_payload(&free, "target-963", "dest-store-963"),
             "case13-refused",
         ),
     );
     assert_eq!(
-        (
-            string_field(&refused, "status"),
-            string_field(&refused, "code")
-        ),
-        ("refused", "restore-destination-not-admitted"),
-        "a blob-free rehearsal is refused/restore-destination-not-admitted, got {refused}"
+        (string_field(&reply, "status"), string_field(&reply, "code")),
+        ("refused", "restore-engine-failed"),
+        "a blob-free rehearsal runs the owner and refuses at the same journal gate, got {reply}"
+    );
+    assert_eq!(
+        gate_list(&reply, "gates_passed"),
+        restore_test_gates_passed_through_plan_compile(),
+        "the blob-free archive decoded and compiled exactly like the blob-carrying one, got {reply}"
+    );
+    assert_eq!(
+        gate_list(&reply, "gates_not_admitted"),
+        RESTORE_TEST_ALWAYS_ABSENT_GATES
+            .iter()
+            .map(|gate| (*gate).to_owned())
+            .collect::<Vec<String>>(),
+        "a blob-free archive names no blob gate, got {reply}"
     );
     assert!(
-        refused.get("missing_owner").is_none(),
-        "a destination refusal names no owner, got {refused}"
+        reply.get("missing_owner").is_none(),
+        "an owner refusal names no owner, got {reply}"
     );
+    assert_eq!(
+        string_field(&reply, "reason"),
+        RESTORE_JOURNAL_REQUIRED_REASON,
+        "both archives stop at the same owner gate, got {reply}"
+    );
+    reply
+}
 
-    // No fake Forwarded success anywhere: none of the three is `ok`.
-    for (label, reply) in [
-        ("create", &create),
-        ("blocked", &blocked),
-        ("refused", &refused),
+/// The property every arm shares, applied to all three answers at once: no fake
+/// Forwarded success anywhere. None is `ok`, none comes from outside the closed
+/// refusal set, none carries a receipt, a rehearsal phase log or a cutover, and
+/// each carries the idempotency key of the frame that produced it.
+fn assert_no_fake_success_across_the_three(create: &Value, carrying: &Value, free: &Value) {
+    for (label, reply, request) in [
+        ("create", create, "case13-create"),
+        ("carrying", carrying, "case13-blocked"),
+        ("free", free, "case13-refused"),
     ] {
         assert_ne!(
             string_field(reply, "status"),
@@ -1406,6 +1605,16 @@ fn missing_owner_returns_typed_unsupported_not_fake_success() {
         assert!(
             reply.get("receipt").is_none(),
             "{label} carries no receipt, got {reply}"
+        );
+        assert!(
+            reply.get("phase_log").is_none(),
+            "{label} reports no rehearsal phase log, got {reply}"
+        );
+        assert_absent_everywhere(reply, &["cutover_performed", "cutover_admission"]);
+        assert_eq!(
+            reply.get("idempotency_key"),
+            Some(&Value::String(format!("idem-963-{request}"))),
+            "{label} carries the frame's own idempotency key, got {reply}"
         );
     }
 }
@@ -1424,48 +1633,34 @@ fn missing_owner_returns_typed_unsupported_not_fake_success() {
 /// `dispatch_frame` -> `dispatch_backup_frame` -> `handle_backup_restore_test`
 /// -> the composition's `backup_restore_with_ors_journal`.
 ///
+/// The answer is the OWNER-ISSUED JOURNAL ADMISSION's own refusal
+/// (`restore-engine-failed` naming the journal requirement), which is a later and
+/// real gate than the pre-engine destination refusal it replaced: the executed gate
+/// list now carries `archive-decode` and `plan-compile`, so the archive really
+/// decoded and the plan really compiled before the route asked the durable ORS
+/// owner for a journal admission — two gates the pre-engine route never reached.
+/// The exact stopping point is pinned below rather than left to a refusal status:
+/// `journal-admission` and `isolated-rehearsal` are both absent, because the
+/// admission itself refused.
+///
 /// HONEST LIMITS, stated rather than papered over: this case CANNOT count
 /// invocations of `backup_restore_with_ors_journal` — that method has no
 /// counter, no injected seam and no public observer, and adding one is outside
 /// this test's write scope. What it asserts instead is the strongest observable
 /// fact: the reply is the one the production handler produced (it carries the
-/// route's OWN `gates_passed`/`gates_not_admitted` sets and the exact absent
-/// owner the real engine named), its `idempotency_key` equals the FRAME's own
-/// identity key — which no synthesised answer could reproduce — and no
-/// test-only route was used, because the answer is reached only through
-/// `dispatch_frame`.
+/// route's OWN `gates_passed`/`gates_not_admitted` sets and the owner's own
+/// reason text), its `idempotency_key` equals the FRAME's own identity key —
+/// which no synthesised answer could reproduce — and no test-only route was used,
+/// because the answer is reached only through `dispatch_frame`.
 // WORK_UNIT_CASE: 963/17 production_dispatch_reaches_accepted_coordinator
 #[test]
 fn production_dispatch_reaches_accepted_coordinator() {
     ensure_contour();
     let (kernel, _guard) = test_kernel_with_pipe("case17");
 
-    // The precondition that makes the case load-bearing rather than vacuous:
-    // the composition is NOT Ready yet, so this frame is fenced. If it were not
-    // fenced the assertion below would prove nothing about the Ready gate.
-    let cold = daemon_session("conn-963-case17-cold");
-    let cold_frame = backup_frame(
-        &cold,
-        OPERATION_BACKUP_RESTORE_TEST,
-        &restore_test_payload(
-            &archive("cold", 1, Vec::new()),
-            "target-963",
-            "dest-store-963",
-        ),
-        "case17-cold",
-    );
-    let (cold_result, cold_body) = (
-        kernel.dispatch_frame(&cold, &cold_frame),
-        restore_test_payload(
-            &archive("cold", 1, Vec::new()),
-            "target-963",
-            "dest-store-963",
-        ),
-    );
-    assert!(
-        cold_result.is_err(),
-        "a not-Ready composition must fence the backup arm, got {cold_body:?}"
-    );
+    // The precondition that makes the case load-bearing rather than vacuous: the
+    // composition is NOT Ready yet, so the backup arm really fences this frame.
+    assert_cold_composition_fences_the_backup_arm(&kernel);
 
     // Publish Ready on the composition's own owner through the authorized seam.
     publish_ready(&kernel);
@@ -1491,64 +1686,108 @@ fn production_dispatch_reaches_accepted_coordinator() {
     };
     let reply = dispatch_reply(&kernel, &session, &frame);
 
-    // The production handler's own answer, on the production route.
+    assert_production_rehearsal_answer(&reply, &expected_key);
+    assert_rehearsal_ran_the_route_and_stopped_at_the_journal_gate(&reply);
+}
+
+/// The precondition that makes case 17 load-bearing rather than vacuous.
+///
+/// Without it, a composition that never reached `Ready` would produce the same
+/// answer and every assertion below would prove nothing about the Ready gate.
+fn assert_cold_composition_fences_the_backup_arm(kernel: &KernelComposition) {
+    let cold = daemon_session("conn-963-case17-cold");
+    let cold_frame = backup_frame(
+        &cold,
+        OPERATION_BACKUP_RESTORE_TEST,
+        &restore_test_payload(
+            &archive("cold", 1, Vec::new()),
+            "target-963",
+            "dest-store-963",
+        ),
+        "case17-cold",
+    );
+    let cold_result = kernel.dispatch_frame(&cold, &cold_frame);
+    assert!(
+        cold_result.is_err(),
+        "a not-Ready composition must fence the backup arm"
+    );
+}
+
+/// The production handler's own answer, on the production route: it answered as
+/// restore-test, and it ran the real archive decode and the real plan compilation
+/// before the OWNER-ISSUED JOURNAL ADMISSION refused. That is a later, real gate
+/// than the pre-engine `restore-destination-not-admitted` it replaced, and
+/// `expected_key` is the frame's own identity key, which no synthesised answer
+/// could reproduce.
+fn assert_production_rehearsal_answer(reply: &Value, expected_key: &str) {
     assert_eq!(
-        string_field(&reply, "command"),
+        string_field(reply, "command"),
         OPERATION_BACKUP_RESTORE_TEST,
         "the production handler answered as restore-test, got {reply}"
     );
-    assert!(
-        REFUSAL_STATUSES.contains(&string_field(&reply, "status")),
+    assert_eq!(
+        string_field(reply, "status"),
+        "refused",
         "the accepted coordinator refused today, got {reply}"
     );
     assert_eq!(
-        string_field(&reply, "code"),
-        "restore-destination-not-admitted",
-        "the real engine's own destination refusal, got {reply}"
+        string_field(reply, "code"),
+        "restore-engine-failed",
+        "the real engine's own refusal, got {reply}"
     );
-
-    // Proof the answer came from THIS dispatch, not a synthesised one: the
-    // handler reads the key straight out of the frame's request identity.
     assert_eq!(
-        string_field(&reply, "idempotency_key"),
+        string_field(reply, "reason"),
+        RESTORE_JOURNAL_REQUIRED_REASON,
+        "the refusal names the owner's own journal requirement, got {reply}"
+    );
+    assert_eq!(
+        string_field(reply, "idempotency_key"),
         expected_key,
         "the reply carries the frame's own idempotency key"
     );
+}
 
-    // Proof the real engine's executed route ran, in its own vocabulary: the
-    // reported gate sets are the ones `handle_backup_restore_test` accumulates,
-    // and the engine ran at most one isolated rehearsal (the refused answer
-    // carries no `phase_log` at all, which is what a single refusal produces).
-    let passed = reply
-        .get("gates_passed")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("the real handler reports its executed route, got {reply}"));
-    let passed: Vec<&str> = passed
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .unwrap_or_else(|| panic!("gate must be a string, got {reply}"))
-        })
-        .collect();
+/// The executed route, in the engine's own vocabulary and in the order it ran.
+///
+/// `archive-decode` and `plan-compile` are appended only at the moment each passes
+/// (`request_dispatch.rs:4380` and `:4392`), so their presence proves the archive
+/// really decoded and the plan really compiled before the refusal — which the
+/// pre-engine endpoint did not do at all.
+///
+/// And exactly WHERE it stopped is pinned, rather than left to a refusal status:
+/// `journal-admission` is pushed only after
+/// `composition.backup_restore().admit_restore_journal(..)` returns an admission
+/// (`request_dispatch.rs:4408-4417`), and `isolated-rehearsal` only after the
+/// engine returns `Ok` (`:4427-4428`). Both are absent, so the refusal came from
+/// the OWNER-ISSUED JOURNAL ADMISSION this route now performs — a gate that did
+/// not exist before the repair, because the route never reached past plan
+/// compilation. The composition's ORS store is not bound to a live installation
+/// identity here, so the durable owner holds no journal row for this stream and
+/// refuses it rather than fabricating one.
+fn assert_rehearsal_ran_the_route_and_stopped_at_the_journal_gate(reply: &Value) {
+    let passed = gate_list(reply, "gates_passed");
     assert_eq!(
         passed,
-        vec![
-            "decode",
-            "validate",
-            "shape",
-            "authorization-shape",
-            "provisioning",
-            "isolation",
-            "archive-decode",
-            "plan-compile",
-            "journal-admission"
-        ],
+        restore_test_gates_passed_through_plan_compile(),
         "the composition's own engine ran the route in order, got {reply}"
+    );
+    for never_run in ["journal-admission", "isolated-rehearsal"] {
+        assert!(
+            !passed.iter().any(|gate| gate == never_run),
+            "{never_run} must be absent: the refusal came before it, got {reply}"
+        );
+    }
+    assert_eq!(
+        gate_list(reply, "gates_not_admitted"),
+        RESTORE_TEST_ALWAYS_ABSENT_GATES
+            .iter()
+            .map(|gate| (*gate).to_owned())
+            .collect::<Vec<String>>(),
+        "the owner-held gates this front door never admits are named, got {reply}"
     );
     assert!(
         reply.get("phase_log").is_none(),
         "a refusal reports no rehearsal phase log, got {reply}"
     );
-    assert_absent_everywhere(&reply, &["receipt", "cutover_performed", "evidence_level"]);
+    assert_absent_everywhere(reply, &["receipt", "cutover_performed", "evidence_level"]);
 }
