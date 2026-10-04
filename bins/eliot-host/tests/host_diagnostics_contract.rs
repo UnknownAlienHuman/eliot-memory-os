@@ -5379,16 +5379,25 @@ fn sink_degradation_and_timeout_never_change_the_host_result_or_claim_a_drain() 
     // the process-wide worker thread was created, and how much work can be in
     // flight at once, in its own bounded start record.
     //
-    // The OS thread itself IS observed, and it is the only thread the product
-    // creates: while the producer is running, its records reach the diagnostic
-    // stream, and the ids that appear there are the ids that exist. On Windows
-    // the Event Log port accepts the record, so the stream is exactly the one
-    // record the single `eliot-event-log` worker delivers. Every other
-    // platform has no live port at all -- `report_local_event` cannot report
-    // anything -- so a swept admission is never queued there and no product
-    // thread exists to observe, which is why the census below is the
-    // unconditional bound and this thread census runs only where delivery is
-    // real.
+    // THE ONE-WORKER BOUND IS A SOURCE CENSUS, and no runtime thread census
+    // runs in this case on ANY platform. Both the worker thread's name and the
+    // sweep's own layers come from the same product source the census reads:
+    // `start_event_log_producer` is the only place the product spawns a thread,
+    // it spawns one named `eliot-event-log`, and that thread runs
+    // `run_event_log_worker`, which is the only writer of the delivery record.
+    // That census is what can actually fail.
+    //
+    // WHY NO RUNTIME THREAD CENSUS RUNS HERE, on Windows as much as anywhere
+    // else: the sweep installs its layers with `tracing::subscriber::with_default`
+    // inside `assert_the_concurrent_sweep_is_accounted_exactly`, which publishes
+    // a THREAD-LOCAL default and does not propagate it into threads spawned
+    // inside the block. A delivery record is emitted from the
+    // `eliot-event-log` thread, which inherits no local default and so falls back
+    // to `get_global()` -- never set by this sweep. So that record cannot reach
+    // this capture on any platform, with or without a live Event Log port: the
+    // limitation is the HARNESS's, not the product's and not the platform's. A
+    // Windows port accepting the record changes where the record GOES, not which
+    // subscriber sees it.
     // (3) The concurrent sweep, and the product's own accounting of the work it
     // owns. Returns the HIGHEST drop total the sweep ever saw published AND the
     // number of records it actually submitted: the post-shutdown admission arm
@@ -5398,9 +5407,12 @@ fn sink_degradation_and_timeout_never_change_the_host_result_or_claim_a_drain() 
     // produced the drops.
     let (highest_drops, submissions) = assert_the_concurrent_sweep_is_accounted_exactly();
 
-    // THE SINGLE WORKER, observed rather than asserted: that census ran inside
-    // the sweep above, against the very ids the sweep's observing layer
-    // collected, so it needs no second pass here.
+    // THE SINGLE-WORKER BOUND, from a SOURCE CENSUS of the product's spawn
+    // sites -- not from a runtime thread observation, and never from a second
+    // pass. No runtime census of the worker thread runs in this case on any
+    // platform, for the reason given above: the sweep's capture is thread-local,
+    // so the worker's records never arrive in it. The census below is what can
+    // actually fail.
 
     // The source census, which is the UNCONDITIONAL bound and needs no runtime:
     // the worker thread is created in exactly one place, from exactly one named
@@ -6158,7 +6170,9 @@ fn assert_the_concurrent_sweep_is_accounted_exactly() -> (u64, u64) {
     // very same ids back after the sweep. `Arc` is not `Copy`, so the layer's
     // field takes a clone of its own and this handle survives the move - both
     // are clones of the SAME allocation, never two separate counters, so the
-    // set asserted by the thread census is exactly what the layer observed.
+    // set read in `assert_delivery_reached_one_product_thread` is exactly the
+    // one the layer filled. Nothing more is claimed for it: that set is empty
+    // over this scope, for the thread-local reason stated at its own site.
     let observing_threads = Arc::clone(&observed_threads);
     let sweep_records = Arc::new(Mutex::new(Vec::<CapturedRecord>::new()));
     let sweep_captured = Arc::clone(&sweep_records);
@@ -6227,11 +6241,14 @@ fn assert_the_concurrent_sweep_is_accounted_exactly() -> (u64, u64) {
         owned_workers * iterations,
     );
 
-    // The thread census reads the ids this very sweep observed. Both layers were
-    // registered over the same scope, so the set below is exactly the one the
-    // observing layer saw, compared as a SET rather than in order, because the
-    // worker thread and this thread race to publish the same records into two
-    // independent cells.
+    // DELIVERY-NAMED EVENTS, handed to the helper that reads both sides. The
+    // `observing_threads` handle below is the very cell the observing layer
+    // filled during this sweep -- the two layers were registered over the same
+    // scope -- so what the helper compares is not a value with itself. It
+    // compares two EMPTY sets over this scope, because the worker thread's
+    // records never reach a thread-local capture on any platform; that helper
+    // says so at its own site, and the one-worker bound is established by the
+    // source census `assert_the_wrapper_spawns_exactly_one_named_worker`.
     assert_delivery_reached_one_product_thread(&captured, &observing_threads);
 
     let sweep_admitted: Vec<AdmissionOutcome> =
@@ -6541,18 +6558,30 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
 /// replace: the three they guard could never fail.
 ///
 /// WHAT IS PROVEN AT RUNTIME, ON BOTH PLATFORMS:
-/// * the filter is LIVE. Every record in `captured` is checked against
+/// * the filter is LIVE. Every record in `captured` is tested against
 ///   [`DELIVERY_EVENT_NAME`], so a delivery record emitted on a caller-side
-///   thread IS selected and every arm below turns red;
-/// * every such record's disposition is one the product really publishes. A
-///   record claiming a delivery under a name outside
-///   [`delivery_event_names`] fails here instead of being swept into silence;
-/// * the two delivery observers over this same scope see the SAME emitting
-///   threads -- one reads them off the records, the other off the layer's own
-///   ids, and they are filled independently;
-/// * the name this filter selects on is one the product REALLY writes, which is
-///   a census of the product's own source and not a restatement of the literal
-///   above.
+///   thread IS selected rather than swept into silence;
+/// * what such a record would turn RED depends on the record itself, and saying
+///   so precisely matters more than a blanket claim. A delivery record appearing
+///   here at all fails the `delivery_records.is_empty()` guard; one carrying no
+///   `outcome=` field, or an `outcome=` outside [`delivery_event_names`], fails
+///   the two disposition arms as well. A well-formed one -- `outcome=` present
+///   and published -- fails the emptiness guard and nothing else;
+/// * UNCONDITIONAL, and able to fail today whatever the scope holds: the census
+///   that `event = "host.event_log_delivery"` is written exactly once, in the
+///   product's own source, which is not a restatement of the literal above; and
+///   the `delivery_records.is_empty()` regression guard, described at its site;
+/// * NOT evidence of anything: the set equality between the two delivery
+///   observers. Over this scope both sets are empty, so it compares two empty
+///   sets. What it does exercise is that both observers read the field named
+///   `event`, which is a fact about this file rather than about the product.
+///
+/// CONDITIONAL AND VACUOUS OVER THIS SCOPE, named here so it is not mistaken for
+/// proof: the `distinct_threads.len() <= 4` bound and the two disposition arms
+/// hold only when a delivery record exists in `captured`, and no such record
+/// exists here (see the next paragraph for why). Each is a real check against a
+/// real record that no present record exercises, and each is satisfied today by
+/// the empty set.
 ///
 /// WHAT IS NOT PROVEN AT RUNTIME, and is claimed from source census instead:
 /// that the product emits its delivery record FROM its single
@@ -6571,8 +6600,9 @@ fn assert_the_sweep_admissions_are_accounted_exactly(
 /// a proof.
 ///
 /// `captured` is the sweep's own record set and `observing_threads` the cell
-/// the sweep's observing layer collected, so the two sides below are filled
-/// independently and their equality is a real one.
+/// the sweep's observing layer collected. The two are filled independently, by
+/// two different layers, which is a fact about THIS FILE -- it is not evidence
+/// about the product, and over this scope both sides are empty.
 fn assert_delivery_reached_one_product_thread(
     captured: &[CapturedRecord],
     observing_threads: &Arc<Mutex<Vec<std::thread::ThreadId>>>,
@@ -6630,16 +6660,38 @@ fn assert_delivery_reached_one_product_thread(
     // The single-worker BOUND is not dropped, it is asserted where it can fail,
     // by `assert_the_wrapper_spawns_exactly_one_named_worker`.
     //
-    // WHAT SURVIVES HERE, and is not a tautology: this sweep's OWN threads all
-    // inherit the thread-local default, so their records ARE in `captured`, and
-    // the arm below bounds the threads those records can have come from. A
-    // product that grew a thread of its own INSIDE this scope would be emitting
-    // on a thread that inherited the capture, and would drive that count past
-    // the bound -- which is why the bound is stated at all rather than left as
-    // the emptiness the observer arm already implies. The delivery dispositions
-    // are checked on BOTH platforms too, because a delivery record absent from a
-    // caller-side capture is only meaningful against a capture that is known to
-    // be reaching.
+    // WHAT SURVIVES HERE IS NOT PROOF, and is not claimed as any. The previous
+    // text in this file described the arms below as surviving over a non-empty
+    // scope, on the strength of this sweep's own threads inheriting the
+    // thread-local default. That inference was wrong, and it is withdrawn: the
+    // sweep's own threads DO inherit the capture, but the DELIVERY FILTER
+    // selects only records carrying the product's `event = "host.event_log_delivery"`
+    // name, and no sweep-owned thread emits that record -- only the product's
+    // worker does, on a thread that inherits nothing. So `delivery_records` is
+    // EMPTY, and therefore `distinct_threads`, `observing_ids`, and
+    // `claimed_dispositions` are all empty. The count bound and the two
+    // disposition arms are consequently vacuous over this scope: each is
+    // satisfied today by the empty set and could not fail for the product as it
+    // stands. They are retained as regression guards against a future product
+    // that emits the delivery record on a caller-side thread, and they are NOT
+    // offered as evidence for anything.
+    //
+    // THE NEXT ARM IS THE REGRESSION GUARD, and this is what it is worth. A
+    // product that claimed a delivery WITHOUT dispatching it through its own
+    // worker is a real regression, and the check below is the semantically right
+    // one for it -- but for ANY product observed through a thread-local capture
+    // it CANNOT fail, because no such product can put a delivery record into
+    // this scope. It is retained as a guard against a future product that emits
+    // the delivery record off-worker, and it is NOT offered as evidence. The
+    // limitation belongs to the HARNESS: `with_default` is thread-local. It is
+    // not a statement about the product, about the delivery path, or about the
+    // platform.
+    //
+    // THE ONE-WORKER BOUND, the thing these arms cannot establish, is asserted
+    // where it can fail, by `assert_the_wrapper_spawns_exactly_one_named_worker`:
+    // exactly one `.spawn(`, exactly one `.name("eliot-event-log"`, zero
+    // `thread::spawn`, and exactly one `worker_spawned.store(true)` in the
+    // product's own source.
     assert!(
         distinct_threads.len() <= 4,
         "at most the sweep's own four worker threads can reach a thread-local capture -- the \
@@ -6652,8 +6704,11 @@ fn assert_delivery_reached_one_product_thread(
     // is not a name the product's own vocabulary publishes, fails here. With the
     // field read from the right place a realistic product record -- `event =
     // "host.event_log_delivery"` with `outcome = "registered_source_accepted"`
-    // -- is selected AND accepted, so this arm is not a filter that can only
-    // ever see the empty set.
+    // -- would be selected AND accepted, so these arms discriminate between
+    // records rather than accepting everything. What they do NOT do is see any
+    // record today: `delivery_records` is empty over this scope for the reason
+    // given above, so both `.all()` calls are satisfied by the empty set. They
+    // are kept as guards, not cited as evidence.
     assert!(
         delivery_records
             .iter()
