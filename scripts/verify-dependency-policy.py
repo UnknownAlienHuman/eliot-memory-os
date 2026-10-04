@@ -1303,7 +1303,7 @@ def collect_direct_rust_dependencies(root: Path) -> tuple[list[Finding], set[str
 def check_cargo_inventory(manifest_data: dict, direct_deps: set[str]) -> list[Finding]:
     findings: list[Finding] = []
     inventory = manifest_data.get("direct_dependencies", {})
-    required_fields = ("consumer", "owner", "reason", "features", "public_exposure", "removal_plan")
+    required_strings = ("consumer", "owner", "reason", "public_exposure", "removal_plan")
 
     for dep in sorted(direct_deps):
         if dep not in inventory:
@@ -1319,16 +1319,32 @@ def check_cargo_inventory(manifest_data: dict, direct_deps: set[str]) -> list[Fi
             )
             continue
 
-        for field in required_fields:
-            if field not in entry:
-                findings.append(
-                    Finding(
-                        "DEP-003",
-                        "config/dependency-policy.toml",
-                        1,
-                        f"dependency '{dep}' is missing required field '{field}' in inventory",
-                    )
+        # Presence is not evidence. A row whose disposition fields are present but
+        # empty used to produce zero findings and still report PASS, and those
+        # empty values were then published into the SBOM as the component
+        # disposition -- an unowned, unjustified, unbounded dependency recorded as
+        # fully dispositioned. The workspace sibling already required real values;
+        # the direct inventory must require the same of its own rows.
+        invalid = [
+            field
+            for field in required_strings
+            if not isinstance(entry.get(field), str) or not entry[field].strip()
+        ]
+        features = entry.get("features")
+        if not isinstance(features, list) or any(
+            not isinstance(feature, str) or not feature.strip() for feature in features
+        ):
+            invalid.append("features")
+        if invalid:
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"dependency '{dep}' inventory disposition is missing valid fields: "
+                    + ", ".join(sorted(set(invalid))),
                 )
+            )
 
     return findings
 
@@ -1572,8 +1588,30 @@ def check_exceptions(manifest_data: dict, now_dt: datetime | None = None) -> lis
                     Finding("DEP-010", "config/dependency-policy.toml", 1, f"exception missing required field '{req}'")
                 )
 
+        # Presence is not ownership. An exception whose owner, compensating
+        # control, removal condition and expiry are all present but empty used to
+        # produce zero findings: the expiry branch below is guarded by `if
+        # exp_str:`, so an empty expiry skipped it entirely and the exception was
+        # neither owned, nor expiring, nor bounded. An unbounded exception is
+        # exactly what an exception review exists to prevent, so every value that
+        # gives the exception its meaning must be a real one.
+        unowned = [
+            field
+            for field in ("package", "version", "advisory", "owner", "compensating_control", "expires_at", "removal_condition")
+            if not isinstance(exc_entry.get(field), str) or not exc_entry[field].strip()
+        ]
+        if unowned:
+            findings.append(
+                Finding(
+                    "DEP-010",
+                    "config/dependency-policy.toml",
+                    1,
+                    "exception is missing valid fields: " + ", ".join(sorted(set(unowned))),
+                )
+            )
+
         exp_str = exc_entry.get("expires_at", "")
-        if exp_str:
+        if isinstance(exp_str, str) and exp_str.strip():
             try:
                 exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
                 if exp_dt < now_dt:
