@@ -56,9 +56,14 @@ use crate::host_job_launch::LaunchPhaseCorrelation;
 // global dedup cache and no terminal emission here: the designated terminal for
 // one failed launch is `lib.rs`'s `HostTerminalGuard` on the OUTER contour - the
 // STARTUP path arms `BOUNDARY_OPEN_TERMINAL` there, a cutover-path launch by
-// `BOUNDARY_BACKUP_CUTOVER_TERMINAL` instead - and the `start_approved` leaf
-// guard is phase-only (#978 audit defect 2), so this cell cannot emit a second terminal.
-// terminal. Typed rejections stay `HostError::Platform` (case 978/2); admitted
+// `BOUNDARY_BACKUP_CUTOVER_TERMINAL`. This cell names TWO owners, not three, and the
+// omission is deliberate rather than an oversight: every `host_launch_options_observe`
+// call site is inside this file, and neither route that reaches
+// `HostComposition::open_for_profile`'s phase-B resume (lib.rs:7770) or
+// `HostComposition::finalize_phase_b_request`'s (lib.rs:8138) - the only two callers of
+// the resume owner `BOUNDARY_RESUME_PENDING_TERMINAL` - passes through this cell. The
+// `start_approved` leaf guard is phase-only (#978 audit defect 2), so this cell cannot
+// emit a second terminal. Typed rejections stay `HostError::Platform` (case 978/2); admitted
 // launches are distinct positive observations carrying the exact admitted
 // identities (cases 978/1, 978/12).
 fn host_launch_options_note_event_log_unavailable() {
