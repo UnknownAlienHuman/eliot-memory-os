@@ -10,8 +10,12 @@
 //! receipt, the installation status the delivery itself recorded
 //! (`status`/`code`/`completed`) is reported under its own `installation` key
 //! and gates `installed`: an install the record says did not complete is
-//! `NOT_INSTALLED` even when every target byte matches. This module executes
-//! no repair, mints no authority, and mutates no store.
+//! `NOT_INSTALLED` even when every target byte matches. An expectation naming
+//! no static surface at all — no target file, no registration, no hook event
+//! — yields no `installed` claim either: nothing was read back to compare, so
+//! the report is `UNVERIFIED_PLAN_GAP` with `installation: null`, never a
+//! vacuous success. This module executes no repair, mints no authority, and
+//! mutates no store.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -139,7 +143,10 @@ pub struct IntegrationReport {
     ///
     /// Requires, in addition to the read-back evidence above, that the
     /// expectation's source record either states no installation status (a
-    /// plain expectation) or records a completed installation.
+    /// plain expectation) or records a completed installation, and that the
+    /// expectation names at least one static target: an expectation with no
+    /// target file, registration, or hook event yields no `installed` claim,
+    /// because nothing was read back to compare.
     pub installed: bool,
     /// Install surface plus live handshake.
     pub live: bool,
@@ -151,7 +158,9 @@ pub struct IntegrationReport {
     /// injection). `INSTALLED_NOT_LIVE` is emitted by [`verify_profile`] when
     /// every read-back file hash matches and the expectation names no
     /// registrations or hook events — the whole static surface is then
-    /// evidenced — while no handshake was observed.
+    /// evidenced — while no handshake was observed. An expectation naming no
+    /// static surface at all reports `UNVERIFIED_PLAN_GAP`: nothing was named
+    /// to read back, so nothing can be evidenced.
     pub disposition: String,
 }
 
@@ -468,9 +477,11 @@ pub fn evaluate(
 /// provider injection), so caller-supplied lists and booleans stay capped to
 /// unverified: any expected registration or hook event withholds `installed`
 /// (`UNVERIFIED_PLAN_GAP` when the read-back hashes match, `NOT_INSTALLED`
-/// otherwise), and `live` is never granted. A fully read-back static surface
-/// with no registration or hook-event expectation is `INSTALLED_NOT_LIVE`.
-/// A forged `handshake_ok: true` can never yield a live verdict.
+/// otherwise), an expectation naming no static surface at all withholds it too
+/// (nothing was read back to compare), and `live` is never granted. A fully
+/// read-back static surface with no registration or hook-event expectation is
+/// `INSTALLED_NOT_LIVE`. A forged `handshake_ok: true` can never yield a live
+/// verdict.
 pub fn verify_profile(
     profile: &str,
     expectation_path: &Path,
@@ -518,10 +529,25 @@ pub fn verify_profile(
     // unverified and withholds `installed`; the handshake has no runner, so
     // `live` is never granted here. A fully read-back static surface with no
     // registration or hook-event expectation is installed but not live; a
-    // forged caller-supplied `handshake_ok: true` can never yield live.
+    // forged caller-supplied `handshake_ok: true` can never yield live, and an
+    // expectation naming no static surface at all cannot yield `installed`
+    // either, because nothing was read back to compare.
     report.live = false;
     let static_unverifiable =
         !expected.expected_registrations.is_empty() || !expected.expected_hook_events.is_empty();
+    // An expectation that names no static surface at all — no target file, no
+    // registration, no hook event — has nothing to read back: the loop above
+    // iterates zero keys, and every comparison over an empty denominator is
+    // vacuously true. Granting `installed` from it would certify an
+    // installation on evidence that was never gathered, from a record that may
+    // state no installation status of its own (`installation: null`). The same
+    // guard that withholds `installed` for axes this front door cannot observe
+    // therefore also covers an expectation that observes nothing; no new
+    // disposition name is introduced, the existing `UNVERIFIED_PLAN_GAP`
+    // reports it.
+    let names_no_static_surface = expected.expected_file_hashes.is_empty()
+        && expected.expected_registrations.is_empty()
+        && expected.expected_hook_events.is_empty();
     // An install that the delivery itself recorded as not completed is not an
     // installation, whatever the bytes on disk happen to say. The receipt's
     // `completed` is the delivery's own claim about the install, and it
@@ -534,7 +560,11 @@ pub fn verify_profile(
         .install_status
         .as_ref()
         .is_some_and(|status| !status.completed);
-    if install_not_completed || static_unverifiable || !report.file_hash_ok {
+    if install_not_completed
+        || static_unverifiable
+        || names_no_static_surface
+        || !report.file_hash_ok
+    {
         report.installed = false;
         if report.file_hash_ok && !install_not_completed {
             "UNVERIFIED_PLAN_GAP".clone_into(&mut report.disposition);
@@ -581,7 +611,7 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
         "installed": report.installed,
         "live": report.live,
         "disposition": report.disposition,
-        "note": "installation is the status the install receipt itself recorded (null when the expectation record carries none), reported separately from the evidence below: file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06). installed is granted only when every expected hash matches, nothing unverifiable is expected, and the record does not state an incomplete install; live is never granted here",
+        "note": "installation is the status the install receipt itself recorded (null when the expectation record carries none), reported separately from the evidence below: file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06). installed is granted only when every expected hash matches, the expectation names at least one static target, nothing unverifiable is expected, and the record does not state an incomplete install; live is never granted here",
     })
 }
 
@@ -801,6 +831,71 @@ mod tests {
         assert_eq!(value["installed"], false);
         assert_eq!(value["live"], false);
         assert_eq!(value["disposition"], "NOT_INSTALLED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expectation_naming_no_static_surface_cannot_report_installed() {
+        // The defect this guards: a record naming nothing to check makes every
+        // comparison vacuously true, so the gate used to certify `installed`
+        // without reading back a single byte and while its own record stated
+        // no installation status. Both admitted shapes must stay unevidenced.
+        let dir = profile_dir("empty-denominator");
+        let expectation_path = dir.join("expectation.json");
+        let observation_path = dir.join("observation.json");
+        std::fs::write(
+            &expectation_path,
+            serde_json::to_vec(&IntegrationExpectation {
+                profile: "demo".to_owned(),
+                expected_file_hashes: BTreeMap::new(),
+                expected_registrations: Vec::new(),
+                expected_hook_events: Vec::new(),
+            })
+            .expect("write expectation"),
+        )
+        .expect("write expectation file");
+        std::fs::write(&observation_path, b"{}").expect("write observation file");
+        let value =
+            verify_profile("demo", &expectation_path, &observation_path).expect("gate runs");
+        assert_eq!(value["installation"], serde_json::Value::Null);
+        assert_eq!(value["installed"], false);
+        assert_eq!(value["live"], false);
+        assert_eq!(value["disposition"], "UNVERIFIED_PLAN_GAP");
+
+        // Same rule on the receipt branch: the delivery's own `completed: true`
+        // is reported beside the evidence, but a preview that named no target
+        // has nothing to read back and still cannot yield an installed claim.
+        let preview = serde_json::json!({
+            "expected_coverage_profile": {
+                "profile": "demo",
+                "expected_file_hashes": {},
+                "expected_registrations": [],
+                "expected_hook_events": [],
+            }
+        });
+        let digest = eliot_contracts::sha256_hex(
+            &eliot_contracts::canonical_json_bytes(&preview).expect("canonical preview bytes"),
+        );
+        let receipt_path = dir.join("receipt.json");
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&serde_json::json!({
+                "contract": INSTALL_RECEIPT_CONTRACT,
+                "profile": "demo",
+                "preview": preview,
+                "preview_digest": digest,
+                "status": "INSTALL_COMPLETED",
+                "code": "OK",
+                "completed": true,
+            }))
+            .expect("write receipt"),
+        )
+        .expect("write receipt file");
+        let value = verify_profile("demo", &receipt_path, &observation_path).expect("gate runs");
+        assert_eq!(value["installation"]["completed"], true);
+        assert_eq!(value["installed"], false);
+        assert_eq!(value["live"], false);
+        assert_eq!(value["disposition"], "UNVERIFIED_PLAN_GAP");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
