@@ -3508,17 +3508,81 @@ fn check_cancellation(
 /// [`check_cancellation`] returns while either stage owes a reconciliation.
 /// Inherited uncertainty is never reset by an invocation that has not written.
 ///
-/// The block is bounded and preserves every other decision: the purge reading,
-/// the disposition mapping and the commit below are untouched, nothing is
-/// published and nothing is written, and the same identity proceeds the moment
-/// its carrier stage is answered — by a cleared ledger, by competent carrier
-/// evidence [`SurrealStoreAdapter::reconcile_operation`] feeds the slot, or by
-/// the carrier readback a `Restored` disposition already performs.
+/// Every other decision is preserved: the purge reading, the disposition
+/// mapping and the commit below are untouched, nothing is published and nothing
+/// is written, and the refusal is the same typed value the carrier publication
+/// already returns for an unproven write.
+///
+/// The exits are exactly these two, and there is no third:
+///
+/// 1. a later invocation of the same identity reads a disposition whose subject
+///    may be served again — a cleared ledger decides
+///    [`MemberDisposition::Restored`], which reaches
+///    [`SurrealStoreAdapter::resolve_carrier_stage`] and its bounded exact
+///    carrier readback; and
+/// 2. that same `Restored` readback, when it proves the carriers, discharges
+///    the stage and authorises the same-identity carrier retry.
+///
+/// There is deliberately **no** exit for a subject that must never become
+/// servable again. While the ledger keeps the member scope out of the
+/// destination, no carrier row can be published, none can be read back, and so
+/// the stage cannot be proved: for that subject this refusal is not bounded by
+/// anything this process controls, and nothing here claims a bound it cannot
+/// show. The block stops the operation from committing; it does not promise that
+/// the obligation ever clears on its own.
+///
+/// In particular [`SurrealStoreAdapter::reconcile_operation`] is **not** one of
+/// the exits, and it is named here so the next reader does not assume otherwise.
+/// It refreshes the slot from a durable record for the same identity, and the
+/// only field it can move is `attempt.effect_state.apply`, raised by
+/// [`project_provider_apply_state`] — whose entire body is one
+/// `attempt.effect_state.apply = attempt.effect_state.apply.max(provider_state)`
+/// assignment plus the lock and the missing-attempt early return. There is no
+/// carrier projection there or anywhere else: the carrier stage is raised only
+/// by [`RestoreEffectExposure::note_carrier_verified`], and its only two
+/// production call sites are the bounded exact carrier readbacks in
+/// [`publish_archive_member_carriers`] and
+/// [`SurrealStoreAdapter::resolve_carrier_stage`]. A committed canonical import
+/// is not evidence that the carrier publication happened exactly once, so
+/// [`project_provider_apply_state`] cannot answer this predicate.
 fn purge_disposition_blocks_on_unproven_carrier(
     scope_disposition: MemberDisposition,
     exposure: RestoreEffectExposure,
 ) -> bool {
     scope_disposition != MemberDisposition::Restored && exposure.carrier_stage().is_unproven()
+}
+
+/// Decides the published carrier set for the disposition that publishes no
+/// carrier row.
+///
+/// This is the whole non-`Restored` arm of the `let published` decision in
+/// [`SurrealStoreAdapter::apply_canonical_batch`], hoisted out so that decision
+/// is executable without a live provider. It has exactly one production caller,
+/// [`SurrealStoreAdapter::apply_canonical_batch`], and it does one thing:
+///
+/// - it asks the one closed predicate
+///   [`purge_disposition_blocks_on_unproven_carrier`], unchanged; and
+/// - on an answer of "blocks", it returns that predicate's refusal — the
+///   existing typed [`StoreError::UnknownOutcome`] built by [`unknown_outcome`]
+///   over this operation's own identity. No new error variant, no new reason
+///   string and no new mechanism is introduced here; the value is byte-for-byte
+///   the one [`publish_archive_member_carriers`]'s `NotApplied` arm and
+///   [`check_cancellation`] already return for an unproven carrier write.
+/// - otherwise it returns an empty published set, because a disposition other
+///   than [`MemberDisposition::Restored`] has no carrier row to publish.
+///
+/// `operation_id` is a parameter rather than read from the exposure because the
+/// refusal must name the operation that is being refused, and the exposure
+/// carries no identity: it is a pair of stages and nothing else.
+fn carrier_publication_for(
+    scope_disposition: MemberDisposition,
+    exposure: RestoreEffectExposure,
+    operation_id: &str,
+) -> Result<Vec<PublishedCarrier>, StoreError> {
+    if purge_disposition_blocks_on_unproven_carrier(scope_disposition, exposure) {
+        return Err(unknown_outcome(operation_id));
+    }
+    Ok(Vec::new())
 }
 
 /// Verifies the expected-state identity: every expected head must carry the
@@ -4763,10 +4827,17 @@ impl SurrealStoreAdapter {
             // invocation that has not written". A carrier stage that is proved,
             // or that was never submitted, is untouched here — only the unproven
             // case waits, and it waits without writing anything.
-            if purge_disposition_blocks_on_unproven_carrier(scope_disposition, *exposure) {
-                return Err(unknown_outcome(batch.operation.operation_id.as_str()));
-            }
-            Vec::new()
+            //
+            // The whole arm is one call to [`carrier_publication_for`], which
+            // owns that decision and refuses with the same typed value the
+            // publication branch refuses with. It is the *only* production
+            // caller of that helper, so this arm cannot grow a second path
+            // around it.
+            carrier_publication_for(
+                scope_disposition,
+                *exposure,
+                batch.operation.operation_id.as_str(),
+            )?
         };
         let resolved = resolve_archive_members(transport, &self.config, batch).await?;
         let imports: Vec<&ResolvedArchiveMember> = if scope_disposition
@@ -7782,15 +7853,6 @@ mod tests {
         );
     }
 
-    /// This file's own text, read at compile time, for the one assertion that
-    /// cannot be executed without a live provider.
-    ///
-    /// The repository proves that kind of structural claim the same way elsewhere
-    /// (`bins/eliot-kernel/tests/backup_restore.rs` reads its own coordinator
-    /// source), and the alternative — restating the branch here — would be a mock
-    /// of the function under proof rather than a case.
-    const RESTORE_SOURCE: &str = include_str!("backup_restore.rs");
-
     /// One current purge-ledger entry over this batch's own archive member
     /// digest, in the state the case names.
     ///
@@ -7816,44 +7878,12 @@ mod tests {
         }
     }
 
-    // WORK_UNIT_CASE: 2666/20 - a suppressed disposition no longer carries an
-    // inherited unproven carrier stage past the carrier stage.
-    //
-    // The defect this pins: the carrier decision was reachable only on the
-    // `Restored` branch, while `decide_purge` re-reads the CURRENT purge ledger on
-    // every invocation, so one operation identity could reach the canonical apply
-    // under `Suppressed`/`Unresolved` with a carrier stage an earlier incarnation
-    // had left unproven. Nothing on that path publishes or reads a carrier row, so
-    // the obligation could never be discharged, and `release` (:1538
-    // `!merged.any_unproven()`) can never evict a slot that still carries one: the
-    // identity stays occupied for as long as the ledger keeps the member scope out
-    // of the destination.
-    //
-    // What this case executes: the real guard lifecycle that produces the inherited
-    // exposure (`RestoreAttemptGuard::acquire` / `Drop` -> `release`), the real
-    // `decide_purge` over a real, validated ledger entry, the real decision
-    // `apply_canonical_batch` consults, the real refusal value, and the real
-    // retention predicate. What it does NOT cover: `apply_canonical_batch` is
-    // `async` over a live `&RpcTransport` obtained from `restore_transport(self)`
-    // (:4560), so the branch itself — that this refusal is *returned* rather than
-    // the commit proceeding, and the provider calls that would follow it — cannot
-    // be observed here at all; and the three-arm
-    // `PurgeDecision -> MemberDisposition` mapping (:4694-4697) is asserted only
-    // through `decide_purge`'s own verdicts, because it is written inline in the
-    // function under proof. The one claim that is therefore made on the source text
-    // is the branch wiring itself, asserted below over this file's own bytes: the
-    // non-`Restored` arm must consult the decision and must refuse before it
-    // publishes its empty set, and the decision must be built from the carrier
-    // stage with `Restored` exempt. That is the single mutation this case kills.
-    //
-    // Measured sites: the branch at :4766-4769 inside the `let published = if
-    // scope_disposition == MemberDisposition::Restored` arm; the decision at
-    // :3517; the refusal it shares with the carrier publication's `NotApplied` arm
-    // (:2945) and with `check_cancellation` (:3479); the apply-stage gate at
-    // :4627 that does NOT answer this schedule; the retention predicate at :1538.
-    /// An earlier incarnation handed the carrier publication to the provider and never
-    /// learned what became of it. The pre-poll mark and the drop are the production
-    /// marks; nothing here is a hand-built exposure.
+    // An earlier incarnation handed the carrier publication to the provider and never
+    // learned what became of it: this helper acquires the real attempt guard, marks the
+    // carrier stage may-have-been-submitted through the production pre-poll mark, drops
+    // the guard so `release` merges the exposure back into the slot, and asserts the
+    // slot still carries that unproven carrier stage and an untouched apply stage.
+    // Nothing here is a hand-built exposure.
     fn abandoned_carrier_publication(batch: &CanonicalRestoreBatch, config: &SurrealAdapterConfig) {
         let mut abandoned = acquire_guard(batch, config);
         abandoned
@@ -7876,6 +7906,65 @@ mod tests {
         );
     }
 
+    // WORK_UNIT_CASE: 2666/20 - a suppressed disposition no longer carries an
+    // inherited unproven carrier stage past the carrier stage.
+    //
+    // The defect this pins: the carrier decision was reachable only on the
+    // `Restored` branch, while `decide_purge` re-reads the CURRENT purge ledger on
+    // every invocation, so one operation identity could reach the canonical apply
+    // under `Suppressed`/`Unresolved` with a carrier stage an earlier incarnation
+    // had left unproven. Nothing on that path publishes or reads a carrier row, so
+    // the obligation could never be discharged, and `release` (:1538
+    // `!merged.any_unproven()`) can never evict a slot that still carries one: the
+    // identity stays occupied for as long as the ledger keeps the member scope out
+    // of the destination.
+    //
+    // What this case executes: the real guard lifecycle that produces the inherited
+    // exposure (`RestoreAttemptGuard::acquire` / `Drop` -> `release`), the real
+    // `decide_purge` over a real, validated ledger entry, the real decision
+    // `apply_canonical_batch` consults, the real refusal value, and the real
+    // retention predicate.
+    //
+    // The wiring is asserted BEHAVIOURALLY, not over this file's bytes. The
+    // non-`Restored` arm of `apply_canonical_batch` was hoisted verbatim into the
+    // pure production helper `carrier_publication_for` (:3577), whose single
+    // production caller is that arm (:4836); the case calls the same helper and
+    // asserts, for the disposition/exposure pairs the real ledger reading
+    // produces, exactly what the arm would therefore do. The mutation this case
+    // kills is a `carrier_publication_for` body that returns `Ok(Vec::new())`
+    // where it must return the typed refusal — replacing the refusal with an
+    // empty published set, or exempting `Suppressed`/`Unresolved` from the
+    // predicate, or swapping the predicate for one that ignores the carrier stage
+    // — because the first assertion below executes that body and would observe
+    // `Ok` instead of the `UnknownOutcome` naming this operation. An earlier
+    // revision of this case asserted the same wiring by reading this file's own
+    // text with `include_str!`; that assertion proved nothing, because
+    // `std::hint::black_box(false) && …` around the call, naming the predicate in
+    // the arm's prose comment, or an earlier duplicate of the predicate's
+    // signature would all have kept every asserted byte and its ordering, so it
+    // was deleted rather than patched.
+    //
+    // What it does NOT cover, and does not claim: `apply_canonical_batch` is
+    // `async` over a live `&RpcTransport` obtained from `restore_transport(self)`
+    // (:4624), so whether the arm is *reached* on any given invocation — and the
+    // provider calls that would follow it — cannot be observed here without a
+    // provider; the card assigns those poll/drop proofs to the assembled-product
+    // test phase. Removing the `carrier_publication_for` call from the arm
+    // altogether is likewise not observable from here, because the helper is
+    // pure and has no side channel back into this test; what bounds that risk is
+    // the structural one, that the helper has exactly one production caller and
+    // therefore cannot be inlined away, skipped, or given a second path around
+    // it without that caller changing. No boundedness is claimed for a subject
+    // that must never become servable again: no carrier row can be published or
+    // read back for it, so the refusal for that subject is not bounded by
+    // anything this process controls.
+    //
+    // Measured sites: the hoisted arm at :4836 inside the `let published = if
+    // scope_disposition == MemberDisposition::Restored` arm (:4771); the helper at
+    // :3577; the predicate it consults at :3548; the refusal it shares with the
+    // carrier publication's `NotApplied` arm (:2945) and with `check_cancellation`
+    // (:3479); the apply-stage gate at :4691 that does NOT answer this schedule;
+    // the retention predicate at :1538.
     #[test]
     fn a_suppressed_disposition_blocks_on_an_inherited_unproven_carrier_stage() {
         let _serial = ledger_serial();
@@ -7964,6 +8053,28 @@ mod tests {
         // returns for an unproven publication, naming this operation.
         assert_carrier_refusal_is_the_typed_unknown(operation_id);
 
+        // The wiring itself, executed rather than asserted over this file's bytes.
+        //
+        // The non-`Restored` arm of `apply_canonical_batch` is exactly one call to
+        // `carrier_publication_for`, hoisted out of the `async` function for that
+        // reason, and that helper has no other production caller. Calling it here
+        // therefore asserts what the arm does, over the same inherited exposure the
+        // arm would be handed, instead of restating the arm as a mock of itself.
+        //
+        // The mutation this kills is a `carrier_publication_for` body that answers
+        // `Ok(Vec::new())` where it must refuse: the refusal replaced by an empty
+        // published set, `Suppressed`/`Unresolved` exempted from the predicate, or
+        // a predicate swapped for one that ignores the carrier stage. Every such
+        // mutation leaves the predicate assertions above passing, and this block
+        // observes `Ok` where it requires the typed `UnknownOutcome` naming this
+        // operation. It reads no source text, so `std::hint::black_box(false) && …`
+        // around the production call, the predicate's name appearing in the arm's
+        // prose comment, and an earlier duplicate of the predicate's signature all
+        // fail to affect it. What it cannot observe is the arm's *reachability* on
+        // a live provider — see the marker comment above.
+        let inherited = exact.exposure;
+        carrier_publication_arm_decides_by_disposition_and_stage(inherited, operation_id);
+
         // The blocked invocation wrote nothing, so the obligation it inherited must
         // survive it untouched and keep the slot retained.
         drop(exact);
@@ -7987,8 +8098,76 @@ mod tests {
              waits for carrier reconciliation and is never silently evicted"
         );
         forget_slot(&batch, &config);
+    }
 
-        suppressed_branch_consults_the_carrier_decision();
+    /// The production `carrier_publication_for` truth table, executed. Each arm
+    /// observes a value the production helper returns, so a helper that answers
+    /// `Ok` where it must refuse, dispositions exempted from the predicate, or a
+    /// predicate that ignores the carrier stage all fail here. It reads no source
+    /// text, so a `black_box(false) &&` conjunct around the production call cannot
+    /// hide from it. What it cannot observe is the arm's reachability on a live
+    /// provider; see the marker comment.
+    fn carrier_publication_arm_decides_by_disposition_and_stage(
+        inherited: RestoreEffectExposure,
+        operation_id: &str,
+    ) {
+        for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
+            match carrier_publication_for(suppressed, inherited, operation_id) {
+                Err(refusal) => assert!(
+                    matches!(
+                        refusal,
+                        StoreError::UnknownOutcome { operation_id: reported }
+                            if reported.as_str() == operation_id
+                    ),
+                    "the arm's refusal is the existing typed unknown outcome over this \
+                     operation identity — no new variant and no new reason string"
+                ),
+                Ok(_) => panic!(
+                    "{suppressed:?} owes a carrier reconciliation, so the arm must refuse \
+                     instead of returning a carrier set"
+                ),
+            }
+        }
+        // A `Restored` disposition never takes that refusal path here: it is decided
+        // by exact carrier readback in `resolve_carrier_stage`, and blocking it would
+        // close the same-identity carrier retry the card clause requires.
+        let restored =
+            carrier_publication_for(MemberDisposition::Restored, inherited, operation_id)
+                .expect("Restored is exempt from the carrier block and cannot refuse here");
+        assert!(
+            restored.is_empty(),
+            "and `Restored` publishes nothing through this path either: \
+             `carrier_publication_for` is only ever the non-Restored arm's set"
+        );
+
+        for suppressed in [MemberDisposition::Suppressed, MemberDisposition::Unresolved] {
+            // A carrier stage an exact readback already proved.
+            let mut proved = RestoreEffectExposure::new(RestoreStageExposure {
+                carrier: RestoreEffectState::WriteMayHaveBeenSubmitted,
+                apply: RestoreEffectState::NoWriteSubmitted,
+            });
+            proved.note_carrier_verified();
+            let published = carrier_publication_for(suppressed, proved, operation_id).expect(
+                "a proved carrier stage owes nothing, so the arm proceeds with an empty \
+                 published set rather than refusing",
+            );
+            assert!(
+                published.is_empty(),
+                "{suppressed:?} publishes no carrier row of its own, so the set is empty \
+                 rather than refused"
+            );
+            // A carrier stage that was never submitted at all.
+            let never = RestoreEffectExposure::new(RestoreStageExposure::NONE);
+            let published = carrier_publication_for(suppressed, never, operation_id).expect(
+                "a slot that never submitted a carrier write owes nothing, so the arm \
+                 proceeds rather than refusing",
+            );
+            assert!(
+                published.is_empty(),
+                "{suppressed:?} still publishes no carrier row, and an unproven stage it \
+                 never reached is not an obligation"
+            );
+        }
     }
 
     /// A slot that never submitted a carrier write proceeds, and a slot whose carrier
@@ -8038,64 +8217,5 @@ mod tests {
             "the refusal is not a receipt-envelope failure: nothing is missing, the \
              outcome is unknown"
         );
-    }
-
-    /// The branch wiring, asserted over this file's own bytes because
-    /// `apply_canonical_batch` is `async` over a live `&RpcTransport` and cannot be
-    /// executed here. This is the weakest kind of proof in this file and is
-    /// labelled as such: it pins that the non-`Restored` arm consults the decision
-    /// and refuses before it returns its empty set, and it would NOT survive a
-    /// mutation that keeps those bytes while moving the guard into a branch that is
-    /// never taken. The behavioural half of the case is the decision's own truth
-    /// table and the retention assertions, which do execute.
-    fn suppressed_branch_consults_the_carrier_decision() {
-        let (after_start, _) = RESTORE_SOURCE
-            .split_once("let published = if scope_disposition == MemberDisposition::Restored {")
-            .expect(
-                "apply_canonical_batch decides the carrier stage from the purge \
-                 disposition it read this invocation",
-            );
-        let (region, _) = after_start
-            .split_once("let resolved = resolve_archive_members(")
-            .expect(
-                "that decision is one region, and the member resolution that \
-                 follows it is where the empty published set is consumed",
-            );
-        let guard = region
-            .find("purge_disposition_blocks_on_unproven_carrier(")
-            .expect(
-                "the disposition that publishes no carrier row must consult the \
-                 carrier stage before it returns an empty published set",
-            );
-        let empty_set = region
-            .find("Vec::new()")
-            .expect("the non-Restored arm still returns an empty published set");
-        assert!(
-            guard < empty_set,
-            "the carrier-stage block must precede the empty published set, otherwise \
-             the operation returns from the arm having decided nothing"
-        );
-        assert!(
-            region[guard..empty_set].contains("return Err(unknown_outcome("),
-            "the block must answer with the typed unknown outcome the carrier path \
-             already returns, not with a silent empty set"
-        );
-        let (after_signature, _) = RESTORE_SOURCE
-            .split_once("fn purge_disposition_blocks_on_unproven_carrier(")
-            .expect("the branch consults one named decision, defined in this file");
-        let (decision, _) = after_signature
-            .split_once("\n}\n")
-            .expect("that decision is a single closed function");
-        for fact in [
-            "MemberDisposition::Restored",
-            "carrier_stage()",
-            "is_unproven()",
-        ] {
-            assert!(
-                decision.contains(fact),
-                "the decision must be built from `{fact}`; a version that answers \
-                 without it would block or wave through every disposition alike"
-            );
-        }
     }
 }
