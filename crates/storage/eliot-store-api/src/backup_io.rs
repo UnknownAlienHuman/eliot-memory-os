@@ -788,9 +788,19 @@ impl SnapshotPage {
     /// is refused before any cursor or cumulative bound is examined, so a
     /// continuation can never advance a capture it does not belong to.
     ///
-    /// The cursor/bounds checks below are unchanged and still apply once the
-    /// handle is proven identical.
+    /// Both pages are validated on their own terms first. This method claims to
+    /// validate a continuation, so it may not assume its two arguments already
+    /// passed [`Self::validate`]: a page whose own cursor is foreign to its own
+    /// handle, whose cumulative bounds do not add up, or whose previous page has
+    /// a rewritten frontier is refused here instead of being compared onward.
+    ///
+    /// The exact previous frontier is then required, not merely plausible
+    /// counters: this cursor must equal the next cursor the previous page
+    /// published in every field, so a continuation can only begin where the
+    /// owner said the capture would continue.
     pub fn validate_continuation(&self, previous: &SnapshotPage) -> Result<(), StoreError> {
+        self.validate()?;
+        previous.validate()?;
         if previous.is_last || previous.coverage.state != SnapshotPageState::InProgress {
             return Err(StoreError::InvalidField {
                 field: "snapshot.page",
@@ -837,6 +847,22 @@ impl SnapshotPage {
             return Err(StoreError::InvalidField {
                 field: "snapshot.coverage.denominator_members",
                 reason: "continuation must preserve the owner-observed denominator",
+            });
+        }
+        // The previous page is independently valid, so a terminal state is
+        // impossible here and the frontier is present; a missing frontier is
+        // still refused rather than treated as "continue anywhere".
+        let frontier = previous
+            .next_cursor
+            .as_ref()
+            .ok_or(StoreError::InvalidField {
+                field: "snapshot.next_cursor",
+                reason: "previous page published no continuation frontier",
+            })?;
+        if &self.cursor != frontier {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.cursor",
+                reason: "continuation must start exactly at the previous page's next cursor",
             });
         }
         Ok(())
