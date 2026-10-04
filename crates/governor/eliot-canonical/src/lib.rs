@@ -1393,7 +1393,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("supported admission contract digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-byte-identity")
                 .expect("manifest digest"),
             semantic_commands: vec![NamedMutationRequest {
@@ -1522,7 +1523,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("supported admission contract digest"),
             operation_manifest_digest: golden_chain_manifest().digest.clone(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
@@ -1533,7 +1535,7 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: vec![EventId::new("event-golden-chain-1").expect("event id")],
-                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                projection_kinds: vec!["CurrentEpistemicPosition".to_owned()],
                 relation_kinds: vec!["relation-golden-chain-1".to_owned()],
             },
             security: SecurityContext::default(),
@@ -1555,7 +1557,7 @@ mod tests {
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "cc14c2c284762ebff5f1c8d11647a9191eda6debd4480ab605c3c8dadd766e54";
+        "8914234dc11ebe11fceea995149accadf22a51e1cb8ac242a39e676873fe9f71";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
