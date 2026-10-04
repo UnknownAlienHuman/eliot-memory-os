@@ -873,9 +873,13 @@ fn case_1_frozen_boundary_table_matches_fixture_and_propagated_exclusions() {
     // and arms the open terminal BEFORE it runs the wiring self-check over a
     // by-value backup-dispatch table, and none of the three registers a
     // process-global; `HostOwnerLease::acquire` is a real `Global\` named mutex;
-    // and the guarded region is entered unconditionally, so the captured
-    // evidence is identical on every machine whichever fallible step fails
-    // first.
+    // and the guarded region is entered unconditionally, so the boundary
+    // records asserted below are the same whichever fallible step fails first.
+    // The capture is NOT byte-identical across machines: each of the two `lib.rs`
+    // observation helpers adds one subordinate `host.event_log_sink_unavailable`
+    // record when the Event Log sink is unavailable. This case asserts the
+    // owner-emitted rows by their frozen spelling; case 22 owns the bounded
+    // total record count.
     let owner_emitted = capture_emit(|| {
         let _ = eliot_host::HostComposition::open(
             eliot_host::HostLaunchOptions::parse(case21_launch_argv())
@@ -7456,9 +7460,12 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     // and arms the open terminal BEFORE it runs the wiring self-check over a
     // by-value backup-dispatch table, and none of the three registers a
     // process-global; `HostOwnerLease::acquire` is a real `Global\` named mutex;
-    // and the guarded region is entered unconditionally, so the captured
-    // evidence is identical on every machine whichever fallible step fails
-    // first.
+    // and the guarded region is entered unconditionally, so the four boundary
+    // records this capture asserts are the same whichever fallible step fails
+    // first. The capture is NOT byte-identical across machines: each of the two
+    // `lib.rs` observation helpers adds one subordinate `host.event_log_
+    // sink_unavailable` record when the Event Log sink is unavailable, so the
+    // total is asserted below from the sink status rather than assumed.
     // The declared `test` column of the `open.terminal` row is `891/case-14`, so
     // case 22 only OBSERVES these rows and does not own them.
     // One unobserved call runs first with no subscriber installed at all: it is
@@ -7493,12 +7500,12 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
     assert_eq!(
         std::mem::discriminant(&owner_first_error),
         std::mem::discriminant(&owner_unobserved_error),
-        "no_lifecycle_delta: installing the subscriber must not change which failure the owner operation returns"
+        "no_lifecycle_delta: installing the subscriber must not change WHICH FAILURE VARIANT the owner operation returns; the discriminant compares the variant, not the payload"
     );
     assert_eq!(
         std::mem::discriminant(&owner_second_error),
         std::mem::discriminant(&owner_unobserved_error),
-        "no_lifecycle_delta: the second observed owner operation must return the same failure as the unobserved one"
+        "no_lifecycle_delta: the second observed owner operation must return the same failure variant as the unobserved one"
     );
     for (owner_label, owner) in [
         ("owner_first", &owner_first),
@@ -7530,6 +7537,23 @@ fn production_call_path_proves_the_allowed_diff_instead_of_asserting_it() {
             "the admitted row was never reached, because this failing open stops at its first fallible step; the lifecycle-delta proof is the unchanged typed result above plus the observation-surface text proof, not this row count ({owner_label}): {owner}"
         );
     }
+    // The capture is bounded by what the owner call can possibly emit, counted
+    // from the sink status instead of assumed: two `HostLaunchOptions::parse`
+    // records (its own sink note discards the answer and emits nothing), the
+    // open request row, exactly one terminal record, plus one subordinate
+    // `host.event_log_sink_unavailable` record for EACH of the two `lib.rs`
+    // observation helpers when the Event Log sink is unavailable.
+    let expected_owner_records = 4 + 2 * usize::from(event_log_sink_status().is_err());
+    assert_eq!(
+        owner_first.lines().count(),
+        expected_owner_records,
+        "the owner capture must carry the launch-options pair, the open boundary pair and exactly one subordinate sink note per `lib.rs` observation helper where the Event Log sink is unavailable, and nothing else: {owner_first}"
+    );
+    assert_eq!(
+        owner_second.lines().count(),
+        expected_owner_records,
+        "the second owner capture must carry the same bounded record set as the first, so no emission is added or lost on a repeat: {owner_second}"
+    );
     assert_eq!(
         count_occurrences(&owner_first, "detail=\"host.open requested\""),
         1,
