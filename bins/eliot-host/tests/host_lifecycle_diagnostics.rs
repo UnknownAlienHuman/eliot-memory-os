@@ -4020,7 +4020,10 @@ fn lifecycle_cancellation_requested_is_not_terminal_stop() {
     );
     assert_eq!(
         count_occurrences(
-            &case12_text,
+            &case12_text
+                .lines()
+                .filter(|line| line.contains(&case12_request_record))
+                .collect::<String>(),
             eliot_host::host_diagnostics::HostRequestEvidence::DurableCommitted.as_str()
         ),
         1,

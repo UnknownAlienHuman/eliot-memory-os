@@ -2037,6 +2037,27 @@ fn require_retained_handle(
     Ok(())
 }
 
+/// Requires that the calling request was admitted under the same State Fence
+/// this capture was opened with.
+///
+/// This is the caller-side half of capture admission and it is deliberately a
+/// separate check from [`require_retained_handle`]: an exact owner-issued handle
+/// proves the caller can name this capture, but it says nothing about which
+/// authority the *current* request was authenticated under. Both the page and the
+/// end path call this immediately after the handle check, so an exact replay is
+/// held to the same State Fence as a first delivery instead of receiving
+/// protected owner evidence under a weaker boundary.
+///
+/// Only the invariant field is compared. Request identity and observation time
+/// legitimately differ between a first delivery and its exact replay, so
+/// `RequestMeta` is never compared whole.
+fn require_capture_fence(state: &SnapshotState, ctx: &RequestMeta) -> Result<(), StoreError> {
+    if ctx.state_fence != state.begin.scope.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(())
+}
+
 /// Resolves a replayed begin against the retained owner decision.
 ///
 /// `Ok(Some(handle))` is an exact replay: the same canonical bytes are already
@@ -4794,6 +4815,17 @@ fn prepare_page(
         return Err(unknown_snapshot_handle());
     };
     require_retained_handle(state, presented)?;
+    // Caller admission is proved BEFORE any maintenance, replay lookup, claim
+    // acquisition, interruption or counter movement. An exact replay returns
+    // protected owner evidence, so it is not a weaker path than first delivery:
+    // a request whose authenticated State Fence is not the one this capture was
+    // admitted under is refused here exactly as it is on the non-replay path,
+    // and a refused request runs no expiry pass for the genuine capture, moves
+    // no counter and leaves the claim, interruption ledger and terminal record
+    // untouched. Only the invariant field is compared: request identity and
+    // observation time legitimately differ between a first delivery and its
+    // exact replay.
+    require_capture_fence(state, ctx)?;
     let incarnation = state.incarnation;
     let now_ms = crate::write_execution::current_time_ms();
     run_expiry_pass(states, now_ms, Some(digest))?;
@@ -4843,9 +4875,6 @@ fn prepare_page(
         // those counters past the recorded ones, so the entry is kept exactly
         // as it is and `end_snapshot` issues the partial receipt.
         return Err(StoreError::Unavailable);
-    }
-    if ctx.state_fence != state.begin.scope.state_fence {
-        return Err(StoreError::FenceMismatch);
     }
     check_cursor(state, cursor)?;
     if known_empty {
@@ -5130,6 +5159,13 @@ fn prepare_close(
         return Err(unknown_snapshot_handle());
     };
     require_retained_handle(state, presented)?;
+    // The same ordering as the page path: the retained end receipt is protected
+    // owner evidence, so current caller admission is proved before the terminal
+    // replay lookup and before any expiry maintenance, claim acquisition or
+    // counter movement. A request under a foreign State Fence receives
+    // `FenceMismatch` rather than the owner-issued terminal receipt, and a
+    // refused close runs no expiry pass for the genuine capture.
+    require_capture_fence(state, ctx)?;
     let incarnation = state.incarnation;
     let now_ms = crate::write_execution::current_time_ms();
     run_expiry_pass(states, now_ms, Some(digest))?;
@@ -5145,9 +5181,6 @@ fn prepare_close(
         // capture, so the final counts are not yet stable. Reporting them now
         // would state numbers a late page can still change.
         return Err(capture_claim_pending());
-    }
-    if ctx.state_fence != state.begin.scope.state_fence {
-        return Err(StoreError::FenceMismatch);
     }
     let window_closed = capture_is_retired(state, now_ms);
     let expected_revision = state.progress_revision;
@@ -6124,6 +6157,20 @@ mod snapshot_capture_contention_tests {
             self.admit_page_in(&mut lock_registry().expect("registry lock is free"))
         }
 
+        /// Runs one page admission under a caller-supplied request context, so a
+        /// case can vary the authenticated State Fence while every other request
+        /// field stays exactly as the admitted request carried it.
+        fn admit_page_under(&self, ctx: &RequestMeta) -> Result<PageAdmission, StoreError> {
+            let mut states = lock_registry().expect("registry lock is free");
+            prepare_page(&mut states, &self.digest, &self.issued, ctx, &self.cursor)
+        }
+
+        /// Runs one close admission under a caller-supplied request context.
+        fn admit_close_under(&self, ctx: &RequestMeta) -> Result<CloseAdmission, StoreError> {
+            let mut states = lock_registry().expect("registry lock is free");
+            prepare_close(&mut states, &self.digest, &self.issued, ctx)
+        }
+
         /// Runs one close admission exactly as the request path runs it.
         fn admit_close(&self) -> Result<CloseAdmission, StoreError> {
             let mut states = lock_registry().expect("registry lock is free");
@@ -6890,5 +6937,172 @@ mod snapshot_capture_contention_tests {
         assert_eq!(receipt.member_count, 0);
         assert_eq!(receipt.byte_count, 0);
         assert!(receipt.is_complete());
+    }
+
+    // ---------------------------------------------------------------------
+    // #2688: an exact replay is not a weaker authority boundary than first
+    // delivery. The page and end paths validate the caller's State Fence
+    // immediately after the owner-issued handle, before expiry maintenance,
+    // replay lookup, claim acquisition or any counter movement.
+    // ---------------------------------------------------------------------
+
+    /// A real, valid fence that is NOT the fixture's own, built from the
+    /// contracts' constructors so no field is defaulted by hand. It differs only
+    /// in the epoch sequence, which is exactly the kind of legitimate difference
+    /// that makes it a different authority rather than a malformed fence.
+    fn foreign_fence() -> StateFence {
+        StateFence::new(
+            eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new(FIXTURE_LINEAGE)
+                    .expect("the fixture lineage is canonical UUID text"),
+                NonZeroU64::new(2).expect("a foreign epoch sequence is non-zero"),
+            )
+            .expect("the foreign epoch is valid"),
+            eliot_contracts::ResourceGeneration::genesis(),
+        )
+    }
+
+    /// The fixture's own request context with only the State Fence replaced.
+    /// Everything else, including the request identity, is left exactly as the
+    /// admitted request carried it, so a case proves the fence comparison alone
+    /// and not some incidental whole-metadata difference.
+    fn foreign_ctx(fixture: &CaptureFixture) -> RequestMeta {
+        let mut ctx = fixture.ctx.clone();
+        ctx.state_fence = foreign_fence();
+        ctx
+    }
+
+    /// Serves this capture's first page so a retained `last_page` exists to
+    /// replay.
+    fn serve_first_page(fixture: &CaptureFixture) -> SnapshotPage {
+        let mut claim = fixture.claim_page();
+        let point = fixture.point();
+        finish_page(&mut claim, &point, fixture.cursor()).expect("the first page is served")
+    }
+
+    /// The complete owner state of one capture, so a refused request can be shown
+    /// to have changed nothing at all.
+    fn owner_evidence(fixture: &CaptureFixture) -> Evidence {
+        let states = lock_registry().expect("registry lock is free");
+        evidence(&states, fixture.digest())
+    }
+
+    #[test]
+    fn a_page_replay_under_a_foreign_fence_is_refused_and_serves_no_evidence() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(71, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let served = serve_first_page(&fixture);
+        let admitted = fixture.read(|state| state.last_page.clone());
+        assert!(admitted.is_some(), "the served page is retained for replay");
+
+        // The admitted request still replays its own retained page: the fix does
+        // not break the exact replay it is protecting.
+        match fixture
+            .admit_page()
+            .expect("the admitted request still replays its retained page")
+        {
+            PageAdmission::Replay(page) => assert_eq!(*page, served),
+            PageAdmission::Claimed(_) => panic!("an exact cursor replay never re-claims"),
+        }
+
+        let before = owner_evidence(&fixture);
+        let foreign = foreign_ctx(&fixture);
+
+        // The counterexample from the audit: the exact owner-issued handle and the
+        // exact repeated cursor, but a request authenticated under F2. It must be
+        // refused with the same typed error a non-replay request already got, so
+        // replay and first delivery are one authority boundary rather than two.
+        assert_eq!(
+            fixture.admit_page_under(&foreign).err(),
+            Some(StoreError::FenceMismatch),
+            "a retained page is protected owner evidence, not a weaker path"
+        );
+
+        // A refused replay leaves the genuine capture exactly as it was: no
+        // counter, no claim, no interruption, no terminal record, no retained
+        // page change, and no expiry maintenance run on its behalf.
+        assert_eq!(
+            owner_evidence(&fixture),
+            before,
+            "a refused request accounts for nothing"
+        );
+        let states = lock_registry().expect("registry lock is free");
+        assert!(
+            states
+                .expiry
+                .iter()
+                .any(|deadline| deadline.digest == fixture.digest()),
+            "the capture keeps its own retirement deadline"
+        );
+    }
+
+    #[test]
+    fn a_terminal_receipt_replay_under_a_foreign_fence_is_refused() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(72, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let (mut claim, window_closed) = fixture.claim_close();
+        assert!(!window_closed, "the fixture window is still open");
+        let point = fixture.point();
+        let receipt = close_capture(&mut claim, Some(&point))
+            .expect("a still capture closes with an exact receipt");
+
+        // The admitted request replays the frozen terminal receipt.
+        match fixture
+            .admit_close()
+            .expect("the admitted request still replays its receipt")
+        {
+            CloseAdmission::Replay(replayed) => assert_eq!(replayed, receipt),
+            CloseAdmission::Claimed(_, _) => panic!("a closed capture never re-claims"),
+        }
+
+        let before = owner_evidence(&fixture);
+        let foreign = foreign_ctx(&fixture);
+        assert_eq!(
+            fixture.admit_close_under(&foreign).err(),
+            Some(StoreError::FenceMismatch),
+            "the owner-issued terminal receipt is protected owner evidence"
+        );
+        assert_eq!(
+            owner_evidence(&fixture),
+            before,
+            "a refused close accounts for nothing and freezes nothing new"
+        );
+
+        // The genuine receipt is still exactly replayable afterwards.
+        match fixture
+            .admit_close()
+            .expect("the receipt survives the refusal")
+        {
+            CloseAdmission::Replay(replayed) => assert_eq!(replayed, receipt),
+            CloseAdmission::Claimed(_, _) => panic!("a closed capture never re-claims"),
+        }
+    }
+
+    #[test]
+    fn the_fence_is_checked_before_any_replay_or_maintenance_work() {
+        let _serial = registry_serial();
+        let fixture =
+            CaptureFixture::install(73, vec![fixture_member(FIXTURE_MEMBER_ID)], Window::Live);
+        let foreign = foreign_ctx(&fixture);
+
+        // A foreign fence is refused even where no replay exists at all, so the
+        // check is a genuine precondition of the whole path rather than a guard
+        // bolted onto the replay branch alone.
+        assert_eq!(
+            fixture.admit_page_under(&foreign).err(),
+            Some(StoreError::FenceMismatch)
+        );
+        assert_eq!(
+            fixture.admit_close_under(&foreign).err(),
+            Some(StoreError::FenceMismatch)
+        );
+
+        // And the admitted request on the very same entry still acquires its
+        // claim, proving the refusal was caused by the fence and nothing else.
+        let claim = fixture.claim_page();
+        assert!(claim.claim_id != 0, "the admitted request still claims");
+        drop(claim);
     }
 }
