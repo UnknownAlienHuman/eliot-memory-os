@@ -1,0 +1,27 @@
+{
+  "acceptance_items": [
+    "item-1"
+  ],
+  "environment": [
+    "windows-msvc"
+  ],
+  "active_plan": [],
+  "completed_work": [],
+  "killed_paths": [],
+  "causal_bridge": [],
+  "negative_memory_checked": false,
+  "exact_load_bearing_atoms": [],
+  "cheapest_discriminative_probes": [],
+  "responsibility_contour_route_refs": [],
+  "next_allowed_action": "stage the fixture",
+  "expected_observable": "the decode fails",
+  "verifier": "cargo test",
+  "stop_condition": "on a red test",
+  "tool_schema_bytes_visible": 1024,
+  "instruction_hotset_size": 32,
+  "invariant_refs": [],
+  "waived_invariants": [],
+  "prediction_confidence": null,
+  "predicted_changed_paths": [],
+  "predicted_failing_verifiers": []
+}

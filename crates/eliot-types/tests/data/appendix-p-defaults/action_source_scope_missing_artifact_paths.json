@@ -1,0 +1,7 @@
+{
+  "kind": "git_worktree",
+  "worktree_ref": "worktree-1",
+  "branch": "lane/K2",
+  "baseline_commit": "commit-1",
+  "baseline_dirty_state_hash": "dirty-sha"
+}

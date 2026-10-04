@@ -1,0 +1,18 @@
+{
+  "worktree_lease_id": "00000000-0000-7000-8000-000000000001",
+  "project_id": "00000000-0000-7000-8000-000000000001",
+  "task_id": "00000000-0000-7000-8000-000000000002",
+  "work_item_id": "00000000-0000-7000-8000-000000000003",
+  "work_lease_id": "00000000-0000-7000-8000-000000000004",
+  "holder_session_id": "00000000-0000-7000-8000-000000000005",
+  "repo_root": "C:/repo",
+  "branch_name": "lane/K2",
+  "base_commit": "commit-1",
+  "allowed_read_set": [],
+  "allowed_write_set": [],
+  "state": "active",
+  "issued_at": "2026-09-07T12:00:00Z",
+  "expires_at": "2026-10-03T12:00:01Z",
+  "cleaned_at": null,
+  "write_receipt": null
+}

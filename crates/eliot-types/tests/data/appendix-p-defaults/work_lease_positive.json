@@ -1,0 +1,45 @@
+{
+  "work_lease_id": "00000000-0000-7000-8000-000000000001",
+  "work_item_id": "00000000-0000-7000-8000-000000000002",
+  "agent_session_id": "00000000-0000-7000-8000-000000000003",
+  "agent_id": "00000000-0000-7000-8000-000000000004",
+  "project_id": "00000000-0000-7000-8000-000000000005",
+  "task_id": "00000000-0000-7000-8000-000000000006",
+  "role": "implementer",
+  "state": "granted",
+  "epoch": 0,
+  "scope": {
+    "repo_root": "C:/repo",
+    "read_set": [],
+    "write_set": [
+      "crates/eliot-types/src/memory.rs"
+    ],
+    "verifier_set": [
+      "cargo test"
+    ],
+    "authority": {
+      "permissions": [
+        "read",
+        "write"
+      ]
+    },
+    "risk_tier": "low",
+    "max_files": 1,
+    "requires_active_work_lease": true
+  },
+  "decision": {
+    "kind": "granted",
+    "reason": "no_conflict",
+    "message": "accepted",
+    "work_lease_id": null,
+    "conflicting_lease_ids": [],
+    "expires_at": null
+  },
+  "conflict_refs": [],
+  "granted_at": "2026-09-07T12:00:00Z",
+  "expires_at": "2026-09-07T12:00:01Z",
+  "renewed_at": null,
+  "released_at": null,
+  "revoked_at": null,
+  "write_receipt": null
+}

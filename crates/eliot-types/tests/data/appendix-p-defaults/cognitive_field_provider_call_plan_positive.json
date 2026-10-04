@@ -1,0 +1,21 @@
+{
+  "call_number": 1,
+  "call_id": "call-1",
+  "role": "codex_worker",
+  "host": "codex",
+  "requested_model": "gpt-test",
+  "expected_provider_executable_sha256": "exec-sha",
+  "prompt_ref": "prompt-1",
+  "prompt_sha256": "prompt-sha",
+  "canonical_schema_sha256": "schema-sha",
+  "provider_schema_sha256": "provider-schema-sha",
+  "provider_smoke": true,
+  "counts_against_cap": true,
+  "executions": [],
+  "runtime_contract_ref": "runtime-contract-1",
+  "runtime_contract_sha256": "runtime-sha",
+  "adapter_id": "adapter-1",
+  "adapter_version": "1",
+  "execution_request_ref": "request-1",
+  "execution_request_sha256": "request-sha"
+}
