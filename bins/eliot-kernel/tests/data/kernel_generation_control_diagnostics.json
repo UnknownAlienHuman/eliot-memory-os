@@ -1,9 +1,459 @@
 {
   "contract": "F-LOG-KERNEL-4 kernel generation/control diagnostics",
   "issue": 903,
+  "facade_issue": 895,
   "target": "eliot_kernel::diagnostics",
-  "note": "Pins only the observation vocabulary exercised by the single focused integrator test: one generation-snapshot read, one rejected control transition with its stable terminal code, and one rejected generation cutover with its stable terminal code. The broader matrix (daemon-runtime recovery terminals, snapshot/cutover per-variant code sweeps, recovery persist/replay phases, identity/health omission outcomes, canary sweeps, ordering proofs) is deferred to the owning follow-ups.",
+  "note": "Freezes the six-file generation/control/recovery/health/identity boundary inventory exercised by tests/kernel_generation_control_diagnostics.rs. `files` is the complete denominator of production modules this issue owns. `events_by_file` is the complete set of `kernel.*` event literals each of those modules emits, measured from source with the same rule case 1 re-measures: each module's production prefix, cut at the first `#[cfg(test)]`- or `#[cfg(all(test, ...))]`-gated test MODULE and never at a `#[cfg(test)]`-gated helper function defined above one. A new, renamed, moved or deleted emitter therefore breaks the map in both directions. `boundaries` freezes one row per WORK_UNIT_CASE 903/1..30. Every row names a real production `function` and a `role` that says which it is: `emitter` means the span is written inside that function's own body, or — when the row also carries `argument_call_sites` — that the span is passed to that function as an argument at exactly those lines of the row's own file; `propagated` means that function neither writes the record itself nor receives it as an argument, and is only on the production call path that produces it. Both directions of that cross-check are asserted by case 1, so `emitter` cannot be claimed for a function that writes nothing and `propagated` cannot be claimed for one that writes the span itself. A method's `function` may be written with the type that owns it, but case 1 resolves it on the segment after the last `::`, so a row that qualifies a free function with a type it does not belong to fails. `argument_call_sites` is present only on the rows that need it, and is compared to the measured call sites in both directions, so an invented line and an unlisted real one both fail. Every row also names the `stage` it belongs to, the exact `span` (a `kernel.*` event literal, a stable terminal code, or a typed `KernelServiceError` field written as `HandshakeMismatch:<field>`, each half of a composite matched as a complete token; no row uses any other shape), the `owner_evidence` for that stage (the durable ORS row, live fence, coordinator disposition or owner receipt the stage actually turns on, read from production values and never invented; its prose is verified by reading, and case 1 asserts only that it is present and non-empty), the `test` that asserts on that span, and, where the row is an absence or noninterference claim, what must not appear. `events_by_file` is a per-module inventory and NOT a whole-tree claim: production modules outside these six emit `kernel.*` records for their own axes through their own observation helpers or raw `tracing` calls, and no row of this map asserts otherwise. The map deliberately does NOT claim: live Windows kernel-owner or daemon-launch execution (the card's DEFER), live cutover or reserve recovery from real owner evidence, the `#[cfg(test)]`-gated source-string guards inside those modules' inline test modules, the `pub(super)` health snapshot omission arms, the `pub(crate)` runtime-identity and ORS-recovery slices, or Control Reserve Product behaviour. Those remain named blockers owned by the modules' own inline test modules and by the deferral clause, not by this fixture. COVERAGE, MEASURED 2026-10-04 against an emitter inventory derived independently from the six modules BEFORE this fixture was read: events_by_file is exactly reproducible (13/10/9/21/14/10 = 77 distinct kernel.* literals), but the 30 boundaries rows cover 5 of the 6 modules - runtime_identity.rs has no row at all - and 34 of the 77 events are read by no case. Two of those uncovered emitters sit in control_plane.rs, a module the map DOES cover, and until this sentence they appeared in neither this note nor the driver's disclosure: kernel.control.runtime_lease_tick (control_plane.rs:1632, emitted by observe_runtime_lease_tick) and kernel.control.resume_identity_gap_observed (control_plane.rs:2149, emitted by observe_resume_identity_gap). Both are named here so the gap is disclosed rather than undisclosed. One row per WORK_UNIT_CASE is the card's 30-row contract, so widening the map is a scope decision and is escalated, not invented.",
   "terminal_event": "kernel.terminal_error",
+  "files": [
+    "bins/eliot-kernel/src/control_plane.rs",
+    "bins/eliot-kernel/src/daemon_runtime.rs",
+    "bins/eliot-kernel/src/generation_control.rs",
+    "bins/eliot-kernel/src/generation_recovery.rs",
+    "bins/eliot-kernel/src/health_view.rs",
+    "bins/eliot-kernel/src/runtime_identity.rs"
+  ],
+  "events_by_file": {
+    "bins/eliot-kernel/src/control_plane.rs": [
+      "kernel.control.capacity_observed",
+      "kernel.control.drain_disposition_observed",
+      "kernel.control.drain_request_failed",
+      "kernel.control.drain_requested_observed",
+      "kernel.control.request_admitted",
+      "kernel.control.request_denied",
+      "kernel.control.request_received",
+      "kernel.control.resume_identity_checked",
+      "kernel.control.resume_identity_gap_observed",
+      "kernel.control.runtime_lease_tick",
+      "kernel.control.transition_committed",
+      "kernel.control.transition_failed",
+      "kernel.control.transition_requested"
+    ],
+    "bins/eliot-kernel/src/daemon_runtime.rs": [
+      "kernel.daemon.await_rejected",
+      "kernel.daemon.await_requested",
+      "kernel.daemon.await_satisfied",
+      "kernel.daemon.contour_observed",
+      "kernel.daemon.ready_proven",
+      "kernel.daemon.ready_reported",
+      "kernel.daemon.recovery_committed",
+      "kernel.daemon.recovery_failed",
+      "kernel.daemon.recovery_requested",
+      "kernel.daemon.restart_refused"
+    ],
+    "bins/eliot-kernel/src/generation_control.rs": [
+      "kernel.generation.cutover_committed",
+      "kernel.generation.cutover_failed",
+      "kernel.generation.cutover_requested",
+      "kernel.generation.service_fence_rejected",
+      "kernel.generation.service_fence_requested",
+      "kernel.generation.service_fenced",
+      "kernel.generation.snapshot_committed",
+      "kernel.generation.snapshot_failed",
+      "kernel.generation.snapshot_requested"
+    ],
+    "bins/eliot-kernel/src/generation_recovery.rs": [
+      "kernel.recovery.cutover_applied",
+      "kernel.recovery.cutover_committed",
+      "kernel.recovery.cutover_ownership_absent",
+      "kernel.recovery.cutover_ownership_failed",
+      "kernel.recovery.cutover_ownership_reconciled",
+      "kernel.recovery.cutover_ownership_requested",
+      "kernel.recovery.cutover_ownership_restored",
+      "kernel.recovery.cutover_staged",
+      "kernel.recovery.cutovers_loaded",
+      "kernel.recovery.cutovers_reconciled",
+      "kernel.recovery.cutovers_validated",
+      "kernel.recovery.handshake_absent",
+      "kernel.recovery.handshake_projected",
+      "kernel.recovery.load_empty",
+      "kernel.recovery.persist_completed",
+      "kernel.recovery.persist_failed",
+      "kernel.recovery.persist_requested",
+      "kernel.recovery.recover_completed",
+      "kernel.recovery.recover_failed",
+      "kernel.recovery.recover_requested",
+      "kernel.recovery.routes_applied"
+    ],
+    "bins/eliot-kernel/src/health_view.rs": [
+      "kernel.activation.view_projected",
+      "kernel.health.blob_projected",
+      "kernel.health.diagnostic_brief_projected",
+      "kernel.health.recovery_view_projected",
+      "kernel.health.response_projected",
+      "kernel.health.route_metrics_projected",
+      "kernel.health.semantic_recovery_deferred",
+      "kernel.health.service_state_observed",
+      "kernel.health.service_state_omitted",
+      "kernel.health.snapshot_omitted",
+      "kernel.health.snapshot_projected",
+      "kernel.health.store_absent",
+      "kernel.health.store_reported",
+      "kernel.health.store_unavailable"
+    ],
+    "bins/eliot-kernel/src/runtime_identity.rs": [
+      "kernel.identity.launch_attempt_derived",
+      "kernel.identity.launch_attempt_failed",
+      "kernel.identity.launch_descriptor_refreshed",
+      "kernel.identity.launch_refresh_failed",
+      "kernel.identity.launch_refresh_requested",
+      "kernel.identity.operation_derived",
+      "kernel.identity.operation_rejected",
+      "kernel.identity.owner_digest_derived",
+      "kernel.identity.session_binding_failed",
+      "kernel.identity.session_binding_observed"
+    ]
+  },
+  "boundaries": [
+    {
+      "case": 1,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "observe_generation",
+      "role": "emitter",
+      "argument_call_sites": [
+        765
+      ],
+      "stage": "boundary_denominator",
+      "span": "kernel.generation.snapshot_requested",
+      "owner_evidence": "the composition's canonical GenerationRouter behind self.generations, whose clone generation_route_snapshot serves; on a fresh composition that is the daemon route and the authority epoch the router already holds, not a value this map supplies",
+      "test": "six_file_boundary_denominator_is_complete"
+    },
+    {
+      "case": 2,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::apply_generation_cutover_inner",
+      "role": "propagated",
+      "stage": "candidate_vs_validated",
+      "span": "CUTOVER_PLATFORM",
+      "owner_evidence": "the composition's generation_poison fence reason this function sets when the ORS publish fails, and the KernelServiceError::Platform it returns for it; generation_cutover_terminal_code maps that variant to this code. The candidate never reaches stage_generation_cutover, so no durable ORS RuntimeGenerationCutoverRecord exists for it and the wrapper's Applied arm, the only writer of a commit record, is unreachable",
+      "test": "candidate_identity_is_not_validated_identity"
+    },
+    {
+      "case": 3,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::active_generation_registry_projection",
+      "role": "emitter",
+      "stage": "foreign_identity",
+      "span": "HandshakeMismatch:generation_registry.route",
+      "owner_evidence": "the canonical GenerationRouter clone taken from self.generations; router.route(&route_scope) is absent for a scope the composition does not own, so there is no route to project and the refusal is typed instead of a substituted route",
+      "test": "invalid_or_foreign_generation_identity_stays_typed"
+    },
+    {
+      "case": 4,
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "OrsGenerationCoordinator::persist_and_publish_inner",
+      "role": "propagated",
+      "stage": "cutover_staging",
+      "span": "kernel.recovery.cutover_staged",
+      "owner_evidence": "the durable ORS row written by stage_generation_cutover, carrying state: GenerationCutoverState::Armed; observations.cutover_staged is set only after that write returned Ok",
+      "test": "staged_generation_is_not_committed_generation"
+    },
+    {
+      "case": 5,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::apply_generation_cutover",
+      "role": "emitter",
+      "stage": "cutover_publish",
+      "span": "kernel.generation.cutover_committed",
+      "owner_evidence": "the GenerationCutoverApplyDisposition::Applied this wrapper receives back, which apply_generation_cutover_inner returns only after persist_and_publish_inner set observations.cutover_applied over an ORS record that came back Committed; a staged or refused cutover never reaches that arm",
+      "test": "staged_generation_is_never_the_active_route"
+    },
+    {
+      "case": 6,
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "KernelComposition::activation_operational_view",
+      "role": "emitter",
+      "stage": "activation_observation",
+      "span": "kernel.activation.view_projected",
+      "owner_evidence": "the owner's own self.service_state() read together with idle_lease_census().observation_code() and coordinator_for(&self.work_root).drain_disposition(); when the service state or the drain coordinator is unreadable the projection is KernelActivationView::FENCED and says so",
+      "test": "activation_request_is_not_an_observed_activation"
+    },
+    {
+      "case": 7,
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "KernelComposition::request_shutdown",
+      "role": "emitter",
+      "stage": "drain_request",
+      "span": "kernel.control.drain_requested_observed",
+      "owner_evidence": "the durable drain intent coordinator.request_shutdown() accepted, plus the owner's own activation_operational_view().drain_disposition: the record's outcome field IS that disposition code, and self.runtime.shutdown_handle().request() is the only thing that follows it",
+      "test": "drain_requested_is_not_drained"
+    },
+    {
+      "case": 8,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::apply_generation_cutover",
+      "role": "propagated",
+      "stage": "cutover_admission",
+      "span": "CUTOVER_PLATFORM",
+      "owner_evidence": "the composition's generation_poison fence reason set inside apply_generation_cutover_inner when the ORS publish fails; generation_cutover_terminal_code maps that KernelServiceError::Platform to this code, and it is the single terminal the refused cutover owns",
+      "test": "cutover_requires_the_owners_committed_receipt"
+    },
+    {
+      "case": 9,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::active_generation_registry_projection",
+      "role": "propagated",
+      "stage": "active_route",
+      "span": "kernel.generation.snapshot_committed",
+      "owner_evidence": "the canonical GenerationRouter clone this projection takes through generation_route_snapshot; the projection itself is built by ActiveGenerationRegistryProjection::from_route over the live route and StateFence::new(live_epoch, route.active_generation()), never from a staged record",
+      "test": "old_generation_cannot_be_current_after_cutover"
+    },
+    {
+      "case": 10,
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "OrsGenerationCoordinator::persist_and_publish_inner",
+      "role": "propagated",
+      "stage": "epoch_bridge",
+      "span": "kernel.recovery.handshake_projected",
+      "owner_evidence": "the HandshakePolicyObservation returned by update_handshake_policy_without_observation over the candidate router and policy.config_snapshot's artifact_digest and protected_snapshot_digest; Projected is reachable only after synchronize_authority_epoch(decision.new_epoch()) returned Ok",
+      "test": "old_and_new_authority_epochs_are_both_preserved"
+    },
+    {
+      "case": 11,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "ServiceFenceObservation::emit_for_cutover",
+      "role": "emitter",
+      "stage": "service_fence",
+      "span": "kernel.generation.service_fenced",
+      "owner_evidence": "the succeeded flag carried by ServiceFenceObservation, which is true only when fence_service_after_generation_failure_without_observation returned Ok from service.fence_generation(reason); the reason body itself never crosses the boundary",
+      "test": "old_and_new_fences_are_both_preserved"
+    },
+    {
+      "case": 12,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::verify_active_generation_registry_fingerprint",
+      "role": "emitter",
+      "stage": "fence_admission",
+      "span": "HandshakeMismatch:generation_registry.admitted_fence",
+      "owner_evidence": "the StateFence assembled from the live service epoch and the live route's active generation; only the owner's exact admitted tuple compares equal, so a stale generation at the same epoch is a different fence and stays a different typed field from the fingerprint refusal",
+      "test": "stale_or_foreign_fence_stays_typed"
+    },
+    {
+      "case": 13,
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "KernelComposition::control_capacity",
+      "role": "propagated",
+      "stage": "reserve_read",
+      "span": "kernel.control.capacity_observed",
+      "owner_evidence": "the integer self.runtime.available_capacity(ExecutionClass::ProtectedControl) returns; this read acquires, releases and resizes nothing, so the recorded count is the reserve owner's own answer and never an admission claim",
+      "test": "control_request_is_not_reserve_admission"
+    },
+    {
+      "case": 14,
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "observe_control_capacity",
+      "role": "emitter",
+      "stage": "reserve_class",
+      "span": "kernel.control.capacity_observed",
+      "owner_evidence": "the same available_capacity(ExecutionClass::ProtectedControl) integer and nothing else: the record binds one bounded count and no execution class, so it structurally cannot carry a promotion or an admission decision",
+      "noninterference": "no observation may change which execution class a command is admitted under, and no normal-work command may reach a protected-control admission path because a diagnostic record was written",
+      "test": "diagnostics_cannot_promote_normal_work_to_protected_control"
+    },
+    {
+      "case": 15,
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "control_transition_terminal_code",
+      "role": "emitter",
+      "stage": "reserve_terminal",
+      "span": "CONTROL_RESERVE_EXHAUSTED",
+      "owner_evidence": "the KernelServiceError::ControlReserveExhausted variant alone; the mapper chooses the stable code from the variant and reads no payload, so this code belongs to the closed vocabulary whether or not a reserve can be exhausted on this surface",
+      "test": "reserve_lifecycle_vocabulary_stays_distinct"
+    },
+    {
+      "case": 16,
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "KernelComposition::apply_control_with_terminal",
+      "role": "emitter",
+      "stage": "control_refusal",
+      "span": "kernel.control.transition_failed",
+      "owner_evidence": "the one KernelServiceError apply_control_inner returned, here ReadinessNotProven from the service owner's own transition gate, and the operation_context scope apply_control built; the record and the single terminal follow that error, and the generation gateway is not consulted",
+      "test": "reserve_degradation_is_not_total_kernel_failure"
+    },
+    {
+      "case": 17,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::generation_route_snapshot_inner",
+      "role": "propagated",
+      "stage": "gateway_fence",
+      "span": "SNAPSHOT_PLATFORM",
+      "owner_evidence": "the KernelServiceError::Platform this read returns when the composition's generation_poison guard holds a fence reason; generation_snapshot_terminal_code maps that variant to this code, and the poison reason body is never read into a record",
+      "test": "reserve_exhaustion_is_visible_without_fabricated_readiness"
+    },
+    {
+      "case": 18,
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "KernelComposition::daemon_launch",
+      "role": "emitter",
+      "stage": "contour_read",
+      "span": "kernel.daemon.contour_observed",
+      "owner_evidence": "presence or absence of the injected Option<EliotdLaunchDescriptor> contour; the descriptor's fields are never read into the record, so only the presence bit is observable from this seam",
+      "test": "daemon_lifecycle_states_stay_distinct"
+    },
+    {
+      "case": 19,
+      "file": "bins/eliot-kernel/src/daemon_runtime.rs",
+      "function": "KernelComposition::mark_daemon_ready",
+      "role": "emitter",
+      "stage": "readiness_report",
+      "span": "kernel.daemon.ready_reported",
+      "owner_evidence": "the daemon_runtime guard's own receipt, status and supervision fields; with no ProcessStartReceipt and no DaemonRuntimeStatus::Running the readiness claim stays unproven and this function never assigns DaemonRuntimeStatus::Ready",
+      "test": "daemon_liveness_is_not_semantic_readiness"
+    },
+    {
+      "case": 20,
+      "file": "bins/eliot-kernel/src/generation_recovery.rs",
+      "function": "OrsGenerationCoordinator::recover",
+      "role": "emitter",
+      "stage": "recovery_replay",
+      "span": "kernel.recovery.recover_requested",
+      "owner_evidence": "the durable ORS cutover set read by reconcile_staged_generation_cutovers and latest_generation_cutovers; an empty set is its own load_empty phase and never a recovered route, and a commit is never inferred from the request itself",
+      "test": "recovery_phases_stay_distinct"
+    },
+    {
+      "case": 21,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::apply_generation_cutover",
+      "role": "emitter",
+      "stage": "cutover_readback",
+      "span": "kernel.generation.cutover_failed",
+      "owner_evidence": "the single KernelServiceError apply_generation_cutover_inner returned; the sibling Applied arm that writes the commit record is a different match arm over the same result, so a failure and a commit claim cannot both be produced for one cutover",
+      "noninterference": "a possible-but-unproven cutover must never be recorded as committed, and a terminal must never be re-emitted for a cutover that already emitted one",
+      "test": "unknown_commit_outcome_is_never_repaired_by_diagnostics"
+    },
+    {
+      "case": 22,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "classify_generation_cutover_live_endpoint",
+      "role": "propagated",
+      "stage": "cutover_replay",
+      "span": "CUTOVER_HANDSHAKE_MISMATCH",
+      "owner_evidence": "the owner's own live state read here: service.authority_epoch() and router.route(decision.route_scope()) compared as exact authority tuples against decision.old_epoch() and decision.new_epoch(). The Mismatch arm this function returns becomes the HandshakeMismatch the cutover terminal code is mapped from, and an exact replay is classified against that same unchanged live state",
+      "noninterference": "an exact replay must emit no second commit record and no second terminal record",
+      "test": "cutover_replay_is_readback_not_a_second_transition"
+    },
+    {
+      "case": 23,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::verify_active_generation_registry_fingerprint",
+      "role": "emitter",
+      "stage": "fingerprint_admission",
+      "span": "HandshakeMismatch:generation_registry.fingerprint",
+      "owner_evidence": "the generation_fingerprint ActiveGenerationRegistryProjection::from_route derives from the live route; only that exact digest verifies, and the admitted-fence comparison above it raises a different field, so the two refusals stay distinct typed conflicts under one operation identity",
+      "test": "changed_payload_for_one_operation_stays_a_conflict"
+    },
+    {
+      "case": 24,
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "KernelComposition::daemon_route_metrics_projection",
+      "role": "emitter",
+      "stage": "health_denominator",
+      "span": "kernel.health.route_metrics_projected",
+      "owner_evidence": "the live host_request_connection_index queue families this projection counts and the durable audit_chain_records() chain it summarises; a lock or chain-read failure projects unknown for that section instead of zeros, so a missing input never reads as an idle route",
+      "test": "health_input_denominator_and_omissions_come_from_evidence"
+    },
+    {
+      "case": 25,
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "observe_health",
+      "role": "emitter",
+      "argument_call_sites": [
+        244,
+        253,
+        267
+      ],
+      "stage": "health_derivation",
+      "span": "kernel.activation.view_projected",
+      "owner_evidence": "KernelActivationView::FENCED: the closed fallback returned when self.service_state() or coordinator_for(&self.work_root) is unreadable, and otherwise the owner's own service_state, idle_lease_census and drain_disposition values. Every field is a closed vocabulary code, so a missing, stale or unknown input has no stronger code available to it",
+      "noninterference": "no missing, stale or unknown input may be reported as a stronger readiness or health claim than the supplied evidence supports",
+      "test": "missing_health_inputs_never_strengthen_the_derived_claim"
+    },
+    {
+      "case": 26,
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "KernelComposition::blob_capability_projection",
+      "role": "emitter",
+      "stage": "component_health",
+      "span": "kernel.health.blob_projected",
+      "owner_evidence": "the BlobProbeStatus blob_probe_status() returns; None projects manifest absent, process not_started and large_payload degraded, so the component verdict is the probe owner's own and never becomes the whole-Kernel lifecycle state",
+      "test": "component_degradation_is_not_whole_kernel_failure"
+    },
+    {
+      "case": 27,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::generation_route_snapshot",
+      "role": "propagated",
+      "stage": "snapshot_terminal",
+      "span": "SNAPSHOT_PLATFORM",
+      "owner_evidence": "the KernelServiceError::Platform generation_route_snapshot_inner returns for the composition's own generation_poison fence reason; exactly one terminal is emitted here for this read, and the fenced cutover that set the poison already owns a different terminal with a different code for a different operation",
+      "noninterference": "exactly one terminal record per failed operation, bound to the operation whose own record names it; no already-terminalised failure may be terminalised again",
+      "test": "one_operation_yields_exactly_one_designated_terminal"
+    },
+    {
+      "case": 28,
+      "file": "bins/eliot-kernel/src/control_plane.rs",
+      "function": "observe_control_in_context",
+      "role": "emitter",
+      "argument_call_sites": [
+        189
+      ],
+      "stage": "canary_freedom",
+      "span": "kernel.control.transition_requested",
+      "owner_evidence": "the operation_context(None, None, None, None) correlation scope apply_control builds and the KernelControlCommand variant being applied; the record binds the event name, the bounded outcome and that empty scope, and reads no field of the command",
+      "noninterference": "no environment value, configuration byte, raw path, credential, source/frame/payload body or whole-error Display may appear anywhere in the captured surface",
+      "test": "environment_config_path_and_payload_canaries_are_absent"
+    },
+    {
+      "case": 29,
+      "file": "bins/eliot-kernel/src/health_view.rs",
+      "function": "observe_health",
+      "role": "emitter",
+      "argument_call_sites": [
+        214
+      ],
+      "stage": "sink_noninterference",
+      "span": "kernel.health.service_state_observed",
+      "owner_evidence": "the KernelServiceState value self.service.lock()?.state() returns to the caller: the same owner value, not a rendering of it. Delivery conditions replace only the subscriber; no composition state, receipt, reserve or returned result is on this path",
+      "noninterference": "a failing, dropping or disabled sink must change no generation, reserve, recovery or health call, no returned result and no phase order",
+      "test": "sink_failure_drop_and_disable_preserve_calls_and_results"
+    },
+    {
+      "case": 30,
+      "file": "bins/eliot-kernel/src/generation_control.rs",
+      "function": "KernelComposition::generation_route_snapshot",
+      "role": "emitter",
+      "stage": "deterministic_diagnostic_diff",
+      "span": "kernel.generation.snapshot_requested",
+      "owner_evidence": "the composition's canonical GenerationRouter clone, built during composition bootstrap and not derived from wall-clock, path or instance identity; two independently constructed compositions therefore emit the identical ordered record sequence and return byte-identical results",
+      "noninterference": "the delivery must change no production event, terminal code, reservation, health derivation, state result or error result; only the observation vocabulary is new",
+      "test": "instrumented_paths_are_deterministic_and_diagnostic_only"
+    }
+  ],
+  "refusal_codes": {
+    "control_readiness_not_proven": "CONTROL_READINESS_NOT_PROVEN",
+    "control_reserve_exhausted": "CONTROL_RESERVE_EXHAUSTED",
+    "control_admission_closed": "CONTROL_ADMISSION_CLOSED",
+    "control_fenced": "control_fenced",
+    "control_identity_conflict": "control_identity_conflict",
+    "control_unknown_outcome": "control_unknown_outcome",
+    "cutover_platform": "CUTOVER_PLATFORM",
+    "cutover_handshake_mismatch": "CUTOVER_HANDSHAKE_MISMATCH",
+    "cutover_generation_fenced": "CUTOVER_GENERATION_FENCED",
+    "snapshot_platform": "SNAPSHOT_PLATFORM",
+    "snapshot_generation_fenced": "SNAPSHOT_GENERATION_FENCED"
+  },
+  "terminal_codes": [
+    "CONTROL_ADMISSION_CLOSED",
+    "CONTROL_READINESS_NOT_PROVEN",
+    "CONTROL_RESERVE_EXHAUSTED",
+    "CUTOVER_GENERATION_FENCED",
+    "CUTOVER_HANDSHAKE_MISMATCH",
+    "CUTOVER_PLATFORM",
+    "SNAPSHOT_GENERATION_FENCED",
+    "SNAPSHOT_PLATFORM",
+    "control_fenced",
+    "control_identity_conflict",
+    "control_unknown_outcome"
+  ],
   "generation": {
     "snapshot_requested": "kernel.generation.snapshot_requested",
     "snapshot_committed": "kernel.generation.snapshot_committed",

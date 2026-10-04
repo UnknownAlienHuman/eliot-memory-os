@@ -104,6 +104,7 @@
     "no_duplicate_evaluation": true,
     "no_lifecycle_delta": true,
     "no_new_visibility": true,
+    "no_unowned_edit": true,
     "no_mutable_global_dedup": true,
     "single_terminal_per_failed_op": true
   },
