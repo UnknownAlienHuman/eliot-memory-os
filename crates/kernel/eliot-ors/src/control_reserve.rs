@@ -1457,6 +1457,39 @@ mod tests {
         ));
     }
 
+    /// The operation-identity complement of the owner check (issue #1679
+    /// A10): every permit binds owner, operation and epoch, so a blank
+    /// operation id must never hold an ORS permit. The refusal names the
+    /// exact field `ors_permit.operation_id` before any partition capacity is
+    /// consumed.
+    #[test]
+    fn ors_acquire_rejects_blank_operation_id() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        let Err(err) = reserve.try_acquire_normal_transaction(
+            NormalWorkClass::CanonicalWrite,
+            "owner-a",
+            "",
+            epoch,
+        ) else {
+            panic!("blank operation id must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_permit.operation_id",
+                ..
+            }
+        ));
+    }
+
     /// Protected-partition exhaustion names its dimension (issue
     /// #1679 A6/W4): a full protected transaction partition refuses
     /// with `ProtectedReserveExhausted` naming exactly
