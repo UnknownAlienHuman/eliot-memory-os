@@ -306,6 +306,7 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     $desktopExpectedArgs = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '${__dirname}/server/agent-bridge/client-declaration-v2.json')
     if (($desktopArgs -join "`0") -cne ($desktopExpectedArgs -join "`0")) {
         throw 'Claude Desktop MCP server argv drifted from the inventoried bytes: integrations/claude/claude-desktop/mcpb/manifest.json'
+    }
     # Issue #1858 W0: prefer the INSTALLED MCPB server config (same contract
     # as the Claude Code surface above).
     $desktopInstalled = Get-InstalledConsumerBytes $InstallRoot 'integrations/claude/claude-desktop/mcpb/manifest.json'
@@ -329,7 +330,6 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         $desktopDeclarationPresent = Test-Path -LiteralPath ([string]$desktopEffectiveArgs[6]) -PathType Leaf
     }
     $desktopResolution = Get-EntrypointCommandResolution $desktopEffectiveCommand
-    }
     $desktopBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches ${__dirname}/server/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
         entrypoint = 'Claude Desktop MCP stdio profile SPINE_FUNCTIONAL'
