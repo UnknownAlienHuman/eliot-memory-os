@@ -91,7 +91,8 @@ mod tests {
             "eliot-delegate",
             "eliot-finish",
         ] {
-            let text = prompt_text(name, "probe-task").expect("known prompt renders");
+            let text = prompt_text(name, "probe-task")
+                .unwrap_or_else(|error| panic!("known prompt renders: {error:?}"));
             assert!(
                 text.contains("probe-task"),
                 "{name} must substitute the task"

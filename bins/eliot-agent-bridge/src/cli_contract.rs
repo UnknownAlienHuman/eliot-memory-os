@@ -493,7 +493,7 @@ where
                 let value = arguments.get(index + 1).ok_or_else(|| {
                     CliError::MalformedArgument("--host requires a value".to_owned())
                 })?;
-                host = value.clone();
+                host.clone_from(value);
                 index += 2;
             }
             value if value.starts_with("--host=") => {
@@ -503,14 +503,14 @@ where
                         "--host= requires a value".to_owned(),
                     ));
                 }
-                host = value.to_owned();
+                value.clone_into(&mut host);
                 index += 1;
             }
             "--surface" => {
                 let value = arguments.get(index + 1).ok_or_else(|| {
                     CliError::MalformedArgument("--surface requires a value".to_owned())
                 })?;
-                surface = value.clone();
+                surface.clone_from(value);
                 index += 2;
             }
             value if value.starts_with("--surface=") => {
@@ -520,7 +520,7 @@ where
                         "--surface= requires a value".to_owned(),
                     ));
                 }
-                surface = value.to_owned();
+                value.clone_into(&mut surface);
                 index += 1;
             }
             value => return Err(CliError::MalformedArgument(value.to_owned())),
@@ -546,7 +546,8 @@ mod cli_catalog_tests {
 
     #[test]
     fn catalog_defaults_mirror_facade() {
-        let args = parse_mcp_catalog_args(Vec::<String>::new()).expect("defaults parse");
+        let args = parse_mcp_catalog_args(Vec::<String>::new())
+            .unwrap_or_else(|error| panic!("defaults parse: {error:?}"));
         assert_eq!(args.host, "claude");
         assert_eq!(args.surface, ClaudeSurface::ClaudeDesktopMcpb);
     }
@@ -554,9 +555,10 @@ mod cli_catalog_tests {
     #[test]
     fn catalog_accepts_code_surface() {
         let args = parse_mcp_catalog_args(["--host", "claude", "--surface", "code"])
-            .expect("code surface parses");
+            .unwrap_or_else(|error| panic!("code surface parses: {error:?}"));
         assert_eq!(args.surface, ClaudeSurface::ClaudeCodePlugin);
-        let args = parse_mcp_catalog_args(["--surface=desktop"]).expect("equals form parses");
+        let args = parse_mcp_catalog_args(["--surface=desktop"])
+            .unwrap_or_else(|error| panic!("equals form parses: {error:?}"));
         assert_eq!(args.surface, ClaudeSurface::ClaudeDesktopMcpb);
     }
 

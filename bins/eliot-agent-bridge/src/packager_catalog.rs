@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn defaults_render_the_desktop_envelope_with_four_prompts() {
         let catalog = render_mcp_catalog("claude", ClaudeSurface::ClaudeDesktopMcpb)
-            .expect("desktop catalog renders");
+            .unwrap_or_else(|error| panic!("desktop catalog renders: {error:?}"));
         assert_eq!(
             catalog["schema_version"].as_str(),
             Some("eliot-mcp-catalog-v2")
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(catalog["surface"].as_str(), Some("claude_desktop_mcpb"));
         let prompts = catalog["mcpb_prompts"]
             .as_array()
-            .expect("mcpb_prompts is an array");
+            .unwrap_or_else(|| panic!("mcpb_prompts is an array: {}", catalog["mcpb_prompts"]));
         assert_eq!(prompts.len(), 4);
         let names: Vec<&str> = prompts
             .iter()
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn code_surface_renders() {
         let catalog = render_mcp_catalog("claude", ClaudeSurface::ClaudeCodePlugin)
-            .expect("code catalog renders");
+            .unwrap_or_else(|error| panic!("code catalog renders: {error:?}"));
         assert_eq!(catalog["surface"].as_str(), Some("claude_code_plugin"));
         assert_eq!(
             catalog["schema_version"].as_str(),
@@ -161,8 +161,10 @@ mod tests {
 
     #[test]
     fn non_claude_host_is_rejected() {
-        let error = render_mcp_catalog("codex", ClaudeSurface::ClaudeDesktopMcpb)
-            .expect_err("non-claude host refuses");
+        let error = match render_mcp_catalog("codex", ClaudeSurface::ClaudeDesktopMcpb) {
+            Ok(catalog) => panic!("non-claude host refuses, rendered: {catalog}"),
+            Err(error) => error,
+        };
         assert!(matches!(error, CatalogError::BadHost(_)));
         assert!(error.to_string().contains("Claude host family"));
     }

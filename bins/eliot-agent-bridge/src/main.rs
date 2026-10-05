@@ -804,7 +804,7 @@ fn main() {
         // here: pretty JSON plus one trailing newline, no server start.
         argv.remove(0);
         let catalog_args: McpCatalogArgs = match parse_mcp_catalog_args(argv) {
-            Ok(args) => args,
+            Ok(parsed) => parsed,
             Err(error) => {
                 let (code, detail) = match error {
                     CliError::MissingProfile => {
@@ -837,8 +837,14 @@ fn main() {
                 }
             };
         let mut stdout = io::stdout().lock();
-        serde_json::to_writer_pretty(&mut stdout, &catalog).expect("packager catalog write");
-        writeln!(stdout).expect("packager catalog newline");
+        if let Err(error) = serde_json::to_writer_pretty(&mut stdout, &catalog) {
+            emit_error("CATALOG_UNWRITABLE", &error.to_string());
+            std::process::exit(PROVIDER_PORT_EXIT);
+        }
+        if let Err(error) = writeln!(stdout) {
+            emit_error("CATALOG_UNWRITABLE", &error.to_string());
+            std::process::exit(PROVIDER_PORT_EXIT);
+        }
         std::process::exit(0);
     }
     if host_events_mode {
