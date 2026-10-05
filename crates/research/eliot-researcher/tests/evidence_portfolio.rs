@@ -1289,6 +1289,101 @@ fn absence_issuer_manifest_revision_refused() {
     );
 }
 
+/// An accounting that never enumerated its whole denominator cannot back a
+/// scoped absence claim.
+///
+/// Completeness is proved on the frozen scope, and `complete_scope` is the only
+/// basis on which a scoped absence may be claimed (I21.6: `denominator_kind =
+/// complete_scope` is the only basis on which a scoped absence may be claimed).
+/// An account opened over the exact denominator members that records only some
+/// of them still holds the rest open, so the enumeration this record would
+/// claim never completed — the unrecorded member is not a disposition at all,
+/// it is a missing step. The authorized manifest here commits that exact
+/// accounting (`coverage_digest` is this account's own digest) and the issuer
+/// holds the presented manifest and the frozen scope, so both bindings pass and
+/// `check_enumeration` is what refuses, before any per-member join runs.
+///
+/// The refusal names the enumeration rather than a disposition: a member
+/// recorded `Unknown` would be closed but non-closing and would take the later
+/// per-member refusal path instead, so the two cases stay distinguishable.
+#[test]
+fn absence_issuer_open_enumeration_refused() {
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let (_, records, _, _) = proven_absence();
+
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        // Skipping the `record` call is what leaves `primary#0` one of the
+        // account's `open_members`: the accounting enumerated its denominator
+        // only partially. A `Unknown` disposition would close the member and
+        // take a different refusal path.
+        if member == "primary#0" {
+            continue;
+        }
+        account
+            .record(
+                member,
+                SourceDisposition::Observed,
+                Some(format!("src-{member}")),
+            )
+            .expect("record");
+    }
+
+    // The manifest is the same authorized manifest `proven_absence` freezes,
+    // field for field, over the same records and denominator; only the
+    // `coverage_digest` is this account's own, so the manifest commits the
+    // partial accounting instead of the complete one.
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: ABSENCE_MANIFEST_REVISION,
+    })
+    .expect("authorized manifest");
+
+    let scope_digest = inquiry_denominator_digest();
+    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
+        .expect("owner issuer");
+    let err = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect_err("an unclosed enumeration must be refused");
+    // `IncompleteDenominator` renders as `{field} is not an exact accounted
+    // denominator`, so the display is what names the exact field path refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::IncompleteDenominator { .. }),
+        "an unclosed enumeration must be refused as `IncompleteDenominator`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.open_members"),
+        "the refused field must be the unclosed enumeration itself: {rendered}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
