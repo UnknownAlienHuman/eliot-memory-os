@@ -1384,6 +1384,74 @@ fn absence_issuer_open_enumeration_refused() {
     );
 }
 
+/// The owner issuer attests what it observed and only while its account remains
+/// current, so it refuses an assessment instant its own window does not cover.
+///
+/// The scope, manifest and enumeration bindings all pass on this exact setup, so
+/// the refusal is caused by the instant alone: `issue_for` runs
+/// `check_observation_window` after `check_scope_binding`,
+/// `check_manifest_binding` and `check_enumeration`. Both directions matter and
+/// are distinct fields: an instant before the issuer observed anything cannot be
+/// inside an observation it has not made yet, and an instant past its
+/// currentness bound would assess a window that has already gone stale — either
+/// one would let a scoped absence claim rest on completeness the issuer cannot
+/// vouch for (I21-06: `complete_scope` is the only basis on which a scoped
+/// absence may be claimed).
+#[test]
+fn absence_issuer_observation_window_refused() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    // `issuer_params_for` holds `observed_at_ms = 1_700_000_250_000` and
+    // `current_until_ms = 1_700_000_400_000`, so the two instants below sit just
+    // outside either edge of that window.
+    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
+        .expect("owner issuer");
+
+    // Too early: the issuer is asked to attest an observation taken before it
+    // observed anything.
+    let err = issuer
+        .issue_for(
+            &account,
+            &records,
+            &manifest,
+            &scope_digest,
+            1_700_000_200_000,
+        )
+        .expect_err("an instant before the observation must be refused");
+    // `Conflict` renders as `{field} conflicts with frozen content`, so the
+    // display is what names the exact field path the issuer refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an instant before the observation must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.observed_at_ms"),
+        "the refused field must be the observation instant itself: {rendered}"
+    );
+
+    // Too late: the issuer is asked to attest inside a window that already
+    // expired at minting time.
+    let err = issuer
+        .issue_for(
+            &account,
+            &records,
+            &manifest,
+            &scope_digest,
+            1_700_000_500_000,
+        )
+        .expect_err("an instant past the currentness bound must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an instant past the currentness bound must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.current_until_ms"),
+        "the refused field must be the currentness bound itself: {rendered}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
