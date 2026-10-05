@@ -2241,9 +2241,11 @@ fn restore_solo_fabric(
 /// dispatched reconciles to unknown instead of relaunching, blocking blind
 /// retry and route substitution until exact reconciliation.
 ///
-/// The caller holds the composition guard across the seam await (see
-/// [`solo_fair_pull_recovery`]); this function takes `&DaemonComposition`
-/// like the construct path and performs no locking of its own.
+/// The production caller holds no composition guard: the state root,
+/// ports and resolved material are prepared under short locks and the
+/// seam runs on owned inputs (see [`solo_fair_pull_recovery`]); this
+/// function takes `&DaemonComposition` like the construct path and
+/// performs no locking of its own.
 ///
 /// `coordinator_document` is the coordinator snapshot JSON selected out of the
 /// persisted projection FILE bytes by [`load_verified_projection`] after that
@@ -2468,25 +2470,55 @@ pub async fn solo_fair_pull_recovery(
         };
         live
     };
-    let composition = composition.lock().await;
-    // Production restores the coordinator from the durable document selected
-    // out of the verified projection bytes; the test-only synchronous seam
-    // keeps the typed readback it has always used.
+    // Prepare under one short lock, then release before any await (issue
+    // #2567 A6): the values below own everything past this point.
+    let state_root = {
+        let composition = composition.lock().await;
+        composition.state_root().to_owned()
+    };
+    // Projection file IO with no composition borrow held (issue #2567 A6).
     #[cfg(not(test))]
     let (mut projection, coordinator_document) = {
-        let verified = load_verified_projection(composition.state_root(), &operation_id)?;
+        let verified = load_verified_projection(&state_root, &operation_id)?;
         (verified.payload, verified.coordinator_document)
     };
     #[cfg(test)]
-    let mut projection = load_projection(composition.state_root(), &operation_id)?;
-    #[cfg(test)]
-    let mut fabric = restore_solo_fabric(&composition, kernel, &projection)?;
+    let mut projection = load_projection(&state_root, &operation_id)?;
+    let (ports, material) = {
+        let composition = composition.lock().await;
+        (
+            composition.production_fabric_ports()?,
+            composition.resolve_verified_material(kernel, projection.claimed.material())?,
+        )
+    };
+    // Owner IO with no composition borrow held (issue #2567 A6): the seam
+    // takes owned inputs only (see
+    // `DaemonComposition::agent_fabric_restore_verified_from_resolved_async`).
     #[cfg(not(test))]
-    let mut fabric =
-        restore_solo_fabric_async(&composition, kernel, &projection, &coordinator_document).await?;
-    let profile = load_scheduling_profile(&composition)?;
+    let mut fabric = DaemonComposition::agent_fabric_restore_verified_from_resolved_async(
+        kernel,
+        state_root,
+        projection.snapshot.clone(),
+        ports,
+        material,
+        &projection.claimed,
+        &coordinator_document,
+    )
+    .await?;
+    #[cfg(test)]
+    let mut fabric = {
+        let composition = composition.lock().await;
+        restore_solo_fabric(&composition, kernel, &projection)?
+    };
+    let profile = {
+        let composition = composition.lock().await;
+        load_scheduling_profile(&composition)?
+    };
     let outcome = fabric.drive_fair_pull(&profile, true)?;
-    repersist_after_control(&composition, &fabric, &mut projection)?;
+    {
+        let composition = composition.lock().await;
+        repersist_after_control(&composition, &fabric, &mut projection)?;
+    }
     let started = outcome.started.len();
     tracing::debug!(
         algorithm = outcome.algorithm,
