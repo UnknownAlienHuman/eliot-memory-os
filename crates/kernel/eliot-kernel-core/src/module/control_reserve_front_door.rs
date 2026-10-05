@@ -1906,6 +1906,32 @@ mod tests {
     }
 
     #[test]
+    fn control_permit_release_returns_slot_exactly_once() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([19u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        let permit =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-rel-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        // The explicit release returns the slot to the partition it was drawn
+        // from and binds the returned evidence to its operation and owner.
+        let evidence = permit.release();
+        assert_eq!(front_door.available_normal(), 1);
+        assert_eq!(evidence.operation_id(), "op-rel-1");
+        assert_eq!(evidence.owner(), "owner-a");
+
+        // Drop after an explicit release moves no counter, so the slot is
+        // returned exactly once and never twice.
+        drop(evidence);
+        assert_eq!(front_door.available_normal(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn ledger_evicts_oldest_when_full() -> Result<(), KernelError> {
         let mut ledger = IdempotencyLedger::new(2)?;
         ledger.record(
