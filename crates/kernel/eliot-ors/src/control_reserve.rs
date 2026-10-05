@@ -1445,4 +1445,47 @@ mod tests {
             matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
         );
     }
+
+    /// The durable-byte face of the same property (issue #1679 A6/W4): a full
+    /// protected durable-byte partition refuses with
+    /// `ProtectedReserveExhausted` naming exactly
+    /// `ORS_DURABLE_BYTES_BOTTLENECK`, so exhaustion of one dimension is never
+    /// reported as global exhaustion (I14.3). The fill permit is held across the
+    /// assertions: it releases on drop.
+    #[test]
+    fn ors_protected_durable_exhaustion_names_bottleneck() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(1).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_durable_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-bytes-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect("protected bytes");
+        assert_eq!(reserve.available_protected_durable_bytes(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_durable_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-bytes-shed-1",
+            NonZeroU64::new(1).expect("bytes"),
+            epoch,
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+    }
 }
