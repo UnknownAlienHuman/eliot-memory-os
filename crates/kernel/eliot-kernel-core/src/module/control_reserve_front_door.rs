@@ -1745,6 +1745,36 @@ mod tests {
     }
 
     #[test]
+    fn protected_exhaustion_response_refuses_a_remaining_partition() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([13u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The protected partition still admits control work, so it must never be
+        // reported as exhausted: recovery-boundary evidence is not manufactured
+        // for a partition that has not refused anything.
+        assert_eq!(front_door.available_protected(), 1);
+
+        let err = front_door
+            .protected_exhaustion_response(
+                ControlOperationClass::CancelOperation,
+                "op-protected-remaining-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("a remaining protected partition must not report exhaustion");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.protected_partition",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn protected_and_emergency_permits_are_owner_and_epoch_bound() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
