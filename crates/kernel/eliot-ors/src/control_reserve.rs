@@ -1594,4 +1594,58 @@ mod tests {
         assert_eq!(reserve.available_normal_durable_bytes(), 7);
         assert_eq!(reserve.available_protected_durable_bytes(), 9);
     }
+
+    /// Release is automatic and exact (issue #1679, norm
+    /// `control-reserve.contract.toml:44`): `OrsPermit` has no release method,
+    /// so `impl Drop for OrsPermit` is the ONLY release path and a dropped
+    /// permit must restore exactly its held amount - once, never twice. A
+    /// reserve that released nothing would strand capacity forever and one that
+    /// released twice would mint capacity out of a counter, so both the
+    /// restored value and the reuse of the slot are pinned: a fresh operation id
+    /// acquires the returned slot again, which no surviving process or counter
+    /// could do. No permit is held across the final assertions: each is
+    /// explicitly released so nothing leaks past this test.
+    #[test]
+    fn ors_dropped_normal_permit_returns_slot_exactly_once() {
+        let reserve = OrsReserve::partitioned(
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // The pre-acquire baseline: dropping the permit below must return
+        // exactly this value, so a duplicate release is visible.
+        assert_eq!(reserve.available_normal_transactions(), 1);
+
+        let first = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-rel-1",
+                epoch,
+            )
+            .expect("first slot");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        // The only release path: drop returns exactly the held amount.
+        drop(first);
+        assert_eq!(reserve.available_normal_transactions(), 1);
+
+        // The restored slot is genuinely reusable: a fresh operation id acquires
+        // it again and the reserve never has to fabricate ownership.
+        let second = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-rel-2",
+                epoch,
+            )
+            .expect("released slot is reusable");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        drop(second);
+    }
 }
