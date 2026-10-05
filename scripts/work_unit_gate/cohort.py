@@ -1006,6 +1006,13 @@ def locked_catalogue_rows(
         raise
     except c.ContractViolation as exc:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    try:
+        expected = tuple(c.IssueIdentity(repo, n) for n in lock.aggregate.issues)
+        receipt = c.CatalogueIntegrityReceipt(tuple(rows.values()), expected)
+    except c.ContractViolation as exc:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    if receipt.sha256 != lock.aggregate.sha256:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate digest mismatch")
     return rows
 
 

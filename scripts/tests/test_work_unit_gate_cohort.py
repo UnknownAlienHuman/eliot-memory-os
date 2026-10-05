@@ -25,6 +25,11 @@ BODY, MATRIX, SOURCE, ARTIFACT = (char * 64 for char in "abcd")
 PROOF = c.ProofCeiling("catalogue-integrity-only")
 GUARD = c.WorkUnitIdentity("source-shape")
 
+# Committed aggregate lock `[aggregate]` sha256 line (the only line replaced by
+# the tampered copy) and its 64-nines replacement.
+COMMITTED_AGGREGATE_SHA256 = "1177af1d0dff9e7ea72975877b88c204c70610c3c76e88efcc0cc65c59a13667"
+TAMPERED_AGGREGATE_SHA256 = "9" * 64
+
 # Frozen leaf-router byte identities: sha256 of the exact on-disk bytes at base
 # commit c0c7257f (Windows CRLF checkout; `.gitattributes` sets `* text=auto`
 # so disk bytes are CRLF while git blobs are LF-only). Fixed literals recorded
@@ -731,6 +736,39 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.validate_snapshot_completeness(incomplete_snapshot)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+    def _committed_aggregate_lock_copies(self):
+        """Two tmp copies of the committed lock: pristine and digest-tampered.
+
+        The lock header forbids hand-edits, so the committed file is copied into
+        a tmp directory and only the single `[aggregate]` sha256 line differs.
+        """
+        source = (ROOT / ".github" / "work-unit-cohort.toml").read_text()
+        committed = 'sha256 = "' + COMMITTED_AGGREGATE_SHA256 + '"'
+        tampered_line = 'sha256 = "' + TAMPERED_AGGREGATE_SHA256 + '"'
+        self.assertEqual(source.count(committed), 1)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        tampered = root / "work-unit-cohort-tampered.toml"
+        tampered.write_text(source.replace(committed, tampered_line))
+        pristine = root / "work-unit-cohort-pristine.toml"
+        pristine.write_text(source)
+        return tampered, pristine
+
+    def test_tampered_aggregate_digest_in_committed_lock_rejected(self):
+        # The stored aggregate digest no longer covers the rows the lock
+        # declares: the projection must fail closed instead of returning them.
+        tampered, _ = self._committed_aggregate_lock_copies()
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.locked_catalogue_rows(tampered)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.INVALID_AGGREGATE_LOCK)
+
+    def test_pristine_committed_lock_copy_projects_eleven_rows(self):
+        # The re-derivation must not be a false positive on the real shape.
+        _, pristine = self._committed_aggregate_lock_copies()
+        rows = ch.locked_catalogue_rows(pristine)
+        self.assertEqual(len(rows), 11)
 
     # WORK_UNIT_CASE: 852/36
     def test_catalogue_with_planned_or_blocked_rows_integrity_valid_but_not_project_complete(self):
