@@ -904,4 +904,19 @@ mod tests {
                 if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
         ));
     }
+
+    /// A fresh reserve reports exactly the partition capacities it was
+    /// configured with (issue #1679): quantities are copied from
+    /// configuration and never derived or scaled at construction, so no
+    /// capacity can be invented while building the reserve (I14.3).
+    #[test]
+    fn ipc_reserve_reports_configured_capacities() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        assert_eq!(reserve.available_normal_bytes(), 10);
+        assert_eq!(reserve.available_protected_bytes(), 6);
+    }
 }
