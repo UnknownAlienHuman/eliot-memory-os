@@ -2112,7 +2112,10 @@ def main(argv: list[str] | None = None) -> int:
                      "blocked": 0, "failed": 0, "passed": len(evidence_rows)}
         identities_ok = [f"issue-{n}" for n in sel_sorted] + [f"cohort:{aggregate[:12]}"]
         ceiling_ok = "selected-verification-only"
-        digest_ok = _result_digest(proof, sel_sorted, counts_ok, ceiling_ok)
+        # CCV7: the success digest is the cohort aggregate, which binds the
+        # load-bearing set (catalogue, selection, descriptors, source
+        # snapshots, receipts, discovered tests, execution records).
+        digest_ok = aggregate
         result_ok = {
             "proof": proof, "selection": sel_sorted,
             "selection_label": ",".join(str(n) for n in sel_sorted),
