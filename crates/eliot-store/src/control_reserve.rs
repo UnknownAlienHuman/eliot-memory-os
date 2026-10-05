@@ -1308,4 +1308,46 @@ mod tests {
             matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_TRANSACTION_BOTTLENECK)
         );
     }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679 A6/W4).
+    /// The single protected pending-write byte is filled first and its permit
+    /// is held across the assertions, so the refusal observes a live
+    /// saturated partition rather than a released one. The refusal names
+    /// `STORE_PENDING_WRITE_BOTTLENECK`: exhaustion of one dimension is a
+    /// local disposition, never a global one (I14.3).
+    #[test]
+    fn store_protected_pending_exhaustion_names_bottleneck() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(1).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_pending_write_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-pend-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("protected bytes");
+        assert_eq!(reserve.available_protected_pending_write_bytes(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_pending_write_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-pend-shed-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_PENDING_WRITE_BOTTLENECK)
+        );
+    }
 }
