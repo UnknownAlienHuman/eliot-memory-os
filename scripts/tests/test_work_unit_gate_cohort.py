@@ -792,6 +792,33 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             dr.decode_descriptor(toml_bad_mode, ".github/work-units/852.toml")
         self.assertIn("UNSUPPORTED_SCHEMA_OR_MODE", str(ctx.exception))
 
+        # The cohort decoder is the #850 boundary the gate itself calls, so the
+        # same arbitrary payloads are proved rejected through it rather than
+        # through the runner alone: a URL smuggled in as the execution mode is
+        # refused as a malformed field (it names no runner the gate may start),
+        # while an injected command line and an injected environment table are
+        # refused as fields outside the closed descriptor shape - the shapes a
+        # hostile descriptor would use to make the gate execute something.
+        toml_url_mode = toml_bad_mode.replace(
+            b'mode = "arbitrary-bash-exec"', b'mode = "https://evil/x"'
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_url_mode, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertEqual(ctx.exception.detail, "UNSUPPORTED_SCHEMA_OR_MODE")
+
+        toml_command = toml_bad_mode.rstrip(b"\n") + b'\ncommand = "rm -rf /"\n'
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_command, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNKNOWN_FIELD)
+        self.assertEqual(ctx.exception.detail, "CLOSED_FIELDS")
+
+        toml_environment = toml_bad_mode.rstrip(b"\n") + b'\nenvironment = { FOO = "bar" }\n'
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_environment, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNKNOWN_FIELD)
+        self.assertEqual(ctx.exception.detail, "CLOSED_FIELDS")
+
     # WORK_UNIT_CASE: 852/25
     def test_leaf_router_cannot_lower_descriptor_denominator(self):
         d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/a.py",))
