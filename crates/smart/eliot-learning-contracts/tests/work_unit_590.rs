@@ -405,6 +405,7 @@ fn valid_delta(tag: &str) -> AttemptLearningDeltaCandidate {
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(delta.seal());
@@ -604,6 +605,7 @@ fn valid_activation(tag: &str) -> HarnessActivationReceiptCandidate {
         downstream_decision_action_artifact_and_verifier_refs: vec![],
         receipt_completeness_and_missing_fields: vec![],
         invalidation_expiry_and_missingness: vec![],
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(receipt.seal());
@@ -663,6 +665,7 @@ fn valid_closure(tag: &str) -> ClosureHandoff {
         rollback_refs: vec![aid(&format!("rollback-590-{tag}"))],
         external_promotion_refs: vec![aid(&format!("promo-owner-590-{tag}"))],
         requested_decision: ExternalDecisionClass::ClosureReview,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(handoff.seal());
@@ -1832,6 +1835,7 @@ fn valid_delta_with_base_before_after_evidence_verifier_rollback() {
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(delta.seal());
@@ -2275,6 +2279,7 @@ fn exact_overlay_base_parent_evaluation_admitted_delta() {
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(delta.seal());
@@ -3809,6 +3814,7 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(delta.seal());
@@ -3928,6 +3934,7 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
         downstream_decision_action_artifact_and_verifier_refs: vec![],
         receipt_completeness_and_missing_fields: vec![],
         invalidation_expiry_and_missingness: vec![],
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     must(activation.seal());

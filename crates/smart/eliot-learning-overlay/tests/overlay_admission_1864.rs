@@ -36,7 +36,7 @@ use eliot_learning_overlay::{
         AuthoritativeRefs, RevalidationRequest, admit_local, admit_local_with_refs,
         revalidate_for_campaign,
     },
-    compose_campaign_harness_overlay,
+    compose_campaign_harness_overlay, frozen_digest,
 };
 
 fn aid(value: &str) -> ArtifactId {
@@ -516,6 +516,7 @@ fn delta(
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal().expect("delta seal");
@@ -626,6 +627,23 @@ fn valid_candidate(
     let candidate =
         compose_campaign_harness_overlay(&input(fixture, &deltas, &pairs)).expect("candidate");
     (deltas, candidate)
+}
+
+// W3: the contracts-side frozen digest of a composed candidate must equal the
+// overlay `freeze` digest over the same fixture bundle, identity and seal.
+#[test]
+fn contracts_frozen_digest_matches_freeze_digest() {
+    let fixture = fixture();
+    let (_, candidate) = valid_candidate(&fixture);
+    assert_eq!(
+        candidate.frozen_digest(),
+        frozen_digest(
+            &fixture.frozen,
+            candidate.overlay_id.as_str(),
+            &candidate.canonical_digest
+        ),
+        "contracts-side frozen digest must match the freeze digest (W3 #1864)"
+    );
 }
 
 // A2/1: a change whose target names a sealed-holdout reference is rejected at

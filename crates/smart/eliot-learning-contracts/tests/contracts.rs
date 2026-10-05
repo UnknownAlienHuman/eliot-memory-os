@@ -438,6 +438,7 @@ fn consequential_success_has_delta_or_evidence_backed_no_change()
         dependencies: vec![aid("dependency-b")?],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal()?;
@@ -462,6 +463,75 @@ fn consequential_success_has_delta_or_evidence_backed_no_change()
         serde_json::to_string(&AttemptLearningOutcome::NoChange(no_change))?
             .contains("\"outcome\":\"NO_CHANGE\"")
     );
+    Ok(())
+}
+
+#[test]
+fn frozen_digest_binds_delta_and_reads_back() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, view) = recipe_and_view()?;
+    let target = target("target-a")?;
+    let binding = binding("b")?;
+    let change = ChangeOperation::Add {
+        target: target.clone(),
+        surface: ChangeSurface::Strategy,
+        after: ValueState {
+            present: true,
+            digest: Some(digest("new-strategy")),
+        },
+    };
+    let inverse = InverseChange {
+        forward_target: target.clone(),
+        inverse: ChangeOperation::Remove {
+            target: target.clone(),
+            surface: ChangeSurface::Strategy,
+            before: ValueState {
+                present: true,
+                digest: Some(digest("new-strategy")),
+            },
+        },
+    };
+    let mut bound = AttemptLearningDeltaCandidate {
+        binding: binding.clone(),
+        attempt_id: AgentAttemptId::new("attempt-frozen")?,
+        delta_id: aid("delta-frozen")?,
+        target: target.clone(),
+        base_view_digest: view.canonical_digest.clone(),
+        pre_observation_discriminator: aid("discriminator-frozen")?,
+        intended_strategy: aid("intended-frozen")?,
+        attempted_strategy: aid("attempted-frozen")?,
+        changes: vec![change],
+        inverses: vec![inverse],
+        evidence: vec![aid("delta-evidence")?],
+        evaluator_receipts: vec![aid("evaluator-frozen")?],
+        baseline: vec![aid("baseline-frozen")?],
+        control: vec![aid("control-frozen")?],
+        confounders: vec![],
+        dependencies: vec![aid("dependency-frozen")?],
+        equivalent_retry: None,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: Some(digest("frozen-pre-evaluation")),
+        canonical_digest: String::new(),
+    };
+    bound.seal()?;
+    bound.validate()?;
+    assert_eq!(
+        bound.frozen_pre_evaluation_digest,
+        Some(digest("frozen-pre-evaluation"))
+    );
+    let mut unbound = bound.clone();
+    unbound.frozen_pre_evaluation_digest = None;
+    unbound.seal()?;
+    unbound.validate()?;
+    assert_ne!(
+        bound.canonical_digest, unbound.canonical_digest,
+        "the frozen binding must be seal-covered"
+    );
+    let mut malformed = bound.clone();
+    malformed.frozen_pre_evaluation_digest = Some("not-a-digest".to_owned());
+    assert!(matches!(
+        malformed.validate(),
+        Err(LearningContractError::InvalidDigest { .. })
+    ));
     Ok(())
 }
 
@@ -633,6 +703,7 @@ fn assessment_dimensions_and_closure_handoff_remain_independent_and_inert()
         rollback_refs: vec![aid("rollback")?],
         external_promotion_refs: vec![aid("promotion-owner")?],
         requested_decision: ExternalDecisionClass::ClosureReview,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     handoff.seal()?;
@@ -679,6 +750,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal()?;
@@ -798,6 +870,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         downstream_decision_action_artifact_and_verifier_refs: vec![],
         receipt_completeness_and_missing_fields: vec![],
         invalidation_expiry_and_missingness: vec![],
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     receipt.seal()?;
@@ -846,6 +919,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         rollback_refs: vec![aid("linked-rollback")?],
         external_promotion_refs: vec![],
         requested_decision: ExternalDecisionClass::ClosureReview,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     handoff.seal()?;

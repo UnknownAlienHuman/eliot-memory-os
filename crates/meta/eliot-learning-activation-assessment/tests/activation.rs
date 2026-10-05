@@ -475,6 +475,7 @@ fn fixture() -> Result<
         dependencies: vec![aid("delta-dependency")?],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal()?;
@@ -757,6 +758,46 @@ fn constructs_candidate_and_retains_unknowns() -> Result<(), Box<dyn std::error:
             field: "dimension.metric_ids"
         }
     ));
+    Ok(())
+}
+
+#[test]
+fn receipt_binds_frozen_digest_of_assessed_overlay() -> Result<(), Box<dyn std::error::Error>> {
+    let (view, delta, overlay, binding, target, recipe) = fixture()?;
+    let admission = aid("admission-frozen")?;
+    let activation_request = aid("activation-request-frozen")?;
+    let assessment_receipt = aid("assessment-receipt-frozen")?;
+    let activation_id = aid("activation-frozen")?;
+    let stages = [observed_stage(
+        LifecycleStage::CandidateProduced,
+        None,
+        "stage-receipt-frozen",
+        "stage-evidence-frozen",
+    )?];
+    let p = policy();
+    let result = assess_learning_activation(&input(
+        &view,
+        &delta,
+        &overlay,
+        &binding,
+        &target,
+        &recipe,
+        &p,
+        &activation_id,
+        Some(&admission),
+        Some(&activation_request),
+        Some(&assessment_receipt),
+        &stages,
+    ))?;
+    let AssessmentResultOrIncomplete::Candidate(result) = result else {
+        return Err("unexpected incomplete result".into());
+    };
+    result.validate()?;
+    assert_eq!(
+        result.activation.frozen_pre_evaluation_digest,
+        Some(overlay.frozen_digest()),
+        "receipt must carry the assessed overlay's frozen digest (W3 #1864)"
+    );
     Ok(())
 }
 
