@@ -1716,6 +1716,35 @@ mod tests {
     }
 
     #[test]
+    fn normal_saturation_response_refuses_an_unsaturated_partition() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([11u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The normal partition still admits work, so it must never be reported
+        // as saturated: pressure evidence is not manufactured.
+        assert_eq!(front_door.available_normal(), 1);
+
+        let err = front_door
+            .normal_saturation_response(
+                NormalWorkClass::Interactive,
+                "op-unsaturated-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("an unsaturated partition must not report saturation");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.normal_partition",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn protected_and_emergency_permits_are_owner_and_epoch_bound() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
