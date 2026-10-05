@@ -2,6 +2,7 @@
 
 mod hook_intake;
 mod host_event_oneshot;
+mod packager_catalog;
 mod packager_prompts;
 mod request_input;
 
@@ -11,10 +12,11 @@ use eliot_agent_bridge::opencode_host_events::{
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
-    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue,
+    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, McpCatalogArgs, NormalizedCue,
     OwnerDryRunPreview, Profile, ToolResultReceipt, TransportAdmissionError, TransportProfile,
     UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration, loopback_http_route,
-    parse_args, reactive_runtime_composition, validate_credential, validate_host, validate_origin,
+    parse_args, parse_mcp_catalog_args, reactive_runtime_composition, validate_credential,
+    validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -796,6 +798,48 @@ fn main() {
     }
     if mcp_mode {
         argv.remove(0);
+    }
+    if mcp_mode && argv.first().is_some_and(|token| token == "catalog") {
+        // The packager catalog dispatch owns its stdout emission from
+        // here: pretty JSON plus one trailing newline, no server start.
+        argv.remove(0);
+        let catalog_args: McpCatalogArgs = match parse_mcp_catalog_args(argv) {
+            Ok(args) => args,
+            Err(error) => {
+                let (code, detail) = match error {
+                    CliError::MissingProfile => {
+                        ("MISSING_PROFILE", "--profile is required".to_owned())
+                    }
+                    CliError::MissingClientDeclaration => (
+                        "MISSING_CLIENT_DECLARATION",
+                        "--client-declaration is required".to_owned(),
+                    ),
+                    CliError::UnsupportedProfile(profile) => ("UNSUPPORTED_PROFILE", profile),
+                    CliError::MalformedArgument(argument) => ("MALFORMED_ARGUMENT", argument),
+                    CliError::RemoteTransportForbidden(transport) => {
+                        ("REMOTE_TRANSPORT_FORBIDDEN", transport)
+                    }
+                    CliError::InvalidClientDeclarationPath(path) => {
+                        ("INVALID_CLIENT_DECLARATION_PATH", path)
+                    }
+                    CliError::TransportRejected(code) => ("TRANSPORT_REJECTED", code),
+                };
+                emit_error(code, &detail);
+                std::process::exit(INVALID_ARGUMENT_EXIT);
+            }
+        };
+        let catalog =
+            match packager_catalog::render_mcp_catalog(&catalog_args.host, catalog_args.surface) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    emit_error("MALFORMED_ARGUMENT", &error.to_string());
+                    std::process::exit(INVALID_ARGUMENT_EXIT);
+                }
+            };
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut stdout, &catalog).expect("packager catalog write");
+        writeln!(stdout).expect("packager catalog newline");
+        std::process::exit(0);
     }
     if host_events_mode {
         argv.remove(0);
