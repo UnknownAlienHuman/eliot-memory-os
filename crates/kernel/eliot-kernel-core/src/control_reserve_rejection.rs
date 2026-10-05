@@ -520,4 +520,49 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// The recording-identity complement of
+    /// `guarantee_lost_response_records_live_guarantee_loss` in this module:
+    /// even a truly live guarantee loss still refuses a blank recording
+    /// identity as `InvalidField { field: "rejection.recording_operation_id" }`,
+    /// so a malformed identity never produces a loss record (#1679 A10).
+    #[test]
+    fn guarantee_lost_response_rejects_malformed_recording_id() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([31u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // Both recording paths are consumed and held: the permits release on
+        // drop, so the refusal below comes from the malformed identity and not
+        // from a live recording path.
+        let _held_protected = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        let _held_emergency = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-gap-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+        assert_eq!(front_door.available_emergency(), 0);
+
+        let err = front_door
+            .guarantee_lost_response(
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed recording identity must never produce a loss record");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "rejection.recording_operation_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
 }
