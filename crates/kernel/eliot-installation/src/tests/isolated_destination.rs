@@ -823,14 +823,17 @@ fn a_non_absent_leaf_observation_is_refused_by_both_records() {
     }
 }
 
-/// A disposable isolated restore area in the REAL `ProgramData` contour, plus
+/// A disposable isolated restore area under an owned temp case root, plus
 /// the retained no-follow lease over it.
 ///
-/// This is the contour production runs in, so `ProtectedRootLease` accepts it
-/// without any test-only override: the owner resolves the protected root itself
-/// and the lease pins the real OS directory contour by retained handles. It also
-/// holds the `PRODUCTION_INSTALLER_TEST_LOCK` the rest of this crate's real-
-/// `ProgramData` proofs hold, because it writes into the same shared tree.
+/// The protected contour is pinned to the case root through
+/// `eliot_platform_windows::test_support::override_protected_root`: the real
+/// `ProgramData` contour needs elevation to create into, which test runners do
+/// not have, while every proof under test -- containment, retained-handle
+/// identity, the publication and its re-proof -- still runs through the real
+/// `expected_root()` and `ProtectedRootLease` machinery. It also
+/// holds the `PRODUCTION_INSTALLER_TEST_LOCK` serialising the shared temp
+/// staging root.
 #[cfg(windows)]
 struct LiveArea {
     /// The retained no-follow lease over the area. Held for the whole case.
@@ -838,8 +841,15 @@ struct LiveArea {
     /// The area path this operation created, used for cleanup and for the
     /// "nothing else was written here" observation.
     path: std::path::PathBuf,
-    /// The crate's real-`ProgramData` serialisation lock, held for the whole case.
+    /// The temp case root the protected contour is overridden to. Held for
+    /// the whole case and removed on release.
+    staging: std::path::PathBuf,
+    /// The serialisation lock for the shared staging root, held for the whole case.
     _serial: std::sync::MutexGuard<'static, ()>,
+    /// The thread-local protected-root override. Held for the whole case: the
+    /// lease, the publication and every re-proof resolve `expected_root()`
+    /// through it.
+    _override: eliot_platform_windows::test_support::ProtectedRootOverride,
 }
 
 #[cfg(windows)]
@@ -858,7 +868,8 @@ impl LiveArea {
         crate::joined_windows_path(&self.root_text(), destination.as_str())
     }
 
-    /// Drops the retained lease and removes the area this operation created.
+    /// Drops the retained lease and removes the area and staging root this
+    /// operation created.
     ///
     /// Ownership is what makes this legitimate: the path was derived under a name
     /// unique to this case, created by this operation, and holds nothing but what
@@ -868,11 +879,15 @@ impl LiveArea {
         let LiveArea {
             lease,
             path,
+            staging,
             _serial,
+            _override,
         } = self;
         drop(lease);
         let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_dir_all(staging);
         drop(_serial);
+        drop(_override);
     }
 }
 
@@ -881,16 +896,17 @@ fn live_isolated_area(name: &str) -> LiveArea {
     let serial = super::PRODUCTION_INSTALLER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let program_data = must(crate::protected_program_data_root());
-    let path = program_data
-        .join("Eliot")
-        .join("isolated-restore")
-        .join(name)
-        .join(
-            super::NEXT_TRANSACTION_ROOT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .to_string(),
-        );
+    // Owned temp staging root: the real `ProgramData` contour needs elevation to
+    // create into, so the protected contour is overridden to this case root and
+    // every proof below still runs through the real `expected_root()` machinery.
+    let staging = std::env::temp_dir().join("eliot-958-installation-area");
+    std::fs::create_dir_all(&staging).expect("the isolated area staging root is creatable");
+    let _override = eliot_platform_windows::test_support::override_protected_root(&staging);
+    let path = staging.join(name).join(
+        super::NEXT_TRANSACTION_ROOT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
     let _ = std::fs::remove_dir_all(&path);
     // The owner's own protected-directory creator, so the area carries the ACL
     // and reparse-freedom the lease later demands rather than a bare
@@ -902,7 +918,9 @@ fn live_isolated_area(name: &str) -> LiveArea {
     LiveArea {
         lease,
         path,
+        staging,
         _serial: serial,
+        _override,
     }
 }
 
