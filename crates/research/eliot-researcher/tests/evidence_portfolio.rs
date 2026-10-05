@@ -1158,3 +1158,45 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
     assert!(GOLDEN.contains("SUPPORTED"));
     assert!(GOLDEN.contains("weakest_link"));
 }
+
+/// Two examined candidates the frozen denominator never declared.
+fn examined_two() -> Vec<ObservedOutsideScope> {
+    vec![
+        ObservedOutsideScope {
+            handle: "witness-a".to_owned(),
+            disposition: SourceDisposition::Observed,
+            content_digest: DIGEST_A.to_owned(),
+            operation_id: "op-1".to_owned(),
+            admitted_manifest_digest: DIGEST_A.to_owned(),
+        },
+        ObservedOutsideScope {
+            handle: "witness-b".to_owned(),
+            disposition: SourceDisposition::Observed,
+            content_digest: DIGEST_A.to_owned(),
+            operation_id: "op-2".to_owned(),
+            admitted_manifest_digest: DIGEST_A.to_owned(),
+        },
+    ]
+}
+
+#[test]
+fn open_verified_empty_refuses_unexamined() {
+    assert!(matches!(
+        CoverageAccount::open_verified_empty(&[]),
+        Err(PortfolioError::IncompleteDenominator { .. })
+    ));
+    assert!(matches!(
+        CoverageAccount::open(BTreeSet::new()),
+        Err(PortfolioError::IncompleteDenominator { .. })
+    ));
+}
+
+#[test]
+fn open_verified_empty_retains_examined() {
+    let account =
+        CoverageAccount::open_verified_empty(&examined_two()).expect("verified empty account");
+    assert_eq!(account.denominator_size(), 0);
+    assert!(account.is_verified_empty());
+    assert!(account.open_members().is_empty());
+    assert_eq!(account.observed_outside_scope().len(), 2);
+}
