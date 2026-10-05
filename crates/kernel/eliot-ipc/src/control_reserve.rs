@@ -1050,6 +1050,42 @@ mod tests {
         ));
     }
 
+    /// The protected-side identity guard (issue #1679 A10):
+    /// `try_acquire_protected_bytes` refuses a blank operation id as
+    /// `InvalidField { field: "ipc_permit.operation_id" }` on a
+    /// partition with free protected bytes, so no control permit ever
+    /// binds an identity the contract cannot name and protected
+    /// capacity is never held under an unnameable operation (I14.3:
+    /// every permit binds owner/operation/epoch; control-channel
+    /// permits are not exempt from identity per
+    /// `docs/architecture/I14-03-control-reserve.md`). The neighbour
+    /// pins only the owner check on this path; a regression silently
+    /// dropping the operation-id check would still pass it while
+    /// letting control permits be held under an unnameable operation.
+    #[test]
+    fn ipc_protected_acquire_rejects_blank_operation_id() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(2).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_protected_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank operation id must never hold a protected permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.operation_id",
+                ..
+            }
+        ));
+    }
+
     /// A fresh reserve reports exactly the partition capacities it was
     /// configured with (issue #1679): quantities are copied from
     /// configuration and never derived or scaled at construction, so no
