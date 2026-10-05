@@ -1,4 +1,4 @@
-inventory_digest = "e73a7372eca1a972bbc042504ced9b0f0eee4e77e9dc62d044bdc919af17ece3"
+inventory_digest = "19e4a53f5d18f0aa17a354640b3c631b309493c154599e4f2fff2bd95eb76031"
 proposed_splits = []
 
 [header]
@@ -26,10 +26,10 @@ stu_accounting_rule = "STU = ceil(UTF-8 bytes / 3) per docs/architecture/I02-16-
 upper_review_band_stu = 65000
 test_path_tracking_evidence = "git ls-files --error-unmatch <path> in the owning worktree; the generator re-verifies existence, byte count and sha256 without spawning git"
 scan_roots = ["crates/eliot-app/src/commands/data_and_memory.rs", "crates/eliot-app/src/mcp_stdio.rs", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "crates/eliot-app/src/mcp_stdio/memory.rs", "crates/eliot-app/src/mcp_stdio/operator.rs", "crates/eliot-app/src/mcp_stdio/skill.rs", "crates/eliot-app/src/mcp_stdio/task_handlers.rs", "crates/eliot-engine/src/cognition.rs", "crates/eliot-engine/src/context.rs", "crates/eliot-engine/src/context/packet_quality.rs", "crates/eliot-engine/src/context_contracts.rs", "crates/eliot-engine/src/control_plane.rs", "crates/eliot-engine/src/host.rs", "crates/eliot-engine/src/memory_distillation.rs", "crates/eliot-engine/src/memory_lifecycle.rs", "crates/eliot-engine/src/skill.rs", "crates/eliot-engine/src/skill_curator.rs", "crates/smart/eliot-context-assembly/src/measurement.rs", "crates/smart/eliot-context-contracts/src/measurement.rs", "crates/smart/eliot-context-measurement/src/capacity.rs", "crates/smart/eliot-context-measurement/src/envelope.rs", "crates/smart/eliot-context-measurement/src/lib.rs", "crates/smart/eliot-context-measurement/src/observation.rs", "crates/smart/eliot-context-measurement/src/receipt.rs", "crates/smart/eliot-context-measurement/src/stu.rs", "crates/smart/eliot-context-measurement/tests/measurement.rs"]
-exclusions = ["exc/1|crates/eliot-app/src/cognitive_field_runner.rs:11659-11659|unrelated_byte_or_character_metric|83224db3c2de82a5|collection-length partition for execution chunking (executions/target_chunks); no byte/char/token/STU semantic|declared unrelated byte/character metric: 'executions.len().div_ceil(target_chunks)'; excluded with exact evidence, not a package skip", "exc/2|crates/eliot-app/src/host_runtime/event_and_authority.rs:2907-2907|unrelated_byte_or_character_metric|8a15cd14ee1d7efe|seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'input.ttl_seconds.div_ceil(60)'; excluded with exact evidence, not a package skip", "exc/3|crates/eliot-app/src/host_runtime/supervised_process.rs:1545-1545|unrelated_byte_or_character_metric|2fb187414f7c18f4|digest text length bound on a hash string; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'hash.chars().count() <= 128'; excluded with exact evidence, not a package skip", "exc/4|crates/eliot-app/src/host_runtime/supervised_process.rs:1576-1576|unrelated_byte_or_character_metric|1b53d5d338573ec6|log-detail truncation bound; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'if detail.chars().count() > 512@@0'; excluded with exact evidence, not a package skip", "exc/5|crates/eliot-engine/src/host.rs:188-188|unrelated_byte_or_character_metric|bd25287324ab7b71|nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens|declared unrelated byte/character metric: 'let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()'; excluded with exact evidence, not a package skip", "exc/6|crates/eliot-engine/src/host.rs:186-186|unrelated_byte_or_character_metric|2a73328ae0d67216|summed description character count reported only as listing_characters; never divided or relabelled as tokens|declared unrelated byte/character metric: 'descriptions += description_characters'; excluded with exact evidence, not a package skip"]
+exclusions = ["exc/1|crates/eliot-app/src/cognitive_field_runner.rs:11659-11659|unrelated_byte_or_character_metric|83224db3c2de82a5|collection-length partition for execution chunking (executions/target_chunks); no byte/char/token/STU semantic|declared unrelated byte/character metric: 'executions.len().div_ceil(target_chunks)'; excluded with exact evidence, not a package skip", "exc/2|crates/eliot-app/src/host_runtime/event_and_authority.rs:2907-2907|unrelated_byte_or_character_metric|8a15cd14ee1d7efe|seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'input.ttl_seconds.div_ceil(60)'; excluded with exact evidence, not a package skip", "exc/3|crates/eliot-app/src/host_runtime/supervised_process.rs:1545-1545|unrelated_byte_or_character_metric|2fb187414f7c18f4|digest text length bound on a hash string; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'hash.chars().count() <= 128'; excluded with exact evidence, not a package skip", "exc/4|crates/eliot-app/src/host_runtime/supervised_process.rs:1576-1576|unrelated_byte_or_character_metric|1b53d5d338573ec6|log-detail truncation bound; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'if detail.chars().count() > 512'; excluded with exact evidence, not a package skip", "exc/5|crates/eliot-engine/src/host.rs:188-188|unrelated_byte_or_character_metric|bd25287324ab7b71|nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens|declared unrelated byte/character metric: 'let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()'; excluded with exact evidence, not a package skip", "exc/6|crates/eliot-engine/src/host.rs:186-186|unrelated_byte_or_character_metric|2a73328ae0d67216|summed description character count reported only as listing_characters; never divided or relabelled as tokens|declared unrelated byte/character metric: 'descriptions += description_characters'; excluded with exact evidence, not a package skip"]
 classifications = ["exact-utf8-envelope", "normative-stu-estimate", "serializer-identity-bound", "route-identity-bound", "estimator-policy-unvalidated", "capacity-fit-analysis", "exact-observation", "stale-or-absent-observation", "transformed-observation", "test-only", "token_estimate_without_tokenizer", "character_count_mislabeled_as_tokens", "bare_measurement_field_or_conversion", "unrelated_byte_or_character_metric", "unresolved"]
 owner_allocations = ["#704:9", "#783:21", "#878:17", "#880:21", "unresolved:4"]
-consumer_worksets_digest = "8d081cc3ffc333b935ef2b8200a1a96afb95125d71e02f48bce7b9e30782ac0f"
+consumer_worksets_digest = "e31e19e405ffbfc2af174a0ed8cf5d0fe3c07375a2ffa7096a30c8e66b2a6bd3"
 
 [[rows]]
 id = "c0001"
@@ -51,8 +51,8 @@ span_digest = "efc9b335bca94c3c6c97329fc398a20ae9a4817e856b019dac7bfe081d15ff9e"
 classification = "normative-stu-estimate"
 status = "owned"
 dispatch_blocked = false
-row_digest = "3964b6aea81fa1252b6fbfb4825cf05dcd7c84d33411895bc4feddafd5dea058"
-evidence = "normative STU signal 'stu_for_bytes': ceil(bytes/3) estimate, never proves fit; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/stu.rs"
+row_digest = "d14d99a634863a5df7f1c05300e8f3c7ec29ca886cb4d6c620e06bbee7560dff"
+evidence = "normative STU signal 'pub fn stu_for_bytes(len: u64) -> Result<u64, ContextError> {': ceil(bytes/3) estimate, never proves fit; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/stu.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/1 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -76,8 +76,8 @@ span_digest = "cadcc7b5482a41479cceced92a8568abf062211222217997ddd94f6c0219340f"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "f076c3e10848af1a31902370ed917113e0606a6ba4477ed0510584f8c3d300ec"
-evidence = "exact envelope signal 'measure_serialized_context': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
+row_digest = "1b8864f34525bc9fb29649ae06eab658c36dfe68c001da5a2344ec673a4d2c4d"
+evidence = "exact envelope signal 'pub fn measure_serialized_context(': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/2 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -101,8 +101,8 @@ span_digest = "a21aa74eb457bbc9f418ebece6a1d50b3f51533cba44147ac3a52fddc84d9022"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "c4127e7184544345c6db90e41968a66a049302b1fe21764cc1a7e58d3bf25213"
-evidence = "exact envelope signal 'measure_exact_utf8': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
+row_digest = "54ecdd076d01d796d7fe65fec633155cf073037af32b44ee542d7b6290b109f2"
+evidence = "exact envelope signal 'pub fn measure_exact_utf8(': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/3 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -126,8 +126,8 @@ span_digest = "01544bc68d8ea63f492ee5cfbfbfc3056587756b4e2f21993f2c0415ad376589"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "3cddd2daf794466118222a7d9e9de028f2448e9bf064280f0dc19e56ac710c06"
-evidence = "exact envelope signal 'declared_len': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/envelope.rs"
+row_digest = "c8a8fed2d82d81c96e2f4bcdb7c304598c0c791c6ec8e68e9638ab326bd3f2c1"
+evidence = "exact envelope signal 'declared_len: u64,': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/envelope.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/4 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -151,8 +151,8 @@ span_digest = "6dd50ffaee280b1cc2abb7772572780032039f442a63a829fafb51f81368c477"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "a7739ba182797d7d4196fca9786cd86bf649bf1f11da906c223b05b9d32c1cb7"
-evidence = "exact envelope signal 'content_digest': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/envelope.rs"
+row_digest = "3d66853247ec16446c78eefaaedc8fbe43172d2e41caf1c154d0c4e0e0fad0ed"
+evidence = "exact envelope signal 'content_digest: &str,': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/envelope.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/5 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -176,8 +176,8 @@ span_digest = "b0c22c8c58ea41a4591130981f279427cf76d894198c96225530b00d3baee310"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "d1fbbfaabd347513564f1a15b57e45cc2d7ec554ed65ef8d82373fdfa942d9ec"
-evidence = "exact envelope signal 'rendered_utf8_bytes': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
+row_digest = "c50dc4bd164b7da52466c19a987a927160713450a6c830c39e738a247760ba8d"
+evidence = "exact envelope signal 'rendered_utf8_bytes: rendered,': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/6 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -201,8 +201,8 @@ span_digest = "be09f104a7f6e767f2b2ff68a2b20c811f69c6fd2486ce62e66d7b61ec8995ea"
 classification = "estimator-policy-unvalidated"
 status = "owned"
 dispatch_blocked = false
-row_digest = "f87caed33619ae71e07687e08e31236e47b73b2fd1e2d8c55409197de0b46d40"
-evidence = "estimator signal 'estimator_id': UNVALIDATED planning evidence, candidates cited only; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
+row_digest = "298138de55d7e6eab317b2d0078915f555f6ea52b8aa6af29ff30b77e45eb6bc"
+evidence = "estimator signal 'pub estimator_id: String,': UNVALIDATED planning evidence, candidates cited only; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/7 (estimator-policy-unvalidated); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -226,8 +226,8 @@ span_digest = "fbf5f5fa89b3b1feae4fa738263579d3c52d03812dd54941c1636f04e71b9f31"
 classification = "estimator-policy-unvalidated"
 status = "owned"
 dispatch_blocked = false
-row_digest = "94ccd44a75fac32877ded13eaae564488831b230e8e1e150d615d1d86751d030"
-evidence = "estimator signal 'candidate_digests': UNVALIDATED planning evidence, candidates cited only; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
+row_digest = "2c9491b1dd86d8d1efb33ce39948176701554a372030fc0da385f574e724a4bc"
+evidence = "estimator signal 'pub candidate_digests: Vec<String>,': UNVALIDATED planning evidence, candidates cited only; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/lib.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/8 (estimator-policy-unvalidated); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -251,8 +251,8 @@ span_digest = "6c01184f283bd5a5530e98b30950bdbf37b4141e3973d816427bdbb7361ba012"
 classification = "capacity-fit-analysis"
 status = "owned"
 dispatch_blocked = false
-row_digest = "2b324a1c0b9a7fedcf73af8687955f26f4e9e03a51238b38e4d34b9b7f4168f1"
-evidence = "capacity signal 'receipt_digest': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/receipt.rs"
+row_digest = "1e1f7bf510a2ff4fa712d8a7ebcaeed31c6df310ef8c0856efa1cc497261dabb"
+evidence = "capacity signal 'pub fn receipt_digest(input: &ReceiptInput) -> String {': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/receipt.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/9 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -276,8 +276,8 @@ span_digest = "7909b65fce3d7f7ca867b9f8e24bba30067a39dfe141748a197d27e862856395"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "830f28a63d5caa19e2ac2238ed59c2ca35d7bbba1b1f2759db71ccd1a1e07803"
-evidence = "exact envelope signal 'final_bytes': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "58bd3f482ebdf2b1416effbfd1997572de9a590f8de83724c401c8ffb7d6979e"
+evidence = "exact envelope signal 'pub(crate) fn final_bytes(': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/1 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -301,8 +301,8 @@ span_digest = "c123fe019fa8b05c557708f07ff46e53bd895570213b01e7570f1c871f6f9cda"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "8a95f9cc04b2d161df55424c3164a1ad06759ff22a62e442916bde29327d95e0"
-evidence = "exact envelope signal 'envelope_digest': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "40b1b33b8f353ad5ac90c96d50acc269fac359ed39c1ed9c6d24bbc7c1e05637"
+evidence = "exact envelope signal 'if measurement.envelope_digest != output_digest {': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/2 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -326,8 +326,8 @@ span_digest = "235f70a11a9912d875bc22fc93cd4943e54e73be3d45637dfc5d5b4552349312"
 classification = "serializer-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "fd4496ccaaec2a589992176a632797e62035c18c2f3b21c181e6ae54f80c8872"
-evidence = "serializer identity signal 'serializer_id': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "d0c9cd15b98122864245d90c013441272595eaea169944608fcad1586211b866"
+evidence = "serializer identity signal 'if measurement.serializer_id != policy.serializer_id': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/3 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -351,8 +351,8 @@ span_digest = "5185fa870c47db88c722de58b2534bedbfe64ee463551db2cdbd4b8c92b70036"
 classification = "route-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "29c2af18b4510edd75d7017baee83a8eeba128506ba3c596799849efbc1db4c6"
-evidence = "route identity signal 'route_id': route/provider/model/tokenizer binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "e1d84cc1247ce2a479ea5e079cfc60d0b52ec9fb008f8c5bc39b1381d1eff568"
+evidence = "route identity signal '|| measurement.route_id != policy.route_id': route/provider/model/tokenizer binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/4 (route-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -376,8 +376,8 @@ span_digest = "179b40e8f8e000487b54c4a8469cf2a9af9f9dda28a5d5e91abe895f081909f9"
 classification = "route-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "4f3203e3d6a21d08f3f3eb5b2e0dabfe125677953527df074408ddf627ce6c31"
-evidence = "route identity signal 'model_id': route/provider/model/tokenizer binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "602fb498c3a2510b06744544ef3d835089105cb7fa44516143de175fc31e9c9e"
+evidence = "route identity signal '|| measurement.model_id != policy.model_id': route/provider/model/tokenizer binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/5 (route-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -401,8 +401,8 @@ span_digest = "4ada173fcfcf33b865a7cd5b839ae6f23c2691f2e65b6157aa4ef4c6fdcead3b"
 classification = "capacity-fit-analysis"
 status = "owned"
 dispatch_blocked = false
-row_digest = "28327594dd1f411f9192a2dc1c3f373984198a3d7561201a21161e8f01a56bd4"
-evidence = "capacity signal 'proves_fit': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "f83c86108c8c8d2e81ef4e6d0b7d6dadba027f64bd23c28e95a1e3c1251a8df5"
+evidence = "capacity signal 'if !measurement.proves_fit(capacity.route_capacity)? {': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/6 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -426,8 +426,8 @@ span_digest = "96a1467e927cefbbd73f17887ce467411508142a2ccb17f5d58a383e66fbf567"
 classification = "capacity-fit-analysis"
 status = "owned"
 dispatch_blocked = false
-row_digest = "3f6628c8fce7c6aba55dfb52e82827e86b6b996af2d0d1253170853dfec24645"
-evidence = "capacity signal 'fixed_overhead': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "59559a80c3cf6180f2f0c131567aa4ea5600269e9a188bdd0dddeb921dfb4893"
+evidence = "capacity signal 'if measurement.fixed_overhead != capacity.fixed_overhead': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/7 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -451,8 +451,8 @@ span_digest = "5bed2256c141a0920a70ce49cf7c10099b4e39e6df974ad1b2a747aac626ab5c"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "b0f5ba871ad7494e6382769a1ef5f2a18298a256f6ed07d2c2e8ab7ca094081e"
-evidence = "exact envelope signal 'ExactUtf8': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
+row_digest = "55a4494816d032e4e469f529d45c88c5ff1aa68761d5e21645a50a6a3b6db747"
+evidence = "exact envelope signal 'if measurement.status != MeasurementStatus::ExactUtf8 {': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-assembly/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/8 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -476,8 +476,8 @@ span_digest = "3c64ed87cd012c8349f6b261fa8e6871a2fe3e7eab2207f8beabc28a268bc769"
 classification = "normative-stu-estimate"
 status = "owned"
 dispatch_blocked = false
-row_digest = "4e414f7d38f1fc439dec0f0c481d280948ca86b0668323ee8c0db6c26970f3ad"
-evidence = "normative STU signal 'stu_for_bytes(envelope.byte_len)': ceil(bytes/3) estimate, never proves fit; measured at crates/eliot-app/src/mcp_stdio.rs:2440-2440 inside `fn canonical_serialized_measurement`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio.rs"
+row_digest = "b7aa3350fbcd6e6fb527f905079285a6a9a930c06230cd6d52d924117e50b969"
+evidence = "normative STU signal 'let stu_estimate = stu_for_bytes(envelope.byte_len).context(                        )?;': ceil(bytes/3) estimate, never proves fit; measured at crates/eliot-app/src/mcp_stdio.rs:2440-2440 inside `fn canonical_serialized_measurement`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/10 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -501,8 +501,8 @@ span_digest = "7c4844e34b6f10324acc1cd47a82a0acbd3445553e114ec06c46ace3a5cd2254"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "2dad7523da237cc69d2e94468d148020b8e18259a09ba58e719b92c1e8fe3516"
-evidence = "bare measurement field or projection: 'combined_ul_tokens'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio.rs:341-341 inside `fn part_e_surface_report`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio.rs"
+row_digest = "2bd5ff42a2b51eee12d20562838feac69126a4bcd41dfb198130b1250626a7f0"
+evidence = "bare measurement field or projection: 'let combined_ul_tokens = combined.stu_estimate;'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio.rs:341-341 inside `fn part_e_surface_report`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/11 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -526,8 +526,8 @@ span_digest = "46f95d58f7a7a22605f2168507cdcac09219aafc2987d9b2b163a6e8e6f2ecd3"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "2b7d45b548fd3884e68f6329524b4caad8129a2f841ec7c180eded229d8f531f"
-evidence = "bare measurement field or projection: 'serialized_bytes: measurement.byte_len'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/memory.rs:819-819 inside `fn canonical_utility_sources`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/memory.rs"
+row_digest = "e6fe99b3af2a57dfdd89879e0cec7aec5427dd57ecb3a9d2969ca664ee4b948f"
+evidence = "bare measurement field or projection: 'serialized_bytes: measurement.byte_len,'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/memory.rs:819-819 inside `fn canonical_utility_sources`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/memory.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/12 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -551,8 +551,8 @@ span_digest = "89ed48467e10efa0ad3e21ce6a5479afc46275c864ee80fee53fde2d74b7cf5f"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "b6a0586275de25270f21174626bb8b27262e7ea0e5979458e9f9d047e6266798"
-evidence = "bare measurement field or projection: 'token_units: measurement.stu_estimate'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/memory.rs:1007-1007 inside `fn canonical_distillation_items`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/memory.rs"
+row_digest = "5a21940b27cbc04f70a4a3fb5168e27f3be4b8197e7ac53448f96dc049cb47ce"
+evidence = "bare measurement field or projection: 'token_units: measurement.stu_estimate,'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/memory.rs:1007-1007 inside `fn canonical_distillation_items`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/memory.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/13 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -576,8 +576,8 @@ span_digest = "c15e2c4af4467b9f66c85fa51c0e2873ec6dbc1fb6d12024fb57043c3c8de00c"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "317b51aa33db4294f21d55af336a8a84b633c78b40e454caac2dd1d9a26612b9"
-evidence = "bare measurement field or projection: 'token_units'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/memory.rs:144-144 inside `fn dispatch_memory_distillation_preview`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/memory.rs"
+row_digest = "37e3b2d1f9ca4cac86357a0d850c5cdd32da0bcedace17b2f41ccb30d8b03a42"
+evidence = "call binding the token_units measurement: ': legacy_memory_token_units_wire(&records)?,'; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-app/src/mcp_stdio/memory.rs:144-144 inside `fn dispatch_memory_distillation_preview`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/memory.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/14 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -626,8 +626,8 @@ span_digest = "c1998444fe104b1068bbbc75badaed7ac8162c362af4b055e5dd6b0dc16853fd"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "cfb761987d12dc01297bdaf87748d8fc0353c884e351195cbabb89782c7fdf9b"
-evidence = "bare measurement field or projection: 'details.section_tokens'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/dispatch.rs:307-307 inside `fn dispatch_error_response`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/dispatch.rs"
+row_digest = "ddd46ebe8e4737cbed971893108025d063bcf2272ce9688ede58a33d2e503d6c"
+evidence = "bare measurement field or projection: 'let section_measurements = recorded_section_wire(&details.section_tokens);'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/dispatch.rs:307-307 inside `fn dispatch_error_response`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/dispatch.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/16 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -676,8 +676,8 @@ span_digest = "6135d477e52f144930a86c4b592f33b3376f9d4000f459669e35751ed064c694"
 classification = "test-only"
 status = "owned"
 dispatch_blocked = false
-row_digest = "b3c0d634c4ba37455a44efecdbf07bff050c95e770192afb35a3548c06a4db55"
-evidence = "test marker or measured test scope in scanned slice; no shipped measurement ('estimated_tokens: 431'); measured at crates/eliot-app/src/mcp_stdio/task_handlers.rs:2789-2789 inside `fn packet_post_commit_intent_pretty_roundtrip_preserves_response_hash`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/task_handlers.rs"
+row_digest = "3f55690219eb6d7d0a8bf84b40590895977faa2b6d28455de3e29147b6923e5b"
+evidence = "test marker or measured test scope in scanned slice; no shipped measurement ('estimated_tokens: 431,'); measured at crates/eliot-app/src/mcp_stdio/task_handlers.rs:2789-2789 inside `fn packet_post_commit_intent_pretty_roundtrip_preserves_response_hash`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/task_handlers.rs"
 successor_scope = "none-required"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -726,8 +726,8 @@ span_digest = "3420675ddc2b9306426c6253280e0ee393cdb2783d81a296c9416b94b6950c08"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "389af158d8bafb416728d41e2dfd0dd22bd0e647b7ed70133ad26297b48e26db"
-evidence = "bare measurement field or projection: ', score.context_cost, false),'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/operator.rs:1149-1149 inside `fn operator_l0_feature_fields`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/operator.rs"
+row_digest = "5361547f3888f9b634bb75321a15a59850f5ca8671bffa0ad57aebe0b51db344"
+evidence = "bare measurement field or projection: 'operator_field(              , score.context_cost, false),'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/operator.rs:1149-1149 inside `fn operator_l0_feature_fields`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/operator.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/20 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -751,8 +751,8 @@ span_digest = "5dd0c0c2b89859709672cd4c0e483b73c4d18536950e70ed8cdae70ebe4acc99"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "f708c0f0a1773776f4c89b2eb87a1466f25f6fc2f0274429eef66d67329da529"
-evidence = "bare measurement field or projection: 'report.estimated_context_cost'; carries no estimator policy of its own; measured at crates/eliot-app/src/commands/data_and_memory.rs:844-844 inside `fn run_skill_influence`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/commands/data_and_memory.rs"
+row_digest = "d17e26a0eada7abbb0f8cec8dde570bef21a780edf2876ad279f474d48810058"
+evidence = "bare measurement field or projection: 'recorded_context_cost(report.estimated_context_cost),'; carries no estimator policy of its own; measured at crates/eliot-app/src/commands/data_and_memory.rs:844-844 inside `fn run_skill_influence`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/commands/data_and_memory.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/21 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -776,8 +776,8 @@ span_digest = "ed0ce9bd8c1e3e8ebd370b90d1e0649da53a7a360d9a0c56e1b8b859ce754fca"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "3a64545d486ffb75464c4325a8d47b4593787d837faeaa052014ecdad13a5c3d"
-evidence = "bare measurement field or projection: '(report.estimated_context_cost != u64::MAX)'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/skill.rs:98-98 inside `fn dispatch_skill_influence`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/skill.rs"
+row_digest = "0e4d84191f026c4646d8d40fd9279b3dd89b989f988fed2201122429c95c0e3a"
+evidence = "bare measurement field or projection: '(report.estimated_context_cost != u64::MAX).then_some(report.estimated_context_cost),'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/skill.rs:98-98 inside `fn dispatch_skill_influence`; frozen owner map confirms exact-scope ownership for crates/eliot-app/src/mcp_stdio/skill.rs"
 successor_scope = "bounded successor scope: consumer #783 owns case 783/22 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -801,8 +801,8 @@ span_digest = "760da60ccd73864d0711da2f46630a708f439a3c6fc36db58c9cd293d3bfd975"
 classification = "serializer-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "e3228f93a14ad30b70420b966e917adb4978a12d377595d7d806c88da1e2fedd"
-evidence = "serializer identity signal 'serializer_id': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
+row_digest = "41061ac060c4077013dd29a8532ae99d119a7236993b3a12774357c57411fcd3"
+evidence = "serializer identity signal 'pub serializer_id: String,': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/1 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -826,8 +826,8 @@ span_digest = "cec712fe0b26619e19279c47b762bcd262063d3a118aca6094bbe26266c28e21"
 classification = "serializer-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "eab6ba2d1ca8011fc531b9719d5a685f1d241564ab43c49c08e4a14fa6f58812"
-evidence = "serializer identity signal 'serializer_options_digest': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
+row_digest = "78663b858c51b9242539f3b011e1ab6945ed2c6ed14e78aa0f41d33f6bb15173"
+evidence = "serializer identity signal 'pub serializer_options_digest: String,': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/2 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -851,8 +851,8 @@ span_digest = "64b922bff6c5cb28892d77355ae331436ad5e2ac613ac0653505b6a8bc3a6132"
 classification = "serializer-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "8d80cf50a97bcd50ff3c74f591354518bde44709bc052f70dd702e9ac0f0dc4e"
-evidence = "serializer identity signal 'schema_version': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
+row_digest = "5aee909a12eee64ee1a5cbce217588e3269b7eee154e4b57591d323310b9af66"
+evidence = "serializer identity signal 'pub schema_version: ContractVersion,': serializer/schema binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/3 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -876,8 +876,8 @@ span_digest = "8e759a2ab8e44fa27242331c1f0e3391d1672dbd54916b21ed433cb85b262681"
 classification = "normative-stu-estimate"
 status = "owned"
 dispatch_blocked = false
-row_digest = "de7bfa16fdbd2561d0b395e5d9bf204681c02c28e1e040c4b28bd8dd5c4b970a"
-evidence = "normative STU signal 'StuEstimate': ceil(bytes/3) estimate, never proves fit; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
+row_digest = "40ed33fa8b3fb96f8d88f01aa7bf0d18f2a1cc11b70d9b42e9fae3b919982388"
+evidence = "normative STU signal 'pub struct StuEstimate {': ceil(bytes/3) estimate, never proves fit; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/4 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -901,8 +901,8 @@ span_digest = "8ca052faa4fdd2a29123c50b0bca40428b2eeeed364f0a666efc711a8d5eb188"
 classification = "exact-observation"
 status = "owned"
 dispatch_blocked = false
-row_digest = "dd402616d5f2e4035bbc19a9c9eaf0c213ea235136805a07437b55ee236becb5"
-evidence = "exact observation signal 'TokenizerObservation': actually-run route tokenizer count; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
+row_digest = "6499f41349a3c908847f41da1e1a3bdb84276b42cbc985a0607bf7fce67b9023"
+evidence = "exact observation signal 'pub struct TokenizerObservation {': actually-run route tokenizer count; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/5 (exact-observation); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -926,8 +926,8 @@ span_digest = "342b62570dd312853cf48a161494482ba25a2d4a1cb347af8a467e77a47d6343"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "96d60fb1aa1c9cd09de75650872e7869897d0f6c3cca464a1bfc47d207957b3e"
-evidence = "exact envelope signal 'utf8_bytes': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
+row_digest = "48302cd15993ad1db5a808114d82a46546862a75613a0496c63aeaea7216dd9c"
+evidence = "exact envelope signal 'pub rendered_utf8_bytes: u64,': final UTF-8 bytes and digest binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-contracts/src/measurement.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/6 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -976,8 +976,8 @@ span_digest = "5d6a2c3725b137bba94b41a65d8298c276ef9a2abc36d9bee44ea708fde5a938"
 classification = "token_estimate_without_tokenizer"
 status = "owned"
 dispatch_blocked = false
-row_digest = "4333da703f1ab6ddee50d2d92dcfbbd1225198bb3327b7f08ba71db2cfd838c6"
-evidence = "local estimator helper 'fn estimate_tokens(packet: &ContextPacketL3)': a named token/STU/context-cost estimator declared at this item; its measured body is bound by the recorded item span; measured at crates/eliot-engine/src/context.rs:3539-3542 inside `<file>`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/context.rs"
+row_digest = "c71f6c104df71ec779906e624c216bdcb10bedfe9d87ca4701a1590a4cbd180b"
+evidence = "local estimator helper 'fn estimate_tokens(packet: &ContextPacketL3) -> Result<usize, EngineError> {\\nlet serialized = serde_json::to_vec(packet)?;\\ncanonical_stu_for_byte_len(serialized.len())\\n}': a named token/STU/context-cost estimator declared at this item; its measured body is bound by the recorded item span; measured at crates/eliot-engine/src/context.rs:3539-3542 inside `<file>`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/context.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/11 (token_estimate_without_tokenizer); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1001,8 +1001,8 @@ span_digest = "8b138ea112fab6afcd085b7d2c63acf5989d9f88d068e51c49f3448c10fdf15b"
 classification = "token_estimate_without_tokenizer"
 status = "owned"
 dispatch_blocked = false
-row_digest = "fddf5fa41a6b4cdf5f2747ca3867b3f1b16f9cf8a8e2f471919aecc28b8d7f15"
-evidence = "call into a declared local estimator: 'estimate_tokens(packet)?);'; consumes an unvalidated byte/character ratio, never a run route tokenizer; measured at crates/eliot-engine/src/context.rs:3642-3642 inside `fn packet_section_accounting`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/context.rs"
+row_digest = "485588d52a542e3c839967d30b8d5a67cfb9ed8af2217ee37e5e8cf5ad2d7bcf"
+evidence = "call into a declared local estimator: 'sections.insert(                       .to_owned(), estimate_tokens(packet)?);'; consumes an unvalidated byte/character ratio, never a run route tokenizer; measured at crates/eliot-engine/src/context.rs:3642-3642 inside `fn packet_section_accounting`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/context.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/12 (token_estimate_without_tokenizer); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1126,8 +1126,8 @@ span_digest = "3bc417e27bf5a12977c84962f0ad7e22c942b2f955071cff7894c4e3519487c5"
 classification = "exact-utf8-envelope"
 status = "owned"
 dispatch_blocked = false
-row_digest = "76aa65df6025fb280cdde7be39bff9ce7a318ad6e86d6b79be07365631b33ebf"
-evidence = "exact envelope signal 'declared_len': final UTF-8 bytes and digest binding; measured at crates/eliot-engine/src/host.rs:377-377 inside `fn exact_text_measurement`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/host.rs"
+row_digest = "260f58963c4bf2222214cac195308794dbe9ee691b112231df0b689cd3003ee1"
+evidence = "exact envelope signal 'let declared_len = u64::try_from(bytes.len()).map_err(|_| ContextError::Overflow)?;': final UTF-8 bytes and digest binding; measured at crates/eliot-engine/src/host.rs:377-377 inside `fn exact_text_measurement`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/host.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/17 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1190,19 +1190,19 @@ seam = "engine-context-packet-quality-host"
 write_scope = "writable"
 path = "crates/eliot-engine/src/host.rs"
 package = "eliot-engine"
-item = "struct SkillPackLintReport"
+item = "fn validate_listing_envelope"
 item_scope = "production"
-signal = "serializer_id@@0"
-span_start = 69
-span_end = 69
-span_bytes = 39
+signal = "serializer_id@@1"
+span_start = 124
+span_end = 124
+span_bytes = 82
 source_sha256 = "7c512a2e7efa0364687c2d2f1cc20c36891f3fbd5d42a2f7c76b815c4579ad4e"
-span_digest = "8f11023173b67bb383e18c723ebf1a38d5b72af77912dcbe5761b12f5d498bf0"
+span_digest = "ada85c32363b99a96cb04bf17c5563a88d3966422341fe21ff790ebc6718e1af"
 classification = "serializer-identity-bound"
 status = "owned"
 dispatch_blocked = false
-row_digest = "6cb05482df8a4afa1136cde1f5f6f1b4584a5292d945404b16a6220d423d918b"
-evidence = "serializer identity signal 'serializer_id': serializer/schema binding; measured at crates/eliot-engine/src/host.rs:69-69 inside `struct SkillPackLintReport`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/host.rs"
+row_digest = "e0274a83b88b301c054143de42768c44eb17faf0672736a681d5dfa2102f71c7"
+evidence = "serializer identity signal 'let (serializer_id, serializer_version, options_digest, profile_digest) =': serializer/schema binding; measured at crates/eliot-engine/src/host.rs:124-124 inside `fn validate_listing_envelope`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/host.rs"
 successor_scope = "bounded successor scope: consumer #878 owns case 878/20 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1226,8 +1226,8 @@ span_digest = "445c4d7c0b203c379969b58eabeb34dbcdb05d2cf1bbb81285e3d822da8b2557"
 classification = "capacity-fit-analysis"
 status = "owned"
 dispatch_blocked = false
-row_digest = "c1d09fc0afabecbc9c90e56548a5b90d64f90f12bab695ce25792f4a38382a5b"
-evidence = "capacity signal 'fixed_overhead': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/capacity.rs"
+row_digest = "7167d1ea62034ff81737b8af736b7e7a03faa3ccc4cf9616adcd11ff54a1046f"
+evidence = "capacity signal 'pub fixed_overhead: u64,': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/capacity.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/1 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1251,8 +1251,8 @@ span_digest = "69cabe436dbc02278b72f0cb257da9b3ad061888777144eb319c6a111c759377"
 classification = "capacity-fit-analysis"
 status = "owned"
 dispatch_blocked = false
-row_digest = "875075f1ffa5175e76fd1f3704a620741cb917e6e411bffbd0687f9654a73d90"
-evidence = "capacity signal 'headroom': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/capacity.rs"
+row_digest = "73e6b3987f48b370c82dd26642fa300097712f43dfb3775006a597394d2cba0b"
+evidence = "capacity signal 'pub headroom: Option<u64>,': reserves/fit/headroom/error/receipt binding; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/capacity.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/2 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1276,8 +1276,8 @@ span_digest = "2c103f90061681e7ef71acc225486d808ea436a891c040b6350ab466076f77c6"
 classification = "exact-observation"
 status = "owned"
 dispatch_blocked = false
-row_digest = "5cf192c323e2fc9388c631d1da70058959b77d26190edcf22ac515628f5d809c"
-evidence = "exact observation signal 'observed_tokens': actually-run route tokenizer count; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/capacity.rs"
+row_digest = "c99e0d55b583245e9d94c108cb6cb08081def23d4c2830c5e9c12ed27e3d6953"
+evidence = "exact observation signal 'observed_tokens: Option<u64>,': actually-run route tokenizer count; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/capacity.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/3 (exact-observation); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1301,8 +1301,8 @@ span_digest = "d6182f2ba29c99ee0dc6618f86138998382b92fb73c8b804a809a74f57811428"
 classification = "exact-observation"
 status = "owned"
 dispatch_blocked = false
-row_digest = "1f59b9fa12f17960cbbcccf55ed73cbf0a1c59f5e2080dc7ed0778887740ce14"
-evidence = "exact observation signal 'ProviderTokenizerRun': actually-run route tokenizer count; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
+row_digest = "8fe0ac03c159d1c64380c6bffa1ae9de653baf9c02e0c9321ba8c55045eb7385"
+evidence = "exact observation signal 'ProviderTokenizerRun,': actually-run route tokenizer count; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/4 (exact-observation); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1326,8 +1326,8 @@ span_digest = "ef8654bad0caa5457f1e99f92dae8bfbe213bc9ac209976aa262e429ae87cb65"
 classification = "transformed-observation"
 status = "owned"
 dispatch_blocked = false
-row_digest = "bd87f579dce14394c2e54807b4c57cc845498d91a7f3b10839ef98380fc2946a"
-evidence = "transformed signal 'Transformed': provider rewrite evidence, no count comparison; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
+row_digest = "1706502b2195cafa665513a689f08987f412e92f8438cc26b5723d5f4d201bc1"
+evidence = "transformed signal 'Transformed,': provider rewrite evidence, no count comparison; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/5 (transformed-observation); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1351,8 +1351,8 @@ span_digest = "9ea9bf9583d1969c65eb5b61c992dfcc68bea4a965a03e21224b708c874c031f"
 classification = "stale-or-absent-observation"
 status = "owned"
 dispatch_blocked = false
-row_digest = "26ae8622f339f415955dc165b2a0b5daba5b7b67791260a568ca292611a194ad"
-evidence = "non-exact signal 'Stale': absent/unavailable/stale/unsupported/unknown, never zero; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
+row_digest = "73b26225d3d004113f03f8a4ae2c53ca887ee6a81eb6e8d5ef64dde72414062c"
+evidence = "non-exact signal 'Stale,': absent/unavailable/stale/unsupported/unknown, never zero; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/6 (stale-or-absent-observation); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1376,8 +1376,8 @@ span_digest = "3aaab08e5a8a99e8eaf195b482e0709f5c2400efbed6b432354db41a251478de"
 classification = "stale-or-absent-observation"
 status = "owned"
 dispatch_blocked = false
-row_digest = "0e461153989251a18dad0617482019136d23fa6574935b9769c3be0df1f1d3f0"
-evidence = "non-exact signal 'Absent': absent/unavailable/stale/unsupported/unknown, never zero; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
+row_digest = "66a3b3887c46947c713194ca31de6494b95a6d309503448dbcf623d179025388"
+evidence = "non-exact signal 'Absent,': absent/unavailable/stale/unsupported/unknown, never zero; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/observation.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/7 (stale-or-absent-observation); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1423,12 +1423,12 @@ span_end = 1020
 span_bytes = 1631
 source_sha256 = "05d24a9bc6fff2bc4864077521c411c199ac72f538a3dfbe5ce7acd405017c97"
 span_digest = "514fdf9faedb6cd996dc99b78d36cd425a9b6f07d370054629cd7e18d6e35cf7"
-classification = "token_estimate_without_tokenizer"
+classification = "normative-stu-estimate"
 status = "owned"
 dispatch_blocked = false
-row_digest = "377f2f4fb5616b513307562696ce7d545e587a07e87c74a9ec70267effd2ded9"
-evidence = "local estimator helper 'fn measure_skill_context_envelope(': a named token/STU/context-cost estimator declared at this item; its measured body is bound by the recorded item span; measured at crates/eliot-engine/src/skill.rs:982-1020 inside `<file>`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill.rs"
-successor_scope = "bounded successor scope: consumer #880 owns case 880/10 (token_estimate_without_tokenizer); prove fit/error/receipt in the owning issue"
+row_digest = "50213011998aa6f73f1f49c358e299f42275e5e40259349efb47af942284f5a9"
+evidence = "normative STU signal 'pub(crate) fn measure_skill_context_envelope(\\nskill: &SkillCardV2,\\n) -> Result<SkillContextEnvelopeMeasurement, EngineError> {\\nconst SERIALIZER_ID: &str =             ;\\nconst SERIALIZER_VERSION: &str =                         ;\\nconst SERIALIZER_OPTIONS: &[u8] =\\n;\\nlet serialized = serde_json::to_vec(skill)?;\\nlet declared_len = u64::try_from(serialized.len()).map_err(|_| ContextError::Overflow)?;\\nlet content_digest = eliot_contracts::sha256_hex(&serialized);\\nlet envelope = validate_envelope(\\n&serialized,\\ndeclared_len,\\n&content_digest,\\nMAX_MEASUREMENT_BYTES,\\n)?;\\nlet value = stu_for_bytes(envelope.byte_len)?;\\nlet serializer_options_digest = eliot_contracts::sha256_hex(SERIALIZER_OPTIONS);\\nlet serializer_profile_digest = eliot_contracts::sha256_hex(\\nformat!(                                                                    ).as_bytes(),\\n);\\nOk(SkillContextEnvelopeMeasurement {\\nskill_ref: skill.skill_id.to_string(),\\nskill_version: skill.version.clone(),\\nrendered_utf8_bytes: envelope.byte_len,\\nstu_estimate: StuEstimate {\\nvalue,\\nempirical: false,\\n},\\nserializer_id: SERIALIZER_ID.to_owned(),\\nserializer_version: SERIALIZER_VERSION.to_owned(),\\nserializer_options_digest,\\nserializer_profile_digest,\\ncontent_digest: envelope.digest,\\nmeasurement_status: MeasurementStatus::ConservativeStu,\\nactual_tokens: None,\\n})\\n}': ceil(bytes/3) estimate, never proves fit; measured at crates/eliot-engine/src/skill.rs:982-1020 inside `<file>`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill.rs"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/10 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
 [[rows]]
@@ -1501,8 +1501,8 @@ span_digest = "1d5716e8037c2c8830208ce36d94cb152d5df7ef6c4f92c3af12c4a6f4853ed1"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "48880713abe93b4fb55b11068958546e41566eceb1b20e07cf5c6dd2a9abd25e"
-evidence = "bare measurement field or projection: 'context_cost(skill: &SkillCardV2) -> Option<u64> {'; carries no estimator policy of its own; measured at crates/eliot-engine/src/skill_curator.rs:657-657 inside `<file>`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill_curator.rs"
+row_digest = "15722e369936d942ac3649927ac8234449adc0c15f2727cb7fc4daee774de8c1"
+evidence = "call binding the context_cost measurement: 'fn measured_skill_context_cost(skill: &SkillCardV2) -> Option<u64> {'; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-engine/src/skill_curator.rs:657-657 inside `<file>`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill_curator.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/13 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1551,8 +1551,8 @@ span_digest = "0f5b7d00d2217609fe2b49bd24908e5e2da4d7e69744e7569213947c7c79b3f7"
 classification = "token_estimate_without_tokenizer"
 status = "owned"
 dispatch_blocked = false
-row_digest = "11c4998536eb58904783bde5241d27f684fe9385882804816526fa93e7444755"
-evidence = "call into a declared local estimator: 'context_cost_delta_tokens: expected_context_delta(action, skill)'; consumes an unvalidated byte/character ratio, never a run route tokenizer; measured at crates/eliot-engine/src/skill_curator.rs:596-596 inside `fn base_proposal`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill_curator.rs"
+row_digest = "c68bc6f4587d61263bcf8f364dfd548966fc239c0da09dd6e73ede851010b96b"
+evidence = "call into a declared local estimator: 'context_cost_delta_tokens: expected_context_delta(action, skill),'; consumes an unvalidated byte/character ratio, never a run route tokenizer; measured at crates/eliot-engine/src/skill_curator.rs:596-596 inside `fn base_proposal`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill_curator.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/15 (token_estimate_without_tokenizer); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1576,8 +1576,8 @@ span_digest = "eac498b791cb31dd4899857f008dc9bae0b32d247616ae1156bd8d58213314d8"
 classification = "bare_measurement_field_or_conversion"
 status = "owned"
 dispatch_blocked = false
-row_digest = "bc18debc875e7f0e0e933e26a6dec4d3b34a486bff52cef1cf8bb841dfd79888"
-evidence = "bare measurement field or projection: 'context_cost(skill).is_some_and(|cost| cost >= 180)'; carries no estimator policy of its own; measured at crates/eliot-engine/src/skill_curator.rs:667-667 inside `fn low_utility_high_cost`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill_curator.rs"
+row_digest = "9c865eac40734f466af67a7c66e9601addbd559a604b78606e26898dfa9253ac"
+evidence = "call binding the context_cost measurement: '&& measured_skill_context_cost(skill).is_some_and(|cost| cost >= 180)'; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-engine/src/skill_curator.rs:667-667 inside `fn low_utility_high_cost`; frozen owner map confirms exact-scope ownership for crates/eliot-engine/src/skill_curator.rs"
 successor_scope = "bounded successor scope: consumer #880 owns case 880/16 (bare_measurement_field_or_conversion); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1801,8 +1801,8 @@ span_digest = "722cc4fcaadd01e1c7eba86627ea913206dad453193d0d4ead0c0560a064d901"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "fc2dd8746bd7953d23806fefd08830bb0f660cd8e3053e12479d86471e6fc40b"
-evidence = "bare unit conversion feeding a measurement field: '.saturating_add(intent.cost_or_token_units)'; no estimator policy; measured at crates/eliot-engine/src/control_plane.rs:714-714 inside `fn record_step`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+row_digest = "9ad9ad3bad0892e7488039601055f3ce513f4a29213350bba4a7d3e31d1e1c61"
+evidence = "bare unit conversion feeding a measurement field: '.saturating_add(intent.cost_or_token_units);'; no estimator policy; measured at crates/eliot-engine/src/control_plane.rs:714-714 inside `fn record_step`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate unres/3 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1826,8 +1826,8 @@ span_digest = "61684735fdb20c426966fd30adc6f866d80df592e8dcbe3cd2920681d3e87acc"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "cb82f378e70202c1dc622d8f992b4c9501ef742144f1db689ed2c9a75d92cf03"
-evidence = "bare measurement field or projection: '|| treatment.estimated_tokens < control.estimated_tokens'; carries no estimator policy of its own; measured at crates/eliot-engine/src/cognition.rs:184-184 inside `fn compare_memory_value`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+row_digest = "fb8a236df63630ad43ccb0f30383d96da6837263324bce9d4274d22840c7614e"
+evidence = "bare measurement field or projection: '|| treatment.estimated_tokens < control.estimated_tokens;'; carries no estimator policy of its own; measured at crates/eliot-engine/src/cognition.rs:184-184 inside `fn compare_memory_value`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate unres/4 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -1905,9 +1905,9 @@ role = "engine-consumer"
 seam = "engine-context-packet-quality-host"
 row_ids = ["c0031", "c0032", "c0033", "c0034", "c0035", "c0036", "c0037", "c0038", "c0039", "c0040", "c0041", "c0042", "c0043", "c0044", "c0045", "c0046", "c0047"]
 source_paths = ["crates/eliot-engine/src/context.rs", "crates/eliot-engine/src/context/packet_quality.rs", "crates/eliot-engine/src/context_contracts.rs", "crates/eliot-engine/src/host.rs"]
-items = ["c0037:crates/eliot-engine/src/context.rs:2843-2843", "c0038:crates/eliot-engine/src/context.rs:3539-3542", "c0039:crates/eliot-engine/src/context.rs:3642-3642", "c0040:crates/eliot-engine/src/context.rs:3199-3199", "c0041:crates/eliot-engine/src/context_contracts.rs:121-121", "c0042:crates/eliot-engine/src/context/packet_quality.rs:190-190", "c0043:crates/eliot-engine/src/host.rs:380-380", "c0044:crates/eliot-engine/src/host.rs:377-377", "c0045:crates/eliot-engine/src/host.rs:406-406", "c0046:crates/eliot-engine/src/host.rs:64-64", "c0047:crates/eliot-engine/src/host.rs:69-69"]
-source_span_bytes = 728
-source_span_stu = 243
+items = ["c0037:crates/eliot-engine/src/context.rs:2843-2843", "c0038:crates/eliot-engine/src/context.rs:3539-3542", "c0039:crates/eliot-engine/src/context.rs:3642-3642", "c0040:crates/eliot-engine/src/context.rs:3199-3199", "c0041:crates/eliot-engine/src/context_contracts.rs:121-121", "c0042:crates/eliot-engine/src/context/packet_quality.rs:190-190", "c0043:crates/eliot-engine/src/host.rs:380-380", "c0044:crates/eliot-engine/src/host.rs:377-377", "c0045:crates/eliot-engine/src/host.rs:406-406", "c0046:crates/eliot-engine/src/host.rs:64-64", "c0047:crates/eliot-engine/src/host.rs:124-124"]
+source_span_bytes = 771
+source_span_stu = 257
 read_only_paths = ["crates/smart/eliot-context-contracts/src/measurement.rs"]
 read_only_spans = ["c0031:crates/smart/eliot-context-contracts/src/measurement.rs:41-41", "c0032:crates/smart/eliot-context-contracts/src/measurement.rs:45-45", "c0033:crates/smart/eliot-context-contracts/src/measurement.rs:117-117", "c0034:crates/smart/eliot-context-contracts/src/measurement.rs:96-96", "c0035:crates/smart/eliot-context-contracts/src/measurement.rs:104-104", "c0036:crates/smart/eliot-context-contracts/src/measurement.rs:124-124"]
 read_only_bytes = 208
@@ -1917,13 +1917,13 @@ test_path_evidence = "git ls-files --error-unmatch <path> in the owning worktree
 test_bytes = 54574
 test_stu = 18192
 routed_required_reading = ["crates/AGENTS.md", "docs/architecture/A10-04-delegation.md", "docs/architecture/A14-08-development-doctrine.md", "docs/architecture/I02-16-crate-size-and-agent-context-envelope.md", "docs/architecture/I02-17-parallel-agent-development-contract.md", "docs/architecture/I07-20-agent-facing-error-contract.md", "docs/architecture/I12-32-context-economy-ledger.md", "docs/architecture/I18-21-local-and-ci-parity.md", "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md"]
-source_scope_bytes = 936
-source_scope_stu = 312
-workset_bytes = 55510
-workset_stu = 18504
+source_scope_bytes = 979
+source_scope_stu = 327
+workset_bytes = 55553
+workset_stu = 18518
 scan_root_bytes = 326759
 scan_root_stu = 108920
-workset_stu_share_of_scan_root = "0.0029"
+workset_stu_share_of_scan_root = "0.0030"
 share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only spans against the declared scan-root universe; a scan-root universe is never context"
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
@@ -1931,7 +1931,7 @@ write_serialization_edges = ["single-writer: crates/eliot-engine/src/{context.rs
 dispatch_ready = true
 dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "e418a7beb2a1c5afb93e0ec6b9afc8808d58edb9bc075f45110d3418bf2c911d"
+workset_digest = "fa8ec3d819ef9513c41b7e5d10003493135d83c68acc1644669dbdf040e2e8d3"
 
 [[consumer_worksets]]
 issue = "#880"

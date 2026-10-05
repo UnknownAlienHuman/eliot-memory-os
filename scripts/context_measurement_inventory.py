@@ -322,7 +322,10 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("878/17", "#878", "crates/eliot-engine/src/host.rs", "declared_len@@0"),
     ("878/18", "#878", "crates/eliot-engine/src/host.rs", "let expected_stu = stu_for_bytes(envelope.byte_len)?;"),
     ("878/19", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
-    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "serializer_id@@0"),
+    # 878/20 pins occurrence @@1, the `serializer_id` let-binding at L124, not the
+    # first masked match (the distinct `listing_serializer_id` field at L69 the old
+    # silent first-pick had pinned). The body earns serializer-identity-bound itself.
+    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "serializer_id@@1"),
     # #880 engine Skill / memory seam
     ("880/10", "#880", "crates/eliot-engine/src/skill.rs", "fn measure_skill_context_envelope("),
     ("880/11", "#880", "crates/eliot-engine/src/skill.rs", "pub(crate) fn estimated_context_cost(&self) -> u64 {"),
@@ -649,14 +652,42 @@ ESTIMATOR_CALL_RE = re.compile(
     r"measure_serialized_context|measure_exact_utf8|expected_context_delta)\s*\("
 )
 BYTE_RATIO = re.compile(r"div_ceil\(\s*4\s*\)")
-MEASURED_FIELD = re.compile(
-    r"\b(?:estimated_tokens|estimated_context_cost|context_cost_tokens|ContextTokenCost|"
-    r"estimated_skill_context_cost|context_cost|token_units|serialized_bytes|"
-    r"listing_characters|cost_or_token_units|cost_or_token_budget|"
-    r"context_cost_delta_tokens|description_ul_tokens|combined_ul_tokens|"
-    r"mandatory_floor_tokens|section_tokens|expected_context_delta)\b"
+_MEASURED_FIELD_TOKENS = (
+    "estimated_tokens",
+    "estimated_context_cost",
+    "context_cost_tokens",
+    "ContextTokenCost",
+    "estimated_skill_context_cost",
+    "context_cost",
+    "token_units",
+    "serialized_bytes",
+    "listing_characters",
+    "cost_or_token_units",
+    "cost_or_token_budget",
+    "context_cost_delta_tokens",
+    "description_ul_tokens",
+    "combined_ul_tokens",
+    "mandatory_floor_tokens",
+    "section_tokens",
+    "expected_context_delta",
 )
+MEASURED_FIELD = re.compile(r"\b(?:" + "|".join(_MEASURED_FIELD_TOKENS) + r")\b")
 TOLERATED_LITERAL = re.compile(r"^\s*\(?\s*(?:pub\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*[\"']")
+
+
+def _mentions_token(text: str, token: str) -> bool:
+    """True when ``token`` occurs in ``text`` as a standalone code token (#866 W3).
+
+    Word boundaries keep `rendered_utf8_bytes` from matching the shorter
+    `utf8_bytes` arm input and vice versa: each closed arm fires only on its
+    own declared token, never on a longer identifier that merely contains it.
+    """
+    return re.search(r"\b%s\b" % re.escape(token), text) is not None
+
+
+def _mentions_any(text: str, tokens: tuple[str, ...]) -> bool:
+    """True when any closed-class token occurs in ``text`` as its own token."""
+    return any(_mentions_token(text, token) for token in tokens)
 
 
 class InventoryError(RuntimeError):
@@ -1096,28 +1127,44 @@ def _span_digest(record: dict[str, object], span_start: int, span_end: int) -> s
 def classify_context_measurement(
     signal: str, path: str = "", item_scope: str = "production"
 ) -> tuple[str, str]:
-    """Classify one denominator signal into exactly one closed class.
+    """Classify one denominator signal into exactly one closed class (#866 W3).
 
-    This is the stable classification API reused by issue #787 (import
-    this function, never copy its rules). First match wins; unknown
-    signals fail closed with CLASSIFICATION_OPEN instead of inventing a
-    class. ``path`` is accepted for scope evidence and is never used to
-    widen a closed class. ``item_scope`` is the measured enclosing scope,
-    never an assumption about everything after ``#[cfg(test)]``.
+    ``signal`` is the normalized extracted masked body of the measured span
+    on the production path, never the locator hint: a helper that keeps its
+    name while its body changes between exact bytes, ``/4`` ratios, character
+    counts, minimum-one and rounded sums classifies by what the body does.
+    Short locator hints are still accepted (frozen compat, self-tests, #787)
+    and classify by the same token rules. This is the stable classification
+    API reused by issue #787 (import this function, never copy its rules).
+    First match wins; unknown signals fail closed with CLASSIFICATION_OPEN
+    instead of inventing a class. ``path`` is accepted for scope evidence and
+    is never used to widen a closed class. ``item_scope`` is the measured
+    enclosing scope, never an assumption about everything after
+    ``#[cfg(test)]``.
     """
     _ = path
-    if signal in ("#[test]", "cfg(test)") or item_scope == "test":
+    if any(
+        signal == _split_occurrence_selector(needle)[0]
+        for _ref, _path, needle, _reason in EXCLUSION_CASES
+    ):
+        return (
+            "unrelated_byte_or_character_metric",
+            f"declared unrelated byte/character metric: {signal!r}; excluded with exact evidence, not a package skip",
+        )
+    if "#[test]" in signal or "cfg(test)" in signal or item_scope == "test":
         return (
             "test-only",
             f"test marker or measured test scope in scanned slice; no shipped measurement ({signal!r})",
         )
-    if "stu_for_bytes" in signal or signal == "StuEstimate":
+    if "stu_for_bytes" in signal or "StuEstimate" in signal:
         return (
             "normative-stu-estimate",
             f"normative STU signal {signal!r}: ceil(bytes/3) estimate, never proves fit",
         )
-    if signal in (
-        "measure_serialized_context",
+    if _mentions_any(
+        signal,
+        (
+            "measure_serialized_context",
         "measure_exact_utf8",
         "rendered_utf8_bytes",
         "envelope_digest",
@@ -1126,65 +1173,81 @@ def classify_context_measurement(
         "payload_utf8",
         "max_serialized_bytes",
         "final_bytes",
-        "utf8_bytes",
-        "ExactUtf8",
+            "utf8_bytes",
+            "ExactUtf8",
+        ),
     ):
         return (
             "exact-utf8-envelope",
             f"exact envelope signal {signal!r}: final UTF-8 bytes and digest binding",
         )
-    if signal in (
-        "serializer_id",
+    if _mentions_any(
+        signal,
+        (
+            "serializer_id",
         "serializer_options_digest",
-        "schema_version",
-        "SerializerIdentity",
+            "schema_version",
+            "SerializerIdentity",
+        ),
     ):
         return (
             "serializer-identity-bound",
             f"serializer identity signal {signal!r}: serializer/schema binding",
         )
-    if signal in (
-        "route_id",
+    if _mentions_any(
+        signal,
+        (
+            "route_id",
         "model_id",
         "provider_id",
-        "tokenizer_hash",
-        "tokenizer_config_digest",
+            "tokenizer_hash",
+            "tokenizer_config_digest",
+        ),
     ):
         return (
             "route-identity-bound",
             f"route identity signal {signal!r}: route/provider/model/tokenizer binding",
         )
-    if "estimator" in signal or signal == "candidate_digests":
+    if "estimator" in signal or "candidate_digests" in signal:
         return (
             "estimator-policy-unvalidated",
             f"estimator signal {signal!r}: UNVALIDATED planning evidence, candidates cited only",
         )
-    if signal in (
-        "fixed_overhead",
+    if _mentions_any(
+        signal,
+        (
+            "fixed_overhead",
         "output_reserve",
         "review_reserve",
         "route_capacity",
         "headroom",
         "proves_fit",
         "receipt_digest",
-        "false_safe",
-        "false_reject",
+            "false_safe",
+            "false_reject",
+        ),
     ):
         return (
             "capacity-fit-analysis",
             f"capacity signal {signal!r}: reserves/fit/headroom/error/receipt binding",
         )
-    if signal in ("ProviderTokenizerRun", "observed_tokens", "TokenizerObservation"):
+    if _mentions_any(
+        signal, ("ProviderTokenizerRun", "observed_tokens", "TokenizerObservation")
+    ):
         return (
             "exact-observation",
             f"exact observation signal {signal!r}: actually-run route tokenizer count",
         )
-    if signal in ("Transformed", "rewrite", "Truncation", "Normalization", "Rewrite"):
+    if _mentions_any(
+        signal, ("Transformed", "rewrite", "Truncation", "Normalization", "Rewrite")
+    ):
         return (
             "transformed-observation",
             f"transformed signal {signal!r}: provider rewrite evidence, no count comparison",
         )
-    if signal in ("Stale", "Absent", "Unavailable", "Unsupported", "Unknown"):
+    if _mentions_any(
+        signal, ("Stale", "Absent", "Unavailable", "Unsupported", "Unknown")
+    ):
         return (
             "stale-or-absent-observation",
             f"non-exact signal {signal!r}: absent/unavailable/stale/unsupported/unknown, never zero",
@@ -1226,14 +1289,21 @@ def classify_context_measurement(
             "bare_measurement_field_or_conversion",
             f"bare measurement field or projection: {signal!r}; carries no estimator policy of its own",
         )
-    if any(
-        signal == _split_occurrence_selector(needle)[0]
-        for _ref, _path, needle, _reason in EXCLUSION_CASES
-    ):
+    if CONVERTER_DEFINED.search(signal):
         return (
-            "unrelated_byte_or_character_metric",
-            f"declared unrelated byte/character metric: {signal!r}; excluded with exact evidence, not a package skip",
+            "bare_measurement_field_or_conversion",
+            f"bare unit conversion over a measured value: {signal!r}; a conversion feeding "
+            f"measurement, never an estimator policy of its own",
         )
+    for field_token in _MEASURED_FIELD_TOKENS:
+        if re.search(
+            r"[A-Za-z_0-9]*%s[A-Za-z_0-9]*\s*\(" % re.escape(field_token), signal
+        ):
+            return (
+                "bare_measurement_field_or_conversion",
+                f"call binding the {field_token} measurement: {signal!r}; the named field is "
+                f"consumed or produced through a declared call, never an estimator policy",
+            )
     raise InventoryError(
         "CLASSIFICATION_OPEN", f"signal is outside the closed {len(CLASSIFICATIONS)}-class set: {signal!r}"
     )
@@ -1398,8 +1468,23 @@ def discover_context_measurements(
         depths = record["depths"]
         assert isinstance(depths, list)
         item, item_scope = _scope_of(masked_lines, depths, span_start, rel)
-        base_signal, _occurrence = _split_occurrence_selector(signal)
-        classification, evidence = classify_context_measurement(base_signal, rel, item_scope)
+        body_lines = [
+            stripped
+            for stripped in (
+                masked_lines[lineno - 1].strip()
+                for lineno in range(span_start, span_end + 1)
+                if 1 <= lineno <= len(masked_lines)
+            )
+            if stripped
+        ]
+        if not body_lines:
+            raise InventoryError(
+                "EMPTY_SPAN",
+                f"span {span_start}-{span_end} carries no classifiable text in {rel}",
+            )
+        classification, evidence = classify_context_measurement(
+            "\n".join(body_lines), rel, item_scope
+        )
         if classification not in CLASSIFICATIONS:
             raise InventoryError(
                 "CLASSIFICATION_NOT_CLOSED", f"class is outside the closed set: {classification!r}"
