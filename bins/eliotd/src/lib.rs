@@ -3671,6 +3671,49 @@ impl DaemonComposition {
         crate::provider_capability::admit_provider_capability(kernel, &admission, claimed).await
     }
 
+    /// Constructs the production fabric from ALREADY-resolved verified
+    /// material without borrowing the composition (issue #2567 W3).
+    ///
+    /// Self-free half of
+    /// [`Self::agent_fabric_new_verified_async`]: `material` must have come
+    /// out of [`Self::resolve_verified_material`] (live fence set, session
+    /// binding and epoch checked). The owner IO below (Kernel verifier,
+    /// capability build) runs with no composition borrow held, so a slow
+    /// owner cannot block independent composition users; the caller
+    /// revalidates and adopts afterwards. Behavior is identical to the
+    /// second half of the seam — this step only moves code.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Kernel verifier, capability construction, or coordinator
+    /// owner rejection unchanged, each typed (same as the seam).
+    pub async fn agent_fabric_new_verified_from_resolved_async(
+        kernel: &Arc<DaemonKernelClient>,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+    ) -> Result<AgentFabric, DaemonError> {
+        let owner = kernel.owner_session_facts().ok_or_else(|| {
+            DaemonError::Kernel(
+                "daemon has no validated Kernel owner session; verified provider admission stays plan-only"
+                    .to_owned(),
+            )
+        })?;
+        let live_fence = kernel.kernel_fence();
+        kernel
+            .verify_provider_binding_async(&material)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        let capability = Self::build_production_provider_capability(
+            kernel, material, &owner, live_fence, claimed,
+        )
+        .await?;
+        let config = daemon_coordinator_config()?;
+        Ok(AgentFabric::new_with_admitted_provider(
+            config, ports, capability,
+        )?)
+    }
+
     /// Constructs the production fabric on a sealed admitted provider
     /// capability verified through the Kernel admission verifier (issue #1108
     /// W5/W2, production caller for A1).
@@ -3695,6 +3738,9 @@ impl DaemonComposition {
     /// never mints admission. The production ports source is
     /// [`Self::production_fabric_ports`] (W1).
     ///
+    /// The slow half runs without the composition borrow (see
+    /// [`Self::agent_fabric_new_verified_from_resolved_async`]).
+    ///
     /// # Errors
     ///
     /// Returns the readiness, session-resolution, Kernel verifier,
@@ -3709,25 +3755,7 @@ impl DaemonComposition {
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_new_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
-        let owner = kernel.owner_session_facts().ok_or_else(|| {
-            DaemonError::Kernel(
-                "daemon has no validated Kernel owner session; verified provider admission stays plan-only"
-                    .to_owned(),
-            )
-        })?;
-        let live_fence = kernel.kernel_fence();
-        kernel
-            .verify_provider_binding_async(&material)
-            .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        let capability = Self::build_production_provider_capability(
-            kernel, material, &owner, live_fence, claimed,
-        )
-        .await?;
-        let config = daemon_coordinator_config()?;
-        Ok(AgentFabric::new_with_admitted_provider(
-            config, ports, capability,
-        )?)
+        Self::agent_fabric_new_verified_from_resolved_async(kernel, ports, material, claimed).await
     }
 
     /// Requires a verified restore to continue the snapshot's retained
