@@ -1218,7 +1218,10 @@ mod tests {
                 PermitIssuance::new(
                     ActionLeaseRef::new(format!("lease-24-{nonce}")).expect("lease"),
                     fence,
-                    BTreeMap::new(),
+                    BTreeMap::from([
+                        ("authority".to_owned(), DIGEST_A.to_owned()),
+                        ("state".to_owned(), DIGEST_B.to_owned()),
+                    ]),
                     100,
                     10_000,
                     format!("nonce-24-{nonce}"),
@@ -1324,7 +1327,9 @@ mod tests {
         assert!(
             matches!(
                 runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
+                Err(BridgeError::NotAdmitted {
+                    reason: "minted process request names an unapproved artifact"
+                })
             ),
             "environment-selected executable must be refused before start"
         );
@@ -1339,7 +1344,9 @@ mod tests {
         assert!(
             matches!(
                 runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
+                Err(BridgeError::NotAdmitted {
+                    reason: "minted process request binds a foreign operation"
+                })
             ),
             "a request bound to a foreign operation must be refused before start"
         );
@@ -1354,7 +1361,9 @@ mod tests {
         assert!(
             matches!(
                 runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
+                Err(BridgeError::NotAdmitted {
+                    reason: "minted process request carries a stale generation"
+                })
             ),
             "a stale process generation must be refused before start"
         );
@@ -1374,7 +1383,9 @@ mod tests {
         assert!(
             matches!(
                 runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
+                Err(BridgeError::NotAdmitted {
+                    reason: "minted process request disagrees on authority epoch"
+                })
             ),
             "authority epoch disagreement must be refused before start"
         );
@@ -1389,7 +1400,9 @@ mod tests {
         assert!(
             matches!(
                 runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
+                Err(BridgeError::NotAdmitted {
+                    reason: "minted process request does not restrict environment inheritance"
+                })
             ),
             "ambient environment inheritance must be refused before start"
         );

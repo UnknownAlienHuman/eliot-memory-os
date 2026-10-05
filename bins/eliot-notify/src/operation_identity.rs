@@ -224,7 +224,8 @@ pub struct IssuedIdentity {
 /// parent references (issue #64 pattern). `identity` is the ORIGINAL
 /// [`RequestIdentity`] retained at first issuance, before the step was sent;
 /// reconstruction replays that exact value and never a recomputed one.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChildLineageEntry {
     /// Stable parent notification request id.
     pub parent_request_id: String,
@@ -296,8 +297,9 @@ impl fmt::Display for OperationIdentityError {
 
 impl std::error::Error for OperationIdentityError {}
 
-/// Ledger key: one parent hash plus one exact operation selector plus one
-/// canonical payload digest plus one prior receipt digest.
+/// Ledger key: one parent hash plus one exact closed operation namespace plus
+/// one canonical payload digest plus one prior receipt digest. The namespace
+/// distinguishes operations that intentionally share a Kernel selector.
 type LedgerKey = (String, String, String, String);
 
 #[derive(Clone, Debug)]
@@ -752,7 +754,7 @@ impl NotifyIdentityIssuer {
             prior.as_deref(),
             retained,
         )?;
-        let original = validate_retained_identity(parent, retained)?;
+        let original = validate_retained_identity(parent, operation, retained)?;
         if original.deadline_unix_ms <= now_unix_ms {
             // Expiry is reported, never repaired: this identity is reconciled
             // against its recorded result, and a fresh deadline is only ever
@@ -878,7 +880,7 @@ fn ledger_key(
 ) -> LedgerKey {
     (
         parent_hash.to_owned(),
-        operation.selector().to_owned(),
+        operation.namespace().to_owned(),
         canonical_digest.to_owned(),
         prior.unwrap_or_default().to_owned(),
     )
@@ -953,14 +955,9 @@ fn check_retained_step(
 /// and State Fence the restored identity must still be bound to.
 fn validate_retained_identity(
     parent: &NotificationRequest,
+    operation: NotifyOperation,
     retained: &ChildLineageEntry,
 ) -> Result<RequestIdentity, OperationIdentityError> {
-    let operation = NotifyOperation::from_selector(&retained.operation).ok_or_else(|| {
-        OperationIdentityError::IncompleteRecord(format!(
-            "{} is not a closed notification step",
-            retained.operation
-        ))
-    })?;
     for value in [
         retained.parent_request_id.as_str(),
         retained.parent_hash.as_str(),
@@ -1005,6 +1002,7 @@ fn validate_retained_identity(
     if child_request_id != retained.child_request_id
         || original.request.metadata.request_id.as_str() != child_request_id
         || original.cancellation_id != cancellation_id
+        || retained.cancellation_id != cancellation_id
         || original.idempotency_key != retained.idempotency_key
     {
         return Err(OperationIdentityError::IncompleteRecord(format!(
@@ -1217,6 +1215,64 @@ mod tests {
 
     fn payload(marker: &str) -> Value {
         json!({"step": marker, "nonce": marker})
+    }
+
+    #[test]
+    fn child_lineage_entry_round_trips_complete_original_identity() {
+        let mut builder = NotifyIdentityIssuer::new();
+        let p = parent("parent-retained-identity-format");
+        let first_child = builder
+            .issue_g08(&p, &payload("retained-identity-format"), NOW)
+            .expect("issued child identity");
+        let retained = builder.lineage().last().expect("retained lineage entry");
+
+        let json_text = serde_json::to_string(retained).expect("serialize lineage entry");
+        let round_tripped: ChildLineageEntry =
+            serde_json::from_str(&json_text).expect("deserialize lineage entry");
+
+        assert_eq!(&round_tripped, retained);
+        assert_eq!(round_tripped.identity, first_child.identity);
+        assert_eq!(
+            round_tripped.identity.deadline_unix_ms,
+            first_child.identity.deadline_unix_ms
+        );
+        assert_eq!(
+            round_tripped.identity.request.metadata.clock,
+            first_child.identity.request.metadata.clock
+        );
+    }
+
+    #[test]
+    fn child_lineage_entry_rejects_incomplete_or_unknown_identity_fields() {
+        let mut builder = NotifyIdentityIssuer::new();
+        let p = parent("parent-retained-identity-invalid");
+        builder
+            .issue_g08(&p, &payload("retained-identity-invalid"), NOW)
+            .expect("issued child identity");
+        let retained = builder.lineage().last().expect("retained lineage entry");
+        let original = serde_json::to_value(retained).expect("serialize lineage entry");
+
+        let mut missing_identity = original.clone();
+        missing_identity
+            .as_object_mut()
+            .expect("lineage object")
+            .remove("identity");
+        assert!(serde_json::from_value::<ChildLineageEntry>(missing_identity).is_err());
+
+        let mut missing_deadline = original.clone();
+        missing_deadline["identity"]
+            .as_object_mut()
+            .expect("identity object")
+            .remove("deadline_unix_ms");
+        assert!(serde_json::from_value::<ChildLineageEntry>(missing_deadline).is_err());
+
+        let mut unknown_lineage_field = original.clone();
+        unknown_lineage_field["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<ChildLineageEntry>(unknown_lineage_field).is_err());
+
+        let mut unknown_identity_field = original;
+        unknown_identity_field["identity"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<ChildLineageEntry>(unknown_identity_field).is_err());
     }
 
     #[test]

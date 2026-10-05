@@ -74,6 +74,9 @@ const EXIT_OPERATION_RECEIPTED: i32 = 0;
 /// coverage. The typed gap and the retained evidence are on stderr.
 const EXIT_OPERATION_DEGRADED: i32 = 1;
 
+#[cfg(test)]
+mod success_receipt_tests;
+
 fn main() {
     match run() {
         Ok(receipt) => {
