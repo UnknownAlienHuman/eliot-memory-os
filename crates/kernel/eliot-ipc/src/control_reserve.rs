@@ -1014,6 +1014,42 @@ mod tests {
         ));
     }
 
+    /// The protected-side identity guard (issue #1679 A10):
+    /// `try_acquire_protected_bytes` refuses a blank owner as
+    /// `InvalidField { field: "ipc_permit.owner" }` on a partition
+    /// with free protected bytes, so no control permit ever binds an
+    /// identity the contract cannot name and protected capacity is
+    /// never held anonymously (I14.3: every permit binds
+    /// owner/operation/epoch; control-channel permits are not exempt
+    /// from identity per `docs/architecture/I14-03-control-reserve.md`).
+    /// The normal-side guard test pins only the normal path; a
+    /// regression silently dropping validation on the protected path
+    /// would still pass it while letting control permits be held
+    /// anonymously.
+    #[test]
+    fn ipc_protected_acquire_rejects_blank_owner() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(2).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_protected_bytes(
+            ControlOperationClass::CancelOperation,
+            "",
+            "op-ctl-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank owner must never hold a protected permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.owner",
+                ..
+            }
+        ));
+    }
+
     /// A fresh reserve reports exactly the partition capacities it was
     /// configured with (issue #1679): quantities are copied from
     /// configuration and never derived or scaled at construction, so no
