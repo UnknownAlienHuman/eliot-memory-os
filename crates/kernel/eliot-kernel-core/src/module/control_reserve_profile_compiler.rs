@@ -533,4 +533,71 @@ mod tests {
         assert_eq!(got.owner_ref, owner);
         Ok(())
     }
+
+    #[test]
+    fn compile_contradictory_owner_fails_closed() -> KernelResult<()> {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch");
+        let identity = ControlReserveProfileIdentity {
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            product_identity_ref: "product-1".to_owned(),
+            source_build_and_runtime_generation_refs: vec!["gen-1".to_owned()],
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch.clone(),
+            compiled_at_ms: 1_000,
+            profile_evidence_refs: Vec::new(),
+            invalidation_set: Vec::new(),
+        };
+
+        // The claimed row is the passing-through row with one field changed:
+        // the owner reference now names an owner the frozen owner map does not
+        // bind to this dimension, so the compiler must fail instead of joining
+        // one owner's numbers as another dimension's proof (issue #1679 A1).
+        let bottleneck = CapacityBottleneck::OrsTransactionSlots;
+        let unit = bottleneck.unit();
+        let row = BottleneckCapacityProfile {
+            bottleneck,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: "owner-impostor".to_owned(),
+            owner_generation_ref: "gen-7".to_owned(),
+            unit,
+            physical_total_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(4).expect("total"),
+            }),
+            normal_work_applicable: true,
+            normal_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("normal"),
+            }),
+            protected_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("protected"),
+            }),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: "proof-1".to_owned(),
+            evidence_refs: vec!["ev-1".to_owned()],
+            invalidation_set: vec!["inv-1".to_owned()],
+        };
+        let evidence = BottleneckOwnerEvidence {
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch,
+            row,
+        };
+
+        let Err(err) = compile_control_reserve_profile(identity, std::slice::from_ref(&evidence))
+        else {
+            panic!("impostor owner must contradict");
+        };
+        assert!(matches!(
+            err,
+            KernelError::ControlReserveEvidenceContradiction { .. }
+        ));
+        Ok(())
+    }
 }
