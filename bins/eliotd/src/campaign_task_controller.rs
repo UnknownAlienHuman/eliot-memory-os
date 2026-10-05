@@ -496,7 +496,8 @@ pub async fn prepare_task_controller_claim(
     // owner, work scope or fence stays a refusal, exactly as the Governor task
     // owner's own anchor check refuses it a layer down.
     let admitted_binding = issue_admitted_campaign_recipe_binding(&claimed, &recipe);
-    if recipe.validate().is_err() || !admitted_binding.is_ok_and(|issued| issued == recipe.binding) {
+    if recipe.validate().is_err() || !admitted_binding.is_ok_and(|issued| issued == recipe.binding)
+    {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
             task_controller_rejection(&claimed, "invalid_recipe")?,
         )));
