@@ -5558,7 +5558,7 @@ mod admitted_solo_binding_tests {
 
     #[test]
     fn admitted_solo_binding_accepts_valid_pair() {
-        let (request, intake, now) = solo_test_pair();
+        let (request, intake, _now) = solo_test_pair();
         assert_eq!(request.deadline_unix_ms, intake.deadline_unix_ms);
         assert!(validate_admitted_solo_binding(&request, &intake).is_ok());
     }
