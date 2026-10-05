@@ -2365,4 +2365,48 @@ mod tests {
         ctx.invalidation_set.clear();
         assert!(reserve.publish_owner_row(&ctx).is_err());
     }
+
+    #[test]
+    fn issue_permit_normal_request_cannot_reach_protected_or_emergency() -> Result<(), KernelError>
+    {
+        // A5 (issue #1679): the operation tag alone selects the partition.
+        // A normal Store write, named read, agent, model, swarm, report or
+        // maintenance operation names a `Normal` tag, so issuance draws only
+        // the normal partition: no priority or class relabelling can move it
+        // onto protected or emergency capacity.
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([41u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 2, 8)?;
+        let request = CapacityRequest {
+            operation: RequestedOperationClass::Normal(NormalWorkClass::CanonicalWrite),
+            operation_id: "op-a5-store-write-1".to_owned(),
+            requested_bottleneck: FRONT_DOOR_BOTTLENECK,
+            requested_limit: CapacityLimit {
+                unit: FRONT_DOOR_BOTTLENECK.unit(),
+                quantity: NonZeroU64::new(1).expect("single slot"),
+            },
+            requesting_owner_ref: "store-bridge".to_owned(),
+            requesting_generation_ref: ResourceGeneration::genesis(),
+            authority_epoch_ref: front_door.epoch(),
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            deadline_ms: 1_000,
+        };
+        let (_permit, binding) =
+            front_door.issue_permit(&request, ResourceGeneration::genesis(), 500)?;
+
+        assert_eq!(binding.capacity_class, CapacityClass::NormalWorkload);
+        assert_eq!(binding.bottleneck, FRONT_DOOR_BOTTLENECK);
+        // Exactly one normal slot is held; protected and emergency partitions
+        // are untouched by the normal issuance.
+        assert_eq!(front_door.available_normal(), 1);
+        assert_eq!(front_door.available_protected(), 2);
+        assert_eq!(
+            front_door.available_emergency(),
+            EMERGENCY_PREALLOCATED_SLOTS
+        );
+        Ok(())
+    }
 }
