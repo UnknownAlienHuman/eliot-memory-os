@@ -1488,4 +1488,24 @@ mod tests {
             matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
         );
     }
+
+    /// A fresh reserve reports exactly the partition capacities it was
+    /// configured with (issue #1679): quantities are copied from
+    /// configuration and never derived or scaled at construction, so no
+    /// capacity can be invented while building the reserve (I14.3).
+    #[test]
+    fn ors_reserve_reports_configured_capacities() {
+        let reserve = OrsReserve::partitioned(
+            3,
+            5,
+            NonZeroU64::new(7).expect("bytes"),
+            NonZeroU64::new(9).expect("bytes"),
+        )
+        .expect("reserve");
+
+        assert_eq!(reserve.available_normal_transactions(), 3);
+        assert_eq!(reserve.available_protected_transactions(), 5);
+        assert_eq!(reserve.available_normal_durable_bytes(), 7);
+        assert_eq!(reserve.available_protected_durable_bytes(), 9);
+    }
 }
