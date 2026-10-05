@@ -94,16 +94,18 @@ except ImportError:  # fallback for direct file loading (delegate context)
     from scripts.work_unit_gate import case_binding  # type: ignore[no-redef]
     from scripts.work_unit_gate import doc_read_evidence  # type: ignore[no-redef]
 
-# Frozen leaf-router byte identities (from test_work_unit_gate_cohort at base;
-# Windows CRLF checkout). Used only for the shared-repo freeze check, never
-# for temp fixture roots (missing routers are skipped, not failed, so tiny
-# bootstrap repositories without routers still verify).
+# Frozen leaf-router byte identities (#852 refresh, retained on the #837 merge;
+# Windows CRLF checkout; verified byte-identical to the on-disk routers at the
+# merge base). Used only for the shared-repo freeze check, never for temp
+# fixture roots (missing routers are skipped, not failed, so tiny bootstrap
+# repositories without routers still verify).
 FROZEN_LEAF_ROUTER_SHA256 = {
     "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
     "scripts/docs_router_core.py": "19532a3505c6c94ccb3f4868ffa2d62fa0f666a6389c1166407937c15eb7ff9c",
     "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
     "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
 }
+
 
 PROOF_CHOICES = ("catalogue-only", "selected", "full-project")
 
@@ -174,6 +176,8 @@ def _git_succeeds(root: Path, arguments: list[str]) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return completed.returncode == 0
+
+
 
 
 def _accepted_commit(root: Path, issue: int) -> str | None:
@@ -1718,14 +1722,15 @@ def main(argv: list[str] | None = None) -> int:
         # Bootstrap guard: never recursively execute own completion gate.
         # This layer only invokes #850 fixed runners via frozen builders with
         # descriptor-owned inputs; it never spawns verify-work-unit.py nor
-        # work_unit_gate.__main__ as a child. Selection of issue 837 itself
-        # still uses fixed fixtures/tiny repos, not a nested gate attempt.
+        # work_unit_gate.__main__ as a child. A descriptor whose TEST roots name
+        # this gate would execute the gate as its own prerequisite, so such a
+        # selection is rejected here instead of failing confusingly downstream;
+        # source roots are snapshot-only inputs that are never executed, so they
+        # stay allowed.
         for d in plan.descriptors:
-            for test_root in tuple(d.test_roots) + tuple(d.source_roots):
-                val = test_root.value
-                if val in ("scripts/verify-work-unit.py", "scripts/work_unit_gate/__main__.py"):
-                    # Not a failure by itself; runner inputs remain fixed builders.
-                    pass
+            for test_root in tuple(d.test_roots):
+                if test_root.value in ("scripts/verify-work-unit.py", "scripts/work_unit_gate/__main__.py"):
+                    return finish(fail_result(f"recursive gate selection: issue-{d.issue.number}", 1, failed=[f"issue-{d.issue.number}"]))
 
         # Attempt-path existence + leaf-router freeze (pure, no mutation).
         for d in plan.descriptors:
@@ -1760,6 +1765,14 @@ def main(argv: list[str] | None = None) -> int:
         evidence_rows: list = []
         for d in plan.descriptors:
             num = d.issue.number
+            # Owned-tree process accounting: every owned child below is
+            # spawned and synchronously reaped at its own site (any spawn
+            # failure, timeout or overflow early-returns), so the counters
+            # turn that control-flow fact into a checked invariant: a future
+            # non-reaped spawn surfaces as active > 0 (non-green), never a
+            # silent pass.
+            owned_spawned = 0
+            owned_reaped = 0
             doc = memo_assignment.get(num)
             if type(doc) is not assignment_source.AssignmentDocument:
                 return finish(fail_result("missing required receipt: assignment", 1, missing=[f"issue-{num}"]))
@@ -1811,7 +1824,7 @@ def main(argv: list[str] | None = None) -> int:
                     if d.package is not None:
                         try:
                             try:
-                                ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+                                ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
                             except Exception:
                                 ws_doc = {}
                             members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
@@ -1913,6 +1926,8 @@ def main(argv: list[str] | None = None) -> int:
                         bproc = subprocess.run([str(a) for a in build_argv], capture_output=True,
                                                timeout=wall_s, env=env, cwd=str(root))
                         build_raw = bproc.stdout or b""
+                        owned_spawned += 1
+                        owned_reaped += 1
                     except subprocess.TimeoutExpired:
                         return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
                     except OSError:
@@ -1958,6 +1973,8 @@ def main(argv: list[str] | None = None) -> int:
                         proc = subprocess.run([str(a) for a in disc_argv], capture_output=True, timeout=wall_s,
                                               env=env, cwd=str(root))
                         disc_out = proc.stdout or b""
+                        owned_spawned += 1
+                        owned_reaped += 1
                         disc_code = int(proc.returncode)
                     except subprocess.TimeoutExpired:
                         return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
@@ -2002,6 +2019,8 @@ def main(argv: list[str] | None = None) -> int:
                             tproc = subprocess.run([str(a) for a in test_argv], capture_output=True,
                                                    timeout=wall_s, env=env, cwd=str(root))
                             tout, tcode = tproc.stdout or b"", int(tproc.returncode)
+                            owned_spawned += 1
+                            owned_reaped += 1
                         except subprocess.TimeoutExpired:
                             try:
                                 erec = descriptor_runner.compose_execution_record(
@@ -2095,19 +2114,33 @@ def main(argv: list[str] | None = None) -> int:
                     # Real contained execution via frozen child protocol.
                     discovery_doc = _run_python_child(root, module, suite_rel, source_sha,
                                                       int(transport["max_tests"]), float(transport["wall_s"]),
-                                                      child_env, "discover", None)
+                                                      child_env, "discover", None,
+                                                      int(transport["output_bytes"]))
                     if discovery_doc is None:
                         return finish(fail_result(f"discovery failure: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    owned_spawned += 1
+                    owned_reaped += 1
                     if type(discovery_doc) is not dict or not discovery_doc.get("tests"):
                         return finish(fail_result(f"discovery without execution cannot pass: issue-{num}", 1,
                                                   failed=[f"issue-{num}"]))
                     exec_doc = _run_python_child(root, module, suite_rel, source_sha,
                                                  int(transport["max_tests"]), float(transport["wall_s"]),
-                                                 child_env, "execute", discovery_doc.get("tests"))
+                                                 child_env, "execute", discovery_doc.get("tests"),
+                                                 int(transport["output_bytes"]))
                     if exec_doc is None:
                         return finish(fail_result(f"execution incomplete: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    owned_spawned += 1
+                    owned_reaped += 1
                     # Compose typed discovery/execution bindings (once per test).
-                    for entry in discovery_doc.get("tests", []):
+                    # Exact selected denominator: extra discovery is a
+                    # mismatch failure before any execution, never a silent
+                    # clip and never execute-then-fail (mirrors the rust
+                    # mismatch rule once test binaries are produced).
+                    discovered_ids = discovery_doc.get("tests", [])
+                    if len(discovered_ids) > d.matrix_cases:
+                        return finish(fail_result(f"discovery denominator mismatch: issue-{num} (discovered {len(discovered_ids)}, matrix {d.matrix_cases})", 1,
+                                                  failed=[f"issue-{num}"]))
+                    for entry in discovered_ids:
                         tid = entry.get("id")
                         line = entry.get("line", 1)
                         try:
@@ -2171,11 +2204,25 @@ def main(argv: list[str] | None = None) -> int:
             # observed disposition), never the descriptor's verification
             # phase label (those pairs are disjoint grammars).
             try:
-                _cleanup = descriptor_runner.cleanup_verdict(cleanup="clean", active_processes=0, truncated=False)
+                # Derived owned-tree observation, not literals: no timeout
+                # path reaches here (every TimeoutExpired handler above
+                # returns first); no bound was exceeded (every out_cap
+                # check above, including the child protocol bound, returns
+                # first); active owned processes = spawned - reaped.
+                _cleanup = descriptor_runner.cleanup_verdict(
+                    cleanup="clean",
+                    active_processes=(owned_spawned - owned_reaped),
+                    truncated=False)
                 exec_outcome = "pass" if executions and all(
                     getattr(e, "disposition", None) is c.ExecutionDisposition.EXECUTED_PASS
                     for e in executions) else "error"
                 _phase = descriptor_runner.phase_verdict("execute", exec_outcome)
+                if _cleanup != "green":
+                    return finish(fail_result(f"cleanup not observed clean: issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
+                if _phase != "green":
+                    return finish(fail_result(f"phase verdict not green: issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
             except descriptor_runner.RunnerInputError:
                 return finish(fail_result(f"phase verdict failure: issue-{num}", 1,
                                           failed=[f"issue-{num}"]))
@@ -2347,11 +2394,15 @@ def main(argv: list[str] | None = None) -> int:
                                       ceiling="selected-verification-only",
                                       scope=("full-project" if proof == "full-project" else "selected")))
         sel_sorted = sorted(d.issue.number for d in plan.descriptors)
+        if proof == "full-project": return finish(fail_result("full-project ceiling unavailable: refusing success under a selected-only ceiling", 1, failed=[f"issue-{n}" for n in sel_sorted], ceiling="selected-verification-only", scope="full-project"))
         counts_ok = {"matrix_cases": int(cohort_receipt.expected_matrix_cases), "missing": 0,
                      "blocked": 0, "failed": 0, "passed": len(evidence_rows)}
         identities_ok = [f"issue-{n}" for n in sel_sorted] + [f"cohort:{aggregate[:12]}"]
         ceiling_ok = "selected-verification-only"
-        digest_ok = _result_digest(proof, sel_sorted, counts_ok, ceiling_ok)
+        # CCV7: the success digest is the cohort aggregate, which binds the
+        # load-bearing set (catalogue, selection, descriptors, source
+        # snapshots, receipts, discovered tests, execution records).
+        digest_ok = aggregate
         result_ok = {
             "proof": proof, "selection": sel_sorted,
             "selection_label": ",".join(str(n) for n in sel_sorted),
@@ -2432,12 +2483,14 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
     if not isinstance(name, str):
         raise descriptor_runner.RunnerInputError("PACKAGE_NOT_FOUND")
     try:
-        ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+        ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
     except Exception:
         ws_doc = {}
-    members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
+    # Closed single-file observation (no search): the root manifest exclude
+    # list only. Member search has no admitted port, so workspace_members
+    # stays [] by construction and real members stay UNAVAILABLE
+    # fail-closed; the discarded local members read is removed, not kept.
     exclude = ws_doc.get("workspace", {}).get("exclude", []) if isinstance(ws_doc, dict) else []
-    _ = members
     entries = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or artifact.get("package") != name:
@@ -2459,7 +2512,8 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
 
 
 def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str,  # type: ignore[no-untyped-def]
-                      max_tests: int, wall_s: float, env: dict, phase: str, expected: object | None):
+                      max_tests: int, wall_s: float, env: dict, phase: str, expected: object | None,
+                      output_cap: int):
     """Run the frozen python child once per phase via frozen builders only.
 
     Returns the parsed protocol dict via parse_python_protocol, or None on any
@@ -2564,6 +2618,11 @@ def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str, 
                     body = proto.read_bytes() if proto.exists() else b""
                 except Exception:
                     return None
+        # Descriptor output bound enforced on observed child protocol bytes
+        # (mirrors the build_raw/disc_out out_cap checks); oversize body is
+        # bounded non-success, the caller already fails it closed (exit 1).
+        if len(body) > output_cap:
+            return None
         if not body:
             return None
         try:
