@@ -3906,23 +3906,6 @@ impl DaemonComposition {
         solo_agent_driver::drive_solo_delegate_async(kernel, intake, unix_ms()).await
     }
 
-    /// Drives at most one queued solo intake; the runtime poll hook
-    /// (issue #2567).
-    ///
-    /// Thin synchronous compatibility wrapper. Production refuses this path;
-    /// use [`crate::solo_poll_queue_async`] from an async cadence.
-    ///
-    /// # Errors
-    ///
-    /// Production returns [`DaemonError::Kernel`] and retains the queued item
-    /// for the asynchronous poll path.
-    pub fn solo_poll_queue(
-        &self,
-        kernel: &Arc<DaemonKernelClient>,
-    ) -> Result<solo_agent_driver::SoloPollOutcome, DaemonError> {
-        solo_agent_driver::solo_poll_queue(self, kernel)
-    }
-
     /// Reads one solo attempt status under its durable identity
     /// (issue #2567).
     ///

@@ -2944,19 +2944,6 @@ pub async fn solo_poll_queue_async(
     })
 }
 
-/// Synchronous queue polling cannot perform authenticated owner IO. It
-/// refuses without dequeuing the retained intake.
-#[cfg(not(test))]
-pub fn solo_poll_queue(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-) -> Result<SoloPollOutcome, DaemonError> {
-    Err(DaemonError::Kernel(
-        "synchronous solo polling is disabled; use the async Kernel-verified poll entry point"
-            .to_owned(),
-    ))
-}
-
 /// Test-only valid admitted-solo pair (issue #2567 W2/A3).
 ///
 /// Builds one fully valid [`SoloDelegateIntake`] plus its matching admitted
