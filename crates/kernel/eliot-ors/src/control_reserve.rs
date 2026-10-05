@@ -1258,4 +1258,50 @@ mod tests {
             BackpressureDisposition::Busy
         ));
     }
+
+    /// The identity complement of
+    /// `ors_transaction_exhaustion_response_reports_live_saturation`: that test
+    /// pins a real `BUSY` report from a live-saturated partition, this one pins
+    /// that the same saturated partition still refuses a blank operation identity
+    /// as `InvalidField { field: "ors_rejection.operation_id" }`, so no report
+    /// carries an identity the contract cannot name (issue #1679 A10).
+    #[test]
+    fn ors_transaction_response_rejects_malformed_operation_id() {
+        let reserve = OrsReserve::partitioned(
+            1,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // The single normal transaction slot is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the malformed
+        // identity and not from an unsaturated partition.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("slot");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        let err = reserve
+            .normal_transaction_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_rejection.operation_id",
+                ..
+            }
+        ));
+    }
 }
