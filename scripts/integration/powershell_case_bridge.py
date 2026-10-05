@@ -25,7 +25,9 @@ emit exactly one JSON object per invocation with these fields::
       "outcome": "Passed",
       "identity": "907/7",
       "content_digest": "<sha256 hex of the exact suite file bytes executed>",
-      "truncated_bytes": 0
+      "truncated_bytes": 0,
+      "executing_pid": 4242,
+      "start_instant": "2026-01-01T00:00:00.0000000+00:00"
     }
 
 ``outcome`` is one of the closed set Passed | AssertionFailed | TimedOut |
@@ -35,6 +37,12 @@ Only ``"Passed"`` together with process exit 0 verifies green. Missing,
 duplicate, foreign, skipped, unsupported, timed-out, contradictory, truncated,
 oversized, or malformed output fails closed; a changed suite file invalidates
 the digest binding. ``identity`` is always ``"907/<case_id>"``.
+
+Freshness: the suite reports the executing interpreter PID and its UTC
+start instant; the bridge binds the result to the owned child it spawned
+(PID equality) inside the owned containment window (start instant within
+the window, +-5s same-host clock tolerance). A replayed or fabricated
+payload with a matching digest but no owned execution fails closed.
 
 Containment (#850): the complete Python->pwsh tree runs under the accepted
 bounded runner contract imported from scripts/work_unit_gate/
@@ -53,12 +61,14 @@ spawning beyond the fixed self-test interpreter.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +103,7 @@ SCHEMA_VERSION = "harness-core-case-result-v1"
 _RESULT_FIELDS = frozenset((
     "suite", "case_id", "schema_version", "outcome",
     "identity", "content_digest", "truncated_bytes",
+    "executing_pid", "start_instant",
 ))
 _OUTCOMES = frozenset((
     "Passed", "AssertionFailed", "TimedOut", "ProcessCrashed",
@@ -157,6 +168,9 @@ class CompletedRun:
     cleanup: str
     reaped: bool
     truncated_bytes: int
+    pid: int
+    started_at: float
+    ended_at: float
 
 
 @dataclass(frozen=True)
@@ -330,7 +344,8 @@ def _run_contained(argv: object, *, timeout_s: float, output_cap: int,
 
     Shell is always disabled and the working directory is fixed to the repo
     root (never caller input). Caps and timeout come from the contained plan;
-    callers may only tighten them, never widen.
+    callers may only tighten them, never widen. The owned PID and the
+    containment window travel on the completed run for freshness binding.
     """
     items = _check_fixed_argv(argv, pwsh_path=pwsh_path, suite_abs=suite_abs,
                               case_id=case_id)
@@ -338,6 +353,7 @@ def _run_contained(argv: object, *, timeout_s: float, output_cap: int,
         raise HarnessError("CHILD_ENV_SHAPE", "child env is not a mapping")
     rendering = _runner.canonical_command(items)
     try:
+        started_at = time.time()
         proc = subprocess.Popen(items, shell=False, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL, env=dict(child_env),
@@ -346,6 +362,7 @@ def _run_contained(argv: object, *, timeout_s: float, output_cap: int,
         raise HarnessError("SPAWN_FAILED",
                            "fixed interpreter failed to start",
                            {"rendering_bytes": len(rendering)}) from exc
+    owned_pid = proc.pid
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -363,7 +380,24 @@ def _run_contained(argv: object, *, timeout_s: float, output_cap: int,
                 pass
         raise _timeout_unknown(timeout_s=timeout_s,
                                reaped=proc.poll() is not None)
+    ended_at = time.time()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.SubprocessError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=15)
+        except subprocess.SubprocessError:
+            pass
     reaped = proc.poll() is not None
+    if not reaped:
+        raise HarnessError(
+            "CLEANUP_UNKNOWN",
+            "owned child survived contained wait; cleanup is unknown so no pass is possible",
+            {"cleanup": "unknown", "timeout_s": timeout_s, "reaped": False})
     if len(stdout) > output_cap:
         raise HarnessError("OVERSIZED_OUTPUT",
                            "captured output exceeds contained byte cap",
@@ -388,7 +422,8 @@ def _run_contained(argv: object, *, timeout_s: float, output_cap: int,
     return CompletedRun(returncode=returncode, stdout=stdout,
                         stderr_tail_bytes=len(stderr[-2048:]),
                         cleanup="clean", reaped=bool(reaped),
-                        truncated_bytes=0)
+                        truncated_bytes=0, pid=owned_pid,
+                        started_at=started_at, ended_at=ended_at)
 
 
 def _parse_result(raw: bytes, *, output_cap: int, line_cap: int) -> dict:
@@ -431,8 +466,27 @@ def _parse_result(raw: bytes, *, output_cap: int, line_cap: int) -> dict:
     return value
 
 
+def _parse_instant(value: object) -> float | None:
+    """Parse an offset ISO-8601 instant to epoch seconds; None if bad."""
+    if type(value) is not str or not value:
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
 def _verify_fields(result: dict, *, case_id: int, expected_digest: str,
-                   python_identity: str, returncode: int) -> CaseResult:
+                   python_identity: str, returncode: int,
+                   owned_pid: int | None = None,
+                   window_start: float | None = None,
+                   window_end: float | None = None) -> CaseResult:
     if result["suite"] != CORE_SUITE_NAME:
         raise HarnessError("RESULT_SUITE_MISMATCH",
                            "result suite is foreign to this bridge")
@@ -470,6 +524,28 @@ def _verify_fields(result: dict, *, case_id: int, expected_digest: str,
         raise HarnessError("CONTRADICTORY_EXIT",
                            "passed result contradicts nonzero exit",
                            {"returncode": returncode})
+    if owned_pid is None or window_start is None or window_end is None:
+        raise HarnessError("FRESHNESS_NO_EXECUTION",
+                           "result carries no owned-execution binding; "
+                           "fixture bytes never executed")
+    if type(result["executing_pid"]) is not int or result["executing_pid"] <= 0:
+        raise HarnessError("FRESHNESS_PID_SHAPE",
+                           "result executing pid is not a positive integer")
+    if result["executing_pid"] != owned_pid:
+        raise HarnessError("FRESHNESS_PID_MISMATCH",
+                           "result pid is not the owned contained child",
+                           {"owned_pid": owned_pid})
+    instant = _parse_instant(result["start_instant"])
+    if instant is None:
+        raise HarnessError("FRESHNESS_INSTANT_SHAPE",
+                           "result start instant is not an offset ISO-8601 instant")
+    # The binding is PID equality; the window only contains replays. The
+    # +-5s tolerance covers same-host clock granularity between the .NET
+    # and Python runtimes, never a behavior.
+    if not window_start - 5.0 <= instant <= window_end + 5.0:
+        raise HarnessError("FRESHNESS_INSTANT_OUTSIDE_WINDOW",
+                           "result start instant is outside the owned window",
+                           {"owned_pid": owned_pid})
     return CaseResult(suite=result["suite"], case_id=case_id,
                       schema_version=SCHEMA_VERSION, outcome="Passed",
                       identity=result["identity"],
@@ -480,11 +556,17 @@ def _verify_fields(result: dict, *, case_id: int, expected_digest: str,
 
 def verify_result_bytes(raw: bytes, *, case_id: int, suite_path: str,
                         expected_digest: str, python_identity: str,
-                        returncode: int = 0) -> CaseResult:
+                        returncode: int = 0,
+                        owned_pid: int | None = None,
+                        window_start: float | None = None,
+                        window_end: float | None = None) -> CaseResult:
     """Verify captured bytes against a registered binding without executing.
 
     Registration, claimant identity, schema, digest, outcome, and exit are all
     enforced exactly as in the live path; this is the fixture-testable seam.
+    Without owned-execution parameters the payload is fixture bytes by
+    construction, so every shape-valid payload fails FRESHNESS_NO_EXECUTION;
+    run_case always binds the owned child.
     """
     plan = _contained_plan()
     if suite_path != CORE_SUITE_PATH:
@@ -506,7 +588,8 @@ def verify_result_bytes(raw: bytes, *, case_id: int, suite_path: str,
     return _verify_fields(parsed, case_id=case_id,
                           expected_digest=expected_digest,
                           python_identity=python_identity,
-                          returncode=returncode)
+                          returncode=returncode, owned_pid=owned_pid,
+                          window_start=window_start, window_end=window_end)
 
 
 def run_case(case_id: int, *, python_identity: str,
@@ -540,4 +623,7 @@ def run_case(case_id: int, *, python_identity: str,
                                suite_path=binding.suite_path,
                                expected_digest=binding.content_digest,
                                python_identity=python_identity,
-                               returncode=completed.returncode)
+                               returncode=completed.returncode,
+                               owned_pid=completed.pid,
+                               window_start=completed.started_at,
+                               window_end=completed.ended_at)
