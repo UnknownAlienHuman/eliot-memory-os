@@ -348,3 +348,44 @@ pub fn project_control_reserve_status(
         lowered_guarantees: profile.unsupported_or_unknown_guarantees.clone(),
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn compile_empty_evidence_yields_fifteen_unknown_rows() -> KernelResult<()> {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch");
+        let identity = ControlReserveProfileIdentity {
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            product_identity_ref: "product-1".to_owned(),
+            source_build_and_runtime_generation_refs: vec!["gen-1".to_owned()],
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch,
+            compiled_at_ms: 1_000,
+            profile_evidence_refs: Vec::new(),
+            invalidation_set: Vec::new(),
+        };
+
+        let profile = compile_control_reserve_profile(identity, &[])?;
+
+        assert_eq!(profile.bottleneck_rows.len(), 15);
+        assert!(
+            profile
+                .bottleneck_rows
+                .iter()
+                .all(|row| row.coverage_state == BottleneckCoverageState::Unknown)
+        );
+        Ok(())
+    }
+}
