@@ -2050,25 +2050,6 @@ async fn drive_admitted_material_async(
     })
 }
 
-/// The synchronous solo path is retained only for unit tests. Production
-/// drives through the async verified seam: the runtime poll uses
-/// [`drive_solo_delegate_verified_async`], while direct production calls
-/// stay on the [`drive_solo_delegate_async`] probe; both refuse this
-/// synchronous path because authenticated Kernel verification requires an
-/// async call.
-#[cfg(not(test))]
-pub fn drive_solo_delegate(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-    _intake: SoloDelegateIntake,
-    _now_unix_ms: u64,
-) -> Result<SoloDriveOutcome, DaemonError> {
-    Err(DaemonError::Kernel(
-        "synchronous solo driving is disabled; use the async Kernel-verified entry point"
-            .to_owned(),
-    ))
-}
-
 /// Returns true when the persisted projection needs no further drive.
 ///
 /// Non-test: the verified async drive clears a settled live slot under the

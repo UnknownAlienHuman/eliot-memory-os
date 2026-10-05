@@ -3922,7 +3922,8 @@ impl DaemonComposition {
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_enqueue`](crate::solo_agent_driver::solo_enqueue):
     /// the intake is validated and queued bounded; driving happens on the
-    /// runtime tick or through [`Self::solo_drive_once`].
+    /// runtime tick through
+    /// [`solo_poll_queue_async`](crate::solo_agent_driver::solo_poll_queue_async).
     ///
     /// # Errors
     ///
@@ -3933,25 +3934,6 @@ impl DaemonComposition {
         intake: solo_agent_driver::SoloDelegateIntake,
     ) -> Result<(), DaemonError> {
         solo_agent_driver::solo_enqueue(self, intake, unix_ms())
-    }
-
-    /// Synchronous compatibility entry for one solo delegate intake
-    /// (issue #2567). Production returns a fail-closed async-required error;
-    /// use [`Self::solo_drive_once_async`] for Kernel-backed verification.
-    ///
-    /// Thin synchronous compatibility wrapper. Production refuses this path
-    /// because authenticated Kernel verification requires an async call.
-    ///
-    /// # Errors
-    ///
-    /// Production returns [`DaemonError::Kernel`] because the synchronous
-    /// path cannot perform authenticated owner verification.
-    pub fn solo_drive_once(
-        &self,
-        kernel: &Arc<DaemonKernelClient>,
-        intake: solo_agent_driver::SoloDelegateIntake,
-    ) -> Result<solo_agent_driver::SoloDriveOutcome, DaemonError> {
-        solo_agent_driver::drive_solo_delegate(self, kernel, intake, unix_ms())
     }
 
     /// Drives one solo delegate through the nonblocking authenticated Kernel
