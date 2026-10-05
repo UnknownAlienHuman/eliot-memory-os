@@ -228,9 +228,10 @@ pub(crate) fn daemon_refuses_replacement(
 /// * a signal or a resource-limit stop is an abnormal exit;
 /// * a tree the owner deliberately cancelled is a planned stop, which is not
 ///   itself a failure to retry;
-/// * a clean exit of a generation that never proved ready failed this child's
-///   health contract, which is the second condition the transient class rests
-///   on besides an abnormal exit;
+/// * a clean exit without current accepted readiness remains an observed exit
+///   and also fails this child's readiness contract, so permanent and transient
+///   classes distinguish it from a live child's failed health; this predicate
+///   does not reconstruct whether an earlier status was READY;
 /// * a clean exit of a generation that did prove ready is a normal exit.
 ///
 /// Every classifiable disposition is `Exact` identity: the process owner did
@@ -262,7 +263,7 @@ fn daemon_restart_evidence(
         ),
         ExitDisposition::Completed if !daemon_status_proves_ready(previous_status) => (
             RestartIdentityEvidence::Exact,
-            RestartFailureEvidence::FailedHealthContract,
+            RestartFailureEvidence::ExitedWithoutReadiness,
         ),
         ExitDisposition::Completed => (
             RestartIdentityEvidence::Exact,
@@ -1560,6 +1561,81 @@ mod process_supervision_lifecycle_tests {
                 .expect("descendant evidence JSON"),
         }))
         .expect("process execution view")
+    }
+
+    /// #1682 W3: exercise the production exit/readiness classifier and the
+    /// shared class rule together. This is a synthetic observation, not proof
+    /// of a physical exit, descendant cleanup, budget or launch authority.
+    #[test]
+    fn completed_before_ready_preserves_exit_for_permanent_restart() {
+        use eliot_runtime_contracts::{RestartClass, RestartGroupStrategy, RestartIntensityPolicy};
+
+        let policy = RestartPolicyV1 {
+            policy_version: 1,
+            subject_id: "restart-class-child".to_owned(),
+            restart_class: RestartClass::Permanent,
+            group_id: "restart-class-group".to_owned(),
+            group_strategy: RestartGroupStrategy::OneForOne,
+            one_for_all_rationale: None,
+            dependencies: Vec::new(),
+            intensity: RestartIntensityPolicy {
+                max_attempts_in_window: 1,
+                window_millis: 1,
+                backoff_initial_millis: 0,
+                backoff_max_millis: 0,
+                jitter_max_millis: 0,
+                cooldown_millis: 0,
+                reset_after_healthy_millis: 1,
+                quarantine_after_attempts: 1,
+                escalation_target: "restart-class-owner".to_owned(),
+            },
+            source_manifest_revision: 1,
+            source_profile_revision: 1,
+        };
+        let mut raw = serde_json::to_value(test_view("restart-class-exit", 1, "exited", None))
+            .expect("execution view JSON");
+        raw["exit"] = serde_json::to_value(
+            eliot_process::ExitStatus::new(ExitDisposition::Completed, Some(0), None, 20)
+                .expect("completed exit observation"),
+        )
+        .expect("exit observation JSON");
+        let view: ProcessExecutionView = serde_json::from_value(raw).expect("completed exit view");
+        let (identity, failure) = daemon_restart_evidence(&DaemonRuntimeStatus::Launching, &view);
+        assert_eq!(identity, RestartIdentityEvidence::Exact);
+        assert_eq!(
+            decide_automatic_restart(&policy, RestartOwnerLifecycle::Running, identity, failure)
+                .expect("valid restart policy"),
+            AutomaticRestartDecision::Eligible,
+            "an observed exit before READY remains an exit for a permanent child"
+        );
+        assert_eq!(
+            daemon_restart_evidence(&DaemonRuntimeStatus::Ready, &view),
+            (
+                RestartIdentityEvidence::Exact,
+                RestartFailureEvidence::NormalExit
+            )
+        );
+        assert_eq!(
+            daemon_restart_evidence(
+                &DaemonRuntimeStatus::Degraded("not currently ready".into()),
+                &view
+            ),
+            (
+                RestartIdentityEvidence::Exact,
+                RestartFailureEvidence::ExitedWithoutReadiness
+            ),
+            "current readiness is separate from the generation's earlier history"
+        );
+        assert_eq!(
+            daemon_restart_evidence(
+                &DaemonRuntimeStatus::Launching,
+                &test_view("restart-class-running", 1, "running", None)
+            ),
+            (
+                RestartIdentityEvidence::MissingOrAmbiguous,
+                RestartFailureEvidence::NoRestartCondition
+            )
+        );
     }
 
     /// A real `DescendantEvidence` tree observation built through the contract's own
