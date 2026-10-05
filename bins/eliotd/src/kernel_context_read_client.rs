@@ -3434,6 +3434,37 @@ mod tests {
         Ok(())
     }
 
+    /// W8 join seam (issue #1679): the Memory dimension HAS a frozen
+    /// owner row (`HeadroomDimension::Memory.owner_bottleneck()` is
+    /// `Some(ProtectedMemoryBytes)`), but the single front-door
+    /// issuance port mints only `KernelControlChannel`, so the join
+    /// reports `OwnerRefused` naming the dimension and its required
+    /// bottleneck instead of mis-issuing (I14.3: capacity is reserved
+    /// independently at every applicable bottleneck — no borrowed
+    /// capacity, one row per bottleneck).
+    #[test]
+    fn packet_headroom_join_owner_refuses_memory_dimension()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands[0].dimension = HeadroomDimension::Memory;
+        request.demands[0].request.requested_bottleneck = CapacityBottleneck::ProtectedMemoryBytes;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is
+        // deliberately not `Debug`, so the error is taken by pattern
+        // instead of through `expect_err`; the refusal asserted below
+        // is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("unissuable dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::OwnerRefused { dimension, bottleneck, .. } if dimension == HeadroomDimension::Memory && bottleneck == CapacityBottleneck::ProtectedMemoryBytes)
+        );
+        Ok(())
+    }
+
     fn evidence_request(
         fence: &StateFence,
     ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
