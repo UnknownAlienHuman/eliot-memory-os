@@ -4317,6 +4317,50 @@ impl OwnerEvidence {
         &self.approved.manifest.runtime_launch.runtime_state_roots
     }
 
+    /// Every APPROVED generation this authority itself retains (#958, A2).
+    ///
+    /// The set is read out of the inspected registry projection, so the approved
+    /// target of a destination admission can only be resolved against generations
+    /// THIS authority approved. Presenting it as a loose manifest/approval pair
+    /// instead would only prove that two caller-supplied values agree with each
+    /// other; here the installation authority looks the target generation up in
+    /// its own retained set and validates that row's approval against that same
+    /// row's manifest.
+    pub fn approved_generations(&self) -> &[ApprovedGeneration] {
+        self.registry.generations()
+    }
+
+    /// The installation identities this authority already knows about (#958, A2).
+    ///
+    /// Read out of the inspected registry projection rather than supplied by a
+    /// caller, so "an active, approved or already-prepared installation is never
+    /// a restore destination" is decided against the authority's OWN records: the
+    /// `installation_epoch.installation` of every approved generation — the
+    /// INSTALLATION identity space, not the `manifest.generation` handle — plus
+    /// every destination it has already admitted as prepared.
+    pub fn known_installations(&self) -> Vec<PlatformHandle> {
+        let mut known: Vec<PlatformHandle> = self
+            .registry
+            .generations()
+            .iter()
+            .map(|generation| {
+                generation
+                    .manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+                    .clone()
+            })
+            .collect();
+        known.extend(
+            self.registry
+                .prepared_isolated_destinations()
+                .iter()
+                .map(|admission| admission.destination_installation.clone()),
+        );
+        known
+    }
+
     /// Binds the active generation to owner-verified build facts.
     ///
     /// The record is already validated by [`OwnerEvidence::inspect`];
