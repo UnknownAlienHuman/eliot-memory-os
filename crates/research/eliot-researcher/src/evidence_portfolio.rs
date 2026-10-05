@@ -2911,9 +2911,11 @@ impl NoMatchEvaluation {
     /// predicate revision and bytes, the evaluator identity and revision, the
     /// index and source revisions, and the per-member results. Records under
     /// different identities are different claims and nothing is compared.
-    /// Observation window, scope, manifest, fence, applicability and ceiling are
-    /// NOT compared: re-scoping or re-windowing is re-admission under a new
-    /// receipt, not a replay of this one.
+    /// Observation window, scope, manifest, fence, applicability and ceiling
+    /// are covered by the canonical-body comparison below: one admitted
+    /// identity carries one canonical body, so re-scoping or re-windowing
+    /// under the SAME receipt is a conflict — genuine re-admission mints a new
+    /// receipt and is a different identity, never a replay of this one.
     ///
     /// # Errors
     ///
@@ -2958,6 +2960,11 @@ impl NoMatchEvaluation {
         if self.results != other.results {
             return Err(PortfolioError::Conflict {
                 field: "no_match_evaluation.results",
+            });
+        }
+        if self.canonical_bytes()? != other.canonical_bytes()? {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.canonical_body",
             });
         }
         Ok(())
