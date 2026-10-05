@@ -3,16 +3,13 @@
 This is a Desktop Extension/MCPB integration, distinct from the Claude Code plugin
 under `../eliot`.
 
-The packaged binary is the same release `eliot-governor.exe` used by other hosts. It
-runs only the stdio facade with `--host claude-desktop --instance default`; the facade
-reuses or starts the one user-mode default Governor and connects through the existing
-authenticated Windows named pipe. The package contains no database, credentials,
+The packaged server is `server/eliot-agent-bridge.exe` (bins/eliot-agent-bridge, not the production Governor). It serves the admitted SPINE_FUNCTIONAL contour through the Kernel front door over stdio; it constructs no Governor, Store, WAL, or writer objects. The package contains no database, credentials,
 project files, provider configuration, or permanent role assignment.
 
 Build from the repository root:
 
 ```powershell
-cargo build --release -p eliot-app
+cargo build --locked --release -p eliot-agent-bridge --bin eliot-agent-bridge
 scripts/build-claude-desktop-extension.ps1
 ```
 
