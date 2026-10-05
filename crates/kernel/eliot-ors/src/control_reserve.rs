@@ -1349,4 +1349,27 @@ mod tests {
             }
         ));
     }
+
+    /// The constructor floor of issue #1679: a reserve with no normal
+    /// transaction slots can never admit any ORS work, so building one must fail
+    /// at build rather than surprise a caller at runtime with an always-shedding
+    /// partition. The refusal names the exact field.
+    #[test]
+    fn ors_partitioned_zero_normal_transactions_fails_closed() {
+        let Err(err) = OrsReserve::partitioned(
+            0,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero normal transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.normal_transaction_slots",
+                ..
+            }
+        ));
+    }
 }
