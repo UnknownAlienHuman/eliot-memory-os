@@ -4,7 +4,7 @@ Claude Desktop uses the MCPB source under
 `integrations/claude/claude-desktop/mcpb`. Its embedded native server runs:
 
 ```text
-server/eliot-governor.exe mcp stdio --host claude-desktop --instance default
+server/eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration ${__dirname}/server/agent-bridge/client-declaration-v2.json
 ```
 
 The package contains no database, password, provider credential, runtime token,
@@ -14,7 +14,7 @@ the Code plugin.
 ## Build and validate
 
 ```powershell
-cargo build --release --package eliot-app --bin eliot-governor
+cargo build --locked --release -p eliot-agent-bridge --bin eliot-agent-bridge
 .\scripts\build-claude-desktop-extension.ps1
 ```
 
