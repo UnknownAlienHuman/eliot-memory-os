@@ -148,6 +148,34 @@ def make_evidence(desc: c.WorkUnitDescriptor, result: c.OverallResult = c.Overal
 
 class WorkUnitCohortTests(unittest.TestCase):
 
+    def test_discover_named_inventory_exempt_and_unknown_rejected(self):
+        # A temporary directory, never the real `.github/work-units`: asserting
+        # on the real dir would couple this unit test to checkout state.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in sorted(ch.ALLOWED_NAMED_INVENTORY):
+                (root / name).write_bytes(b"")
+
+            # The closed named-inventory class is exempt from the numeric class.
+            self.assertEqual(
+                ch.discover_work_units(root),
+                ch.DescriptorDiscovery(ch.DescriptorDiscoveryStatus.OBSERVED, ()),
+            )
+
+            # Any other non-numeric TOML artifact fails closed.
+            (root / "unknown.toml").write_bytes(b"")
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.discover_work_units(root)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNEXPECTED_DESCRIPTOR)
+
+            # A numeric descriptor is still discovered alongside exempt files.
+            (root / "unknown.toml").unlink()
+            (root / "852.toml").write_bytes(b"")
+            self.assertEqual(
+                ch.discover_work_units(root),
+                ch.DescriptorDiscovery(ch.DescriptorDiscoveryStatus.OBSERVED, ((852, "852.toml"),)),
+            )
+
     # WORK_UNIT_CASE: 852/1
     def test_exact_frozen_current_catalogue_row_denominator(self):
         d1 = make_desc(851, "D-WU-BINDINGS", 44, source_roots=("scripts/work_unit_gate/case_binding.py",))
