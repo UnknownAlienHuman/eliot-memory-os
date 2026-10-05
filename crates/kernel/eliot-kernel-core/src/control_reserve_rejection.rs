@@ -565,4 +565,49 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// The partial-loss boundary (issue #1679, W9/A11): the emergency
+    /// slot is gone but the protected partition is still live, so a
+    /// recording path remains and no guarantee loss is reported — the
+    /// loss record exists only when NO path remains (I14.3). This
+    /// contrasts the neighbours: one pins refusal with both paths
+    /// live, one pins the record with both gone; this one pins
+    /// refusal with exactly one gone.
+    #[test]
+    fn guarantee_lost_response_refuses_while_protected_path_live() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([35u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // Only the emergency path is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the live
+        // protected path, not from a fully lost guarantee.
+        let _held_emergency = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-gap-1",
+        )?;
+        assert_eq!(front_door.available_emergency(), 0);
+        assert!(front_door.available_protected() > 0);
+
+        // The `I14BackpressureResponseV1` Debug status is not
+        // re-verified here, so the error is taken by pattern instead
+        // of through `expect_err`.
+        let Err(err) = front_door.guarantee_lost_response(
+            "op-loss-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        ) else {
+            panic!("a live recording path must not produce a loss record");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.last_resort_path",
+                ..
+            }
+        ));
+        Ok(())
+    }
 }
