@@ -578,3 +578,57 @@ mod cli_catalog_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declaration_path_accepts_manifest_launch_shape() {
+        let path = Path::new(r"C:\pkg\server\agent-bridge\client-declaration-v2.json");
+        let validated = validate_client_declaration_path(path)
+            .unwrap_or_else(|error| panic!("manifest launch shape validates: {error:?}"));
+        assert_eq!(validated, path);
+    }
+
+    #[test]
+    fn declaration_path_rejects_wrong_file_name() {
+        let path = Path::new(r"C:\pkg\server\agent-bridge\declaration.json");
+        let result = validate_client_declaration_path(path);
+        assert!(matches!(
+            result,
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+    }
+
+    #[test]
+    fn declaration_path_rejects_wrong_parent() {
+        let path = Path::new(r"C:\pkg\server\bridge\client-declaration-v2.json");
+        let result = validate_client_declaration_path(path);
+        assert!(matches!(
+            result,
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+    }
+
+    #[test]
+    fn declaration_path_rejects_relative() {
+        let path = Path::new(r"server\agent-bridge\client-declaration-v2.json");
+        let result = validate_client_declaration_path(path);
+        assert!(matches!(
+            result,
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+    }
+
+    #[test]
+    fn declaration_path_rejects_traversal() {
+        let path =
+            Path::new(r"C:\pkg\server\agent-bridge\..\agent-bridge\client-declaration-v2.json");
+        let result = validate_client_declaration_path(path);
+        assert!(matches!(
+            result,
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+    }
+}
