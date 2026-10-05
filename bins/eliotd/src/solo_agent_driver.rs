@@ -180,6 +180,31 @@ impl SoloDelegateBody {
         }
         Ok(())
     }
+
+    /// Builds the delegate body from the canonical admitted carrier's
+    /// primitives plus the ORIGINAL canonical delegate bytes the digest binds.
+    ///
+    /// Primitives on purpose: the MCP carrier types stay test-only
+    /// (`eliot-mcp` is a dev-dependency), so production gains no surfaces
+    /// edge. Tests parse the real `eliot_mcp::CoordinateInput::Delegate` and
+    /// feed its fields here, which keeps the primitives bound to the contract
+    /// shape (I07-06:37) instead of hand-mirrored JSON.
+    pub fn from_canonical_delegate(
+        goal: &str,
+        owned_resources: Vec<String>,
+        expected_result: &str,
+        source_bytes: &[u8],
+    ) -> Result<Self, FabricError> {
+        let body = Self {
+            goal: goal.to_owned(),
+            owned_resources,
+            expected_result: expected_result.to_owned(),
+            source_bytes: source_bytes.to_vec(),
+            source_digest: sha256_hex(source_bytes),
+        };
+        body.validate()?;
+        Ok(body)
+    }
 }
 
 /// Claimed provider halves of one solo delegate intake.
@@ -3348,6 +3373,70 @@ mod solo_enqueue_push_tests {
         match push_validated_intake(&mut state, intake, now) {
             Err(DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
             other => panic!("expected backpressure refusal, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod canonical_delegate_tests {
+    use super::*;
+
+    fn canonical_delegate_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "operation": "delegate",
+            "goal": "bounded valve survey",
+            "owned_resources": ["rig-1"],
+            "expected_result": "valve-report",
+        }))
+        .expect("canonical delegate bytes build")
+    }
+
+    #[test]
+    fn canonical_delegate_binds_contract_shape() {
+        let source_bytes = canonical_delegate_bytes();
+        // NOTE: `contract` is a private module (`contract.rs:11`); the carrier
+        // parses through the crate-root re-export (`lib.rs:20`).
+        let input: eliot_mcp::CoordinateInput =
+            serde_json::from_slice(&source_bytes).expect("carrier parses");
+        let eliot_mcp::CoordinateInput::Delegate(request) = input else {
+            panic!("expected a Delegate carrier, got {input:?}");
+        };
+        let body = SoloDelegateBody::from_canonical_delegate(
+            &request.goal,
+            request.owned_resources.clone(),
+            &request.expected_result,
+            &source_bytes,
+        )
+        .expect("valid carrier builds");
+        assert_eq!(body.goal, request.goal);
+        assert_eq!(body.owned_resources, request.owned_resources);
+        assert_eq!(body.expected_result, request.expected_result);
+        assert_eq!(body.source_bytes, source_bytes);
+        assert_eq!(body.source_digest, sha256_hex(&source_bytes));
+    }
+
+    #[test]
+    fn canonical_delegate_detects_tampered_bytes() {
+        let mut source_bytes = canonical_delegate_bytes();
+        let last = source_bytes.len() - 1;
+        source_bytes[last] = u8::MAX - source_bytes[last];
+        let input: eliot_mcp::CoordinateInput =
+            serde_json::from_slice(&canonical_delegate_bytes()).expect("carrier parses");
+        let eliot_mcp::CoordinateInput::Delegate(request) = input else {
+            panic!("expected a Delegate carrier, got {input:?}");
+        };
+        let mut body = SoloDelegateBody::from_canonical_delegate(
+            &request.goal,
+            request.owned_resources.clone(),
+            &request.expected_result,
+            &canonical_delegate_bytes(),
+        )
+        .expect("valid carrier builds");
+        body.source_bytes = source_bytes;
+        match body.validate() {
+            Err(FabricError::IdentityConflict(_)) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
         }
     }
 }
