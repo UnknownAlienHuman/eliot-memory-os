@@ -1175,6 +1175,34 @@ mod tests {
         }
     }
 
+    /// A claimed row must name one runtime owner AND one owner generation
+    /// (norm I14.3), so a blank `owner_generation_ref` must be refused at
+    /// publication rather than publishing an unaccountable claimed row:
+    /// `publish_owner_rows` funnels every row through the shared
+    /// `row.validate()` contract check, and a claimed row without an owner
+    /// generation is not valid.
+    #[test]
+    fn ors_publish_owner_rows_rejects_blank_generation() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let ctx = OrsOwnerEvidenceContext {
+            owner_generation_ref: String::new(),
+            proof_profile_ref: "proof-ors-1".to_owned(),
+            evidence_refs: vec!["ev-ors-1".to_owned()],
+            invalidation_set: vec!["inv-ors-1".to_owned()],
+        };
+        let err = reserve
+            .publish_owner_rows(&ctx)
+            .expect_err("blank generation must never publish a row");
+        assert!(matches!(err, OrsReserveError::Contract(_)));
+    }
+
     /// The transaction dimension of issue #1679: the same fail-closed property
     /// as the durable face, applied to the slot dimension.
     /// `normal_transaction_exhaustion_response` must never manufacture
