@@ -369,4 +369,39 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// The positive complement of
+    /// `protected_exhaustion_response_refuses_a_remaining_partition` in
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
+    /// that test pins refusal while protected capacity remains, this one pins a
+    /// real recovery-boundary report once the protected partition is truly gone,
+    /// so boundary evidence is reported only for live exhaustion.
+    #[test]
+    fn protected_exhaustion_response_reports_live_boundary() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([21u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single protected slot is consumed and held: the permit releases on
+        // drop, so the report below observes the live exhausted partition.
+        let _held = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+
+        let response = front_door.protected_exhaustion_response(
+            ControlOperationClass::CancelOperation,
+            "op-report-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert!(matches!(
+            response.disposition,
+            eliot_runtime_contracts::BackpressureDisposition::Busy
+        ));
+        Ok(())
+    }
 }
