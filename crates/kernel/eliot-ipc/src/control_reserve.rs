@@ -721,4 +721,46 @@ mod tests {
         // This owner claims no emergency partition.
         assert!(row.emergency_limit.is_none());
     }
+
+    /// A genuinely saturated normal pipe-byte partition is the positive
+    /// complement of the admitting-partition refusal above (issue #1679):
+    /// exhaustion of this one dimension yields real pressure evidence — a
+    /// [`BackpressureDisposition::Busy`] directive naming
+    /// [`IPC_PIPE_BYTES_BOTTLENECK`] — rather than a generic refusal or a
+    /// claim of global exhaustion.
+    #[test]
+    fn ipc_bytes_exhaustion_response_reports_live_saturation() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        // Saturating the whole normal partition holds the permit alive: the
+        // report below must observe the live saturated state, not a partition
+        // that already released.
+        let _held = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-pipe-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+            )
+            .expect("normal pipe bytes");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+
+        // The request cannot be admitted, so the response must be pressure
+        // evidence for this dimension.
+        let response = reserve
+            .normal_bytes_exhaustion_response(
+                NormalWorkClass::Interactive,
+                "op-pipe-report-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("live saturation must report");
+        assert!(matches!(
+            response.disposition,
+            BackpressureDisposition::Busy
+        ));
+    }
 }
