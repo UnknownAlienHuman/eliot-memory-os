@@ -94,16 +94,25 @@ except ImportError:  # fallback for direct file loading (delegate context)
     from scripts.work_unit_gate import case_binding  # type: ignore[no-redef]
     from scripts.work_unit_gate import doc_read_evidence  # type: ignore[no-redef]
 
-# Frozen leaf-router byte identities (from test_work_unit_gate_cohort at base;
-# Windows CRLF checkout). Used only for the shared-repo freeze check, never
-# for temp fixture roots (missing routers are skipped, not failed, so tiny
-# bootstrap repositories without routers still verify).
-FROZEN_LEAF_ROUTER_SHA256 = {
-    "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
-    "scripts/docs_router_core.py": "455aec470ab6f3f8bf7e64578d264ca0877a06cfec411d9aa415ffa62ae4a06a",
-    "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
-    "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
-}
+# Leaf-router freeze, relative to the current branch base (#837 A1/A29).
+#
+# The shared leaf routers change through accepted docs-infra work (e.g. main
+# commits a09eaf1b7, 77f480fee), so absolute byte literals recorded at an old
+# base rot and fail every selected proof on current main with
+# ROUTER_MUTATION_DETECTED. The freeze instead verifies that the routers on
+# disk are identical to the current branch base (merge-base of HEAD with
+# origin/main, else main) via fixed read-only `git diff` projections, which
+# compare normalized content and never rot when the base advances. Used only
+# for the shared-repo check, never for temp fixture roots (a tree without
+# `.git` identity is skipped, not failed, so tiny bootstrap repositories
+# without routers still verify).
+_LEAF_ROUTER_PATHS = (
+    "scripts/docs_router.py",
+    "scripts/docs_router_core.py",
+    "scripts/docs_shards.py",
+    "scripts/docs_shards_core.py",
+)
+_ROUTER_FREEZE_BASE_REFS = ("origin/main", "main")
 
 PROOF_CHOICES = ("catalogue-only", "selected", "full-project")
 
@@ -174,6 +183,34 @@ def _git_succeeds(root: Path, arguments: list[str]) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return completed.returncode == 0
+
+
+def _verify_routers_unchanged_from_base(gate_root: Path) -> bool:
+    """Verify leaf routers match the current branch base (read-only).
+
+    Resolves the base with the fixed read-only `git merge-base HEAD <ref>`
+    projection (`origin/main`, else `main`) and requires an empty
+    `git diff --exit-code` on each leaf router path, so both committed and
+    worktree mutations are detected while accepted base advances never
+    fail. Raises CohortError(ROUTER_MUTATION_DETECTED) on any difference;
+    raises RuntimeError when the base itself is unobservable (the caller
+    maps that to an internal router-check failure, never to a pass).
+    """
+    base: str | None = None
+    for ref in _ROUTER_FREEZE_BASE_REFS:
+        observed = _git_observed(gate_root, ["merge-base", "HEAD", ref])
+        if observed is not None and re.fullmatch(r"[0-9a-f]{40}", observed) is not None:
+            base = observed
+            break
+    if base is None:
+        raise RuntimeError("router freeze base unresolvable: origin/main and main both unobservable")
+    for rel in _LEAF_ROUTER_PATHS:
+        if not _git_succeeds(gate_root, ["diff", "--exit-code", "--no-ext-diff", base, "--", rel]):
+            raise cohort.CohortError(
+                cohort.CohortProblem.ROUTER_MUTATION_DETECTED,
+                f"router differs from base {base}: {rel}",
+            )
+    return True
 
 
 def _accepted_commit(root: Path, issue: int) -> str | None:
@@ -1464,12 +1501,13 @@ def main(argv: list[str] | None = None) -> int:
                                           failed=[f"issue-{d.issue.number}"]))
             except Exception:
                 return finish(fail_result("internal failure: descriptor scope", 2))
-        # Leaf routers: check shared repo (where this file lives), not temp
-        # fixture roots. Missing routers under temp are skipped, not failed.
+        # Leaf routers: check shared repo (where this file lives) against its
+        # current branch base, not temp fixture roots. A tree without `.git`
+        # identity is skipped, not failed.
         try:
             gate_root = Path(__file__).resolve().parents[2]
             if cohort.is_real_repository_root(gate_root):
-                cohort.verify_leaf_routers_unchanged(gate_root, FROZEN_LEAF_ROUTER_SHA256)
+                _verify_routers_unchanged_from_base(gate_root)
             # Else a genuine temp fixture root: missing routers are skipped, not failed.
         except cohort.CohortError as exc:
             problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
