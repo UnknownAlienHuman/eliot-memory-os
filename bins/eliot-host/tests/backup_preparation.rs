@@ -21,12 +21,13 @@ use eliot_host::backup_config_projection::{
     project_backup_config,
 };
 use eliot_host::backup_preparation::{
-    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission, OwnerEvidence,
-    PreparationClass, PreparationError, PreparationJournal, PreparedDestination,
-    PresentedPreparationRequest, ReconcileDisposition, RootIdentity, cancel_preparation,
-    cleanup_preparations, derive_destination_epoch, derive_destination_id,
+    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission,
+    DestinationCustody, OwnerEvidence, PreparationClass, PreparationError, PreparationJournal,
+    PreparedDestination, PresentedPreparationRequest, ReconcileDisposition, RootIdentity,
+    cancel_preparation, cleanup_preparations, derive_destination_epoch, derive_destination_id,
     prepare_isolated_destination, reconcile_preparation,
 };
+use eliot_platform_windows::test_support::override_protected_root;
 use serde_json::Value;
 
 const LINEAGE_958: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -146,6 +147,15 @@ struct MemJournal {
 }
 
 impl PreparationJournal for MemJournal {
+    /// No restore/cutover custody claim can be outstanding against this sink: it
+    /// retains no custody records and no other party can hold one, so every root
+    /// it prepared is reclaimable here. The fail-closed `Unresolved` default stays
+    /// for sinks that cannot prove their owners clear; the production Host sink
+    /// reads the real owners instead of this stub.
+    fn destination_custody(&self, _root: &Path) -> DestinationCustody {
+        DestinationCustody::Released
+    }
+
     fn record_intent(
         &mut self,
         operation_id: &str,
@@ -986,17 +996,33 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
         eprintln!("SKIP 958/17 on non-Windows: real isolated-root preparation requires Windows");
         return;
     }
-    let (source_root, sentinel) = source_tree("17");
+    // One case root keeps the source tree and the staging parent inside a single
+    // protected contour: `override_protected_root` pins one root and
+    // `ProtectedRootLease::open_existing` demands `path.starts_with(root)`.
+    let case_root = isolated_root("17", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
-    let parent = isolated_root("17", "staging");
-    // Registry evidence is fail-closed on a non-protected directory: owner
-    // inspection refuses instead of inventing authority.
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    // Thread-local contour pin, restored on drop; parallel tests in this binary
+    // observe their own contour only.
+    let _protected = override_protected_root(&case_root);
+    // Fail-closed contour exactness: outside the pinned root the owner still
+    // refuses instead of inventing authority. A positive `inspect` is not
+    // asserted here: `inspect_inner` additionally demands a committed
+    // installation registry with an active generation, which no temp fixture
+    // can stage; the positive proof goes through preparation below.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore
+    // ("restore to isolated root;").
     assert!(
         matches!(
-            OwnerEvidence::inspect(&parent),
+            OwnerEvidence::inspect(&std::env::temp_dir()),
             Err(PreparationError::FilesystemEffect { .. })
         ),
-        "non-protected root yields no owner evidence"
+        "outside the pinned contour the owner yields no evidence"
     );
     let mut journal = MemJournal::default();
     let prepared = prepare_isolated_destination(
@@ -1019,8 +1045,7 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
     assert_eq!(report.removed, vec!["op-958-real".to_owned()]);
     assert!(!prepared.root.exists(), "destination removed");
     assert_eq!(sentinel_bytes(&sentinel), before, "source unchanged");
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/18
