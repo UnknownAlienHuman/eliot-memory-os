@@ -1955,8 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_permit_release_returns_last_resort_slot_exactly_once(
-    ) -> Result<(), KernelError> {
+    fn emergency_permit_release_returns_last_resort_slot_exactly_once() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([77u8; 32]),
             genesis_epoch(),
