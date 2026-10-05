@@ -124,3 +124,29 @@ fn contradiction(bottleneck: CapacityBottleneck, reason: &'static str) -> Kernel
         reason,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_contracts::EpochLineageId;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn join_ors_owner_evidence_rejects_blank_snapshot_ref() {
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("epoch");
+
+        let error = join_ors_owner_evidence(&[], "", &epoch).expect_err("blank snapshot must fail");
+
+        match error {
+            KernelError::InvalidField { field, .. } => {
+                assert_eq!(field, "control_reserve.config_snapshot_ref");
+            }
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
+    }
+}
