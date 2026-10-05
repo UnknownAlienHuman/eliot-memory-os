@@ -59,8 +59,10 @@ use crate::validation_stage::{resolve_validation_inputs, validate_admitted_draft
 use crate::{
     AuthenticatedKernelJobPort, CurationCarrierSource, DreamJobInput, DreamResult, DreamerError,
     JobClass, JobState, KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort,
-    OrientationDisposition, pulse::PulseStageId, run_admitted_pipeline,
+    run_admitted_pipeline,
 };
+#[cfg(test)]
+use crate::{OrientationDisposition, pulse::PulseStageId};
 use eliot_dreamer_contracts::validation::structured::{
     GroundingValidationInput, ValidatedGroundingCandidate,
 };
