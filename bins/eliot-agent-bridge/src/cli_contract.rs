@@ -541,7 +541,7 @@ where
 
 #[cfg(test)]
 mod cli_catalog_tests {
-    use super::{parse_mcp_catalog_args, CliError};
+    use super::{CliError, parse_mcp_catalog_args};
     use eliot_types::ClaudeSurface;
 
     #[test]
