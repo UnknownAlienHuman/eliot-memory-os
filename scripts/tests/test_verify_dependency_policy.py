@@ -23,6 +23,7 @@ _spec.loader.exec_module(vdp)
 run_self_tests = vdp.run_self_tests
 verify_all = vdp.verify_all
 check_cargo_inventory = vdp.check_cargo_inventory
+check_direct_inventory_reconciliation = vdp.check_direct_inventory_reconciliation
 check_exceptions = vdp.check_exceptions
 check_python_ecosystem = vdp.check_python_ecosystem
 check_nuget_ecosystem = vdp.check_nuget_ecosystem
@@ -128,6 +129,22 @@ class TestVerifyDependencyPolicy(unittest.TestCase):
         }
         findings = check_cargo_inventory(manifest_fixture, {"known_crate", "unregistered_crate"})
         self.assertTrue(any(f.code == "DEP-003" and "unregistered_crate" in f.detail for f in findings))
+
+    def test_empty_owner_disposition_rejected(self) -> None:
+        manifest_fixture = {
+            "direct_dependencies": {
+                "bare-nuget": {
+                    "ecosystem": "nuget",
+                    "consumer": "apps/Eliot.Operator",
+                    "owner": "",
+                    "reason": "test",
+                    "public_exposure": "none",
+                    "removal_plan": "none",
+                }
+            },
+        }
+        findings = check_direct_inventory_reconciliation(manifest_fixture, "nuget", {"bare-nuget"}, "DEP-007")
+        self.assertTrue(any(f.code == "DEP-007" and "owner" in f.detail for f in findings))
 
     def test_expired_exception_rejected(self) -> None:
         manifest_exc = {

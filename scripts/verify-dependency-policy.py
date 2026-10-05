@@ -1363,7 +1363,17 @@ def check_direct_inventory_reconciliation(
     observed_direct_names: set[str],
     finding_code: str,
 ) -> list[Finding]:
-    """Require the policy inventory and observed direct roots to agree both ways."""
+    """Require the policy inventory and observed direct roots to agree both ways.
+
+    Presence is not evidence (issue #1229 W4/A2). A row whose disposition
+    fields are present but empty used to reconcile cleanly by name alone and
+    still report PASS, and those empty values were then published into the
+    SBOM as the component disposition -- an unowned, unjustified, unbounded
+    dependency recorded as fully dispositioned. Every row of this ecosystem
+    must therefore carry real consumer/owner/reason/public_exposure/
+    removal_plan values, the same values the cargo inventory check requires
+    of rust rows.
+    """
 
     findings: list[Finding] = []
     inventory = manifest_data.get("direct_dependencies", {})
@@ -1408,6 +1418,21 @@ def check_direct_inventory_reconciliation(
                     )
                 )
             declared[normalized] = name
+            invalid = [
+                field
+                for field in ("consumer", "owner", "reason", "public_exposure", "removal_plan")
+                if not isinstance(entry.get(field), str) or not entry[field].strip()
+            ]
+            if invalid:
+                findings.append(
+                    Finding(
+                        finding_code,
+                        "config/dependency-policy.toml",
+                        1,
+                        f"dependency '{name}' inventory disposition is missing valid fields: "
+                        + ", ".join(sorted(set(invalid))),
+                    )
+                )
 
     for normalized, name in sorted(observed.items()):
         if normalized not in declared:
@@ -6565,7 +6590,41 @@ def run_self_tests() -> int:
             print("SELF_TEST_FAILURE: expected DEP-014 for invalid lock drift path", file=sys.stderr)
             return 1
 
-    print("DEPENDENCY_POLICY_SELF_TEST: PASS (13/13 cases verified)")
+    _CASE14_BARE = {
+        "direct_dependencies": {
+            "bare-nuget": {
+                "ecosystem": "nuget",
+                "consumer": "apps/Eliot.Operator",
+                "owner": "",
+                "reason": "test",
+                "public_exposure": "none",
+                "removal_plan": "none",
+            }
+        },
+    }
+    if not any(
+        f.code == "DEP-007" and "missing valid fields" in f.detail and "owner" in f.detail
+        for f in check_direct_inventory_reconciliation(_CASE14_BARE, "nuget", {"bare-nuget"}, "DEP-007")
+    ):
+        print("SELF_TEST_FAILURE: expected DEP-007 for empty owner disposition", file=sys.stderr)
+        return 1
+    _CASE14_FULL = {
+        "direct_dependencies": {
+            "full-nuget": {
+                "ecosystem": "nuget",
+                "consumer": "apps/Eliot.Operator",
+                "owner": "apps/Eliot.Operator",
+                "reason": "test",
+                "public_exposure": "none",
+                "removal_plan": "none",
+            }
+        },
+    }
+    if check_direct_inventory_reconciliation(_CASE14_FULL, "nuget", {"full-nuget"}, "DEP-007"):
+        print("SELF_TEST_FAILURE: valid disposition must reconcile cleanly", file=sys.stderr)
+        return 1
+
+    print("DEPENDENCY_POLICY_SELF_TEST: PASS (14/14 cases verified)")
     return 0
 
 
