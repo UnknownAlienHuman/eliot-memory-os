@@ -720,6 +720,55 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             ch.materialize_catalogue([make_row(d_other)], (d_other.issue,), integration_owners=profile)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
 
+        # The same exact pair admitted through the production derivation
+        # helper - the authority path the gate itself uses for the
+        # selected/full cohort - authorizes the root claim identically.
+        rel = c.AssignmentRelation(
+            source_issue=c.IssueIdentity(REPO, 999),
+            role=c.RelationRole.INTEGRATED_BY,
+            target_issue=d_int.issue,
+        )
+        derived = ch.derive_integration_owners([rel], {d_int.issue: d_int.unit})
+        cat_derived = ch.materialize_catalogue(
+            [make_row(d_int)], (d_int.issue,), integration_owners=derived
+        )
+        self.assertEqual(len(cat_derived.rows), 1)
+
+        # Impersonation leg: the very same unit spelling under an unlisted
+        # issue is not admitted by that derived profile.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_other)], (d_other.issue,), integration_owners=derived
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # An unadmitted target unit derives no owner at all, so the same
+        # claim is refused rather than fabricated.
+        unadmitted = ch.derive_integration_owners([rel], {})
+        self.assertEqual(unadmitted.owners, ())
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_int)], (d_int.issue,), integration_owners=unadmitted
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # Only the closed integrated-by role carries authority: the same
+        # well-formed relation with a blocked-by role derives nothing.
+        blocked_rel = c.AssignmentRelation(
+            source_issue=c.IssueIdentity(REPO, 999),
+            role=c.RelationRole.BLOCKED_BY,
+            target_issue=d_int.issue,
+        )
+        blocked_profile = ch.derive_integration_owners(
+            [blocked_rel], {d_int.issue: d_int.unit}
+        )
+        self.assertEqual(blocked_profile.owners, ())
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_int)], (d_int.issue,), integration_owners=blocked_profile
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
     # WORK_UNIT_CASE: 852/24
     def test_arbitrary_command_url_env_rejected_through_runner(self):
         toml_bad_mode = b"""
@@ -1229,6 +1278,35 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         r_blocked = make_row(d, disposition=c.CatalogueDisposition.BLOCKED, override_desc=None)
         self.assertIsNone(r_blocked.descriptor)
         self.assertEqual(r_blocked.disposition, c.CatalogueDisposition.BLOCKED)
+
+        # Unresolved finite allocation is an explicit blocked row inside an
+        # otherwise valid cohort, not a wildcard descriptor: it materializes,
+        # and it can never be selected for execution.
+        d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/a.py",))
+        d2 = make_desc(852, "D-WU-B", 22, source_roots=("scripts/b.py",))
+        cat = ch.materialize_catalogue(
+            [make_row(d1), make_row(d2, disposition=c.CatalogueDisposition.BLOCKED)],
+            (d1.issue, d2.issue),
+        )
+        self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(
+                cat,
+                c.VerificationSelection(
+                    cat.sha256, "e" * 64, c.SelectionScope.SELECTED, (d2.issue,)
+                ),
+                [d2],
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.BLOCKED_ALLOCATION)
+
+        # Blocked-only: the same explicit materialization with no executable
+        # row is itself integrity-valid.
+        cat_blocked = ch.materialize_catalogue(
+            [make_row(d2, disposition=c.CatalogueDisposition.BLOCKED, override_desc=None)],
+            (d2.issue,),
+        )
+        self.assertEqual(cat_blocked.result, c.CatalogueResult.INTEGRITY_VALID)
 
     # WORK_UNIT_CASE: 852/41
     def test_catalogue_generation_digest_no_future_commit_or_result_cycle(self):
