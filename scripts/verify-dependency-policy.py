@@ -796,6 +796,43 @@ def _consume_standalone_preparation_binding(root: Path, workspace_dir: Path, loc
     return binding
 
 
+def _resolve_tool_executable(name: str, cwd: Path) -> str | None:
+    """Resolve a toolchain tool to the binary that actually executes (issue #1229 A1).
+
+    A rustup proxy shim (`cargo`/`rustc` as a symlink to `rustup.exe`) must
+    never be resolved to the proxy itself: executing `rustup.exe metadata`
+    fails, and probing `rustup.exe --version` records the proxy version as
+    the tool version. When PATH resolution lands on a rustup proxy, ask
+    rustup for the real tool path; otherwise keep the resolved path.
+    """
+
+    found = shutil.which(name)
+    if not found:
+        return None
+    resolved = str(Path(found).resolve())
+    if Path(resolved).stem.casefold() != "rustup":
+        return resolved
+    try:
+        completed = subprocess.run(
+            [resolved, "which", name],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return resolved
+    if completed.returncode != 0:
+        return resolved
+    for line in completed.stdout.splitlines():
+        candidate = line.strip()
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return resolved
+
+
 def _load_nonmember_resolver_metadata(
     root: Path, workspace_dir: Path, lockfile: str
 ) -> tuple[dict, dict | None, str | None]:
@@ -822,8 +859,8 @@ def _load_nonmember_resolver_metadata(
     if not cargo or not rustc:
         evidence["status"] = "tool_unavailable"
         return evidence, None, "Cargo and rustc must both be available to bind resolver/toolchain identity"
-    cargo_path = str(Path(cargo).resolve())
-    rustc_path = str(Path(rustc).resolve())
+    cargo_path = _resolve_tool_executable("cargo", workspace_dir) or cargo
+    rustc_path = _resolve_tool_executable("rustc", workspace_dir) or rustc
     cargo_version = _run_resolver_command([cargo_path, "--version", "--verbose"], workspace_dir, 20)
     rustc_version = _run_resolver_command([rustc_path, "--version", "--verbose"], workspace_dir, 20)
     evidence.update(
@@ -6745,7 +6782,17 @@ def run_self_tests() -> int:
         print("SELF_TEST_FAILURE: clean scanner output must not classify as stale or unavailable", file=sys.stderr)
         return 1
 
-    print("DEPENDENCY_POLICY_SELF_TEST: PASS (18/18 cases verified)")
+    # Case 19: toolchain tools resolve past rustup proxy shims (issue #1229 A1)
+    _resolved_cargo = _resolve_tool_executable("cargo", Path("."))
+    if (
+        not isinstance(_resolved_cargo, str)
+        or Path(_resolved_cargo).stem.casefold() == "rustup"
+        or not Path(_resolved_cargo).is_file()
+    ):
+        print("SELF_TEST_FAILURE: expected cargo to resolve past the rustup proxy", file=sys.stderr)
+        return 1
+
+    print("DEPENDENCY_POLICY_SELF_TEST: PASS (19/19 cases verified)")
     return 0
 
 
