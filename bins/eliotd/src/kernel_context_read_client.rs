@@ -3378,6 +3378,31 @@ mod tests {
         Ok(FrontDoor::partitioned(authority, 4, 4, 8)?)
     }
 
+    /// The join fails closed on a dimension that has no frozen owner row
+    /// (issue #1679): `HeadroomDimension::Gpu` has no `owner_bottleneck()` and
+    /// no frozen owner, so `PacketHeadroomJoin::acquire` refuses it rather than
+    /// admitting the demand without a reservation. The refusal names the exact
+    /// dimension, so the reader never has to infer which owner was missing.
+    #[test]
+    fn packet_headroom_join_refuses_dimension_without_frozen_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let request = gpu_demand_request(&fence)?;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is deliberately
+        // not `Debug`, so the error is taken by pattern instead of through
+        // `expect_err`; the refusal asserted below is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("ownerless dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NoFrozenOwner { dimension } if dimension == HeadroomDimension::Gpu)
+        );
+        Ok(())
+    }
+
     fn evidence_request(
         fence: &StateFence,
     ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
