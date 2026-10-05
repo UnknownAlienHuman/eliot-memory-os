@@ -1350,4 +1350,26 @@ mod tests {
             matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_PENDING_WRITE_BOTTLENECK)
         );
     }
+
+    /// No-scaling construction (issue #1679): a fresh reserve reports
+    /// exactly its configured partition capacities (I14.3: quantities
+    /// are copied from configuration, never derived or scaled).
+    #[test]
+    fn store_reserve_reports_configured_capacities() {
+        let reserve = StoreReserve::partitioned(
+            3,
+            5,
+            7,
+            9,
+            NonZeroU64::new(11).expect("bytes"),
+            NonZeroU64::new(13).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_connections(), 3);
+        assert_eq!(reserve.available_protected_connections(), 5);
+        assert_eq!(reserve.available_normal_transactions(), 7);
+        assert_eq!(reserve.available_protected_transactions(), 9);
+        assert_eq!(reserve.available_normal_pending_write_bytes(), 11);
+        assert_eq!(reserve.available_protected_pending_write_bytes(), 13);
+    }
 }
