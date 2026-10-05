@@ -1484,6 +1484,139 @@ fn required_optional_conditional_slots() {
     must(view.validate_against(&recipe));
 }
 
+// WORK_UNIT_CASE: 590/1864-req
+#[test]
+fn required_known_empty_derives_complete_1864() {
+    let target = target("target-590-1864-req");
+    let binding = binding("1864-req");
+    let spec = SlotSpec {
+        slot_id: SlotId::from_artifact(aid("slot-590-1864-req")),
+        owner: OwnerId::from_artifact(aid("owner-590-1864-req")),
+        source_role: CampaignSourceRole::ArtifactProjection,
+        target: target.clone(),
+        requirement: SlotRequirement::Required,
+        declared_members: vec![],
+        accepted_type: "strategy/v1".to_owned(),
+        schema_digest: digest("schema-590-1864-req"),
+    };
+    let (source_requirements, mut provenance) = campaign_source_contract(&binding, "1864-req");
+    let mut recipe = LearningStateViewRecipe {
+        recipe_id: aid("recipe-590-1864-req"),
+        campaign_id: CampaignId::from_artifact(aid("campaign-590-1864-req")),
+        target: target.clone(),
+        binding: binding.clone(),
+        slots: vec![spec.clone()],
+        source_requirements,
+        active_overlay_policy: CampaignActiveOverlayPolicy::ExplicitlyAbsentAllowed,
+        freshness: EvidenceFreshness::ExactCandidate,
+        privacy_class: "task-local".to_owned(),
+        omission_policy: OmissionPolicy::RequiredSlots,
+        canonical_digest: String::new(),
+    };
+    let slots = vec![SlotProjection {
+        slot_id: spec.slot_id.clone(),
+        disposition: SlotDisposition::KnownEmpty,
+        members: vec![],
+        evidence: vec![aid("ev-590-1864-req")],
+    }];
+    bind_slot_source_contract(&mut recipe, &mut provenance, &slots);
+    must(recipe.seal());
+    must(recipe.validate());
+    let mut view = CampaignLearningStateView {
+        view_id: aid("view-590-1864-req"),
+        recipe_id: recipe.recipe_id.clone(),
+        campaign_id: recipe.campaign_id.clone(),
+        target,
+        binding,
+        recipe_digest: recipe.canonical_digest.clone(),
+        provenance,
+        slots,
+        denominator: SourceDenominator {
+            declared: 1,
+            observed: 1,
+        },
+        completeness: Completeness::CompleteForDeclaredRecipe,
+        omissions: vec![],
+        frontier: vec![],
+        owner_disagreements: vec![],
+        required_references: vec![aid("obj-590-1864-req")],
+        invalidated: false,
+        invalidation_reason: None,
+        canonical_digest: String::new(),
+    };
+    must(view.seal_content_addressed());
+    assert_eq!(
+        view.derived_completeness(&recipe),
+        Completeness::CompleteForDeclaredRecipe
+    );
+    assert!(view.validate_against(&recipe).is_ok());
+}
+
+// WORK_UNIT_CASE: 590/1864-opt
+#[test]
+fn optional_known_empty_derives_partial_1864() {
+    let target = target("target-590-1864-opt");
+    let binding = binding("1864-opt");
+    let spec = SlotSpec {
+        slot_id: SlotId::from_artifact(aid("slot-590-1864-opt")),
+        owner: OwnerId::from_artifact(aid("owner-590-1864-opt")),
+        source_role: CampaignSourceRole::ArtifactProjection,
+        target: target.clone(),
+        requirement: SlotRequirement::Optional,
+        declared_members: vec![],
+        accepted_type: "strategy/v1".to_owned(),
+        schema_digest: digest("schema-590-1864-opt"),
+    };
+    let (source_requirements, mut provenance) = campaign_source_contract(&binding, "1864-opt");
+    let mut recipe = LearningStateViewRecipe {
+        recipe_id: aid("recipe-590-1864-opt"),
+        campaign_id: CampaignId::from_artifact(aid("campaign-590-1864-opt")),
+        target: target.clone(),
+        binding: binding.clone(),
+        slots: vec![spec.clone()],
+        source_requirements,
+        active_overlay_policy: CampaignActiveOverlayPolicy::ExplicitlyAbsentAllowed,
+        freshness: EvidenceFreshness::ExactCandidate,
+        privacy_class: "task-local".to_owned(),
+        omission_policy: OmissionPolicy::RequiredSlots,
+        canonical_digest: String::new(),
+    };
+    let slots = vec![SlotProjection {
+        slot_id: spec.slot_id.clone(),
+        disposition: SlotDisposition::KnownEmpty,
+        members: vec![],
+        evidence: vec![aid("ev-590-1864-opt")],
+    }];
+    bind_slot_source_contract(&mut recipe, &mut provenance, &slots);
+    must(recipe.seal());
+    must(recipe.validate());
+    let mut view = CampaignLearningStateView {
+        view_id: aid("view-590-1864-opt"),
+        recipe_id: recipe.recipe_id.clone(),
+        campaign_id: recipe.campaign_id.clone(),
+        target,
+        binding,
+        recipe_digest: recipe.canonical_digest.clone(),
+        provenance,
+        slots,
+        denominator: SourceDenominator {
+            declared: 1,
+            observed: 1,
+        },
+        completeness: Completeness::Partial,
+        omissions: vec![],
+        frontier: vec![],
+        owner_disagreements: vec![],
+        required_references: vec![aid("obj-590-1864-opt")],
+        invalidated: false,
+        invalidation_reason: None,
+        canonical_digest: String::new(),
+    };
+    must(view.seal_content_addressed());
+    assert_eq!(view.derived_completeness(&recipe), Completeness::Partial);
+    assert!(view.validate_against(&recipe).is_ok());
+}
+
 // WORK_UNIT_CASE: 590/11
 #[test]
 fn all_slot_disposition_states() {
