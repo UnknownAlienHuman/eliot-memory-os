@@ -886,8 +886,6 @@ impl LiveArea {
         drop(lease);
         let _ = std::fs::remove_dir_all(path);
         let _ = std::fs::remove_dir_all(staging);
-        drop(_serial);
-        drop(_override);
     }
 }
 
@@ -901,7 +899,7 @@ fn live_isolated_area(name: &str) -> LiveArea {
     // every proof below still runs through the real `expected_root()` machinery.
     let staging = std::env::temp_dir().join("eliot-958-installation-area");
     std::fs::create_dir_all(&staging).expect("the isolated area staging root is creatable");
-    let _override = eliot_platform_windows::test_support::override_protected_root(&staging);
+    let protected = eliot_platform_windows::test_support::override_protected_root(&staging);
     let path = staging.join(name).join(
         super::NEXT_TRANSACTION_ROOT
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -920,7 +918,7 @@ fn live_isolated_area(name: &str) -> LiveArea {
         path,
         staging,
         _serial: serial,
-        _override,
+        _override: protected,
     }
 }
 

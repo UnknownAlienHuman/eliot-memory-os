@@ -586,7 +586,6 @@ fn alias_substitution_refused_and_identity_pinned() {
         let _ = std::fs::remove_dir_all(&source_root);
         return;
     }
-    let (source_root, _) = source_tree("08");
     // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
     // `override_protected_root`, source and staging as siblings beneath it, so
     // `admit_staging_parent` observes the owner contour instead of temp_dir.
