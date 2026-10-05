@@ -6261,6 +6261,24 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 break;
             }
             crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
+                // A legacy pass needs both no owner slot record for this
+                // claim and no durable markers at all (issue #2786 A7): a
+                // slot-recorded set is new-format (the slot gate below
+                // decides), and a slot-less set on a directory whose markers
+                // prove versioned sets ran here is stale — it stays for the
+                // owner instead of resurrecting as legacy.
+                let slot_recorded =
+                    crate::dispatch_material::read_delivery_publication(&directory, &identity)
+                        .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
+                        .is_some();
+                if !slot_recorded && crate::dispatch_material::versioned_markers_present(&directory)
+                {
+                    return Err(OrdinaryDriveError::DeliveryInProgress {
+                        operation_id: identity.operation_id,
+                        generation: identity.generation,
+                        claim_id: identity.claim_id,
+                    });
+                }
                 // Explicit v1 compatibility: full admission under the staged
                 // identity verbatim, never reinterpreted as a fresh
                 // generation with new identity. Bounded served retention:
@@ -6426,8 +6444,9 @@ fn consume_delivery_set(
 /// a ready record naming another delivery, both fail closed here — nothing
 /// executes and nothing is deleted, so the staged set stays for the owner
 /// under its exact identity. No owner record at all is the legacy v1
-/// fixed-name compatibility state, which stays admissible under full
-/// admission with the staged identity verbatim.
+/// fixed-name compatibility state — but only when the directory carries no
+/// durable markers: beside markers that prove versioned sets ran here the
+/// unrecorded set is refused explicitly instead of admitted as legacy.
 ///
 /// # Errors
 ///
@@ -6450,7 +6469,19 @@ fn require_ready_publication(
         Some(_) => Err(OrdinaryDriveError::Publication {
             code: "DELIVERY_IDENTITY_MISMATCH",
         }),
-        None => Ok(()),
+        // No owner record is legacy compatibility only when the directory
+        // carries no durable markers at all; a slot-less set beside markers
+        // that prove versioned sets ran here is a torn publication that
+        // stays for the owner under an explicit migration refusal (issue
+        // #2786 W7).
+        None => {
+            if crate::dispatch_material::versioned_markers_present(directory) {
+                return Err(OrdinaryDriveError::Publication {
+                    code: "DELIVERY_SLOT_UNRECORDED",
+                });
+            }
+            Ok(())
+        }
     }
 }
 

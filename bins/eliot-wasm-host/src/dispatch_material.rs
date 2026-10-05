@@ -1915,7 +1915,10 @@ pub fn read_delivery_publication(
 pub enum StagedDeliveryState {
     /// Staged set matches served state: replay, no second guest effect.
     Replay { identity: StagedDeliveryIdentity },
-    /// Legacy v1 fixed-name set: explicit compat, full admission only.
+    /// No replay evidence for this set: the caller narrows this to genuine
+    /// legacy compatibility (no owner slot record and no durable markers
+    /// at all) versus a stale set the markers prove moved on (issue #2786
+    /// A7) — classification alone cannot tell them apart.
     LegacyV1FixedName { identity: StagedDeliveryIdentity },
 }
 
@@ -1963,7 +1966,9 @@ pub fn classify_staged_delivery(
         Some(mark) if mark.grant_digest == identity.grant_digest => StagedDeliveryState::Replay {
             identity: identity.clone(),
         },
-        _ => StagedDeliveryState::LegacyV1FixedName {
+        // No replay evidence either way: the caller narrows this with the
+        // owner slot record and the durable markers (issue #2786 A7).
+        Some(_) | None => StagedDeliveryState::LegacyV1FixedName {
             identity: identity.clone(),
         },
     }
@@ -2008,6 +2013,19 @@ impl ServedDeliveryMarker {
             && self.claim_id == identity.claim_id
             && self.grant_digest == identity.grant_digest
     }
+}
+
+/// Reports whether the install directory carries any durable versioned
+/// marker at all: the served marker, the `InFlight` marker, or the served
+/// result record (issue #2786 W7/A7). Legacy v1 fixed-name sets predate all
+/// three, so any presence proves versioned sets ran here and a slot-less
+/// staged set is stale, never legacy. Existence only — parsing is the
+/// caller-visible readers' job; a corrupt marker still proves history.
+#[must_use]
+pub fn versioned_markers_present(install_dir: &std::path::Path) -> bool {
+    install_dir.join(WASM_HOST_SERVED_FILE_NAME).exists()
+        || install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME).exists()
+        || install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME).exists()
 }
 
 /// Reads the durable served marker, if any. Only an absent marker answers
@@ -3674,6 +3692,32 @@ mod tests {
         remove_stale_reclaim_asides(&dir, "probe-file.bin");
         assert!(strange.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty directory has no versioned history.
+    #[test]
+    fn markers_absent_on_empty_dir() {
+        let dir = inflight_dir("eliot-2786-markers-empty");
+        assert!(!versioned_markers_present(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each durable marker file proves versioned history on its own.
+    #[test]
+    fn markers_present_with_each_record() {
+        for (name, file) in [
+            ("eliot-2786-markers-served", WASM_HOST_SERVED_FILE_NAME),
+            ("eliot-2786-markers-inflight", WASM_HOST_INFLIGHT_FILE_NAME),
+            (
+                "eliot-2786-markers-result",
+                WASM_HOST_SERVED_RESULT_FILE_NAME,
+            ),
+        ] {
+            let dir = inflight_dir(name);
+            std::fs::write(dir.join(file), b"bytes").expect("record writable");
+            assert!(versioned_markers_present(&dir));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     fn test_envelope_json(input: &DispatchMaterialInput) -> Vec<u8> {
