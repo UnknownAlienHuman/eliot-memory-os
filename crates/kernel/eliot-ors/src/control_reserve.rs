@@ -999,4 +999,59 @@ mod tests {
             matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
         );
     }
+
+    /// The durable-byte face of the same property (issue #1679): saturating the
+    /// normal durable-byte partition leaves the protected byte partition
+    /// untouched, so an admitted cancellation keeps its recovery lane while
+    /// ordinary work is shed naming exactly `ORS_DURABLE_BYTES_BOTTLENECK`.
+    /// Exhaustion of one dimension is therefore never reported as global
+    /// exhaustion, and normal work never borrows the reserve.
+    #[test]
+    fn ors_normal_durable_saturation_leaves_protected_bytes_available() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+                epoch,
+            )
+            .expect("normal bytes");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // protected byte path while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_durable_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-bytes-ctl-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_durable_bytes(), 3);
+
+        let err = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-shed-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect_err("saturated normal bytes must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+    }
 }
