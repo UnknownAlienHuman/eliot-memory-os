@@ -974,8 +974,8 @@ fn case_2_service_start_request_is_distinct_from_result() {
     );
     assert_eq!(
         count_occurrences(&lib, requested),
-        1,
-        "the start request record has exactly one emission site"
+        2,
+        "the start request record has exactly two disjoint emission sites (exported direct-start contour and live open manifest-start contour); each operation fires exactly one"
     );
     assert_eq!(
         count_occurrences(&lib, started),
