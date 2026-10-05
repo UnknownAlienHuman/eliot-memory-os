@@ -1033,6 +1033,59 @@ fn absence_stale_record_is_unproven() {
     );
 }
 
+#[test]
+fn absence_missing_handle_is_unproven() {
+    // A closing member with no acquired handle is the same evidence with the
+    // accounting-to-record join impossible: the member *is* closed as `Observed`,
+    // so nothing of the denominator is left open, yet no handle exists that could
+    // resolve that closure to a vetted record. Completeness is proved on the
+    // frozen scope (I21-06: `complete_scope` is the only basis on which a scoped
+    // absence may be claimed), so a member that cannot be joined to any record at
+    // all cannot support `Proven`.
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let (_, records, _, _) = proven_absence();
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        // Every member carries the same handle the vetted record map is keyed by,
+        // except `primary#0`: it is closed with no handle at all, which is the
+        // accounting this case is about.
+        account
+            .record(
+                member,
+                SourceDisposition::Observed,
+                if member == "primary#0" {
+                    None
+                } else {
+                    Some(format!("src-{member}"))
+                },
+            )
+            .expect("record");
+    }
+    // No bound evaluation and no manifest, on purpose: the manifest
+    // `proven_absence()` built commits that fixture's accounting and coverage
+    // digest, not this one, and presenting it here would report an accounting
+    // mismatch instead of the join under test. The handle join applies on its own
+    // without an evaluation, and it is returned first for a member that closed
+    // with no handle.
+    let handle_less = AbsencePreconditions::derive(
+        &account,
+        &records,
+        None,
+        ASSESSMENT_MS,
+        &inquiry_denominator_digest(),
+        None,
+    )
+    .expect("preconditions over a missing handle");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &handle_less) else {
+        panic!("a closing member with no acquired handle must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=missing_acquired_handle"),
+        "the handle-less member and its specific unmet join must be retained: {reason}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
