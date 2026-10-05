@@ -5,8 +5,10 @@ One substantive Python unittest per # WORK_UNIT_CASE: 852/<case> immediately abo
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.work_unit_gate import __main__ as gate_main
 from scripts.work_unit_gate import cohort as ch
 from scripts.work_unit_gate import contracts as c
 from scripts.work_unit_gate import descriptor_runner as dr
@@ -817,6 +820,49 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             d2 = make_desc(852, "D-WU-B", 22, source_roots=("scripts/b.py",))
             cat = ch.materialize_catalogue([make_row(d1), make_row(d2)], (d1.issue, d2.issue))
             self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+
+            # Normal CLI validator legs: the production entry itself reaches no
+            # network, spawns no process and mutates no repository. Temp roots
+            # only; `--root` never points at the real checkout.
+
+            def run_validator(root: Path) -> tuple[int, dict]:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = gate_main.main(["--proof", "catalogue-only", "--root", str(root), "--json"])
+                self.assertIsInstance(code, int)
+                return code, json.loads(stdout.getvalue())
+
+            def path_set(root: Path) -> set[str]:
+                return {p.relative_to(root).as_posix() for p in root.rglob("*")}
+
+            # Leg A: a bare tmp root carries no catalogue at all.
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                before = path_set(root)
+                code, doc = run_validator(root)
+                self.assertEqual(code, 1)
+                self.assertEqual(doc["exit"], 1)
+
+                # Leg C: the validator wrote nothing under either tmp root.
+                self.assertEqual(path_set(root), before)
+
+            # Leg B: the committed aggregate lock over an empty descriptor
+            # directory is a valid catalogue with no execution claimed.
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".github" / "work-units").mkdir(parents=True)
+                (root / ".github" / "work-unit-cohort.toml").write_bytes(
+                    (ROOT / ".github" / "work-unit-cohort.toml").read_bytes()
+                )
+                before = path_set(root)
+                code, doc = run_validator(root)
+                self.assertEqual(code, 0)
+                self.assertEqual(doc["exit"], 0)
+                self.assertEqual(doc["digest"], COMMITTED_AGGREGATE_SHA256)
+                self.assertEqual(len(doc["blocked_evidence"]), 5)
+
+                # Leg C: the validator wrote nothing under either tmp root.
+                self.assertEqual(path_set(root), before)
         finally:
             socket.socket = orig_socket
             subprocess.Popen = orig_popen
