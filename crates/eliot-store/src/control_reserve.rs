@@ -1044,4 +1044,50 @@ mod tests {
         // This owner claims no emergency partition.
         assert!(row.emergency_limit.is_none());
     }
+
+    /// The Store owner must publish a live, validated
+    /// [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+    /// join (issue #1679): the row names exactly
+    /// [`STORE_TRANSACTION_BOTTLENECK`] with the frozen-map owner, so the
+    /// composition joins real owner evidence rather than a borrowed or
+    /// invented capacity story.
+    #[test]
+    fn store_publish_claimed_row_names_frozen_transaction_owner() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // A returned row already passed `row.validate()`, so a contract
+        // failure here would be the fail-closed property itself.
+        let row = reserve
+            .publish_claimed_row(
+                StoreDimension::TransactionSlots,
+                "gen-7",
+                "proof-store-2",
+                "ev-store-2",
+                "inv-store-2",
+            )
+            .expect("claimed row");
+
+        assert_eq!(row.bottleneck, STORE_TRANSACTION_BOTTLENECK);
+        assert_eq!(row.coverage_state, BottleneckCoverageState::Claimed);
+
+        // The owner string is read from the frozen contract rather than
+        // restated here: a hard-coded owner would only prove that the test
+        // agrees with itself.
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|b| b.bottleneck == STORE_TRANSACTION_BOTTLENECK)
+            .expect("frozen transaction owner");
+        assert_eq!(row.owner_ref, bound.owner);
+
+        // This owner claims no emergency partition.
+        assert!(row.emergency_limit.is_none());
+    }
 }
