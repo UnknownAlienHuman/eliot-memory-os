@@ -1088,4 +1088,47 @@ mod tests {
             }
         ));
     }
+
+    /// The positive complement of
+    /// `ors_durable_exhaustion_response_refuses_an_admitting_partition`: that
+    /// test pins no-manufactured-pressure while durable staging is available,
+    /// this one pins that a truly saturated normal durable partition yields a
+    /// real `STORAGE_BACKPRESSURE` report naming the durable-byte bottleneck.
+    #[test]
+    fn ors_durable_exhaustion_response_reports_live_saturation() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop, and the report
+        // below must observe the live saturated partition.
+        let _held = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-fill-2",
+                NonZeroU64::new(2).expect("bytes"),
+                epoch,
+            )
+            .expect("normal bytes");
+        assert_eq!(reserve.available_normal_durable_bytes(), 0);
+
+        let response = reserve
+            .normal_durable_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-bytes-report-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("live saturation must report");
+        assert!(matches!(
+            response.disposition,
+            BackpressureDisposition::StorageBackpressure
+        ));
+    }
 }
