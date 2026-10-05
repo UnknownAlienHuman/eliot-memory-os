@@ -1452,6 +1452,45 @@ fn absence_issuer_observation_window_refused() {
     );
 }
 
+/// A vetted record rewritten after the owner issued its result no longer commits
+/// that result, so the same evidence that proved absence over the original bytes
+/// stops proving anything.
+///
+/// The handle, the accounting, the manifest and the evaluation are exactly
+/// `proven_absence`'s; only the bytes behind one member differ, so the per-member
+/// result the owner minted no longer names the record now standing behind that
+/// member. `member_join_reason` compares the result's `record_digest` against the
+/// joined record's own canonical digest before staleness and before the manifest
+/// joins, so the retained reason is the digest mismatch itself (I21-06:
+/// `complete_scope` is the only basis on which a scoped absence may be claimed).
+#[test]
+fn absence_changed_record_breaks_result_binding() {
+    let (account, mut records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    // Any field change alters the record's canonical digest, so the result issued
+    // over the original record no longer commits this one.
+    let mut params = source_params("src-primary#0");
+    params.title = "a changed title for src-primary#0".to_owned();
+    let changed = SourceRecord::new(params).expect("changed record");
+    records.insert("src-primary#0".to_owned(), changed);
+    let changed_binding = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(evaluation),
+    )
+    .expect("preconditions over a changed record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &changed_binding) else {
+        panic!("a changed vetted record must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=result_record_digest_mismatch"),
+        "the changed member and its specific unmet join must be retained: {reason}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
