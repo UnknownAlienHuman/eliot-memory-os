@@ -1175,11 +1175,91 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(c.ContractViolation):
             c.PrerequisiteEvidence(assignment_bad, "a" * 40, "b" * 64)
 
+        # CLOSED without proof is not a closed prerequisite: the state is
+        # right, but the accepted commit is not an observed Git object ID, so
+        # the evidence cannot be built at all - readiness stays unproven rather
+        # than being granted on a state claim alone.
+        assignment_unproven = make_assignment(
+            d_dep,
+            state=c.IssueState.CLOSED,
+            source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE,
+        )
+        with self.assertRaises(c.ContractViolation):
+            c.PrerequisiteEvidence(assignment_unproven, "not-a-commit", "b" * 64)
+
+        # An unresolved legacy umbrella is a superseded row with no retained
+        # descriptor: even perfectly well-formed closed evidence naming it
+        # cannot make it a matching accepted-historical prerequisite, so the
+        # selection is refused instead of the umbrella silently counting as
+        # satisfied.
+        d_sup = make_desc(859, "D-WU-OLD", 34)
+        r_sup = make_row(d_sup, disposition=c.CatalogueDisposition.SUPERSEDED, override_desc=None)
+        d_main = make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/cohort.py",))
+        r_main = make_row(d_main, prerequisites=(d_sup.issue,))
+        cat_legacy = ch.materialize_catalogue([r_sup, r_main], (d_sup.issue, d_main.issue))
+        ev_legacy = c.PrerequisiteEvidence(
+            make_assignment(
+                d_sup,
+                state=c.IssueState.CLOSED,
+                source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE,
+            ),
+            "a" * 40,
+            "b" * 64,
+        )
+        selection_legacy = c.VerificationSelection(
+            cat_legacy.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_main.issue,)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_legacy, selection_legacy, [d_main], prerequisites=[ev_legacy])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
     # WORK_UNIT_CASE: 852/33
     def test_package_local_excluded_versus_membership_required_integration_unauthorized_weakening_changes_identity(self):
         d_standalone = make_desc(852, "D-WU-COHORT", 42, package="eliot-standalone", require_member=False)
         d_member = make_desc(852, "D-WU-COHORT", 42, package="eliot-standalone", require_member=True)
         self.assertNotEqual(d_standalone.sha256, d_member.sha256)
+
+        # Weakening membership is not a free re-labelling: the membership-
+        # required descriptor and the package-local one differ in identity, so
+        # the weakened descriptor cannot be planned against a catalogue built
+        # from the strong one - the old identity does not carry over.
+        d_weak = make_desc(852, "D-WU-COHORT", 42, package="eliot-standalone", require_member=False)
+        cat_member = ch.materialize_catalogue([make_row(d_member)], (d_member.issue,))
+        selection_member = c.VerificationSelection(
+            cat_member.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_member.issue,)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_member, selection_member, [d_weak])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # Membership-required with no exact package is refused at construction,
+        # not tolerated as "integration by default" - built directly here
+        # because `make_desc` would auto-fill a sample package instead.
+        with self.assertRaises(c.ContractViolation):
+            c.WorkUnitDescriptor(
+                schema_version=c.WORK_UNIT_DESCRIPTOR_SCHEMA,
+                identity=c.DescriptorIdentity("work-unit-852"),
+                issue=c.IssueIdentity(REPO, 852),
+                unit=c.WorkUnitIdentity("D-WU-COHORT"),
+                mode=c.RunnerMode.PYTHON_UNITTEST,
+                source_roots=(c.RepositoryPath("scripts/work_unit_gate/cohort.py"),),
+                test_roots=(c.RepositoryPath("scripts/tests/test_work_unit_gate_cohort.py"),),
+                matrix_cases=42,
+                proof_ceiling=PROOF,
+                revision=1,
+                body_sha256=BODY,
+                matrix_sha256=MATRIX,
+                require_workspace_member=True,
+                requirements=c.VerificationRequirements(
+                    source_floor=1, public_floor=0, test_floor=42, required_guards=(GUARD,)
+                ),
+                bounds=c.ExecutionBounds(
+                    wall_ms=60000, idle_ms=10000, output_bytes=1048576,
+                    line_bytes=65536, discovery_tests=1000, child_processes=4,
+                ),
+                package=None,
+                module=c.ModuleIdentity("scripts.work_unit_gate"),
+            )
 
     # WORK_UNIT_CASE: 852/34
     def test_unfrozen_inventory_paths_or_contradictory_counts_cannot_be_dispatch_ready(self):
