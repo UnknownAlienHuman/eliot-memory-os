@@ -1213,6 +1213,47 @@ fn absence_issuer_blank_index_refused() {
     );
 }
 
+#[test]
+fn absence_issuer_foreign_scope_refused() {
+    // The issuer holds the frozen scope its evaluation is bounded to, so an
+    // issuer asked to attest a scope it does not hold would mint a record whose
+    // own `scope_digest` contradicts the completeness it claims. Completeness is
+    // proved on the frozen scope (I21-06: `complete_scope` is the only basis on
+    // which a scoped absence may be claimed), so the binding is the issuer's to
+    // refuse at minting rather than the assessor's to discover on readback:
+    // `issue_for` runs `check_scope_binding` before any other commitment, and
+    // `DIGEST_A` is a well-formed digest, so this refusal names the scope binding
+    // alone.
+    //
+    // The positive control first pins that the unmutated helper value issues
+    // exactly what `issued_evaluation` issues, so the refusal below is caused by
+    // the mutated scope alone.
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
+        .expect("owner issuer");
+    issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("positive control issues");
+
+    let bad = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, DIGEST_A))
+        .expect("issuer holds another scope");
+    let err = bad
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect_err("a foreign scope must be refused");
+    // `Conflict` renders as `{field} conflicts with frozen content`, so the display
+    // is what names the exact field path the issuer refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a foreign frozen scope must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.scope_digest"),
+        "the refused field must be the scope binding itself: {rendered}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
