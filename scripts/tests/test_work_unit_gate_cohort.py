@@ -824,6 +824,17 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         ev_fail = make_evidence(d1, c.OverallResult.CONTRACT_FAILURE)
         rec_fail = ch.materialize_cohort_receipt(plan, [ev_fail])
         self.assertEqual(rec_fail.result, c.OverallResult.CONTRACT_FAILURE)
+
+        # A leaf source edit is a well-formed descriptor that is no longer the
+        # planned one: execution evidence bound to it is stale and the receipt is
+        # refused, rather than accepted as proof of the planned descriptor.
+        ev_stale = make_evidence(
+            make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/edited.py",))
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_cohort_receipt(plan, [ev_stale])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.EXECUTION_EVIDENCE_INVALIDATED)
+
         self.assertEqual(cat.sha256, ch.materialize_catalogue([r1], (d1.issue,)).sha256)
 
     # WORK_UNIT_CASE: 852/27
@@ -946,6 +957,77 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
                 result=c.OverallResult.PASS,
                 aggregate_sha256="f" * 64,
             )
+
+        # The committed invalidation paths, proven on well-formed but stale or
+        # unadmitted inputs. The lock is minted by the production minter (the
+        # `generate-cohort-lock` CLI path) into a tmp file, never hand-rendered,
+        # and the work-units dir stays an observed-empty tmp directory.
+        d1 = make_desc(851, "D-WU-A", 3)
+        snapshot = {
+            "header": {
+                "repository": "UnknownAlienHuman/eliot-memory-os",
+                "base_revision": "0" * 40,
+                "acquisition": "probe",
+                "acquired_at": "2026-10-05T00:00:00Z",
+                "complete": True,
+            },
+            "rows": [
+                {
+                    "issue": 851,
+                    "unit": "D-WU-A",
+                    "body_sha256": d1.body_sha256,
+                    "disposition": "assigned",
+                    "prerequisites": [],
+                },
+                {
+                    "issue": 852,
+                    "unit": "D-WU-B",
+                    "body_sha256": "c" * 64,
+                    "disposition": "blocked",
+                    "prerequisites": [],
+                },
+            ],
+            "numeric_descriptors": [],
+        }
+        lock_bytes = ch.generate_cohort_lock(snapshot, {851: d1})
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        lock_path = root / "work-unit-cohort.toml"
+        lock_path.write_bytes(lock_bytes)
+        wu_dir = root / "work-units"
+        wu_dir.mkdir()
+
+        # A stale base is invalidation, never a valid self-consistent lock.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_cohort_lock(lock_path, wu_dir, {851: d1}, expected_base_commit="f" * 40)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.INVALID_AGGREGATE_LOCK)
+
+        # An assigned row with no admitted receipt is incomplete, not valid: the
+        # admitted receipt set covers only the blocked row.
+        d2 = make_desc(852, "D-WU-B", 3)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_assignment_binding(
+                ch.read_cohort_lock(lock_path), {851: d1}, {852: make_assignment(d2)}
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # A moved mirror: the receipt's body digest is well-formed but no longer
+        # the digest the locked row retained.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_assignment_binding(
+                ch.read_cohort_lock(lock_path),
+                {851: d1},
+                {851: make_assignment(d1, body_sha256="f" * 64)},
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # Control: at the lock's own base revision the same lock verifies, so the
+        # refusals above are currency- and admission-driven.
+        receipt = ch.verify_cohort_lock(
+            lock_path, wu_dir, {851: d1}, expected_base_commit="0" * 40
+        )
+        self.assertEqual(receipt.sha256, ch.read_cohort_lock(lock_path).aggregate.sha256)
 
     # WORK_UNIT_CASE: 852/30
     def test_normal_validator_has_no_network_subprocess_repository_mutation(self):
