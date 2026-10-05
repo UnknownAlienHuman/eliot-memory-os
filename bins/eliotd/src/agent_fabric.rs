@@ -5550,3 +5550,16 @@ pub fn consume_admitted_solo_coordinate(
     crate::solo_agent_driver::solo_enqueue(composition, intake, now_unix_ms)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod admitted_solo_binding_tests {
+    use super::*;
+    use crate::solo_agent_driver::solo_test_pair;
+
+    #[test]
+    fn admitted_solo_binding_accepts_valid_pair() {
+        let (request, intake, now) = solo_test_pair();
+        assert_eq!(request.deadline_unix_ms, intake.deadline_unix_ms);
+        assert!(validate_admitted_solo_binding(&request, &intake).is_ok());
+    }
+}
