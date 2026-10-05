@@ -327,17 +327,12 @@ def answer() -> bool:
 '''
 
 
-def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL'):
-    """Build a temp gate root proving selected success honestly end-to-end.
+def _write_offline_capture(tmp: Path, issue_num, unit_name):
+    """Controller-side offline assignment snapshot + admission sidecar.
 
-    The test acts as CONTROLLER admitting inputs: descriptor TOML (with
-    measured body/matrix shas from the frozen #849 parser), tiny suite
-    sources, offline snapshot, and the admission sidecar carrying expected
-    digests. The gate (worker) reads digests only from the sidecar, validates
-    the snapshot via #849, binds via #850, reconciles via #851, materializes
-    via #852, and executes the real tiny suite through the frozen #850 child
-    protocol. No network, no mocks of child logic. Returns the capture path
-    for --offline-capture (pass tmp as --root).
+    The assignment is mode-independent, so the python and rust selected
+    roots admit the same snapshot. Returns (capture_path, body_sha256,
+    matrix_sha256) measured from OFFLINE_BODY via the #849 parser.
     """
     import time as _time
 
@@ -372,6 +367,22 @@ def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINA
          'capture_receipt_sha256': 'e' * 64, 'freshness_policy_sha256': 'f' * 64,
          'max_age_seconds': max_age}, sort_keys=True, separators=(',', ':')),
         encoding='utf-8')
+    return capture, matrix.body_sha256, matrix.matrix_sha256
+
+
+def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL'):
+    """Build a temp gate root proving selected success honestly end-to-end.
+
+    The test acts as CONTROLLER admitting inputs: descriptor TOML (with
+    measured body/matrix shas from the frozen #849 parser), tiny suite
+    sources, offline snapshot, and the admission sidecar carrying expected
+    digests. The gate (worker) reads digests only from the sidecar, validates
+    the snapshot via #849, binds via #850, reconciles via #851, materializes
+    via #852, and executes the real tiny suite through the frozen #850 child
+    protocol. No network, no mocks of child logic. Returns the capture path
+    for --offline-capture (pass tmp as --root).
+    """
+    capture, body_sha, matrix_sha = _write_offline_capture(tmp, issue_num, unit_name)
     suite = tmp / 'suite'
     suite.mkdir(parents=True)
     (suite / 'src.py').write_text(MARKED_SOURCE, encoding='utf-8')
@@ -390,8 +401,8 @@ def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINA
         'matrix_cases = 2\n'
         'proof_ceiling = {value = "assignment-source-only"}\n'
         'revision = 1\n'
-        f'body_sha256 = "{matrix.body_sha256}"\n'
-        f'matrix_sha256 = "{matrix.matrix_sha256}"\n'
+        f'body_sha256 = "{body_sha}"\n'
+        f'matrix_sha256 = "{matrix_sha}"\n'
         'require_workspace_member = false\n'
         'module = {value = "suite.test_marked"}\n'
         'requirements = {source_floor = 1, public_floor = 1, test_floor = 2, '
@@ -400,6 +411,52 @@ def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINA
         'line_bytes = 65536, discovery_tests = 100, child_processes = 4}\n',
         encoding='utf-8')
     return capture
+
+def make_rust_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL',
+                            matrix_cases=2, broken_build=False):
+    """Build a temp gate root with a real zero-dep cargo crate at the root.
+
+    Mirrors make_offline_selected_root field-for-field, except the crate lives
+    at tmp/Cargo.toml + tmp/src/lib.rs: the gate builds manifest_rel="Cargo.toml"
+    with cwd=root, so the manifest must sit at the root, not in a subdir.
+    rust-tiny supplies the sources (two passing tests, one failure, one
+    ignore); broken_build appends a compile_error! canary so `cargo build`
+    exits nonzero. Returns the --offline-capture path.
+    """
+    capture, body_sha, matrix_sha = _write_offline_capture(tmp, issue_num, unit_name)
+    (tmp / 'src').mkdir(parents=True, exist_ok=True)
+    lib = (INTEGRATION / 'repos/rust-tiny/src/lib.rs').read_bytes()
+    if broken_build:
+        lib += b'\ncompile_error!("o2-canary-broken-build");\n'
+    (tmp / 'src' / 'lib.rs').write_bytes(lib)
+    (tmp / 'Cargo.toml').write_text(
+        '[package]\nname = "wu837_tiny"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n',
+        encoding='utf-8')
+    units = tmp / '.github' / 'work-units'
+    units.mkdir(parents=True, exist_ok=True)
+    (units / f'{issue_num}.toml').write_text(
+        'schema_version = "eliot-work-unit-descriptor-v2"\n'
+        f'identity = {{value = "work-unit-{issue_num}"}}\n'
+        'issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, '
+        f'number = {issue_num}}}\n'
+        f'unit = {{value = "{unit_name}"}}\n'
+        'mode = "rust-package"\n'
+        'source_roots = [{value = "src/lib.rs"}]\n'
+        'test_roots = [{value = "src/lib.rs"}]\n'
+        f'matrix_cases = {matrix_cases}\n'
+        'proof_ceiling = {value = "package-local"}\n'
+        'revision = 1\n'
+        f'body_sha256 = "{body_sha}"\n'
+        f'matrix_sha256 = "{matrix_sha}"\n'
+        'require_workspace_member = false\n'
+        'package = {name = "wu837_tiny"}\n'
+        'requirements = {source_floor = 1, public_floor = 0, test_floor = 1, '
+        'required_guards = [{value = "bounded"}]}\n'
+        'bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+        'line_bytes = 65536, discovery_tests = 100, child_processes = 4}\n',
+        encoding='utf-8')
+    return capture
+
 
 
 class WorkUnitGateMatrixTests(unittest.TestCase):
