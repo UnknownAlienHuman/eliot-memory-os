@@ -301,6 +301,10 @@ fn preconditions(
     evaluation: Option<NoMatchEvaluation>,
     frozen_scope_digest: &str,
 ) -> AbsencePreconditions {
+    // Bare-preconditions helper carries no issuer context, so the admitted side
+    // is `None`; the retained twin is the presented record itself, exactly what
+    // the arrive-together doctrine threads on the production route.
+    let retained_eval = evaluation.clone();
     AbsencePreconditions::derive(
         account,
         &BTreeMap::new(),
@@ -308,6 +312,8 @@ fn preconditions(
         1_700_000_300_000,
         frozen_scope_digest,
         evaluation,
+        None,
+        retained_eval.as_ref(),
     )
     .expect("preconditions")
 }
@@ -886,6 +892,8 @@ fn absence_requires_complete_authoritative_lookup() {
         ASSESSMENT_MS,
         &scope_digest,
         Some(evaluation.clone()),
+        Some(&admitted_query()),
+        Some(&evaluation),
     )
     .expect("preconditions over real evidence");
     assert_eq!(
@@ -944,6 +952,8 @@ fn absence_requires_complete_authoritative_lookup() {
         ASSESSMENT_MS,
         &scope_digest,
         Some(evaluation.clone()),
+        Some(&admitted_query()),
+        Some(&evaluation),
     )
     .expect("preconditions over a withheld record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &blocked) else {
@@ -1029,6 +1039,7 @@ fn absence_substituted_record_is_unproven() {
     let (account, mut records, manifest, evaluation) = proven_absence();
     let scope_digest = inquiry_denominator_digest();
     records.insert("src-primary#0".to_owned(), record("src-intruder"));
+    let retained_eval = evaluation.clone();
     let substituted = AbsencePreconditions::derive(
         &account,
         &records,
@@ -1036,6 +1047,8 @@ fn absence_substituted_record_is_unproven() {
         ASSESSMENT_MS,
         &scope_digest,
         Some(evaluation),
+        Some(&admitted_query()),
+        Some(&retained_eval),
     )
     .expect("preconditions over a substituted record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &substituted) else {
@@ -1070,9 +1083,17 @@ fn absence_stale_record_is_unproven() {
     // earlier result-record mismatch rather than staleness; the handle, record and
     // currentness joins are the ones that hold or fail without a bound
     // evaluation, and currentness is the claim under test here.
-    let stale_preconditions =
-        AbsencePreconditions::derive(&account, &records, None, ASSESSMENT_MS, &scope_digest, None)
-            .expect("preconditions over a stale record");
+    let stale_preconditions = AbsencePreconditions::derive(
+        &account,
+        &records,
+        None,
+        ASSESSMENT_MS,
+        &scope_digest,
+        None,
+        None,
+        None,
+    )
+    .expect("preconditions over a stale record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &stale_preconditions) else {
         panic!("a record past its frozen freshness boundary must not prove absence");
     };
@@ -1124,6 +1145,8 @@ fn absence_missing_handle_is_unproven() {
         ASSESSMENT_MS,
         &inquiry_denominator_digest(),
         None,
+        None,
+        None,
     )
     .expect("preconditions over a missing handle");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &handle_less) else {
@@ -1153,6 +1176,7 @@ fn absence_foreign_scope_is_unproven() {
     // claimed scope is `assess_absence`'s own work at `foreign_evaluation_scope`
     // (`src/evidence_portfolio.rs`).
     let (account, records, manifest, evaluation) = proven_absence();
+    let retained_eval = evaluation.clone();
     let foreign = AbsencePreconditions::derive(
         &account,
         &records,
@@ -1160,6 +1184,8 @@ fn absence_foreign_scope_is_unproven() {
         ASSESSMENT_MS,
         DIGEST_A,
         Some(evaluation),
+        Some(&admitted_query()),
+        Some(&retained_eval),
     )
     .expect("preconditions over a foreign scope");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &foreign) else {
@@ -1545,6 +1571,7 @@ fn absence_changed_record_breaks_result_binding() {
     params.title = "a changed title for src-primary#0".to_owned();
     let changed = SourceRecord::new(params).expect("changed record");
     records.insert("src-primary#0".to_owned(), changed);
+    let retained_eval = evaluation.clone();
     let changed_binding = AbsencePreconditions::derive(
         &account,
         &records,
@@ -1552,6 +1579,8 @@ fn absence_changed_record_breaks_result_binding() {
         ASSESSMENT_MS,
         &scope_digest,
         Some(evaluation),
+        Some(&admitted_query()),
+        Some(&retained_eval),
     )
     .expect("preconditions over a changed record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &changed_binding) else {
@@ -1838,6 +1867,7 @@ fn absence_closed_denominator_missing_result_is_unproven() {
     })
     .expect("authorized manifest");
     let scope_digest = inquiry_denominator_digest();
+    let retained_eval = evaluation.clone();
     let preconditions = AbsencePreconditions::derive(
         &account,
         &records,
@@ -1845,6 +1875,8 @@ fn absence_closed_denominator_missing_result_is_unproven() {
         ASSESSMENT_MS,
         &scope_digest,
         Some(evaluation),
+        Some(&admitted_query()),
+        Some(&retained_eval),
     )
     .expect("preconditions over a closed denominator with a missing result");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &preconditions) else {
@@ -2160,37 +2192,120 @@ fn absence_foreign_predicate_is_a_different_claim() {
 /// This test pins that behavior so the gap stays visible instead of being
 /// covered by a malformed-text shape check.
 #[test]
-fn absence_foreign_predicate_assessment_pins_retained_gap() {
+fn absence_presented_without_retained_refused_on_consuming_path() {
     let (account, records, manifest, _) = proven_absence();
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
-    let foreign_issuer = NoMatchEvaluationIssuer::new(
-        params,
-        &AdmittedQueryCommitments::new(
-            "unadmitted-arbitrary-predicate".to_owned(),
-            "index-700.1".to_owned(),
-        )
-        .expect("foreign admitted"),
+    let foreign_admitted = AdmittedQueryCommitments::new(
+        "unadmitted-arbitrary-predicate".to_owned(),
+        "index-700.1".to_owned(),
     )
-    .expect("foreign issuer");
+    .expect("foreign admitted");
+    let foreign_issuer =
+        NoMatchEvaluationIssuer::new(params, &foreign_admitted).expect("foreign issuer");
     let foreign = foreign_issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("well-formed foreign issuance still issues");
-    let preconditions = AbsencePreconditions::derive(
+    // The admitted join passes (foreign admitted matches the presented
+    // record), so the refusal below names the retained join alone.
+    let err = AbsencePreconditions::derive(
         &account,
         &records,
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
         Some(foreign),
+        Some(&foreign_admitted),
+        None,
     )
-    .expect("preconditions over self-consistent foreign evidence");
-    assert_eq!(
-        assess_absence(&account, &preconditions),
-        AbsenceVerdict::Proven,
-        "retained gap: no in-crate join binds the presented predicate to an \
-         admitted query, so a self-consistent foreign-predicate record \
-         assesses Proven; the admitted-query join belongs to #1762"
+    .expect_err("a presented record with no retained record must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a presented-but-unretained record must be refused as `Conflict`: {rendered}"
+    );
+    assert!(
+        rendered.contains("absence.presented_without_retained"),
+        "the refusal must name the retained join itself: {rendered}"
+    );
+}
+
+/// A presented record answering a query the admitted side does not carry
+/// refuses on the consuming path even when a retained twin exists (issue
+/// #2893 W10/A2-consume): the retained join passes (twin of the presented
+/// record), so the refusal below names the admitted join alone.
+#[test]
+fn absence_unadmitted_presented_refused_on_consuming_path() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let foreign_admitted = AdmittedQueryCommitments::new(
+        "unadmitted-arbitrary-predicate".to_owned(),
+        "index-700.1".to_owned(),
+    )
+    .expect("foreign admitted");
+    let foreign_issuer =
+        NoMatchEvaluationIssuer::new(params, &foreign_admitted).expect("foreign issuer");
+    let foreign = foreign_issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("well-formed foreign issuance still issues");
+    let retained_foreign = foreign.clone();
+    let err = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(foreign),
+        Some(&admitted_query()),
+        Some(&retained_foreign),
+    )
+    .expect_err("a presented record under an unadmitted query must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unadmitted presented record must be refused as `Conflict`: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_evaluation.predicate_id"),
+        "the refusal must name the predicate identity binding itself: {rendered}"
+    );
+}
+
+/// A presented record diverging from the retained record under one admitted
+/// identity refuses on the consuming path (issue #2893 A5/W8-consume): the
+/// admitted join passes (predicate and index unchanged), so the refusal below
+/// names the replay join alone.
+#[test]
+fn absence_replay_conflict_refused_on_consuming_path() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.work_scope = "propulsion acoustic envelope".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    let err = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(changed),
+        Some(&admitted_query()),
+        Some(&evaluation),
+    )
+    .expect_err("a presented record diverging from the retained record must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a same-identity divergence must be refused as `Conflict`: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_evaluation.canonical_body"),
+        "the conflict must name the canonical body: {rendered}"
     );
 }

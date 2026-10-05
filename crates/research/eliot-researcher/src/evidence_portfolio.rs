@@ -3750,7 +3750,14 @@ impl AbsencePreconditions {
     /// manifest or evaluation no longer re-proves its own identity,
     /// [`PortfolioError::Conflict`] when a result identity is not the identity its
     /// own commitments imply or when a result names a member the accounting never
-    /// closed, and [`PortfolioError::IncompleteDenominator`] for an evaluation
+    /// closed, when a presented evaluation answers a query the admitted side did
+    /// not carry (`no_match_evaluation.predicate_id` / `no_match_evaluation.index_revision`
+    /// via [`NoMatchEvaluation::check_admitted_binding`]),
+    /// when a presented evaluation arrives with no composition-retained record
+    /// (`absence.presented_without_retained`), or when the presented record
+    /// diverges from the retained record under one identity
+    /// ([`NoMatchEvaluation::check_replay_consistency`]), and
+    /// [`PortfolioError::IncompleteDenominator`] for an evaluation
     /// that names no member, which no closed population produces.
     pub fn derive(
         account: &CoverageAccount,
@@ -3759,6 +3766,8 @@ impl AbsencePreconditions {
         now_ms: i64,
         frozen_scope_digest: &str,
         evaluation: Option<NoMatchEvaluation>,
+        admitted_query: Option<&AdmittedQueryCommitments>,
+        retained_evaluation: Option<&NoMatchEvaluation>,
     ) -> Result<Self, PortfolioError> {
         digest(frozen_scope_digest, "absence.frozen_scope_digest")?;
         // The manifest is read back on the same footing as the evaluation. Without
@@ -3775,6 +3784,27 @@ impl AbsencePreconditions {
             // before any of its content is believed, let alone joined.
             evaluation.verify_integrity()?;
             evaluation.validate_shape()?;
+            // Presented-vs-admitted (W10/A2 consume): a presented record answering
+            // a query the admitted side did not carry refuses here, never joins.
+            // `admitted_query` is `None` exactly when no admitted-query producer
+            // exists on the route (the retaining composition owns it); `None`
+            // skips only this join, never the retained join below.
+            if let Some(admitted) = admitted_query {
+                evaluation.check_admitted_binding(admitted)?;
+            }
+            // Presented-vs-retained (A5/W8 consume): a presented record with no
+            // composition-retained record refuses here; a retained record under
+            // the same identity with different content conflicts, no transition.
+            match retained_evaluation {
+                None => {
+                    return Err(PortfolioError::Conflict {
+                        field: "absence.presented_without_retained",
+                    });
+                }
+                Some(retained) => {
+                    retained.check_replay_consistency(evaluation)?;
+                }
+            }
             // A no-match verdict over a member the accounting never closed is the
             // evaluator contradicting the run's own accounting, not a gap to
             // retain, so it is refused here rather than becoming a partition entry.
