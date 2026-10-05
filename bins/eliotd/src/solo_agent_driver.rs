@@ -2956,3 +2956,280 @@ pub fn solo_poll_queue(
             .to_owned(),
     ))
 }
+
+/// Test-only valid admitted-solo pair (issue #2567 W2/A3).
+///
+/// Builds one fully valid [`SoloDelegateIntake`] plus its matching admitted
+/// envelope and the `now` the pair is valid under. The plan mirrors the
+/// proven `agent_fabric_wiring::test_request` fixture: [`guard_solo_plan`]
+/// checks only launch validity, the solo recipe id, one lane, and fanout
+/// one — never lane content — so lane and route-candidate content is echoed
+/// verbatim instead of reinvented. `observed_scope` stays default because
+/// [`SoloDelegateIntake::validate`] never reads it. Every load-bearing
+/// binding (digest, task, fence, deadline, principal, operation) is exact,
+/// so the pair is the positive control for both the binding check and the
+/// queue push; tests mutate one field at a time for refusals.
+#[cfg(test)]
+pub(crate) fn solo_test_pair() -> (
+    crate::agent_fabric::AdmittedSoloCoordinateRequest,
+    SoloDelegateIntake,
+    u64,
+) {
+    use eliot_agent_api::{
+        AgentWorkUnitBrief, BudgetEnvelope, EffectCeiling, EffectKind, LaunchRequestId,
+        LowercaseSha256, TaskId, WorkUnitId,
+    };
+    use eliot_agent_contracts::{PublicReference, RevisionId, TargetId};
+    use eliot_agent_coordinator::{
+        CandidateId, HumanStaffingIntent, LearningRole, ProviderIdentity, RecipeId, RecipeManifest,
+        RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
+        StaffingPlanRequest, StaffingPreset, WorkClass,
+    };
+    use eliot_contracts::{
+        ContractVersion, EpochId, EpochLineageId, ResourceGeneration, StateFence, contract_identity,
+    };
+    use eliot_evaluation_contracts::BudgetEvidence;
+    use eliot_kernel_service::ProviderCapabilityExpectation;
+    use eliot_security_contracts::PrivacyClass;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
+
+    use crate::agent_fabric::SOLO_ROUTE_OPERATION;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const NOW: u64 = 1_800_000_000_000;
+
+    fn test_epoch() -> EpochId {
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test lineage parses");
+        let sequence = NonZeroU64::new(1).expect("non-zero test sequence");
+        EpochId::new(lineage, sequence).expect("test epoch builds")
+    }
+
+    fn test_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(serde_json::json!(sha256_hex(seed.as_bytes())))
+            .expect("test digest decodes")
+    }
+
+    fn fixture_reference(label: &str) -> PublicReference {
+        PublicReference {
+            kind: "fixture".to_owned(),
+            id: TargetId::new(format!("fixture-{label}")).expect("fixture target builds"),
+            revision: RevisionId::new("fixture-v1").expect("fixture revision builds"),
+            digest: None,
+        }
+    }
+
+    fn fixture_schema_identity(
+        label: &str,
+    ) -> Result<eliot_contracts::ContractIdentity, eliot_contracts::ContractError> {
+        contract_identity(
+            format!("fixture-{label}"),
+            ContractVersion::new(1, 0, 0),
+            &serde_json::json!({ "fixture_schema": label }),
+        )
+    }
+
+    fn test_budget() -> BudgetEnvelope {
+        BudgetEnvelope {
+            context_tokens: 8_000,
+            wall_time_ms: 60_000,
+            output_bytes: 256_000,
+            cost_microunits: 1_000_000,
+            max_depth: 3,
+            max_descendants: 8,
+        }
+    }
+
+    let fence = StateFence::new(test_epoch(), ResourceGeneration::genesis());
+    let route = RouteFingerprint {
+        host_family: "test-host".to_owned(),
+        adapter: "adapter-fabric-a".to_owned(),
+        protocol_transport: "fabric-fixture".to_owned(),
+        runtime_hash: test_digest("fabric-runtime"),
+        adapter_hash: test_digest("fabric-adapter"),
+        provider: "provider-fabric-a".to_owned(),
+        model: "model-fabric-a".to_owned(),
+        auth_billing: "fixture-account".to_owned(),
+        serializer_hash: test_digest("fabric-serializer"),
+        tool_semantics_hash: test_digest("fabric-tools"),
+        reasoning_mode: "bounded".to_owned(),
+        continuation_behavior: "fresh".to_owned(),
+        feature_flags_hash: test_digest("fabric-features"),
+    };
+    let work = AgentWorkUnitBrief {
+        id: WorkUnitId::new("work-1").expect("work id builds"),
+        objective: "bounded responsibility work-1".to_owned(),
+        causal_property: "causal property work-1".to_owned(),
+        scope_ref: "scope-work-1".to_owned(),
+        expected_outputs: vec!["candidate artifact".to_owned()],
+        source_refs: vec!["architecture:10635".to_owned()],
+        verifier_ref: "cargo-test".to_owned(),
+        integration_owner: "independent-integrator".to_owned(),
+        contract_revision: "work-v1".to_owned(),
+        budget: test_budget(),
+        effect_ceiling: EffectCeiling {
+            scope_ref: "scope-work-1".to_owned(),
+            allowed: BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace]),
+            max_external_effects: 0,
+        },
+        stop_condition: "candidate submitted".to_owned(),
+    };
+    let role_effects = work.effect_ceiling.clone();
+    let plan = StaffingPlanRequest {
+        candidate_id: CandidateId::new("solo-2567").expect("candidate id builds"),
+        launch: eliot_agent_api::AgentLaunchRequest {
+            id: LaunchRequestId::new("launch-2567").expect("launch id builds"),
+            task_id: TaskId::new("task-2567").expect("task id builds"),
+            parent_attempt: None,
+            work_units: vec![work],
+            required_competence: vec!["rust".to_owned()],
+            allowed_route_classes: vec!["provider-fabric-a".to_owned()],
+            native_child_policy: "bounded".to_owned(),
+            root_context_revision: "root-v1".to_owned(),
+            context_budget: test_budget(),
+            evidence_capability_refs: vec!["capability-fixture".to_owned()],
+            privacy_profile: "PRIVATE".to_owned(),
+            effect_ceiling: EffectCeiling {
+                scope_ref: "task-scope".to_owned(),
+                allowed: BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace]),
+                max_external_effects: 0,
+            },
+            max_depth: 3,
+            max_fanout: 1,
+            cumulative_descendant_budget: test_budget(),
+            verifier_ref: "cargo-test".to_owned(),
+            synthesis_owner: "synthesis-owner".to_owned(),
+            integration_owner: "integration-owner".to_owned(),
+            cancellation_policy: "cascade".to_owned(),
+        },
+        recipe: RecipeManifest {
+            recipe_id: RecipeId::new(SOLO_RECIPE_ID).expect("solo recipe id builds"),
+            manifest_revision: RevisionId::new("recipe-rev-2567").expect("recipe rev builds"),
+            schema_identity: fixture_schema_identity("recipe-2567").expect("schema builds"),
+            content_digest: test_digest("recipe-manifest-2567"),
+            route_policy_revision: RevisionId::new("route-policy-1").expect("policy rev builds"),
+            max_lanes: 1,
+            max_descendants: 8,
+            stage_templates: vec![fixture_reference("stage-template")],
+            work_item_templates: vec![fixture_reference("work-item-template")],
+            dependency_templates: vec![fixture_reference("dependency-template")],
+            merge_templates: vec![fixture_reference("merge-template")],
+            eligible_route_classes: vec!["provider-fabric-a".to_owned()],
+            expansion_conditions: vec![fixture_reference("expansion-condition")],
+            contraction_conditions: vec![fixture_reference("contraction-condition")],
+            verifier_requirements: vec![fixture_reference("verifier-requirement")],
+            audit_requirements: vec![fixture_reference("audit-requirement")],
+            budget: test_budget(),
+            partial_result_behavior: fixture_reference("partial-result-behavior"),
+            failure_behavior: fixture_reference("failure-behavior"),
+            role_profiles: vec![RoleProfileManifest {
+                role_id: RoleProfileId::new("role-1").expect("role id builds"),
+                manifest_revision: RevisionId::new("role-rev-role-1").expect("role rev builds"),
+                schema_identity: fixture_schema_identity("role-1").expect("role schema builds"),
+                content_digest: test_digest("role-manifest-1"),
+                required_competence: vec!["rust".to_owned()],
+                allowed_operations: vec![fixture_reference("role-operation")],
+                allowed_effects: role_effects,
+                independence_requirement: fixture_reference("independence-requirement"),
+                input_schemas: vec![fixture_reference("role-input-schema")],
+                output_schemas: vec![fixture_reference("role-output-schema")],
+                visibility_policy: fixture_reference("visibility-policy"),
+                learning_role: LearningRole::NotApplicable,
+                stop_condition: fixture_reference("candidate-submitted"),
+                escalation_policy: fixture_reference("integration-owner"),
+                allowed_route_classes: vec!["provider-fabric-a".to_owned()],
+                mutation_capable: false,
+            }],
+        },
+        task_revision: "task-rev-1".to_owned(),
+        plan_revision: RevisionId::new("plan-rev-2567").expect("plan rev builds"),
+        state_fence: fence.clone(),
+        human_staffing_intent: HumanStaffingIntent {
+            preset: StaffingPreset::Balanced,
+            per_job_budget: test_budget(),
+        },
+        privacy_class: PrivacyClass::Private,
+        work_class: "swarm".parse::<WorkClass>().expect("swarm class parses"),
+        lanes: vec![StaffingLaneRequest {
+            work_unit_id: WorkUnitId::new("work-1").expect("lane work builds"),
+            role_id: RoleProfileId::new("role-1").expect("lane role builds"),
+            work_class: "swarm".parse::<WorkClass>().expect("lane class parses"),
+            route_candidates: vec![RouteCandidateEvidence {
+                route: route.clone(),
+                preference_rank: 0,
+                capacity_identity: crate::agent_fabric::FABRIC_CAPACITY_IDENTITY.to_owned(),
+                capacity_revision: RevisionId::new(crate::agent_fabric::FABRIC_CAPACITY_REVISION)
+                    .expect("capacity rev builds"),
+                capacity_limit: 4,
+                budget_evidence: BudgetEvidence {
+                    arm_id: "route-arm-0".to_owned(),
+                    model_calls: 1,
+                    wall_time_ms: 100,
+                    ..BudgetEvidence::default()
+                },
+                route_classes: vec!["provider-fabric-a".to_owned()],
+                route_class_evidence_refs: vec!["route-class-evidence-0".to_owned()],
+                privacy_classes: vec![PrivacyClass::Private],
+                privacy_evidence_refs: vec!["privacy-evidence-0".to_owned()],
+                evidence_refs: vec!["route-evidence-0".to_owned()],
+            }],
+            budget: test_budget(),
+            priority: 0,
+            mutation_scope: None,
+        }],
+    };
+    let source_bytes = b"solo-2567-delegate".to_vec();
+    let intake = SoloDelegateIntake {
+        delegate: SoloDelegateBody {
+            goal: "solo delegate goal".to_owned(),
+            owned_resources: vec!["scope-work-2567".to_owned()],
+            expected_result: "candidate artifact".to_owned(),
+            source_digest: sha256_hex(&source_bytes),
+            source_bytes: source_bytes.clone(),
+        },
+        plan,
+        claimed: SoloClaimedHalves {
+            identity: ProviderIdentity {
+                verifier_identity: "verifier-2567".to_owned(),
+                a01_acceptance_receipt_ref: "receipt-2567".to_owned(),
+                a01_contract_revision: "a01-rev-1".to_owned(),
+                g11_provider_revision: "g11-rev-1".to_owned(),
+                capacity_identity: crate::agent_fabric::FABRIC_CAPACITY_IDENTITY.to_owned(),
+                capacity_revision: RevisionId::new(crate::agent_fabric::FABRIC_CAPACITY_REVISION)
+                    .expect("identity capacity rev builds"),
+            },
+            claim_id: "claim-2567-1".to_owned(),
+            attempt_id: "attempt-2567-1".to_owned(),
+            operation_id: "op-2567-1".to_owned(),
+            binding_digest: "b".repeat(64),
+            executable_digest: "c".repeat(64),
+            route_revision: "route-rev-1".to_owned(),
+            capacity_revision: "capacity-rev-1".to_owned(),
+            worker_generation: 1,
+            presented_fence: fence.clone(),
+            expectation: ProviderCapabilityExpectation {
+                current_route_revision: "route-rev-1".to_owned(),
+                current_capacity_revision: "capacity-rev-1".to_owned(),
+                live_authority_epoch: test_epoch(),
+                revoked: false,
+            },
+            minimum_event_sequence: 0,
+        },
+        requirements: crate::agent_fabric::RouteRequirements {
+            role: "solo-delegate".to_owned(),
+            competence: vec!["rust".to_owned()],
+        },
+        observed_scope: eliot_governor::RouteScopeFingerprint::default(),
+        deadline_unix_ms: NOW + 60_000,
+    };
+    let request = crate::agent_fabric::AdmittedSoloCoordinateRequest {
+        operation: SOLO_ROUTE_OPERATION.to_owned(),
+        delegate_bytes: source_bytes,
+        task_id: "task-2567".to_owned(),
+        fence,
+        deadline_unix_ms: NOW + 60_000,
+        cancelled: false,
+        principal: "solo-test-principal".to_owned(),
+    };
+    (request, intake, NOW)
+}
