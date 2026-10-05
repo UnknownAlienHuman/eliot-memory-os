@@ -2737,15 +2737,29 @@ pub fn solo_enqueue(
     if composition.readiness() != CompositionReadiness::Ready {
         return Err(DaemonError::Composition(CompositionError::NotReady));
     }
-    intake
-        .validate(now_unix_ms)
-        .map_err(DaemonError::ProviderAdmission)?;
-    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
     let mut state = composition.solo_state.lock().map_err(|_| {
         DaemonError::Composition(CompositionError::Recovery(
             "solo driver state lock poisoned".to_owned(),
         ))
     })?;
+    push_validated_intake(&mut state, intake, now_unix_ms)
+}
+
+/// Validates one intake and pushes it onto the driver queue (issue #2567 W2).
+///
+/// Pure queue half of [`solo_enqueue`]: intake shape, solo plan guard, and the
+/// `SOLO_QUEUE_MAX_LEN` bound, with no readiness or composition touch, so the
+/// queue-fill proof runs without a daemon composition. The readiness gate
+/// stays in `solo_enqueue`.
+pub(crate) fn push_validated_intake(
+    state: &mut SoloDriverState,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<(), DaemonError> {
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
     if state.queue.len() >= SOLO_QUEUE_MAX_LEN {
         return Err(DaemonError::ProviderAdmission(FabricError::Contract(
             "solo intake queue is full; backpressure instead of unbounded growth".to_owned(),

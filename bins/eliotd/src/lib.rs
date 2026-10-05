@@ -169,16 +169,17 @@ pub use activation_projection::{
 #[cfg(test)]
 use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
-    ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
-    AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
-    CancellationLifecycle, DAEMON_CRATE, DispatchAck, DispatchEgressPort, DispatchIntent,
-    FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION, FABRIC_PLAN_GAP_REASON, FabricAdmission,
-    FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
-    PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
-    SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    admit_swarm_definition_candidate, begin_swarm_execution_candidate, daemon_coordinator_config,
+    ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort,
+    AdmittedSoloCoordinateRequest, AgentFabric, AgentFabricDescriptor, AttemptLifecycle,
+    AttemptResultRecord, COORDINATOR_CRATE, CancellationLifecycle, DAEMON_CRATE, DispatchAck,
+    DispatchEgressPort, DispatchIntent, FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION,
+    FABRIC_PLAN_GAP_REASON, FabricAdmission, FabricError, FabricPorts, FabricSnapshot, LedgerEntry,
+    ModelRegistryPort, PREREQ_PORTS, PeerChannelPort, PeerMessage, PeerReceipt, Reservation,
+    RouteRequirements, SOLO_ROUTE_OPERATION, SwarmControlPort, SwarmDefinition, SwarmEntryReceipt,
+    VerifiedProviderMaterial, WorkerAck, admit_swarm_definition_candidate,
+    begin_swarm_execution_candidate, consume_admitted_solo_coordinate, daemon_coordinator_config,
     launch_swarm_child_candidate, plan_candidate, prepare_swarm_definition_admission_candidate,
-    prereq_ports,
+    prereq_ports, validate_admitted_solo_binding,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 

@@ -5458,20 +5458,18 @@ pub struct AdmittedSoloCoordinateRequest {
     pub principal: String,
 }
 
-/// Consumes one admitted `eliot.coordinate { operation: delegate }` request
-/// into the runtime solo queue (issue #2567 I2 consumer).
+/// Checks one admitted `eliot.coordinate { operation: delegate }` envelope
+/// against its intake without touching the queue (issue #2567 I2).
 ///
 /// The envelope-to-intake binding is checked field for field — operation
 /// discriminator, cancellation, principal presence, ORIGINAL delegate bytes
-/// against the intake body digest, task identity, fence, and deadline — then
-/// the intake is handed to
-/// [`solo_enqueue`](crate::solo_agent_driver::solo_enqueue),
-/// which re-validates the intake shape, the solo plan guard, readiness, and
-/// the queue bound. Non-delegate coordinate operations (`audit`, `compare`,
-/// `wait`, `inspect`, `cancel`, `send`) refuse here with a typed contract
-/// rejection: they need their own owner paths and are never reinterpreted
-/// as solo delegate work. No coordinator is constructed, no port is
-/// touched, and no peer/swarm behavior is consulted on this path.
+/// against the intake body digest, task identity, fence, and deadline.
+/// Non-delegate coordinate operations (`audit`, `compare`, `wait`, `inspect`,
+/// `cancel`, `send`) refuse here with a typed contract rejection: they need
+/// their own owner paths and are never reinterpreted as solo delegate work.
+/// Pure: no coordinator is constructed, no port is touched, and no
+/// peer/swarm behavior is consulted on this path. The queue hand-off lives in
+/// [`consume_admitted_solo_coordinate`].
 ///
 /// # Errors
 ///
@@ -5480,13 +5478,10 @@ pub struct AdmittedSoloCoordinateRequest {
 /// operation, carries a blank principal, or disagrees with the intake on
 /// task or deadline; [`FabricError::IdentityConflict`] when the delegate
 /// bytes do not digest to the intake body; [`FabricError::StaleFence`]
-/// when the envelope fence moved under the intake plan; or the
-/// `solo_enqueue` readiness/validation/queue-bound rejection unchanged.
-pub fn consume_admitted_solo_coordinate(
-    composition: &crate::DaemonComposition,
+/// when the envelope fence moved under the intake plan.
+pub fn validate_admitted_solo_binding(
     request: &AdmittedSoloCoordinateRequest,
-    intake: crate::solo_agent_driver::SoloDelegateIntake,
-    now_unix_ms: u64,
+    intake: &crate::solo_agent_driver::SoloDelegateIntake,
 ) -> Result<(), crate::DaemonError> {
     if request.cancelled {
         return Err(FabricError::Contract(
@@ -5527,6 +5522,31 @@ pub fn consume_admitted_solo_coordinate(
         )
         .into());
     }
+    Ok(())
+}
+
+/// Consumes one admitted `eliot.coordinate { operation: delegate }` request
+/// into the runtime solo queue (issue #2567 I2 consumer).
+///
+/// Thin over [`validate_admitted_solo_binding`] plus
+/// [`solo_enqueue`](crate::solo_agent_driver::solo_enqueue): the binding is
+/// checked field for field, then the intake is handed to the queue, which
+/// re-validates the intake shape, the solo plan guard, readiness, and the
+/// queue bound. The production producer that presents the envelope alongside
+/// the full drive intake is the #2565 durable semantic-request carrier (still
+/// OPEN); this consumer constructs no coordinator and touches no port.
+///
+/// # Errors
+///
+/// Returns the [`validate_admitted_solo_binding`] rejection, or the
+/// `solo_enqueue` readiness/validation/queue-bound rejection, each unchanged.
+pub fn consume_admitted_solo_coordinate(
+    composition: &crate::DaemonComposition,
+    request: &AdmittedSoloCoordinateRequest,
+    intake: crate::solo_agent_driver::SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<(), crate::DaemonError> {
+    validate_admitted_solo_binding(request, &intake)?;
     crate::solo_agent_driver::solo_enqueue(composition, intake, now_unix_ms)?;
     Ok(())
 }
