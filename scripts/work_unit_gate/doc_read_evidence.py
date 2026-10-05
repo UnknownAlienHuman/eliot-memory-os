@@ -1150,6 +1150,8 @@ ORACLE_REVIEW_FIELDS = (
 ORACLE_PATH_PREFIXES = (".github/workflows/",)
 ORACLE_PATH_FILES = (
     "scripts/verify-github-workflows.py",
+    "scripts/work_unit_gate/__main__.py",
+    "scripts/work_unit_gate/doc_read_evidence.py",
     "scripts/verify.ps1",
     "scripts/verify-dependency-policy.py",
     "scripts/requirements-verification.txt",
