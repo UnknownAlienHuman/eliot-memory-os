@@ -67,15 +67,11 @@
 //!
 //! The runtime queue poll snapshots its head plus the expected
 //! task/route/admission/fence revisions under a short composition lock and
-//! releases that guard before any await. The verified drive then borrows the
-//! composition across the seam await: `agent_fabric_new_verified_async`
-//! resolves the session halves and verifies through the Kernel
-//! provider-admission verifier on `&DaemonComposition`, so the borrow cannot
-//! drop before the fabric exists without forking the closed admission path
-//! (a prepare/adopt split of the seam itself is a lib.rs residual). The
-//! poll flight stays single-flighted, so ticks never overlap a drive and
-//! other composition users queue on the mutex only for the bounded seam
-//! await. Both the drive adopt and the queue adopt revalidate the consumed
+//! releases that guard before any await. The verified drive prepares an
+//! owned snapshot under a short lock, runs the seam with no composition
+//! borrow held, and re-locks briefly to adopt and revalidate; the runtime
+//! admits one poll flight, so ticks never overlap a drive. Both the drive
+//! adopt and the queue adopt revalidate the consumed
 //! revisions before adopting; a stale or moved revision refuses typed with
 //! the head left queued. Until the owner ports bind (B-MOD #694 for the
 //! route, the native-worker executable-binding digest for execution), the
@@ -1788,27 +1784,25 @@ pub(crate) fn prepare_solo_drive(
 /// before `emit` exactly as in the sync drive, so a restart reads back the
 /// same digest-bound attempt.
 ///
-/// The caller holds the composition guard across the seam await (see
-/// [`solo_poll_queue_async`]); this function takes `&DaemonComposition`
-/// like the sync drive and performs no locking of its own.
+/// The caller holds no composition guard: prepare runs under one short
+/// lock, the seam IO runs on owned inputs, and adopt re-locks briefly
+/// (see [`solo_poll_queue_async`]).
 async fn drive_solo_delegate_verified_async(
-    composition: &DaemonComposition,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
     now_unix_ms: u64,
 ) -> Result<SoloDriveOutcome, DaemonError> {
-    let material = intake.claimed.material();
-    // The admitted-material future below is heap-pinned so the queue-poll
-    // future that awaits this wrapper stays small: the intake would
-    // otherwise be counted in both frames across the seam await.
-    Box::pin(drive_admitted_material_async(
-        composition,
-        kernel,
-        intake,
-        material,
-        now_unix_ms,
-    ))
-    .await
+    // Prepare under one short lock, then release before any await (issue
+    // #2567 W3): the snapshot below owns everything past this point.
+    let prepared = {
+        let composition = composition.lock().await;
+        prepare_solo_drive(&composition, kernel, intake, now_unix_ms)?
+    };
+    // The admitted-material future stays heap-pinned so the queue-poll
+    // future that awaits this wrapper stays small: the prepared snapshot
+    // would otherwise be counted in both frames across the seam await.
+    Box::pin(drive_admitted_material_async(composition, kernel, prepared)).await
 }
 
 /// Drives one intake on its consumed binding through the verified async seam
@@ -1827,46 +1821,21 @@ async fn drive_solo_delegate_verified_async(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
 async fn drive_admitted_material_async(
-    composition: &DaemonComposition,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
-    intake: SoloDelegateIntake,
-    material: VerifiedProviderMaterial,
-    now_unix_ms: u64,
+    prepared: SoloDrivePrepared,
 ) -> Result<SoloDriveOutcome, DaemonError> {
-    if composition.readiness() != CompositionReadiness::Ready {
-        return Err(DaemonError::Composition(CompositionError::NotReady));
-    }
-    intake
-        .validate(now_unix_ms)
-        .map_err(DaemonError::ProviderAdmission)?;
-    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
-    check_verified_binds_intake(&intake, &material)?;
+    let SoloDrivePrepared {
+        ports,
+        state_root,
+        intake,
+        material,
+        now_unix_ms,
+    } = prepared;
     let prepared = Box::new(material.clone());
     let operation_id = material.operation_id.clone();
     let attempt_id = AttemptId::new(material.attempt_id.clone())
         .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
-    // Single live slot: a second drive while the slot holds an unsettled
-    // attempt refuses instead of overlapping ownership. A settled slot
-    // clears so the next admitted operation may proceed.
-    {
-        let mut state = composition.solo_state.lock().map_err(|_| {
-            DaemonError::Composition(CompositionError::Recovery(
-                "solo driver state lock poisoned".to_owned(),
-            ))
-        })?;
-        if let Some(live) = state.live_operation.clone()
-            && live != operation_id
-        {
-            let settled = load_projection(composition.state_root(), &live)
-                .is_ok_and(|projection| projection_settled(&projection));
-            if !settled {
-                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
-                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
-                )));
-            }
-            state.live_operation = None;
-        }
-    }
     let config = daemon_coordinator_config()?;
     let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
         DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
@@ -1885,29 +1854,41 @@ async fn drive_admitted_material_async(
     // binding through the Kernel provider-admission verifier, and builds
     // the sealed capability through the closed admission port before the
     // coordinator is constructed.
-    let ports = composition.production_fabric_ports()?;
-    let mut fabric = composition
-        .agent_fabric_new_verified_async(kernel, ports, material, &intake.claimed)
-        .await?;
+    // Owner IO with no composition borrow held (issue #2567 W3): the seam
+    // takes owned inputs only (see
+    // `DaemonComposition::agent_fabric_new_verified_from_resolved_async`).
+    let mut fabric = DaemonComposition::agent_fabric_new_verified_from_resolved_async(
+        kernel,
+        ports,
+        material,
+        &intake.claimed,
+    )
+    .await?;
     // AUD9: adopt revalidates the consumed revisions after owner IO, before
     // touching the fabric (see `adopt_solo_drive`): fence, epoch,
     // task/route, and live-slot admission. Any move refuses with a typed
     // stale/conflict instead of adopting verified material under another
     // generation; the queue head stays queued for a fresh evaluation.
-    adopt_solo_drive(composition, kernel, &intake, &prepared)?;
+    {
+        let composition = composition.lock().await;
+        adopt_solo_drive(&composition, kernel, &intake, &prepared)?;
+    }
     // Issue #1702 W2: the drive runs against the daemon state root, so every
     // owner-separated revision published on this fabric is committed and
     // verified durably before anything reports it current. Attaching the store
     // before the first semantic write is what makes the ordering property
     // reachable from the production path instead of a separate test seam.
-    fabric.attach_semantic_revision_store(composition.state_root());
-    let evidence = composition.capability_admission()?;
-    let route = fabric.require_model_route(
-        &intake.requirements,
-        evidence,
-        &intake.observed_scope,
-        now_unix_ms,
-    )?;
+    fabric.attach_semantic_revision_store(&state_root);
+    let route = {
+        let composition = composition.lock().await;
+        let evidence = composition.capability_admission()?;
+        fabric.require_model_route(
+            &intake.requirements,
+            evidence,
+            &intake.observed_scope,
+            now_unix_ms,
+        )?
+    };
     let (definition, _) = fabric.define_and_plan(intake.plan.clone())?;
     let reservation = fabric.stage_reservation(&definition.definition_id)?;
     let admission = fabric.commit_admission(&reservation.reservation_id)?;
@@ -1916,14 +1897,17 @@ async fn drive_admitted_material_async(
     // after the last owner write and before the first possible external
     // effect. Missing, substituted, moved-route, or stale-activation
     // material refuses here instead of launching.
-    revalidate_launch_gate(
-        composition,
-        kernel,
-        &admission,
-        &attempt_id,
-        &activation,
-        &prepared,
-    )?;
+    {
+        let composition = composition.lock().await;
+        revalidate_launch_gate(
+            &composition,
+            kernel,
+            &admission,
+            &attempt_id,
+            &activation,
+            &prepared,
+        )?;
+    }
     // AUD12/I4: the resolved material is re-resolved immediately before
     // dispatch: frozen definition, staged reservation, committed admission,
     // frozen packet bytes, staffed route, digest-bound receipt (budget,
@@ -1993,7 +1977,7 @@ async fn drive_admitted_material_async(
         result_digest: None,
         cancellation_evidence: None,
     };
-    persist_projection(composition.state_root(), &projection)?;
+    persist_projection(&state_root, &projection)?;
     // Issue #1108 W3 (acceptance A3/A7/A10/A11): the verified-path
     // production caller of the provider-capability frame. The frame binds
     // the recorded intent's operation/attempt identity, the admitted
@@ -2017,8 +2001,9 @@ async fn drive_admitted_material_async(
             "solo provider capability frame was not recorded for the dispatched intent".to_owned(),
         )));
     }
-    persist_projection(composition.state_root(), &projection)?;
+    persist_projection(&state_root, &projection)?;
     {
+        let composition = composition.lock().await;
         let mut state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
@@ -2940,19 +2925,12 @@ pub async fn solo_poll_queue_async(
     let expected = intake.clone();
     // Issue #1108 W4/A2: the runtime drive chain
     // (`run_loop` -> `solo_poll_queue_async` -> verified drive) enters the
-    // async seam here with the driver's claimed halves. The composition
-    // guard is held across this await: the seam needs `&DaemonComposition`
-    // for the production ports, the session-half resolution, and the closed
-    // capability construction, and the single live slot the drive adopts
-    // must not move underneath it. Releasing this borrow across the owner
-    // IO needs a prepare/adopt split of the seam itself
-    // (`agent_fabric_new_verified_async` takes `&self` across its internal
-    // verifier awaits), which lives in `lib.rs` and is out of this slice's
-    // scope; the single-flighted poll flight bounds the hold to one drive.
-    let outcome = {
-        let composition = composition.lock().await;
-        drive_solo_delegate_verified_async(&composition, kernel, intake, crate::unix_ms()).await?
-    };
+    // async seam here with the driver's claimed halves.
+    // No composition guard is held across the drive await: the drive
+    // prepares, awaits owner IO on owned inputs, and re-locks briefly to
+    // revalidate and adopt (see `drive_solo_delegate_verified_async`).
+    let outcome =
+        drive_solo_delegate_verified_async(composition, kernel, intake, crate::unix_ms()).await?;
     // Queue adopt (issue #2567 AUD9): recheck the consumed revisions under a
     // short lock before dequeuing. The drive adopt already revalidated
     // post-seam; this closes the remaining window over the sync fabric
