@@ -833,6 +833,26 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
                 prerequisites=(),
             )
 
+        # Promotion of a subset is not a way to drop a row from the denominator:
+        # with a router-rooted descriptor in the catalogue, a full-project
+        # selection over the two promoted leaves is refused precisely because
+        # the third row is still counted. A router cannot lower the descriptor
+        # denominator by being routed around.
+        d3 = make_desc(853, "D-WU-ROUTER", 10, source_roots=("scripts/docs_router.py",))
+        cat3 = ch.materialize_catalogue(
+            [make_row(d1), make_row(d2), make_row(d3)], (d1.issue, d2.issue, d3.issue)
+        )
+        self.assertEqual(len(cat3.rows), 3)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(
+                cat3,
+                c.VerificationSelection(
+                    cat3.sha256, "e" * 64, c.SelectionScope.FULL_PROJECT, (d1.issue, d2.issue)
+                ),
+                [d1, d2],
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.DENOMINATOR_REDUCTION_REJECTED)
+
     # WORK_UNIT_CASE: 852/26
     def test_leaf_source_edit_invalidates_execution_evidence_without_rewriting_catalogue_identity(self):
         d1 = make_desc(852, "D-WU-COHORT", 42)
@@ -1460,6 +1480,23 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.verify_attempt_paths_exist(d, ROOT)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.MISSING_ATTEMPT_SOURCE)
+
+        # A prerequisite-created path that really IS on disk is the positive
+        # half of the same distinction: attempt verification passes and the
+        # descriptor is a valid planned registration, so "missing" is a fact
+        # about the checkout and never a shape the gate rejects up front.
+        d_created = make_desc(
+            852,
+            "D-WU-COHORT",
+            42,
+            source_roots=("scripts/work_unit_gate/cohort.py",),
+            test_roots=("scripts/tests/test_work_unit_gate_cohort.py",),
+        )
+        self.assertIsNone(ch.verify_attempt_paths_exist(d_created, ROOT))
+        cat_created = ch.materialize_catalogue(
+            [make_row(d_created, disposition=c.CatalogueDisposition.PLANNED)], (d_created.issue,)
+        )
+        self.assertEqual(cat_created.result, c.CatalogueResult.INTEGRITY_VALID)
 
     # WORK_UNIT_CASE: 852/40
     def test_unresolved_finite_allocation_is_explicit_blocked_materialization_not_wildcard_descriptor(self):
