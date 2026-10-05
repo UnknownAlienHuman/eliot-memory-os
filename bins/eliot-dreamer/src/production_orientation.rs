@@ -1554,3 +1554,100 @@ mod carrier_deadline_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod blocked_result_tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+
+    use super::{BlockedIdentity, BlockedParts, blocked_result, blocked_stage_record};
+    use crate::pulse::PulseStageId;
+    use crate::{OrientationAdmittedPrefix, OrientationBoundaryRecord, OrientationDisposition};
+
+    const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        let lineage = match EpochLineageId::new(LINEAGE) {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("test lineage must parse: {error:?}"),
+        };
+        let Some(sequence) = NonZeroU64::new(1) else {
+            panic!("test sequence must be non-zero");
+        };
+        let epoch = match EpochId::new(lineage, sequence) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("test epoch must build: {error:?}"),
+        };
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    /// `blocked_result` carries every mandatory-denominator record with its
+    /// reason and loses none: ten stages, each refusing with its own reason,
+    /// both omission reasons preserved verbatim, no packet, disposition
+    /// `Blocked`.
+    #[test]
+    fn blocked_result_covers_full_denominator() {
+        let stages: Vec<_> = PulseStageId::ORDER
+            .iter()
+            .map(|id| blocked_stage_record(*id, id.missing_reason()))
+            .collect();
+        assert_eq!(
+            stages.len(),
+            PulseStageId::ORDER.len(),
+            "one ledger record per mandatory-denominator member"
+        );
+        let omissions = vec!["reason-a".to_owned(), "reason-b".to_owned()];
+        let missing_owners = vec!["owner-a".to_owned(), "owner-b".to_owned()];
+        let result = match blocked_result(BlockedParts {
+            identity: BlockedIdentity {
+                job_id: "job-a3".to_owned(),
+                task_id: "task-a3".to_owned(),
+                scope_id: "scope-a3".to_owned(),
+                operation_id: "op-a3".to_owned(),
+                fence: fence(),
+            },
+            admitted: OrientationAdmittedPrefix {
+                candidate_digest: "c".to_owned(),
+                policy_digest: "p".to_owned(),
+                bundle_digest: "b".to_owned(),
+            },
+            model_outcome: OrientationBoundaryRecord {
+                boundary: "cc002_model_route".to_owned(),
+                present: false,
+                commitment: None,
+                disposition: None,
+                reason: Some("reason-a".to_owned()),
+            },
+            projections: OrientationBoundaryRecord {
+                boundary: "cc004_canonical_projections".to_owned(),
+                present: false,
+                commitment: None,
+                disposition: None,
+                reason: Some("reason-b".to_owned()),
+            },
+            stages,
+            omissions: omissions.clone(),
+            missing_owners: missing_owners.clone(),
+        }) {
+            Ok(result) => result,
+            Err(error) => panic!("complete blocked ledger must publish: {error:?}"),
+        };
+        assert_eq!(result.disposition, OrientationDisposition::Blocked);
+        assert!(result.packet.is_none(), "a blocked pulse carries no packet");
+        assert_eq!(
+            result.stages.len(),
+            PulseStageId::ORDER.len(),
+            "all ten denominator records travel"
+        );
+        for record in &result.stages {
+            assert!(
+                record.reason.is_some(),
+                "no stage record loses its reason: {}",
+                record.stage
+            );
+        }
+        assert_eq!(result.omissions, omissions, "no omission reason is lost");
+        assert_eq!(result.missing_owners, missing_owners);
+    }
+}
