@@ -915,6 +915,34 @@ mod tests {
         ));
     }
 
+    /// Publication-side identity guard (issue #1679 A10/W1): a
+    /// claimed row is never published under a blank evidence
+    /// reference, so `publish_claimed_row` refuses the blank
+    /// evidence ref as `InvalidField { field:
+    /// "ipc_evidence.evidence_ref" }` before any row is assembled
+    /// and the Kernel composition never joins evidence whose
+    /// evidence reference the contract cannot name (I14.3; rows
+    /// carry exact evidence references per
+    /// `I14-03-control-reserve.md`).
+    #[test]
+    fn ipc_publish_claimed_row_rejects_blank_evidence_ref() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        let err = reserve
+            .publish_claimed_row("gen-7", "proof-ipc-1", "", "inv-ipc-1")
+            .expect_err("blank evidence ref must never publish a row");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_evidence.evidence_ref",
+                ..
+            }
+        ));
+    }
+
     /// Protected-partition exhaustion names its dimension (issue #1679
     /// A6/W4): a full protected pipe partition refuses with
     /// [`IpcReserveError::ProtectedReserveExhausted`] naming exactly
