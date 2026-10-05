@@ -830,8 +830,22 @@ fn lost_response_reconciles_before_retry() {
         eprintln!("SKIP 958/14 on non-Windows: reconcile effects need the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("14");
-    let parent = isolated_root("14", "staging");
+    // One case root keeps the source tree and the staging parent inside a single
+    // protected contour: `override_protected_root` pins one root and
+    // `ProtectedRootLease::open_existing` demands `path.starts_with(root)`.
+    // `admit_staging_parent` still refuses a parent nested under the source.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore
+    // ("restore to isolated root;").
+    let case_root = isolated_root("14", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    // Thread-local contour pin, restored on drop; parallel tests in this binary
+    // observe their own contour only.
+    let _protected = override_protected_root(&case_root);
     // Fresh operation with no record reconciles Absent: retry may proceed.
     let mut journal = MemJournal::default();
     assert_eq!(
@@ -882,8 +896,7 @@ fn lost_response_reconciles_before_retry() {
     assert!(report.removed.is_empty(), "unknown never removed");
     assert_eq!(report.preserved.len(), 1);
     assert!(prepared.root.exists(), "unknown root preserved");
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/15
