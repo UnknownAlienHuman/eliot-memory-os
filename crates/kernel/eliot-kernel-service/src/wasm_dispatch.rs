@@ -50,6 +50,14 @@ pub const WASM_HOST_MATERIAL_FILE_NAME: &str = "eliot-wasm-host.admitted-dispatc
 pub const WASM_HOST_GUEST_ARTIFACT_FILE_NAME: &str = "eliot-wasm-host.guest-artifact.bin";
 /// Colocated guest input file name staged with the material.
 pub const WASM_HOST_GUEST_INPUT_FILE_NAME: &str = "eliot-wasm-host.guest-input.bin";
+/// Child InFlight-claim marker name, byte-identical to the child reader's
+/// `WASM_HOST_INFLIGHT_FILE_NAME`. Duplicated here under the same convention
+/// as `WASM_HOST_MATERIAL_FILE_NAME` above: the child stays the authority
+/// for the value, and this crate never depends on the host crate.
+pub const WASM_HOST_INFLIGHT_FILE_NAME: &str = "eliot-wasm-host.inflight.json";
+/// Child served-result record name, byte-identical to the child reader's
+/// `WASM_HOST_SERVED_RESULT_FILE_NAME`, duplicated under the same convention.
+pub const WASM_HOST_SERVED_RESULT_FILE_NAME: &str = "eliot-wasm-host.served-result.json";
 /// Material envelope wire identity, matched exactly by the child reader.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
 /// Material envelope wire version, matched exactly by the child reader.
@@ -1931,13 +1939,62 @@ fn check_reclaim_quiescent(
     Ok(())
 }
 
+/// Reports whether the named delivery may still have a live child claim
+/// with no settled result (issue #2786 W4): the child writes its InFlight
+/// marker after claim and before any guest effect and clears it only after
+/// the served record is durable, so a marker naming this set with no
+/// settling served record reads as a possibly-live process. Anything
+/// unreadable or unidentifiable reads as outstanding (fail-closed); a
+/// marker naming another set never blocks this one.
+fn live_delivery_outstanding(
+    install_dir: &std::path::Path,
+    operation_id: &str,
+    claim_id: &str,
+    generation: u64,
+) -> bool {
+    fn triple(value: &serde_json::Value) -> Option<(&str, &str, u64)> {
+        Some((
+            value.get("operation_id")?.as_str()?,
+            value.get("claim_id")?.as_str()?,
+            value.get("generation")?.as_u64()?,
+        ))
+    }
+    let marker_bytes = match std::fs::read(install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let marker: serde_json::Value = match serde_json::from_slice(&marker_bytes) {
+        Ok(marker) => marker,
+        Err(_) => return true,
+    };
+    let Some((marker_operation, marker_claim, marker_generation)) = triple(&marker) else {
+        return true;
+    };
+    if (marker_operation, marker_claim, marker_generation) != (operation_id, claim_id, generation) {
+        return false;
+    }
+    let served_bytes = match std::fs::read(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME)) {
+        Ok(bytes) => bytes,
+        Err(_) => return true,
+    };
+    let served: serde_json::Value = match serde_json::from_slice(&served_bytes) {
+        Ok(served) => served,
+        Err(_) => return true,
+    };
+    triple(&served).is_none_or(|settled| settled != (operation_id, claim_id, generation))
+}
+
 /// Retires an expired live set under its exact presented identity, or
 /// refuses the replacement with typed bounded backpressure (#2786 step
 /// 4). Supported expiry without a wall clock: a live set whose grant
 /// expired before the new admission opened can no longer execute, so the
 /// owner reclaims exactly that set and the replacement publishes fresh.
-/// Anything still live backpressures with the exact retry condition, and
-/// a partially reclaimed set fails closed instead of publishing over
+/// Expiry alone never frees a set that may still execute: a live child
+/// claim without a settled served result backpressures with the exact
+/// recovery reference instead of being reclaimed underfoot (issue #2786
+/// W4). Anything still live backpressures with the exact retry condition,
+/// and a partially reclaimed set fails closed instead of publishing over
 /// unknown bytes.
 fn retire_or_backpressure_live(
     live: &WasmDispatchMaterial,
@@ -1953,6 +2010,20 @@ fn retire_or_backpressure_live(
         1,
     )?;
     if live_identity.expires_at <= claim_admitted_at_unix_ms {
+        if live_delivery_outstanding(
+            install_dir,
+            &live_identity.operation_id,
+            &live_identity.claim_id,
+            live_identity.generation,
+        ) {
+            return Err(WasmDispatchError::Backpressure(WasmDeliveryBackpressure {
+                live_generation: live_identity.generation,
+                live_operation_id: live_identity.operation_id.clone(),
+                live_expires_at: live_identity.expires_at,
+                retry_condition:
+                    "live delivery has an inflight claim without a settled served result".to_owned(),
+            }));
+        }
         let reclamation = reclaim_fixed_delivery(install_dir, &live_identity)?;
         if !reclamation.fully_reclaimed() {
             return Err(invalid("delivery-reclaim-partial"));
@@ -2594,6 +2665,145 @@ mod tests {
         let dir = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&dir).expect("stage dir writable");
         dir
+    }
+
+    fn write_json(dir: &std::path::Path, name: &str, value: serde_json::Value) {
+        std::fs::write(
+            dir.join(name),
+            serde_json::to_vec(&value).expect("marker serializes"),
+        )
+        .expect("marker writable");
+    }
+
+    /// A live InFlight claim with no served record reads as outstanding.
+    #[test]
+    fn outstanding_with_inflight_claim() {
+        let dir = stage_dir("eliot-2786-outstanding-claim");
+        write_json(
+            &dir,
+            WASM_HOST_INFLIGHT_FILE_NAME,
+            serde_json::json!({"operation_id": "op-a", "claim_id": "claim-a",
+                "generation": 7, "grant_digest": "d"}),
+        );
+        assert!(live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A served record settling the same identity releases the gate.
+    #[test]
+    fn settled_with_served_result() {
+        let dir = stage_dir("eliot-2786-outstanding-settled");
+        write_json(
+            &dir,
+            WASM_HOST_INFLIGHT_FILE_NAME,
+            serde_json::json!({"operation_id": "op-a", "claim_id": "claim-a",
+                "generation": 7, "grant_digest": "d"}),
+        );
+        write_json(
+            &dir,
+            WASM_HOST_SERVED_RESULT_FILE_NAME,
+            serde_json::json!({"operation_id": "op-a", "generation": 7,
+                "claim_id": "claim-a", "grant_digest": "g", "retained_at_unix_ms": 1}),
+        );
+        assert!(!live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A claim naming another set never blocks this one.
+    #[test]
+    fn free_with_foreign_inflight() {
+        let dir = stage_dir("eliot-2786-outstanding-foreign");
+        write_json(
+            &dir,
+            WASM_HOST_INFLIGHT_FILE_NAME,
+            serde_json::json!({"operation_id": "op-a", "claim_id": "claim-b",
+                "generation": 7, "grant_digest": "d"}),
+        );
+        assert!(!live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unparseable claim evidence reads as outstanding, never as absent.
+    #[test]
+    fn outstanding_on_unparseable_inflight() {
+        let dir = stage_dir("eliot-2786-outstanding-garbage");
+        std::fs::write(dir.join(WASM_HOST_INFLIGHT_FILE_NAME), b"not-json")
+            .expect("marker writable");
+        assert!(live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The W4 proof: a replacement arriving after the live grant expired
+    /// backpressures while the live set has an unsettled InFlight claim
+    /// (A's bytes stay staged), and publishes fresh once the served record
+    /// settles it. No wall clock gates admission, so the far-future
+    /// admission time is legitimate input.
+    #[test]
+    fn inflight_claim_backpressures_expired_replacement_until_settled() {
+        let dir = stage_dir("eliot-2786-expiry-gate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim_a = test_claim();
+        claim_a.artifact_bytes = b"gate-artifact-a".to_vec();
+        claim_a.input_bytes = b"gate-input-a".to_vec();
+        claim_a.guest.artifact_digest = sha256_hex(b"gate-artifact-a");
+        claim_a.guest.input_digest = sha256_hex(b"gate-input-a");
+        match publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_a,
+            &mut joins,
+        ) {
+            Ok(_) => {}
+            Err(error) => panic!("bundle A publishes, got {error:?}"),
+        }
+        write_json(
+            &dir,
+            WASM_HOST_INFLIGHT_FILE_NAME,
+            serde_json::json!({"operation_id": "operation-bundle-001",
+                "claim_id": "claim-bundle-001", "generation": 7, "grant_digest": "d"}),
+        );
+        let mut claim_b = test_claim();
+        claim_b.artifact_bytes = b"gate-artifact-b".to_vec();
+        claim_b.input_bytes = b"gate-input-b".to_vec();
+        claim_b.guest.artifact_digest = sha256_hex(b"gate-artifact-b");
+        claim_b.guest.input_digest = sha256_hex(b"gate-input-b");
+        claim_b.admitted_at_unix_ms = 4_000_000_060_001;
+        match publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_b,
+            &mut joins,
+        ) {
+            Err(WasmDispatchError::Backpressure(backpressure)) => {
+                assert_eq!(backpressure.live_operation_id, "operation-bundle-001");
+                assert!(backpressure.retry_condition.contains("inflight"));
+            }
+            Err(_) => panic!("expected inflight backpressure, got another error"),
+            Ok(_) => panic!("expected inflight backpressure, got a published bundle"),
+        }
+        assert!(dir.join(WASM_HOST_MATERIAL_FILE_NAME).is_file());
+        write_json(
+            &dir,
+            WASM_HOST_SERVED_RESULT_FILE_NAME,
+            serde_json::json!({"operation_id": "operation-bundle-001", "generation": 7,
+                "claim_id": "claim-bundle-001", "grant_digest": "g",
+                "retained_at_unix_ms": 1}),
+        );
+        assert!(
+            publish_wasm_dispatch_bundle(
+                "C:\\Kernel\\eliot-wasm-host.exe",
+                &"d".repeat(64),
+                &dir,
+                &claim_b,
+                &mut joins,
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Byte binding fails before any join registers or any file stages:
