@@ -138,11 +138,6 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         body: WINDOWS_RELEASE_BUILD,
     },
     ConsumerSurface {
-        path: "scripts/build-claude-desktop-extension.ps1",
-        live_reference: "server\\eliot-governor.exe",
-        body: CLAUDE_DESKTOP_BUILD,
-    },
-    ConsumerSurface {
         path: "docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md",
         live_reference: "eliot-governor --config",
         body: CREDENTIAL_RUNBOOK,
@@ -1116,13 +1111,6 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             expiry: "remove by 2026-12-31, when the release bundle no longer stages eliot-governor.exe at root or plugin bin",
         },
         ConsumerEntry {
-            consumer: "Claude Desktop MCPB package staging",
-            proof: "scripts/build-claude-desktop-extension.ps1",
-            live_reference: "server\\eliot-governor.exe",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the packaged MCPB server is a current root binary under #11",
-        },
-        ConsumerEntry {
             consumer: "Operator credential runbook",
             proof: "docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md",
             live_reference: "eliot-governor --config",
@@ -1363,6 +1351,14 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge one-shot host-event intake (host_event_oneshot.rs)",
         evidence: "bridge argv host-event --host opencode --event <kind> with host event JSON on stdin and decision JSON on stdout, identical to the retired facade HostCommand::Event contract; exe override ELIOT_AGENT_BRIDGE_EXE only; plugin file digest-bound in host-bundle.manifest.json",
     },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop MCPB package staging",
+        proof: "scripts/build-claude-desktop-extension.ps1",
+        legacy_reference: "server\\eliot-governor.exe",
+        current_owner_reference: "server\\eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge (Desktop MCPB server)",
+        evidence: "021 packager swap stages server/eliot-agent-bridge.exe and renders the manifest from bridge mcp catalog --host claude --surface desktop (bins/eliot-agent-bridge/src/packager_catalog.rs::render_mcp_catalog over eliot_mcp::tools_list_result); the tracked manifest entry server/eliot-agent-bridge.exe matches the staged path",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -1375,6 +1371,7 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
         "integrations/opencode/opencode.json" => Some(OPENCODE_CONFIG),
         "integrations/opencode/plugins/eliot.js" => Some(OPENCODE_PLUGIN),
+        "scripts/build-claude-desktop-extension.ps1" => Some(CLAUDE_DESKTOP_BUILD),
         "integrations/codex/marketplace.json" => Some(CODEX_MARKETPLACE),
         "plugin/eliot-governor/.codex-plugin/plugin.json" => Some(CODEX_PLUGIN_METADATA),
         "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md" => Some(CLAUDE_DESKTOP_GUIDE),
