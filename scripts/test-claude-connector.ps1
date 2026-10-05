@@ -62,18 +62,14 @@ function Assert-CompactClaudeSurface {
         -TimeoutSeconds 60
     $result = $json | ConvertFrom-Json -Depth 40
     $expectedTools = @(
-        'eliot_task_state',
-        'eliot_agent_candidate_submit',
-        'eliot_host_session_status',
-        'eliot_project_identity',
-        'eliot_current_state',
-        'eliot_recall_l0',
-        'eliot_fetch_l2',
-        'eliot_compile_packet_l3',
-        'eliot_memory_influence_trace',
-        'eliot_agent_delegate',
-        'eliot_agent_result',
-        'eliot_agent_result_disposition'
+        'eliot.act',
+        'eliot.coordinate',
+        'eliot.finish',
+        'eliot.observe',
+        'eliot.packet',
+        'eliot.query',
+        'eliot.state',
+        'eliot.verify'
     ) | Sort-Object
     $actualTools = @($result.tool_names | Sort-Object)
     Assert-True ($result.status -eq 'passed') "$HostSurface MCP reference client did not pass"
@@ -94,6 +90,8 @@ try {
     $metadata = (Invoke-NativeChecked 'cargo' @('metadata', '--format-version', '1', '--no-deps') 'Cargo metadata') | ConvertFrom-Json
     $governorExe = Join-Path ([string]$metadata.target_directory) 'release\eliot-governor.exe'
     Assert-True (Test-Path -LiteralPath $governorExe -PathType Leaf) "release Governor binary is missing: $governorExe"
+    $bridgeExe = Join-Path ([string]$metadata.target_directory) 'release\eliot-agent-bridge.exe'
+    Assert-True (Test-Path -LiteralPath $bridgeExe -PathType Leaf) "release Bridge binary is missing: $bridgeExe"
     Assert-True (Test-Path -LiteralPath $referenceClient -PathType Leaf) "reference client is missing: $referenceClient"
 
     $family = (Invoke-NativeChecked $governorExe @('host', 'doctor', '--host', 'claude') 'Claude family doctor') | ConvertFrom-Json -Depth 50
@@ -150,14 +148,15 @@ try {
     $packageReportPath = Join-Path $packageRoot 'claude\compatibility-report.json'
     Assert-True (Test-Path -LiteralPath $packageReportPath -PathType Leaf) "Claude Desktop package report is missing: $packageReportPath"
     $packageReport = Get-Content -LiteralPath $packageReportPath -Raw | ConvertFrom-Json -Depth 20
-    $desktopGovernor = Join-Path $packageRoot 'claude-desktop-mcpb\eliot-governor\server\eliot-governor.exe'
-    $desktopManifest = Join-Path $packageRoot 'claude-desktop-mcpb\eliot-governor\manifest.json'
-    Assert-True (Test-Path -LiteralPath $desktopGovernor -PathType Leaf) 'staged Desktop Governor is missing'
+    $desktopBridge = Join-Path $packageRoot 'claude-desktop-mcpb\eliot-agent-bridge\server\eliot-agent-bridge.exe'
+    $desktopManifest = Join-Path $packageRoot 'claude-desktop-mcpb\eliot-agent-bridge\manifest.json'
+    Assert-True (Test-Path -LiteralPath $desktopBridge -PathType Leaf) 'staged Desktop Bridge is missing'
     Assert-True (Test-Path -LiteralPath $desktopManifest -PathType Leaf) 'generated Desktop manifest is missing'
-    $desktopSha256 = (Get-FileHash -LiteralPath $desktopGovernor -Algorithm SHA256).Hash
-    Assert-True ($releaseSha256 -eq $desktopSha256) 'staged Desktop Governor differs from the canonical release binary'
+    $desktopSha256 = (Get-FileHash -LiteralPath $desktopBridge -Algorithm SHA256).Hash
+    $releaseBridgeSha256 = (Get-FileHash -LiteralPath $bridgeExe -Algorithm SHA256).Hash
+    Assert-True ($releaseBridgeSha256 -eq $desktopSha256) 'staged Desktop Bridge differs from the canonical release bridge binary'
     $generatedManifest = Get-Content -LiteralPath $desktopManifest -Raw | ConvertFrom-Json -Depth 50
-    Assert-True (@($generatedManifest.tools).Count -eq 12) 'generated MCPB manifest must contain twelve tools'
+    Assert-True (@($generatedManifest.tools).Count -eq 8) 'generated MCPB manifest must contain eight tools'
     Assert-True (@($generatedManifest.prompts).Count -eq 4) 'generated MCPB manifest must contain four prompts'
     Assert-True ([bool]$generatedManifest.tools_generated) 'MCPB tools were not marked generated'
     Assert-True ([bool]$generatedManifest.prompts_generated) 'MCPB prompts were not marked generated'
@@ -170,7 +169,7 @@ try {
     }
 
     Assert-CompactClaudeSurface -HostSurface 'claude' -Governor $installedGovernor
-    Assert-CompactClaudeSurface -HostSurface 'claude-desktop' -Governor $desktopGovernor
+    Assert-CompactClaudeSurface -HostSurface 'claude-desktop' -Governor $desktopBridge
 
     if (-not $SkipCargoTests) {
         Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'plugin_hooks', '--', '--nocapture', '--test-threads=1') 'Claude hook tests' | Out-Null
