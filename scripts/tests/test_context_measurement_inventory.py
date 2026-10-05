@@ -73,7 +73,7 @@ class TestContextMeasurementInventory(unittest.TestCase):
             oracle.classify_context_measurement("no-such-signal-xyz")
 
     def test_sync_identical_and_tamper_fails(self) -> None:
-        tiny = (("704/1", "#704", "scan/a.rs", "stu_for_bytes"), ("880/1", "#880", "scan/b.rs", "fixed_overhead"))
+        tiny = (("704/1", "#704", "scan/a.rs", "stu_for_bytes"), ("880/1", "#880", "scan/b.rs", "fixed_overhead@@0"))
         with tempfile.TemporaryDirectory() as td:
             troot = Path(td).resolve()
             scan = troot / "scan"
@@ -90,20 +90,38 @@ class TestContextMeasurementInventory(unittest.TestCase):
                 src, dst = ROOT / rel, troot / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(src.read_bytes())
+            for _ref, rel, _needle, _reason in oracle.EXCLUSION_CASES:
+                src, dst = ROOT / rel, troot / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src.read_bytes())
+            for _own, rels in oracle.CONSUMER_TEST_PATHS.items():
+                for rel in rels:
+                    src, dst = ROOT / rel, troot / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(src.read_bytes())
+            for _own, rels in oracle.CONSUMER_ROUTED_READING.items():
+                for rel in rels:
+                    src, dst = ROOT / rel, troot / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(src.read_bytes())
+            map_src = ROOT / oracle.OWNER_MAP_PATH.as_posix()
+            map_dst = troot / oracle.OWNER_MAP_PATH.as_posix()
+            map_dst.parent.mkdir(parents=True, exist_ok=True)
+            map_dst.write_bytes(map_src.read_bytes())
             self.assertEqual(oracle.cmd_sync(troot, "unittest-sync"), 0)
             target = troot / oracle.OWNED_TOML.as_posix()
             before = target.read_bytes()
             self.assertEqual(oracle.cmd_sync(troot, "unittest-sync"), 0)
             self.assertEqual(target.read_bytes(), before, "repeated sync stays byte-identical")
-            self.assertEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(oracle.cmd_check(troot), 2)
             with open(troot / "crates/smart/eliot-context-measurement/src/stu.rs", "ab") as fh:
                 fh.write(b"\n// touch\n")
-            self.assertNotEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(oracle.cmd_check(troot), 1)
             oracle.cmd_sync(troot, "unittest-sync")
-            self.assertEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(oracle.cmd_check(troot), 2)
             tampered = target.read_text(encoding="utf-8").replace("exact-utf8-envelope", "test-only", 1)
             target.write_text(tampered, encoding="utf-8")
-            self.assertNotEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(oracle.cmd_check(troot), 2)
 
     def test_fail_closed_no_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:
