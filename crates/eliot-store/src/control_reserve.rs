@@ -1228,4 +1228,44 @@ mod tests {
             }
         ));
     }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679 A6/W4).
+    /// The single protected connection slot is filled first and its permit is
+    /// held across the assertions, so the refusal observes a live saturated
+    /// partition rather than a released one. The refusal names
+    /// `STORE_CONNECTION_BOTTLENECK`: exhaustion of one dimension is a local
+    /// disposition, never a global one (I14.3).
+    #[test]
+    fn store_protected_connection_exhaustion_names_bottleneck() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            1,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-fill-1",
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_connections(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_connection(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-conn-shed-1",
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_CONNECTION_BOTTLENECK)
+        );
+    }
 }
