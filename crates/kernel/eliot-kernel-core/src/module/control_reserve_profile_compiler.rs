@@ -43,11 +43,14 @@
 //!   owner adapter publishes a record, its dimension stays `UNKNOWN` here
 //!   rather than being described from a neighbouring owner's numbers.
 //!
-//! Consequently this compiler currently has no in-tree call site. The
-//! production caller the contract names is the Kernel composition that joins
-//! owner evidence, and that edge does not exist in this tree. `STITCH`: the
-//! compiler is landed without a caller rather than given a manufactured one
-//! (no startup hook, no `fn main` call, no discarded-result statement).
+//! The production caller the contract names is the Kernel composition that
+//! joins owner evidence: `KernelComposition::assemble`
+//! (`bins/eliot-kernel/src/composition_bootstrap.rs`) compiles the profile
+//! from its resolved Authority Epoch, generation, approved config hash and
+//! clock, and fails the build closed on contradictory evidence. Until an
+//! owner adapter publishes a record (issue #1679 W3) the composition joins
+//! zero records, so every dimension is an explicit `UNKNOWN` row rather than
+//! a value described from a neighbouring owner's numbers.
 
 use eliot_contracts::EpochId;
 use eliot_runtime_contracts::{
@@ -291,10 +294,10 @@ pub struct ControlReserveStatusRow {
 /// no clock, reads no environment, performs no owner I/O, allocates nothing
 /// beyond the snapshot itself, and grants no authority.
 ///
-/// Consequently this projection currently has no in-tree consumer. The status
-/// and recovery surfaces that render it do not exist in this tree. `STITCH`:
-/// the projection is landed without a caller rather than given a manufactured
-/// one (no startup hook, no `fn main` call, no discarded-result statement).
+/// The in-tree consumer is `KernelComposition::control_reserve_status`
+/// (`bins/eliot-kernel/src/composition_bootstrap.rs`), which projects the
+/// profile the composition retained at assembly. Broader status and recovery
+/// surfaces render that snapshot; they do not re-derive it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlReserveStatusSnapshot {
     /// Stable profile identity of the projected profile.
