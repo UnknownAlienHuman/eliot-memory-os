@@ -3758,9 +3758,10 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval, 
     if (-not $governorRetired) {
         $marketplace = Get-Content -LiteralPath (Join-Path $codexRoot 'marketplace.json') -Raw | ConvertFrom-Json
         $marketplacePlugins = @($marketplace.plugins)
+        # Norm(#18-A9-advertise-bridge): install identity is eliot-agent-bridge; staged directory stays plugins/eliot-governor.
         if ([string]$marketplace.name -ne 'eliot-system' -or
             $marketplacePlugins.Count -ne 1 -or
-            [string]$marketplacePlugins[0].name -ne 'eliot-governor' -or
+            [string]$marketplacePlugins[0].name -ne 'eliot-agent-bridge' -or
             [string]$marketplacePlugins[0].source.source -ne 'local' -or
             [string]$marketplacePlugins[0].source.path -ne './plugins/eliot-governor' -or
             [string]$marketplacePlugins[0].policy.installation -ne 'INSTALLED_BY_DEFAULT' -or
@@ -3789,13 +3790,13 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval, 
             throw 'RELEASE.json is missing the explicit pre-release signing boundary'
         }
         $plugin = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
-        if ([string]$plugin.name -ne 'eliot-governor' -or
+        if ([string]$plugin.name -ne 'eliot-agent-bridge' -or
             [string]$plugin.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$' -or
             [string]$plugin.version -ne [string]$release.codex_plugin_base_version -or
             [string]$plugin.author.name -ne 'ELIOT' -or
             [string]$plugin.skills -ne './skills/' -or
             [string]$plugin.mcpServers -ne './.mcp.json' -or
-            [string]$plugin.interface.displayName -ne 'ELIOT Governor' -or
+            [string]$plugin.interface.displayName -ne 'ELIOT Agent Bridge' -or
             $plugin.PSObject.Properties.Name -contains 'hooks') {
             throw 'release Codex plugin manifest does not match the canonical cache-neutral base contract'
         }
