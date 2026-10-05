@@ -713,12 +713,15 @@ pub enum CounterSearchStatus {
 ///
 /// A *verified empty* eligible scope is a state this vocabulary now expresses
 /// through the [`Self::VerifiedEmpty`] variant, and no placeholder member is
-/// invented to carry it. The two construction gates stay closed until later W1
-/// slices open them with run evidence:
-/// [`crate::evidence_portfolio::CoverageAccount::open`] refuses a zero-member
-/// denominator and [`CoverageReceipt::compute`] refuses a zero expected-member
-/// count, so an inquiry whose admitted manifest declares no member produces no
-/// record at all rather than a record stating that the eligible scope is empty.
+/// invented to carry it. The two construction gates open only with run
+/// evidence: [`crate::evidence_portfolio::CoverageAccount::open`] still
+/// refuses a zero-member denominator, and only an account opened over
+/// run-examined candidates
+/// ([`crate::evidence_portfolio::CoverageAccount::open_verified_empty`],
+/// refused when the run examined nothing) passes
+/// [`CoverageReceipt::compute`]'s zero expected-member gate, so an inquiry
+/// whose admitted manifest declares no member produces no record at all
+/// unless the run examined candidates and found none eligible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumerationState {
     /// Nothing was observed against the frozen scope, so an empty eligible set
@@ -765,6 +768,12 @@ fn enumeration_state(
     account: &CoverageAccount,
     observed_outside_scope: &[ObservedOutsideScope],
 ) -> EnumerationState {
+    // Read before `all_closed`: accounting over an empty denominator is
+    // vacuously closed, and a verified empty scope must never misread as
+    // `Complete`.
+    if account.is_verified_empty() {
+        return EnumerationState::VerifiedEmpty;
+    }
     if account.all_closed() {
         return EnumerationState::Complete;
     }
@@ -3302,7 +3311,11 @@ impl CoverageReceipt {
         require_scope(requested_scope, "coverage.requested_scope")?;
         require_digest(frozen_scope_digest, "coverage.frozen_scope_digest")?;
         let expected_members = account.denominator_size();
-        if expected_members == 0 {
+        // A bare empty denominator is still an absent measurement, never a
+        // verified empty scope: only an account opened over run-examined
+        // candidates ([`CoverageAccount::open_verified_empty`]) may receipt a
+        // zero-member denominator.
+        if expected_members == 0 && !account.is_verified_empty() {
             return Err(InquiryError::IncompleteDenominator {
                 field: "coverage.expected_members",
             });
