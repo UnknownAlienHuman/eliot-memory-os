@@ -1483,3 +1483,55 @@ fn sequence_gap_is_refused() {
     assert_eq!(view.next_sequence(), 1);
     assert_eq!(view.next_offset(), C.len() as u64);
 }
+
+/// Source: `BlobStoreService::new` joins the process-local single-owner registry
+/// above `BlobStoreCore::claim`, so a second service on the same root fails with
+/// `BlobError::OwnerConflict`.
+/// Discovery: the sink harness holds one owner through a cloned handle because
+/// a second owner on that root would be refused; here the first service stays
+/// bound while the second is refused, never admitted alongside it.
+/// Executed-pass: a first service is opened on a unique root and kept alive by
+/// `_first`, then a second `BlobStoreService::new` over the same live lease
+/// returns exactly `Err(BlobError::OwnerConflict)`.
+/// I05-12: vendor-neutral CAS, one active root owner.
+// WORK_UNIT_CASE: 297/A8
+#[test]
+fn second_service_on_same_root_fails_with_owner_conflict() {
+    let root = unique_test_root();
+    let first_req = stage_request("bootstrap", b"bootstrap", &root);
+    // The clone keeps the FIRST service the registry's owner across the second
+    // construction below; dropping it would release the root and prove nothing.
+    let _first = ok(BlobStoreService::new(
+        first_req.root_lease.clone(),
+        FixturePlatform::default(),
+        FixtureCompression,
+        FixtureKeys,
+        FixtureAead,
+        FixtureLiveSets,
+        test_anchor(),
+    ));
+
+    // WHY the destructuring rather than `assert_eq!` on the whole `Result`:
+    // `BlobStoreService` derives `Clone` only -- no `PartialEq`, no `Debug` -- so
+    // the service value is not comparable. The ERROR is (`BlobError` derives
+    // `Eq`/`PartialEq`), so the exact refusal is still asserted by value, not by
+    // "the call did not succeed".
+    let Err(second_error) = BlobStoreService::new(
+        first_req.root_lease,
+        FixturePlatform::default(),
+        FixtureCompression,
+        FixtureKeys,
+        FixtureAead,
+        FixtureLiveSets,
+        test_anchor(),
+    ) else {
+        panic!(
+            "a second service owner on the same root is refused, never admitted alongside the first"
+        );
+    };
+    assert_eq!(
+        second_error,
+        BlobError::OwnerConflict,
+        "a second service owner on the same root is refused, never admitted alongside the first"
+    );
+}
