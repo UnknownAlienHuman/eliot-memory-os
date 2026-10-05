@@ -1535,3 +1535,102 @@ fn second_service_on_same_root_fails_with_owner_conflict() {
         "a second service owner on the same root is refused, never admitted alongside the first"
     );
 }
+
+/// Source: `bounded_preview_measure` and `check_preview` in
+/// `crates/storage/eliot-blob/src/stream_sink.rs`, and the `max_preview_bytes`
+/// ceiling of `ProcessStreamSinkLimits::new` (`types.rs:127`).
+/// Discovery: the A5 preview item has two halves and only the EMPTY half was
+/// proved, by `empty_source_publishes_and_verifies_as_real_object`. A nonempty
+/// source whose bounded preview retains EVERY admitted byte was unproved, so a
+/// measure that silently dropped or mis-stated the whole preview would still
+/// pass every existing case. This is the COMPLETE-preview half: the session
+/// ceiling holds all seven bytes, so no truncation arm is reached and
+/// `omitted_ranges` must be empty — a truncated preview may never read as a
+/// complete one.
+/// Executed-pass: `ALL` (7 bytes) is admitted in TWO chunks, so exactness is
+/// proved over a multi-chunk stream rather than a single write; the finalize
+/// carries the full retained prefix, and the assertions are the publication's
+/// locator, digest, byte count AND the exact bounded-preview measure — never
+/// only that `finalize` returned `Ok`.
+/// I05-12: vendor-neutral CAS, one active root owner. Blob durability proves
+/// bytes only.
+// WORK_UNIT_CASE: 297/A5-preview
+#[test]
+fn nonempty_source_with_complete_preview_publishes_exact_measures() {
+    const ALL: &[u8] = b"0123456";
+    // `preview-full` yields exactly this case's own disjoint session, source and
+    // terminal identities and the `policy:sink-preview-full` binding, over a
+    // `unique_test_root` this case owns alone.
+    let (sink, session) = open_replay_sink("preview-full");
+
+    // WHY two chunks: a single write would make the incremental preview
+    // accumulation and the transport measure trivially equal to the one append,
+    // so the exactness below would never be proved ACROSS chunk boundaries.
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, &ALL[..4])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: 4,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, 4, &ALL[4..])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 2,
+            next_offset: 7,
+        },
+    );
+
+    let expected_sha256 = format!("{:x}", Sha256::digest(ALL));
+    let request = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        2,
+        ALL.len() as u64,
+        20,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        ALL.len() as u64,
+        // The FULL retained prefix: the session ceiling holds every byte, so
+        // this request preview matches the adapter's own incremental
+        // accumulation exactly and `check_preview` passes.
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            ALL.to_vec(),
+            ALL.len() as u64,
+        )),
+        None,
+        Vec::new(),
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), request)));
+
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+    assert_eq!(terminal.admitted_chunks(), 2);
+    assert_eq!(terminal.admitted_bytes(), 7);
+    assert_eq!(terminal.admitted_sha256(), expected_sha256);
+
+    // The published object is exactly `ALL`, so the two-chunk admission minted
+    // ONE object carrying the whole source and not a per-chunk object.
+    let Some(BlobStreamPublication::Complete(complete)) = sink.publication() else {
+        panic!("a complete source must record a real object, never `Unavailable`");
+    };
+    assert_eq!(complete.byte_length, 7);
+    assert_eq!(complete.sha256, expected_sha256);
+    assert_eq!(
+        complete.locator,
+        format!("blob:{}", blake3::hash(ALL).to_hex()),
+        "the published locator is the content hash of the bytes this case admitted"
+    );
+
+    // The measure itself, not merely a successful finalize: the preview retains
+    // all seven bytes, represents all seven bytes, omits nothing, and its
+    // TransportBytes digest covers exactly the retained bytes.
+    assert_eq!(complete.measures.bounded_preview.retained_byte_count, 7);
+    assert_eq!(complete.measures.bounded_preview.represented_byte_count, 7);
+    assert!(
+        complete.measures.bounded_preview.omitted_ranges.is_empty(),
+        "a preview that retains every admitted byte omits nothing, so a truncated \
+         preview can never read as a complete one: {:?}",
+        complete.measures.bounded_preview.omitted_ranges
+    );
+    assert_eq!(complete.measures.bounded_preview.sha256, expected_sha256);
+}
