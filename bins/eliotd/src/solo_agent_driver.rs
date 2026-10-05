@@ -2624,6 +2624,71 @@ pub fn solo_reconcile_cancel(
     solo_status(composition, operation_id)
 }
 
+/// Requests cancellation of the exact admitted attempt through the verified
+/// async seam (issue #2567 W5).
+///
+/// Same retained operation as [`solo_request_cancel`]: records the request
+/// only, with effects reconciling until a terminal disposition is observed
+/// through the reconcile leg. The sync leg restores through the test-only
+/// seam, which refuses in a normal build; this entry restores through
+/// [`restore_solo_fabric_async`] on owned inputs prepared under short locks,
+/// so the control path works outside tests. No new tick caller: cancellation
+/// stays event-driven and dispatcher-owned.
+pub async fn solo_request_cancel_async(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    {
+        let composition = composition.lock().await;
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+    }
+    let state_root = {
+        let composition = composition.lock().await;
+        composition.state_root().to_owned()
+    };
+    #[cfg(not(test))]
+    let (mut projection, coordinator_document) = {
+        let verified = load_verified_projection(&state_root, operation_id)?;
+        (verified.payload, verified.coordinator_document)
+    };
+    #[cfg(test)]
+    let mut projection = load_projection(&state_root, operation_id)?;
+    #[cfg(not(test))]
+    let (ports, material) = {
+        let composition = composition.lock().await;
+        (
+            composition.production_fabric_ports()?,
+            composition.resolve_verified_material(kernel, projection.claimed.material())?,
+        )
+    };
+    #[cfg(not(test))]
+    let mut fabric = restore_solo_fabric_async(
+        kernel,
+        &projection,
+        &coordinator_document,
+        state_root,
+        ports,
+        material,
+    )
+    .await?;
+    #[cfg(test)]
+    let mut fabric = {
+        let composition = composition.lock().await;
+        restore_solo_fabric(&composition, kernel, &projection)?
+    };
+    let attempt = AttemptId::new(projection.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    fabric.request_cancellation(&attempt, &projection.operation_id)?;
+    {
+        let composition = composition.lock().await;
+        repersist_after_control(&composition, &fabric, &mut projection)?;
+        solo_status(&composition, operation_id)
+    }
+}
+
 /// Ingests one worker observation as the correlated candidate result.
 ///
 /// Records the worker acknowledgement (never success) and submits the
@@ -2665,6 +2730,87 @@ pub fn solo_ingest_result(
     // command. The candidate result is already durable above.
     drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
+}
+
+/// Ingests one worker observation through the verified async seam
+/// (issue #2567 W5).
+///
+/// Same retained operation as [`solo_ingest_result`]: the worker
+/// acknowledgement (never success) and the candidate result digest (never
+/// Finish) under the same attempt identity, then the fair-pull join on the
+/// release path. Restores through [`restore_solo_fabric_async`] on owned
+/// inputs prepared under short locks, so the ingest path works outside
+/// tests. No new tick caller: ingest stays event-driven and
+/// dispatcher-owned.
+pub async fn solo_ingest_result_async(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+    worker_id: &str,
+    result_digest: &str,
+    observed_via: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    {
+        let composition = composition.lock().await;
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+    }
+    require_text(worker_id, "worker identity").map_err(DaemonError::ProviderAdmission)?;
+    require_text(result_digest, "result digest").map_err(DaemonError::ProviderAdmission)?;
+    require_text(observed_via, "observation leg").map_err(DaemonError::ProviderAdmission)?;
+    let state_root = {
+        let composition = composition.lock().await;
+        composition.state_root().to_owned()
+    };
+    #[cfg(not(test))]
+    let (mut projection, coordinator_document) = {
+        let verified = load_verified_projection(&state_root, operation_id)?;
+        (verified.payload, verified.coordinator_document)
+    };
+    #[cfg(test)]
+    let mut projection = load_projection(&state_root, operation_id)?;
+    #[cfg(not(test))]
+    let (ports, material) = {
+        let composition = composition.lock().await;
+        (
+            composition.production_fabric_ports()?,
+            composition.resolve_verified_material(kernel, projection.claimed.material())?,
+        )
+    };
+    #[cfg(not(test))]
+    let mut fabric = restore_solo_fabric_async(
+        kernel,
+        &projection,
+        &coordinator_document,
+        state_root,
+        ports,
+        material,
+    )
+    .await?;
+    #[cfg(test)]
+    let mut fabric = {
+        let composition = composition.lock().await;
+        restore_solo_fabric(&composition, kernel, &projection)?
+    };
+    let attempt = AttemptId::new(projection.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    let worker = crate::agent_fabric::WorkerAck {
+        attempt_id: attempt.clone(),
+        worker_id: worker_id.to_owned(),
+    };
+    fabric.observe_worker_ack(&worker)?;
+    let record = crate::agent_fabric::AttemptResultRecord {
+        attempt_id: attempt,
+        result_digest: result_digest.to_owned(),
+    };
+    fabric.submit_attempt_result(&record)?;
+    projection.result_digest = Some(result_digest.to_owned());
+    {
+        let composition = composition.lock().await;
+        drive_fair_pull_after_release(&composition, &mut fabric, &mut projection)?;
+        solo_status(&composition, operation_id)
+    }
 }
 
 /// Ingests one bridge-projected tool result as attempt evidence for the

@@ -1003,6 +1003,49 @@ pub async fn solo_fair_pull_recovery(
     solo_agent_driver::solo_fair_pull_recovery(composition, kernel).await
 }
 
+/// Requests cancellation of the exact admitted attempt through the verified
+/// async seam (issue #2567 W5).
+///
+/// Thin wrapper over
+/// [`solo_agent_driver::solo_request_cancel_async`](crate::solo_agent_driver::solo_request_cancel_async):
+/// same retained operation as the sync leg, restored through the async seam
+/// so the control path works in a normal build. Event-driven and
+/// dispatcher-owned; the runtime tick installs no caller.
+pub async fn solo_request_cancel_async(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+    solo_agent_driver::solo_request_cancel_async(composition, kernel, operation_id).await
+}
+
+/// Ingests one worker observation through the verified async seam
+/// (issue #2567 W5).
+///
+/// Thin wrapper over
+/// [`solo_agent_driver::solo_ingest_result_async`](crate::solo_agent_driver::solo_ingest_result_async):
+/// same retained operation as the sync leg, restored through the async seam
+/// so the ingest path works in a normal build. Event-driven and
+/// dispatcher-owned; the runtime tick installs no caller.
+pub async fn solo_ingest_result_async(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+    worker_id: &str,
+    result_digest: &str,
+    observed_via: &str,
+) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+    solo_agent_driver::solo_ingest_result_async(
+        composition,
+        kernel,
+        operation_id,
+        worker_id,
+        result_digest,
+        observed_via,
+    )
+    .await
+}
+
 impl DaemonComposition {
     /// Composes the daemon only from a Host-approved authenticated Kernel port.
     ///
