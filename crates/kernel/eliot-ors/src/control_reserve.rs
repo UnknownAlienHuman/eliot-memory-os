@@ -1174,4 +1174,38 @@ mod tests {
             assert_eq!(row.owner_ref, bound.owner);
         }
     }
+
+    /// The transaction dimension of issue #1679: the same fail-closed property
+    /// as the durable face, applied to the slot dimension.
+    /// `normal_transaction_exhaustion_response` must never manufacture
+    /// pressure evidence for a normal transaction partition that still admits
+    /// work. Per I14.3 pressure evidence exists only for live saturation, so an
+    /// admitting partition refuses the response rather than reporting an
+    /// exhausted resource that is not exhausted.
+    #[test]
+    fn ors_transaction_exhaustion_response_refuses_an_admitting_partition() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_transactions(), 2);
+
+        let err = reserve
+            .normal_transaction_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-tx-admitting-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("an admitting partition must not produce pressure evidence");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.normal_transaction_slots",
+                ..
+            }
+        ));
+    }
 }
