@@ -2969,6 +2969,48 @@ impl NoMatchEvaluation {
         }
         Ok(())
     }
+
+    /// Binds the record to the admitted query and index revision (I21-09:17: the disposition binds query, source portfolio, coverage denominator, reference manifest, State Fence).
+    /// WHY a separate admitted side: the record carries PRESENTED values and this crate holds no predicate registry or admission ledger (stated residual on `NoMatchEvaluation`), so the admitted commitments must arrive from the retaining composition (live evaluator composition, #1762 OPEN); nothing is defaulted.
+    pub fn check_admitted_binding(
+        &self,
+        admitted: &AdmittedQueryCommitments,
+    ) -> Result<(), PortfolioError> {
+        if self.predicate_id != admitted.predicate_id {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.predicate_id",
+            });
+        }
+        if self.index_revision != admitted.index_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.index_revision",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The admitted query and index revision a no-match record is bound to
+/// (I21-09:17: the disposition binds the query the record answers).
+#[derive(Clone, Debug)]
+pub struct AdmittedQueryCommitments {
+    /// Exact identity of the admitted predicate.
+    pub predicate_id: String,
+    /// Exact revision of the admitted source/index.
+    pub index_revision: String,
+}
+
+impl AdmittedQueryCommitments {
+    /// Validates both commitments with the same text validation every
+    /// other identity in this file carries.
+    pub fn new(predicate_id: String, index_revision: String) -> Result<Self, PortfolioError> {
+        text(&predicate_id, "admitted_query.predicate_id")?;
+        text(&index_revision, "admitted_query.index_revision")?;
+        Ok(Self {
+            predicate_id,
+            index_revision,
+        })
+    }
 }
 
 /// Named constructor arguments for [`NoMatchEvaluationIssuer::new`]. Named
@@ -3128,13 +3170,18 @@ impl NoMatchEvaluationIssuer {
     /// ladder are all refused here, so no issuer exists that cannot attest the
     /// commitments it holds.
     ///
+    /// A mint under an unadmitted predicate/index refuses here (I21-09:17), so the issuer attests only admitted executions.
+    ///
     /// # Errors
     ///
     /// Returns a field error for a blank or malformed held commitment,
     /// [`PortfolioError::Conflict`] for an inverted currentness window, and
     /// [`PortfolioError::UnknownGrade`] for a ceiling outside the canonical
     /// ladder.
-    pub fn new(params: NoMatchEvaluationIssuerParams) -> Result<Self, PortfolioError> {
+    pub fn new(
+        params: NoMatchEvaluationIssuerParams,
+        admitted: &AdmittedQueryCommitments,
+    ) -> Result<Self, PortfolioError> {
         text(&params.predicate_id, "no_match_issuer.predicate_id")?;
         text(
             &params.predicate_revision,
@@ -3179,6 +3226,16 @@ impl NoMatchEvaluationIssuer {
             field: "no_match_issuer.proof_ceiling_grade",
         })?;
         grade_name(proof_ceiling_grade)?;
+        if params.predicate_id != admitted.predicate_id {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.predicate_id",
+            });
+        }
+        if params.index_revision != admitted.index_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.index_revision",
+            });
+        }
         Ok(Self {
             predicate_id: params.predicate_id,
             predicate_revision: params.predicate_revision,

@@ -354,34 +354,37 @@ fn issued_evaluation(
     manifest: &AuthorizedManifest,
     frozen_scope_digest: &str,
 ) -> NoMatchEvaluation {
-    let issuer = NoMatchEvaluationIssuer::new(NoMatchEvaluationIssuerParams {
-        predicate_id: "no-match/absent-valley-alloy".to_owned(),
-        predicate_revision: "r1".to_owned(),
-        predicate_form: "exists(snapshot_bytes, alloy == member_alloy) == false".to_owned(),
-        issuer_id: "evaluator-owner-700".to_owned(),
-        evaluator_id: "no-match-evaluator-700".to_owned(),
-        evaluator_revision: "evaluator-700.1".to_owned(),
-        admission_receipt_id: "admission-700.1".to_owned(),
-        fence: fence(),
-        work_scope: "propulsion thermal envelope".to_owned(),
-        scope_digest: frozen_scope_digest.to_owned(),
-        scope_revision: "scope-700.1".to_owned(),
-        denominator_digest: inquiry_denominator_digest(),
-        manifest_digest: manifest.canonical_digest().expect("manifest commitment"),
-        manifest_revision: ABSENCE_MANIFEST_REVISION,
-        index_revision: "index-700.1".to_owned(),
-        source_revision: "corpus-700.1".to_owned(),
-        // At or after every record's retrieval time and at or before the
-        // assessment instant, and the currentness bound at or after both, so the
-        // observation window covers this assessment rather than merely parsing.
-        observed_at_ms: 1_700_000_250_000,
-        current_until_ms: 1_700_000_400_000,
-        applicability: NoMatchApplicability::Current,
-        // Grade 2 is the weakest grade `source_params` gives every record, so a
-        // ceiling at that rank is checkable against the joined records rather
-        // than an overclaim `check_ceiling` would refuse.
-        proof_ceiling_grade: Some(2),
-    })
+    let issuer = NoMatchEvaluationIssuer::new(
+        NoMatchEvaluationIssuerParams {
+            predicate_id: "no-match/absent-valley-alloy".to_owned(),
+            predicate_revision: "r1".to_owned(),
+            predicate_form: "exists(snapshot_bytes, alloy == member_alloy) == false".to_owned(),
+            issuer_id: "evaluator-owner-700".to_owned(),
+            evaluator_id: "no-match-evaluator-700".to_owned(),
+            evaluator_revision: "evaluator-700.1".to_owned(),
+            admission_receipt_id: "admission-700.1".to_owned(),
+            fence: fence(),
+            work_scope: "propulsion thermal envelope".to_owned(),
+            scope_digest: frozen_scope_digest.to_owned(),
+            scope_revision: "scope-700.1".to_owned(),
+            denominator_digest: inquiry_denominator_digest(),
+            manifest_digest: manifest.canonical_digest().expect("manifest commitment"),
+            manifest_revision: ABSENCE_MANIFEST_REVISION,
+            index_revision: "index-700.1".to_owned(),
+            source_revision: "corpus-700.1".to_owned(),
+            // At or after every record's retrieval time and at or before the
+            // assessment instant, and the currentness bound at or after both, so the
+            // observation window covers this assessment rather than merely parsing.
+            observed_at_ms: 1_700_000_250_000,
+            current_until_ms: 1_700_000_400_000,
+            applicability: NoMatchApplicability::Current,
+            // Grade 2 is the weakest grade `source_params` gives every record, so a
+            // ceiling at that rank is checkable against the joined records rather
+            // than an overclaim `check_ceiling` would refuse.
+            proof_ceiling_grade: Some(2),
+        },
+        &admitted_query(),
+    )
     .expect("owner issuer");
     issuer
         .issue_for(
@@ -426,6 +429,18 @@ fn issuer_params_for(
         applicability: NoMatchApplicability::Current,
         proof_ceiling_grade: Some(2),
     }
+}
+
+/// The admitted query the suite's no-match records are bound to
+/// (I21-09:17): the predicate identity and index revision the
+/// frozen inquiry admitted, equal to the commitments
+/// [`issuer_params_for`] holds.
+fn admitted_query() -> AdmittedQueryCommitments {
+    AdmittedQueryCommitments::new(
+        "no-match/absent-valley-alloy".to_owned(),
+        "index-700.1".to_owned(),
+    )
+    .expect("admitted query")
 }
 
 /// The denominator digest of the single frozen inquiry this suite shares.
@@ -1171,7 +1186,7 @@ fn absence_issuer_blank_predicate_refused() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.predicate_id = String::new();
-    let err = NoMatchEvaluationIssuer::new(params)
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
         .expect_err("a blank predicate identity must be refused");
     // `Blank` renders as `{field} must be non-blank`, so the display is what
     // names the exact field path the constructor refused.
@@ -1200,8 +1215,8 @@ fn absence_issuer_blank_index_refused() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.index_revision = String::new();
-    let err =
-        NoMatchEvaluationIssuer::new(params).expect_err("a blank index identity must be refused");
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a blank index identity must be refused");
     let rendered = err.to_string();
     assert!(
         matches!(err, PortfolioError::Blank { .. }),
@@ -1210,6 +1225,53 @@ fn absence_issuer_blank_index_refused() {
     assert!(
         rendered.contains("no_match_issuer.index_revision"),
         "the refused field must be the index identity itself: {rendered}"
+    );
+}
+
+/// A well-formed predicate the admitted query does not carry is a
+/// different query, not a malformed one (issue #2893 W10/A2): every
+/// shape validation passes, so the admitted binding is what refuses
+/// the mint. Only `predicate_id` is mutated, so this names that
+/// binding alone.
+#[test]
+fn absence_unadmitted_predicate_refused_at_issuance() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a predicate the admitted query does not carry must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unadmitted predicate identity must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.predicate_id"),
+        "the refused field must be the predicate identity binding itself: {rendered}"
+    );
+}
+
+/// The same refusal on the other half of the admitted binding: a
+/// well-formed but unadmitted index revision passes every shape
+/// validation, so the admitted comparison is what refuses the mint.
+/// Only `index_revision` is mutated, so this names that binding alone.
+#[test]
+fn absence_unadmitted_index_refused_at_issuance() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.index_revision = "index-UNADMITTED.9".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("an index revision the admitted query does not carry must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unadmitted index revision must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.index_revision"),
+        "the refused field must be the index revision binding itself: {rendered}"
     );
 }
 
@@ -1230,14 +1292,18 @@ fn absence_issuer_foreign_scope_refused() {
     // the mutated scope alone.
     let (account, records, manifest, _) = proven_absence();
     let scope_digest = inquiry_denominator_digest();
-    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
-        .expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
     issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("positive control issues");
 
-    let bad = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, DIGEST_A))
-        .expect("issuer holds another scope");
+    let bad =
+        NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, DIGEST_A), &admitted_query())
+            .expect("issuer holds another scope");
     let err = bad
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect_err("a foreign scope must be refused");
@@ -1272,7 +1338,7 @@ fn absence_issuer_manifest_revision_refused() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.manifest_revision = ABSENCE_MANIFEST_REVISION + 1;
-    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
     let err = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect_err("a manifest revision the issuer does not hold must be refused");
@@ -1366,8 +1432,11 @@ fn absence_issuer_open_enumeration_refused() {
     .expect("authorized manifest");
 
     let scope_digest = inquiry_denominator_digest();
-    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
-        .expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
     let err = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect_err("an unclosed enumeration must be refused");
@@ -1404,8 +1473,11 @@ fn absence_issuer_observation_window_refused() {
     // `issuer_params_for` holds `observed_at_ms = 1_700_000_250_000` and
     // `current_until_ms = 1_700_000_400_000`, so the two instants below sit just
     // outside either edge of that window.
-    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
-        .expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
 
     // Too early: the issuer is asked to attest an observation taken before it
     // observed anything.
@@ -1687,7 +1759,7 @@ fn absence_issuer_nonblank_predicate_refused() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.predicate_id = "no-match/absent-valley-alloy\u{7}".to_owned();
-    let err = NoMatchEvaluationIssuer::new(params)
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
         .expect_err("a control-bearing predicate identity must be refused");
     let rendered = err.to_string();
     assert!(
@@ -1706,7 +1778,7 @@ fn absence_issuer_nonblank_index_refused() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.index_revision = "index-700.1\u{7}".to_owned();
-    let err = NoMatchEvaluationIssuer::new(params)
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
         .expect_err("a control-bearing index revision must be refused");
     let rendered = err.to_string();
     assert!(
@@ -1792,13 +1864,19 @@ fn absence_closed_denominator_missing_result_is_unproven() {
 fn absence_replay_is_identical_under_one_identity() {
     let (account, records, manifest, _) = proven_absence();
     let scope_digest = inquiry_denominator_digest();
-    let issuer_a = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
-        .expect("owner issuer");
+    let issuer_a = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
     let eval_a = issuer_a
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("first issuance");
-    let issuer_b = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
-        .expect("owner issuer");
+    let issuer_b = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
     let eval_b = issuer_b
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("replayed issuance");
@@ -1823,7 +1901,7 @@ fn absence_replay_conflicts_on_changed_predicate() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.predicate_form = "exists(snapshot_bytes, alloy == other_alloy) == false".to_owned();
-    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
     let changed = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("changed issuance still issues");
@@ -1852,7 +1930,7 @@ fn absence_replay_conflicts_on_changed_source_revision() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.source_revision = "corpus-700.2".to_owned();
-    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
     let changed = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("changed issuance still issues");
@@ -1881,7 +1959,7 @@ fn absence_replay_conflicts_on_changed_evaluator() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.evaluator_id = "no-match-evaluator-701".to_owned();
-    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
     let changed = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("changed issuance still issues");
@@ -1944,8 +2022,11 @@ fn absence_replay_conflicts_on_changed_member_result() {
         revision: ABSENCE_MANIFEST_REVISION,
     })
     .expect("authorized manifest");
-    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
-        .expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
     let changed = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("changed issuance still issues");
@@ -1973,7 +2054,7 @@ fn absence_replay_conflicts_on_changed_work_scope() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.work_scope = "propulsion acoustic envelope".to_owned();
-    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
     let changed = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("changed issuance still issues");
@@ -2002,7 +2083,7 @@ fn absence_replay_conflicts_on_changed_scope_revision() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.scope_revision = "scope-700.2".to_owned();
-    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
     let changed = issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("changed issuance still issues");
@@ -2042,7 +2123,15 @@ fn absence_foreign_predicate_is_a_different_claim() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
-    let foreign_issuer = NoMatchEvaluationIssuer::new(params).expect("foreign issuer");
+    let foreign_issuer = NoMatchEvaluationIssuer::new(
+        params,
+        &AdmittedQueryCommitments::new(
+            "unadmitted-arbitrary-predicate".to_owned(),
+            "index-700.1".to_owned(),
+        )
+        .expect("foreign admitted"),
+    )
+    .expect("foreign issuer");
     let foreign = foreign_issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("well-formed foreign issuance still issues");
@@ -2076,7 +2165,15 @@ fn absence_foreign_predicate_assessment_pins_retained_gap() {
     let scope_digest = inquiry_denominator_digest();
     let mut params = issuer_params_for(&manifest, &scope_digest);
     params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
-    let foreign_issuer = NoMatchEvaluationIssuer::new(params).expect("foreign issuer");
+    let foreign_issuer = NoMatchEvaluationIssuer::new(
+        params,
+        &AdmittedQueryCommitments::new(
+            "unadmitted-arbitrary-predicate".to_owned(),
+            "index-700.1".to_owned(),
+        )
+        .expect("foreign admitted"),
+    )
+    .expect("foreign issuer");
     let foreign = foreign_issuer
         .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
         .expect("well-formed foreign issuance still issues");
