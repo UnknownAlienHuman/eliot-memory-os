@@ -2078,4 +2078,37 @@ mod tests {
         assert!(matches!(err, KernelError::ControlReserveExhausted));
         Ok(())
     }
+
+    /// Legacy control saturation leaves normal capacity available
+    /// (issue #1679): the neighbour above pins only that the
+    /// protected slot is spent and refuses; it never proves the
+    /// spend did not borrow from normal. Holding the spent
+    /// protected permit while normal work still acquires pins the
+    /// cross-partition guarantee (I14.3: the protected partition
+    /// is preallocated and non-borrowable, so spending it never
+    /// reduces normal capacity).
+    #[test]
+    fn legacy_control_saturation_leaves_normal_capacity_available() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([44u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 1, 8)?;
+
+        // Spend the single legacy control slot: the permit releases
+        // on drop, so holding it keeps the protected partition spent.
+        let _held = front_door
+            .acquire_control()
+            .expect("legacy protected acquire");
+        assert_eq!(front_door.available_control(), 0);
+
+        // Positive control: normal work still acquires while the
+        // protected partition is spent, so a cross-partition leak
+        // would fail here.
+        let _held_normal = front_door
+            .acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-norm-1")
+            .expect("normal path stays open while protected spent");
+        assert_eq!(front_door.available_normal(), 1);
+        Ok(())
+    }
 }
