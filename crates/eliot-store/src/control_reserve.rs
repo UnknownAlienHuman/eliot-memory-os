@@ -1493,4 +1493,46 @@ mod tests {
             .expect("returned slot");
         assert_eq!(reserve.available_normal_connections(), 0);
     }
+
+    /// A dropped protected permit returns its slot exactly once (issue
+    /// #1679): the `Drop` match routes by capacity class, so a protected
+    /// connection permit restores the protected partition - never the normal
+    /// one - and a fresh control operation can then re-acquire the returned
+    /// slot (A7 release-at-most-once on the protected path).
+    #[test]
+    fn store_dropped_protected_permit_returns_slot_exactly_once() {
+        let reserve = StoreReserve::partitioned(
+            2,
+            1,
+            2,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_protected_connections(), 1);
+
+        let permit = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-prel-1",
+            )
+            .expect("protected connection slot");
+        assert_eq!(reserve.available_protected_connections(), 0);
+
+        // `StorePermit` exposes no release method: drop is the only
+        // release path, and it returns the protected slot exactly once.
+        drop(permit);
+        assert_eq!(reserve.available_protected_connections(), 1);
+
+        let _permit = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-prel-2",
+            )
+            .expect("returned slot");
+        assert_eq!(reserve.available_protected_connections(), 0);
+    }
 }
