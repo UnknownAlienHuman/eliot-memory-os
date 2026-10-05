@@ -1163,6 +1163,32 @@ mod tests {
         ));
     }
 
+    /// The Store constructor floor (issue #1679) applies to the transaction
+    /// partition exactly as it does to the connection partition: a reserve
+    /// with no normal transaction partition can never admit Store work, so
+    /// building one must fail at build (I14.3: partitions are non-borrowable;
+    /// zero capacity is a build error, not a runtime surprise).
+    #[test]
+    fn store_partitioned_zero_normal_transactions_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            4,
+            4,
+            0,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero normal transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.normal_transaction_slots",
+                ..
+            }
+        ));
+    }
+
     /// Owner-identity validation at acquisition (issue #1679 A10): every
     /// permit binds owner and operation identity, so a blank owner is
     /// refused by name at acquisition instead of yielding a permit that
