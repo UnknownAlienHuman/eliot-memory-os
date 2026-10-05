@@ -320,3 +320,53 @@ impl FrontDoor {
         )
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn genesis_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch")
+    }
+
+    /// The positive complement of
+    /// `normal_saturation_response_refuses_an_unsaturated_partition` in
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
+    /// that test pins refusal while capacity remains, this one pins a real
+    /// `BUSY` report once normal capacity is truly gone, so pressure evidence is
+    /// reported only while the partition is live-saturated.
+    #[test]
+    fn normal_saturation_response_reports_live_saturation_as_busy() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([17u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single normal slot is consumed and held: the permit releases on
+        // drop, so the response below observes the live saturated partition.
+        let _held =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-fill-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        let response = front_door.normal_saturation_response(
+            NormalWorkClass::Interactive,
+            "op-report-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert!(matches!(
+            response.disposition,
+            eliot_runtime_contracts::BackpressureDisposition::Busy
+        ));
+        Ok(())
+    }
+}
