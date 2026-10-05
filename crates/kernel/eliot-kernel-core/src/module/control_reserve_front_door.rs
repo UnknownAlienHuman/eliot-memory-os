@@ -1981,6 +1981,25 @@ mod tests {
     }
 
     #[test]
+    fn ledger_zero_capacity_fails_closed() -> Result<(), KernelError> {
+        // The ledger constructor floor (issue #1679, A7): a zero-capacity
+        // idempotency ledger cannot order any entry, so building one fails
+        // at build instead of producing a ledger that evicts everything
+        // (exact replay needs a real ledger).
+        let Err(err) = IdempotencyLedger::new(0) else {
+            panic!("zero ledger capacity must fail at build");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "idempotency_ledger.capacity",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn ledger_evicts_oldest_when_full() -> Result<(), KernelError> {
         let mut ledger = IdempotencyLedger::new(2)?;
         ledger.record(
