@@ -969,6 +969,35 @@ fn absence_requires_complete_authoritative_lookup() {
     ));
 }
 
+#[test]
+fn absence_substituted_record_is_unproven() {
+    // A substituted record is the same evidence with the handle/identity binding
+    // broken: the accounting handle `src-primary#0` resolves to a vetted record
+    // whose own handle is `src-intruder`. Completeness is proved on the frozen
+    // scope (I21-06: `complete_scope` is the only basis on which a scoped absence
+    // may be claimed), so a member closed against a record that is not itself that
+    // member's record cannot support `Proven`.
+    let (account, mut records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    records.insert("src-primary#0".to_owned(), record("src-intruder"));
+    let substituted = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(evaluation),
+    )
+    .expect("preconditions over a substituted record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &substituted) else {
+        panic!("a substituted vetted record must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=record_handle_mismatch"),
+        "the substituted member and its specific unmet join must be retained: {reason}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
