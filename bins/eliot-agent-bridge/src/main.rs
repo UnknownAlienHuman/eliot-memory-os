@@ -2,6 +2,7 @@
 
 mod hook_intake;
 mod host_event_oneshot;
+mod packager_prompts;
 mod request_input;
 
 use eliot_agent_bridge::opencode_host_events::{
