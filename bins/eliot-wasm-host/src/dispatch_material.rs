@@ -1407,13 +1407,30 @@ fn reclaim_aside_path(
     ))
 }
 
-/// Removes orphaned aside files for one fixed staging name. Every aside
-/// predates this call, so under the single-driver rule (one child driver
-/// per install directory; the publisher never writes aside names) each
-/// one is a crash-window orphan whose fixed set already moved on. Bounded
-/// scan; failures are ignored because a leftover aside is inert evidence,
-/// never a live name. Callers run this only while the fixed name exists.
+/// Parses one aside name into its (generation, writer pid):
+/// `.{file}.g{generation:020}.{fragment}.{pid}.reclaiming`. Anything else
+/// is not an aside this code wrote.
+fn parse_reclaim_aside(name: &str, file_name: &str) -> Option<(u64, u32)> {
+    let rest = name.strip_prefix(&format!(".{file_name}."))?;
+    let rest = rest.strip_suffix(RECLAIM_ASIDE_SUFFIX)?;
+    let (generation_part, rest) = rest.split_once('.')?;
+    let generation = generation_part.strip_prefix('g')?.parse::<u64>().ok()?;
+    let pid = rest.rsplit('.').next()?.parse::<u32>().ok()?;
+    Some((generation, pid))
+}
+
+/// Removes orphaned aside files for one fixed staging name (issue #2786
+/// AUD5): only asides whose writer is provably gone are swept. The writer
+/// pid is embedded in every aside name, and under the single-driver rule
+/// (one child driver per install directory; the publisher never writes
+/// aside names) a pid that is not this process's is a dead writer whose
+/// claim died with it. A live writer's aside — our own earlier aside from
+/// this run — is never deleted, and neither is a name this code cannot
+/// parse. Bounded scan; failures are ignored because a leftover aside is
+/// inert evidence, never a live name. Callers run this only while the
+/// fixed name exists.
 fn remove_stale_reclaim_asides(install_dir: &std::path::Path, file_name: &str) {
+    let ours = std::process::id();
     let prefix = format!(".{file_name}.");
     let Ok(entries) = std::fs::read_dir(install_dir) else {
         return;
@@ -1423,8 +1440,14 @@ fn remove_stale_reclaim_asides(install_dir: &std::path::Path, file_name: &str) {
         let Some(text) = name.to_str() else {
             continue;
         };
-        if text.starts_with(&prefix) && text.ends_with(RECLAIM_ASIDE_SUFFIX) {
-            let _ = std::fs::remove_file(entry.path());
+        if !text.starts_with(&prefix) || !text.ends_with(RECLAIM_ASIDE_SUFFIX) {
+            continue;
+        }
+        match parse_reclaim_aside(text, file_name) {
+            Some((_, pid)) if pid != ours => {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            _ => {}
         }
     }
 }
@@ -3613,6 +3636,43 @@ mod tests {
         );
         assert!(clear_inflight_marker(&dir, &inflight_identity("claim-a")));
         assert!(dir.join(WASM_HOST_INFLIGHT_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep removes only a dead writer's aside.
+    #[test]
+    fn sweep_removes_dead_writer_aside() {
+        let dir = inflight_dir("eliot-2786-aside-dead");
+        let dead = dir.join(format!(
+            ".probe-file.bin.g{:020}.frag-claim.{}.reclaiming",
+            7,
+            u32::MAX
+        ));
+        std::fs::write(&dead, b"orphan").expect("aside writable");
+        remove_stale_reclaim_asides(&dir, "probe-file.bin");
+        assert!(!dead.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Our own aside from this run is never swept.
+    #[test]
+    fn sweep_keeps_live_writer_aside() {
+        let dir = inflight_dir("eliot-2786-aside-live");
+        let live = reclaim_aside_path(&dir, "probe-file.bin", &inflight_identity("claim-a"));
+        std::fs::write(&live, b"evidence").expect("aside writable");
+        remove_stale_reclaim_asides(&dir, "probe-file.bin");
+        assert!(live.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name the parser cannot attribute is never deleted.
+    #[test]
+    fn sweep_keeps_unparseable_name() {
+        let dir = inflight_dir("eliot-2786-aside-unparseable");
+        let strange = dir.join(".probe-file.bin.garbage.reclaiming");
+        std::fs::write(&strange, b"strange").expect("aside writable");
+        remove_stale_reclaim_asides(&dir, "probe-file.bin");
+        assert!(strange.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

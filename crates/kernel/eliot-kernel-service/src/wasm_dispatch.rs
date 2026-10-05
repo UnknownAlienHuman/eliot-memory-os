@@ -2089,6 +2089,13 @@ fn stage_and_expose_delivery(
 /// removes another generation: each removal names one exact non-live
 /// slot path. Best-effort and bounded; failures stay as disk residual
 /// and never fail the publication.
+///
+/// Deterministic per-removal guard (issue #2786 A2): a candidate is
+/// removed only when it still carries a parsable slot marker and still
+/// does not own the live fixed names, verified immediately before the
+/// removal. A concurrent publisher's fresh slot either has no marker yet
+/// (kept as crash-window residue) or owns the live names by now (kept),
+/// so no completion path deletes a set another publisher is staging.
 fn prune_delivery_slots(
     slots: &std::path::Path,
     live_envelope_digest: Option<&str>,
@@ -2115,14 +2122,14 @@ fn prune_delivery_slots(
         if name == current_slot_name {
             continue;
         }
-        if let Some(live) = live_envelope_digest {
-            let live_slot = read_slot_state(&slots.join(&name))
-                .is_some_and(|state| state.identity().envelope_digest == live);
-            if live_slot {
-                continue;
-            }
+        let slot = slots.join(&name);
+        let Some(state) = read_slot_state(&slot) else {
+            continue;
+        };
+        if live_envelope_digest.is_some_and(|live| state.identity().envelope_digest == live) {
+            continue;
         }
-        if std::fs::remove_dir_all(slots.join(&name)).is_ok() {
+        if std::fs::remove_dir_all(&slot).is_ok() {
             removed = removed.saturating_add(1);
         }
     }
@@ -2740,6 +2747,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.join("00000000000000000007-aaaaaaaaaaaaaaaa"));
         let _ = std::fs::remove_dir_all(dir.join("00000000000000000007-bbbbbbbbbbbbbbbb"));
         assert_eq!(slot_revision_for(&dir, 7), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn marked_slot(slots: &std::path::Path, name: &str, revision: u64) {
+        let slot = slots.join(name);
+        std::fs::create_dir_all(&slot).expect("slot dir writable");
+        std::fs::write(
+            slot.join(WASM_DELIVERY_READY_FILE_NAME),
+            serde_json::to_vec(&WasmPublicationState::Ready {
+                identity: revision_identity(revision),
+            })
+            .expect("marker serializes"),
+        )
+        .expect("marker writable");
+    }
+
+    /// Pruning removes the oldest marked non-live slot and keeps the
+    /// current one; markerless crash residue is never deleted.
+    #[test]
+    fn prune_removes_oldest_marked_keeps_current_and_residue() {
+        let dir = stage_dir("eliot-2786-prune-oldest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        for revision in 1..=9u64 {
+            marked_slot(
+                &dir,
+                &format!("00000000000000000007-{revision:016x}"),
+                revision,
+            );
+        }
+        std::fs::create_dir_all(dir.join("00000000000000000007-residue"))
+            .expect("residue dir writable");
+        prune_delivery_slots(&dir, None, "00000000000000000007-0000000000000009");
+        assert!(!dir.join("00000000000000000007-0000000000000001").exists());
+        assert!(dir.join("00000000000000000007-0000000000000009").exists());
+        assert!(dir.join("00000000000000000007-residue").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning never removes the slot that owns the live fixed names.
+    #[test]
+    fn prune_keeps_live_owning_slot() {
+        let dir = stage_dir("eliot-2786-prune-live");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        for revision in 1..=9u64 {
+            marked_slot(
+                &dir,
+                &format!("00000000000000000007-{revision:016x}"),
+                revision,
+            );
+        }
+        prune_delivery_slots(
+            &dir,
+            Some(&"e".repeat(64)),
+            "00000000000000000007-0000000000000009",
+        );
+        for revision in 1..=9u64 {
+            assert!(
+                dir.join(format!("00000000000000000007-{revision:016x}"))
+                    .exists()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
