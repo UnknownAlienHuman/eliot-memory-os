@@ -27,15 +27,21 @@
 
 use eliot_protocol::backup::BackupClassWire;
 
+#[cfg(all(windows, feature = "test-support"))]
+use super::test_commit_fence;
 use super::{must, registering_transaction, test_activation_approval, test_handle};
 use crate::isolated_destination::{
     DestinationLeafObservation, IsolationEvidence, PreparedDestinationAdmission,
     PreparedDestinationMaterialisation, ProposedRestorationRequirements,
     destination_generation_for_admission, resolve_current_approved_target,
 };
+#[cfg(all(windows, feature = "test-support"))]
+use eliot_platform_windows::{HostOwnerLease, UserOwnedRootLease};
 // The real-filesystem cases below drive the materialise seam itself, which needs
 // a retained protected-root lease and therefore a real Windows contour. The
 // import is gated with them so it is never an unused import elsewhere.
+#[cfg(all(windows, feature = "test-support"))]
+use crate::RedbInstallationRegistry;
 #[cfg(windows)]
 use crate::isolated_destination::materialise_prepared_isolated_destination;
 use crate::{
@@ -1220,4 +1226,201 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
     );
 
     area.release();
+}
+
+/// The DURABLE proof: the creation pair is recorded through the real owner
+/// compare-and-swap seam into a real redb registry, survives a close +
+/// reopen, and a stale revision can no longer write.
+///
+/// # Why this case exists
+///
+/// Every case above proves the DECISION through the in-memory projection.
+/// The CS2 return on the stitch request refused exactly that: the added
+/// installation tests used the `*_unchecked` in-memory helpers rather than
+/// redb CAS/readback. Four Bunny attempts then died on the fixture (a
+/// single-field `host_state_root` override violates the installation
+/// profile, and a `from_database_for_test` registry can never pass the
+/// owner binding, which demands a retained installation Host root). This
+/// case builds the whole contour instead: the fixture's own approved-row
+/// builder (whose roots stay its own consistent set), a current-user Host
+/// lease AT that manifest's own `host_state_root` (the PortableDev
+/// registry contour only demands the root be the explicit Host state
+/// child), a registry opened on that lease, a Host-owner capability
+/// acquired for the seeded installation, a real on-disk materialisation,
+/// and the production `record_prepared_isolated_destination_creation`
+/// seam.
+///
+/// # What fails without the change
+///
+/// A directory-only implementation has no registry write at all, so the
+/// readback finds nothing; an in-memory-only record does not survive the
+/// reopen; and a lost-response repeat carrying the pre-write revision is
+/// refused by the fence instead of forking the record.
+///
+/// # Ownership
+///
+/// See [`LiveArea::release`]: every path below is created by THIS operation
+/// under names unique to this case. The registry owner is dropped before
+/// the area release removes the staging tree that holds the redb file.
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn redb_cas_records_the_creation_and_a_reopen_reads_it_back() {
+    let transaction = registering_transaction();
+    // The source row through the fixture's own builder, never hand-written:
+    // its roots stay the portable fixture's own consistent set, so every
+    // descriptor-bound field (store arguments, work roots, digests) keeps
+    // the binding the fixture constructor proved. The registry Host lease
+    // below is opened AT this manifest's own host_state_root instead of
+    // overriding any field to meet the test.
+    let source_installation = installation_key("a");
+    let source_row = approved_generation(&source_installation, "generation-958-redb", true);
+    let source_generation = source_row.manifest.generation.clone();
+    let fence = test_commit_fence(&source_row.manifest);
+    // The manifest's own host_state_root under a current-user lease: the
+    // PortableDev registry contour only demands the root BE the explicit
+    // Host state child, so the fixture's own portable shape satisfies it
+    // with no elevation and no protected-contour override.
+    let host_path = std::path::PathBuf::from(
+        source_row
+            .manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    std::fs::create_dir_all(&host_path).expect("this operation owns its Host state child");
+    let host_lease = UserOwnedRootLease::open_existing(&host_path)
+        .expect("the registry Host root admits a retained current-user lease");
+    // The isolated area: the destination under it is classified Unowned
+    // against the ProgramData-shaped declared roots, which is the condition
+    // the materialise pre-effect proof requires.
+    let area = live_isolated_area("redb-creation");
+    // The Host-owner capability for the SEEDED installation: the record seam
+    // binds the caller against the active generation's own installation
+    // identity, so a lease for any other name is refused here, not later.
+    let owner_lease = HostOwnerLease::acquire(&source_installation)
+        .expect("this operation acquires its own Host-owner lease");
+    let capability = owner_lease.activation_capability();
+    let registry = must(RedbInstallationRegistry::open_user_owned_at(
+        host_lease,
+        crate::InstallationProfile::PortableDev,
+    ));
+    must(registry.seed_active_generation_for_test_support(
+        &capability,
+        &source_row.manifest,
+        &transaction.transaction_id,
+        &transaction.installer_plan_digest,
+        &fence,
+    ));
+    // A genuinely new destination, admitted against the seeded generation,
+    // materialised for real: the receipt below carries the created object's
+    // live protected-root identity, never a constant.
+    let destination = installation_key("9");
+    let admission = live_admission(&area, &destination, &source_generation);
+    let materialisation = must(materialise_prepared_isolated_destination(
+        &admission,
+        &area.lease,
+        std::slice::from_ref(&source_row),
+        &source_generation,
+    ));
+    let allocation_fence = source_row
+        .manifest
+        .runtime_launch
+        .authority_state_fence
+        .clone();
+    let destination_generation = must(destination_generation_for_admission(
+        &source_row,
+        &admission.operation_id,
+        &admission.destination_installation,
+        &admission.admission_digest,
+        &allocation_fence,
+        &test_handle("owner:958-redb-creation"),
+    ));
+    let revision = must(registry.load()).revision();
+    let stored = must(registry.record_prepared_isolated_destination_creation(
+        &capability,
+        revision,
+        &admission,
+        &destination_generation,
+        &materialisation,
+        LIVE_PURGE_REVISION,
+    ));
+    assert_eq!(
+        stored, materialisation,
+        "the seam returns the stored creation receipt"
+    );
+    let assert_durable_pair = |projection: &ApprovedGenerationRegistry| {
+        assert_eq!(
+            projection.prepared_isolated_destination(&admission.operation_id),
+            Some(&admission),
+            "the admission survives as the exact record this operation wrote"
+        );
+        assert_eq!(
+            projection.prepared_destination_materialisation(&admission.operation_id),
+            Some(&materialisation),
+            "the creation receipt survives as the exact record this operation wrote"
+        );
+        let row = projection
+            .generations
+            .iter()
+            .find(|generation| {
+                generation.manifest.generation == destination_generation.manifest.generation
+            })
+            .expect("the destination generation row survives the write");
+        assert!(
+            !row.active,
+            "a prepared destination is recorded, never activated"
+        );
+        assert_eq!(
+            row.manifest.runtime_launch.installation_epoch.installation, destination,
+            "the row is written in the destination's own identity space"
+        );
+    };
+    assert_durable_pair(&must(registry.load()));
+    // The CAS half: the pre-write revision is stale now, so a lost-response
+    // repeat with it is refused by the fence instead of forking the record.
+    assert!(
+        matches!(
+            registry.record_prepared_isolated_destination_creation(
+                &capability,
+                revision,
+                &admission,
+                &destination_generation,
+                &materialisation,
+                LIVE_PURGE_REVISION,
+            ),
+            Err(InstallationError::CompareAndSaveConflict { .. })
+        ),
+        "a repeat with the pre-write revision is refused by the revision fence"
+    );
+    assert!(
+        materialisation
+            .destination_root_identity
+            .volume_serial_number
+            != 0
+            && materialisation.destination_root_identity.file_index != 0,
+        "the recorded receipt carries the created root's real protected-root identity"
+    );
+    // The durability half: close the database, reopen the same file under a
+    // fresh lease, and read the pair back byte-equal.
+    drop(registry);
+    let host_lease = UserOwnedRootLease::open_existing(&host_path)
+        .expect("the registry Host root re-admits a retained lease after close");
+    let registry = must(RedbInstallationRegistry::open_existing_user_owned_at(
+        host_lease,
+        crate::InstallationProfile::PortableDev,
+    ))
+    .expect("the registry file created above reopens");
+    assert_durable_pair(&must(registry.load()));
+    drop(registry);
+    drop(owner_lease);
+    area.release();
+    // The fixture transaction root that holds the manifest's portable tree
+    // (and the registry file just proved) belongs to this operation alone:
+    // every registering_transaction root carries a unique sequence.
+    let transaction_root = host_path
+        .parent()
+        .and_then(|portable| portable.parent())
+        .expect("the Host state child lives two leaves below its transaction root");
+    let _ = std::fs::remove_dir_all(transaction_root);
 }
