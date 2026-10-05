@@ -711,8 +711,10 @@ pub enum CounterSearchStatus {
 /// ran over a closed population; when nothing was enumerated the same empty
 /// eligible set is an absent measurement and stays `Uninitialised`.
 ///
-/// A *verified empty* eligible scope is a state this vocabulary cannot
-/// currently express, and no placeholder member is invented to close that gap:
+/// A *verified empty* eligible scope is a state this vocabulary now expresses
+/// through the [`Self::VerifiedEmpty`] variant, and no placeholder member is
+/// invented to carry it. The two construction gates stay closed until later W1
+/// slices open them with run evidence:
 /// [`crate::evidence_portfolio::CoverageAccount::open`] refuses a zero-member
 /// denominator and [`CoverageReceipt::compute`] refuses a zero expected-member
 /// count, so an inquiry whose admitted manifest declares no member produces no
@@ -726,6 +728,11 @@ pub enum EnumerationState {
     Incomplete,
     /// The enumeration ran and every declared member closed intact.
     Complete,
+    /// The enumeration ran over the closed population and the eligible set is
+    /// provably empty. Distinct from `Uninitialised`: an enumeration that never
+    /// ran leaves an absent measurement, never this state. No placeholder member
+    /// is ever invented to carry it.
+    VerifiedEmpty,
 }
 
 impl EnumerationState {
@@ -736,6 +743,7 @@ impl EnumerationState {
             Self::Uninitialised => "uninitialised",
             Self::Incomplete => "incomplete",
             Self::Complete => "complete",
+            Self::VerifiedEmpty => "verified_empty",
         }
     }
 }
