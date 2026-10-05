@@ -2051,4 +2051,31 @@ mod tests {
         assert!(front_door.available_emergency() > 0);
         Ok(())
     }
+
+    /// The legacy ownerless control path spends exactly the
+    /// preallocated protected slot (issue #1679): the migration-only
+    /// `acquire_control` draws from the protected partition with
+    /// legacy attribution, so saturating it never touches normal
+    /// capacity (I14.3: the protected partition is preallocated and
+    /// non-borrowable).
+    #[test]
+    fn legacy_control_acquire_spends_the_single_protected_slot() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([44u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 1, 8)?;
+
+        assert_eq!(front_door.available_control(), 1);
+        let _held = front_door
+            .acquire_control()
+            .expect("legacy protected acquire");
+        assert_eq!(front_door.available_control(), 0);
+
+        let err = front_door
+            .acquire_control()
+            .expect_err("spent protected slot must refuse");
+        assert!(matches!(err, KernelError::ControlReserveExhausted));
+        Ok(())
+    }
 }
