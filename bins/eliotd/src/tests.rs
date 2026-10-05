@@ -322,3 +322,66 @@ async fn receipt_publication_race_retries_only_exact_pre_admission_failures()
     assert_eq!(substituted_attempts.load(Ordering::Relaxed), 1);
     Ok(())
 }
+
+#[test]
+fn production_ports_order_refuses_at_first_missing_port() {
+    let ports = FabricPorts {
+        model_registry: std::sync::Arc::new(crate::ProductionModelRegistryPort),
+        peer_channel: std::sync::Arc::new(crate::ProductionPeerChannelPort),
+        swarm_control: std::sync::Arc::new(crate::ProductionSwarmControlPort),
+        admission_authority: std::sync::Arc::new(crate::ProductionAdmissionAuthorityPort),
+        activation_authority: std::sync::Arc::new(crate::ProductionActivationAuthorityPort),
+        dispatch_egress: std::sync::Arc::new(crate::ProductionDispatchEgressPort),
+    };
+    assert_eq!(
+        ports.model_registry.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.peer_channel.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.swarm_control.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.admission_authority.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.activation_authority.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.dispatch_egress.interface_binding(),
+        PortBindingState::Missing
+    );
+    let order = [
+        (
+            FabricOperation::ResolveModelRoute,
+            FabricPortId::ModelRegistry,
+        ),
+        (
+            FabricOperation::StageReservation,
+            FabricPortId::AdmissionAuthority,
+        ),
+        (
+            FabricOperation::CommitAdmission,
+            FabricPortId::AdmissionAuthority,
+        ),
+        (FabricOperation::Activate, FabricPortId::ActivationAuthority),
+        (FabricOperation::Emit, FabricPortId::DispatchEgress),
+    ];
+    for (operation, port) in order {
+        assert_eq!(operation.required_port(), port);
+        match crate::blocked_port(port, operation, "work-2567-1".to_owned(), None, None) {
+            FabricError::MissingPrerequisite(residual) => {
+                assert_eq!(residual.port, port);
+                assert_eq!(residual.state, PortBindingState::Missing);
+                assert_eq!(residual.blocked_operation, operation);
+            }
+            other => panic!("expected typed residual for {operation:?}, got {other:?}"),
+        }
+    }
+}
