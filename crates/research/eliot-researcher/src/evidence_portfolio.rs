@@ -2901,6 +2901,67 @@ impl NoMatchEvaluation {
         }
         Ok(())
     }
+
+    /// Refuses two records that share one admitted identity but attest different execution.
+    ///
+    /// I05-27 (`docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md:18`):
+    /// reusing an identity key with a different canonical hash returns
+    /// `IDENTITY_CONFLICT` and performs no transition. The admitted identity here
+    /// is (`predicate_id`, `admission_receipt_id`); the execution content is the
+    /// predicate revision and bytes, the evaluator identity and revision, the
+    /// index and source revisions, and the per-member results. Records under
+    /// different identities are different claims and nothing is compared.
+    /// Observation window, scope, manifest, fence, applicability and ceiling are
+    /// NOT compared: re-scoping or re-windowing is re-admission under a new
+    /// receipt, not a replay of this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Conflict`] naming the first diverged execution
+    /// field when both records carry the same admitted identity.
+    pub fn check_replay_consistency(&self, other: &Self) -> Result<(), PortfolioError> {
+        if self.predicate_id != other.predicate_id
+            || self.admission_receipt_id != other.admission_receipt_id
+        {
+            return Ok(());
+        }
+        if self.predicate_revision != other.predicate_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.predicate_revision",
+            });
+        }
+        if self.predicate_form != other.predicate_form {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.predicate_form",
+            });
+        }
+        if self.evaluator_id != other.evaluator_id {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.evaluator_id",
+            });
+        }
+        if self.evaluator_revision != other.evaluator_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.evaluator_revision",
+            });
+        }
+        if self.index_revision != other.index_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.index_revision",
+            });
+        }
+        if self.source_revision != other.source_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.source_revision",
+            });
+        }
+        if self.results != other.results {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.results",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Named constructor arguments for [`NoMatchEvaluationIssuer::new`]. Named
