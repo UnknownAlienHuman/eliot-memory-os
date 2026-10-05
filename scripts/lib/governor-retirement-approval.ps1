@@ -3041,8 +3041,8 @@ function Resolve-GovernorRetirementApprovalBinding(
         issuer_receipt_chain_trusted = if ($ReceiptVerification) { [string]$ReceiptVerification.certificate_chain_trusted } else { 'false' }
         issuer_receipt_revocation = if ($ReceiptVerification) { [string]$ReceiptVerification.revocation } else { 'NOT_CHECKED' }
         approver_principal = [string]$shape.approver_principal
-        trust_root_ref = [string]$TrustPolicy.trust_root_ref
-        trust_root_commit = [string]$TrustPolicy.trust_root_commit
+        trust_root_ref = [string]$TrustPolicy.ref
+        trust_root_commit = [string]$TrustPolicy.commit
         trust_policy_sha256 = [string]$TrustPolicy.trust_policy_sha256
         verifier_sha256 = [string]$TrustPolicy.verifier_sha256
         verifier_blob = [string]$TrustPolicy.verifier_blob
