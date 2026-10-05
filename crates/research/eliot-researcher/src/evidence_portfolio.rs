@@ -1716,6 +1716,67 @@ impl CoverageAccount {
         })
     }
 
+    /// Opens accounting over a verified empty eligible scope: the run
+    /// examined candidates, but the frozen denominator declared none.
+    ///
+    /// Norm `docs/architecture/I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md:32`
+    /// makes `complete_scope` the only absence basis, and the
+    /// `EnumerationState::VerifiedEmpty` vocabulary block in
+    /// `inquiry_governance.rs` (the "What one run actually established"
+    /// doc paragraph) is the vocabulary this constructor answers. An
+    /// enumeration that never ran leaves an absent measurement, never a
+    /// verified-empty scope, so an empty `examined` slice is refused with
+    /// the same [`PortfolioError::IncompleteDenominator`] [`Self::open`]
+    /// uses for its zero-member refusal. Otherwise every examined item is
+    /// fed through [`Self::observe`], so examined bindings get identical
+    /// shape validation plus idempotent-or-conflict semantics — a changed
+    /// binding under a retained handle conflicts instead of overwriting —
+    /// and no placeholder member is inserted: `expected` and `outcomes`
+    /// stay empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::IncompleteDenominator`] when `examined`
+    /// is empty, and [`Self::observe`]'s error for a malformed or
+    /// conflicting examined binding.
+    pub fn open_verified_empty(examined: &[ObservedOutsideScope]) -> Result<Self, PortfolioError> {
+        if examined.is_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "coverage.expected",
+            });
+        }
+        let mut account = Self {
+            expected: BTreeSet::new(),
+            outcomes: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
+            frontier: None,
+            observed: BTreeMap::new(),
+        };
+        for item in examined {
+            account.observe(
+                &item.handle,
+                item.disposition,
+                &item.content_digest,
+                &item.operation_id,
+                &item.admitted_manifest_digest,
+            )?;
+        }
+        Ok(account)
+    }
+
+    /// Whether this account is a verified empty scope: an empty expected
+    /// denominator that only [`Self::open_verified_empty`] can produce,
+    /// with a non-empty observed population proving the run examined
+    /// candidates. `open` refuses every empty denominator, so an empty
+    /// `expected` can only come from that constructor, and a non-empty
+    /// `observed` proves the run examined candidates — the predicate
+    /// exactly characterizes that constructor's products with no flag to
+    /// drift.
+    #[must_use]
+    pub fn is_verified_empty(&self) -> bool {
+        self.expected.is_empty() && !self.observed.is_empty()
+    }
+
     /// Records one disposition for one expected member, with the acquiring
     /// source handle when one exists. A repeated delivery of the identical
     /// member/disposition/handle binding is idempotent; any changed binding
