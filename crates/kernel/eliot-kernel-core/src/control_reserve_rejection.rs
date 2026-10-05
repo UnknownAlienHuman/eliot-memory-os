@@ -370,6 +370,47 @@ mod tests {
         Ok(())
     }
 
+    /// The bottleneck-identity complement of
+    /// `normal_saturation_response_reports_live_saturation_as_busy`
+    /// (issue #1679): that test pins only the `Busy` disposition, while
+    /// this one pins WHICH bottleneck the report names, so a report
+    /// naming the wrong bottleneck fails here while still showing
+    /// `Busy` there. The observation binds the front-door bottleneck
+    /// in its exact unit (`docs/architecture/I14-04-backpressure-responses.md:13`:
+    /// every response includes a RecoveryDirective naming the real
+    /// bottleneck).
+    #[test]
+    fn normal_saturation_response_binds_front_door_bottleneck_in_exact_unit()
+    -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([17u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single normal slot is consumed and held: the permit releases on
+        // drop, so the response below observes the live saturated partition.
+        let _held =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-fill-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        let response = front_door.normal_saturation_response(
+            NormalWorkClass::Interactive,
+            "op-report-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert_eq!(response.directive.bottlenecks.len(), 1);
+        assert_eq!(
+            response.directive.bottlenecks[0].bottleneck,
+            FRONT_DOOR_BOTTLENECK
+        );
+        assert_eq!(
+            response.directive.bottlenecks[0].unit,
+            FRONT_DOOR_BOTTLENECK.unit()
+        );
+        Ok(())
+    }
+
     /// The positive complement of
     /// `protected_exhaustion_response_refuses_a_remaining_partition` in
     /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
