@@ -133,11 +133,6 @@ const TRUSTED_CLI_LIVE_SIGNING_TEST: &str =
 /// cannot silently fall behind the declared consumer set.
 pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
     ConsumerSurface {
-        path: "integrations/opencode/plugins/eliot.js",
-        live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
-        body: OPENCODE_PLUGIN,
-    },
-    ConsumerSurface {
         path: "scripts/build-eliot-windows-x64-release.ps1",
         live_reference: "integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe",
         body: WINDOWS_RELEASE_BUILD,
@@ -1114,13 +1109,6 @@ const INVENTORY_REVISION: &str = "2026-09-25";
 pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
     &[
         ConsumerEntry {
-            consumer: "OpenCode host integration",
-            proof: "integrations/opencode/plugins/eliot.js",
-            live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when OpenCode resolves its governor executable to a current root binary under #13",
-        },
-        ConsumerEntry {
             consumer: "Windows x64 release bundle staging",
             proof: "scripts/build-eliot-windows-x64-release.ps1",
             live_reference: "integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe",
@@ -1367,6 +1355,14 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (Desktop MCPB server)",
         evidence: "the bundle paragraph names the packaged bridge server and its no-Governor construction claim from the tracked manifest long_description",
     },
+    MigratedConsumerEdge {
+        consumer: "OpenCode host integration",
+        proof: "integrations/opencode/plugins/eliot.js",
+        legacy_reference: "host-integrations/opencode/bin/eliot-governor.exe",
+        current_owner_reference: "host-integrations/opencode/bin/eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge one-shot host-event intake (host_event_oneshot.rs)",
+        evidence: "bridge argv host-event --host opencode --event <kind> with host event JSON on stdin and decision JSON on stdout, identical to the retired facade HostCommand::Event contract; exe override ELIOT_AGENT_BRIDGE_EXE only; plugin file digest-bound in host-bundle.manifest.json",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -1378,6 +1374,7 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "plugin/eliot-governor/hooks/hooks.json" => Some(CODEX_PLUGIN_HOOKS),
         "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
         "integrations/opencode/opencode.json" => Some(OPENCODE_CONFIG),
+        "integrations/opencode/plugins/eliot.js" => Some(OPENCODE_PLUGIN),
         "integrations/codex/marketplace.json" => Some(CODEX_MARKETPLACE),
         "plugin/eliot-governor/.codex-plugin/plugin.json" => Some(CODEX_PLUGIN_METADATA),
         "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md" => Some(CLAUDE_DESKTOP_GUIDE),
