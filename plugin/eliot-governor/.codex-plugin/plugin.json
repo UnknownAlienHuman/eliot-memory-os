@@ -1,7 +1,7 @@
 {
-  "name": "eliot-governor",
+  "name": "eliot-agent-bridge",
   "version": "0.1.0",
-  "description": "Connects every Codex project to the system ELIOT Memory OS controller surface.",
+  "description": "Connects every Codex project to the ELIOT agent-bridge MCP surface.",
   "author": {
     "name": "ELIOT"
   },
@@ -16,9 +16,9 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "ELIOT Governor",
-    "shortDescription": "System ELIOT memory and governance for Codex",
-    "longDescription": "Provides every Codex project with the ELIOT controller surface for governed memory, task context, observations, and verification receipts.",
+    "displayName": "ELIOT Agent Bridge",
+    "shortDescription": "ELIOT memory and task context for Codex",
+    "longDescription": "Provides every Codex project with the ELIOT agent-bridge surface for memory, task context, observations, and verification receipts.",
     "developerName": "ELIOT",
     "category": "Developer Tools",
     "capabilities": [
