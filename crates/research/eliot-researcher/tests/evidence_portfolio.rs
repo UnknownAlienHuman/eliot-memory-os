@@ -1787,3 +1787,27 @@ fn absence_closed_denominator_missing_result_is_unproven() {
         "all five members must be closed (no open/unclosed arm may fire first): {reason}"
     );
 }
+
+#[test]
+fn absence_replay_is_identical_under_one_identity() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let issuer_a = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
+        .expect("owner issuer");
+    let eval_a = issuer_a
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("first issuance");
+    let issuer_b = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
+        .expect("owner issuer");
+    let eval_b = issuer_b
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("replayed issuance");
+    assert_eq!(
+        eval_a.canonical_digest().expect("digest"),
+        eval_b.canonical_digest().expect("digest"),
+        "an exact replay under one admitted identity must be byte-identical"
+    );
+    eval_a
+        .check_replay_consistency(&eval_b)
+        .expect("an exact replay is consistent");
+}
