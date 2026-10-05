@@ -3836,9 +3836,27 @@ impl DaemonComposition {
     /// no second capability build and no second recovery path: the one
     /// `build_production_provider_capability` result drives both, and the
     /// typed snapshot stays the fabric state carrier.
-    pub async fn agent_fabric_restore_verified_async(
-        &self,
+    /// Restores the production fabric from ALREADY-resolved verified material
+    /// without borrowing the composition (issue #2567 W3/A6 round-2, recovery leg).
+    ///
+    /// Self-free half of [`Self::agent_fabric_restore_verified_async`]:
+    /// `material` must have come out of [`Self::resolve_verified_material`]
+    /// (live fence set, session binding and epoch checked) and `state_root`
+    /// must be the composition's state root captured under a short lock. The
+    /// owner IO below (Kernel verifier, capability build) runs with no
+    /// composition borrow held, so a slow owner cannot block independent
+    /// composition users; the caller revalidates and adopts afterwards.
+    /// Behavior is identical to the second half of the seam — this step only
+    /// moves code.
+    ///
+    /// # Errors
+    ///
+    /// Returns the restore-continuity, session-resolution, Kernel verifier,
+    /// capability construction, or coordinator owner restore rejection
+    /// unchanged, each typed (same as the seam).
+    pub async fn agent_fabric_restore_verified_from_resolved_async(
         kernel: &Arc<DaemonKernelClient>,
+        state_root: PathBuf,
         snapshot: FabricSnapshot,
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
@@ -3846,7 +3864,6 @@ impl DaemonComposition {
         coordinator_document: &str,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
-        let material = self.resolve_verified_material(kernel, material)?;
         Self::require_restore_attempt_continuity(&snapshot, &material)?;
         let owner = kernel.owner_session_facts().ok_or_else(|| {
             DaemonError::Kernel(
@@ -3864,7 +3881,7 @@ impl DaemonComposition {
         )
         .await?;
         let config = daemon_coordinator_config()?;
-        let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
+        let store = crate::semantic_revision_store::SemanticRevisionStore::new(&state_root);
         Ok(
             AgentFabric::restore_durable_snapshot_with_admitted_provider(
                 snapshot,
@@ -3875,6 +3892,29 @@ impl DaemonComposition {
                 capability,
             )?,
         )
+    }
+
+    pub async fn agent_fabric_restore_verified_async(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        snapshot: FabricSnapshot,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+        coordinator_document: &str,
+    ) -> Result<AgentFabric, DaemonError> {
+        let material = self.resolve_verified_material(kernel, material)?;
+        let state_root = self.state_root().to_owned();
+        Self::agent_fabric_restore_verified_from_resolved_async(
+            kernel,
+            state_root,
+            snapshot,
+            ports,
+            material,
+            claimed,
+            coordinator_document,
+        )
+        .await
     }
 
     /// Enqueues one validated solo delegate intake for the runtime poll hook
