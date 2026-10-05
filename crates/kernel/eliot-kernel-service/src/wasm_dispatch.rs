@@ -1699,22 +1699,31 @@ fn slots_dir(install_dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Counts the distinct envelope slots already present for one
 /// generation (bounded scan) plus one: the next publication revision.
-/// Deterministic for a fixed directory state.
+/// Deterministic for a fixed directory state. The retained markers'
+/// maximum keeps the revision monotonic across pruning: `prune_delivery_slots`
+/// removes the oldest slot directories (regressing the raw count) but always
+/// retains the current and live slots with their markers, so the marker
+/// maximum survives while the count does not.
 fn slot_revision_for(slots: &std::path::Path, generation: u64) -> u64 {
     let prefix = format!("{generation:020}-");
     let mut count = 0_u64;
+    let mut marked = 0_u64;
     if let Ok(entries) = std::fs::read_dir(slots) {
         for entry in entries.flatten().take(MAX_SLOT_SCAN_ENTRIES) {
-            if entry
+            let path = entry.path();
+            if path
                 .file_name()
-                .to_str()
+                .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix))
             {
                 count = count.saturating_add(1);
+                if let Some(state) = read_slot_state(&path) {
+                    marked = marked.max(state.identity().publication_revision);
+                }
             }
         }
     }
-    count.saturating_add(1)
+    count.max(marked).saturating_add(1)
 }
 
 /// Reads one slot's retained publication state: a Ready marker wins, then
@@ -2673,6 +2682,65 @@ mod tests {
             serde_json::to_vec(&value).expect("marker serializes"),
         )
         .expect("marker writable");
+    }
+
+    fn revision_identity(revision: u64) -> WasmDeliveryIdentity {
+        serde_json::from_value(serde_json::json!({"claim_id": "c", "operation_id": "o",
+            "generation": 7, "launch_nonce": "n", "grant_digest": "d".repeat(64),
+            "fence_generation": 1, "artifact_digest": "a".repeat(64),
+            "input_digest": "i".repeat(64), "admitted_at_unix_ms": 4_000_000_000_000u64,
+            "expires_at": 4_000_000_060_000u64, "authority_epoch_json": "{}",
+            "delivery_version": 1, "envelope_digest": "e".repeat(64),
+            "host_artifact_digest": "h".repeat(64),
+            "publication_incarnation": 4_000_000_000_000u64,
+            "publication_revision": revision}))
+        .expect("identity parses")
+    }
+
+    /// Markerless slot directories count toward the next revision.
+    #[test]
+    fn slot_revision_counts_markerless_slots() {
+        let dir = stage_dir("eliot-2786-rev-count");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        for name in [
+            "00000000000000000007-aaaaaaaaaaaaaaaa",
+            "00000000000000000007-bbbbbbbbbbbbbbbb",
+            "00000000000000000008-aaaaaaaaaaaaaaaa",
+        ] {
+            std::fs::create_dir_all(dir.join(name)).expect("slot dir writable");
+        }
+        assert_eq!(slot_revision_for(&dir, 7), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning the oldest marked slots never regresses the next revision.
+    #[test]
+    fn slot_revision_survives_prune_of_oldest_markers() {
+        let dir = stage_dir("eliot-2786-rev-prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        for (suffix, revision) in [
+            ("aaaaaaaaaaaaaaaa", 1),
+            ("bbbbbbbbbbbbbbbb", 2),
+            ("cccccccccccccccc", 3),
+        ] {
+            let slot = dir.join(format!("00000000000000000007-{suffix}"));
+            std::fs::create_dir_all(&slot).expect("slot dir writable");
+            std::fs::write(
+                slot.join(WASM_DELIVERY_READY_FILE_NAME),
+                serde_json::to_vec(&WasmPublicationState::Ready {
+                    identity: revision_identity(revision),
+                })
+                .expect("marker serializes"),
+            )
+            .expect("marker writable");
+        }
+        assert_eq!(slot_revision_for(&dir, 7), 4);
+        let _ = std::fs::remove_dir_all(dir.join("00000000000000000007-aaaaaaaaaaaaaaaa"));
+        let _ = std::fs::remove_dir_all(dir.join("00000000000000000007-bbbbbbbbbbbbbbbb"));
+        assert_eq!(slot_revision_for(&dir, 7), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A live InFlight claim with no served record reads as outstanding.
