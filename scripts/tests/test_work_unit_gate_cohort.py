@@ -819,6 +819,23 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat_changed = ch.materialize_catalogue([r1, make_row(d2_changed)], (d1.issue, d2_changed.issue))
         self.assertNotEqual(cat1.sha256, cat_changed.sha256)
 
+    def test_blocked_row_with_restricted_root_descriptor_rejected(self):
+        # A blocked row carrying a descriptor is unresolved work, not an
+        # exemption from the scope rules: an ordinary leaf claiming a
+        # restricted root is rejected exactly like an assigned/planned row.
+        d_bad = make_desc(852, "D-WU-COHORT", 42, source_roots=(".github",))
+        r_bad = make_row(d_bad, disposition=c.CatalogueDisposition.BLOCKED)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([r_bad], (d_bad.issue,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # Control: the same BLOCKED disposition with ordinary roots and no
+        # integration-owner profile materializes normally.
+        d_ok = make_desc(852, "D-WU-COHORT", 42)
+        cat = ch.materialize_catalogue(
+            [make_row(d_ok, disposition=c.CatalogueDisposition.BLOCKED)], (d_ok.issue,))
+        self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+
 
 if __name__ == "__main__":
     unittest.main()

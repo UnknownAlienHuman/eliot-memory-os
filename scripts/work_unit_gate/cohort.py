@@ -435,6 +435,13 @@ def materialize_catalogue(
         elif r.disposition is c.CatalogueDisposition.PLANNED:
             if r.descriptor is not None:
                 validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
+        elif r.disposition is c.CatalogueDisposition.BLOCKED and r.descriptor is not None:
+            # A blocked allocation is unresolved work, not an exemption from the
+            # scope rules: a blocked row carrying a descriptor that claims a
+            # restricted/shared root belongs to its named integrator, not to
+            # every leaf, so it is validated exactly like a planned row.
+            # Descriptor-less blocked rows pass through (case 852/36).
+            validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
         elif r.disposition is c.CatalogueDisposition.SUPERSEDED and r.descriptor is not None:
             # A superseded historical row is a terminal record: #843 accepts no
             # implementation evidence ("Superseded source donor only") and #859
