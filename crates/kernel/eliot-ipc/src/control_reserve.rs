@@ -604,3 +604,56 @@ impl IpcRejectionParts {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn ipc_normal_saturation_leaves_protected_bytes_available() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(1).expect("normal bytes"),
+            NonZeroU64::new(4).expect("protected bytes"),
+        );
+
+        // Saturating the single normal byte holds the partition: the
+        // permit must stay alive for the saturation proven below.
+        let _held = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-fill-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("first normal byte");
+
+        // Positive control first: the admitted cancellation keeps its
+        // protected path while normal pipe bytes are saturated.
+        let _ctl = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-ctl-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_bytes(), 3);
+
+        // Ordinary traffic observes exhaustion naming the exact
+        // dimension, never a collapsed scalar reason.
+        let err = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-shed-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(matches!(
+            err,
+            IpcReserveError::NormalCapacityExhausted { bottleneck, .. }
+                if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
+        ));
+    }
+}
