@@ -2017,3 +2017,24 @@ fn model_commitment_change_changes_packet_id() {
     );
     assert_ne!(packet_a.output_digest, packet_b.output_digest);
 }
+
+// Issue #2901 A6: packet_id ignores non-content variation. The projection
+// canonicalizes its handle order (`ordered_handles` in `build_projection`),
+// so presenting the same evidence in a different order must not move the id:
+// only the model commitment does (see the W10 probe above).
+#[test]
+fn handle_reorder_keeps_packet_id() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet_a =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("base projection");
+    let mut reordered = handles.clone();
+    reordered.reverse();
+    assert_ne!(handles, reordered, "the fixture must carry distinct handles");
+    let packet_b =
+        project_orientation(&job, &bundle, &candidate, &reordered, &policy)
+            .expect("reordered projection");
+    assert_eq!(
+        packet_a.packet_id, packet_b.packet_id,
+        "handle order is not content and must not move packet_id"
+    );
+}
