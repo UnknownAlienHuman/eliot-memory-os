@@ -1251,29 +1251,31 @@ where
         payload: Value,
         prior_receipt_digest: Option<&str>,
     ) -> Result<Value, KernelClientError> {
+        if !matches!(
+            operation,
+            operation_identity::NotifyOperation::LedgerReserve
+                | operation_identity::NotifyOperation::LedgerCommit
+        ) {
+            return Err(KernelClientError::Configuration(
+                "notification ledger requires a reserve or commit operation".to_owned(),
+            ));
+        }
         let now = now_unix_ms()?;
-        let issued = {
-            let mut issuer = self.issuer.lock().map_err(|_| {
-                KernelClientError::Rejected(
-                    "Kernel verification exchange mutex is poisoned".to_owned(),
-                )
-            })?;
-            match operation {
-                operation_identity::NotifyOperation::LedgerReserve => {
-                    issuer.issue_reserve(parent, &payload, prior_receipt_digest, now)
-                }
-                operation_identity::NotifyOperation::LedgerCommit => {
-                    issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
-                }
-                _ => issuer.issue_g08(parent, &payload, now),
+        let issued = issue_step(
+            &self.issuer,
+            parent,
+            operation,
+            &payload,
+            prior_receipt_digest,
+            None,
+            now,
+        )
+        .map_err(|error| match error {
+            operation_identity::OperationIdentityError::IdentityConflict(detail) => {
+                KernelClientError::Rejected(format!("IDENTITY_CONFLICT: {detail}"))
             }
-            .map_err(|error| match error {
-                operation_identity::OperationIdentityError::IdentityConflict(detail) => {
-                    KernelClientError::Rejected(format!("IDENTITY_CONFLICT: {detail}"))
-                }
-                other => KernelClientError::Configuration(other.to_string()),
-            })?
-        };
+            other => KernelClientError::Configuration(other.to_string()),
+        })?;
         issued
             .identity
             .validate()
@@ -1731,6 +1733,8 @@ pub mod notify_declaration;
 pub mod notify_launch;
 pub mod operation_identity;
 pub mod quiet_hours;
+#[cfg(test)]
+mod retained_identity_port_tests;
 pub use eliot_notify_core::NotificationEnvelope;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
@@ -3216,7 +3220,9 @@ mod tests {
             envelope: eliot_notify_core::WatchdogFallbackEnvelope {
                 incident_class: PlatformHandle::new("CONTROL_PLANE_LOSS").unwrap(),
                 installation_identity: PlatformHandle::new("installation-1").unwrap(),
-                timestamp_ms: 100,
+                // The signed parent must satisfy the same freshness policy
+                // as production before the ledger behavior can be exercised.
+                timestamp_ms: fresh_clock_ms(),
                 evidence_digest: evidence_digest.clone(),
                 recovery_instruction: eliot_notify_core::RecoveryInstruction::EliotRecoveryStatus,
             },

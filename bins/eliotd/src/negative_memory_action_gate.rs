@@ -65,6 +65,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
@@ -604,6 +607,18 @@ const fn observation_outcome(
     }
 }
 
+/// Require an existing scorecard without inventing any missing grades.
+fn require_scorecard(
+    scorecard: Option<&QualityScorecard>,
+) -> Result<&QualityScorecard, NegativeMemoryActionError> {
+    scorecard.ok_or_else(|| NegativeMemoryActionError::QualityNotReady {
+        operation: QualityOperation::DependentAction,
+        kind: QualityRefusalKind::InvalidScorecard,
+        blocking: Vec::new(),
+        unresolved_applicability: Vec::new(),
+    })
+}
+
 /// Refuse this dependent effect unless the action's own scorecard says it is
 /// ready, using the one shared readiness rule.
 ///
@@ -657,13 +672,9 @@ const fn observation_outcome(
 fn require_effect_ready(
     scorecard: Option<&QualityScorecard>,
 ) -> Result<(), NegativeMemoryActionError> {
-    // An action with no packet scorecard has nothing to grade against. This is
-    // the pre-existing shape of the parameter — the gate grades a card when the
-    // caller holds one — and this function does not invent a card to grade, so a
-    // cardless action reaches the negative-memory gate exactly as it did before.
-    let Some(card) = scorecard else {
-        return Ok(());
-    };
+    // Missing grades cannot establish readiness for a dependent action. Keep
+    // the refusal explicit without fabricating blocking dimension evidence.
+    let card = require_scorecard(scorecard)?;
     card.suitability(QualityOperation::DependentAction, &[])
         .map_err(|refusal| NegativeMemoryActionError::QualityNotReady {
             operation: refusal.operation,
@@ -723,6 +734,9 @@ pub async fn commit_gated_action<P: KernelGenerationPort + ?Sized>(
     envelope: CanonicalWriteEnvelope,
     scorecard: Option<&mut QualityScorecard>,
 ) -> Result<NegativeMemoryActionOutcome, NegativeMemoryActionError> {
+    // Refuse a missing packet before even attempting the named rule read.
+    // Present cards are still graded below before their readiness is checked.
+    require_scorecard(scorecard.as_deref())?;
     let resolved = resolve_rule_set(kernel, action).await?;
     let base_operation_id = envelope.operation_id.clone();
     let subject = action_subject(action)?;

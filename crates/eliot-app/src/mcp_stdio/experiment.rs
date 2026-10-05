@@ -138,6 +138,7 @@ pub(super) async fn dispatch_meta_experiment_run(
         holdout_candidate: holdout_candidate.receipt_body.clone(),
         threshold: input.candidate_policy.clone(),
         attempted_fence: input.attempted_fence.clone(),
+        evidence_corroboration: input.evidence_corroboration.clone(),
     })?;
     let mut experiment = assessment.records.experiment.clone();
     experiment
@@ -810,6 +811,17 @@ pub(super) async fn dispatch_meta_experiment_disposition(
         {
             anyhow::bail!("rejected or isolated meta experiment cannot promote policy");
         }
+        // Issue #1922: this route used to synthesize `eligible_for_promotion:
+        // true` with empty gate results, which let a rehydrated record promote
+        // without ever evaluating its evaluation-integrity evidence. The
+        // eligibility flag is a caller assertion, so it is derived here only
+        // from what this route can actually evidence: the stored experiment
+        // decision plus the absence of a recorded isolation/threshold rejection
+        // (both already checked above). The evaluation-integrity gate itself is
+        // NOT asserted here, because this route holds no sealed receipt to
+        // evaluate; `MetaPolicyExecutor::promote` requires a passing integrity
+        // gate, so an uncorroborated replay-only experiment is refused instead
+        // of promoted on a fabricated flag.
         let assessment = CanonicalMetaExperimentAssessment {
             records: eliot_types::CanonicalMetaExperimentRecordSet {
                 experiment: experiment.receipt_body.clone(),

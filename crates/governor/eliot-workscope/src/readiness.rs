@@ -668,11 +668,12 @@ pub fn evaluate_material_request(
 mod tests {
     #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::super::{
-        ColdStartController, GenerationEvidence, GoverningSource, GoverningSourceRole,
-        GoverningSourceSet, OnboardingLease, OnboardingLeaseState, PrivacyProfile,
-        RepositoryLineageIdentity, ResourceExecutionIdentity, ScopeBinding, ScopeBindingGuard,
-        ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus, TaskBindingInput,
-        WorkScopeCandidate, WorkspaceInstanceIdentity,
+        AuthorityBasis, ColdStartController, GenerationEvidence, GoverningSource,
+        GoverningSourceCandidate, GoverningSourceRole, GoverningSourceSet, OnboardingLease,
+        OnboardingLeaseState, PrivacyProfile, RepositoryLineageIdentity, ResourceExecutionIdentity,
+        ScopeBinding, ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeLifecycle,
+        SourceAdmissionRequest, SourceReadiness, SourceStatus, TaskBindingInput,
+        WorkScopeCandidate, WorkspaceInstanceIdentity, admit_governing_sources, source_readiness,
     };
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
@@ -788,7 +789,9 @@ mod tests {
                 status: SourceStatus::Admitted,
                 domains: Vec::new(),
                 digest: "a".repeat(64),
-                authority_basis: None,
+                authority_basis: Some(AuthorityBasis::HumanOwner {
+                    owner_ref: "owner:test".into(),
+                }),
             }],
             Vec::new(),
         ) {
@@ -798,6 +801,13 @@ mod tests {
     }
 
     fn receipt_with(task: TaskBindingInput) -> OnboardingReadinessReceipt {
+        compile_with(task, &sources())
+    }
+
+    fn compile_with(
+        task: TaskBindingInput,
+        sources: &GoverningSourceSet,
+    ) -> OnboardingReadinessReceipt {
         let one = candidate();
         match ColdStartController.compile(
             "receipt:one",
@@ -808,7 +818,7 @@ mod tests {
             &one.instance,
             one.lineage.as_ref(),
             &one,
-            &sources(),
+            sources,
             &fence(),
             "governance-profile:test",
             vec!["integration:evidence:one".into()],
@@ -829,6 +839,141 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("readiness compilation failed: {error}"),
         }
+    }
+
+    /// Builds one exact governing-source candidate as the wire type every
+    /// ingress deserializes.
+    fn source_candidate(digest_char: char) -> GoverningSourceCandidate {
+        from_json(serde_json::json!({
+            "source_ref": "architecture",
+            "digest": digest_char.to_string().repeat(64),
+            "role": "architecture",
+            "origin": {"origin": "authenticated_root", "detail": {"root_identity": "root:a"}},
+            "applicable_scope_ref": "scope:instance:a",
+            "applicable_generation": 1,
+            "assurance": {
+                "source_ref": "architecture",
+                "provenance_ref": "artifact:architecture",
+                "integrity": "VERIFIED",
+                "freshness": "CURRENT",
+                "competence": "DOMAIN_VERIFIED",
+                "independence": "INDEPENDENT",
+                "privacy_class": "INTERNAL",
+                "instruction_taint": "CLEARED",
+                "allowed_epistemic_use": ["OBSERVATION"],
+                "allowed_effects": ["READ_ONLY"],
+                "required_verifier": null,
+                "quarantine": "NONE",
+                "state_fence": {
+                    "authority_epoch": {"lineage_id": TEST_LINEAGE_A, "sequence": 1},
+                    "resource_generation": 1,
+                    "task_revision": null,
+                    "policy_revision": null,
+                    "integration_revision": null
+                }
+            },
+            "domains": [],
+            "claim": null
+        }))
+    }
+
+    /// A1: an unresolved source clash fails compilation with
+    /// `UnresolvedSourceConflict` and leaves every Material effect ineligible
+    /// instead of selecting a winner from the documents themselves.
+    #[test]
+    fn unresolved_source_conflict_keeps_material_ineligible() {
+        let admission = match admit_governing_sources(SourceAdmissionRequest {
+            scope_ref: "scope:instance:a".into(),
+            generation: 1,
+            candidates: vec![source_candidate('a'), source_candidate('b')],
+            precedences: Vec::new(),
+            required_owner_ref: "owner:test".into(),
+            proven_current_bindings: Vec::new(),
+            proven_contracts: Vec::new(),
+            absence_reason_ref: None,
+            state_fence: fence(),
+            expires_at: 10,
+        }) {
+            Ok(value) => value,
+            Err(error) => panic!("an unresolvable clash must return a conflict set: {error}"),
+        };
+        assert!(admission.admitted.sources.is_empty());
+        assert!(admission.conflict.is_some());
+        assert_eq!(
+            source_readiness(&admission.admitted),
+            SourceReadiness::Conflicted {
+                conflicting_refs: vec!["architecture".into()],
+            }
+        );
+
+        let one = candidate();
+        let compiled = ColdStartController.compile(
+            "receipt:conflicted",
+            &lease(),
+            "principal:test",
+            "session:test",
+            &one.scope,
+            &one.instance,
+            one.lineage.as_ref(),
+            &one,
+            &admission.admitted,
+            &fence(),
+            "governance-profile:test",
+            vec!["integration:evidence:one".into()],
+            "route-profile:test",
+            "serializer:test",
+            "serializer-version:test",
+            "serializer-options:test",
+            "tokenizer:test",
+            "tokenizer-version:test",
+            "tokenizer-hash:test",
+            "projection-source:test",
+            1,
+            &privacy(),
+            current_task(),
+            None,
+            1,
+        );
+        assert_eq!(
+            compiled.expect_err("a conflicted set compiles no readiness receipt"),
+            WorkScopeError::UnresolvedSourceConflict
+        );
+
+        // The same conflicted coverage denies every effect, Material included,
+        // on an otherwise fully grounded receipt.
+        let receipt = receipt_with(current_task());
+        let descriptor_value = descriptor();
+        let coverage = GoverningCoverage::AdmittedSources(admission.admitted);
+        let guard = guard_receipt();
+        let lease_value = lease();
+        let fence_value = fence();
+        let args = inputs(
+            &receipt,
+            &descriptor_value,
+            &coverage,
+            &guard,
+            &lease_value,
+            &fence_value,
+        );
+        let report = match assess_material_readiness(&args) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness assessment failed: {error}"),
+        };
+        assert!(!report.coverage_sufficient);
+        assert!(
+            report
+                .missing_inputs
+                .contains(&"governing_sources".to_owned())
+        );
+        let material = match evaluate_material_request(&args, RequestedEffect::MaterialEffect) {
+            Ok(value) => value,
+            Err(error) => panic!("gate evaluation failed: {error}"),
+        };
+        assert!(!material.is_admitted());
+        assert_eq!(
+            material.directive(),
+            Some(MaterialReadinessDirective::ReadinessReevaluationRequired)
+        );
     }
 
     fn descriptor() -> WorkScopeDescriptor {

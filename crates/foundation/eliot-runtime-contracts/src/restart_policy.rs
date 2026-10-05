@@ -389,6 +389,10 @@ pub enum RestartIdentityEvidence {
 pub enum RestartFailureEvidence {
     NormalExit,
     AbnormalExit,
+    /// The process owner observed completion without current accepted readiness.
+    /// This is both a known exit and a failed readiness contract; a health
+    /// failure without an observed exit remains `FailedHealthContract`.
+    ExitedWithoutReadiness,
     FailedHealthContract,
     NoRestartCondition,
 }
@@ -425,11 +429,15 @@ pub fn decide_automatic_restart(
     let eligible = match policy.restart_class {
         RestartClass::Permanent => matches!(
             failure,
-            RestartFailureEvidence::NormalExit | RestartFailureEvidence::AbnormalExit
+            RestartFailureEvidence::NormalExit
+                | RestartFailureEvidence::AbnormalExit
+                | RestartFailureEvidence::ExitedWithoutReadiness
         ),
         RestartClass::Transient => matches!(
             failure,
-            RestartFailureEvidence::AbnormalExit | RestartFailureEvidence::FailedHealthContract
+            RestartFailureEvidence::AbnormalExit
+                | RestartFailureEvidence::ExitedWithoutReadiness
+                | RestartFailureEvidence::FailedHealthContract
         ),
         RestartClass::Temporary => false,
     };

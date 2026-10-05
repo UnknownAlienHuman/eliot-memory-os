@@ -13,6 +13,11 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/approved_recipe.rs"]
+mod approved_recipe;
+
+use approved_recipe::{approved_for, seal};
+
 use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
@@ -326,6 +331,71 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     }
 }
 
+fn rendered_for(admitted: &AdmittedContextSet) -> Vec<RenderedAtom> {
+    let mut rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    rendered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.atom_id.cmp(&right.atom_id))
+    });
+    rendered
+}
+
+/// This file's card for one admitted set and the sealed recipe it names.
+///
+/// The output binding is what makes a card a grade OF a packet rather than of a
+/// fixture placeholder, so it is derived from the set the call presents and the
+/// sealed instance the call assembles with.
+fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)
+            .expect("fixture fence digest");
+    let rendered = rendered_for(admitted);
+    card.output.recipe_digest = recipe.recipe_sha256.clone();
+    card.output.fence_digest = fence_digest.clone();
+    card.output.admitted_digest = if let Ok(digest) = admitted.canonical_payload_digest() {
+        digest
+    } else {
+        // A test that deliberately drifted the fence cannot re-derive its own
+        // admitted payload; the set's recorded measurement is used instead, and
+        // the owner still refuses the pair on its own comparison.
+        admitted.economy.measurement.digest.clone()
+    };
+    card.output.rendered_digest = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &recipe.recipe_sha256,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("fixture rendered digest");
+    card.output.omission_handles = admitted.economy.displaced.clone();
+    card
+}
+
+/// The card for the pristine admitted fixture, with its output binding naming
+/// the sealed instance the call assembles with.
+fn quality_for_binding(
+    context: &ContextBinding,
+    recipe: &ContextRecipe,
+    pristine: &AdmittedContextSet,
+) -> QualityScorecard {
+    let mut card = quality_for(pristine, recipe);
+    // Every result carries the scorecard's own binding and the owner refuses a
+    // card whose results name a different one, so moving the card's binding has
+    // to move each result's with it.
+    card.binding = context.clone();
+    for result in &mut card.results {
+        result.binding = context.clone();
+    }
+    card
+}
+
 fn measurement(context: &ContextBinding, bytes: &[u8]) -> SerializedContextMeasurement {
     SerializedContextMeasurement {
         measurement_id: id("measurement"),
@@ -400,7 +470,11 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
         invalidation: None,
     };
     recipe.recipe_sha256 = recipe.canonical_policy_digest().expect("recipe digest");
-    recipe
+    // The approved revision this instance names is part of the instance,
+    // not something a call site adds: the economy receipt already records
+    // `recipe(&context).decision.policy_sha256`, so sealing here is what
+    // keeps the admitted set and the approved revision one record.
+    seal(recipe)
 }
 
 fn owner_permit(
@@ -472,10 +546,13 @@ fn assemble_marked(
     now: u64,
 ) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
     let context = value.binding.clone();
+    let recipe1 = recipe(&context);
+    let recipe1_approved = approved_for(&recipe1);
     assemble_active_view_with_learning(
         value,
-        &recipe(&context),
-        quality(&context),
+        &recipe1,
+        &recipe1_approved,
+        quality_for_binding(&context, &recipe1, &value),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1869(governor, verified, overlay, backlog, now),
@@ -513,10 +590,13 @@ fn drifted_fence_refuses_before_render() {
     let mut calls = 0;
     let overlay = live_overlay_1869(&fence);
     let backlog = BoundedBacklog::default();
+    let recipe2 = recipe(&context);
+    let recipe2_approved = approved_for(&recipe2);
     let result = assemble_active_view_with_learning(
         &value,
-        &recipe(&context),
-        quality(&context),
+        &recipe2,
+        &recipe2_approved,
+        quality_for_binding(&context, &recipe2, &value),
         &policy_for(&context, 100_000),
         |bytes| {
             calls += 1;
@@ -579,10 +659,13 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     let context = value.binding.clone();
     let overlay = live_overlay_1869(&fence);
     let backlog = BoundedBacklog::default();
+    let recipe3 = recipe(&context);
+    let recipe3_approved = approved_for(&recipe3);
     let result = assemble_active_view_with_learning(
         &value,
-        &recipe(&context),
-        quality(&context),
+        &recipe3,
+        &recipe3_approved,
+        quality_for_binding(&context, &recipe3, &value),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
@@ -610,10 +693,13 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     plain.economy.measurement.digest = plain.canonical_payload_digest().expect("admitted digest");
     refresh_economy_receipt(&mut plain);
     let context = plain.binding.clone();
+    let recipe4 = recipe(&context);
+    let recipe4_approved = approved_for(&recipe4);
     let view = assemble_active_view(
         &plain,
-        &recipe(&context),
-        quality(&context),
+        &recipe4,
+        &recipe4_approved,
+        quality_for_binding(&context, &recipe4, &plain),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )

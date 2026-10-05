@@ -1150,6 +1150,26 @@ pub enum TaskIntakeOrigin {
     Import,
 }
 
+impl TaskIntakeOrigin {
+    /// Returns whether this origin's own `decision_owner_ref` may stand in for
+    /// the admitting Human/Task decision owner.
+    ///
+    /// Only an intake that arrived through the Human-owned channel carries an
+    /// owner reference the owner actually stated, so only that origin can be
+    /// matched against a [`AuthorityBasis::HumanOwner`] basis. Every other
+    /// origin is either an observation or a proposal made by something other
+    /// than the owner — host-visible prompt text, an imported document, an
+    /// agent's explicit request, or a resumed candidate — so its own
+    /// `decision_owner_ref` is text its own proposer wrote: matching it
+    /// against a basis would let a candidate authorize itself. Those origins
+    /// reach a current task only through a proven delegated current-task
+    /// binding ([`AuthorityBasis::DelegatedTaskBinding`]) or not at all.
+    #[must_use]
+    pub fn owner_stated_decision_owner(&self) -> bool {
+        matches!(self, Self::HumanUi)
+    }
+}
+
 /// Explicit task-intake candidate.
 ///
 /// A task becomes current only when the applicable Human/Task owner or an
@@ -1345,9 +1365,17 @@ impl TaskIntakeCandidate {
 
     /// Promotes the intake to a current-task binding input.
     ///
-    /// Only the matching Human decision owner promotes directly. A delegated
-    /// binding promotes only when the caller presents the existing current
-    /// binding the delegation names: `parent` must be the current task
+    /// Only the matching Human decision owner promotes directly, and only for
+    /// an intake that reached this method through the Human-owned channel
+    /// ([`TaskIntakeOrigin::owner_stated_decision_owner`]): `decision_owner_ref`
+    /// is a field of the candidate, so matching it against a basis is only
+    /// evidence when the owner actually stated it. Host-visible prompt text,
+    /// imported text, an agent's explicit request and a resumed candidate are
+    /// observations or proposals, never owner statements, so they can never
+    /// self-authorize — they need a delegated binding.
+    ///
+    /// A delegated binding promotes only when the caller presents the existing
+    /// current binding the delegation names: `parent` must be the current task
     /// contract whose task matches the delegation, which proves the binding
     /// the delegation claims actually exists instead of trusting a nonblank
     /// reference. A project contract alone cannot promote, and host-visible
@@ -1363,8 +1391,9 @@ impl TaskIntakeCandidate {
     /// # Errors
     ///
     /// Returns [`WorkScopeError::TaskAuthorityDenied`] when the basis is not
-    /// the decision owner or a proven delegated binding, an error when the
-    /// intake is incomplete, tampered, or the revision is zero.
+    /// the decision owner of an owner-stated intake or a proven delegated
+    /// binding, an error when the intake is incomplete, tampered, or the
+    /// revision is zero.
     pub fn promote(
         &self,
         basis: &AuthorityBasis,
@@ -1377,8 +1406,15 @@ impl TaskIntakeCandidate {
         // decision owner, or the delegating binding for a delegated promotion.
         // Both are proven above, never reconstructed from an unrelated handle.
         let selection_source_ref = match basis {
+            // A Human basis is matched against the candidate's own
+            // `decision_owner_ref` only when the owner stated it through the
+            // Human-owned channel. Any other origin is an observation or a
+            // proposal its own proposer wrote, so the match is withheld here
+            // and falls through to the typed denial below instead of letting
+            // host-visible prompt text or imported text authorize itself.
             AuthorityBasis::HumanOwner { owner_ref }
-                if self.decision_owner_ref.as_deref() == Some(owner_ref.as_str()) =>
+                if self.origin.owner_stated_decision_owner()
+                    && self.decision_owner_ref.as_deref() == Some(owner_ref.as_str()) =>
             {
                 owner_ref.clone()
             }
@@ -1500,4 +1536,265 @@ pub fn task_selection_required(scope_ref: &str) -> Result<TaskSelectionRequired,
         minimal_intake_example,
         exploratory_offer: "a bounded exploratory task may be admitted without task authority; it permits read-only orientation only and never scope-sensitive Material effects".to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
+    use super::*;
+    use crate::TaskBindingState;
+    use serde_json::json;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const SCOPE_REF: &str = "scope:instance:a";
+    const OWNER_REF: &str = "owner:example";
+    const GENERATION: u64 = 1;
+
+    fn test_fence() -> StateFence {
+        StateFence::new(
+            eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            eliot_contracts::ResourceGeneration::genesis(),
+        )
+    }
+
+    /// Builds one exact candidate as the wire type every ingress deserializes,
+    /// so the fixture exercises the same evidence shape production reads.
+    fn candidate(
+        source_ref: &str,
+        digest_char: char,
+        role: &str,
+        claim: Option<AuthorityBasis>,
+    ) -> GoverningSourceCandidate {
+        let assurance: SourceAssurance = serde_json::from_value(json!({
+            "source_ref": source_ref,
+            "provenance_ref": format!("artifact:{source_ref}"),
+            "integrity": "VERIFIED",
+            "freshness": "CURRENT",
+            "competence": "DOMAIN_VERIFIED",
+            "independence": "INDEPENDENT",
+            "privacy_class": "INTERNAL",
+            "instruction_taint": "CLEARED",
+            "allowed_epistemic_use": ["OBSERVATION"],
+            "allowed_effects": ["READ_ONLY"],
+            "required_verifier": null,
+            "quarantine": "NONE",
+            "state_fence": {
+                "authority_epoch": {"lineage_id": TEST_LINEAGE, "sequence": 1},
+                "resource_generation": 1,
+                "task_revision": null,
+                "policy_revision": null,
+                "integration_revision": null
+            }
+        }))
+        .expect("candidate assurance fixture is valid");
+        GoverningSourceCandidate {
+            source_ref: source_ref.to_owned(),
+            digest: digest_char.to_string().repeat(64),
+            role: serde_json::from_value(json!(role)).expect("candidate role fixture is valid"),
+            origin: SourceCandidateOrigin::AuthenticatedRoot {
+                root_identity: "root:a".to_owned(),
+            },
+            applicable_scope_ref: SCOPE_REF.to_owned(),
+            applicable_generation: GENERATION,
+            assurance,
+            domains: Vec::new(),
+            claim,
+        }
+    }
+
+    fn request(candidates: Vec<GoverningSourceCandidate>) -> SourceAdmissionRequest {
+        SourceAdmissionRequest {
+            scope_ref: SCOPE_REF.to_owned(),
+            generation: GENERATION,
+            candidates,
+            precedences: Vec::new(),
+            required_owner_ref: OWNER_REF.to_owned(),
+            proven_current_bindings: Vec::new(),
+            proven_contracts: Vec::new(),
+            absence_reason_ref: None,
+            state_fence: test_fence(),
+            expires_at: 10,
+        }
+    }
+
+    fn intake(origin: TaskIntakeOrigin, owner_ref: Option<&str>) -> TaskIntakeCandidate {
+        TaskIntakeCandidate::new(NewTaskIntake {
+            intake_ref: "intake:one".to_owned(),
+            proposer_principal_ref: "principal:example".to_owned(),
+            proposer_session_ref: "session:example".to_owned(),
+            route_ref: "route:example".to_owned(),
+            goal: Some("ship the scoped change".to_owned()),
+            acceptance_digest: Some("digest:acceptance:one".to_owned()),
+            constraints: Vec::new(),
+            proposed_scope_ref: Some(SCOPE_REF.to_owned()),
+            proposed_source_digests: Vec::new(),
+            decision_owner_ref: owner_ref.map(ToOwned::to_owned),
+            task_controller_ref: None,
+            origin,
+        })
+        .expect("intake fixture is complete")
+    }
+
+    fn parent_binding() -> TaskBindingState {
+        TaskBindingState::CurrentTaskContract {
+            task_ref: "task:parent".to_owned(),
+            task_revision: 4,
+            acceptance_digest: "digest:acceptance:parent".to_owned(),
+            selection_source_ref: OWNER_REF.to_owned(),
+            evidence_ref: "intake:parent".to_owned(),
+        }
+    }
+
+    /// A1: two conflicting candidates and no applicable precedence produce a
+    /// conflict set with no admitted winner, and readiness observes it as
+    /// conflicted instead of a silent winner.
+    #[test]
+    fn conflicting_candidates_without_precedence_yield_no_admitted_winner() {
+        let admission = admit_governing_sources(request(vec![
+            candidate("architecture", 'a', "architecture", None),
+            candidate("architecture", 'b', "architecture", None),
+        ]))
+        .expect("admission of an unresolvable clash returns a conflict set");
+        let conflict = admission
+            .conflict
+            .as_ref()
+            .expect("clash names a conflict set");
+        assert_eq!(conflict.conflicting_refs, vec!["architecture".to_owned()]);
+        assert_eq!(conflict.required_owner_ref, OWNER_REF);
+        assert!(admission.admitted.sources.is_empty());
+        assert!(
+            admission
+                .preserved
+                .iter()
+                .all(|record| record.status == SourceStatus::Conflicted)
+        );
+        assert_eq!(
+            source_readiness(&admission.admitted),
+            SourceReadiness::Conflicted {
+                conflicting_refs: vec!["architecture".to_owned()],
+            }
+        );
+    }
+
+    /// W4: the Architecture/Implementation pair has no implicit order. With no
+    /// declaration naming it for this scope the pair stays conflicted, so the
+    /// derived role order never decides a winner.
+    #[test]
+    fn undeclared_role_pair_is_never_settled_by_enum_order() {
+        let admission = admit_governing_sources(request(vec![
+            candidate("architecture", 'a', "architecture", None),
+            candidate("architecture", 'a', "implementation", None),
+        ]))
+        .expect("admission of an undeclared role pair returns a conflict set");
+        assert!(admission.admitted.sources.is_empty());
+        assert!(admission.conflict.is_some());
+        assert!(admission.applied_precedences.is_empty());
+    }
+
+    /// A2: an owner-admitted exact digest plus a promoted intake identify the
+    /// exact admitted record and the exact intake.
+    #[test]
+    fn owner_admitted_digest_promotes_only_through_its_stated_owner() {
+        let admission = admit_governing_sources(request(vec![candidate(
+            "architecture",
+            'a',
+            "architecture",
+            Some(AuthorityBasis::HumanOwner {
+                owner_ref: OWNER_REF.to_owned(),
+            }),
+        )]))
+        .expect("owner-admitted candidate is admitted");
+        assert_eq!(admission.admitted.sources.len(), 1);
+        assert_eq!(admission.admitted.sources[0].digest, "a".repeat(64));
+        assert!(admission.conflict.is_none());
+
+        let promoted = intake(TaskIntakeOrigin::HumanUi, Some(OWNER_REF))
+            .promote(
+                &AuthorityBasis::HumanOwner {
+                    owner_ref: OWNER_REF.to_owned(),
+                },
+                &TaskBindingState::None_,
+                5,
+            )
+            .expect("owner-stated intake promotes");
+        assert_eq!(
+            promoted,
+            TaskBindingInput::Current {
+                task_ref: "intake:one".to_owned(),
+                task_revision: 5,
+                acceptance_digest: "digest:acceptance:one".to_owned(),
+                selection_source_ref: OWNER_REF.to_owned(),
+                evidence_ref: "intake:one".to_owned(),
+            }
+        );
+    }
+
+    /// W5/the open defect: an intake that did not arrive through the
+    /// Human-owned channel can never match its own `decision_owner_ref`
+    /// against a Human basis, whatever owner reference it names.
+    #[test]
+    fn non_owner_origins_never_self_authorize_a_current_task() {
+        for origin in [
+            TaskIntakeOrigin::HostVisiblePrompt,
+            TaskIntakeOrigin::AgentExplicit,
+            TaskIntakeOrigin::Import,
+            TaskIntakeOrigin::ResumedWork,
+        ] {
+            let candidate = intake(origin, Some(OWNER_REF));
+            assert!(!origin.owner_stated_decision_owner());
+            assert_eq!(
+                candidate
+                    .promote(
+                        &AuthorityBasis::HumanOwner {
+                            owner_ref: OWNER_REF.to_owned(),
+                        },
+                        &TaskBindingState::None_,
+                        5,
+                    )
+                    .expect_err("self-authorization is denied"),
+                WorkScopeError::TaskAuthorityDenied
+            );
+            // A proven delegated binding remains the only path for them.
+            let delegated = candidate.promote(
+                &AuthorityBasis::DelegatedTaskBinding {
+                    binding_ref: "binding:parent".to_owned(),
+                    task_ref: "task:parent".to_owned(),
+                },
+                &parent_binding(),
+                5,
+            );
+            match delegated.expect("proven delegation promotes") {
+                TaskBindingInput::Current {
+                    selection_source_ref,
+                    ..
+                } => {
+                    assert_eq!(selection_source_ref, "binding:parent");
+                }
+                other => panic!("delegated promotion must stay a current task, got {other:?}"),
+            }
+        }
+    }
+
+    /// A delegation the caller cannot prove names no current task, so an
+    /// observation-origin intake stays a candidate.
+    #[test]
+    fn unproven_delegation_denies_an_observation_origin_intake() {
+        assert_eq!(
+            intake(TaskIntakeOrigin::HostVisiblePrompt, None)
+                .promote(
+                    &AuthorityBasis::DelegatedTaskBinding {
+                        binding_ref: "binding:parent".to_owned(),
+                        task_ref: "task:other".to_owned(),
+                    },
+                    &parent_binding(),
+                    5,
+                )
+                .expect_err("a delegation naming another task is denied"),
+            WorkScopeError::TaskAuthorityDenied
+        );
+    }
 }

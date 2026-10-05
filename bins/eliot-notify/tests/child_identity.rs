@@ -5,8 +5,9 @@
 //! verify, ledger reserve, ledger commit). Exact retry reuses the child;
 //! cross-step or cross-payload reuse fails `IDENTITY_CONFLICT` before any
 //! Kernel effect; reserve and commit never share an identity; per-step
-//! cancellation is isolated; crash after reserve reconciles at the exact
-//! step.
+//! cancellation is isolated; serialized retained records restore the complete
+//! original identity through the issuer API. This test does not establish a
+//! durable owner for those records in the normal notification path.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -18,7 +19,8 @@ use eliot_contracts::{
     ResourceGeneration, SourceId, StateFence,
 };
 use eliot_notify::operation_identity::{
-    NOTIFY_IDENTITY_VERSION, NotifyIdentityIssuer, NotifyOperation, OperationIdentityError,
+    ChildLineageEntry, IssuedIdentity, NOTIFY_IDENTITY_VERSION, NotifyIdentityIssuer,
+    NotifyOperation, OperationIdentityError,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
 use serde_json::{Value, json};
@@ -59,6 +61,102 @@ fn parent_with_id(id: &str) -> NotificationRequest {
 
 fn payload(marker: &str) -> Value {
     json!({"step": marker, "parent": PARENT_HASH})
+}
+
+fn retained_restore_scenarios(
+    parent: &NotificationRequest,
+) -> [(NotifyOperation, Value, Option<&'static str>); 10] {
+    // Markers and prior digests mirror operation_identity.rs fixtures. The
+    // quiet-hours payload matches the request envelope built in lib.rs.
+    [
+        (NotifyOperation::G08Verify, payload("g08"), None),
+        (
+            NotifyOperation::A08Admit,
+            payload("a08"),
+            Some("source-digest"),
+        ),
+        (NotifyOperation::WatchdogVerify, payload("watchdog"), None),
+        (
+            NotifyOperation::DeliveryVerify,
+            payload("delivery"),
+            Some("admission-digest"),
+        ),
+        (
+            NotifyOperation::LedgerReserve,
+            payload("reserve"),
+            Some("admission-digest"),
+        ),
+        (
+            NotifyOperation::LedgerCommit,
+            payload("commit"),
+            Some("reservation-digest"),
+        ),
+        (
+            NotifyOperation::NotificationState,
+            payload("state"),
+            Some("source-digest"),
+        ),
+        (
+            NotifyOperation::NotificationStateRead,
+            payload("read"),
+            None,
+        ),
+        (
+            NotifyOperation::QuietHoursProjectionRead,
+            json!({
+                "operation": eliot_notify::operation_identity::QUIET_HOURS_PROJECTION_OPERATION,
+                "context": &parent.context,
+                "state_fence": &parent.context.state_fence,
+                "scope": "notification",
+            }),
+            None,
+        ),
+        (
+            NotifyOperation::UserAutomationPreflightRead,
+            payload("user-automation-preflight"),
+            None,
+        ),
+    ]
+}
+
+fn issue_through_public_api(
+    issuer: &mut NotifyIdentityIssuer,
+    parent: &NotificationRequest,
+    operation: NotifyOperation,
+    child_payload: &Value,
+    prior_digest: Option<&str>,
+    now_unix_ms: u64,
+) -> Result<IssuedIdentity, OperationIdentityError> {
+    match operation {
+        NotifyOperation::G08Verify => issuer.issue_g08(parent, child_payload, now_unix_ms),
+        NotifyOperation::A08Admit => {
+            issuer.issue_a08(parent, child_payload, prior_digest, now_unix_ms)
+        }
+        NotifyOperation::WatchdogVerify => {
+            issuer.issue_watchdog(parent, child_payload, now_unix_ms)
+        }
+        NotifyOperation::DeliveryVerify => {
+            issuer.issue_delivery(parent, child_payload, prior_digest, now_unix_ms)
+        }
+        NotifyOperation::LedgerReserve => {
+            issuer.issue_reserve(parent, child_payload, prior_digest, now_unix_ms)
+        }
+        NotifyOperation::LedgerCommit => {
+            issuer.issue_commit(parent, child_payload, prior_digest, now_unix_ms)
+        }
+        NotifyOperation::NotificationState => {
+            issuer.issue_notification_state(parent, child_payload, prior_digest, now_unix_ms)
+        }
+        NotifyOperation::NotificationStateRead => {
+            issuer.issue_notification_state_read(parent, child_payload, now_unix_ms)
+        }
+        NotifyOperation::QuietHoursProjectionRead => {
+            issuer.issue_quiet_hours_projection_read(parent, child_payload, now_unix_ms)
+        }
+        NotifyOperation::UserAutomationPreflightRead => {
+            issuer.issue_user_automation_preflight_read(parent, child_payload, now_unix_ms)
+        }
+    }
 }
 
 #[test]
@@ -162,6 +260,7 @@ fn exact_retry_returns_the_same_child() {
     let second = issuer
         .issue_g08(&parent, &payload("same"), NOW + 700)
         .expect("retry");
+    assert_eq!(first.identity, second.identity);
     assert_eq!(first.request_id, second.request_id);
     assert_eq!(
         first.identity.idempotency_key,
@@ -182,6 +281,7 @@ fn exact_retry_returns_the_same_child() {
     let reserve_retry = issuer
         .issue_reserve(&parent, &payload("r"), Some("admission-sha"), NOW + 100)
         .expect("reserve retry");
+    assert_eq!(reserve_first.identity, reserve_retry.identity);
     assert_eq!(reserve_first.request_id, reserve_retry.request_id);
 }
 
@@ -280,47 +380,176 @@ fn unknown_delivery_step_is_distinct_from_source_and_ledger() {
 }
 
 #[test]
-fn crash_after_reserve_reconciles_at_the_exact_step() {
+fn serialized_lineage_restores_complete_identity_at_t_plus_one() {
     let parent = parent_with_id("parent-crash");
-    let reserve_payload = payload("reserve");
-    let first = {
+    let scenarios = retained_restore_scenarios(&parent);
+    let covered_operations = scenarios
+        .iter()
+        .map(|(operation, _, _)| *operation)
+        .collect::<Vec<_>>();
+    let closed_operations = NotifyOperation::all().into_iter().collect::<Vec<_>>();
+    assert_eq!(
+        covered_operations, closed_operations,
+        "the retained-record round trip covers the entire closed operation set"
+    );
+
+    // This is the issuer's retained-record restore API, not evidence that the
+    // normal notification path has a durable owner for these records.
+    for (operation, child_payload, prior_digest) in scenarios {
         let mut issuer = NotifyIdentityIssuer::new();
-        issuer
-            .issue_reserve(&parent, &reserve_payload, Some("admission-sha"), NOW)
-            .expect("reserve before crash")
-    };
-    // Crash: the ledger is gone. A fresh issuer re-derives the same child
-    // transport identity from the same parent plus step plus bytes, so the
-    // reservation reconciles without a duplicate notification.
+        let first = issue_through_public_api(
+            &mut issuer,
+            &parent,
+            operation,
+            &child_payload,
+            prior_digest,
+            NOW,
+        )
+        .unwrap_or_else(|error| panic!("issue {operation:?}: {error:?}"));
+        assert_eq!(first.operation, operation);
+        assert_eq!(first.parent_request_id, parent.context.request_id.as_str());
+        assert_eq!(first.parent_hash, parent.canonical_request_hash.as_str());
+        assert_eq!(
+            first.identity.request.state_fence, parent.context.state_fence,
+            "first issuance retains the parent fence for {operation:?}"
+        );
+
+        let retained = issuer
+            .lineage()
+            .last()
+            .expect("issued step has retained lineage")
+            .clone();
+        assert_eq!(retained.operation, operation.selector());
+        assert_eq!(
+            retained.parent_request_id,
+            parent.context.request_id.as_str()
+        );
+        assert_eq!(retained.parent_hash, parent.canonical_request_hash.as_str());
+        assert_eq!(retained.prior_receipt_digest.as_deref(), prior_digest);
+        assert_eq!(
+            retained.identity.request.state_fence, parent.context.state_fence,
+            "retained record preserves the parent fence for {operation:?}"
+        );
+        let encoded = serde_json::to_vec(&retained).expect("lineage serializes");
+        let restored_entry: ChildLineageEntry =
+            serde_json::from_slice(&encoded).expect("lineage deserializes");
+
+        let mut restarted = NotifyIdentityIssuer::new();
+        let restored = restarted
+            .restore_issued(
+                &parent,
+                operation,
+                &child_payload,
+                prior_digest,
+                &restored_entry,
+                NOW + 1,
+            )
+            .unwrap_or_else(|error| panic!("restore {operation:?}: {error:?}"));
+        assert_eq!(
+            restored.identity, first.identity,
+            "restore preserves the complete original identity for {operation:?}"
+        );
+        assert_eq!(restored.operation, operation);
+        assert_eq!(restored.canonical_digest, first.canonical_digest);
+        assert_eq!(restored.request_id, first.request_id);
+        assert_eq!(
+            restored.parent_request_id,
+            parent.context.request_id.as_str()
+        );
+        assert_eq!(restored.parent_hash, parent.canonical_request_hash.as_str());
+        assert_eq!(
+            restored.identity.request.state_fence, parent.context.state_fence,
+            "restored identity preserves the parent fence for {operation:?}"
+        );
+        assert_eq!(restarted.issued_count(), 1);
+        assert_eq!(restarted.lineage().len(), 1);
+        assert_eq!(restarted.lineage()[0], restored_entry);
+    }
+}
+
+#[test]
+fn restore_rejects_changed_payload_or_prior_receipt() {
+    let parent = parent_with_id("parent-restore-conflict");
+    let original_payload = payload("reserve");
+    let mut issuer = NotifyIdentityIssuer::new();
+    issuer
+        .issue_reserve(&parent, &original_payload, Some("admission-sha"), NOW)
+        .expect("reserve");
+    let retained = issuer.lineage().last().expect("retained reserve").clone();
+    let encoded = serde_json::to_vec(&retained).expect("lineage serializes");
+    let restored_entry: ChildLineageEntry =
+        serde_json::from_slice(&encoded).expect("lineage deserializes");
+
+    let mut changed_payload_issuer = NotifyIdentityIssuer::new();
+    let changed_payload = changed_payload_issuer.restore_issued(
+        &parent,
+        NotifyOperation::LedgerReserve,
+        &payload("changed"),
+        Some("admission-sha"),
+        &restored_entry,
+        NOW + 1,
+    );
+    assert!(
+        matches!(
+            changed_payload,
+            Err(OperationIdentityError::IdentityConflict(_))
+        ),
+        "changed canonical payload must conflict, got {changed_payload:?}"
+    );
+    assert_eq!(changed_payload_issuer.issued_count(), 0);
+
+    let mut changed_prior_issuer = NotifyIdentityIssuer::new();
+    let changed_prior = changed_prior_issuer.restore_issued(
+        &parent,
+        NotifyOperation::LedgerReserve,
+        &original_payload,
+        Some("different-admission-sha"),
+        &restored_entry,
+        NOW + 1,
+    );
+    assert!(
+        matches!(
+            changed_prior,
+            Err(OperationIdentityError::IdentityConflict(_))
+        ),
+        "changed prior receipt must conflict, got {changed_prior:?}"
+    );
+    assert_eq!(changed_prior_issuer.issued_count(), 0);
+}
+
+#[test]
+fn expired_restore_refuses_without_renewing_deadline() {
+    let parent = parent_with_id("parent-expired-restore");
+    let original_payload = payload("g08");
+    let mut issuer = NotifyIdentityIssuer::new();
+    let original = issuer
+        .issue_g08(&parent, &original_payload, NOW)
+        .expect("original g08");
+    let retained = issuer.lineage().last().expect("retained g08").clone();
+    let encoded = serde_json::to_vec(&retained).expect("lineage serializes");
+    let restored_entry: ChildLineageEntry =
+        serde_json::from_slice(&encoded).expect("lineage deserializes");
+    let expired_at = original.identity.deadline_unix_ms + 1;
+
     let mut restarted = NotifyIdentityIssuer::new();
-    let replay = restarted
-        .issue_reserve(
-            &parent,
-            &reserve_payload,
-            Some("admission-sha"),
-            NOW + 5_000,
-        )
-        .expect("reserve after restart");
-    assert_eq!(first.request_id, replay.request_id);
-    assert_eq!(
-        first.identity.idempotency_key,
-        replay.identity.idempotency_key
+    let result = restarted.restore_issued(
+        &parent,
+        NotifyOperation::G08Verify,
+        &original_payload,
+        None,
+        &restored_entry,
+        expired_at,
+    );
+    assert!(
+        matches!(result, Err(OperationIdentityError::ExpiredIdentity(_))),
+        "expired original must require reconciliation, got {result:?}"
     );
     assert_eq!(
-        first.identity.cancellation_id,
-        replay.identity.cancellation_id
+        restored_entry.identity.deadline_unix_ms, original.identity.deadline_unix_ms,
+        "the retained deadline remains unchanged"
     );
-    // The commit step is still a different identity: reserve success never
-    // impersonates commit success.
-    let commit = restarted
-        .issue_commit(
-            &parent,
-            &payload("commit"),
-            Some("reservation-sha"),
-            NOW + 5_000,
-        )
-        .expect("commit");
-    assert_ne!(replay.request_id, commit.request_id);
+    assert_eq!(restarted.issued_count(), 0, "no renewed child is installed");
+    assert!(restarted.lineage().is_empty());
 }
 
 #[test]

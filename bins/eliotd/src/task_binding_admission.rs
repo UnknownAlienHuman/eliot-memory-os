@@ -171,7 +171,18 @@
 //!   only caller of [`ScopeAttachIngress`] — has **zero call sites**, and
 //!   `GovernorComposition::admit_observed_scope_attach` fails closed unless a
 //!   `WorkScope` owner is *already* retained, so the entry is additionally
-//!   circular: its only producer of the state it requires is itself.
+//!   circular: its only producer of the state it requires is itself. Its
+//!   governing-source leg is no longer a caller-supplied set: the entry now runs
+//!   `GovernorComposition::admit_governing_sources_for_scope` over the ingress's
+//!   exact [`SourceAdmissionRequest`] and binds with the admitted set it returns.
+//! - [`DaemonComposition::admit_task_intake`](super::DaemonComposition) — the
+//!   only caller of [`TaskIntakeIngress`] — reads the retained terminal's
+//!   owner-proven `task_binding` and calls
+//!   `GovernorComposition::promote_task_intake`, so an origin that did not
+//!   arrive through the Human-owned channel cannot match its own
+//!   `decision_owner_ref`. It has **zero call sites**: the explicit task-intake
+//!   transport that would authenticate the owner reference and supply the full
+//!   readiness claim is still to be built (STITCH).
 //!
 //! The single blocking symbol for the evidence leg is the compiled readiness
 //! receipt. `TaskSelectionEvidence` needs a non-zero `task_revision` and a
@@ -246,11 +257,12 @@ use eliot_protocol::{
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
-    BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
-    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
-    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    issue_discovery_lease, task_selection_required,
+    AuthorityBasis, BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey,
+    DiscoveryLeaseRequest, DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence,
+    GoverningSourceRole, ManifestEvidence, ObservedScopeResources, OnboardingLease,
+    OnboardingReadinessReceipt, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
+    SourceAdmissionRequest, TaskBindingState, TaskIntakeCandidate, issue_discovery_lease,
+    task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -1014,14 +1026,20 @@ pub struct TaskBindingError {
 }
 
 impl TaskBindingError {
-    fn selection_required(detail: impl Into<String>) -> Self {
+    /// Builds the `TASK_SELECTION_REQUIRED` answer for a refused selection.
+    ///
+    /// Public so the daemon composition root reports its own refusals with the
+    /// same stable code as this module's admission entries, instead of
+    /// collapsing them into an opaque recovery string.
+    pub fn selection_required(detail: impl Into<String>) -> Self {
         Self {
             code: TASK_SELECTION_REQUIRED,
             detail: detail.into(),
         }
     }
 
-    fn scope_incompatible(detail: impl Into<String>) -> Self {
+    /// Builds the `TASK_SCOPE_INCOMPATIBLE` answer for a refused scope.
+    pub fn scope_incompatible(detail: impl Into<String>) -> Self {
         Self {
             code: TASK_SCOPE_INCOMPATIBLE,
             detail: detail.into(),
@@ -3353,19 +3371,28 @@ impl ColdStartAttachInput {
 ///   record the trigger authenticated through owned IPC/session state) — a
 ///   reference only; the producer enforces non-blank, the trigger owns the
 ///   authentication;
-/// - `privacy_class`, `governing_source_generation`, `sources`, `privacy`:
-///   the scope's admitted privacy class and the onboarding-retained source
-///   closure that authenticates the observed instance;
+/// - `privacy_class`, `governing_source_generation`, `privacy`: the scope's
+///   admitted privacy class, the source generation the admission fences at,
+///   and the privacy boundary the new binding must satisfy;
+/// - `source_admission`: the exact governing-source admission request for that
+///   scope generation — candidates from authenticated roots or a valid
+///   discovery lease, their authority claims, the declared precedences, the
+///   required owner, the proven current bindings/contracts, the state fence and
+///   the expiry. The attach path admits it through the Governor owner and
+///   binds with the admitted set it returns, so no caller-supplied source set
+///   reaches a `WorkScope` binding;
 /// - `owner_revision`: caller-sequenced durable revision for the admitted
 ///   owner (same convention as the sibling admission entries).
 ///
 /// [`ScopeAttachIngress::validate`] checks shape only: it never authenticates
-/// the scope, the lineage, or the authorization — the live owner read at the
-/// fence, the `MATCHED` guard, and the source closure inside
+/// the scope, the lineage, the authorization, or the governing sources — the
+/// live owner read at the fence, the Governor's governing-source admission,
+/// the `MATCHED` guard, and the source closure inside
 /// `GovernorComposition::admit_observed_scope_attach` do. Call sequence:
 /// `validate`, then [`observe_explicit_workspace`] on `explicit_root`, then
-/// `GovernorComposition::admit_observed_scope_attach` with every field below.
-/// That call order is the production one in
+/// `GovernorComposition::admit_governing_sources_for_scope` on
+/// `source_admission`, then `GovernorComposition::admit_observed_scope_attach`
+/// with the admitted set. That call order is the production one in
 /// `DaemonComposition::admit_scope_attach`.
 ///
 /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
@@ -3383,8 +3410,10 @@ pub struct ScopeAttachIngress {
     pub privacy_class: PrivacyClass,
     /// Source generation the onboarding closure authenticates.
     pub governing_source_generation: u64,
-    /// Onboarding-retained governing sources for the observed instance.
-    pub sources: GoverningSourceSet,
+    /// Exact governing-source admission request for this scope generation.
+    /// The Governor admits it; only its admitted set may authenticate the
+    /// observed instance.
+    pub source_admission: SourceAdmissionRequest,
     /// Privacy boundary the new binding must satisfy.
     pub privacy: PrivacyProfile,
     /// Caller-sequenced durable revision for the admitted owner.
@@ -3394,13 +3423,14 @@ pub struct ScopeAttachIngress {
 impl ScopeAttachIngress {
     /// Validates the payload shape without authenticating anything.
     ///
-    /// Malformed caller fields (blank references, zero counters) fail as
+    /// Malformed caller fields (blank references, zero counters, a source
+    /// admission for another scope or generation) fail as
     /// `TASK_SELECTION_REQUIRED`; scope-identity disagreements (a descriptor
     /// that does not validate, a privacy class outside the admitted
     /// boundary) fail as `TASK_SCOPE_INCOMPATIBLE`. A non-absolute root
     /// fails as incompatible: only an explicit absolute path may be
-    /// observed. The governing source set itself is checked at admission
-    /// against the observed scope, never here.
+    /// observed. The candidates themselves are admitted and authority-checked
+    /// by the Governor owner, never here.
     pub fn validate(&self) -> Result<(), TaskBindingError> {
         if !self.explicit_root.is_absolute() {
             return Err(TaskBindingError::scope_incompatible(
@@ -3442,6 +3472,13 @@ impl ScopeAttachIngress {
         if !self.privacy.admits(self.privacy_class) {
             return Err(TaskBindingError::scope_incompatible(
                 "attach ingress privacy class is outside the admitted boundary",
+            ));
+        }
+        if self.source_admission.scope_ref != self.descriptor.scope_ref
+            || self.source_admission.generation != self.governing_source_generation
+        {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress source admission names another scope or generation",
             ));
         }
         Ok(())
@@ -3487,6 +3524,117 @@ fn observe_explicit_workspace_facts(
             ))
         })?;
     Ok((facts, observed))
+}
+
+/// Authenticated task-intake ingress payload assembled from owned evidence.
+///
+/// The task transport builds exactly one of these per proposed selection, from
+/// evidence it already owns:
+///
+/// - `candidate`: the exact [`TaskIntakeCandidate`] the transport received,
+///   provenance and missing fields intact. The daemon never edits the goal,
+///   acceptance digest, scope, source digests, decision owner, or origin, and
+///   never rebuilds a candidate from display text;
+/// - `owner_ref`: the authenticated Human/Task decision-owner reference the
+///   transport authenticated through owned session/host state — a reference
+///   only, never derived from the candidate's own `decision_owner_ref`;
+/// - `delegating_binding_ref`: the delegating binding reference when the
+///   selection is delegated from the scope's current task. The delegated task
+///   is never taken from the caller: the daemon reads the retained terminal's
+///   `task_binding` through the Governor owner and the binding must match it;
+/// - `readiness_claim`: the full Governor-built ORS claim for the retained
+///   terminal whose `task_binding` is the owner-proven parent binding. Partial
+///   lease terms never reach a promotion;
+/// - `task_revision`: the durable revision the admitting owner assigns to the
+///   promoted task (zero is refused).
+///
+/// [`TaskIntakeIngress::validate`] checks shape and the candidate's own
+/// provenance/completeness agreement only. Authority stays with
+/// [`eliot_governor::GovernorComposition::promote_task_intake`], which reads
+/// the origin: an intake whose origin is not the Human-owned channel can never
+/// match this ingress's `owner_ref` against its own `decision_owner_ref`.
+#[derive(Clone, Debug)]
+pub struct TaskIntakeIngress {
+    /// Exact intake candidate received by the task transport.
+    pub candidate: TaskIntakeCandidate,
+    /// Trigger-authenticated Human/Task decision-owner reference.
+    pub owner_ref: String,
+    /// Delegating binding reference for a delegated selection, if any.
+    pub delegating_binding_ref: Option<String>,
+    /// Full Governor-built claim for the retained terminal holding the
+    /// owner-proven parent binding.
+    pub readiness_claim: ColdStartReadinessClaim,
+    /// Durable task revision the admitting owner assigns.
+    pub task_revision: u64,
+}
+
+impl TaskIntakeIngress {
+    /// Validates the payload shape without granting task authority.
+    ///
+    /// A tampered candidate (stored missing-field list disagreeing with the
+    /// recomputed one) and malformed references fail as
+    /// `TASK_SELECTION_REQUIRED`; a missing owner or delegation reference fails
+    /// as `TASK_SCOPE_INCOMPATIBLE` because neither selection can name an
+    /// admitting owner. Promotion authority itself is the Governor owner's.
+    pub fn validate(&self) -> Result<(), TaskBindingError> {
+        self.candidate.validate().map_err(|error| {
+            TaskBindingError::selection_required(format!(
+                "task intake candidate is invalid: {error}"
+            ))
+        })?;
+        if self.owner_ref.trim().is_empty() || self.owner_ref.chars().any(char::is_control) {
+            return Err(TaskBindingError::scope_incompatible(
+                "task intake owner_ref is blank",
+            ));
+        }
+        if let Some(binding_ref) = &self.delegating_binding_ref
+            && (binding_ref.trim().is_empty() || binding_ref.chars().any(char::is_control))
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "task intake delegating_binding_ref is blank",
+            ));
+        }
+        if self.task_revision == 0 {
+            return Err(TaskBindingError::selection_required(
+                "task intake task_revision is zero",
+            ));
+        }
+        self.readiness_claim.validate().map_err(|error| {
+            TaskBindingError::selection_required(format!(
+                "task intake readiness claim is invalid: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Builds the authority basis this ingress admits through.
+    ///
+    /// A delegated selection names the delegating binding and the task read from
+    /// the retained terminal's owner-proven current binding, never a
+    /// caller-supplied task; a direct selection names the authenticated owner.
+    /// A delegation with no current task contract fails closed here, before the
+    /// Governor owner is asked to promote anything.
+    pub fn authority_basis(
+        &self,
+        parent: &TaskBindingState,
+    ) -> Result<AuthorityBasis, TaskBindingError> {
+        match &self.delegating_binding_ref {
+            Some(binding_ref) => {
+                let TaskBindingState::CurrentTaskContract { task_ref, .. } = parent else {
+                    return Err(TaskBindingError::selection_required(
+                        "delegated task intake names no current task contract to delegate from",
+                    ));
+                };
+                Ok(AuthorityBasis::DelegatedTaskBinding {
+                    binding_ref: binding_ref.clone(),
+                    task_ref: task_ref.clone(),
+                })
+            }
+            None => Ok(AuthorityBasis::HumanOwner {
+                owner_ref: self.owner_ref.clone(),
+            }),
+        }
+    }
 }
 
 /// Observes one authenticated activation selector and creates the exact

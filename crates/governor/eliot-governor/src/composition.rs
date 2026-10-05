@@ -7696,8 +7696,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// expired admission and an admitted record without authority fail closed
     /// here instead of reaching readiness. The returned admission is the
     /// caller input for cold-start compilation of that scope generation.
-    /// Live status: owning thin entry for daemon/scanner ingress; no live
-    /// attach transport builds a `SourceAdmissionRequest` yet
+    /// Live status: called by the daemon attach entry
+    /// `DaemonComposition::admit_scope_attach` from its `ScopeAttachIngress`
+    /// request; no live attach transport builds that request yet
     /// (BLOCKED-BY attach-transport).
     pub fn admit_governing_sources_for_scope(
         request: SourceAdmissionRequest,
@@ -7744,8 +7745,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// decision owner (or delegating binding) as `selection_source_ref` and
     /// the exact intake as `evidence_ref`, which the receipt compiler carries
     /// into the terminal receipt for the bind path to compare.
-    /// Live status: owning thin entry for task ingress; no live task ingress
-    /// builds a `TaskIntakeCandidate` yet (BLOCKED-BY task-ingress).
+    /// Live status: called by the daemon task-intake entry
+    /// `DaemonComposition::admit_task_intake`, which reads the parent binding
+    /// from the retained terminal and builds the basis from the authenticated
+    /// owner reference or the delegating binding; no live task transport builds
+    /// a `TaskIntakeCandidate` yet (BLOCKED-BY task-ingress).
     pub fn promote_task_intake(
         candidate: &TaskIntakeCandidate,
         basis: &AuthorityBasis,
