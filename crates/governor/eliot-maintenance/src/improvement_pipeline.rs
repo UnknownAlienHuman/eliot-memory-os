@@ -5095,6 +5095,51 @@ mod tests {
         );
     }
 
+    /// `I12.24:76`: replay-only evidence cannot promote. Every status other than
+    /// `Executed` refuses, and the refused label is the machine state's own.
+    #[test]
+    fn evidence_shape_refuses_non_executed_status() {
+        let mut group = fixture("a");
+        group.evidence.execution = ImprovementEvidenceExecution::NotExecuted;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "not-executed",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.evidence.execution = ImprovementEvidenceExecution::Simulated;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "simulated",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.evidence.execution = ImprovementEvidenceExecution::UnknownOutcome;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "unknown-outcome",
+            }
+        );
+    }
+
+    /// `I12.24:76`: a dependent or failed evaluation is not independent
+    /// evidence, even though the evaluation itself did execute.
+    #[test]
+    fn evidence_shape_refuses_dependent_or_failed_verdict() {
+        let mut group = fixture("a");
+        group.evidence.independent = false;
+        assert_eq!(group.refusal(), PipelineError::EvidenceNotIndependent);
+
+        let mut group = fixture("a");
+        group.evidence.verifier_passed = false;
+        assert_eq!(group.refusal(), PipelineError::EvidenceNotIndependent);
+    }
+
     #[test]
     fn substituted_operation_and_idempotency_identity_refuse_on_both_joins() {
         // Proposal to candidate: the candidate view no longer declares the
