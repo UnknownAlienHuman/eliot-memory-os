@@ -2102,6 +2102,7 @@ function Test-GovernorRetirementCandidateTransition(
     [string]$Repo,
     [string]$CandidateCommit,
     [string]$OwnerSourceCommit,
+    [string]$TrustRootCommit,
     [object]$CandidateIdentity,
     [object]$SourceClosure,
     [object]$CandidateClosure,
@@ -2117,6 +2118,13 @@ function Test-GovernorRetirementCandidateTransition(
     $null = & git -C $Repo merge-base --is-ancestor $OwnerSourceCommit $CandidateCommit 2>$null
     if ($LASTEXITCODE -ne 0) {
         return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_OWNER_SOURCE_NOT_ANCESTOR' }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TrustRootCommit)) {
+        $null = & git -C $Repo merge-base --is-ancestor $TrustRootCommit $OwnerSourceCommit 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_TRUST_ROOT_NOT_ANCESTOR' }
+        }
     }
     if ([string]$CandidateClosure.status -cne 'COMPLETE') {
         return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CANDIDATE_CLOSURE_INCOMPLETE (status=$([string]$CandidateClosure.status))" }
@@ -2982,7 +2990,8 @@ function Resolve-GovernorRetirementApprovalBinding(
         $candidateIdentity `
         $ownerClosure `
         $candidateClosure `
-        @($shape.consumers)
+        @($shape.consumers) `
+        ([string]$TrustPolicy.commit)
     if (-not [bool]$transition.admitted) {
         return (& $rejected 'APPROVAL_CANDIDATE_TRANSITION_REJECTED' ([string]$transition.reason))
     }
