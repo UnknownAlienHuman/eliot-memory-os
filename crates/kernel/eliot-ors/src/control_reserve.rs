@@ -1131,4 +1131,47 @@ mod tests {
             BackpressureDisposition::StorageBackpressure
         ));
     }
+
+    /// The W1 per-owner rows for ORS (issue #1679): the owner publishes live,
+    /// validated rows for BOTH its dimensions, naming exactly
+    /// `ORS_TRANSACTION_BOTTLENECK` then `ORS_DURABLE_BYTES_BOTTLENECK` with
+    /// the frozen-map owners, so the Kernel profile composition joins real owner
+    /// evidence. Per I14.3 there is one row per bottleneck in the frozen owner
+    /// binding and no borrowed capacity, so each row is checked against the
+    /// frozen map rather than a hard-coded owner: a hard-coded owner would only
+    /// prove the test agrees with itself.
+    #[test]
+    fn ors_publish_owner_rows_name_both_frozen_dimensions() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let ctx = OrsOwnerEvidenceContext {
+            owner_generation_ref: "gen-7".to_owned(),
+            proof_profile_ref: "proof-ors-1".to_owned(),
+            evidence_refs: vec!["ev-ors-1".to_owned()],
+            invalidation_set: vec!["inv-ors-1".to_owned()],
+        };
+        let rows = reserve.publish_owner_rows(&ctx).expect("owner rows");
+
+        // The constructor returns transaction first, durable second.
+        assert_eq!(rows[0].bottleneck, ORS_TRANSACTION_BOTTLENECK);
+        assert_eq!(rows[1].bottleneck, ORS_DURABLE_BYTES_BOTTLENECK);
+        assert!(
+            rows.iter()
+                .all(|row| row.coverage_state == BottleneckCoverageState::Claimed)
+        );
+
+        for row in &rows {
+            let bound = frozen_bottleneck_owner_map()
+                .into_iter()
+                .find(|b| b.bottleneck == row.bottleneck)
+                .expect("frozen ors owner");
+            assert_eq!(row.owner_ref, bound.owner);
+        }
+    }
 }
