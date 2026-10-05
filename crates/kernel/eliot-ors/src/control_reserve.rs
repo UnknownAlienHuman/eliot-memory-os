@@ -1054,4 +1054,38 @@ mod tests {
             matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
         );
     }
+
+    /// The reporting face of the same property (issue #1679):
+    /// `normal_durable_exhaustion_response` must never manufacture a
+    /// `STORAGE_BACKPRESSURE` response for a durable partition that still
+    /// admits the request. A response that names an exhausted resource while
+    /// durable staging is available would be false pressure evidence, so the
+    /// admitting partition is refused instead.
+    #[test]
+    fn ors_durable_exhaustion_response_refuses_an_admitting_partition() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_durable_bytes(), 8);
+
+        let err = reserve
+            .normal_durable_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-bytes-admitting-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("an admitting partition must not produce pressure evidence");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.normal_durable_bytes",
+                ..
+            }
+        ));
+    }
 }
