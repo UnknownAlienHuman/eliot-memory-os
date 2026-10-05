@@ -395,6 +395,37 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(c.ContractViolation):
             make_desc(852, "D-WU-COHORT", cases=-5)
 
+        # The same defects must fail at the closed decoder, not only at the
+        # constructor: a descriptor artifact carrying a non-integer case count.
+        toml_string_count = b"""
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = { value = "work-unit-852" }
+issue = { repository = { owner = "UnknownAlienHuman", name = "eliot-memory-os" }, number = 852 }
+unit = { value = "D-WU-COHORT" }
+mode = "python-unittest"
+source_roots = [{ value = "scripts/work_unit_gate" }]
+test_roots = [{ value = "scripts/tests" }]
+matrix_cases = "42"
+proof_ceiling = { value = "catalogue-integrity-only" }
+revision = 1
+body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+require_workspace_member = false
+requirements = { source_floor = 1, public_floor = 0, test_floor = 42, required_guards = [] }
+bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes = 65536, discovery_tests = 1000, child_processes = 4 }
+"""
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_string_count, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("INTEGER_BOUND", str(ctx.exception))
+
+        # A zero case count is a well-typed integer outside the closed bound.
+        toml_zero_count = toml_string_count.replace(b'matrix_cases = "42"', b"matrix_cases = 0")
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_zero_count, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("INTEGER_BOUND", str(ctx.exception))
+
     # WORK_UNIT_CASE: 852/14
     def test_floor_weaker_than_matrix_rejected(self):
         with self.assertRaises(c.ContractViolation):
@@ -751,6 +782,52 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         # Wildcard authority is rejected at contract construction time
         with self.assertRaises(c.ContractViolation):
             make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/work_unit_gate/*.py",))
+
+        # ...and a wildcard root in a descriptor artifact cannot decode into a
+        # dispatch-ready descriptor either.
+        toml_wildcard_root = b"""
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = { value = "work-unit-852" }
+issue = { repository = { owner = "UnknownAlienHuman", name = "eliot-memory-os" }, number = 852 }
+unit = { value = "D-WU-COHORT" }
+mode = "python-unittest"
+source_roots = [{ value = "scripts/*.py" }]
+test_roots = [{ value = "scripts/tests" }]
+matrix_cases = 42
+proof_ceiling = { value = "catalogue-integrity-only" }
+revision = 1
+body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+require_workspace_member = false
+requirements = { source_floor = 1, public_floor = 0, test_floor = 42, required_guards = [] }
+bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes = 65536, discovery_tests = 1000, child_processes = 4 }
+"""
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_wildcard_root, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("NONCANONICAL_PATH", str(ctx.exception))
+
+        # A test floor below the declared matrix denominator is a contradiction
+        # the closed decoder rejects.
+        toml_low_test_floor = toml_wildcard_root.replace(
+            b'source_roots = [{ value = "scripts/*.py" }]', b'source_roots = [{ value = "scripts/work_unit_gate" }]'
+        ).replace(
+            b"requirements = { source_floor = 1, public_floor = 0, test_floor = 42, required_guards = [] }",
+            b"requirements = { source_floor = 1, public_floor = 0, test_floor = 10, required_guards = [] }",
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_low_test_floor, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("TEST_FLOOR_TOO_LOW", str(ctx.exception))
+
+        # A zero matrix denominator cannot become dispatch-ready either.
+        toml_zero_cases = toml_wildcard_root.replace(
+            b'source_roots = [{ value = "scripts/*.py" }]', b'source_roots = [{ value = "scripts/work_unit_gate" }]'
+        ).replace(b"matrix_cases = 42", b"matrix_cases = 0")
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_zero_cases, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("INTEGER_BOUND", str(ctx.exception))
 
     # WORK_UNIT_CASE: 852/35
     def test_incomplete_truncated_tag_filtered_moving_snapshot_cannot_assert_complete_catalogue(self):
