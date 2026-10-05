@@ -3630,6 +3630,51 @@ mod tests {
         Ok(())
     }
 
+    /// W8 join order (issue #1679): with two ownerless demands the
+    /// join refuses the FIRST one without consulting further, so no
+    /// later demand is admitted or masked (I14.3: every dimension
+    /// needs its owner).
+    #[test]
+    fn packet_headroom_join_refuses_first_ownerless_of_two_demands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands.push(HeadroomDemand {
+            dimension: HeadroomDimension::ModelQuota,
+            quantity: HeadroomQuantity::Unknown {
+                reason: eliot_contracts::ArtifactId::new("reason-mq-1")?,
+            },
+            request: CapacityRequest {
+                operation: RequestedOperationClass::Normal(NormalWorkClass::Interactive),
+                operation_id: "op-mq-1".to_owned(),
+                requested_bottleneck: CapacityBottleneck::KernelRunnableControlSlots,
+                requested_limit: CapacityLimit {
+                    unit: CapacityUnit::Items,
+                    quantity: NonZeroU64::new(1).ok_or("non-zero demand")?,
+                },
+                requesting_owner_ref: "owner-a".to_owned(),
+                requesting_generation_ref: ResourceGeneration::new(1)?,
+                authority_epoch_ref: test_epoch(1)?,
+                profile_id: "profile-1".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                deadline_ms: 1_000,
+            },
+        });
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is deliberately
+        // not `Debug`, so the error is taken by pattern instead of through
+        // `expect_err`; the refusal asserted below is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("ownerless demands must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NoFrozenOwner { dimension } if dimension == HeadroomDimension::Gpu)
+        );
+        Ok(())
+    }
+
     fn evidence_request(
         fence: &StateFence,
     ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
