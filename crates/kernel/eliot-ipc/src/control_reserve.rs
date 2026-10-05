@@ -887,6 +887,36 @@ mod tests {
         ));
     }
 
+    /// The acquisition-side identity guard: `try_acquire_normal_bytes` refuses a
+    /// blank operation id as `InvalidField { field:
+    /// "ipc_permit.operation_id" }` on a partition with free bytes, so no
+    /// permit ever binds an identity the contract cannot name and capacity is
+    /// never held anonymously (issue #1679 A10; `I14.3` every permit binds
+    /// owner/operation/epoch).
+    #[test]
+    fn ipc_acquire_rejects_blank_operation_id() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_normal_bytes(
+            NormalWorkClass::Interactive,
+            "owner-a",
+            "",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank operation id must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.operation_id",
+                ..
+            }
+        ));
+    }
+
     /// Publication-side identity guard (issue #1679 A10/W1): a
     /// claimed row is never published under a blank owner-generation
     /// reference, so `publish_claimed_row` refuses the blank
