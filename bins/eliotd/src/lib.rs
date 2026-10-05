@@ -4047,7 +4047,7 @@ impl DaemonComposition {
     /// with the session-observed one; a validated session must exist.
     /// Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
-    fn resolve_verified_material(
+    pub(crate) fn resolve_verified_material(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         mut material: VerifiedProviderMaterial,

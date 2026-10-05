@@ -100,14 +100,14 @@ use eliot_agent_coordinator::{
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::agent_fabric::ModelRegistryPort;
 use crate::agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric, DispatchAck,
     DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricOperation,
-    FabricPortId, FabricSnapshot, PortBindingState, Reservation, RouteRequirements,
+    FabricPortId, FabricPorts, FabricSnapshot, PortBindingState, Reservation, RouteRequirements,
     SwarmDefinition, VerifiedProviderMaterial, daemon_coordinator_config,
 };
-#[cfg(test)]
-use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
 use crate::daemon_kernel_client::DaemonKernelClient;
 use crate::staffing_policy::{
     StaffedLane, StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
@@ -1682,6 +1682,84 @@ fn adopt_solo_drive(
         }
     }
     Ok(())
+}
+
+/// Owned drive preparation snapshot (issue #2567 W3).
+///
+/// Everything the verified drive needs past the prepare step, taken under
+/// one short composition borrow and releasable before any await: the
+/// production ports, a state-root copy, the admitted intake, the resolved
+/// (session-checked, fence-stamped) material, and the clock. The seam and
+/// the post-seam chain consume only this snapshot plus short re-locks for
+/// adopt-time revalidation — never a borrow held across owner IO.
+pub(crate) struct SoloDrivePrepared {
+    pub(crate) ports: FabricPorts,
+    pub(crate) state_root: std::path::PathBuf,
+    pub(crate) intake: SoloDelegateIntake,
+    pub(crate) material: VerifiedProviderMaterial,
+    pub(crate) now_unix_ms: u64,
+}
+
+/// Prepares one verified drive under a short borrow (issue #2567 W3).
+///
+/// Synchronous: readiness, intake shape, solo recipe, binding cross-check,
+/// single live slot, session-bound material resolution, production ports,
+/// state-root copy. No await inside by construction, so the caller drops
+/// its guard before the seam await. Fail-closed order mirrors the current
+/// drive head exactly — this step only moves it.
+///
+/// # Errors
+///
+/// Returns the readiness, admission, binding, slot, session-resolution, or
+/// port-construction refusal unchanged, each typed (same as the drive head).
+pub(crate) fn prepare_solo_drive(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<SoloDrivePrepared, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    let material = intake.claimed.material();
+    check_verified_binds_intake(&intake, &material)?;
+    let operation_id = material.operation_id.clone();
+    let attempt_id = AttemptId::new(material.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.clone()
+            && live != operation_id
+        {
+            let settled = load_projection(composition.state_root(), &live)
+                .is_ok_and(|projection| projection_settled(&projection));
+            if !settled {
+                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
+                )));
+            }
+            state.live_operation = None;
+        }
+    }
+    let material = composition.resolve_verified_material(kernel, material)?;
+    let ports = composition.production_fabric_ports()?;
+    let state_root = composition.state_root().to_owned();
+    let _ = attempt_id;
+    Ok(SoloDrivePrepared {
+        ports,
+        state_root,
+        intake,
+        material,
+        now_unix_ms,
+    })
 }
 
 /// Drives one admitted solo delegate intake through the verified async
