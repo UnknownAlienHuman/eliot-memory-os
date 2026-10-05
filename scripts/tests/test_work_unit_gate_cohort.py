@@ -405,6 +405,37 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue))
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
 
+        # The very same well-formed pair is declarable: sharing is valid only
+        # with an explicit disjoint (or serialized) declaration, and the
+        # production derivation helper supplies exactly that one edge. Deriving
+        # is deterministic, so a repeated derivation is the identical tuple.
+        edges = ch.derive_package_sharing([d1, d2], {}, None)
+        self.assertEqual(len(edges), 1)
+        self.assertIsInstance(edges[0], ch.PackageSharingEdge)
+        self.assertIs(edges[0].kind, ch.PackageSharingKind.DISJOINT)
+        self.assertEqual(edges[0].package.name, "eliot-core")
+        self.assertEqual(set(edges[0].issues), {d1.issue, d2.issue})
+        self.assertEqual(edges, ch.derive_package_sharing([d1, d2], {}, None))
+
+        cat = ch.materialize_catalogue(
+            [make_row(d1), make_row(d2)], (d1.issue, d2.issue), package_sharing=tuple(edges)
+        )
+        self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+        self.assertEqual(len(cat.rows), 2)
+
+        # The undeclarable counterpart: same package and same distinct issues,
+        # but the mutable scopes overlap and there is neither a typed
+        # prerequisite nor an integration owner, so no edge is derivable and
+        # the same empty sharing leaves the conflict standing.
+        o1 = make_desc(853, "D-WU-PKG-O1", 20, package="eliot-core", source_roots=("crates/core",))
+        o2 = make_desc(854, "D-WU-PKG-O2", 22, package="eliot-core", source_roots=("crates/core/sub.rs",))
+        self.assertEqual(ch.derive_package_sharing([o1, o2], {}, None), ())
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(o1), make_row(o2)], (o1.issue, o2.issue), package_sharing=()
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
+
     # WORK_UNIT_CASE: 852/12
     def test_valid_distinct_same_order_tracks(self):
         d1 = make_desc(851, "D-WU-TRACK-A", 20, package="eliot-track-a", source_roots=("crates/track-a/src/lib.rs",))
@@ -414,6 +445,26 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat = ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue))
         self.assertEqual(len(cat.rows), 2)
         self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+
+        # Two same-package tracks are a valid cohort when their mutable scopes
+        # are disjoint and that fact is explicitly declared: derivation holds
+        # exactly the one pair edge, and the unrelated third package needs none.
+        t1 = make_desc(853, "D-WU-TRACK-A", 20, package="eliot-track", source_roots=("crates/track/a.rs",))
+        t2 = make_desc(854, "D-WU-TRACK-B", 22, package="eliot-track", source_roots=("crates/track/b.rs",))
+        t3 = make_desc(855, "D-WU-OTHER", 20, package="eliot-other", source_roots=("crates/other/lib.rs",))
+        track_edges = ch.derive_package_sharing([t1, t2, t3], {}, None)
+        self.assertEqual(len(track_edges), 1)
+        self.assertIs(track_edges[0].kind, ch.PackageSharingKind.DISJOINT)
+        self.assertEqual(track_edges[0].package.name, "eliot-track")
+        self.assertEqual(set(track_edges[0].issues), {t1.issue, t2.issue})
+
+        cat3 = ch.materialize_catalogue(
+            [make_row(t1), make_row(t2), make_row(t3)],
+            (t1.issue, t2.issue, t3.issue),
+            package_sharing=tuple(track_edges),
+        )
+        self.assertEqual(len(cat3.rows), 3)
+        self.assertEqual(cat3.result, c.CatalogueResult.INTEGRITY_VALID)
 
     # WORK_UNIT_CASE: 852/13
     def test_zero_negative_malformed_case_count_rejected(self):
