@@ -1347,6 +1347,97 @@ fn changed_replay_leaves_state_unchanged() {
     );
 }
 
+/// Source: the same `append_locked` replay-identity block cited by case
+/// 297/A3-replay and 297/A3-changed, and specifically the LENGTH arm of the
+/// `matches_admitted_chunk` conjunction: a replay is accepted only when the
+/// recorded `AdmittedChunk` metadata AND the admitted bytes at that chunk's
+/// coordinates ALL match, and a disagreement on any one of them is
+/// `MismatchedReplay`.
+/// Discovery: a transport may re-send a chunk with EXTRA BYTES APPENDED -- the
+/// same sequence and offset, but STRICTLY LONGER than what was admitted. Such a
+/// replay STARTS WITH the admitted bytes, so it is not a changed chunk, yet it is
+/// not the same chunk either: the length arm fails before the byte comparison,
+/// so it is refused as `MismatchedReplay` and the append-only evidence object is
+/// never silently extended by the extra byte.
+/// Executed-pass: one chunk `C` is admitted, then the LONGER `b"chunk-c!"` is
+/// offered at the same sequence and offset; the refusal is the exact
+/// `MismatchedReplay`, the session view shows both cursors unmoved, and the
+/// finalized publication is the ORIGINAL `C`.
+/// I10.8.5: the append-only temporary raw evidence object grows once, by the
+/// admitted bytes -- an overlapping replay admits no byte of its extra tail.
+// WORK_UNIT_CASE: 297/A3-overlap
+#[test]
+fn overlapping_replay_leaves_state_unchanged() {
+    const C: &[u8] = b"chunk-c";
+    let (sink, session) = open_replay_sink("overlap");
+
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, C)),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: C.len() as u64,
+        },
+    );
+
+    // The same sequence and offset with EXTRA BYTES APPENDED: `b"chunk-c!"` is
+    // one byte longer than the admitted `C` and begins with it. The admitted
+    // length arm of the replay identity fails on the longer payload, so this is
+    // `MismatchedReplay` rather than a silent extension of the evidence object.
+    // `replay_limits()` leaves every ceiling far above eight bytes, so the
+    // refusal is the replay-identity arm and not a byte-limit arm.
+    assert_eq!(
+        append_chunk(&sink, &session, 0, 0, b"chunk-c!"),
+        Err(ProcessStreamSinkError::MismatchedReplay),
+        "a replay that carries more bytes than the admitted chunk is not the same chunk, even when it begins with the admitted bytes"
+    );
+
+    // The refused overlap admitted nothing and moved no cursor: the session still
+    // counts exactly the one original chunk at its original extent.
+    let ProcessStreamSinkReadback::Session { view } = ok(block_on(sink.readback(session.clone())))
+    else {
+        panic!("an unfinalized session reads back as its session view");
+    };
+    assert_eq!(view.admitted_chunks(), 1);
+    assert_eq!(view.admitted_bytes(), C.len() as u64);
+    assert_eq!(view.next_sequence(), 1);
+    assert_eq!(view.next_offset(), C.len() as u64);
+
+    let expected_sha256 = format!("{:x}", Sha256::digest(C));
+    let request = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        1,
+        C.len() as u64,
+        20,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        C.len() as u64,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            C.to_vec(),
+            C.len() as u64,
+        )),
+        None,
+        Vec::new(),
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), request)));
+
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+    assert_eq!(terminal.admitted_chunks(), 1);
+
+    // The published object is the ORIGINAL `C`, without the replayed `!`: had the
+    // overlapping tail reached the staged plaintext, the length or the digest
+    // below would differ.
+    let Some(BlobStreamPublication::Complete(complete)) = sink.publication() else {
+        panic!("a complete source must record a real object, never `Unavailable`");
+    };
+    assert_eq!(complete.byte_length, C.len() as u64);
+    assert_eq!(complete.sha256, expected_sha256);
+    assert_eq!(
+        complete.locator,
+        format!("blob:{}", blake3::hash(C).to_hex())
+    );
+}
+
 /// Source: the `SequenceGap` arm of `append_locked`: an append whose sequence
 /// is ABOVE `next_sequence` names the exact expected and observed cursors and
 /// is refused before any byte is admitted.
