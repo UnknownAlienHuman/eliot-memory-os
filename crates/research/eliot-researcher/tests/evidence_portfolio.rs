@@ -1086,6 +1086,42 @@ fn absence_missing_handle_is_unproven() {
     );
 }
 
+#[test]
+fn absence_foreign_scope_is_unproven() {
+    // A foreign scope is the same positive evidence with the scope binding broken:
+    // every closing member still resolves to its own vetted record, the manifest
+    // still commits those exact records and the owner-issued evaluation still
+    // carries a result for every member — but that evaluation was bounded to the
+    // digest of the frozen scope snapshot this suite shares, while the claim is
+    // scoped to `DIGEST_A`. Completeness is proved on the frozen scope (I21-06:
+    // `complete_scope` is the only basis on which a scoped absence may be claimed),
+    // so evidence bounded to a different snapshot cannot support `Proven` however
+    // complete it is over its own.
+    //
+    // `AbsencePreconditions::derive` checks only the *shape* of the frozen scope
+    // digest, and `DIGEST_A` is a well-formed 64-hex digest, so the preconditions
+    // are derived rather than refused there; the binding of the evaluation to the
+    // claimed scope is `ass_absence`'s own work at `foreign_evaluation_scope`
+    // (`src/evidence_portfolio.rs`).
+    let (account, records, manifest, evaluation) = proven_absence();
+    let foreign = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        DIGEST_A,
+        Some(evaluation),
+    )
+    .expect("preconditions over a foreign scope");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &foreign) else {
+        panic!("an evaluation bounded to a different frozen scope must not prove absence");
+    };
+    assert!(
+        reason.contains(&format!("not to {DIGEST_A}")),
+        "the scope the claim is scoped to must be retained: {reason}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
