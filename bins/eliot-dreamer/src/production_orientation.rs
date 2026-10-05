@@ -1527,3 +1527,30 @@ mod curation_member_identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod carrier_deadline_tests {
+    use crate::pulse::PulseError;
+
+    use super::check_carrier_deadline;
+
+    /// A deadline 1ms past the Unix epoch is in the past on any real clock,
+    /// so the carrier must fail closed here rather than publish a stale pulse.
+    #[test]
+    fn past_deadline_is_refused() {
+        assert!(
+            matches!(check_carrier_deadline(1), Err(PulseError::DeadlineExceeded)),
+            "a past carrier deadline must refuse with DeadlineExceeded"
+        );
+    }
+
+    /// `u64::MAX` ms is unreachable by any real clock, so a live carrier
+    /// passes this gate (positive control for the refusal above).
+    #[test]
+    fn far_future_deadline_passes() {
+        assert!(
+            check_carrier_deadline(u64::MAX).is_ok(),
+            "a far-future carrier deadline must pass"
+        );
+    }
+}
