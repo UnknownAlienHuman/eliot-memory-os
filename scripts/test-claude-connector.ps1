@@ -85,6 +85,45 @@ function Assert-CompactClaudeSurface {
     }
 }
 
+function Assert-BridgeDesktopSurface {
+    param(
+        [Parameter(Mandatory = $true)][string]$BridgeExe
+    )
+    # Supported bridge surface-proof argv: mcp catalog --host claude --surface desktop
+    # (the facade reference client's `mcp stdio --host <surface> --instance default`
+    # is rejected by the bridge with exit 2 MALFORMED_ARGUMENT).
+    $json = Invoke-NativeChecked $BridgeExe @('mcp', 'catalog', '--host', 'claude', '--surface', 'desktop') 'Desktop Bridge MCP catalog'
+    $catalog = $json | ConvertFrom-Json -Depth 50
+    $expectedTools = @(
+        'eliot.act',
+        'eliot.coordinate',
+        'eliot.finish',
+        'eliot.observe',
+        'eliot.packet',
+        'eliot.query',
+        'eliot.state',
+        'eliot.verify'
+    ) | Sort-Object
+    $actualTools = @($catalog.tools | Sort-Object)
+    $expectedPrompts = @(
+        'eliot-delegate',
+        'eliot-finish',
+        'eliot-start',
+        'eliot-understand'
+    ) | Sort-Object
+    $actualPrompts = @($catalog.prompts | Sort-Object)
+    Assert-True ($catalog.schema_version -eq 'eliot-mcp-catalog-v2') 'Desktop Bridge catalog schema_version drifted'
+    Assert-True (@(Compare-Object $actualTools $expectedTools).Count -eq 0) 'Desktop Bridge catalog tool set drifted'
+    Assert-True (@(Compare-Object $actualPrompts $expectedPrompts).Count -eq 0) 'Desktop Bridge catalog prompt set drifted'
+    $bridgeSha256 = (Get-FileHash -LiteralPath $BridgeExe -Algorithm SHA256).Hash
+    Add-PassedStep 'claude_desktop_bridge_surface' @{
+        bridge = $BridgeExe
+        bridge_sha256 = $bridgeSha256
+        tools = $actualTools.Count
+        prompts = $actualPrompts.Count
+    }
+}
+
 Push-Location $repoRoot
 try {
     $metadata = (Invoke-NativeChecked 'cargo' @('metadata', '--format-version', '1', '--no-deps') 'Cargo metadata') | ConvertFrom-Json
@@ -169,7 +208,7 @@ try {
     }
 
     Assert-CompactClaudeSurface -HostSurface 'claude' -Governor $installedGovernor
-    Assert-CompactClaudeSurface -HostSurface 'claude-desktop' -Governor $desktopBridge
+    Assert-BridgeDesktopSurface -BridgeExe $desktopBridge
 
     if (-not $SkipCargoTests) {
         Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'plugin_hooks', '--', '--nocapture', '--test-threads=1') 'Claude hook tests' | Out-Null
