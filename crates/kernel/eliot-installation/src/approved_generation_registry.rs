@@ -3045,7 +3045,8 @@ const TEST_SUPPORT_ACTIVATION_FIXTURE_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestSupportRegistryFixtureContour {
     /// In-memory `ApprovedGenerationRegistry` used by the state-machine, wire
-    /// and launch fixtures.
+    /// and launch fixtures (in-crate unit tests only).
+    #[cfg(test)]
     InMemory,
     /// Durable redb `RedbInstallationRegistry` used by the store and Host
     /// recovery fixtures.
@@ -3057,6 +3058,7 @@ impl TestSupportRegistryFixtureContour {
     /// Canonical label bound into the fixture preimage.
     fn canonical_label(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::InMemory => "IN_MEMORY_REGISTRY",
             Self::Durable => "DURABLE_REDB_REGISTRY",
         }
