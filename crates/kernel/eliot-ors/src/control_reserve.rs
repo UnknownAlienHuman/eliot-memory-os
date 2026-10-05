@@ -1372,4 +1372,36 @@ mod tests {
             }
         ));
     }
+
+    /// The owner-identity complement of the acquisition paths (issue #1679
+    /// A10): every permit binds owner, operation and epoch, so a blank owner
+    /// must never hold an ORS permit. The refusal names the exact field
+    /// `ors_permit.owner` before any partition capacity is consumed.
+    #[test]
+    fn ors_acquire_rejects_blank_owner() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        let Err(err) = reserve.try_acquire_normal_transaction(
+            NormalWorkClass::CanonicalWrite,
+            "",
+            "op-owner-1",
+            epoch,
+        ) else {
+            panic!("blank owner must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_permit.owner",
+                ..
+            }
+        ));
+    }
 }
