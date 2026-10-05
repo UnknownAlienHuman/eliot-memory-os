@@ -544,6 +544,21 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat = ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue))
         self.assertEqual(len(cat.rows), 2)
 
+        # Shared reads stay legal, identical write claims do not: two distinct
+        # issues writing the very same source file are a write-scope overlap.
+        d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/mod.py",))
+        d2 = make_desc(852, "D-WU-B", 20, source_roots=("scripts/mod.py",))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([make_row(d1), make_row(d2)], (d1.issue, d2.issue))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.WRITE_SCOPE_OVERLAP)
+
+        # The same conflict holds for an identical write directory.
+        d3 = make_desc(851, "D-WU-C", 20, source_roots=("scripts/pkg",))
+        d4 = make_desc(852, "D-WU-D", 20, source_roots=("scripts/pkg",))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([make_row(d3), make_row(d4)], (d3.issue, d4.issue))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.WRITE_SCOPE_OVERLAP)
+
     # WORK_UNIT_CASE: 852/21
     def test_explicit_serialized_overlap_remains_nonparallel(self):
         d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/shared",))
@@ -560,6 +575,15 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_catalogue([make_row(d_root)], (d_root.issue,))
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # Every restricted claim class rejects an ordinary leaf the same way:
+        # a lock file, a nested shared-configuration directory and a subpath of
+        # a generated-artifact root.
+        for restricted in ("Cargo.lock", ".github/workflows", "target/debug"):
+            d_claim = make_desc(852, "D-WU-LEAF", 42, source_roots=(restricted,))
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.materialize_catalogue([make_row(d_claim)], (d_claim.issue,))
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
 
     # WORK_UNIT_CASE: 852/23
     def test_exact_integration_owner_can_claim_root_paths(self):
