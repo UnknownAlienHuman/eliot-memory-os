@@ -3028,7 +3028,13 @@ pub(crate) fn solo_test_pair() -> (
         }
     }
 
-    let fence = StateFence::new(test_epoch(), ResourceGeneration::genesis());
+    // The plan-only coordinator binds route selection to the fence's policy
+    // revision (absent revision is not a default); the fixture carries the
+    // explicit genesis revision, never live policy evidence.
+    let fence = StateFence {
+        policy_revision: Some(eliot_contracts::PolicyRevision::genesis()),
+        ..StateFence::new(test_epoch(), ResourceGeneration::genesis())
+    };
     let route = RouteFingerprint {
         host_family: "test-host".to_owned(),
         adapter: "adapter-fabric-a".to_owned(),
