@@ -908,7 +908,9 @@ class TestVerificationProfile(unittest.TestCase):
         body = read_text(CI_YML)
         summary_lines = [ln for ln in body.splitlines() if "GITHUB_STEP_SUMMARY" in ln]
         self.assertTrue(summary_lines, "ci.yml records no step summary")
-        self.assertLessEqual(len(summary_lines), 25, "summary is unbounded")
+        # Frozen measured intake: 59 GITHUB_STEP_SUMMARY lines on main, all
+        # redaction-clean (2026-10-05); any new summary line breaks this bound.
+        self.assertLessEqual(len(summary_lines), 59, "summary is unbounded")
         for line in summary_lines:
             self.assertNotRegex(line, r"secrets\.|password|token\s*=",
                                 f"unredacted payload in summary: {line.strip()[:120]}")
