@@ -445,4 +445,41 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// The identity complement of `normal_saturation_response_reports_live_saturation_as_busy`
+    /// in this module: that test pins a real `BUSY` report, this one pins that a
+    /// blank operation identity is still refused as
+    /// `InvalidField { field: "rejection.operation_id" }` on a live-saturated
+    /// partition, so a malformed identity never produces pressure evidence.
+    #[test]
+    fn normal_saturation_response_rejects_malformed_operation_id() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([27u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single normal slot is consumed and held: the permit releases on
+        // drop, so the refusal below comes from the malformed identity and not
+        // from an unsaturated partition.
+        let _held =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-fill-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        let err = front_door
+            .normal_saturation_response(
+                NormalWorkClass::Interactive,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "rejection.operation_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
 }
