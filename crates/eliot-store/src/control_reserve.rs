@@ -1162,4 +1162,36 @@ mod tests {
             }
         ));
     }
+
+    /// Owner-identity validation at acquisition (issue #1679 A10): every
+    /// permit binds owner and operation identity, so a blank owner is
+    /// refused by name at acquisition instead of yielding a permit that
+    /// carries no accountable owner (I14.3).
+    #[test]
+    fn store_acquire_rejects_blank_owner() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let Err(err) = reserve.try_acquire_normal_connection(
+            NormalWorkClass::CanonicalWrite,
+            "",
+            "op-owner-1",
+        ) else {
+            panic!("blank owner must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_permit.owner",
+                ..
+            }
+        ));
+    }
 }
