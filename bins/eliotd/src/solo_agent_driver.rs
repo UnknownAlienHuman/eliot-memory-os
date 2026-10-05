@@ -2484,6 +2484,9 @@ pub async fn solo_fair_pull_recovery(
     };
     #[cfg(test)]
     let mut projection = load_projection(&state_root, &operation_id)?;
+    // Resolve only on the production path: the test-only synchronous seam
+    // below takes `&DaemonComposition` directly and never consumes these.
+    #[cfg(not(test))]
     let (ports, material) = {
         let composition = composition.lock().await;
         (
