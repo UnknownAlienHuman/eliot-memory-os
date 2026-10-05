@@ -5,7 +5,7 @@
   },
   "plugins": [
     {
-      "name": "eliot-governor",
+      "name": "eliot-agent-bridge",
       "source": {
         "source": "local",
         "path": "./plugins/eliot-governor"
