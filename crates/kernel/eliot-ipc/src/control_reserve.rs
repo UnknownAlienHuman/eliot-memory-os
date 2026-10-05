@@ -835,4 +835,32 @@ mod tests {
             }
         ));
     }
+
+    /// Publication-side identity guard (issue #1679 A10/W1): a
+    /// claimed row is never published under a blank owner-generation
+    /// reference, so `publish_claimed_row` refuses the blank
+    /// generation as `InvalidField { field:
+    /// "ipc_evidence.owner_generation_ref" }` before any row is
+    /// assembled and the Kernel composition never joins evidence
+    /// whose generation reference the contract cannot name (I14.3;
+    /// rows carry exact generation references per
+    /// `I14-03-control-reserve.md`).
+    #[test]
+    fn ipc_publish_claimed_row_rejects_blank_generation() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        let err = reserve
+            .publish_claimed_row("", "proof-ipc-1", "ev-ipc-1", "inv-ipc-1")
+            .expect_err("blank generation must never publish a row");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_evidence.owner_generation_ref",
+                ..
+            }
+        ));
+    }
 }
