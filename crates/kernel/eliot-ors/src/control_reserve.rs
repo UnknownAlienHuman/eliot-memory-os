@@ -49,7 +49,7 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
@@ -204,6 +204,7 @@ struct OrsReserveInner {
     transaction_protected_in_flight: AtomicU64,
     durable_normal_in_flight_bytes: AtomicU64,
     durable_protected_in_flight_bytes: AtomicU64,
+    restart_sealed: AtomicBool,
 }
 
 /// The ORS control reserve: disjoint normal/protected partitions for the two
@@ -365,6 +366,7 @@ impl OrsReserve {
                 transaction_protected_in_flight: AtomicU64::new(0),
                 durable_normal_in_flight_bytes: AtomicU64::new(0),
                 durable_protected_in_flight_bytes: AtomicU64::new(0),
+                restart_sealed: AtomicBool::new(false),
             }),
         })
     }
@@ -433,6 +435,46 @@ impl OrsReserve {
         )
     }
 
+    /// Returns whether the reserve is sealed after a restart.
+    ///
+    /// While sealed, every acquisition fails closed with its typed exhaustion
+    /// disposition: unknown held capacity stays excluded until the recovery
+    /// journal owner reconciles it. A sealed reserve reports zero
+    /// availability everywhere, but the cause is recorded here rather than
+    /// inferred from the counters.
+    #[must_use]
+    pub fn restart_sealed(&self) -> bool {
+        self.inner.restart_sealed.load(Ordering::Acquire)
+    }
+
+    /// Seals the reserve at a restart boundary: restart never restores
+    /// capacity by resetting a local counter (issue #1679 W5/A8).
+    ///
+    /// Every in-flight counter is pinned to its full partition capacity, so
+    /// no new acquisition can succeed on the back of a zeroed counter.
+    /// Unknown held capacity stays excluded: there is no in-module unseal
+    /// because lifting the seal needs the epoch fence only the durable
+    /// recovery-journal owner observes — the seal is lifted by rebuilding
+    /// the reserve from reconciled journal state (STITCH: the embedding
+    /// owner calls this exactly once when it detects an unclean restart
+    /// before admitting new work).
+    pub fn seal_after_restart(&self) {
+        self.inner
+            .transaction_normal_in_flight
+            .fetch_max(self.inner.transaction_normal_capacity, Ordering::AcqRel);
+        self.inner
+            .transaction_protected_in_flight
+            .fetch_max(self.inner.transaction_protected_capacity, Ordering::AcqRel);
+        self.inner
+            .durable_normal_in_flight_bytes
+            .fetch_max(self.inner.durable_normal_capacity_bytes, Ordering::AcqRel);
+        self.inner.durable_protected_in_flight_bytes.fetch_max(
+            self.inner.durable_protected_capacity_bytes,
+            Ordering::AcqRel,
+        );
+        self.inner.restart_sealed.store(true, Ordering::Release);
+    }
+
     /// Attempts to acquire one normal transaction slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
@@ -464,6 +506,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::NormalCapacityExhausted {
+                bottleneck: ORS_TRANSACTION_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.transaction_normal_in_flight,
             self.inner.transaction_normal_capacity,
@@ -521,6 +572,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::NormalCapacityExhausted {
+                bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.durable_normal_in_flight_bytes,
             self.inner.durable_normal_capacity_bytes,
@@ -579,6 +639,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::ProtectedReserveExhausted {
+                bottleneck: ORS_TRANSACTION_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.transaction_protected_in_flight,
             self.inner.transaction_protected_capacity,
@@ -636,6 +705,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::ProtectedReserveExhausted {
+                bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.durable_protected_in_flight_bytes,
             self.inner.durable_protected_capacity_bytes,
@@ -998,6 +1076,93 @@ mod tests {
             .expect_err("saturated normal partition must refuse");
         assert!(
             matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+    }
+
+    /// A restart never restores capacity by resetting a local counter (issue
+    /// #1679 W5/A8): sealing pins every in-flight counter to its full
+    /// partition capacity, so all four acquisition paths fail closed with
+    /// their typed exhaustion dispositions and every availability reads zero.
+    /// Unknown held capacity stays excluded until the recovery-journal owner
+    /// reconciles it — there is no in-module unseal.
+    #[test]
+    fn ors_restart_seal_closes_all_partitions_without_restoring_capacity() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(16).expect("bytes"),
+            NonZeroU64::new(16).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+        assert!(!reserve.restart_sealed());
+
+        // Positive control: every path admits before the seal.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-live-1",
+                epoch,
+            )
+            .expect("normal transaction admits");
+        assert_eq!(reserve.available_normal_transactions(), 1);
+
+        reserve.seal_after_restart();
+        assert!(reserve.restart_sealed());
+
+        // The pinned counters read as fully held: no availability anywhere.
+        assert_eq!(reserve.available_normal_transactions(), 0);
+        assert_eq!(reserve.available_protected_transactions(), 0);
+        assert_eq!(reserve.available_normal_durable_bytes(), 0);
+        assert_eq!(reserve.available_protected_durable_bytes(), 0);
+
+        // Every acquisition path fails closed with its typed disposition.
+        let err = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-sealed-1",
+                epoch,
+            )
+            .expect_err("sealed normal transaction must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+        let err = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-sealed-2",
+                epoch,
+            )
+            .expect_err("sealed protected transaction must refuse");
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+        let err = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-dur-sealed-1",
+                NonZeroU64::new(1).expect("byte"),
+                epoch,
+            )
+            .expect_err("sealed normal durable bytes must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+        let err = reserve
+            .try_acquire_protected_durable_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-dur-sealed-2",
+                NonZeroU64::new(1).expect("byte"),
+                epoch,
+            )
+            .expect_err("sealed protected durable bytes must refuse");
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
         );
     }
 
