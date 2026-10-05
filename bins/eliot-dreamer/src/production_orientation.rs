@@ -1562,7 +1562,7 @@ mod blocked_result_tests {
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 
     use super::{BlockedIdentity, BlockedParts, blocked_result, blocked_stage_record};
-    use crate::pulse::PulseStageId;
+    use crate::pulse::{CEILING_BLOCKED, PulseStageId};
     use crate::{OrientationAdmittedPrefix, OrientationBoundaryRecord, OrientationDisposition};
 
     const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1649,5 +1649,56 @@ mod blocked_result_tests {
         }
         assert_eq!(result.omissions, omissions, "no omission reason is lost");
         assert_eq!(result.missing_owners, missing_owners);
+    }
+
+    /// One blocked ledger record serializes with all ten members, including
+    /// the input/output commitments and the proof ceiling: a JSON reader
+    /// sees the same denominator shape the receipt logic binds.
+    #[test]
+    fn stage_record_json_carries_ten_members() {
+        let record = blocked_stage_record(PulseStageId::Grounding, "reason-g");
+        let value = match serde_json::to_value(&record) {
+            Ok(value) => value,
+            Err(error) => panic!("stage record must serialize: {error:?}"),
+        };
+        let object = match value.as_object() {
+            Some(object) => object,
+            None => panic!("stage record serializes as a JSON object"),
+        };
+        for member in [
+            "stage",
+            "owner",
+            "required",
+            "disposition",
+            "expected_input",
+            "input_commitment",
+            "output_commitment",
+            "proof_ceiling",
+            "reason",
+            "recovery",
+        ] {
+            assert!(
+                object.contains_key(member),
+                "stage JSON keeps member {member}"
+            );
+        }
+        assert_eq!(
+            object.len(),
+            10,
+            "exactly the ten denominator members, no more"
+        );
+        assert_eq!(
+            object["stage"],
+            PulseStageId::Grounding.as_str(),
+            "the record names its denominator member"
+        );
+        assert_eq!(
+            object["proof_ceiling"], CEILING_BLOCKED,
+            "a blocked record carries the blocked ceiling"
+        );
+        assert_eq!(
+            object["reason"], "reason-g",
+            "the refusal reason survives serialization"
+        );
     }
 }
