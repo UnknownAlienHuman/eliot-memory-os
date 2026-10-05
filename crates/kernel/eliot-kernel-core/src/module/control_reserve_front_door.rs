@@ -1906,6 +1906,29 @@ mod tests {
     }
 
     #[test]
+    fn protected_acquire_rejects_blank_owner() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 2, 8)?;
+
+        let Err(err) =
+            front_door.acquire_protected(ControlOperationClass::Recovery, "", "op-recovery-1")
+        else {
+            panic!("blank owner must never hold a protected permit");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "control_permit.owner",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn control_permit_release_returns_slot_exactly_once() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([19u8; 32]),
