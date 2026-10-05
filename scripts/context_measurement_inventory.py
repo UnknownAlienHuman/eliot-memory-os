@@ -236,13 +236,13 @@ BASELINE_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("704/1", "#704", "crates/smart/eliot-context-measurement/src/stu.rs", "stu_for_bytes"),
     ("704/2", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "measure_serialized_context"),
     ("704/3", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "measure_exact_utf8"),
-    ("704/4", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "declared_len"),
-    ("704/5", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "content_digest"),
-    ("704/6", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "rendered_utf8_bytes"),
-    ("704/7", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "estimator_id"),
-    ("704/8", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "candidate_digests"),
+    ("704/4", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "declared_len@@0"),
+    ("704/5", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "content_digest@@0"),
+    ("704/6", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "rendered_utf8_bytes@@0"),
+    ("704/7", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "estimator_id@@0"),
+    ("704/8", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "candidate_digests@@0"),
     ("704/9", "#704", "crates/smart/eliot-context-measurement/src/receipt.rs", "receipt_digest"),
-    ("783/1", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "final_bytes"),
+    ("783/1", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "final_bytes@@0"),
     ("783/2", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "envelope_digest"),
     ("783/3", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "serializer_id"),
     ("783/4", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "route_id"),
@@ -250,20 +250,20 @@ BASELINE_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/6", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "proves_fit"),
     ("783/7", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "fixed_overhead"),
     ("783/8", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "ExactUtf8"),
-    ("878/1", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_id"),
-    ("878/2", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_options_digest"),
+    ("878/1", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_id@@0"),
+    ("878/2", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_options_digest@@0"),
     ("878/3", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "schema_version"),
-    ("878/4", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "StuEstimate"),
-    ("878/5", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "TokenizerObservation"),
-    ("878/6", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "utf8_bytes"),
-    ("880/1", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "fixed_overhead"),
-    ("880/2", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "headroom"),
-    ("880/3", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "observed_tokens"),
-    ("880/4", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "ProviderTokenizerRun"),
-    ("880/5", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Transformed"),
-    ("880/6", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Stale"),
-    ("880/7", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Absent"),
-    ("880/8", "#880", "crates/smart/eliot-context-measurement/tests/measurement.rs", "#[test]"),
+    ("878/4", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "StuEstimate@@0"),
+    ("878/5", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "TokenizerObservation@@0"),
+    ("878/6", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "utf8_bytes@@0"),
+    ("880/1", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "fixed_overhead@@0"),
+    ("880/2", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "headroom@@0"),
+    ("880/3", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "observed_tokens@@0"),
+    ("880/4", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "ProviderTokenizerRun@@0"),
+    ("880/5", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Transformed@@0"),
+    ("880/6", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Stale@@0"),
+    ("880/7", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Absent@@0"),
+    ("880/8", "#880", "crates/smart/eliot-context-measurement/tests/measurement.rs", "#[test]@@0"),
 )
 
 EXPECTED_BASELINE_COUNT = 31
@@ -277,7 +277,7 @@ EXPECTED_BASELINE_COUNT = 31
 CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     # #783 app seam -- crates/eliot-app
     ("783/10", "#783", "crates/eliot-app/src/mcp_stdio.rs", "stu_for_bytes(envelope.byte_len)"),
-    ("783/11", "#783", "crates/eliot-app/src/mcp_stdio.rs", "combined_ul_tokens"),
+    ("783/11", "#783", "crates/eliot-app/src/mcp_stdio.rs", "combined_ul_tokens@@0"),
     ("783/12", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "serialized_bytes: measurement.byte_len"),
     ("783/13", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units: measurement.stu_estimate"),
     # 783/14 is the legacy memory `token_units` wire the migration ADDED beside
@@ -292,8 +292,8 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     # occurrences are 144 (the publishing site), 783 (the declaration), 793
     # (its per-record value constructor) and 1007 (783/13's `token_units`
     # field). The anchor is the bare token `token_units`, which matches the
-    # same identifier embedded in those three callee-path lines, so the FIRST
-    # masked occurrence is 144 -- the publishing site, not 783 and not 783/13's
+    # same identifier embedded in those three callee-path lines, so occurrence @@0
+    # (the first masked occurrence) is 144 -- the publishing site, not 783 and
     # 1007. Verified with the module's own `_mask_rust` + `_locate_signal`
     # against the current tree: span 144-144, 86 span bytes, inside
     # `fn dispatch_memory_distillation_preview`, production scope.
@@ -302,10 +302,10 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     # name earns, and the key is a wire key, never a second measurement owner:
     # the value it carries is produced by the closed legacy decoder, never by
     # the canonical owner.
-    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units"),
-    ("783/15", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "estimated_tokens,"),
-    ("783/16", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "details.section_tokens"),
-    ("783/17", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "runtime.ledger.cost_or_token_units"),
+    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units@@0"),
+    ("783/15", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "estimated_tokens,@@0"),
+    ("783/16", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "details.section_tokens@@0"),
+    ("783/17", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "runtime.ledger.cost_or_token_units@@0"),
     ("783/18", "#783", "crates/eliot-app/src/mcp_stdio/task_handlers.rs", "estimated_tokens: 431"),
     ("783/19", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "&& intent.cost_or_token_units == 0)"),
     ("783/20", "#783", "crates/eliot-app/src/mcp_stdio/operator.rs", ", score.context_cost, false),"),
@@ -319,10 +319,13 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("878/14", "#878", "crates/eliot-engine/src/context_contracts.rs", "pub estimated_tokens: usize,"),
     ("878/15", "#878", "crates/eliot-engine/src/context/packet_quality.rs", "report.estimated_tokens = estimated_tokens;"),
     ("878/16", "#878", "crates/eliot-engine/src/host.rs", "let value = stu_for_bytes(envelope.byte_len)?;"),
-    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "declared_len"),
+    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "declared_len@@0"),
     ("878/18", "#878", "crates/eliot-engine/src/host.rs", "let expected_stu = stu_for_bytes(envelope.byte_len)?;"),
     ("878/19", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
-    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "serializer_id"),
+    # 878/20 pins occurrence @@1, the `serializer_id` let-binding at L124, not the
+    # first masked match (the distinct `listing_serializer_id` field at L69 the old
+    # silent first-pick had pinned). The body earns serializer-identity-bound itself.
+    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "serializer_id@@1"),
     # #880 engine Skill / memory seam
     ("880/10", "#880", "crates/eliot-engine/src/skill.rs", "fn measure_skill_context_envelope("),
     ("880/11", "#880", "crates/eliot-engine/src/skill.rs", "pub(crate) fn estimated_context_cost(&self) -> u64 {"),
@@ -344,9 +347,9 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
 # They stay rows with owner "unresolved"; no owner is invented for them.
 # ---------------------------------------------------------------------------
 UNRESOLVED_CASES: tuple[tuple[str, str, str, str], ...] = (
-    ("unres/1", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", "pub cost_or_token_units: u64,"),
-    ("unres/2", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".cost_or_token_budget"),
-    ("unres/3", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".saturating_add(intent.cost_or_token_units)"),
+    ("unres/1", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", "pub cost_or_token_units: u64,@@0"),
+    ("unres/2", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".cost_or_token_budget@@0"),
+    ("unres/3", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".saturating_add(intent.cost_or_token_units)@@0"),
     ("unres/4", UNRESOLVED_OWNER, "crates/eliot-engine/src/cognition.rs", "|| treatment.estimated_tokens < control.estimated_tokens"),
 )
 
@@ -373,7 +376,7 @@ EXCLUSION_CASES: tuple[tuple[str, str, str, str], ...] = (
      "seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic"),
     ("exc/3", "crates/eliot-app/src/host_runtime/supervised_process.rs", "hash.chars().count() <= 128",
      "digest text length bound on a hash string; no byte/char/token/STU semantic"),
-    ("exc/4", "crates/eliot-app/src/host_runtime/supervised_process.rs", "if detail.chars().count() > 512",
+    ("exc/4", "crates/eliot-app/src/host_runtime/supervised_process.rs", "if detail.chars().count() > 512@@0",
      "log-detail truncation bound; no byte/char/token/STU semantic"),
     ("exc/5", "crates/eliot-engine/src/host.rs", "let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()",
      "nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens"),
@@ -550,6 +553,11 @@ ROW_KEYS = frozenset(
     }
 )
 
+# Alias the closed row-key set under the name the versioned suite asserts.
+# The suite must fail loudly if a row ever gains or loses a key, so the name
+# is part of the stable oracle surface reused by #787 (never copy the set).
+REQUIRED_ROW_KEYS = frozenset(ROW_KEYS)
+
 WORKSET_KEYS = frozenset(
     {
         "issue",
@@ -644,14 +652,42 @@ ESTIMATOR_CALL_RE = re.compile(
     r"measure_serialized_context|measure_exact_utf8|expected_context_delta)\s*\("
 )
 BYTE_RATIO = re.compile(r"div_ceil\(\s*4\s*\)")
-MEASURED_FIELD = re.compile(
-    r"\b(?:estimated_tokens|estimated_context_cost|context_cost_tokens|ContextTokenCost|"
-    r"estimated_skill_context_cost|context_cost|token_units|serialized_bytes|"
-    r"listing_characters|cost_or_token_units|cost_or_token_budget|"
-    r"context_cost_delta_tokens|description_ul_tokens|combined_ul_tokens|"
-    r"mandatory_floor_tokens|section_tokens|expected_context_delta)\b"
+_MEASURED_FIELD_TOKENS = (
+    "estimated_tokens",
+    "estimated_context_cost",
+    "context_cost_tokens",
+    "ContextTokenCost",
+    "estimated_skill_context_cost",
+    "context_cost",
+    "token_units",
+    "serialized_bytes",
+    "listing_characters",
+    "cost_or_token_units",
+    "cost_or_token_budget",
+    "context_cost_delta_tokens",
+    "description_ul_tokens",
+    "combined_ul_tokens",
+    "mandatory_floor_tokens",
+    "section_tokens",
+    "expected_context_delta",
 )
+MEASURED_FIELD = re.compile(r"\b(?:" + "|".join(_MEASURED_FIELD_TOKENS) + r")\b")
 TOLERATED_LITERAL = re.compile(r"^\s*\(?\s*(?:pub\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*[\"']")
+
+
+def _mentions_token(text: str, token: str) -> bool:
+    """True when ``token`` occurs in ``text`` as a standalone code token (#866 W3).
+
+    Word boundaries keep `rendered_utf8_bytes` from matching the shorter
+    `utf8_bytes` arm input and vice versa: each closed arm fires only on its
+    own declared token, never on a longer identifier that merely contains it.
+    """
+    return re.search(r"\b%s\b" % re.escape(token), text) is not None
+
+
+def _mentions_any(text: str, tokens: tuple[str, ...]) -> bool:
+    """True when any closed-class token occurs in ``text`` as its own token."""
+    return any(_mentions_token(text, token) for token in tokens)
 
 
 class InventoryError(RuntimeError):
@@ -986,26 +1022,80 @@ def _load_files(root: Path, rels: tuple[str, ...] | list[str]) -> dict[str, dict
     return cache
 
 
-def _locate_signal(record: dict[str, object], rel: str, signal: str) -> tuple[int, int]:
-    """First masked line holding ``signal``; whole item span for fn needles."""
+_OCCURRENCE_SELECTOR_RE = re.compile(r"@@(\d+)$")
+
+
+def _split_occurrence_selector(signal: str) -> tuple[str, int | None]:
+    """Split a frozen reconciliation hint into base needle + occurrence index.
+
+    A trailing ``@@<n>`` pins the n-th masked occurrence (0-based) of the base
+    needle. ``@@`` never occurs in valid Rust, so the suffix is unambiguous.
+    The suffix is a stable, explicit occurrence identity, never a silent
+    first-pick: an unqualified needle matching several occurrences fails
+    closed, and a stale index fails closed with SIGNAL_ABSENT. Strip the
+    suffix before classification: the class is earned by the base needle,
+    never by the identity suffix.
+    """
+    match = _OCCURRENCE_SELECTOR_RE.search(signal)
+    if match is None:
+        return (signal, None)
+    return (signal[: match.start()], int(match.group(1)))
+
+
+def _locate_all_occurrences(
+    record: dict[str, object], rel: str, base: str
+) -> list[tuple[int, int]]:
+    """Every masked occurrence span of ``base`` in file order (#866 W2).
+
+    Whole item span for ``fn `` needles, single lines otherwise. The caller,
+    never this function, decides which occurrence a row owns.
+    """
+    _ = rel
     masked_lines = record["masked_lines"]
     assert isinstance(masked_lines, list)
-    span_start = 0
+    occurrences: list[tuple[int, int]] = []
     for lineno, line in enumerate(masked_lines, start=1):
-        if signal in line:
-            span_start = lineno
-            break
-    if span_start == 0:
+        if base in line:
+            span_end = lineno
+            if base.startswith("fn "):
+                depths = record["depths"]
+                assert isinstance(depths, list)
+                span_end = _item_extent(masked_lines, depths, lineno)
+            occurrences.append((lineno, span_end))
+    return occurrences
+
+
+def _locate_signal(record: dict[str, object], rel: str, signal: str) -> tuple[int, int]:
+    """One masked span for ``signal``; whole item span for fn needles (#866 W2).
+
+    ``signal`` may carry an explicit ``@@<n>`` occurrence pin. An unqualified
+    needle resolving to zero occurrences raises SIGNAL_ABSENT; resolving to
+    several raises AMBIGUOUS_SIGNAL instead of silently taking the first. A
+    stale pin raises SIGNAL_ABSENT. This is the stable discovery API reused
+    by #787 (import these helpers, never copy their rules).
+    """
+    base, selected = _split_occurrence_selector(signal)
+    occurrences = _locate_all_occurrences(record, rel, base)
+    if not occurrences:
         raise InventoryError(
             "SIGNAL_ABSENT",
             f"denominator signal {signal!r} absent from masked source: {rel}",
         )
-    span_end = span_start
-    if signal.startswith("fn "):
-        depths = record["depths"]
-        assert isinstance(depths, list)
-        span_end = _item_extent(masked_lines, depths, span_start)
-    return (span_start, span_end)
+    if selected is None:
+        if len(occurrences) > 1:
+            raise InventoryError(
+                "AMBIGUOUS_SIGNAL",
+                f"reconciliation hint {signal!r} resolves to {len(occurrences)} "
+                f"occurrences in {rel}; pin one explicitly with @@<n>",
+            )
+        return occurrences[0]
+    if selected >= len(occurrences):
+        raise InventoryError(
+            "SIGNAL_ABSENT",
+            f"denominator signal {signal!r} pins occurrence {selected} but only "
+            f"{len(occurrences)} occur in masked source: {rel}",
+        )
+    return occurrences[selected]
 
 
 def _span_bytes(record: dict[str, object], span_start: int, span_end: int) -> int:
@@ -1037,28 +1127,44 @@ def _span_digest(record: dict[str, object], span_start: int, span_end: int) -> s
 def classify_context_measurement(
     signal: str, path: str = "", item_scope: str = "production"
 ) -> tuple[str, str]:
-    """Classify one denominator signal into exactly one closed class.
+    """Classify one denominator signal into exactly one closed class (#866 W3).
 
-    This is the stable classification API reused by issue #787 (import
-    this function, never copy its rules). First match wins; unknown
-    signals fail closed with CLASSIFICATION_OPEN instead of inventing a
-    class. ``path`` is accepted for scope evidence and is never used to
-    widen a closed class. ``item_scope`` is the measured enclosing scope,
-    never an assumption about everything after ``#[cfg(test)]``.
+    ``signal`` is the normalized extracted masked body of the measured span
+    on the production path, never the locator hint: a helper that keeps its
+    name while its body changes between exact bytes, ``/4`` ratios, character
+    counts, minimum-one and rounded sums classifies by what the body does.
+    Short locator hints are still accepted (frozen compat, self-tests, #787)
+    and classify by the same token rules. This is the stable classification
+    API reused by issue #787 (import this function, never copy its rules).
+    First match wins; unknown signals fail closed with CLASSIFICATION_OPEN
+    instead of inventing a class. ``path`` is accepted for scope evidence and
+    is never used to widen a closed class. ``item_scope`` is the measured
+    enclosing scope, never an assumption about everything after
+    ``#[cfg(test)]``.
     """
     _ = path
-    if signal in ("#[test]", "cfg(test)") or item_scope == "test":
+    if any(
+        signal == _split_occurrence_selector(needle)[0]
+        for _ref, _path, needle, _reason in EXCLUSION_CASES
+    ):
+        return (
+            "unrelated_byte_or_character_metric",
+            f"declared unrelated byte/character metric: {signal!r}; excluded with exact evidence, not a package skip",
+        )
+    if "#[test]" in signal or "cfg(test)" in signal or item_scope == "test":
         return (
             "test-only",
             f"test marker or measured test scope in scanned slice; no shipped measurement ({signal!r})",
         )
-    if "stu_for_bytes" in signal or signal == "StuEstimate":
+    if "stu_for_bytes" in signal or "StuEstimate" in signal:
         return (
             "normative-stu-estimate",
             f"normative STU signal {signal!r}: ceil(bytes/3) estimate, never proves fit",
         )
-    if signal in (
-        "measure_serialized_context",
+    if _mentions_any(
+        signal,
+        (
+            "measure_serialized_context",
         "measure_exact_utf8",
         "rendered_utf8_bytes",
         "envelope_digest",
@@ -1067,65 +1173,81 @@ def classify_context_measurement(
         "payload_utf8",
         "max_serialized_bytes",
         "final_bytes",
-        "utf8_bytes",
-        "ExactUtf8",
+            "utf8_bytes",
+            "ExactUtf8",
+        ),
     ):
         return (
             "exact-utf8-envelope",
             f"exact envelope signal {signal!r}: final UTF-8 bytes and digest binding",
         )
-    if signal in (
-        "serializer_id",
+    if _mentions_any(
+        signal,
+        (
+            "serializer_id",
         "serializer_options_digest",
-        "schema_version",
-        "SerializerIdentity",
+            "schema_version",
+            "SerializerIdentity",
+        ),
     ):
         return (
             "serializer-identity-bound",
             f"serializer identity signal {signal!r}: serializer/schema binding",
         )
-    if signal in (
-        "route_id",
+    if _mentions_any(
+        signal,
+        (
+            "route_id",
         "model_id",
         "provider_id",
-        "tokenizer_hash",
-        "tokenizer_config_digest",
+            "tokenizer_hash",
+            "tokenizer_config_digest",
+        ),
     ):
         return (
             "route-identity-bound",
             f"route identity signal {signal!r}: route/provider/model/tokenizer binding",
         )
-    if "estimator" in signal or signal == "candidate_digests":
+    if "estimator" in signal or "candidate_digests" in signal:
         return (
             "estimator-policy-unvalidated",
             f"estimator signal {signal!r}: UNVALIDATED planning evidence, candidates cited only",
         )
-    if signal in (
-        "fixed_overhead",
+    if _mentions_any(
+        signal,
+        (
+            "fixed_overhead",
         "output_reserve",
         "review_reserve",
         "route_capacity",
         "headroom",
         "proves_fit",
         "receipt_digest",
-        "false_safe",
-        "false_reject",
+            "false_safe",
+            "false_reject",
+        ),
     ):
         return (
             "capacity-fit-analysis",
             f"capacity signal {signal!r}: reserves/fit/headroom/error/receipt binding",
         )
-    if signal in ("ProviderTokenizerRun", "observed_tokens", "TokenizerObservation"):
+    if _mentions_any(
+        signal, ("ProviderTokenizerRun", "observed_tokens", "TokenizerObservation")
+    ):
         return (
             "exact-observation",
             f"exact observation signal {signal!r}: actually-run route tokenizer count",
         )
-    if signal in ("Transformed", "rewrite", "Truncation", "Normalization", "Rewrite"):
+    if _mentions_any(
+        signal, ("Transformed", "rewrite", "Truncation", "Normalization", "Rewrite")
+    ):
         return (
             "transformed-observation",
             f"transformed signal {signal!r}: provider rewrite evidence, no count comparison",
         )
-    if signal in ("Stale", "Absent", "Unavailable", "Unsupported", "Unknown"):
+    if _mentions_any(
+        signal, ("Stale", "Absent", "Unavailable", "Unsupported", "Unknown")
+    ):
         return (
             "stale-or-absent-observation",
             f"non-exact signal {signal!r}: absent/unavailable/stale/unsupported/unknown, never zero",
@@ -1167,11 +1289,21 @@ def classify_context_measurement(
             "bare_measurement_field_or_conversion",
             f"bare measurement field or projection: {signal!r}; carries no estimator policy of its own",
         )
-    if any(signal == needle for _ref, _path, needle, _reason in EXCLUSION_CASES):
+    if CONVERTER_DEFINED.search(signal):
         return (
-            "unrelated_byte_or_character_metric",
-            f"declared unrelated byte/character metric: {signal!r}; excluded with exact evidence, not a package skip",
+            "bare_measurement_field_or_conversion",
+            f"bare unit conversion over a measured value: {signal!r}; a conversion feeding "
+            f"measurement, never an estimator policy of its own",
         )
+    for field_token in _MEASURED_FIELD_TOKENS:
+        if re.search(
+            r"[A-Za-z_0-9]*%s[A-Za-z_0-9]*\s*\(" % re.escape(field_token), signal
+        ):
+            return (
+                "bare_measurement_field_or_conversion",
+                f"call binding the {field_token} measurement: {signal!r}; the named field is "
+                f"consumed or produced through a declared call, never an estimator policy",
+            )
     raise InventoryError(
         "CLASSIFICATION_OPEN", f"signal is outside the closed {len(CLASSIFICATIONS)}-class set: {signal!r}"
     )
@@ -1279,6 +1411,162 @@ def _owner_confirmed(
     return ("owned", f"frozen owner map confirms exact-scope ownership for {path}")
 
 
+def _discover_unmatched_candidates(
+    cache: dict[str, dict[str, object]],
+    ordered_cases: list[tuple[str, str, str, str]],
+) -> list[dict[str, object]]:
+    """Enumerate measurement candidates no frozen case covers (#866 W1).
+
+    Two bounded pattern families over the masked sources of the declared
+    scan roots: (P1) estimator definitions matching ESTIMATOR_HELPER_RE, and
+    (P5) further production-scope occurrences of frozen needles beyond the
+    pinned occurrence. Comments and strings are already masked away, so
+    marker-like text there never becomes a candidate; test-scope matches are
+    skipped (production after ``#[cfg(test)]`` still counts, per ``_scope_of``).
+    Frozen case references are reconciliation metadata here, never the
+    discovery source: a span contained in (or containing) a frozen span is
+    covered by that row and yields no auto candidate. Among auto spans the
+    outermost wins, so an estimator item absorbs its own body lines instead
+    of double counting; true partial overlaps fail closed. Bodies that earn
+    no closed class are recorded with classification ``unresolved``, never
+    deleted and never given an invented owner. Deterministic: files sorted,
+    outermost spans first, lines ascending.
+    """
+    frozen_by_file: dict[str, list[tuple[int, int]]] = {}
+    needles_by_file: dict[str, list[tuple[str, int]]] = {}
+    for _ref, _owner, rel, signal in ordered_cases:
+        base, selected = _split_occurrence_selector(signal)
+        record = cache[rel]
+        occurrences = _locate_all_occurrences(record, rel, base)
+        if not occurrences:
+            raise InventoryError(
+                "SIGNAL_ABSENT",
+                f"denominator signal {signal!r} absent from masked source: {rel}",
+            )
+        if selected is None:
+            if len(occurrences) > 1:
+                raise InventoryError(
+                    "AMBIGUOUS_SIGNAL",
+                    f"reconciliation hint {signal!r} resolves to {len(occurrences)} "
+                    f"occurrences in {rel}; pin one explicitly with @@<n>",
+                )
+            pinned = 0
+        elif selected >= len(occurrences):
+            raise InventoryError(
+                "SIGNAL_ABSENT",
+                f"denominator signal {signal!r} pins occurrence {selected} but only "
+                f"{len(occurrences)} occur in masked source: {rel}",
+            )
+        else:
+            pinned = selected
+        frozen_by_file.setdefault(rel, []).append(occurrences[pinned])
+        needles_by_file.setdefault(rel, []).append((base, pinned))
+    raw: list[tuple[str, int, int, str, str]] = []
+    # Denominator files only: exclusion-declared inputs stay excluded and can
+    # never yield candidates, no matter what patterns they contain.
+    for rel in sorted(needles_by_file):
+        record = cache[rel]
+        masked_lines = record["masked_lines"]
+        assert isinstance(masked_lines, list)
+        depths = record["depths"]
+        assert isinstance(depths, list)
+        for lineno, line in enumerate(masked_lines, start=1):
+            stripped = line.strip()
+            fn_match = re.search(r"\bfn\s+", stripped)
+            if fn_match and ESTIMATOR_HELPER_RE.match(stripped[fn_match.start():]):
+                end = _item_extent(masked_lines, depths, lineno)
+                raw.append((rel, lineno, end, stripped, "estimator-definition"))
+        for base, pinned in needles_by_file.get(rel, []):
+            for index, (start, end) in enumerate(
+                _locate_all_occurrences(record, rel, base)
+            ):
+                if index == pinned:
+                    continue
+                trigger = masked_lines[start - 1].strip()
+                raw.append((rel, start, end, trigger, "repeated-needle"))
+    kept: list[tuple[str, int, int, str, str]] = []
+    for rel, start, end, trigger, kind in sorted(
+        raw, key=lambda entry: (entry[0], -(entry[2] - entry[1]), entry[1])
+    ):
+        frozen = frozen_by_file.get(rel, [])
+        if any(fstart <= start and end <= fend for fstart, fend in frozen):
+            continue
+        if any(start <= fstart and fend <= end for fstart, fend in frozen):
+            continue
+        covered = False
+        for krel, kstart, kend, _k, _kind in kept:
+            if krel != rel or end < kstart or kend < start:
+                continue
+            if kstart <= start and end <= kend:
+                covered = True
+                break
+            raise InventoryError(
+                "OVERLAPPING_SPANS",
+                f"discovered {kind} at {rel}:{start}-{end} partially overlaps kept "
+                f"candidate {krel}:{kstart}-{kend}; refine the discovery patterns",
+            )
+        if covered:
+            continue
+        kept.append((rel, start, end, trigger, kind))
+    candidates: list[dict[str, object]] = []
+    for rel, start, end, trigger, kind in kept:
+        record = cache[rel]
+        masked_lines = record["masked_lines"]
+        assert isinstance(masked_lines, list)
+        depths = record["depths"]
+        assert isinstance(depths, list)
+        item, item_scope = _scope_of(masked_lines, depths, start, rel)
+        item_match = ITEM_RE.match(masked_lines[start - 1])
+        if item_match:
+            item = f"{item_match.group('kind')} {item_match.group('name')}"
+        if item_scope != "production":
+            continue
+        body = "\n".join(
+            stripped
+            for stripped in (
+                masked_lines[lineno - 1].strip()
+                for lineno in range(start, end + 1)
+                if 1 <= lineno <= len(masked_lines)
+            )
+            if stripped
+        )
+        if not body:
+            continue
+        try:
+            classification, class_evidence = classify_context_measurement(body, rel, item_scope)
+        except InventoryError as exc:
+            if exc.code != "CLASSIFICATION_OPEN":
+                raise
+            classification = "unresolved"
+            class_evidence = (
+                f"extracted body carries no closed-class token ({exc.detail}); "
+                f"recorded unresolved and never deleted to obtain green"
+            )
+        basename = rel.rsplit("/", 1)[-1]
+        candidates.append(
+            {
+                "case_ref": f"auto/{basename}/{start}",
+                "owner": UNRESOLVED_OWNER,
+                "path": rel,
+                "signal": trigger[:160],
+                "span_start": start,
+                "span_end": end,
+                "span_bytes": _span_bytes(record, start, end),
+                "source_sha256": str(record["sha256"]),
+                "span_digest": _span_digest(record, start, end),
+                "classification": classification,
+                "evidence": (
+                    f"discovered {kind} at {rel}:{start}-{end} inside `{item}` with no "
+                    f"frozen case covering the span; {class_evidence}"
+                ),
+                "package": str(record["package"]),
+                "item": item,
+                "item_scope": item_scope,
+            }
+        )
+    return candidates
+
+
 def discover_context_measurements(
     root: Path,
     cases: tuple[tuple[str, str, str, str], ...] | None = None,
@@ -1336,7 +1624,26 @@ def discover_context_measurements(
         depths = record["depths"]
         assert isinstance(depths, list)
         item, item_scope = _scope_of(masked_lines, depths, span_start, rel)
-        classification, evidence = classify_context_measurement(signal, rel, item_scope)
+        opener = ITEM_RE.match(masked_lines[span_start - 1])
+        if opener:
+            item = f"{opener.group('kind')} {opener.group('name')}"
+        body_lines = [
+            stripped
+            for stripped in (
+                masked_lines[lineno - 1].strip()
+                for lineno in range(span_start, span_end + 1)
+                if 1 <= lineno <= len(masked_lines)
+            )
+            if stripped
+        ]
+        if not body_lines:
+            raise InventoryError(
+                "EMPTY_SPAN",
+                f"span {span_start}-{span_end} carries no classifiable text in {rel}",
+            )
+        classification, evidence = classify_context_measurement(
+            "\n".join(body_lines), rel, item_scope
+        )
         if classification not in CLASSIFICATIONS:
             raise InventoryError(
                 "CLASSIFICATION_NOT_CLOSED", f"class is outside the closed set: {classification!r}"
@@ -1359,6 +1666,28 @@ def discover_context_measurements(
                 "item_scope": item_scope,
             }
         )
+    auto_candidates = _discover_unmatched_candidates(cache, list(ordered_cases))
+    candidates.extend(auto_candidates)
+    spans_by_path: dict[str, list[tuple[int, int, str]]] = {}
+    for candidate in candidates:
+        spans_by_path.setdefault(str(candidate["path"]), []).append(
+            (
+                int(candidate["span_start"]),  # type: ignore[arg-type]
+                int(candidate["span_end"]),  # type: ignore[arg-type]
+                str(candidate["case_ref"]),
+            )
+        )
+    for path, spans in spans_by_path.items():
+        for first in range(len(spans)):
+            for second in range(first + 1, len(spans)):
+                start_a, end_a, ref_a = spans[first]
+                start_b, end_b, ref_b = spans[second]
+                if start_a <= end_b and start_b <= end_a:
+                    raise InventoryError(
+                        "OVERLAPPING_SPANS",
+                        f"rows {ref_a} and {ref_b} claim overlapping spans "
+                        f"in {path}; refine one anchor",
+                    )
     candidates.sort(key=lambda item: _case_sort_key(str(item["case_ref"])))
     return file_records, candidates
 
@@ -1382,7 +1711,8 @@ def discover_exclusions(
         if record is None:
             raise InventoryError("SCAN_INPUT_MISSING", f"exclusion input was not loaded: {rel}")
         span_start, span_end = _locate_signal(record, rel, needle)
-        label, label_reason = classify_context_measurement(needle, rel)
+        base_needle, _index = _split_occurrence_selector(needle)
+        label, label_reason = classify_context_measurement(base_needle, rel)
         if label != "unrelated_byte_or_character_metric":
             raise InventoryError(
                 "EXCLUSION_NOT_UNRELATED",
@@ -1812,26 +2142,40 @@ def build_inventory(
                 "COUNT_MISMATCH",
                 f"default denominator holds {len(active_cases)}, expected {EXPECTED_DENOMINATOR_COUNT}",
             )
-        if len(candidates) != EXPECTED_DENOMINATOR_COUNT:
+        reconciled = [
+            candidate
+            for candidate in candidates
+            if not str(candidate["case_ref"]).startswith("auto/")
+        ]
+        if len(reconciled) != EXPECTED_DENOMINATOR_COUNT:
             raise InventoryError(
                 "COUNT_MISMATCH",
-                f"default scan yielded {len(candidates)}, expected {EXPECTED_DENOMINATOR_COUNT}",
+                f"default scan reconciled {len(reconciled)} frozen cases, "
+                f"expected {EXPECTED_DENOMINATOR_COUNT}",
             )
     source_pairs = sorted(f"{record['path']}:{record['sha256']}" for record in file_records)
     source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))
     rows = _build_rows(candidates, mapping)
-    counts: dict[str, int] = {}
+    table_counts: dict[str, int] = {}
     for _ref, owner, _path, _sig in active_cases:
-        counts[owner] = counts.get(owner, 0) + 1
-    if default_denominator and tuple(sorted(counts.items())) != tuple(
+        table_counts[owner] = table_counts.get(owner, 0) + 1
+    if default_denominator and tuple(sorted(table_counts.items())) != tuple(
         sorted(EXPECTED_OWNER_ALLOCATIONS)
     ):
         raise InventoryError(
             "OWNER_ALLOCATION_DRIFT",
-            f"measured owner allocation {sorted(counts.items())} differs from the declared "
+            f"measured owner allocation {sorted(table_counts.items())} differs from the declared "
             f"{sorted(EXPECTED_OWNER_ALLOCATIONS)}",
         )
-    owner_allocations = sorted(f"{owner}:{count}" for owner, count in counts.items())
+    # owner_allocations describes the artifact's ROWS (declared distribution plus
+    # discovered-unallocated rows), so its sum reconciles with candidate_count.
+    # The frozen table's exact distribution keeps its own DRIFT gate above and
+    # is digested separately in owner_digest.
+    row_counts: dict[str, int] = {}
+    for row in rows:
+        row_owner = str(row["owner"])
+        row_counts[row_owner] = row_counts.get(row_owner, 0) + 1
+    owner_allocations = sorted(f"{owner}:{count}" for owner, count in row_counts.items())
     unresolved_rows = [row for row in rows if row["status"] != "owned"]
     owned_count = len(rows) - len(unresolved_rows)
     if default_denominator and any(
@@ -2988,7 +3332,8 @@ def run_self_tests() -> int:
     assert tuple(BASELINE_CASES) == tuple(DENOMINATOR_CASES[:EXPECTED_BASELINE_COUNT])
     # Every rule arm resolves to a closed class; unknown fails closed.
     for _ref, _owner, _path, signal in DENOMINATOR_CASES:
-        label, evidence = classify_context_measurement(signal)
+        base, _index = _split_occurrence_selector(signal)
+        label, evidence = classify_context_measurement(base)
         assert label in CLASSIFICATIONS, signal
         assert evidence, signal
     for signal in ("#[test]", "cfg(test)"):
@@ -3007,8 +3352,9 @@ def run_self_tests() -> int:
         == "bare_measurement_field_or_conversion"
     )
     for _ref, _path, needle, _reason in EXCLUSION_CASES:
+        base, _index = _split_occurrence_selector(needle)
         assert (
-            classify_context_measurement(needle)[0] == "unrelated_byte_or_character_metric"
+            classify_context_measurement(base)[0] == "unrelated_byte_or_character_metric"
         ), needle
     try:
         classify_context_measurement("definitely-not-a-measurement-signal-xyz")

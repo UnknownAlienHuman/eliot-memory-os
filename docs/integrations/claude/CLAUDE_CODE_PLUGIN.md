@@ -59,10 +59,11 @@ receipt (gating owned by #1858); the flagged Claude MCP edge is served by
 the staged bridge instead, and the flag being absent preserves the legacy
 path on all hosts.
 
-- Tracked host config `integrations/claude/eliot/.mcp.json` keeps the legacy
-  default byte-identical: one `eliot` server,
-  `${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe` with
-  `mcp stdio --host claude --instance default`. Hooks in `hooks/hooks.json`
+- Tracked host config `integrations/claude/eliot/.mcp.json` serves the bridge
+  directly: one `eliot` server,
+  `${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe` with
+  `mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration
+  ${CLAUDE_PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json`. Hooks in `hooks/hooks.json`
   stay on the Governor binary as well.
 - Bundle provisioning: `scripts/build-eliot-windows-x64-release.ps1
   -ClaudeCodeFrontDoor legacy|agent-bridge` (default `legacy`). `legacy`
