@@ -2242,3 +2242,65 @@ fn route_admission_evidence(
         retained_prior_proposal: retained.cloned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Norm: `I12.24:209` - the intended mechanism is frozen before evaluation.
+    #[test]
+    fn predeclaration_mechanism_binds_the_recorded_candidate() {
+        // Every ref set is non-empty because `ReplayPlan::validate`
+        // (`crates/meta/eliot-improvement/src/lib.rs:636`) refuses an empty set and
+        // `ImprovementCandidate::new` runs it.
+        let replay_plan = eliot_improvement::ReplayPlan {
+            fixed_replay_refs: vec!["replay-1145-a".to_string()],
+            holdout_refs: vec!["holdout-1145-a".to_string()],
+            transfer_refs: vec!["transfer-1145-a".to_string()],
+            counter_metric_names: vec!["metric-1145-a".to_string()],
+            verifier_refs: vec!["verifier-1145-a".to_string()],
+        };
+        // `validate_base` (`crates/meta/eliot-improvement/src/lib.rs:862`) requires
+        // a non-empty project and change, non-empty ref and rule sets that do not
+        // overlap, and finite metrics; the empty metric map is the finite one.
+        let mut candidate = ImprovementCandidate::new(
+            "maintenance-1145-a",
+            eliot_improvement::ImprovementSurface::Memory,
+            "change-1145-a",
+            vec!["applies-1145-a".to_string()],
+            vec!["not-applies-1145-a".to_string()],
+            vec!["trace-1145-a".to_string()],
+            vec!["evidence-1145-a".to_string()],
+            replay_plan,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("candidate builds");
+        candidate.set_details(
+            "trigger-1145-a",
+            vec!["hypothesis-1145-a".to_string()],
+            std::collections::BTreeMap::new(),
+            "scope-1145-a",
+            "owner-1145-a",
+            "delivery-1145-a",
+            "canary-1145-a",
+            "rollback-1145-a",
+            "stop-1145-a",
+        );
+
+        // The declaration carries only what the already-recorded candidate holds: its
+        // own recorded hypothesis, its own recorded proposed change, and the durable
+        // record key of that same candidate. It therefore cannot become a post-hoc
+        // explanation of a result observed after it.
+        let mechanism = route_mechanism(&candidate);
+        assert_eq!(mechanism.hypothesis, "hypothesis-1145-a");
+        assert_eq!(mechanism.causal_link, "change-1145-a");
+        assert!(
+            mechanism.declared_before_results,
+            "the mechanism must be declared before any result exists"
+        );
+        assert_eq!(
+            mechanism.declared_ref,
+            format!("improvement-candidate:{}", candidate.candidate_id)
+        );
+    }
+}
