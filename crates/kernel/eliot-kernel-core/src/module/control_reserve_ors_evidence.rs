@@ -293,4 +293,74 @@ mod tests {
             "expected contradiction naming the duplicated dimension, got {error:?}"
         );
     }
+
+    fn live_ors_ctx() -> eliot_ors::OrsOwnerEvidenceContext {
+        eliot_ors::OrsOwnerEvidenceContext {
+            owner_generation_ref: "resource-generation:7".to_owned(),
+            proof_profile_ref: "proof-profile:live-ors-capacity-proof".to_owned(),
+            evidence_refs: vec!["evidence:live-ors-capacity-observation".to_owned()],
+            invalidation_set: vec!["invalidation:epoch-close".to_owned()],
+        }
+    }
+
+    fn live_ors_reserve() -> eliot_ors::OrsReserve {
+        eliot_ors::OrsReserve::partitioned(
+            8,
+            4,
+            NonZeroU64::new(4_096).expect("live normal bytes"),
+            NonZeroU64::new(2_048).expect("live protected bytes"),
+        )
+        .expect("live ORS reserve builds")
+    }
+
+    /// Owner-level conflict (issue #1679 A7): rows published by two live ORS
+    /// reserves claim the same frozen dimensions, so the join contradicts on
+    /// the duplicated dimension instead of choosing one owner's numbers.
+    #[test]
+    fn join_live_ors_owner_rows_from_two_reserves_conflict() {
+        let epoch = test_epoch();
+        let ctx = live_ors_ctx();
+        let first = live_ors_reserve()
+            .publish_owner_rows(&ctx)
+            .expect("first owner publishes");
+        let second = live_ors_reserve()
+            .publish_owner_rows(&ctx)
+            .expect("second owner publishes");
+        let rows = [first[0].clone(), second[0].clone()];
+
+        let error =
+            join_ors_owner_evidence(&rows, "snap-1", &epoch).expect_err("two owners conflict");
+
+        assert!(
+            matches!(
+                error,
+                KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
+                if bottleneck == CapacityBottleneck::OrsTransactionSlots.as_contract_str()
+            ),
+            "expected contradiction naming the contested dimension, got {error:?}"
+        );
+    }
+
+    /// Owner-level positive control (issue #1679 A7): rows published by one
+    /// live ORS reserve join into exactly the two composition-bound records,
+    /// so the conflict above is proven against the same live path that
+    /// succeeds.
+    #[test]
+    fn join_live_ors_owner_rows_from_one_reserve_succeeds() {
+        let epoch = test_epoch();
+        let rows = live_ors_reserve()
+            .publish_owner_rows(&live_ors_ctx())
+            .expect("live owner publishes");
+
+        let joined = join_ors_owner_evidence(&rows, "snap-1", &epoch).expect("live rows join");
+
+        assert_eq!(
+            joined[0].row.bottleneck,
+            CapacityBottleneck::OrsTransactionSlots
+        );
+        assert_eq!(
+            joined[1].row.bottleneck,
+            CapacityBottleneck::OrsDurableQueueBytes
+        );
+    }
 }
