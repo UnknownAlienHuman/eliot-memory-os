@@ -336,8 +336,8 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     }
 
     $opencodePlugin = Read-PinnedConsumerBytes $RepoRoot $SourceCommit 'integrations/opencode/plugins/eliot.js'
-    if ($opencodePlugin.text -notmatch 'if \(process\.env\.ELIOT_GOVERNOR_EXE\) return process\.env\.ELIOT_GOVERNOR_EXE' -or
-        $opencodePlugin.text -notmatch 'LOCALAPPDATA\}/Eliot/host-integrations/opencode/bin/eliot-governor\.exe') {
+    if ($opencodePlugin.text -notmatch 'if \(process\.env\.ELIOT_AGENT_BRIDGE_EXE\) return process\.env\.ELIOT_AGENT_BRIDGE_EXE' -or
+        $opencodePlugin.text -notmatch 'LOCALAPPDATA\}/Eliot/host-integrations/opencode/bin/eliot-agent-bridge\.exe') {
         throw 'OpenCode plugin executable resolution drifted from the inventoried bytes: integrations/opencode/plugins/eliot.js'
     }
     $consumers += [ordered]@{
@@ -349,11 +349,11 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         source_bytes = [int64]$opencodePlugin.bytes
         staged_sha256 = $null
         staged_bytes = $null
-        command = 'ELIOT_GOVERNOR_EXE else %LOCALAPPDATA%/Eliot/host-integrations/opencode/bin/eliot-governor.exe'
+        command = 'ELIOT_AGENT_BRIDGE_EXE else %LOCALAPPDATA%/Eliot/host-integrations/opencode/bin/eliot-agent-bridge.exe'
         args = @()
         configured_environment = 'Script resolution only; MCP server environment comes from integrations/opencode/opencode.json, not this script.'
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
-        behavior = 'Script resolution only; the resolved eliot-governor.exe MCP invocation follows the OpenCode MCP entry above (unconditional redirect when the Bridge is staged, structured ERROR otherwise). This script stages no cutover selection.'
+        behavior = 'Script resolution only; invokeLegacyProcessBridge launches the resolved eliot-agent-bridge.exe with host-event --host opencode --event <kind> for the bounded one-shot host-event path when no HTTP bridge is configured. An HTTP attempt never falls through to this process path. This script stages no cutover selection.'
         canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
     }
 
