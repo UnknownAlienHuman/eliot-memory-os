@@ -1136,4 +1136,30 @@ mod tests {
         // This owner claims no emergency partition.
         assert!(row.emergency_limit.is_none());
     }
+
+    /// The Store constructor floor (issue #1679): a reserve with no
+    /// normal connection partition can never admit Store work, so
+    /// building one must fail at build (I14.3: partitions are
+    /// non-borrowable; zero capacity is a build error, not a
+    /// runtime surprise).
+    #[test]
+    fn store_partitioned_zero_normal_connections_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            0,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero normal connections must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.normal_connection_slots",
+                ..
+            }
+        ));
+    }
 }
