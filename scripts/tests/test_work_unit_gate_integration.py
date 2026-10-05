@@ -1394,6 +1394,35 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         payload = json.loads(out)
         self.assertIn('cohort:' + payload['digest'][:12], payload['identities'])
 
+    # WORK_UNIT_CASE: 837/47
+    def test_selected_python_child_output_bound_truncates_fail_closed(self):
+        # CCV3: the descriptor output bound must be enforced on the OBSERVED
+        # python child protocol bytes, not passed as a literal `truncated=False`.
+        # Every other bounded read in the selected path length-checks against
+        # out_cap and early-returns; an oversize body must do the same, so the
+        # run fails closed through the existing None mapping
+        # (`discovery failure`, exit 1) instead of reaching the cleanup site.
+        # Tiny-but-consistent bounds (line_bytes <= output_bytes): a 64-byte cap
+        # is certainly exceeded by the real discovery protocol body yet still
+        # passes decode_descriptor shape validation, so the run reaches the new
+        # check instead of failing earlier on bounds shape. Every other bound is
+        # unchanged, mirroring test_selected_end_to_end_success_through_all_owners.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            descriptor = tmp / '.github' / 'work-units' / '837.toml'
+            raw = descriptor.read_text(encoding='utf-8')
+            honest = ('bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+                      'line_bytes = 65536, discovery_tests = 100, child_processes = 4}')
+            tiny = ('bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 64, '
+                    'line_bytes = 32, discovery_tests = 100, child_processes = 4}')
+            self.assertIn(honest, raw)
+            descriptor.write_text(raw.replace(honest, tiny), encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        self.assertIn('discovery failure', out + err)
+
 
 
 if __name__ == '__main__':

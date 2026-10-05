@@ -2100,7 +2100,8 @@ def main(argv: list[str] | None = None) -> int:
                     # Real contained execution via frozen child protocol.
                     discovery_doc = _run_python_child(root, module, suite_rel, source_sha,
                                                       int(transport["max_tests"]), float(transport["wall_s"]),
-                                                      child_env, "discover", None)
+                                                      child_env, "discover", None,
+                                                      int(transport["output_bytes"]))
                     if discovery_doc is None:
                         return finish(fail_result(f"discovery failure: issue-{num}", 1, failed=[f"issue-{num}"]))
                     if type(discovery_doc) is not dict or not discovery_doc.get("tests"):
@@ -2108,7 +2109,8 @@ def main(argv: list[str] | None = None) -> int:
                                                   failed=[f"issue-{num}"]))
                     exec_doc = _run_python_child(root, module, suite_rel, source_sha,
                                                  int(transport["max_tests"]), float(transport["wall_s"]),
-                                                 child_env, "execute", discovery_doc.get("tests"))
+                                                 child_env, "execute", discovery_doc.get("tests"),
+                                                 int(transport["output_bytes"]))
                     if exec_doc is None:
                         return finish(fail_result(f"execution incomplete: issue-{num}", 1, failed=[f"issue-{num}"]))
                     # Compose typed discovery/execution bindings (once per test).
@@ -2468,7 +2470,8 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
 
 
 def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str,  # type: ignore[no-untyped-def]
-                      max_tests: int, wall_s: float, env: dict, phase: str, expected: object | None):
+                      max_tests: int, wall_s: float, env: dict, phase: str, expected: object | None,
+                      output_cap: int):
     """Run the frozen python child once per phase via frozen builders only.
 
     Returns the parsed protocol dict via parse_python_protocol, or None on any
@@ -2573,6 +2576,11 @@ def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str, 
                     body = proto.read_bytes() if proto.exists() else b""
                 except Exception:
                     return None
+        # Descriptor output bound enforced on observed child protocol bytes
+        # (mirrors the build_raw/disc_out out_cap checks); oversize body is
+        # bounded non-success, the caller already fails it closed (exit 1).
+        if len(body) > output_cap:
+            return None
         if not body:
             return None
         try:
