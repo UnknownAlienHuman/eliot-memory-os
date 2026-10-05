@@ -1,4 +1,4 @@
-inventory_digest = "3e816c5e692b0d04c2e82dc4d31dfe3d735e575e8948e9351b694cb836fcff0d"
+inventory_digest = "3fa6bbc3634b24456e8926bebb61e26ed215681cb5f5c097ac9482f28b8461ed"
 proposed_splits = []
 
 [header]
@@ -28,7 +28,7 @@ test_path_tracking_evidence = "git ls-files --error-unmatch <path> in the owning
 scan_roots = ["crates/eliot-app/src/commands/data_and_memory.rs", "crates/eliot-app/src/mcp_stdio.rs", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "crates/eliot-app/src/mcp_stdio/memory.rs", "crates/eliot-app/src/mcp_stdio/operator.rs", "crates/eliot-app/src/mcp_stdio/skill.rs", "crates/eliot-app/src/mcp_stdio/task_handlers.rs", "crates/eliot-engine/src/cognition.rs", "crates/eliot-engine/src/context.rs", "crates/eliot-engine/src/context/packet_quality.rs", "crates/eliot-engine/src/context_contracts.rs", "crates/eliot-engine/src/control_plane.rs", "crates/eliot-engine/src/host.rs", "crates/eliot-engine/src/memory_distillation.rs", "crates/eliot-engine/src/memory_lifecycle.rs", "crates/eliot-engine/src/skill.rs", "crates/eliot-engine/src/skill_curator.rs", "crates/smart/eliot-context-assembly/src/measurement.rs", "crates/smart/eliot-context-contracts/src/measurement.rs", "crates/smart/eliot-context-measurement/src/capacity.rs", "crates/smart/eliot-context-measurement/src/envelope.rs", "crates/smart/eliot-context-measurement/src/lib.rs", "crates/smart/eliot-context-measurement/src/observation.rs", "crates/smart/eliot-context-measurement/src/receipt.rs", "crates/smart/eliot-context-measurement/src/stu.rs", "crates/smart/eliot-context-measurement/tests/measurement.rs"]
 exclusions = ["exc/1|crates/eliot-app/src/cognitive_field_runner.rs:11659-11659|unrelated_byte_or_character_metric|83224db3c2de82a5|collection-length partition for execution chunking (executions/target_chunks); no byte/char/token/STU semantic|declared unrelated byte/character metric: 'executions.len().div_ceil(target_chunks)'; excluded with exact evidence, not a package skip", "exc/2|crates/eliot-app/src/host_runtime/event_and_authority.rs:2907-2907|unrelated_byte_or_character_metric|8a15cd14ee1d7efe|seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'input.ttl_seconds.div_ceil(60)'; excluded with exact evidence, not a package skip", "exc/3|crates/eliot-app/src/host_runtime/supervised_process.rs:1545-1545|unrelated_byte_or_character_metric|2fb187414f7c18f4|digest text length bound on a hash string; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'hash.chars().count() <= 128'; excluded with exact evidence, not a package skip", "exc/4|crates/eliot-app/src/host_runtime/supervised_process.rs:1576-1576|unrelated_byte_or_character_metric|1b53d5d338573ec6|log-detail truncation bound; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'if detail.chars().count() > 512'; excluded with exact evidence, not a package skip", "exc/5|crates/eliot-engine/src/host.rs:188-188|unrelated_byte_or_character_metric|bd25287324ab7b71|nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens|declared unrelated byte/character metric: 'let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()'; excluded with exact evidence, not a package skip", "exc/6|crates/eliot-engine/src/host.rs:186-186|unrelated_byte_or_character_metric|2a73328ae0d67216|summed description character count reported only as listing_characters; never divided or relabelled as tokens|declared unrelated byte/character metric: 'descriptions += description_characters'; excluded with exact evidence, not a package skip"]
 classifications = ["exact-utf8-envelope", "normative-stu-estimate", "serializer-identity-bound", "route-identity-bound", "estimator-policy-unvalidated", "capacity-fit-analysis", "exact-observation", "stale-or-absent-observation", "transformed-observation", "test-only", "token_estimate_without_tokenizer", "character_count_mislabeled_as_tokens", "bare_measurement_field_or_conversion", "unrelated_byte_or_character_metric", "unresolved"]
-owner_allocations = ["#704:9", "#783:21", "#878:17", "#880:21", "unresolved:4"]
+owner_allocations = ["#704:9", "#783:21", "#878:17", "#880:21", "unresolved:58"]
 consumer_worksets_digest = "e31e19e405ffbfc2af174a0ed8cf5d0fe3c07375a2ffa7096a30c8e66b2a6bd3"
 
 [[rows]]
@@ -1790,7 +1790,7 @@ seam = "unassigned"
 write_scope = "none"
 path = "crates/smart/eliot-context-measurement/src/capacity.rs"
 package = "eliot-context-measurement"
-item = "<file>"
+item = "fn fit_headroom"
 item_scope = "production"
 signal = "fn fit_headroom(capacity: Option<u64>, total: Option<u64>) -> (Option<bool>, Option<u64>) {"
 span_start = 121
@@ -1801,8 +1801,8 @@ span_digest = "df416736e66600c8ea7989e77bf5c51dafb305aab29332a38651d48a00d56d7a"
 classification = "unresolved"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "6f475b31852f3a838a7b5e2b21e399461d97ab2c1238cad14723e64e53c99b42"
-evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:121-121 inside `<file>` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'fn fit_headroom(capacity: Option<u64>, total: Option<u64>) -> (Option<bool>, Option<u64>) {'); recorded unresolved and never deleted to obtain green; measured at crates/smart/eliot-context-measurement/src/capacity.rs:121-121 inside `<file>`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+row_digest = "36801a6eb418383820f7225b6ab57bd9cd8e43710cd512755a2c17cf9510743b"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:121-121 inside `fn fit_headroom` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'fn fit_headroom(capacity: Option<u64>, total: Option<u64>) -> (Option<bool>, Option<u64>) {'); recorded unresolved and never deleted to obtain green; measured at crates/smart/eliot-context-measurement/src/capacity.rs:121-121 inside `fn fit_headroom`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate auto/capacity.rs/121 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -2665,7 +2665,7 @@ seam = "unassigned"
 write_scope = "none"
 path = "crates/smart/eliot-context-contracts/src/measurement.rs"
 package = "eliot-context-contracts"
-item = "impl SerializedContextMeasurement"
+item = "fn utf8_bytes"
 item_scope = "production"
 signal = "pub fn utf8_bytes(serialized: &str) -> u64 {"
 span_start = 174
@@ -2676,8 +2676,8 @@ span_digest = "21f75bb669139c9b58d5014cc1be9ef85a90783e65be8ff43130fb6892519bdc"
 classification = "exact-utf8-envelope"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "4234da58b9c3a2e7f93b3471f290e50f90466055b896ae2e085bc531eb0cfa55"
-evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:174-174 inside `impl SerializedContextMeasurement` with no frozen case covering the span; exact envelope signal 'pub fn utf8_bytes(serialized: &str) -> u64 {': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:174-174 inside `impl SerializedContextMeasurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+row_digest = "9e8839b8a0ad55a0e2dc459b73c32cc5ae17d2190e5467faf10b0e3bdc34e7d3"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:174-174 inside `fn utf8_bytes` with no frozen case covering the span; exact envelope signal 'pub fn utf8_bytes(serialized: &str) -> u64 {': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:174-174 inside `fn utf8_bytes`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate auto/measurement.rs/174 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
@@ -2815,7 +2815,7 @@ seam = "unassigned"
 write_scope = "none"
 path = "crates/eliot-app/src/mcp_stdio/memory.rs"
 package = "eliot-app"
-item = "<file>"
+item = "fn legacy_memory_token_units_wire"
 item_scope = "production"
 signal = "pub(super) fn legacy_memory_token_units_wire("
 span_start = 783
@@ -2826,8 +2826,8 @@ span_digest = "6bd937ec1d6bd2d467ed7242bf1d2abdfefa4d686a7610104edde23fc85f7f95"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "e5516bb384bc8b8bd4462559114043baaa66222d7c9b0f1a3e044da30305b296"
-evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/memory.rs:783-783 inside `<file>` with no frozen case covering the span; call binding the token_units measurement: 'pub(super) fn legacy_memory_token_units_wire('; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-app/src/mcp_stdio/memory.rs:783-783 inside `<file>`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+row_digest = "6dbf72d068a79712c3dc276b0ddb449f9b4cb9a6bc8fac97e8a3374bf203593c"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/memory.rs:783-783 inside `fn legacy_memory_token_units_wire` with no frozen case covering the span; call binding the token_units measurement: 'pub(super) fn legacy_memory_token_units_wire('; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-app/src/mcp_stdio/memory.rs:783-783 inside `fn legacy_memory_token_units_wire`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate auto/memory.rs/783 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 

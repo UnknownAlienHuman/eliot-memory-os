@@ -1471,9 +1471,11 @@ def _discover_unmatched_candidates(
         depths = record["depths"]
         assert isinstance(depths, list)
         for lineno, line in enumerate(masked_lines, start=1):
-            if ESTIMATOR_HELPER_RE.match(line.strip()):
+            stripped = line.strip()
+            fn_match = re.search(r"\bfn\s+", stripped)
+            if fn_match and ESTIMATOR_HELPER_RE.match(stripped[fn_match.start():]):
                 end = _item_extent(masked_lines, depths, lineno)
-                raw.append((rel, lineno, end, line.strip(), "estimator-definition"))
+                raw.append((rel, lineno, end, stripped, "estimator-definition"))
         for base, pinned in needles_by_file.get(rel, []):
             for index, (start, end) in enumerate(
                 _locate_all_occurrences(record, rel, base)
@@ -1514,6 +1516,9 @@ def _discover_unmatched_candidates(
         depths = record["depths"]
         assert isinstance(depths, list)
         item, item_scope = _scope_of(masked_lines, depths, start, rel)
+        item_match = ITEM_RE.match(masked_lines[start - 1])
+        if item_match:
+            item = f"{item_match.group('kind')} {item_match.group('name')}"
         if item_scope != "production":
             continue
         body = "\n".join(
@@ -2148,18 +2153,26 @@ def build_inventory(
     source_pairs = sorted(f"{record['path']}:{record['sha256']}" for record in file_records)
     source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))
     rows = _build_rows(candidates, mapping)
-    counts: dict[str, int] = {}
+    table_counts: dict[str, int] = {}
     for _ref, owner, _path, _sig in active_cases:
-        counts[owner] = counts.get(owner, 0) + 1
-    if default_denominator and tuple(sorted(counts.items())) != tuple(
+        table_counts[owner] = table_counts.get(owner, 0) + 1
+    if default_denominator and tuple(sorted(table_counts.items())) != tuple(
         sorted(EXPECTED_OWNER_ALLOCATIONS)
     ):
         raise InventoryError(
             "OWNER_ALLOCATION_DRIFT",
-            f"measured owner allocation {sorted(counts.items())} differs from the declared "
+            f"measured owner allocation {sorted(table_counts.items())} differs from the declared "
             f"{sorted(EXPECTED_OWNER_ALLOCATIONS)}",
         )
-    owner_allocations = sorted(f"{owner}:{count}" for owner, count in counts.items())
+    # owner_allocations describes the artifact's ROWS (declared distribution plus
+    # discovered-unallocated rows), so its sum reconciles with candidate_count.
+    # The frozen table's exact distribution keeps its own DRIFT gate above and
+    # is digested separately in owner_digest.
+    row_counts: dict[str, int] = {}
+    for row in rows:
+        row_owner = str(row["owner"])
+        row_counts[row_owner] = row_counts.get(row_owner, 0) + 1
+    owner_allocations = sorted(f"{owner}:{count}" for owner, count in row_counts.items())
     unresolved_rows = [row for row in rows if row["status"] != "owned"]
     owned_count = len(rows) - len(unresolved_rows)
     if default_denominator and any(
