@@ -863,4 +863,45 @@ mod tests {
             }
         ));
     }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679
+    /// A6/W4): a full protected pipe partition refuses with
+    /// [`IpcReserveError::ProtectedReserveExhausted`] naming exactly
+    /// [`IPC_PIPE_BYTES_BOTTLENECK`], so exhaustion of one dimension is
+    /// never reported as global exhaustion
+    /// (`docs/architecture/I14-03-control-reserve.md`).
+    #[test]
+    fn ipc_protected_bytes_exhaustion_names_bottleneck() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(2).expect("bytes"),
+        );
+
+        // The whole protected partition is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the saturated
+        // partition and not from a partition that already released.
+        let _held = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-pipe-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+            )
+            .expect("protected bytes");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-pipe-shed-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::ProtectedReserveExhausted { bottleneck, .. }
+                if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
+        ));
+    }
 }
