@@ -2079,6 +2079,34 @@ mod tests {
         Ok(())
     }
 
+    /// The legacy permit carries its legacy attribution
+    /// (issue #1679): the neighbour tests pin only capacity
+    /// movement (spend/refuse, normal untouched); nothing
+    /// pins WHO the legacy slot is attributed to. Reading
+    /// the live permit attribution here means a regression
+    /// stamping the wrong identity fails this test while the
+    /// capacity tests still pass (I14.3: every permit binds
+    /// owner and operation identity; the legacy path
+    /// attributes holders as legacy rather than anonymous).
+    #[test]
+    fn legacy_control_permit_carries_legacy_attribution() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([44u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 1, 8)?;
+
+        // Held in a named binding so the attribution can be read
+        // while the single protected slot stays spent.
+        let permit = front_door
+            .acquire_control()
+            .expect("legacy protected acquire");
+        assert_eq!(permit.owner(), "legacy-control-reserve");
+        assert_eq!(permit.operation_id(), "legacy-control");
+        assert_eq!(permit.operation(), PermitOperation::LegacyControl);
+        Ok(())
+    }
+
     /// Legacy control saturation leaves normal capacity available
     /// (issue #1679): the neighbour above pins only that the
     /// protected slot is spent and refuses; it never proves the
