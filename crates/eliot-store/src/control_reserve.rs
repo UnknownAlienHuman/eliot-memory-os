@@ -1215,6 +1215,32 @@ mod tests {
         ));
     }
 
+    /// The protected transaction partition obeys the same constructor floor
+    /// (issue #1679) as its normal counterpart: a reserve with no protected
+    /// transaction partition can never admit protected Store work, so building
+    /// one must fail at build (I14.3: partitions are non-borrowable; zero
+    /// capacity is a build error, not a runtime surprise).
+    #[test]
+    fn store_partitioned_zero_protected_transactions_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            0,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero protected transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.protected_transaction_slots",
+                ..
+            }
+        ));
+    }
+
     /// Owner-identity validation at acquisition (issue #1679 A10): every
     /// permit binds owner and operation identity, so a blank owner is
     /// refused by name at acquisition instead of yielding a permit that
