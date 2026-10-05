@@ -1680,3 +1680,41 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
     assert!(GOLDEN.contains("SUPPORTED"));
     assert!(GOLDEN.contains("weakest_link"));
 }
+
+#[test]
+fn absence_issuer_nonblank_predicate_refused() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "no-match/absent-valley-alloy\u{7}".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params)
+        .expect_err("a control-bearing predicate identity must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::ControlCharacter { .. }),
+        "a control-bearing identity must be refused as `ControlCharacter`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.predicate_id"),
+        "the refused field must be the predicate identity itself: {rendered}"
+    );
+}
+
+#[test]
+fn absence_issuer_nonblank_index_refused() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.index_revision = "index-700.1\u{7}".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params)
+        .expect_err("a control-bearing index revision must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::ControlCharacter { .. }),
+        "a control-bearing revision must be refused as `ControlCharacter`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.index_revision"),
+        "the refused field must be the index revision itself: {rendered}"
+    );
+}
