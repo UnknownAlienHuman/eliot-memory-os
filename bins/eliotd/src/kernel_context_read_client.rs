@@ -3559,6 +3559,77 @@ mod tests {
         Ok(())
     }
 
+    /// The join fails closed on a dimension that has no frozen owner row
+    /// (issue #1679, W3/AUD2): `HeadroomDimension::ModelQuota` has no
+    /// `owner_bottleneck()` and no frozen owner, so
+    /// `PacketHeadroomJoin::acquire` refuses it rather than admitting
+    /// the demand without a reservation. The refusal names the exact
+    /// dimension, so the reader never has to infer which owner was
+    /// missing.
+    #[test]
+    fn packet_headroom_join_refuses_modelquota_without_frozen_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let demand = HeadroomDemand {
+            dimension: HeadroomDimension::ModelQuota,
+            quantity: HeadroomQuantity::Unknown {
+                reason: eliot_contracts::ArtifactId::new("reason-mq-unknown")?,
+            },
+            request: CapacityRequest {
+                operation: RequestedOperationClass::Normal(NormalWorkClass::Interactive),
+                operation_id: "op-mq-1".to_owned(),
+                requested_bottleneck: CapacityBottleneck::KernelRunnableControlSlots,
+                requested_limit: CapacityLimit {
+                    unit: CapacityUnit::Items,
+                    quantity: NonZeroU64::new(1).ok_or("non-zero demand")?,
+                },
+                requesting_owner_ref: "owner-a".to_owned(),
+                requesting_generation_ref: ResourceGeneration::new(1)?,
+                authority_epoch_ref: test_epoch(1)?,
+                profile_id: "profile-1".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                deadline_ms: 1_000,
+            },
+        };
+        let request = DownstreamHeadroomRequest {
+            schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+            pipeline_id: eliot_contracts::ArtifactId::new("pipe-mq-1")?,
+            attempt_id: eliot_contracts::ArtifactId::new("attempt-mq-1")?,
+            stage_id: eliot_contracts::ArtifactId::new("stage-mq-1")?,
+            consumer: HeadroomConsumer::Verifier,
+            binding: ContextBinding {
+                task_id: eliot_contracts::TaskId::new("task-one")?,
+                attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-one")?,
+                scope_id: eliot_receipts::WorkScopeId::new("governor")?,
+                state_fence: fence.clone(),
+                decision_id: eliot_contracts::DecisionId::new("decision-one")?,
+                operation_id: None,
+            },
+            route_id: "route-mq-1".to_owned(),
+            serializer_id: "serializer-mq-1".to_owned(),
+            recipe_digest: "recipe-mq-1".to_owned(),
+            demands: vec![demand],
+            release: HeadroomReleaseCondition {
+                completion_receipt: eliot_contracts::ArtifactId::new("receipt-mq-1")?,
+                release_on_cancel: true,
+                expires_at_ms: 9_999_999,
+            },
+        };
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is deliberately
+        // not `Debug`, so the error is taken by pattern instead of through
+        // `expect_err`; the refusal asserted below is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("ownerless dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NoFrozenOwner { dimension } if dimension == HeadroomDimension::ModelQuota)
+        );
+        Ok(())
+    }
+
     fn evidence_request(
         fence: &StateFence,
     ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
