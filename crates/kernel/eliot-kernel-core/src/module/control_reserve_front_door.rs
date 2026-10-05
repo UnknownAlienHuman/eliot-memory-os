@@ -1775,6 +1775,35 @@ mod tests {
     }
 
     #[test]
+    fn guarantee_lost_response_refuses_a_remaining_last_resort_path() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([15u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The preallocated last-resort emergency slot is still live, so there is
+        // no guarantee loss to record: this pins the fail-closed property, not
+        // the preallocation constant.
+        assert!(front_door.available_emergency() > 0);
+
+        let err = front_door
+            .guarantee_lost_response(
+                "op-loss-premature-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("a live last-resort path must not produce a loss record");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.last_resort_path",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn protected_and_emergency_permits_are_owner_and_epoch_bound() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
