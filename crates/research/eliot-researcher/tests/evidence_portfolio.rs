@@ -998,6 +998,41 @@ fn absence_substituted_record_is_unproven() {
     );
 }
 
+#[test]
+fn absence_stale_record_is_unproven() {
+    // A stale record is the same evidence with the currentness join unmet: the
+    // accounting handle `src-primary#0` still resolves to a vetted record under
+    // that exact handle, but its frozen freshness boundary now sits before the
+    // assessment instant. Completeness is proved on the frozen scope (I21-06:
+    // `complete_scope` is the only basis on which a scoped absence may be
+    // claimed), so a member closed against a record that was already stale when
+    // the claim was made cannot support `Proven`.
+    let (account, mut records, _, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    // Same handle, same everything else, earlier boundary: the constructor puts no
+    // constraint on the boundary and `is_stale_at` reports true because the
+    // assessment instant is already past it.
+    let mut params = source_params("src-primary#0");
+    params.freshness_boundary_ms = Some(ASSESSMENT_MS - 1);
+    let stale = SourceRecord::new(params).expect("stale record");
+    records.insert("src-primary#0".to_owned(), stale);
+    // No evaluation and no manifest, on purpose. The record now differs from the
+    // one the issuer committed, so binding the evaluation would report the
+    // earlier result-record mismatch rather than staleness; the handle, record and
+    // currentness joins are the ones that hold or fail without a bound
+    // evaluation, and currentness is the claim under test here.
+    let stale_preconditions =
+        AbsencePreconditions::derive(&account, &records, None, ASSESSMENT_MS, &scope_digest, None)
+            .expect("preconditions over a stale record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &stale_preconditions) else {
+        panic!("a record past its frozen freshness boundary must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=record_stale_at_assessment"),
+        "the stale member and its specific unmet join must be retained: {reason}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
