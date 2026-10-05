@@ -446,6 +446,40 @@ pub fn stage_control_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), M
     Ok(())
 }
 
+/// Outcome of one compare-before-write ack stage (issue #2896 W10).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AckStageOutcome {
+    /// The ack bytes were newly written: the slot was absent.
+    Staged,
+    /// Identical bytes already occupy the slot: no write was performed.
+    AlreadyStaged,
+}
+
+/// Stages one child ack only when the slot does not already hold other
+/// bytes (issue #2896 W10): an absent slot is written atomically, identical
+/// bytes restage quietly without rotating the file under a concurrent owner
+/// read, and foreign bytes are refused without touching them — the name is
+/// owned by whoever staged those bytes, and overwriting them would let a
+/// stale acknowledgement impersonate the staged one
+/// (`docs/architecture/I07-02-frame.md:66`).
+pub fn stage_ack_bytes(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<AckStageOutcome, MaterialError> {
+    if bytes.is_empty() || bytes.len() as u64 > WASM_CONTROL_MAX_FILE_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    match std::fs::read(path) {
+        Ok(existing) if existing == bytes => Ok(AckStageOutcome::AlreadyStaged),
+        Ok(_) => Err(MaterialError::DigestMismatch),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            stage_control_bytes(path, bytes)?;
+            Ok(AckStageOutcome::Staged)
+        }
+        Err(error) => Err(MaterialError::Unreadable(error.kind().to_string())),
+    }
+}
+
 /// Retires the legacy fixed control file only when its current bytes still
 /// match the admitted digest: a replacement staged after admission owns the
 /// name now and must never be deleted through this path. Returns whether the
@@ -3353,6 +3387,46 @@ mod tests {
         std::fs::write(&path, vec![0xA5; DISPATCH_MATERIAL_MAX_BYTES as usize + 1])
             .expect("oversize fixture writable");
         assert_eq!(read_staged_bytes(&path), Err(MaterialError::TooLarge));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An absent ack slot stages, and an identical restage stays quiet.
+    #[test]
+    fn ack_stage_first_write_stages_and_second_is_quiet() {
+        let path = std::env::temp_dir().join("eliot-2896-ack-stage-quiet.json");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            stage_ack_bytes(&path, b"ack-bytes-1"),
+            Ok(AckStageOutcome::Staged)
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("staged ack readable"),
+            b"ack-bytes-1"
+        );
+        assert_eq!(
+            stage_ack_bytes(&path, b"ack-bytes-1"),
+            Ok(AckStageOutcome::AlreadyStaged)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Foreign bytes own the slot: the stage conflicts and nothing is written.
+    #[test]
+    fn ack_stage_foreign_bytes_conflict_without_overwrite() {
+        let path = std::env::temp_dir().join("eliot-2896-ack-stage-conflict.json");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            stage_ack_bytes(&path, b"ack-bytes-1"),
+            Ok(AckStageOutcome::Staged)
+        );
+        assert_eq!(
+            stage_ack_bytes(&path, b"ack-bytes-2"),
+            Err(MaterialError::DigestMismatch)
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("staged ack readable"),
+            b"ack-bytes-1"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
