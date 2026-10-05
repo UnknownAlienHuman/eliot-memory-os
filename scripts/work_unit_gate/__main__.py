@@ -1765,6 +1765,14 @@ def main(argv: list[str] | None = None) -> int:
         evidence_rows: list = []
         for d in plan.descriptors:
             num = d.issue.number
+            # Owned-tree process accounting: every owned child below is
+            # spawned and synchronously reaped at its own site (any spawn
+            # failure, timeout or overflow early-returns), so the counters
+            # turn that control-flow fact into a checked invariant: a future
+            # non-reaped spawn surfaces as active > 0 (non-green), never a
+            # silent pass.
+            owned_spawned = 0
+            owned_reaped = 0
             doc = memo_assignment.get(num)
             if type(doc) is not assignment_source.AssignmentDocument:
                 return finish(fail_result("missing required receipt: assignment", 1, missing=[f"issue-{num}"]))
@@ -1918,6 +1926,8 @@ def main(argv: list[str] | None = None) -> int:
                         bproc = subprocess.run([str(a) for a in build_argv], capture_output=True,
                                                timeout=wall_s, env=env, cwd=str(root))
                         build_raw = bproc.stdout or b""
+                        owned_spawned += 1
+                        owned_reaped += 1
                     except subprocess.TimeoutExpired:
                         return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
                     except OSError:
@@ -1963,6 +1973,8 @@ def main(argv: list[str] | None = None) -> int:
                         proc = subprocess.run([str(a) for a in disc_argv], capture_output=True, timeout=wall_s,
                                               env=env, cwd=str(root))
                         disc_out = proc.stdout or b""
+                        owned_spawned += 1
+                        owned_reaped += 1
                         disc_code = int(proc.returncode)
                     except subprocess.TimeoutExpired:
                         return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
@@ -2007,6 +2019,8 @@ def main(argv: list[str] | None = None) -> int:
                             tproc = subprocess.run([str(a) for a in test_argv], capture_output=True,
                                                    timeout=wall_s, env=env, cwd=str(root))
                             tout, tcode = tproc.stdout or b"", int(tproc.returncode)
+                            owned_spawned += 1
+                            owned_reaped += 1
                         except subprocess.TimeoutExpired:
                             try:
                                 erec = descriptor_runner.compose_execution_record(
@@ -2104,6 +2118,8 @@ def main(argv: list[str] | None = None) -> int:
                                                       int(transport["output_bytes"]))
                     if discovery_doc is None:
                         return finish(fail_result(f"discovery failure: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    owned_spawned += 1
+                    owned_reaped += 1
                     if type(discovery_doc) is not dict or not discovery_doc.get("tests"):
                         return finish(fail_result(f"discovery without execution cannot pass: issue-{num}", 1,
                                                   failed=[f"issue-{num}"]))
@@ -2113,6 +2129,8 @@ def main(argv: list[str] | None = None) -> int:
                                                  int(transport["output_bytes"]))
                     if exec_doc is None:
                         return finish(fail_result(f"execution incomplete: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    owned_spawned += 1
+                    owned_reaped += 1
                     # Compose typed discovery/execution bindings (once per test).
                     for entry in discovery_doc.get("tests", []):
                         tid = entry.get("id")
@@ -2178,11 +2196,25 @@ def main(argv: list[str] | None = None) -> int:
             # observed disposition), never the descriptor's verification
             # phase label (those pairs are disjoint grammars).
             try:
-                _cleanup = descriptor_runner.cleanup_verdict(cleanup="clean", active_processes=0, truncated=False)
+                # Derived owned-tree observation, not literals: no timeout
+                # path reaches here (every TimeoutExpired handler above
+                # returns first); no bound was exceeded (every out_cap
+                # check above, including the child protocol bound, returns
+                # first); active owned processes = spawned - reaped.
+                _cleanup = descriptor_runner.cleanup_verdict(
+                    cleanup="clean",
+                    active_processes=(owned_spawned - owned_reaped),
+                    truncated=False)
                 exec_outcome = "pass" if executions and all(
                     getattr(e, "disposition", None) is c.ExecutionDisposition.EXECUTED_PASS
                     for e in executions) else "error"
                 _phase = descriptor_runner.phase_verdict("execute", exec_outcome)
+                if _cleanup != "green":
+                    return finish(fail_result(f"cleanup not observed clean: issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
+                if _phase != "green":
+                    return finish(fail_result(f"phase verdict not green: issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
             except descriptor_runner.RunnerInputError:
                 return finish(fail_result(f"phase verdict failure: issue-{num}", 1,
                                           failed=[f"issue-{num}"]))
