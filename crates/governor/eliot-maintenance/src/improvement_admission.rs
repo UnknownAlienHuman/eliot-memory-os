@@ -1275,6 +1275,22 @@ mod tests {
         }
     }
 
+    /// `I12.24:143`: a `STALE`/`BLOCKED` binding cannot be silently filled, so
+    /// a valid-but-stale closure blocks until it is revalidated.
+    #[test]
+    fn stale_closure_blocks_until_revalidated() {
+        let mut stale = evidence();
+        stale.closure_valid = true;
+        stale.closure_stale = true;
+        match decide(&candidate(), &stale, &policy()) {
+            ImprovementAdmissionDecision::Blocked { cause, reason, .. } => {
+                assert_eq!(cause, ImprovementBlockCause::StaleClosure);
+                assert!(reason.contains("stale-closure-binding"));
+            }
+            other => panic!("stale closure binding must block, got {other:?}"),
+        }
+    }
+
     #[test]
     fn self_report_cannot_admit() {
         let mut dependent = evidence();
