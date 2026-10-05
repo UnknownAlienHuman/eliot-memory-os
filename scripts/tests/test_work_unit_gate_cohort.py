@@ -930,6 +930,42 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             ch.validate_snapshot_completeness(incomplete_snapshot)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
 
+        # Every remaining leg is an honest-but-incomplete snapshot that still
+        # claims completeness: each refusal is INCOMPLETE_SNAPSHOT, never a
+        # malformed-input error and never "zero findings".
+        base_header = {
+            "repository": "UnknownAlienHuman/eliot-memory-os",
+            "complete": True,
+            "base_revision": "0" * 40,
+            "acquisition": "probe",
+            "acquired_at": "2026-10-05T00:00:00Z",
+        }
+        incomplete_legs = (
+            # Truncated: pagination says the walk stopped early.
+            {**base_header, "pagination": {"complete": False}},
+            # Tag-filtered: declared issue_count disagrees with observed issues.
+            {**base_header, "issue_count": 2, "issues": [{"number": 1}]},
+            # Moving snapshot: reported movement.
+            {**base_header, "moved": True},
+            # Moving snapshot: reported inconsistency.
+            {**base_header, "inconsistent": True},
+            # No acquisition receipt.
+            {
+                key: value
+                for key, value in base_header.items()
+                if key not in ("acquisition", "acquired_at")
+            },
+        )
+        for leg_header in incomplete_legs:
+            with self.subTest(keys=sorted(leg_header)):
+                with self.assertRaises(ch.CohortError) as ctx:
+                    ch.validate_snapshot_completeness({"header": leg_header})
+                self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # Positive control: the complete, bound, acquired snapshot alone is
+        # accepted, so the refusals above are shape-driven.
+        self.assertIsNone(ch.validate_snapshot_completeness({"header": dict(base_header)}))
+
     def _committed_aggregate_lock_copies(self):
         """Two tmp copies of the committed lock: pristine and digest-tampered.
 
