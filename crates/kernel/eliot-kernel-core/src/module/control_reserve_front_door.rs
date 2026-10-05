@@ -1955,6 +1955,39 @@ mod tests {
     }
 
     #[test]
+    fn emergency_permit_release_returns_last_resort_slot_exactly_once(
+    ) -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([77u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The last-resort slot is preallocated outside normal accounting
+        // (I14.3), so one emergency acquire drains it exactly like the
+        // normal slot above.
+        let permit = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-emrel-1",
+        )?;
+        assert_eq!(front_door.available_emergency(), 0);
+
+        // The explicit release returns the slot and binds the returned
+        // evidence to its operation and owner.
+        let evidence = permit.release();
+        assert_eq!(front_door.available_emergency(), 1);
+        assert_eq!(evidence.operation_id(), "op-emrel-1");
+        assert_eq!(evidence.owner(), "owner-a");
+
+        // Drop after an explicit release moves no counter: exactly once,
+        // never twice.
+        drop(evidence);
+        assert_eq!(front_door.available_emergency(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn partitioned_zero_normal_capacity_fails_closed() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([25u8; 32]),
