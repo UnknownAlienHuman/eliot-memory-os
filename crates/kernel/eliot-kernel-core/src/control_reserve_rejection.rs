@@ -482,4 +482,42 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// The protected-dimension identity complement of
+    /// `normal_saturation_response_rejects_malformed_operation_id` and
+    /// `protected_exhaustion_response_reports_live_boundary` in this module:
+    /// even a truly exhausted protected partition still refuses a blank
+    /// operation identity as `InvalidField { field: "rejection.operation_id" }`,
+    /// so a malformed identity never produces pressure evidence (#1679 A10).
+    #[test]
+    fn protected_exhaustion_response_rejects_malformed_operation_id() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([29u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        let _held = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+
+        let err = front_door
+            .protected_exhaustion_response(
+                ControlOperationClass::CancelOperation,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "rejection.operation_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
 }
