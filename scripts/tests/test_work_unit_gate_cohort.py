@@ -1586,6 +1586,51 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat_changed = ch.materialize_catalogue([r1, make_row(d2_changed)], (d1.issue, d2_changed.issue))
         self.assertNotEqual(cat1.sha256, cat_changed.sha256)
 
+        # The legs above prove a CHANGED COUNT changes identity. A count alone
+        # is not the whole denominator: the selection, the parent catalogue
+        # digest, every required descriptor and the phase are bound too, and
+        # those are what a regenerated plan must carry (A14-08:56 counts are
+        # not progress without proof; I00-14:54 generated counts are recomputed
+        # from payloads, so identity follows the bytes).
+        #
+        # Plan determinism: two independent materializations of the SAME
+        # unchanged canonical selection serialize to identical bytes, so no
+        # ordering or identity dependence can hide behind a digest equality.
+        self.assertEqual(
+            ch.serialize_plan_canonical(ch.materialize_selection_plan(
+                cat1,
+                c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue,)),
+                [d1],
+            )),
+            ch.serialize_plan_canonical(ch.materialize_selection_plan(
+                cat1,
+                c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue,)),
+                [d1],
+            )),
+        )
+
+        # Changed selection changes identity: both plans materialize from the
+        # same UNCHANGED catalogue, so the selection is the only differing
+        # input, and its exact descriptor denominator rides in the digest.
+        plan_single = ch.materialize_selection_plan(
+            cat1,
+            c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue,)),
+            [d1],
+        )
+        plan_changed_selection = ch.materialize_selection_plan(
+            cat1,
+            c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue, d2.issue)),
+            [d1, d2],
+        )
+        self.assertNotEqual(
+            plan_single.sha256,
+            plan_changed_selection.sha256,
+        )
+
+        # The changed assignment carries its exact obligations under a DISTINCT
+        # leaf owner, so a changed matrix count never duplicated one.
+        self.assertNotEqual(d1.unit, d2_changed.unit)
+
     def test_blocked_row_with_restricted_root_descriptor_rejected(self):
         # A blocked row carrying a descriptor is unresolved work, not an
         # exemption from the scope rules: an ordinary leaf claiming a
