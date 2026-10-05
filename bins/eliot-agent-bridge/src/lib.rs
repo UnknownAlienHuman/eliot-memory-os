@@ -86,7 +86,9 @@ pub use bridge_contract::{
     BridgeContractError, agent_bridge_contract, validate_agent_bridge_contract,
 };
 pub(crate) use cli_contract::validate_client_declaration_path;
-pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
+pub use cli_contract::{
+    CliConfig, CliError, McpCatalogArgs, Profile, parse_args, parse_mcp_catalog_args,
+};
 use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
