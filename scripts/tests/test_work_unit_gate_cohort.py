@@ -31,7 +31,7 @@ COMMITTED_AGGREGATE_SHA256 = "1177af1d0dff9e7ea72975877b88c204c70610c3c76e88efcc
 TAMPERED_AGGREGATE_SHA256 = "9" * 64
 
 # Frozen leaf-router byte identities: sha256 of the exact on-disk bytes at base
-# commit c0c7257f (Windows CRLF checkout; `.gitattributes` sets `* text=auto`
+# commit 38d5ac18b (Windows CRLF checkout; `.gitattributes` sets `* text=auto`
 # so disk bytes are CRLF while git blobs are LF-only). Fixed literals recorded
 # once — never computed from live files at test runtime.
 FROZEN_LEAF_ROUTER_SHA256 = {
