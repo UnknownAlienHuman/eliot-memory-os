@@ -1570,7 +1570,7 @@ def main(argv: list[str] | None = None) -> int:
                     if d.package is not None:
                         try:
                             try:
-                                ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+                                ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
                             except Exception:
                                 ws_doc = {}
                             members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
@@ -2191,7 +2191,7 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
     if not isinstance(name, str):
         raise descriptor_runner.RunnerInputError("PACKAGE_NOT_FOUND")
     try:
-        ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+        ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
     except Exception:
         ws_doc = {}
     members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []

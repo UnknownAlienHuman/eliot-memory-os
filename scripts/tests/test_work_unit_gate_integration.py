@@ -1294,6 +1294,26 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         self.assertEqual(member_desc.phase, contractsmod.VerificationPhase.WORKSPACE_INTEGRATION)
         self.assertEqual(ready.phase, contractsmod.VerificationPhase.PACKAGE_LOCAL)
 
+    # WORK_UNIT_CASE: 837/43
+    def test_selected_rust_workspace_manifest_observed(self):
+        # The closed root-manifest read must observe the manifest (tomllib.loads
+        # needs str; bytes raised TypeError, swallowed into {} so every package
+        # resolved UNAVAILABLE). A standalone crate root now passes workspace
+        # admission, so the gate reaches binary binding instead. Binary
+        # production itself is a separate defect (plain cargo build emits no
+        # test-profile artifact): pinned here only by its message, to be
+        # replaced by a real execution proof once test binaries are produced.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_rust_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        combined = out + err
+        self.assertNotIn('workspace incomplete', combined)
+        self.assertIn('missing test binary: issue-837', combined)
+
+
 
 if __name__ == '__main__':
     unittest.main()
