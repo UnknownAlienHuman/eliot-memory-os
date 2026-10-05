@@ -1956,6 +1956,31 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_zero_protected_capacity_fails_closed() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([33u8; 32]),
+            genesis_epoch(),
+        );
+        // The second constructor floor (issue #1679): a front door with no
+        // protected partition can never admit control work, so building one
+        // fails closed instead of producing a reserve that refuses every
+        // control operation at runtime (I14.3: protected control is
+        // non-borrowable; zero capacity is a build error, not a runtime
+        // surprise).
+        let Err(err) = FrontDoor::partitioned(authority, 1, 0, 8) else {
+            panic!("zero protected capacity must fail at build");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "control_reserve.protected_capacity",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn ledger_evicts_oldest_when_full() -> Result<(), KernelError> {
         let mut ledger = IdempotencyLedger::new(2)?;
         ledger.record(
