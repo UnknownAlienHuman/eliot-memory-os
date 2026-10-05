@@ -2303,4 +2303,68 @@ mod tests {
             format!("improvement-candidate:{}", candidate.candidate_id)
         );
     }
+
+    /// Norm: `I12.24:76` - replay-only evidence cannot promote a change.
+    #[test]
+    fn honest_unexecuted_evidence_reports_no_run() {
+        let replay_plan = eliot_improvement::ReplayPlan {
+            fixed_replay_refs: vec!["replay-1145-a".to_string()],
+            holdout_refs: vec!["holdout-1145-a".to_string()],
+            transfer_refs: vec!["transfer-1145-a".to_string()],
+            counter_metric_names: vec!["metric-1145-a".to_string()],
+            verifier_refs: vec!["verifier-1145-a".to_string()],
+        };
+        let mut candidate = ImprovementCandidate::new(
+            "maintenance-1145-a",
+            eliot_improvement::ImprovementSurface::Memory,
+            "change-1145-a",
+            vec!["applies-1145-a".to_string()],
+            vec!["not-applies-1145-a".to_string()],
+            vec!["trace-1145-a".to_string()],
+            vec!["evidence-1145-a".to_string()],
+            replay_plan,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("candidate builds");
+        candidate.set_details(
+            "trigger-1145-a",
+            vec!["hypothesis-1145-a".to_string()],
+            std::collections::BTreeMap::new(),
+            "scope-1145-a",
+            "owner-1145-a",
+            "delivery-1145-a",
+            "canary-1145-a",
+            "rollback-1145-a",
+            "stop-1145-a",
+        );
+
+        // The owners are read from the same `improvement_operation_owners`
+        // projection the live dispatch uses, so the evidence below is bound to
+        // the owner values the route actually submits, not to literals.
+        let owners = RouteOwners::read("rollback-1145-a").expect("owners resolve");
+        let evidence = route_activation_evidence(&candidate, &owners);
+
+        // This daemon starts no experiment, so the evidence says exactly that in
+        // machine state: a `NOT_EXECUTED` status that no real-effect verifier
+        // can be satisfied by, rather than a substituted self-report, a model
+        // score, or an exit zero.
+        assert_eq!(
+            evidence.execution,
+            ImprovementEvidenceExecution::NotExecuted
+        );
+        assert!(!evidence.independent);
+        assert!(!evidence.verifier_passed);
+
+        // The honest status is bound to THIS candidate and THIS plan, so it
+        // cannot be carried over from another candidate's evaluation.
+        assert_eq!(evidence.verifier_id, owners.evaluator);
+        assert_eq!(evidence.bound_candidate_id, candidate.candidate_id);
+        assert_eq!(
+            evidence.bound_experiment_id,
+            format!(
+                "maintenance-improvement-experiment:{}",
+                candidate.candidate_id
+            )
+        );
+    }
 }
