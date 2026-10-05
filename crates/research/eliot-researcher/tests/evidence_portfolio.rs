@@ -1718,3 +1718,72 @@ fn absence_issuer_nonblank_index_refused() {
         "the refused field must be the index revision itself: {rendered}"
     );
 }
+
+#[test]
+fn absence_closed_denominator_missing_result_is_unproven() {
+    let (_, mut records, _, evaluation) = proven_absence();
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let mut members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    members.push("primary#extra".to_owned());
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        let handle = format!("src-{member}");
+        if member == "primary#extra" {
+            records.insert(handle.clone(), record(&handle));
+        }
+        account
+            .record(member, SourceDisposition::Observed, Some(handle))
+            .expect("record");
+    }
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: ABSENCE_MANIFEST_REVISION,
+    })
+    .expect("authorized manifest");
+    let scope_digest = inquiry_denominator_digest();
+    let preconditions = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(evaluation),
+    )
+    .expect("preconditions over a closed denominator with a missing result");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &preconditions) else {
+        panic!("a closed member with no owner-issued result must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#extra=no_predicate_result"),
+        "the result-less member and its specific unmet join must be retained: {reason}"
+    );
+    assert!(
+        reason.contains("5 closed member(s)"),
+        "all five members must be closed (no open/unclosed arm may fire first): {reason}"
+    );
+}
