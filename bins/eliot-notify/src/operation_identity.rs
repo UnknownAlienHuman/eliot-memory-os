@@ -224,7 +224,8 @@ pub struct IssuedIdentity {
 /// parent references (issue #64 pattern). `identity` is the ORIGINAL
 /// [`RequestIdentity`] retained at first issuance, before the step was sent;
 /// reconstruction replays that exact value and never a recomputed one.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChildLineageEntry {
     /// Stable parent notification request id.
     pub parent_request_id: String,
@@ -1217,6 +1218,61 @@ mod tests {
 
     fn payload(marker: &str) -> Value {
         json!({"step": marker, "nonce": marker})
+    }
+
+    #[test]
+    fn child_lineage_entry_round_trips_complete_original_identity() {
+        let mut issuer = NotifyIdentityIssuer::new();
+        let p = parent("parent-retained-identity-format");
+        let issued = issuer
+            .issue_g08(&p, &payload("retained-identity-format"), NOW)
+            .expect("issued child identity");
+        let retained = issuer.lineage().last().expect("retained lineage entry");
+
+        let encoded = serde_json::to_string(retained).expect("serialize lineage entry");
+        let decoded: ChildLineageEntry =
+            serde_json::from_str(&encoded).expect("deserialize lineage entry");
+
+        assert_eq!(&decoded, retained);
+        assert_eq!(decoded.identity, issued.identity);
+        assert_eq!(decoded.identity.deadline_unix_ms, issued.identity.deadline_unix_ms);
+        assert_eq!(
+            decoded.identity.request.metadata.clock,
+            issued.identity.request.metadata.clock
+        );
+    }
+
+    #[test]
+    fn child_lineage_entry_rejects_incomplete_or_unknown_identity_fields() {
+        let mut issuer = NotifyIdentityIssuer::new();
+        let p = parent("parent-retained-identity-invalid");
+        issuer
+            .issue_g08(&p, &payload("retained-identity-invalid"), NOW)
+            .expect("issued child identity");
+        let retained = issuer.lineage().last().expect("retained lineage entry");
+        let original = serde_json::to_value(retained).expect("serialize lineage entry");
+
+        let mut missing_identity = original.clone();
+        missing_identity
+            .as_object_mut()
+            .expect("lineage object")
+            .remove("identity");
+        assert!(serde_json::from_value::<ChildLineageEntry>(missing_identity).is_err());
+
+        let mut missing_deadline = original.clone();
+        missing_deadline["identity"]
+            .as_object_mut()
+            .expect("identity object")
+            .remove("deadline_unix_ms");
+        assert!(serde_json::from_value::<ChildLineageEntry>(missing_deadline).is_err());
+
+        let mut unknown_lineage_field = original.clone();
+        unknown_lineage_field["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<ChildLineageEntry>(unknown_lineage_field).is_err());
+
+        let mut unknown_identity_field = original;
+        unknown_identity_field["identity"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<ChildLineageEntry>(unknown_identity_field).is_err());
     }
 
     #[test]

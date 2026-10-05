@@ -1730,6 +1730,8 @@ pub mod no_session_persist;
 pub mod notify_declaration;
 pub mod notify_launch;
 pub mod operation_identity;
+#[cfg(test)]
+mod retained_identity_port_tests;
 pub mod quiet_hours;
 pub use eliot_notify_core::NotificationEnvelope;
 #[cfg(test)]
