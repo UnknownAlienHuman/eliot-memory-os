@@ -1194,4 +1194,38 @@ mod tests {
             }
         ));
     }
+
+    /// Owner-identity validation at publication (issue #1679 A10/W1): a claimed
+    /// row is never published under a blank owner-generation reference, because
+    /// the evidence row would name no accountable generation once it became
+    /// visible to readers (I14.3).
+    #[test]
+    fn store_publish_claimed_row_rejects_blank_generation() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let err = reserve
+            .publish_claimed_row(
+                StoreDimension::ConnectionSlots,
+                "",
+                "proof-store-1",
+                "ev-store-1",
+                "inv-store-1",
+            )
+            .expect_err("blank generation must never publish a row");
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_evidence.owner_generation_ref",
+                ..
+            }
+        ));
+    }
 }
