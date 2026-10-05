@@ -60,6 +60,7 @@
 //! belongs to the I6.10 authority owner (STITCH).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -70,6 +71,10 @@ use crate::RouteScope;
 use crate::authority::{AuthorityGrant, AuthorityReceipt, KernelAuthority};
 use crate::error::{KernelError, validate_id};
 
+use eliot_runtime_contracts::{
+    BottleneckCapacityProfile, BottleneckCoverageState, CapacityEnforcement, CapacityLimit,
+    frozen_bottleneck_owner_map,
+};
 pub use eliot_runtime_contracts::{
     CapacityBottleneck, CapacityClass, CapacityPermitBinding, CapacityRequest,
     ControlOperationClass, EmergencyOperationClass, NormalWorkClass, RequestedOperationClass,
@@ -334,6 +339,34 @@ impl ControlPermit {
     }
 }
 
+/// Composition-resolved reference strings the front-door owner binds into its
+/// published capacity row but cannot observe itself.
+///
+/// The owner supplies every quantity in the row from the live reserve: the
+/// frozen bottleneck and unit, the disjoint normal/protected partition limits
+/// and their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+/// mechanism those partitions are held under. The composition supplies the
+/// references that identify the observation: its own owner-generation
+/// reference for the front-door owner, the independent proof-profile
+/// reference, and the current evidence and invalidation references. Both
+/// halves are required: [`ControlReserve::publish_owner_row`] fails closed
+/// through the existing
+/// [`BottleneckCapacityProfile::validate`][eliot_runtime_contracts::BottleneckCapacityProfile::validate]
+/// when any reference is missing or non-canonical, so the composition must
+/// resolve canonical (strictly ascending, duplicate-free) reference sets
+/// rather than have them defaulted or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontDoorOwnerEvidenceContext {
+    /// Owner generation/revision reference for the Kernel front-door owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the dimension.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published row.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published row.
+    pub invalidation_set: Vec<String>,
+}
+
 impl ControlReserve {
     /// Creates a reserve with symmetric migration partitions.
     ///
@@ -531,6 +564,91 @@ impl ControlReserve {
         *sealed = None;
         self.inner.restart_sealed.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// Publishes the owner-produced capacity row for the frozen Kernel
+    /// control-channel dimension (issue #1679 W3).
+    ///
+    /// Every quantity is read from this reserve: the frozen bottleneck and
+    /// unit, the configured disjoint normal/protected partition limits and
+    /// their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+    /// mechanism those partitions are held under. The published limits are the
+    /// configured partition capacities, not the currently available remainder:
+    /// availability moves as permits are acquired and released, while the
+    /// guarantee the profile records is the partition itself. No emergency
+    /// partition is claimed here: the preallocated last-resort slot stays with
+    /// the loss-reporting path (W9), mirroring the ORS owner which likewise
+    /// claims none. The composition-resolved references come from `ctx`
+    /// unchanged.
+    ///
+    /// The row is checked by the existing contract validation before it is
+    /// returned, so a missing owner, generation, physical total, protected
+    /// partition, enforcement, proof, evidence or invalidation reference fails
+    /// here rather than publishing a row the Kernel composition would have to
+    /// lower to `UNKNOWN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidField`] when the frozen owner map binds
+    /// no owner to the front-door dimension or when the configured partition
+    /// capacities cannot form a positive physical total, and
+    /// [`KernelError::RuntimeContract`] when the assembled row fails the
+    /// existing contract validation.
+    pub fn publish_owner_row(
+        &self,
+        ctx: &FrontDoorOwnerEvidenceContext,
+    ) -> Result<BottleneckCapacityProfile, KernelError> {
+        let owner = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == FRONT_DOOR_BOTTLENECK)
+            .map(|bound| bound.owner)
+            .ok_or(KernelError::InvalidField {
+                field: "control_reserve.owner_row",
+                reason: "frozen owner map binds no owner to the front-door dimension",
+            })?;
+        let unit = FRONT_DOOR_BOTTLENECK.unit();
+        let limit = |field: &'static str, amount: usize| {
+            u64::try_from(amount)
+                .ok()
+                .and_then(NonZeroU64::new)
+                .map(|quantity| CapacityLimit { unit, quantity })
+                .ok_or(KernelError::InvalidField {
+                    field,
+                    reason: "partition capacity must be a positive value",
+                })
+        };
+        let normal_limit = limit("control_reserve.normal_limit", self.inner.normal_capacity)?;
+        let protected_limit = limit(
+            "control_reserve.protected_limit",
+            self.inner.protected_capacity,
+        )?;
+        let physical_total = self
+            .inner
+            .normal_capacity
+            .checked_add(self.inner.protected_capacity)
+            .ok_or(KernelError::InvalidField {
+                field: "control_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+        let physical_total_limit = limit("control_reserve.physical_total_limit", physical_total)?;
+        let row = BottleneckCapacityProfile {
+            bottleneck: FRONT_DOOR_BOTTLENECK,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: owner.to_owned(),
+            owner_generation_ref: ctx.owner_generation_ref.clone(),
+            unit,
+            physical_total_limit: Some(physical_total_limit),
+            normal_work_applicable: true,
+            normal_limit: Some(normal_limit),
+            protected_limit: Some(protected_limit),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: ctx.proof_profile_ref.clone(),
+            evidence_refs: ctx.evidence_refs.clone(),
+            invalidation_set: ctx.invalidation_set.clone(),
+        };
+        row.validate()?;
+        Ok(row)
     }
 
     /// Attempts to acquire one normal-workload permit without blocking.
@@ -2190,5 +2308,61 @@ mod tests {
             .expect("normal path stays open while protected spent");
         assert_eq!(front_door.available_normal(), 1);
         Ok(())
+    }
+
+    fn owner_evidence_context() -> FrontDoorOwnerEvidenceContext {
+        FrontDoorOwnerEvidenceContext {
+            owner_generation_ref: "resource-generation:7".to_owned(),
+            proof_profile_ref: "proof-profile:front-door-capacity-proof".to_owned(),
+            evidence_refs: vec!["evidence:front-door-capacity-observation".to_owned()],
+            invalidation_set: vec!["invalidation:epoch-close".to_owned()],
+        }
+    }
+
+    #[test]
+    fn front_door_publish_owner_row_names_frozen_dimension() -> Result<(), KernelError> {
+        // The W3 front-door adapter (issue #1679): the published row carries
+        // the frozen bottleneck, unit and owner with live partition
+        // quantities, so the Kernel profile composition can join it without
+        // restating owner facts.
+        let reserve = ControlReserve::partitioned(8, 4)?;
+        let row = reserve.publish_owner_row(&owner_evidence_context())?;
+        assert_eq!(row.bottleneck, FRONT_DOOR_BOTTLENECK);
+        assert_eq!(row.unit, FRONT_DOOR_BOTTLENECK.unit());
+        assert_eq!(row.owner_ref, "Kernel front-door/control-channel owner");
+        assert_eq!(row.normal_limit.map(|limit| limit.quantity.get()), Some(8));
+        assert_eq!(
+            row.protected_limit.map(|limit| limit.quantity.get()),
+            Some(4)
+        );
+        assert_eq!(
+            row.physical_total_limit.map(|limit| limit.quantity.get()),
+            Some(12)
+        );
+        row.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn front_door_publish_owner_row_rejects_blank_generation() {
+        // A row without the composition-resolved owner generation is not a
+        // claim: validation fails it here instead of publishing a row the
+        // composition would have to lower to UNKNOWN.
+        let reserve = ControlReserve::partitioned(8, 4).expect("reserve builds");
+        let mut ctx = owner_evidence_context();
+        ctx.owner_generation_ref.clear();
+        assert!(reserve.publish_owner_row(&ctx).is_err());
+    }
+
+    #[test]
+    fn front_door_publish_owner_row_rejects_missing_evidence() {
+        // Evidence and invalidation are required halves of the claim: the
+        // owner holds quantities, the composition holds references, and a
+        // row missing either half fails closed at publish time.
+        let reserve = ControlReserve::partitioned(8, 4).expect("reserve builds");
+        let mut ctx = owner_evidence_context();
+        ctx.evidence_refs.clear();
+        ctx.invalidation_set.clear();
+        assert!(reserve.publish_owner_row(&ctx).is_err());
     }
 }
