@@ -2223,9 +2223,9 @@ fn restore_solo_fabric(
 /// A6/A8/A9, production restore caller for the async path).
 ///
 /// Production counterpart of the test-only synchronous `restore_solo_fabric`:
-/// builds the closed production ports through
+/// consumes the caller-prepared ports from
 /// [`DaemonComposition::production_fabric_ports`], then restores through
-/// [`DaemonComposition::agent_fabric_restore_verified_async`] with the
+/// [`DaemonComposition::agent_fabric_restore_verified_from_resolved_async`] with the
 /// projection's own claimed halves as both the resolution input and the
 /// per-operation `claimed` argument. Session halves are re-resolved over the
 /// live authenticated session and the binding is verified through the Kernel
@@ -2243,9 +2243,7 @@ fn restore_solo_fabric(
 ///
 /// The production caller holds no composition guard: the state root,
 /// ports and resolved material are prepared under short locks and the
-/// seam runs on owned inputs (see [`solo_fair_pull_recovery`]); this
-/// function takes `&DaemonComposition` like the construct path and
-/// performs no locking of its own.
+/// seam runs on owned inputs (see [`solo_fair_pull_recovery`]).
 ///
 /// `coordinator_document` is the coordinator snapshot JSON selected out of the
 /// persisted projection FILE bytes by [`load_verified_projection`] after that
@@ -2255,23 +2253,23 @@ fn restore_solo_fabric(
 /// in-memory snapshot is never reserialized to stand in for the durable bytes.
 #[cfg(not(test))]
 async fn restore_solo_fabric_async(
-    composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     projection: &SoloPersistedAttempt,
     coordinator_document: &str,
+    state_root: std::path::PathBuf,
+    ports: FabricPorts,
+    material: VerifiedProviderMaterial,
 ) -> Result<AgentFabric, DaemonError> {
-    let material = projection.claimed.material();
-    let ports = composition.production_fabric_ports()?;
-    let mut fabric = composition
-        .agent_fabric_restore_verified_async(
-            kernel,
-            projection.snapshot.clone(),
-            ports,
-            material,
-            &projection.claimed,
-            coordinator_document,
-        )
-        .await?;
+    let mut fabric = DaemonComposition::agent_fabric_restore_verified_from_resolved_async(
+        kernel,
+        state_root,
+        projection.snapshot.clone(),
+        ports,
+        material,
+        &projection.claimed,
+        coordinator_document,
+    )
+    .await?;
     // Reconcile the unknown: an emitted dispatch with no ingested result
     // cannot relaunch and cannot release; its outcome stays unknown until
     // the worker observation arrives through the ingest leg.
@@ -2498,14 +2496,13 @@ pub async fn solo_fair_pull_recovery(
     // takes owned inputs only (see
     // `DaemonComposition::agent_fabric_restore_verified_from_resolved_async`).
     #[cfg(not(test))]
-    let mut fabric = DaemonComposition::agent_fabric_restore_verified_from_resolved_async(
+    let mut fabric = restore_solo_fabric_async(
         kernel,
+        &projection,
+        &coordinator_document,
         state_root,
-        projection.snapshot.clone(),
         ports,
         material,
-        &projection.claimed,
-        &coordinator_document,
     )
     .await?;
     #[cfg(test)]
@@ -3323,8 +3320,14 @@ mod solo_enqueue_push_tests {
     #[test]
     fn solo_enqueue_push_accepts_valid_intake() {
         let (_, intake, now) = solo_test_pair();
+        let expected = intake.clone();
         let mut state = SoloDriverState::new();
         assert!(push_validated_intake(&mut state, intake, now).is_ok());
+        assert_eq!(state.queue.len(), 1);
+        assert!(intake_revisions_match(
+            state.queue.front().expect("validated intake is queued"),
+            &expected,
+        ));
     }
 
     #[test]
