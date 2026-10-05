@@ -1,1 +1,1 @@
-{"case_id":12,"content_digest":"1234567812345678123456781234567812345678123456781234567812345678","identity":"907/12","outcome":"Passed","schema_version":"harness-core-case-result-v1","suite":"IntegrationHarness.Core","truncated_bytes":0}
+{"case_id":12,"content_digest":"1234567812345678123456781234567812345678123456781234567812345678","identity":"907/12","outcome":"Passed","schema_version":"harness-core-case-result-v1","suite":"IntegrationHarness.Core","truncated_bytes":0,"executing_pid":424207,"start_instant":"2026-01-01T00:00:00+00:00"}
