@@ -1163,6 +1163,32 @@ mod tests {
         ));
     }
 
+    /// The protected-partition complement of the Store constructor floor
+    /// (issue #1679): a reserve with no protected connection partition can
+    /// never admit protected Store work, so building one must fail at build
+    /// (I14.3: partitions are non-borrowable; zero capacity is a build
+    /// error, not a runtime surprise).
+    #[test]
+    fn store_partitioned_zero_protected_connections_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            4,
+            0,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero protected connections must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.protected_connection_slots",
+                ..
+            }
+        ));
+    }
+
     /// The Store constructor floor (issue #1679) applies to the transaction
     /// partition exactly as it does to the connection partition: a reserve
     /// with no normal transaction partition can never admit Store work, so
