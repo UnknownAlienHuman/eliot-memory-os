@@ -3233,3 +3233,36 @@ pub(crate) fn solo_test_pair() -> (
     };
     (request, intake, NOW)
 }
+
+#[cfg(test)]
+mod solo_enqueue_push_tests {
+    use super::*;
+
+    #[test]
+    fn solo_enqueue_push_accepts_valid_intake() {
+        let (_, intake, now) = solo_test_pair();
+        let mut state = SoloDriverState::new();
+        assert!(push_validated_intake(&mut state, intake, now).is_ok());
+    }
+
+    #[test]
+    fn solo_enqueue_push_refuses_invalid_and_full() {
+        let (_, intake, now) = solo_test_pair();
+        let mut expired = intake.clone();
+        expired.deadline_unix_ms = now;
+        let mut state = SoloDriverState::new();
+        match push_validated_intake(&mut state, expired, now) {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected Contract refusal, got {other:?}"),
+        }
+        let (_, intake, now) = solo_test_pair();
+        let mut state = SoloDriverState::new();
+        for _ in 0..SOLO_QUEUE_MAX_LEN {
+            push_validated_intake(&mut state, intake.clone(), now).expect("queue fills");
+        }
+        match push_validated_intake(&mut state, intake, now) {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected backpressure refusal, got {other:?}"),
+        }
+    }
+}
