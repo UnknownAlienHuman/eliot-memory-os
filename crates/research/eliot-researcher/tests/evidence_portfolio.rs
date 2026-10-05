@@ -2024,3 +2024,76 @@ fn absence_replay_conflicts_on_changed_scope_revision() {
         "the conflict must name the canonical body: {err}"
     );
 }
+
+/// A well-formed evaluation under a different predicate identity is a
+/// different claim, not a replay (issue #2893 W10/A2 round-2).
+///
+/// The admitted issuer holds `no-match/absent-valley-alloy`. An issuer
+/// holding the well-formed but unadmitted `unadmitted-arbitrary-predicate`
+/// still issues successfully over the same closed account, vetted records
+/// and authorized manifest — issuance joins the presented evidence against
+/// the issuer's own held commitments, and a different predicate is a
+/// different admitted identity, not malformed text. Across the two records
+/// `check_replay_consistency` is `Ok`: records under different identities
+/// are different claims and nothing is compared.
+#[test]
+fn absence_foreign_predicate_is_a_different_claim() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let foreign_issuer = NoMatchEvaluationIssuer::new(params).expect("foreign issuer");
+    let foreign = foreign_issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("well-formed foreign issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        foreign.canonical_digest().expect("digest"),
+        "the predicate identity must be load-bearing in the record identity"
+    );
+    evaluation
+        .check_replay_consistency(&foreign)
+        .expect("different admitted identities are different claims, never a conflict");
+}
+
+/// Assessing a well-formed foreign-predicate evaluation pins the retained
+/// gap (issue #2893 W10/A2 round-2).
+///
+/// The foreign record above is fully self-consistent: it was issued over
+/// the real closed account, vetted records and authorized manifest, so every
+/// join `AbsencePreconditions::derive` performs recomputes cleanly and the
+/// verdict is `Proven`. That verdict proves only the record's own
+/// consistency — this crate holds no predicate registry or admission ledger
+/// against which the presented `predicate_id` could be bound to the
+/// inquiry's admitted query (stated residual on `NoMatchEvaluation`; owner
+/// route: the live evaluator composition, #1762). A caller that mints a
+/// second well-formed issuer answers a different query and still closes.
+/// This test pins that behavior so the gap stays visible instead of being
+/// covered by a malformed-text shape check.
+#[test]
+fn absence_foreign_predicate_assessment_pins_retained_gap() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let foreign_issuer = NoMatchEvaluationIssuer::new(params).expect("foreign issuer");
+    let foreign = foreign_issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("well-formed foreign issuance still issues");
+    let preconditions = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        Some(foreign),
+    )
+    .expect("preconditions over self-consistent foreign evidence");
+    assert_eq!(
+        assess_absence(&account, &preconditions),
+        AbsenceVerdict::Proven,
+        "retained gap: no in-crate join binds the presented predicate to an \
+         admitted query, so a self-consistent foreign-predicate record \
+         assesses Proven; the admitted-query join belongs to #1762"
+    );
+}
