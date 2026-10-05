@@ -1648,4 +1648,49 @@ mod tests {
 
         drop(second);
     }
+
+    /// A dropped protected permit returns its slot exactly once (issue
+    /// #1679): the `Drop` match routes by capacity class, so a protected
+    /// transaction permit restores the protected partition - never the normal
+    /// one - and a fresh control operation can then re-acquire the returned
+    /// slot (A7 release-at-most-once on the protected path).
+    #[test]
+    fn ors_dropped_protected_permit_returns_slot_exactly_once() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let first = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-prel-1",
+                epoch,
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        // The only release path: drop returns exactly the held amount.
+        drop(first);
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let second = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-prel-2",
+                epoch,
+            )
+            .expect("released slot is reusable");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        drop(second);
+    }
 }
