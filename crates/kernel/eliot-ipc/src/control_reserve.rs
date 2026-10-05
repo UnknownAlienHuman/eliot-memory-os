@@ -1101,4 +1101,42 @@ mod tests {
         assert_eq!(reserve.available_normal_bytes(), 10);
         assert_eq!(reserve.available_protected_bytes(), 6);
     }
+
+    /// A dropped normal permit returns exactly the bytes it consumed
+    /// (issue #1679): `IpcPermit` has no release method, so `Drop` is
+    /// the only release path, and dropping must restore the normal
+    /// partition to exactly its pre-acquire value so the same bytes
+    /// can be acquired exactly once more (I14.3).
+    #[test]
+    fn ipc_dropped_normal_permit_returns_bytes_exactly_once() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        assert_eq!(reserve.available_normal_bytes(), 4);
+
+        let permit = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-rel-1",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("normal pipe bytes");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+
+        drop(permit);
+        assert_eq!(reserve.available_normal_bytes(), 4);
+
+        let _reacquired = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-rel-2",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("dropped bytes return exactly once");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+    }
 }
