@@ -3803,12 +3803,11 @@ impl AbsencePreconditions {
         presented: PresentedEvaluation<'_>,
     ) -> Result<Self, PortfolioError> {
         digest(frozen_scope_digest, "absence.frozen_scope_digest")?;
-        // The manifest is read back on the same footing as the evaluation. Without
-        // this, a caller could present a manifest whose stored `digest` never
-        // matched its own content, set `evaluation.manifest_digest` to that
-        // string, and every manifest join below would be measured against
-        // content nobody froze. `AuthorizedManifest::verify_integrity` exists and
-        // was not being called from the absence path; it is now.
+        // The manifest is read back on the same footing as the evaluation: without
+        // this, a caller could present a manifest whose stored `digest` never matched
+        // its own content, set `evaluation.manifest_digest` to that string, and every
+        // manifest join below would be measured against content nobody froze (it is
+        // now verified here; it was not called from the absence path before).
         if let Some(admitted) = manifest {
             admitted.verify_integrity()?;
         }
@@ -3836,17 +3835,12 @@ impl AbsencePreconditions {
         }
         let binding =
             AbsenceJoinBinding::of(manifest, presented.evaluation.as_ref(), now_ms, account);
-        let results: BTreeMap<&str, &MemberNoMatchResult> = presented
-            .evaluation
-            .as_ref()
-            .map(|evaluation| {
-                evaluation
-                    .results
-                    .iter()
-                    .map(|result| (result.member.as_str(), result))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut results: BTreeMap<&str, &MemberNoMatchResult> = BTreeMap::new();
+        if let Some(evaluation) = presented.evaluation.as_ref() {
+            for result in &evaluation.results {
+                results.insert(result.member.as_str(), result);
+            }
+        }
         let mut unclosed: Vec<(String, &'static str)> = Vec::new();
         let mut closed: Vec<String> = Vec::new();
         let mut incompatible: Vec<(String, &'static str)> = Vec::new();
