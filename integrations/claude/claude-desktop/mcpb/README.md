@@ -1,8 +1,6 @@
 # ELIOT Governor MCPB
 
-This Windows x64 bundle connects Claude Desktop to the existing per-user ELIOT
-Governor over its authenticated local stdio facade. It contains one release
-`eliot-governor.exe`, no database, no provider credentials, and no project data.
+This Windows x64 bundle connects Claude Desktop to the ELIOT Kernel front door through the packaged `server/eliot-agent-bridge.exe` bridge over stdio. It contains one release bridge binary, no database, no provider credentials, and no project data. The bridge constructs no Governor, Store, WAL, or writer objects.
 
 Installation is owned by Claude Desktop's official custom-extension UI. The
 Governor may open this package and observe only ELIOT-owned installation state;
