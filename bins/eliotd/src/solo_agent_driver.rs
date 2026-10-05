@@ -2877,22 +2877,18 @@ pub fn solo_poll_queue(
 /// drive refuses or when the post-drive adopt recheck finds moved revisions,
 /// preserving the exact operation for a later fresh evaluation.
 ///
-/// Prepare/IO/adopt (issue #2567 AUD9/AUD10): the head intake is snapshotted
-/// under a short `try_lock` and that guard is released before any await. The
-/// verified drive then borrows the composition across the seam await because
-/// the sole-path seam
-/// ([`DaemonComposition::agent_fabric_new_verified_async`]) resolves the
-/// session halves and verifies through the Kernel provider-admission
-/// verifier on `&DaemonComposition`; invoking it without that borrow would
-/// fork the closed admission path, so a prepare/adopt split of the seam
-/// itself stays a lib.rs residual (see below). The poll flight stays
-/// single-flighted (see `daemon_runtime`), so ticks never overlap a drive,
-/// and the drive adopt plus the queue adopt below both revalidate the
-/// consumed task/route/admission/fence revisions before adopting. Other
-/// composition users queue on the mutex during the bounded seam await. Until
-/// the owner ports bind, the drive refuses with the typed
-/// missing-prerequisite residual and the head stays queued; a refusal is a
-/// refusal, never a degraded drive.
+/// Prepare/IO/adopt (issue #2567 AUD9/AUD10, W3 round-2): the head intake is
+/// snapshotted under a short `try_lock` and that guard is released before
+/// any await. The verified drive prepares an owned snapshot under one short
+/// lock, runs the owner-IO seam with no composition borrow held (see
+/// [`drive_solo_delegate_verified_async`]), and re-locks briefly to adopt
+/// and revalidate. The poll flight stays single-flighted (see
+/// `daemon_runtime`), so ticks never overlap a drive, and the drive adopt
+/// plus the queue adopt below both revalidate the consumed
+/// task/route/admission/fence revisions before adopting. Until the owner
+/// ports bind, the drive refuses with the typed missing-prerequisite
+/// residual and the head stays queued; a refusal is a refusal, never a
+/// degraded drive.
 pub async fn solo_poll_queue_async(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
