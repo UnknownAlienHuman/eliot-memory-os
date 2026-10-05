@@ -449,6 +449,240 @@ class TestContextMeasurementInventory(unittest.TestCase):
             self.assertEqual(row["status"], "owned")
             self.assertFalse(row["dispatch_blocked"])
 
+    # WORK_UNIT_CASE: 866/17
+    def test_case_17_unknown_owner_rejected_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/r.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 3\n}\n")
+            cases = (("C17", "#999", "scan/r.rs", "stu_for_bytes"),)
+            try:
+                oracle.build_inventory(troot, cases, "case-17")
+            except oracle.InventoryError as exc:
+                self.assertEqual(exc.code, "OWNER_NOT_CLOSED")
+            else:
+                self.fail("unknown owner must fail closed without any network")
+
+    # WORK_UNIT_CASE: 866/18
+    def test_case_18_consumer_source_allocation_exact(self) -> None:
+        inv = _live()
+        ws = [w for w in inv["consumer_worksets"] if str(w["issue"]) == "#783"]
+        self.assertEqual(len(ws), 1)
+        for key in ("source_paths", "test_paths"):
+            paths = [str(p) for p in ws[0][key]]
+            self.assertTrue(paths, key)
+            for p in paths:
+                self.assertNotIn("*", p)
+                self.assertTrue((ROOT / p).is_file(), p)
+
+    # WORK_UNIT_CASE: 866/19
+    def test_case_19_seams_disjoint_never_forbidden_owner(self) -> None:
+        inv = _live()
+        owners = {str(r["owner"]) for r in inv["rows"]}
+        self.assertEqual(owners, {"#704", "#783", "#878", "#880", "unresolved"})
+        refs_878 = {str(r["case_ref"]) for r in inv["rows"] if str(r["owner"]) == "#878"}
+        refs_880 = {str(r["case_ref"]) for r in inv["rows"] if str(r["owner"]) == "#880"}
+        self.assertTrue(refs_878)
+        self.assertTrue(refs_880)
+        self.assertEqual(refs_878 & refs_880, set())
+
+    # WORK_UNIT_CASE: 866/20
+    def test_case_20_expression_mutation_changes_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            rel, sig = "scan/e.rs", "fn estimate_tokens_v"
+            _write(
+                troot,
+                rel,
+                "pub fn estimate_tokens_v(input: &[u8]) -> u64 {\n"
+                "    input.len().div_ceil(4) as u64\n"
+                "}\n",
+            )
+            cases = (("C20", "#704", rel, sig),)
+            first = oracle.build_inventory(troot, cases, "case-20")["rows"][0]
+            _write(
+                troot,
+                rel,
+                "pub fn estimate_tokens_v(input: &[u8]) -> u64 {\n"
+                "    input.len().div_ceil(4).saturating_add(1) as u64\n"
+                "}\n",
+            )
+            second = oracle.build_inventory(troot, cases, "case-20")["rows"][0]
+            self.assertEqual(first["classification"], second["classification"])
+            self.assertNotEqual(first["span_digest"], second["span_digest"])
+            self.assertNotEqual(first["row_digest"], second["row_digest"])
+
+    # WORK_UNIT_CASE: 866/21
+    def test_case_21_deleted_input_invalidates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/g.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 3\n}\n")
+            cases = (("C21", "#704", "scan/g.rs", "stu_for_bytes"),)
+            oracle.build_inventory(troot, cases, "case-21")
+            (troot / "scan/g.rs").unlink()
+            try:
+                oracle.build_inventory(troot, cases, "case-21")
+            except oracle.InventoryError as exc:
+                self.assertEqual(exc.code, "SOURCE_NOT_REGULAR_FILE")
+            else:
+                self.fail("deleted input must fail closed, never empty success")
+
+    # WORK_UNIT_CASE: 866/22
+    def test_case_22_shuffled_traversal_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/a.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 3\n}\n")
+            _write(troot, "scan/b.rs", "pub struct Envelope {\n    pub rendered_utf8_bytes: u64,\n}\n")
+            tiny = (
+                ("C22a", "#704", "scan/a.rs", "stu_for_bytes"),
+                ("C22b", "#704", "scan/b.rs", "rendered_utf8_bytes"),
+            )
+            first = oracle._emit_toml(oracle.build_inventory(troot, tiny, "case-22"))
+            second = oracle._emit_toml(oracle.build_inventory(troot, tuple(reversed(tiny)), "case-22"))
+            self.assertEqual(first, second)
+
+    # WORK_UNIT_CASE: 866/23
+    def test_case_23_repeated_generation_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/a.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 3\n}\n")
+            cases = (("C23", "#704", "scan/a.rs", "stu_for_bytes"),)
+            first = oracle._emit_toml(oracle.build_inventory(troot, cases, "case-23"))
+            second = oracle._emit_toml(oracle.build_inventory(troot, cases, "case-23"))
+            self.assertEqual(first, second)
+
+    # WORK_UNIT_CASE: 866/24
+    def test_case_24_check_missing_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            before = _snapshot(troot)
+            self.assertEqual(oracle.cmd_check(troot), 1)
+            self.assertEqual(_snapshot(troot), before)
+
+    # WORK_UNIT_CASE: 866/25
+    def test_case_25_parse_failure_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/bad.rs", 'let s = "unclosed;\n')
+            try:
+                oracle.build_inventory(troot, (("C25", "#704", "scan/bad.rs", "stu_for_bytes"),), "case-25")
+            except oracle.InventoryError as exc:
+                self.assertEqual(exc.code, "MALFORMED_RUST_SOURCE")
+            else:
+                self.fail("unparsable source must fail closed")
+            try:
+                oracle.build_inventory(troot, (), "case-25-empty")
+            except oracle.InventoryError as exc:
+                self.assertEqual(exc.code, "EMPTY_SCAN")
+            else:
+                self.fail("empty selection must fail closed, never empty success")
+
+    # WORK_UNIT_CASE: 866/26
+    def test_case_26_no_clock_network_command(self) -> None:
+        src_text = SCRIPT.read_text(encoding="utf-8")
+        for pat in (r"os\.popen", r"os\.system", r"__import__\("):
+            self.assertIsNone(re.search(pat, src_text), pat)
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/a.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 3\n}\n")
+            cases = (("C26", "#704", "scan/a.rs", "stu_for_bytes"),)
+            first = oracle.build_inventory(troot, cases, "case-26")["inventory_digest"]
+            second = oracle.build_inventory(troot, cases, "case-26")["inventory_digest"]
+            self.assertEqual(first, second)
+
+    # WORK_UNIT_CASE: 866/27
+    def test_case_27_consumer_test_paths_finite(self) -> None:
+        inv = _live()
+        by_issue = {str(w["issue"]): w for w in inv["consumer_worksets"]}
+        for issue in ("#783", "#878", "#880"):
+            paths = [str(p) for p in by_issue[issue]["test_paths"]]
+            self.assertTrue(paths, issue)
+            for p in paths:
+                self.assertNotIn("*", p)
+                self.assertTrue(p.endswith(".rs"), p)
+                self.assertTrue((ROOT / p).is_file(), p)
+
+    # WORK_UNIT_CASE: 866/28
+    def test_case_28_shared_paths_need_owner_or_readonly(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(
+                troot,
+                "scan/x.rs",
+                "pub fn stu_for_bytes(len: u64) -> u64 {\n"
+                "    len / 3\n"
+                "}\n"
+                "pub fn probe_user(envelope: &[u8]) -> u64 {\n"
+                "    stu_for_bytes(envelope.byte_len)\n"
+                "}\n",
+            )
+            clash = (
+                ("704/1", "#704", "scan/x.rs", "stu_for_bytes@@0"),
+                ("783/10", "#783", "scan/x.rs", "stu_for_bytes(envelope.byte_len)"),
+            )
+            try:
+                oracle.build_inventory(troot, clash, "case-28-clash")
+            except oracle.InventoryError as exc:
+                self.assertEqual(exc.code, "SOURCE_PATH_COLLISION")
+            else:
+                self.fail("shared writable source path must fail closed")
+            _write(
+                troot,
+                "scan/y.rs",
+                "pub fn measure_serialized_context(payload: &[u8]) -> u64 {\n"
+                "    measure_exact_utf8(payload)\n"
+                "}\n",
+            )
+            shared = (
+                ("704/2", "#783", "scan/y.rs", "measure_serialized_context"),
+                ("704/3", "#880", "scan/y.rs", "measure_exact_utf8"),
+            )
+            inv = oracle.build_inventory(troot, shared, "case-28-shared")
+            self.assertEqual(len(inv["rows"]), 2)
+            by_issue = {str(w["issue"]): w for w in inv["consumer_worksets"]}
+            self.assertIn("scan/y.rs", [str(p) for p in by_issue["#783"]["read_only_paths"]])
+            self.assertIn("scan/y.rs", [str(p) for p in by_issue["#880"]["read_only_paths"]])
+
+    # WORK_UNIT_CASE: 866/29
+    def test_case_29_workset_slice_not_universe(self) -> None:
+        inv = _live()
+        self.assertTrue(inv["consumer_worksets"])
+        nonzero = 0
+        for ws in inv["consumer_worksets"]:
+            share = float(ws["workset_stu_share_of_scan_root"])
+            self.assertLess(share, 1.0)
+            if share > 0.0:
+                nonzero += 1
+            self.assertIn(
+                ws["band_disposition"],
+                ("WITHIN_UPPER_REVIEW_BAND", "EXCEEDS_UPPER_REVIEW_BAND_BLOCKING_SPLIT"),
+            )
+        self.assertGreater(nonzero, 0)
+
+    # WORK_UNIT_CASE: 866/30
+    def test_case_30_artifact_commit_no_self_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            _write(troot, "scan/a.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 3\n}\n")
+            cases = (("C30", "#704", "scan/a.rs", "stu_for_bytes"),)
+            first = oracle.build_inventory(troot, cases, "case-30")["header"]["source_sha"]
+            _write(troot, "generated.toml", "committed artifact bytes must not stale inputs\n")
+            second = oracle.build_inventory(troot, cases, "case-30")["header"]["source_sha"]
+            self.assertEqual(first, second)
+            _write(troot, "scan/a.rs", "pub fn stu_for_bytes(len: u64) -> u64 {\n    len / 4\n}\n")
+            third = oracle.build_inventory(troot, cases, "case-30")["header"]["source_sha"]
+            self.assertNotEqual(first, third)
+
+    # WORK_UNIT_CASE: 866/31
+    def test_case_31_baseline_rows_preserved(self) -> None:
+        inv = _live()
+        base_refs = {c[0] for c in oracle.BASELINE_CASES}
+        self.assertEqual(len(base_refs), 31)
+        row_refs = {str(r["case_ref"]) for r in inv["rows"]}
+        self.assertTrue(base_refs <= row_refs)
+        for row in inv["rows"]:
+            self.assertTrue(row["successor_scope"])
+            self.assertTrue(row["invalidation"])
+
 
 if __name__ == "__main__":
     unittest.main()
