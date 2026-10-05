@@ -4,8 +4,9 @@
 //! packager generates manifests from. Tools come from the same
 //! `tools/list` source the bridge serves (`eliot_mcp::tools_list_result`),
 //! never from a transcription of the retiring facade; prompts come
-//! from `crate::packager_prompts`, so the rendered prompt text is
-//! byte-identical to the facade catalog it replaces.
+//! from `crate::packager_prompts`, so the rendered prompt text is the
+//! bridge-aligned text naming only served canonical tools (it intentionally
+//! diverges from the facade copy where the facade names facade-only tools).
 
 use std::fmt;
 
