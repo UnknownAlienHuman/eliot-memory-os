@@ -1167,31 +1167,136 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
     let _ = std::fs::remove_dir_all(&case_root);
 }
 
-// WORK_UNIT_CASE: 958/18
-#[test]
-fn preparation_guard_excludes_registry_restore_and_cutover() {
-    fn listing(root: &Path) -> Vec<String> {
-        let mut entries = Vec::new();
-        for entry in walkdir_like(root) {
-            entries.push(entry);
-        }
-        entries.sort();
-        entries
-    }
-    fn walkdir_like(root: &Path) -> Vec<String> {
-        let mut out = Vec::new();
+/// Sorted recursive listing of every path under one root (958/18 guard).
+fn list_tree(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, out: &mut Vec<String>) {
         let Ok(read) = std::fs::read_dir(root) else {
-            return out;
+            return;
         };
         for entry in read.flatten() {
             let path = entry.path();
             out.push(path.to_string_lossy().into_owned());
             if path.is_dir() {
-                out.extend(walkdir_like(&path));
+                walk(&path, out);
             }
         }
-        out
     }
+    let mut entries = Vec::new();
+    walk(root, &mut entries);
+    entries.sort();
+    entries
+}
+
+/// One write-decoy per excluded production path (958/18). Each path that
+/// preparation must not take would have to WRITE to act, so each gets a
+/// file it would disturb: a foreign registry file (a second-registry
+/// record would extend it), a same-installation store tree (a Store
+/// recovery rewrite would restamp it), an archive tree (an archive restore
+/// would materialize into it), and a cutover-eligible marker (a cutover
+/// would flip it into an activation record).
+struct GuardDecoys {
+    source_sentinel: PathBuf,
+    foreign_registry: PathBuf,
+    store_sentinel: PathBuf,
+    archive_sentinel: PathBuf,
+    cutover_marker: PathBuf,
+}
+
+fn plant_guard_decoys(case_root: &Path, source_root: &Path) -> GuardDecoys {
+    let source_sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&source_sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let foreign_registry = case_root.join("foreign-registry.redb");
+    std::fs::write(&foreign_registry, b"foreign-registry-bytes-958").expect("registry decoy");
+    let store_sentinel = case_root.join("store").join("recovery-sentinel.txt");
+    std::fs::create_dir_all(store_sentinel.parent().expect("store parent"))
+        .expect("store decoy tree");
+    std::fs::write(&store_sentinel, b"store-recovery-bytes-958").expect("store decoy");
+    let archive_sentinel = case_root.join("archive").join("archive-sentinel.txt");
+    std::fs::create_dir_all(archive_sentinel.parent().expect("archive parent"))
+        .expect("archive decoy tree");
+    std::fs::write(&archive_sentinel, b"archive-restore-bytes-958").expect("archive decoy");
+    let cutover_marker = case_root.join("cutover-eligible.txt");
+    std::fs::write(&cutover_marker, b"cutover-eligible-958").expect("cutover decoy");
+    GuardDecoys {
+        source_sentinel,
+        foreign_registry,
+        store_sentinel,
+        archive_sentinel,
+        cutover_marker,
+    }
+}
+
+/// The whole-tree diff guard (958/18): exactly one added path, under the
+/// staging parent, and no decoy removed.
+fn assert_only_destination_added(
+    tree_before: &[String],
+    parent: &Path,
+    decoys: &GuardDecoys,
+    prepared: &[String],
+) {
+    let added: Vec<&String> = prepared
+        .iter()
+        .filter(|entry| !tree_before.contains(entry))
+        .collect();
+    assert_eq!(
+        added.len(),
+        1,
+        "preparation adds exactly one path: {prepared:?}"
+    );
+    assert!(
+        added[0].starts_with(&parent.to_string_lossy().into_owned()),
+        "the one added path is the destination under the staging parent: {}",
+        added[0]
+    );
+    for untouched in [
+        &decoys.source_sentinel,
+        &decoys.foreign_registry,
+        &decoys.store_sentinel,
+        &decoys.archive_sentinel,
+        &decoys.cutover_marker,
+    ] {
+        assert!(
+            prepared
+                .iter()
+                .any(|entry| entry == &untouched.to_string_lossy().into_owned()),
+            "excluded path decoy was not removed: {}",
+            untouched.to_string_lossy()
+        );
+    }
+}
+
+/// Byte-equality over every decoy (958/18): nothing was modified.
+fn assert_decoys_untouched(decoys: &GuardDecoys) {
+    assert_eq!(
+        sentinel_bytes(&decoys.source_sentinel),
+        b"source-installation-bytes-958",
+        "source tree identical"
+    );
+    assert_eq!(
+        std::fs::read(&decoys.foreign_registry).expect("registry decoy readable"),
+        b"foreign-registry-bytes-958",
+        "no second-registry record touched the foreign registry"
+    );
+    assert_eq!(
+        sentinel_bytes(&decoys.store_sentinel),
+        b"store-recovery-bytes-958",
+        "no Store recovery rewrite touched the same-installation store"
+    );
+    assert_eq!(
+        sentinel_bytes(&decoys.archive_sentinel),
+        b"archive-restore-bytes-958",
+        "no archive restore materialized into the archive tree"
+    );
+    assert_eq!(
+        sentinel_bytes(&decoys.cutover_marker),
+        b"cutover-eligible-958",
+        "no cutover flipped the eligibility marker"
+    );
+}
+
+// WORK_UNIT_CASE: 958/18
+#[test]
+fn preparation_guard_excludes_registry_restore_and_cutover() {
     if !cfg!(windows) {
         // The closed class set and the fail-closed caller gate hold on every
         // platform, even where effects cannot run.
@@ -1219,95 +1324,20 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
     let case_root = isolated_root("18", "case");
     let source_root = case_root.join("source");
     std::fs::create_dir_all(&source_root).expect("case source root");
-    let sentinel = source_root.join("source-sentinel.txt");
-    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
-    // Recursive listing before and after: preparation adds exactly one
-    // destination directory under the staging parent, nothing anywhere else.
-    //
-    // Each excluded production path would have to WRITE to act, so each gets
-    // a decoy it would disturb: a foreign registry file (a second-registry
-    // record would extend it), a same-installation store tree (a Store
-    // recovery rewrite would restamp it), an archive tree (an archive
-    // restore would materialize into it), and a cutover-eligible marker (a
-    // cutover would flip it into an activation record). The whole-tree diff
-    // below is the guard: exactly one added directory, zero modified files.
     let parent = case_root.join("staging");
     std::fs::create_dir_all(&parent).expect("case staging parent");
-    let foreign_registry = case_root.join("foreign-registry.redb");
-    std::fs::write(&foreign_registry, b"foreign-registry-bytes-958").expect("registry decoy");
-    let store_tree = case_root.join("store");
-    std::fs::create_dir_all(&store_tree).expect("store decoy tree");
-    let store_sentinel = store_tree.join("recovery-sentinel.txt");
-    std::fs::write(&store_sentinel, b"store-recovery-bytes-958").expect("store decoy");
-    let archive_tree = case_root.join("archive");
-    std::fs::create_dir_all(&archive_tree).expect("archive decoy tree");
-    let archive_sentinel = archive_tree.join("archive-sentinel.txt");
-    std::fs::write(&archive_sentinel, b"archive-restore-bytes-958").expect("archive decoy");
-    let cutover_marker = case_root.join("cutover-eligible.txt");
-    std::fs::write(&cutover_marker, b"cutover-eligible-958").expect("cutover decoy");
+    let decoys = plant_guard_decoys(&case_root, &source_root);
     let _protected = override_protected_root(&case_root);
-    let tree_before = listing(&case_root);
+    let tree_before = list_tree(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
         &admission("op-958-guard", &source_root, &parent),
     )
     .expect("admitted");
-    let tree_after = listing(&case_root);
-    let added: Vec<&String> = tree_after
-        .iter()
-        .filter(|entry| !tree_before.contains(entry))
-        .collect();
-    assert_eq!(
-        added.len(),
-        1,
-        "preparation adds exactly one path: {tree_after:?}"
-    );
-    assert!(
-        added[0].starts_with(&parent.to_string_lossy().into_owned()),
-        "the one added path is the destination under the staging parent: {}",
-        added[0]
-    );
-    for untouched in [
-        &sentinel,
-        &foreign_registry,
-        &store_sentinel,
-        &archive_sentinel,
-        &cutover_marker,
-    ] {
-        assert!(
-            tree_after
-                .iter()
-                .any(|entry| entry == &untouched.to_string_lossy().into_owned()),
-            "excluded path decoy was not removed: {}",
-            untouched.to_string_lossy()
-        );
-    }
-    assert_eq!(
-        sentinel_bytes(&sentinel),
-        b"source-installation-bytes-958",
-        "source tree identical"
-    );
-    assert_eq!(
-        std::fs::read(&foreign_registry).expect("registry decoy readable"),
-        b"foreign-registry-bytes-958",
-        "no second-registry record touched the foreign registry"
-    );
-    assert_eq!(
-        sentinel_bytes(&store_sentinel),
-        b"store-recovery-bytes-958",
-        "no Store recovery rewrite touched the same-installation store"
-    );
-    assert_eq!(
-        sentinel_bytes(&archive_sentinel),
-        b"archive-restore-bytes-958",
-        "no archive restore materialized into the archive tree"
-    );
-    assert_eq!(
-        sentinel_bytes(&cutover_marker),
-        b"cutover-eligible-958",
-        "no cutover flipped the eligibility marker"
-    );
+    let tree_after = list_tree(&case_root);
+    assert_only_destination_added(&tree_before, &parent, &decoys, &tree_after);
+    assert_decoys_untouched(&decoys);
     // The delegation sink binds a journal without a second registry, store
     // recovery, archive import, or cutover stage: an empty sink reconciles
     // Absent and the caller gate stays fail-closed pending #954.

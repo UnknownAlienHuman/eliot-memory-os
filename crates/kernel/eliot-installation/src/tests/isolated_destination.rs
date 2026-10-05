@@ -1243,7 +1243,7 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
 /// owner binding, which demands a retained installation Host root). This
 /// case builds the whole contour instead: the fixture's own approved-row
 /// builder (whose roots stay its own consistent set), a current-user Host
-/// lease AT that manifest's own `host_state_root` (the PortableDev
+/// lease AT that manifest's own `host_state_root` (the `PortableDev`
 /// registry contour only demands the root be the explicit Host state
 /// child), a registry opened on that lease, a Host-owner capability
 /// acquired for the seeded installation, a real on-disk materialisation,
