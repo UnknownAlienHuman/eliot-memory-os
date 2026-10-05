@@ -416,4 +416,46 @@ mod tests {
         assert_eq!(status.lowered_guarantees.len(), 15);
         Ok(())
     }
+
+    #[test]
+    fn compile_duplicate_owner_evidence_fails_closed() -> KernelResult<()> {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch");
+        let identity = ControlReserveProfileIdentity {
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            product_identity_ref: "product-1".to_owned(),
+            source_build_and_runtime_generation_refs: vec!["gen-1".to_owned()],
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch.clone(),
+            compiled_at_ms: 1_000,
+            profile_evidence_refs: Vec::new(),
+            invalidation_set: Vec::new(),
+        };
+
+        // Two records for one dimension: only the bottleneck matters for the
+        // duplicate check, and `unclaimed_row` binds the frozen bottleneck and
+        // unit with no invented capacity (issue #1679 A1).
+        let map = frozen_bottleneck_owner_map();
+        let row = unclaimed_row(&map[0]);
+        let evidence = BottleneckOwnerEvidence {
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch,
+            row,
+        };
+
+        let Err(err) = compile_control_reserve_profile(identity, &[evidence.clone(), evidence])
+        else {
+            panic!("two records for one dimension must contradict");
+        };
+        assert!(matches!(
+            err,
+            KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
+                if bottleneck == map[0].bottleneck.as_contract_str()
+        ));
+        Ok(())
+    }
 }
