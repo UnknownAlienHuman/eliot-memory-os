@@ -653,40 +653,72 @@ fn alias_substitution_refused_and_identity_pinned() {
 }
 
 // WORK_UNIT_CASE: 958/9
+//
+// The previous revision of this case hashed literal caller nonces and
+// compared decoys, which proved the hash helper but not the identity: the
+// production derivation takes owner-issued evidence, never a caller nonce
+// (see `owner_identity_evidence`: the nonce is excluded on purpose). This
+// case drives the real evidence builder and the real derivations.
 #[test]
 fn fresh_identities_never_archive_or_caller_copies() {
-    let archive_id = "archive-opaque-id-123";
-    let caller_decoy = "caller-chosen-9";
-    let first = derive_destination_id("op-958-fresh", "nonce-958-fresh");
-    assert_ne!(first, archive_id);
-    assert_ne!(first, caller_decoy);
+    let case_root = isolated_root("fresh", "case");
+    let (source_root, _sentinel) = source_tree("fresh");
+    let parent = case_root.join("staging-parent");
+    std::fs::create_dir_all(&parent).expect("staging parent");
+    let admission = admission("op-958-fresh", &source_root, &parent);
+    // Owner-issued evidence: authority generation, owner-projected config
+    // digest, owner-resolved parent. Sixty-four hex, stable across reads.
+    let evidence = owner_identity_evidence(&admission, &parent);
+    assert_eq!(evidence.len(), 64);
+    assert_eq!(evidence, owner_identity_evidence(&admission, &parent));
+    // Caller-controlled fields cannot move the evidence: rotating the
+    // authority nonce leaves it byte-equal, so no caller-selected value
+    // can select the destination identity, and neither can the operation
+    // name itself (freshness across operations comes from the derivation,
+    // not from caller-steered evidence).
+    let mut rotated = admission.clone();
+    rotated.authority_nonce = "nonce-958-rotated-by-caller".to_owned();
+    assert_eq!(evidence, owner_identity_evidence(&rotated, &parent));
+    // Owner-issued facts DO move it: a new authority generation, a new
+    // projected config, or another resolved parent each rebind the identity.
+    let mut moved_generation = admission.clone();
+    moved_generation.authority_generation = admission.authority_generation + 1;
+    assert_ne!(
+        evidence,
+        owner_identity_evidence(&moved_generation, &parent)
+    );
+    let mut moved_config = admission.clone();
+    moved_config.config_projection_digest = HEX_C.to_owned();
+    assert_ne!(evidence, owner_identity_evidence(&moved_config, &parent));
+    let other_parent = case_root.join("other-parent");
+    std::fs::create_dir_all(&other_parent).expect("other parent");
+    assert_ne!(evidence, owner_identity_evidence(&admission, &other_parent));
+    // The destination identity is bound to that evidence: fresh per
+    // operation, stable across repeats, and neither the source (archive
+    // side) identity nor any caller-chosen value.
+    let first = derive_destination_id("op-958-fresh", &evidence);
     assert_eq!(first.len(), 64);
-    // Stable across repeats (idempotent), distinct across operations and
-    // across nonces for the same operation.
-    assert_eq!(
-        first,
-        derive_destination_id("op-958-fresh", "nonce-958-fresh")
-    );
-    assert_ne!(
-        first,
-        derive_destination_id("op-958-other", "nonce-958-fresh")
-    );
-    assert_ne!(
-        first,
-        derive_destination_id("op-958-fresh", "nonce-958-rotated")
-    );
-    let epoch = derive_destination_epoch("op-958-fresh", "nonce-958-fresh");
+    assert_ne!(first, admission.source_installation_id);
+    assert_ne!(first, admission.authority_nonce);
+    assert_eq!(first, derive_destination_id("op-958-fresh", &evidence));
+    assert_ne!(first, derive_destination_id("op-958-other", &evidence));
+    // Preparation-scope epochs discriminate fenced preparations under
+    // identical evidence; they are never the Authority Epoch: the derived
+    // value is not the owner-issued authority generation it was derived
+    // beside, and no Authority Epoch is allocated here (I5.13, A13.7: the
+    // cutover child's owner obligation).
+    let epoch = derive_destination_epoch("op-958-fresh", &evidence);
     assert!(epoch >= 1);
-    assert_eq!(
-        epoch,
-        derive_destination_epoch("op-958-fresh", "nonce-958-fresh")
-    );
-    // Preparation-scope epochs are not caller-chosen increments: the derived
-    // value ignores any archive/caller epoch presented alongside.
+    assert_eq!(epoch, derive_destination_epoch("op-958-fresh", &evidence));
+    assert_ne!(epoch, admission.authority_generation);
     assert_ne!(
-        derive_destination_epoch("op-958-fresh", "nonce-958-fresh"),
-        0
+        epoch,
+        derive_destination_epoch(
+            "op-958-fresh",
+            &owner_identity_evidence(&moved_generation, &parent)
+        )
     );
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/10
@@ -1190,23 +1222,92 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
     let sentinel = source_root.join("source-sentinel.txt");
     std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     // Recursive listing before and after: preparation adds exactly one
-    // destination directory under the staging parent, nothing in source.
+    // destination directory under the staging parent, nothing anywhere else.
+    //
+    // Each excluded production path would have to WRITE to act, so each gets
+    // a decoy it would disturb: a foreign registry file (a second-registry
+    // record would extend it), a same-installation store tree (a Store
+    // recovery rewrite would restamp it), an archive tree (an archive
+    // restore would materialize into it), and a cutover-eligible marker (a
+    // cutover would flip it into an activation record). The whole-tree diff
+    // below is the guard: exactly one added directory, zero modified files.
     let parent = case_root.join("staging");
     std::fs::create_dir_all(&parent).expect("case staging parent");
+    let foreign_registry = case_root.join("foreign-registry.redb");
+    std::fs::write(&foreign_registry, b"foreign-registry-bytes-958").expect("registry decoy");
+    let store_tree = case_root.join("store");
+    std::fs::create_dir_all(&store_tree).expect("store decoy tree");
+    let store_sentinel = store_tree.join("recovery-sentinel.txt");
+    std::fs::write(&store_sentinel, b"store-recovery-bytes-958").expect("store decoy");
+    let archive_tree = case_root.join("archive");
+    std::fs::create_dir_all(&archive_tree).expect("archive decoy tree");
+    let archive_sentinel = archive_tree.join("archive-sentinel.txt");
+    std::fs::write(&archive_sentinel, b"archive-restore-bytes-958").expect("archive decoy");
+    let cutover_marker = case_root.join("cutover-eligible.txt");
+    std::fs::write(&cutover_marker, b"cutover-eligible-958").expect("cutover decoy");
     let _protected = override_protected_root(&case_root);
-    let source_before = listing(&source_root);
+    let tree_before = listing(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
         &admission("op-958-guard", &source_root, &parent),
     )
     .expect("admitted");
+    let tree_after = listing(&case_root);
+    let added: Vec<&String> = tree_after
+        .iter()
+        .filter(|entry| !tree_before.contains(entry))
+        .collect();
     assert_eq!(
-        listing(&source_root),
-        source_before,
+        added.len(),
+        1,
+        "preparation adds exactly one path: {tree_after:?}"
+    );
+    assert!(
+        added[0].starts_with(&parent.to_string_lossy().into_owned()),
+        "the one added path is the destination under the staging parent: {}",
+        added[0]
+    );
+    for untouched in [
+        &sentinel,
+        &foreign_registry,
+        &store_sentinel,
+        &archive_sentinel,
+        &cutover_marker,
+    ] {
+        assert!(
+            tree_after
+                .iter()
+                .any(|entry| entry == &untouched.to_string_lossy().into_owned()),
+            "excluded path decoy was not removed: {}",
+            untouched.to_string_lossy()
+        );
+    }
+    assert_eq!(
+        sentinel_bytes(&sentinel),
+        b"source-installation-bytes-958",
         "source tree identical"
     );
-    assert_eq!(listing(&parent).len(), 1, "exactly one destination created");
+    assert_eq!(
+        std::fs::read(&foreign_registry).expect("registry decoy readable"),
+        b"foreign-registry-bytes-958",
+        "no second-registry record touched the foreign registry"
+    );
+    assert_eq!(
+        sentinel_bytes(&store_sentinel),
+        b"store-recovery-bytes-958",
+        "no Store recovery rewrite touched the same-installation store"
+    );
+    assert_eq!(
+        sentinel_bytes(&archive_sentinel),
+        b"archive-restore-bytes-958",
+        "no archive restore materialized into the archive tree"
+    );
+    assert_eq!(
+        sentinel_bytes(&cutover_marker),
+        b"cutover-eligible-958",
+        "no cutover flipped the eligibility marker"
+    );
     // The delegation sink binds a journal without a second registry, store
     // recovery, archive import, or cutover stage: an empty sink reconciles
     // Absent and the caller gate stays fail-closed pending #954.
