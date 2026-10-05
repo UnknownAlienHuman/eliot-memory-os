@@ -149,3 +149,11 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+# Issue #2567 (W2): tests bind the solo delegate body against the canonical
+# admitted carrier (`crates/surfaces/eliot-mcp/src/contract.rs::DelegateRequest`
+# under `CoordinateInput::Delegate`, I07-06:37) instead of hand-mirrored JSON
+# (I01-08:50: schemas come from the same contract types). Test-only: production
+# code takes primitives and gains no surfaces edge.
+[dev-dependencies]
+eliot-mcp.workspace = true
