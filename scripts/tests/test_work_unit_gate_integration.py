@@ -1329,6 +1329,55 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         combined = out + err
         self.assertIn('full-project ceiling unavailable', combined)
 
+    # WORK_UNIT_CASE: 837/45
+    def test_recursive_gate_selection_rejected_snapshot_roots_allowed(self):
+        # CCV7 no-recursion rule with real teeth, over two real temp roots: a
+        # descriptor whose TEST roots name this gate would execute the gate as
+        # its own prerequisite, so the selection is rejected (exit 1) before
+        # any runner instead of failing confusingly downstream. Source roots
+        # are snapshot-only inputs that are never executed, so the same path in
+        # source_roots stays allowed and the real tiny suite still proves
+        # selected end to end.
+        gate_rel = 'scripts/verify-work-unit.py'
+        descriptor_rel = '.github/work-units/837.toml'
+        test_roots_line = 'test_roots = [{value = "suite/test_marked.py"}]'
+        source_roots_line = 'source_roots = [{value = "suite/src.py"}]'
+        # Leg 1 (reject): the gate named as a test root.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            (tmp / 'scripts').mkdir(parents=True)
+            (tmp / gate_rel).write_bytes((ROOT / gate_rel).read_bytes())
+            descriptor = tmp / descriptor_rel
+            original = descriptor.read_text(encoding='utf-8')
+            rewritten = original.replace(
+                test_roots_line,
+                'test_roots = [{value = "scripts/verify-work-unit.py"}]')
+            self.assertNotEqual(original, rewritten)
+            descriptor.write_text(rewritten, encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        self.assertIn('recursive gate selection: issue-837', out + err)
+        # Leg 2 (snapshot-only allowed): the gate named as a source root only.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            (tmp / 'scripts').mkdir(parents=True)
+            (tmp / gate_rel).write_bytes((ROOT / gate_rel).read_bytes())
+            descriptor = tmp / descriptor_rel
+            original = descriptor.read_text(encoding='utf-8')
+            rewritten = original.replace(
+                source_roots_line,
+                'source_roots = [{value = "suite/src.py"}, '
+                '{value = "scripts/verify-work-unit.py"}]')
+            self.assertNotEqual(original, rewritten)
+            self.assertIn(test_roots_line, rewritten)
+            descriptor.write_text(rewritten, encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(0, code)
+
 
 
 if __name__ == '__main__':

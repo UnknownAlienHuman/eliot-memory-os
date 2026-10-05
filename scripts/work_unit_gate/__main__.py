@@ -1476,14 +1476,15 @@ def main(argv: list[str] | None = None) -> int:
         # Bootstrap guard: never recursively execute own completion gate.
         # This layer only invokes #850 fixed runners via frozen builders with
         # descriptor-owned inputs; it never spawns verify-work-unit.py nor
-        # work_unit_gate.__main__ as a child. Selection of issue 837 itself
-        # still uses fixed fixtures/tiny repos, not a nested gate attempt.
+        # work_unit_gate.__main__ as a child. A descriptor whose TEST roots name
+        # this gate would execute the gate as its own prerequisite, so such a
+        # selection is rejected here instead of failing confusingly downstream;
+        # source roots are snapshot-only inputs that are never executed, so they
+        # stay allowed.
         for d in plan.descriptors:
-            for test_root in tuple(d.test_roots) + tuple(d.source_roots):
-                val = test_root.value
-                if val in ("scripts/verify-work-unit.py", "scripts/work_unit_gate/__main__.py"):
-                    # Not a failure by itself; runner inputs remain fixed builders.
-                    pass
+            for test_root in tuple(d.test_roots):
+                if test_root.value in ("scripts/verify-work-unit.py", "scripts/work_unit_gate/__main__.py"):
+                    return finish(fail_result(f"recursive gate selection: issue-{d.issue.number}", 1, failed=[f"issue-{d.issue.number}"]))
 
         # Attempt-path existence + leaf-router freeze (pure, no mutation).
         for d in plan.descriptors:
