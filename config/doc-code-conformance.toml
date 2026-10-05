@@ -332,6 +332,9 @@ ignore_globs = [
   "scripts/verify-doc-code-conformance.py",
   "scripts/doc_code_conformance_core.py",
   "scripts/work_unit_gate/doc_read_evidence.py",
+  "scripts/tests/test_package_reader_closure.py",
+  "scripts/tests/test_wasm_component_lane.py",
+  "scripts/verify-github-workflows.py",
   "config/doc-code-conformance.toml",
   ".github/workflows/repository-policy.yml",
 ]
@@ -366,6 +369,46 @@ reason = "The unit-test fixture preserves an incoming legacy identity and is not
 source = "scripts/verify-legacy-config-retirement.py"
 path = "docs/notes.md"
 reason = "The self-test fixture uses docs/notes.md as a temporary test path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "Name-only workspace document discovery candidate table entry."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "Name-only workspace document discovery candidate table entry."
 
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"

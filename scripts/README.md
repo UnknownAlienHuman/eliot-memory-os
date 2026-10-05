@@ -52,6 +52,9 @@ committed as repository authority.
 | `wasm_component_lane.py` | Affected-component WASM build/test lane selector and evidence helper (#764) | Build/test lane selection only |
 | `verify-legacy-config-retirement.py` | Verify legacy config filenames, modes, roots, and module manifests stay retired (#1219) | Static source and packaging evidence only |
 | `context_measurement_inventory.py` | Deterministic source-bound inventory of serialized-context measurement cases with closed classification and frozen denominator (#866) | Static source classification only |
+| `audit-context-measurement-ownership.py` | Read-only Context-measurement ownership oracle and reconciliation (#787) | Context-measurement ownership oracle evidence only |
+| `gen_capability_cell_registry.py` | Generate daemon projection and native-worker capability-cell registry contract | Generated capability-cell registry contract only |
+| `prepare-dependency-policy-inputs.py` | Declared reproducible scanner/input preparation for dependency policy (#1229) | Dependency policy input preparation evidence only |
 | `audit_cue_kind_retirement.py` | Cross-package `CueKind` retirement oracle library over the static source/wire/caller denominator (#835); exercised by `scripts/tests/test_cue_kind_retirement.py` | Static source denominator evidence only |
 | `verify-excluded-dispositions-1811.py` | Fail-closed excluded/standalone disposition gate over standalone packages and root exclude entries with consumption evidence checks (#1811) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
