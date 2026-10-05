@@ -2106,6 +2106,7 @@ def main(argv: list[str] | None = None) -> int:
                                       ceiling="selected-verification-only",
                                       scope=("full-project" if proof == "full-project" else "selected")))
         sel_sorted = sorted(d.issue.number for d in plan.descriptors)
+        if proof == "full-project": return finish(fail_result("full-project ceiling unavailable: refusing success under a selected-only ceiling", 1, failed=[f"issue-{n}" for n in sel_sorted], ceiling="selected-verification-only", scope="full-project"))
         counts_ok = {"matrix_cases": int(cohort_receipt.expected_matrix_cases), "missing": 0,
                      "blocked": 0, "failed": 0, "passed": len(evidence_rows)}
         identities_ok = [f"issue-{n}" for n in sel_sorted] + [f"cohort:{aggregate[:12]}"]

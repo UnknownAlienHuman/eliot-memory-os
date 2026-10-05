@@ -1313,6 +1313,22 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         self.assertNotIn('workspace incomplete', combined)
         self.assertIn('missing test binary: issue-837', combined)
 
+    # WORK_UNIT_CASE: 837/44
+    def test_full_project_selected_ceiling_refused(self):
+        # CCV7: no contract-approved full-project ceiling exists, so a
+        # successful full-project result must fail closed (exit 1) instead of
+        # being reported under the selected-verification-only ceiling. The
+        # selector flag is omitted: full-project selects the entire profile and
+        # an explicit selector is rejected before execution.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'full-project', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        combined = out + err
+        self.assertIn('full-project ceiling unavailable', combined)
+
 
 
 if __name__ == '__main__':
