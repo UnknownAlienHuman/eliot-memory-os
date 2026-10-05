@@ -162,17 +162,11 @@ fn dispatch_manifest(
     // (the installer-owned state contour the per-installation runtime tree
     // sits strictly below), while binaries and user config/cache keep the
     // proven liveness layout re-anchored onto the case root.
-    let anchor_eliot = case_root
-        .join("Eliot")
-        .to_string_lossy()
-        .into_owned();
+    let anchor_eliot = case_root.join("Eliot").to_string_lossy().into_owned();
     // The I3.1 user root is a sibling of the durable contour (production:
     // `%LocalAppData%\Eliot` beside `%ProgramData%\Eliot`), so it must not
     // sit under the durable root the separation rule compares it against.
-    let user_root = case_root
-        .join("user")
-        .to_string_lossy()
-        .into_owned();
+    let user_root = case_root.join("user").to_string_lossy().into_owned();
     let profile_governed_roots = eliot_installation::InstallationRoots {
         binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
         immutable_binaries: case_bin
@@ -275,10 +269,7 @@ fn dispatch_manifest(
             dispatch_handle("--eliotd-descriptor-sha256"),
             dispatch_handle("f".repeat(64)),
         ],
-        store_bridge_arguments: vec![
-            dispatch_handle("--config"),
-            config_path.clone(),
-        ],
+        store_bridge_arguments: vec![dispatch_handle("--config"), config_path.clone()],
         canonical_store_arguments: vec![
             dispatch_handle("start"),
             dispatch_handle("--no-banner"),
@@ -440,6 +431,16 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
     // lives under `%ProgramData%`, and the separation rule refuses overlap.
     let bin = case_root.join("bin");
     std::fs::create_dir_all(&bin).expect("case binaries");
+    // The SCM approval issuer binds the canonical SCM configuration digest
+    // through a real `ServiceRegistrationRequest`, which requires the
+    // registered images to exist on disk (the
+    // `system_registration_transaction` precedent writes the same fixture
+    // bytes). Content is fixture-owned; identity comes from the paths the
+    // manifest binds, never from these bytes.
+    for image in ["eliot-host.exe", "eliot-watchdog.exe"] {
+        std::fs::write(bin.join(image), b"approved-service-image-fixture-958")
+            .expect("case service image");
+    }
     let staging_parent = case_root
         .join("Eliot")
         .join(eliot_platform_windows::ISOLATED_RESTORE_ROOT_DIR);
@@ -453,30 +454,53 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         &case_root,
         &bin,
     );
-    let owner_lease = HostOwnerLease::acquire(&dispatch_handle(installation.clone()))
-        .expect("case owner lease");
+    let owner_lease =
+        HostOwnerLease::acquire(&dispatch_handle(installation.clone())).expect("case owner lease");
     let fence = dispatch_commit_fence(&manifest, &installation);
     let transaction_id = dispatch_handle(format!("transaction:958-dispatch-{unique}"));
     let plan_digest = dispatch_handle(dispatch_sha256(&format!("plan:958-dispatch-{unique}")));
-    let registry_file = Path::new(roots.host_state_root.as_str()).join("installation-registry.redb");
-    let store = eliot_installation::RedbInstallationRegistry::open_test_support(&registry_file)
+    let registry_file =
+        Path::new(roots.host_state_root.as_str()).join("installation-registry.redb");
+    // The registry opens through the real lease-bound owner (`open_at` over
+    // a retained protected-root lease), never through the leaseless
+    // test-support opener: every capability-bound record/read seam the arm
+    // exercises (`validate_host_owner_capability`) refuses a registry
+    // without a retained installation Host root, and the contour owns a
+    // real one (the T17 override precedent).
+    let host_lease = eliot_platform_windows::ProtectedRootLease::open_existing(Path::new(
+        roots.host_state_root.as_str(),
+    ))
+    .expect("case Host root lease");
+    let store = eliot_installation::RedbInstallationRegistry::open_at(host_lease)
         .expect("case registry store");
+    // A SystemService generation is invalid without exactly the Host +
+    // Watchdog SCM approvals: the issuer derives the pair from this case's
+    // own manifest (images, bootstrap, transaction), so the seeded row is
+    // the same projection an installer-driven activation would commit.
+    let service_approvals = eliot_installation::issue_test_support_service_registration_approvals(
+        &transaction_id,
+        &manifest,
+    )
+    .expect("case SCM approvals");
+    assert_eq!(
+        service_approvals.len(),
+        2,
+        "SystemService seeding carries exactly the Host + Watchdog approvals"
+    );
     store
-        .seed_active_generation_for_test_support(
+        .seed_active_generation_with_service_approvals_for_test_support(
             &owner_lease.activation_capability(),
             &manifest,
             &transaction_id,
             &plan_digest,
             &fence,
+            &service_approvals,
         )
         .expect("case active generation");
     let registry = store.load().expect("case registry projection");
     drop(store);
-    let ors_file =
-        Path::new(roots.kernel_ors_root.as_str()).join("kernel-ors.redb");
-    drop(
-        eliot_ors::RedbRecoveryStore::open(&ors_file).expect("case ORS store"),
-    );
+    let ors_file = Path::new(roots.kernel_ors_root.as_str()).join("kernel-ors.redb");
+    drop(eliot_ors::RedbRecoveryStore::open(&ors_file).expect("case ORS store"));
     let journal_file = case_root.join("host-journal.redb");
     let (journal, host, activation_generation, activation_id, _) =
         super::host_epoch_reopen::open_test_support_epoch(
@@ -488,10 +512,7 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         .expect("case host epoch");
     let launch_options = HostLaunchOptions {
         config_descriptor_path: PathBuf::from(
-            manifest
-                .runtime_launch
-                .authority_descriptor_path
-                .as_str(),
+            manifest.runtime_launch.authority_descriptor_path.as_str(),
         ),
         config_descriptor_digest: phase_b_scm_selector(
             &manifest.runtime_launch.authority_descriptor_digest,
@@ -499,17 +520,27 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         .expect("case descriptor selector"),
         installation: dispatch_handle(installation.clone()),
         transaction_plan_generation: manifest.runtime_launch.authority_generation.value(),
-        host_state_root: PathBuf::from(manifest.runtime_launch.runtime_state_roots.host_state_root.as_str()),
+        host_state_root: PathBuf::from(
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        ),
         registration_nonce: None,
     };
-    let jobs =
-        HostJobBranches::new_test_support(&host).expect("case job branches");
+    let jobs = HostJobBranches::new_test_support(&host).expect("case job branches");
     let composition = HostComposition {
         store_rebind_boundary: HostStoreRebindProductionBoundary,
         runtime_control_boundary: HostRuntimeControlProductionBoundary,
         journal,
         registry_host_root: PathBuf::from(roots.host_state_root.as_str()),
-        test_registry_file: Some(registry_file.clone()),
+        // No test-file hook: the arm under proof opens the registry through
+        // the production lease-bound path (`open_registry_store` falls
+        // through to `open_registry_store_at_profile` when no hook is set),
+        // which is the only opener whose retained root passes the
+        // capability binding the record/read seams enforce.
+        test_registry_file: None,
         registry,
         launch_options,
         host,
@@ -559,17 +590,510 @@ fn release_contour(contour: DispatchContour) {
     let _ = std::fs::remove_dir_all(&contour.case_root);
 }
 
+/// Builds one admitted dispatch request for a contour: every owner-checked
+/// name (target build, target profile, staging parent, authority generation)
+/// is copied back out of freshly inspected owner evidence, so the request
+/// carries owner-issued values, never invented ones. The only caller-chosen
+/// values are the operation identity and the forensic digests, which the
+/// admission binds but never sources authority from.
+fn admitted_dispatch_request(
+    contour: &DispatchContour,
+    operation: &str,
+    source_installation_id: &str,
+) -> crate::backup_preparation::PresentedPreparationRequest {
+    use crate::backup_preparation::{
+        OwnerEvidence, PreparationClass, resolve_owner_staging_parent,
+    };
+    let evidence = OwnerEvidence::inspect(Path::new(contour.roots.host_state_root.as_str()))
+        .expect("request builder inspects owner evidence");
+    let binding = evidence
+        .approved_binding()
+        .expect("owner-approved build binding");
+    // The presented parent is a claim about the owner-issued root: resolve
+    // the owner's value and echo it, so a mismatch here would be a fixture
+    // bug, never a second parent.
+    let staging_parent =
+        resolve_owner_staging_parent(&contour.roots).expect("owner staging parent");
+    assert_eq!(
+        staging_parent, contour.staging_parent,
+        "fixture staging area is the owner-declared isolated root"
+    );
+    crate::backup_preparation::PresentedPreparationRequest {
+        operation_id: operation.to_owned(),
+        class: PreparationClass::IsolatedRestoreRehearsal,
+        source_installation_id: source_installation_id.to_owned(),
+        staging_parent,
+        target_build: binding.generation_handle.clone(),
+        target_profile: binding.approved_profile.clone(),
+        approved_generation: evidence.authority_generation(),
+        authority_generation: evidence.authority_generation(),
+        owner_lease_ref: String::new(),
+        purge_ledger_revision: 0,
+        build_digests: binding.artifact_digests.clone(),
+        audit_fence_note: None,
+        authority_nonce: format!("nonce-958-{operation}"),
+        state_fence_digest: dispatch_sha256(&format!("fence:{operation}")),
+    }
+}
+
+/// Caller authentication material for the dispatch port: shape-checked
+/// digests only, carrying no authority of their own.
+fn dispatch_caller_auth() -> crate::backup_preparation::BackupCallerAuth {
+    crate::backup_preparation::BackupCallerAuth {
+        lease_digest: dispatch_sha256("caller-lease-958"),
+        fence_digest: dispatch_sha256("caller-fence-958"),
+    }
+}
+
+/// Journal-port regression proof: the admitted `backup_dispatch_prepare`
+/// port prepares through the Host journal sink and reconciles the recorded
+/// result. This is the port that caught the inverted `admits` operands
+/// (`retained.state.admits(outcome)` refused every `Pending -> Prepared`
+/// move, so no result could ever be recorded through the Host journal);
+/// it retains no installation row by design — the row belongs to the
+/// installation-authority arm proved below — and asserts none.
+#[test]
+fn dispatch_journal_port_prepares_and_reconciles() {
+    use crate::backup_preparation::ReconcileDisposition;
+    let (contour, composition) = dispatch_contour("journal");
+    let operation = "op-958-dispatch-journal";
+    let request = admitted_dispatch_request(&contour, operation, &contour.installation);
+    let (_sink, prepared) = composition
+        .backup_dispatch_prepare(&dispatch_caller_auth(), &request)
+        .expect("admitted dispatch prepares");
+    assert_eq!(prepared.operation_id, operation);
+    assert!(prepared.root.exists(), "destination created");
+    match composition
+        .backup_dispatch_reconcile(operation)
+        .expect("reconcile resolves")
+    {
+        ReconcileDisposition::Current(current) => assert_eq!(
+            current.root, prepared.root,
+            "status resolves the original destination"
+        ),
+        other => panic!("reconcile must resolve Current, got {other:?}"),
+    }
+    drop(composition);
+    release_contour(contour);
+}
+
+/// Refusal proof on the journal port: a foreign source is refused by the
+/// caller gate before any effect — no destination directory appears.
+#[test]
+fn dispatch_journal_port_refuses_foreign_source_before_effect() {
+    let (contour, composition) = dispatch_contour("refusal");
+    let operation = "op-958-dispatch-refusal";
+    let request =
+        admitted_dispatch_request(&contour, operation, "installation:foreign-958-refusal");
+    let error = match composition.backup_dispatch_prepare(&dispatch_caller_auth(), &request) {
+        Ok(_) => panic!("foreign source refused"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:?}").contains("caller_auth"),
+        "refusal names the caller-auth gate, got {error:?}"
+    );
+    let staged: Vec<_> = std::fs::read_dir(&contour.staging_parent)
+        .expect("staging parent readable")
+        .collect();
+    assert!(
+        staged.is_empty(),
+        "refused preparation leaves no destination behind"
+    );
+    drop(composition);
+    release_contour(contour);
+}
+
+/// Opens one short-lived lease-bound registry handle over a contour's Host
+/// root: the production `open_at` shape the arm itself uses, so the
+/// capability-bound read seams under proof pass the same owner binding.
+fn open_case_registry(contour: &DispatchContour) -> eliot_installation::RedbInstallationRegistry {
+    assert!(
+        contour.registry_file.exists(),
+        "seeding committed the registry file"
+    );
+    let lease = eliot_platform_windows::ProtectedRootLease::open_existing(Path::new(
+        contour.roots.host_state_root.as_str(),
+    ))
+    .expect("readback Host root lease");
+    eliot_installation::RedbInstallationRegistry::open_at(lease).expect("readback store")
+}
+
+/// Builds the `#954` fence this fixture's identities bind: the same epoch
+/// and generation everywhere the contract demands agreement (identity,
+/// transport, admission scope and authority).
+fn dispatch_fence() -> eliot_contracts::StateFence {
+    let epoch = eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|_| unreachable!()),
+        std::num::NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    eliot_contracts::StateFence::new(
+        epoch,
+        eliot_contracts::ResourceGeneration::new(1).unwrap_or_else(|_| unreachable!()),
+    )
+}
+
+/// Builds the `#954` transport correlation for one envelope, mirroring the
+/// protocol oracle's shape with fixture-owned correlation names.
+fn dispatch_transport(
+    request_id: &str,
+    fence: &eliot_contracts::StateFence,
+) -> eliot_protocol::RequestIdentity {
+    eliot_protocol::RequestIdentity {
+        request: eliot_receipts::RequestBinding {
+            metadata: eliot_contracts::RequestMetadata {
+                request_id: eliot_contracts::RequestId::new(request_id)
+                    .unwrap_or_else(|_| unreachable!()),
+                session_id: Some(
+                    eliot_contracts::SessionId::new("session-958-dispatch")
+                        .unwrap_or_else(|_| unreachable!()),
+                ),
+                task_id: None,
+                product_id: eliot_contracts::ProductId::new("product-958-dispatch")
+                    .unwrap_or_else(|_| unreachable!()),
+                source_id: eliot_contracts::SourceId::new("source-958-dispatch")
+                    .unwrap_or_else(|_| unreachable!()),
+                state_fence: fence.clone(),
+                clock: eliot_contracts::ClockReading::default(),
+            },
+            state_fence: fence.clone(),
+        },
+        idempotency_key: format!("transport-958-{request_id}"),
+        deadline_unix_ms: 10_000,
+        cancellation_id: "cancel-958-dispatch".to_owned(),
+    }
+}
+
+/// Builds the `#954` admission reference all of whose fences agree, mirroring
+/// the protocol oracle's shape.
+fn dispatch_admission(
+    fence: &eliot_contracts::StateFence,
+) -> eliot_protocol::backup::BackupAdmissionRef {
+    eliot_protocol::backup::BackupAdmissionRef {
+        authority: eliot_receipts::AuthorityBinding {
+            authority_id: eliot_contracts::ContractId::new("admission-authority-958")
+                .unwrap_or_else(|_| unreachable!()),
+            authority_owner: "backup-admission-authority-958".to_owned(),
+            authority_epoch: fence.authority_epoch.clone(),
+            state_fence: fence.clone(),
+            allowed_effect: eliot_receipts::EffectClass::Read,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        scope: eliot_receipts::WorkScopeBinding {
+            scope_id: eliot_receipts::WorkScopeId::new("scope-958-dispatch")
+                .unwrap_or_else(|_| unreachable!()),
+            product_id: eliot_contracts::ProductId::new("product-958-dispatch")
+                .unwrap_or_else(|_| unreachable!()),
+            resource_generation: fence.resource_generation,
+            state_fence: fence.clone(),
+        },
+        capability: "backup.capture".to_owned(),
+        admission_receipt: eliot_contracts::ReceiptId::new("admission-958-dispatch")
+            .unwrap_or_else(|_| unreachable!()),
+    }
+}
+
+/// Builds one `#954` request identity for a contour: the Requester principal
+/// (the role that may prepare and reconcile), the contour's own source
+/// installation, the case destination identity, and the case-stable
+/// canonical request hash that prepare, status and cleanup all key by.
+fn dispatch_identity(
+    contour: &DispatchContour,
+    operation: eliot_protocol::backup::BackupOperationKind,
+    dest_installation: &str,
+    request_id: &str,
+    canonical_request_hash: &str,
+) -> eliot_protocol::backup::BackupRequestIdentity {
+    use eliot_protocol::backup::{
+        BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
+    };
+    let fence = dispatch_fence();
+    let contract = |name: &str| eliot_contracts::ContractIdentity {
+        name: eliot_contracts::ContractId::new(name).unwrap_or_else(|_| unreachable!()),
+        version: eliot_contracts::ContractVersion::new(1, 0, 0),
+        shape_sha256: dispatch_sha256(name),
+    };
+    eliot_protocol::backup::BackupRequestIdentity {
+        wire_id: BACKUP_REQUEST_IDENTITY_WIRE_ID.to_owned(),
+        wire_version: BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
+        principal: eliot_protocol::backup::BackupAuthenticatedPrincipal {
+            principal: "principal-958-dispatch".to_owned(),
+            session_id: "session-958-dispatch".to_owned(),
+            role: eliot_protocol::backup::BackupRole::Requester,
+            authority_epoch: fence.authority_epoch.clone(),
+        },
+        request: dispatch_transport(request_id, &fence),
+        mutation: eliot_protocol::backup::BackupMutationBinding {
+            operation,
+            canonical_request_hash: canonical_request_hash.to_owned(),
+        },
+        archive_id: "archive-958-dispatch".to_owned(),
+        archive_contract: contract("archive.owner.958"),
+        archive_digest: dispatch_sha256("archive-958-dispatch"),
+        owner_contract: contract("attesting.owner.958"),
+        schema_digest: dispatch_sha256("schema-958-dispatch"),
+        build_digest: dispatch_sha256("build-958-dispatch"),
+        source_installation: contour.installation.clone(),
+        dest_installation: dest_installation.to_owned(),
+        class: eliot_protocol::backup::BackupClassWire::FullRecovery,
+        fence: fence.clone(),
+        snapshot_digest: dispatch_sha256("snapshot-958-dispatch"),
+        member_digest: dispatch_sha256("members-958-dispatch"),
+        max_page_members: 16,
+        max_payload_bytes: 65_536,
+        deadline_unix_ms: 10_000,
+        cancellation_id: "cancel-958-dispatch".to_owned(),
+        admission: dispatch_admission(&fence),
+        identity_digest: String::new(),
+    }
+    .with_computed_digest()
+    .expect("identity digest computes")
+}
+
+/// Builds the `#954` prepare body for one case destination: the identity
+/// above plus the body's own destination echo and a bounded restore bound.
+fn dispatch_prepare_body(
+    identity: eliot_protocol::backup::BackupRequestIdentity,
+    dest_installation: &str,
+) -> eliot_host_service::runtime_control::BackupOperationBody {
+    use eliot_protocol::backup::{
+        BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID, BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
+    };
+    let body = eliot_protocol::backup::BackupIsolatedRestorePrepare {
+        wire_id: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID.to_owned(),
+        wire_version: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
+        identity,
+        operation: eliot_protocol::backup::BackupOperationKind::PrepareIsolatedRestore,
+        destination_installation: dest_installation.to_owned(),
+        max_restore_bytes: 65_536,
+        request_digest: String::new(),
+    }
+    .with_computed_digest()
+    .expect("prepare digest computes");
+    eliot_host_service::runtime_control::BackupOperationBody::PrepareIsolatedRestore(body)
+}
+
+/// Builds the `#954` reconcile body that selects the SAME retained operation:
+/// the case-stable canonical request hash is carried unchanged while the
+/// mutation operation labels the body's own reconcile operation, which is
+/// the stable-selector binding P4 requires across prepare and status.
+fn dispatch_reconcile_body(
+    contour: &DispatchContour,
+    canonical_request_hash: &str,
+    request_id: &str,
+) -> eliot_host_service::runtime_control::BackupOperationBody {
+    use eliot_protocol::backup::{
+        BACKUP_RESTORE_RECONCILE_WIRE_ID, BACKUP_RESTORE_RECONCILE_WIRE_VERSION,
+    };
+    // The status read names the same destination the preparation allocated:
+    // only the mutation operation is relabeled to the body's own reconcile
+    // operation, while the canonical request hash — the selector — stays
+    // the case-stable value.
+    let dest_key = dispatch_sha256(&format!("destination:{}", contour.installation));
+    let identity = dispatch_identity(
+        contour,
+        eliot_protocol::backup::BackupOperationKind::ReconcileRestore,
+        &dest_key,
+        request_id,
+        canonical_request_hash,
+    );
+    let body = eliot_protocol::backup::BackupRestoreReconcile {
+        wire_id: BACKUP_RESTORE_RECONCILE_WIRE_ID.to_owned(),
+        wire_version: BACKUP_RESTORE_RECONCILE_WIRE_VERSION,
+        identity,
+        operation: eliot_protocol::backup::BackupOperationKind::ReconcileRestore,
+        believed_digest: dispatch_sha256(&format!("believed:{canonical_request_hash}")),
+        request_digest: String::new(),
+    }
+    .with_computed_digest()
+    .expect("reconcile digest computes");
+    eliot_host_service::runtime_control::BackupOperationBody::ReconcileRestore(body)
+}
+
+/// Wraps one `#954` body in its transport envelope through the exact
+/// `new_backup` constructor the endpoint ingress uses, so the header commits
+/// the body's own request digest and cannot describe another operation.
+fn dispatch_envelope(
+    body: eliot_host_service::runtime_control::BackupOperationBody,
+    tag: &str,
+) -> eliot_host_control_endpoint::BackupRuntimeControlRequest {
+    let handle = |value: String| {
+        eliot_platform::PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    };
+    eliot_host_service::runtime_control::BackupRuntimeControlRequest::new_backup(
+        body,
+        handle("host-owner-958-dispatch".to_owned()),
+        handle(format!("request-958-{tag}")),
+        handle(dispatch_sha256(&format!("nonce:{tag}"))),
+        handle(dispatch_sha256(&format!("generation:{tag}"))),
+        handle(dispatch_sha256(&format!("fence:{tag}"))),
+    )
+    .unwrap_or_else(|error| panic!("envelope admits the fixture body: {error}"))
+}
+
+/// Production-path success proof (P2/P3/P4): the live queue arm
+/// (`process_backup_dispatch_requests -> dispatch_backup_owner_operation ->
+/// Prepare`) answers `PossibleEffect` once the effect boundary is crossed,
+/// retains the destination ApprovedGeneration row (inactive, new
+/// installation) with its creation pair naming the created root, and the
+/// status arm resolves the original destination under the same admitted
+/// operation hash.
+#[test]
+fn dispatch_arm_admits_and_records_destination() {
+    use eliot_host_service::runtime_control::BackupOwnerOutcome;
+    use eliot_protocol::backup::BackupOperationKind;
+    let (contour, composition) = dispatch_contour("arm");
+    // The case destination identity is an owner installation KEY (64-hex),
+    // minted for this case alone; the source stays the contour's own
+    // installation, so the pair is isolated by construction.
+    let dest_key = dispatch_sha256(&format!("destination:{}", contour.installation));
+    let canonical_request_hash =
+        dispatch_sha256(&format!("canonical-request:{}", contour.installation));
+    let identity = dispatch_identity(
+        &contour,
+        BackupOperationKind::PrepareIsolatedRestore,
+        &dest_key,
+        "prepare-958-arm",
+        &canonical_request_hash,
+    );
+    let prepare = dispatch_envelope(
+        dispatch_prepare_body(identity, &dest_key),
+        "prepare-958-arm",
+    );
+    match composition.dispatch_backup_owner_operation(&prepare) {
+        Ok(BackupOwnerOutcome::PossibleEffect { retained }) => assert_eq!(
+            retained.operation,
+            BackupOperationKind::PrepareIsolatedRestore,
+            "possible effect retains the exact admitted operation"
+        ),
+        other => panic!("prepare arm must answer PossibleEffect, got {other:?}"),
+    }
+    // Durable readback through a fresh lease-bound handle, using the
+    // production read seams: the destination row exists, is inactive, is a
+    // new installation, and the creation pair names the created root.
+    let store = open_case_registry(&contour);
+    let capability = composition.owner_lease.activation_capability();
+    let operation_id =
+        eliot_installation::PlatformHandle::new(&canonical_request_hash).expect("operation handle");
+    let row = store
+        .read_prepared_destination_generation(&capability, &operation_id)
+        .expect("destination row recorded");
+    assert!(
+        !row.active,
+        "prepared destination never activates at preparation"
+    );
+    assert_ne!(
+        row.manifest.generation.as_str(),
+        contour.manifest.generation.as_str(),
+        "destination row is a new installation, not the source generation"
+    );
+    let (admission, materialisation) = store
+        .read_prepared_isolated_destination_creation(&capability, &operation_id)
+        .expect("creation pair recorded");
+    let created = Path::new(&materialisation.destination_installation_root);
+    assert!(created.exists(), "recorded root exists on disk");
+    let canonical_parent =
+        std::fs::canonicalize(&contour.staging_parent).expect("parent canonicalizes");
+    let canonical_root = std::fs::canonicalize(created).expect("root canonicalizes");
+    assert!(
+        canonical_root.starts_with(&canonical_parent),
+        "created root sits under the owner-issued staging parent"
+    );
+    drop(admission);
+    drop(store);
+    // Status arm (P4): the reconcile body carries the SAME canonical request
+    // hash and resolves the retained operation instead of preparing again.
+    let reconcile = dispatch_envelope(
+        dispatch_reconcile_body(&contour, &canonical_request_hash, "reconcile-958-arm"),
+        "reconcile-958-arm",
+    );
+    match composition.dispatch_backup_owner_operation(&reconcile) {
+        Ok(BackupOwnerOutcome::Admitted { retained }) => assert_eq!(
+            retained.operation,
+            BackupOperationKind::ReconcileRestore,
+            "status retains the reconcile operation it answered"
+        ),
+        other => panic!("status arm must answer Admitted, got {other:?}"),
+    }
+    drop(composition);
+    release_contour(contour);
+}
+
+/// Production-path refusal proof (P2): a destination identity that is not
+/// an owner installation key is refused by the installation authority
+/// before any effect — no directory appears and no row is retained.
+#[test]
+fn dispatch_arm_refuses_arbitrary_destination_before_effect() {
+    use eliot_protocol::backup::BackupOperationKind;
+    let (contour, composition) = dispatch_contour("refusal");
+    let canonical_request_hash = dispatch_sha256(&format!(
+        "canonical-request-refusal:{}",
+        contour.installation
+    ));
+    let foreign = "installation:foreign-958-refusal";
+    let identity = dispatch_identity(
+        &contour,
+        BackupOperationKind::PrepareIsolatedRestore,
+        foreign,
+        "prepare-958-refusal",
+        &canonical_request_hash,
+    );
+    let prepare = dispatch_envelope(
+        dispatch_prepare_body(identity, foreign),
+        "prepare-958-refusal",
+    );
+    let refusal = match composition.dispatch_backup_owner_operation(&prepare) {
+        Ok(outcome) => panic!("arbitrary destination refused, got {outcome:?}"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(
+        refusal.operation,
+        BackupOperationKind::PrepareIsolatedRestore,
+        "refusal names the refused operation"
+    );
+    let staged: Vec<_> = std::fs::read_dir(&contour.staging_parent)
+        .expect("staging parent readable")
+        .collect();
+    assert!(
+        staged.is_empty(),
+        "refused preparation leaves no destination behind"
+    );
+    let store = open_case_registry(&contour);
+    let projection = store.load().expect("registry projection");
+    assert!(
+        projection.prepared_isolated_destinations().is_empty(),
+        "refused preparation retains no admission"
+    );
+    assert!(
+        projection
+            .prepared_destination_materialisations()
+            .is_empty(),
+        "refused preparation retains no materialisation"
+    );
+    assert!(
+        projection
+            .generations()
+            .iter()
+            .all(|generation| generation.active),
+        "refused preparation allocates no destination row"
+    );
+    drop(store);
+    drop(composition);
+    release_contour(contour);
+}
+
 /// First staging proof: the disposable contour inspects into real owner
 /// evidence bound to the seeded active generation, with the registry
 /// revision fence agreeing between the evidence and the composition.
 #[test]
 fn dispatch_contour_inspects_owner_evidence() {
     let (contour, composition) = dispatch_contour("inspect");
-    let evidence =
-        crate::backup_preparation::OwnerEvidence::inspect(Path::new(
-            contour.roots.host_state_root.as_str(),
-        ))
-        .expect("contour inspects");
+    let evidence = crate::backup_preparation::OwnerEvidence::inspect(Path::new(
+        contour.roots.host_state_root.as_str(),
+    ))
+    .expect("contour inspects");
     assert_eq!(
         evidence.approved().manifest.generation.as_str(),
         contour.manifest.generation.as_str(),

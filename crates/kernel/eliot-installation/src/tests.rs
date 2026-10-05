@@ -6277,9 +6277,7 @@ fn system_service_installation_roots_validate_below_durable_data() {
         .to_string_lossy()
         .into_owned();
     assert!(
-        moved
-            .validate(InstallationProfile::SystemService)
-            .is_err(),
+        moved.validate(InstallationProfile::SystemService).is_err(),
         "a durable root off the profile anchor still refuses"
     );
 }

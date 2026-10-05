@@ -1496,7 +1496,7 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
         // cancellation envelope reaches this port as well, and a durable
         // preparation has no cancelled disposition, so the only forward moves
         // are the owner-authorized reclamation steps.
-        if !retained.state.admits(outcome) {
+        if !outcome.admits(retained.state) {
             return Err(PreparationError::UnknownState {
                 operation: operation_id.to_owned(),
                 reason: "the durable preparation has no admissible move to this outcome; \

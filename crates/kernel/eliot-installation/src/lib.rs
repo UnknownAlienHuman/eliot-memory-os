@@ -288,6 +288,8 @@ pub use runtime_root_contract::{
     InstallationProfile, RuntimeRootLease, RuntimeRootLeaseProvider, RuntimeStateRoots,
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
 };
+#[cfg(feature = "test-support")]
+pub use scm_approval::issue_test_support_service_registration_approvals;
 pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval};
 pub use setup_binding::{
     SETUP_BINDING_WIRE_VERSION, SetupAdmissionError, SetupAdvanceInput, SetupBinding,

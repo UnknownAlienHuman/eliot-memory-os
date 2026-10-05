@@ -511,6 +511,37 @@ impl RedbInstallationRegistry {
         plan_digest: &PlatformHandle,
         commit_fence: &ActivationCommitFence,
     ) -> Result<(), InstallationError> {
+        self.seed_active_generation_with_service_approvals_for_test_support(
+            host,
+            manifest,
+            transaction_id,
+            plan_digest,
+            commit_fence,
+            &[],
+        )
+    }
+
+    /// Seeds one physically persisted active generation carrying explicit
+    /// installer SCM approvals (issue #958 dispatch fixture).
+    ///
+    /// A SystemService generation is invalid without exactly the Host +
+    /// Watchdog approvals; callers that seed a SystemService manifest pass
+    /// the pair from
+    /// [`crate::issue_test_support_service_registration_approvals`]. The
+    /// approvals ride the same Pending stage/commit path as the approval-less
+    /// seeding above, so the committed row is indistinguishable from an
+    /// installer-driven activation except for the domain-separated
+    /// test-support effect identity the issuer binds.
+    #[cfg(feature = "test-support")]
+    pub fn seed_active_generation_with_service_approvals_for_test_support(
+        &self,
+        host: &HostOwnerEpochCapability,
+        manifest: &crate::CandidateManifest,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        commit_fence: &ActivationCommitFence,
+        service_registration_approvals: &[crate::InstallerServiceRegistrationApproval],
+    ) -> Result<(), InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -550,7 +581,7 @@ impl RedbInstallationRegistry {
             registry.stage_pending_activation_unchecked(
                 manifest.clone(),
                 &activation_fixture,
-                &[],
+                service_registration_approvals,
             )?;
             registry.commit_pending_activation_unchecked(
                 transaction_id,
