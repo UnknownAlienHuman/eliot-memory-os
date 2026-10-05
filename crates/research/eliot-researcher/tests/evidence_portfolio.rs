@@ -1156,6 +1156,63 @@ fn absence_foreign_scope_is_unproven() {
     );
 }
 
+#[test]
+fn absence_issuer_blank_predicate_refused() {
+    // The issuer's own predicate identity is one of the twenty commitments it
+    // attests to, so a blank one is an evaluation over an arbitrary string
+    // rather than over an identified predicate. Completeness is proved on the
+    // frozen scope (I21-06: `complete_scope` is the only basis on which a scoped
+    // absence may be claimed), and a claim whose predicate identity is blank
+    // cannot be the predicate that completeness was proved for, so the issuer
+    // refuses to exist rather than mint one. Only `predicate_id` is mutated here;
+    // every other owner commitment is the value `issued_evaluation` holds, so the
+    // refusal names this field alone.
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = String::new();
+    let err = NoMatchEvaluationIssuer::new(params)
+        .expect_err("a blank predicate identity must be refused");
+    // `Blank` renders as `{field} must be non-blank`, so the display is what
+    // names the exact field path the constructor refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Blank { .. }),
+        "a blank identity must be refused as `Blank`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.predicate_id"),
+        "the refused field must be the predicate identity itself: {rendered}"
+    );
+}
+
+#[test]
+fn absence_issuer_blank_index_refused() {
+    // The same refusal on the other identity this pair covers: the revision of
+    // the source/index the predicate runs against. A blank index revision attests
+    // to an evaluation over whatever the index happened to hold at claim time, so
+    // the exact-negative claim it would back is not the one completeness was
+    // proved for on the frozen scope (I21-06: `complete_scope` is the only basis
+    // on which a scoped absence may be claimed). Only `index_revision` is
+    // mutated, so this names its own field rather than the predicate identity
+    // the sibling case refuses.
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.index_revision = String::new();
+    let err =
+        NoMatchEvaluationIssuer::new(params).expect_err("a blank index identity must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Blank { .. }),
+        "a blank identity must be refused as `Blank`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.index_revision"),
+        "the refused field must be the index identity itself: {rendered}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
