@@ -2902,25 +2902,25 @@ impl NoMatchEvaluation {
         Ok(())
     }
 
-    /// Refuses two records that share one admitted identity but attest different execution.
+    /// Refuses two records that share one claimed identity but attest different execution.
     ///
     /// I05-27 (`docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md:18`):
     /// reusing an identity key with a different canonical hash returns
-    /// `IDENTITY_CONFLICT` and performs no transition. The admitted identity here
+    /// `IDENTITY_CONFLICT` and performs no transition. The presented identity here
     /// is (`predicate_id`, `admission_receipt_id`); the execution content is the
     /// predicate revision and bytes, the evaluator identity and revision, the
     /// index and source revisions, and the per-member results. Records under
-    /// different identities are different claims and nothing is compared.
+    /// different identities are not compared; this method does not validate admission.
     /// Observation window, scope, manifest, fence, applicability and ceiling
-    /// are covered by the canonical-body comparison below: one admitted
-    /// identity carries one canonical body, so re-scoping or re-windowing
-    /// under the SAME receipt is a conflict — genuine re-admission mints a new
-    /// receipt and is a different identity, never a replay of this one.
+    /// are covered by the canonical-body comparison, which the retaining consumer
+    /// must invoke before accepting a record under the same presented identity:
+    /// different canonical bodies under the SAME receipt conflict. Changing the
+    /// receipt changes the tuple but does not prove that another admission occurred.
     ///
     /// # Errors
     ///
-    /// Returns [`PortfolioError::Conflict`] naming the first diverged execution
-    /// field when both records carry the same admitted identity.
+    /// Returns [`PortfolioError::Conflict`] naming an explicitly compared field
+    /// or `no_match_evaluation.canonical_body` for other canonical differences.
     pub fn check_replay_consistency(&self, other: &Self) -> Result<(), PortfolioError> {
         if self.predicate_id != other.predicate_id
             || self.admission_receipt_id != other.admission_receipt_id
