@@ -656,4 +656,34 @@ mod tests {
                 if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
         ));
     }
+
+    #[test]
+    fn ipc_exhaustion_response_refuses_an_admitting_partition() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        // The pipe partition still admits the request, so no BUSY
+        // pressure evidence may be manufactured for it.
+        assert_eq!(reserve.available_normal_bytes(), 4);
+
+        // A refusal to admit is not exhaustion: the disposition must
+        // name the partition rather than a fabricated retry directive.
+        let err = reserve
+            .normal_bytes_exhaustion_response(
+                NormalWorkClass::Interactive,
+                "op-pipe-admitting-1",
+                ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("an admitting partition must not produce pressure evidence");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_reserve.normal_pipe_bytes",
+                ..
+            }
+        ));
+    }
 }
