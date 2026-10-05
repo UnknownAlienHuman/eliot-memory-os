@@ -138,11 +138,6 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         body: OPENCODE_PLUGIN,
     },
     ConsumerSurface {
-        path: "plugin/eliot-governor/.codex-plugin/plugin.json",
-        live_reference: "\"name\": \"eliot-governor\"",
-        body: CODEX_PLUGIN_METADATA,
-    },
-    ConsumerSurface {
         path: "scripts/build-eliot-windows-x64-release.ps1",
         live_reference: "integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe",
         body: WINDOWS_RELEASE_BUILD,
@@ -156,11 +151,6 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md",
         live_reference: "eliot-governor --config",
         body: CREDENTIAL_RUNBOOK,
-    },
-    ConsumerSurface {
-        path: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
-        live_reference: "server/eliot-governor.exe mcp stdio",
-        body: CLAUDE_DESKTOP_GUIDE,
     },
     ConsumerSurface {
         path: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
@@ -196,16 +186,6 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "scripts/test-claude-connector.ps1",
         live_reference: "'release\\eliot-governor.exe'",
         body: CLAUDE_CONNECTOR_TEST,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/claude-desktop/README.md",
-        live_reference: "cargo build --release -p eliot-app",
-        body: CLAUDE_DESKTOP_README,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/claude-desktop/mcpb/README.md",
-        live_reference: "`eliot-governor.exe`",
-        body: CLAUDE_DESKTOP_MCPB_README,
     },
     ConsumerSurface {
         path: "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
@@ -1134,13 +1114,6 @@ const INVENTORY_REVISION: &str = "2026-09-25";
 pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
     &[
         ConsumerEntry {
-            consumer: "Codex plugin identity manifest",
-            proof: "plugin/eliot-governor/.codex-plugin/plugin.json",
-            live_reference: "\"name\": \"eliot-governor\"",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the Codex Governor plugin subtree is removed together with the accepted #18 consumer and retirement evidence under #1719",
-        },
-        ConsumerEntry {
             consumer: "OpenCode host integration",
             proof: "integrations/opencode/plugins/eliot.js",
             live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
@@ -1167,13 +1140,6 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             live_reference: "eliot-governor --config",
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when the runbook targets bins/eliot under #11",
-        },
-        ConsumerEntry {
-            consumer: "Claude Desktop operator guide",
-            proof: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
-            live_reference: "server/eliot-governor.exe mcp stdio",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the guide targets the current root server binary under #11",
         },
         ConsumerEntry {
             consumer: "Claude Code operator guide",
@@ -1223,20 +1189,6 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             live_reference: "'release\\eliot-governor.exe'",
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when connector tests target the current root server binary under #11",
-        },
-        ConsumerEntry {
-            consumer: "Claude Desktop package build instructions",
-            proof: "integrations/claude/claude-desktop/README.md",
-            live_reference: "cargo build --release -p eliot-app",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the package instructions build and stage the current owner server under #11/#18",
-        },
-        ConsumerEntry {
-            consumer: "Claude Desktop MCPB package instructions",
-            proof: "integrations/claude/claude-desktop/mcpb/README.md",
-            live_reference: "`eliot-governor.exe`",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the MCPB guide names only the current owner server under #11/#18",
         },
         ConsumerEntry {
             consumer: "Legacy UL cross-agent reference MCP client",
@@ -1383,6 +1335,38 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (codex_controller MCP access edge; scope/capability admission in cli_contract)",
         evidence: "the default-installed marketplace entry now declares its MCP server route explicitly as the bridge (integrations/codex/marketplace.json plugins[eliot-governor].eliot_mcp_server): bridge argv mcp --profile codex_controller --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>, matching the staged plugin manifest the release builder stages beside the retained governor copy, binds in RELEASE.json codex_plugin_bridge, and verifies; the install policy and legacy plugin directory identity are unchanged and the installed plugin launches nothing but the bridge",
     },
+    MigratedConsumerEdge {
+        consumer: "Codex plugin identity manifest",
+        proof: "plugin/eliot-governor/.codex-plugin/plugin.json",
+        legacy_reference: "\"name\": \"eliot-governor\"",
+        current_owner_reference: "\"name\": \"eliot-agent-bridge\"",
+        current_owner: "bins/eliot-agent-bridge (install identity; the staged plugin launches bin/eliot-agent-bridge.exe)",
+        evidence: "marketplace plugins[0].name and the staged plugin manifest both declare the bridge install identity; the staged plugin directory is unchanged and the installed plugin launches nothing but the bridge",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop operator guide",
+        proof: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
+        legacy_reference: "server/eliot-governor.exe mcp stdio",
+        current_owner_reference: "server/eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "tracked MCPB manifest server.mcp_config declares exactly the bridge argv the guide now documents",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop package build instructions",
+        proof: "integrations/claude/claude-desktop/README.md",
+        legacy_reference: "cargo build --release -p eliot-app",
+        current_owner_reference: "cargo build --locked --release -p eliot-agent-bridge --bin eliot-agent-bridge",
+        current_owner: "bins/eliot-agent-bridge (Desktop MCPB server)",
+        evidence: "the staged MCPB server builds from bins/eliot-agent-bridge, not the legacy facade",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop MCPB package instructions",
+        proof: "integrations/claude/claude-desktop/mcpb/README.md",
+        legacy_reference: "`eliot-governor.exe`",
+        current_owner_reference: "server/eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge (Desktop MCPB server)",
+        evidence: "the bundle paragraph names the packaged bridge server and its no-Governor construction claim from the tracked manifest long_description",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -1395,6 +1379,10 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
         "integrations/opencode/opencode.json" => Some(OPENCODE_CONFIG),
         "integrations/codex/marketplace.json" => Some(CODEX_MARKETPLACE),
+        "plugin/eliot-governor/.codex-plugin/plugin.json" => Some(CODEX_PLUGIN_METADATA),
+        "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md" => Some(CLAUDE_DESKTOP_GUIDE),
+        "integrations/claude/claude-desktop/README.md" => Some(CLAUDE_DESKTOP_README),
+        "integrations/claude/claude-desktop/mcpb/README.md" => Some(CLAUDE_DESKTOP_MCPB_README),
         _ => None,
     }
 }
