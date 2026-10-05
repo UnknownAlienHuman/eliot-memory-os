@@ -1932,6 +1932,30 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_zero_normal_capacity_fails_closed() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([25u8; 32]),
+            genesis_epoch(),
+        );
+        // The constructor floor (issue #1679): a front door with no normal
+        // partition can never admit normal work, so building one fails
+        // closed instead of producing a reserve that refuses everything
+        // at runtime (I14.3: partitions are non-borrowable; zero
+        // capacity is a build error, not a runtime surprise).
+        let Err(err) = FrontDoor::partitioned(authority, 0, 1, 8) else {
+            panic!("zero normal capacity must fail at build");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "control_reserve.normal_capacity",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn ledger_evicts_oldest_when_full() -> Result<(), KernelError> {
         let mut ledger = IdempotencyLedger::new(2)?;
         ledger.record(
