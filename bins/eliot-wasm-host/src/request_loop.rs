@@ -6523,3 +6523,152 @@ fn read_admitted_material() -> Result<
         other => DriveError::Material(other),
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod spool_tests {
+    use super::*;
+    use crate::dispatch_material::{
+        ControlDeliveryIdentity, WASM_CONTROL_DELIVERY_WIRE_ID, WASM_CONTROL_DELIVERY_WIRE_VERSION,
+    };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(3).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence() -> StateFence {
+        StateFence::new(
+            test_epoch(),
+            ResourceGeneration::new(7).expect("nonzero test generation"),
+        )
+    }
+
+    fn test_binding(generation: u64) -> AdmittedBinding {
+        AdmittedBinding {
+            claim_id: "claim-2896".to_owned(),
+            operation_id: "operation-2896".to_owned(),
+            invocation_id: "operation-2896".to_owned(),
+            request_digest: "d".repeat(64),
+            grant_digest: "9".repeat(64),
+            generation,
+            work_scope: "scope-2896".to_owned(),
+            authority_epoch_json: "{}".to_owned(),
+            component_id: "component-2896".to_owned(),
+            artifact_digest: "a".repeat(64),
+            input_digest: "i".repeat(64),
+            input_bytes: Vec::new(),
+            fence_nonce: "fence-2896".to_owned(),
+            deterministic_seed: 7,
+            max_output_bytes: 1024,
+        }
+    }
+
+    fn test_delivery(generation: u64, sequence: u64) -> WasmControlDelivery {
+        WasmControlDelivery {
+            wire_id: WASM_CONTROL_DELIVERY_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_DELIVERY_WIRE_VERSION,
+            identity: ControlDeliveryIdentity {
+                operation_id: "operation-2896".to_owned(),
+                invocation_id: "operation-2896".to_owned(),
+                claim_id: "claim-2896".to_owned(),
+                generation,
+                control_kind: WasmControlKind::Reconcile,
+                owner_sequence: sequence,
+                authority_epoch: test_epoch(),
+                state_fence: test_fence(),
+                work_scope: "scope-2896".to_owned(),
+                principal_digest: "b".repeat(64),
+                session_connection: "conn-2896".to_owned(),
+                session_epoch: 1,
+                dispatch_grant_digest: "c".repeat(64),
+                publisher_challenge_id: "challenge-2896".to_owned(),
+                publisher_operation: "operation-class-2896".to_owned(),
+                publisher_decided_at_unix_ms: 4_000_000_000_000,
+                deadline_unix_ms: 4_000_000_060_000,
+                replay_key: "e".repeat(64),
+                previous_delivery_digest: None,
+            },
+            delivery_digest: "f".repeat(64),
+        }
+    }
+
+    fn test_ack(
+        delivery: &WasmControlDelivery,
+        phase: ControlAckPhase,
+        detail: Option<&str>,
+        outcome_digest: Option<&str>,
+    ) -> WasmControlAck {
+        let identity = &delivery.identity;
+        WasmControlAck {
+            wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+            replay_key: identity.replay_key.clone(),
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            owner_sequence: identity.owner_sequence,
+            delivery_digest: delivery.delivery_digest.clone(),
+            phase,
+            detail: detail.map(str::to_owned),
+            outcome_digest: outcome_digest.map(str::to_owned),
+        }
+    }
+
+    fn spool_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("spool dir writable");
+        dir
+    }
+
+    fn test_reader(dir: &std::path::Path, generation: u64) -> KernelControlReader {
+        KernelControlReader::new(&test_binding(generation), dir.to_path_buf())
+    }
+
+    fn stage_ack(dir: &std::path::Path, generation: u64, sequence: u64, ack: &WasmControlAck) {
+        let bytes = serde_json::to_vec(ack).expect("ack serializes");
+        std::fs::write(dir.join(control_ack_name(generation, sequence)), &bytes)
+            .expect("ack writable");
+    }
+
+    /// Positive control for the spool builders: no staged ack resolves Free.
+    #[test]
+    fn ack_slot_free_without_staged_ack() {
+        let dir = spool_dir("eliot-2896-ack-slot-free");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[], &mut reads),
+            AckSlot::Free
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A decisive Completed ack bound to the exact delivery resolves Decided.
+    #[test]
+    fn ack_slot_decided_on_completed() {
+        let dir = spool_dir("eliot-2896-ack-slot-decided");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Completed, None, None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Decided
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
