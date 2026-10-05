@@ -1807,6 +1807,11 @@ fn absence_replay_is_identical_under_one_identity() {
         eval_b.canonical_digest().expect("digest"),
         "an exact replay under one admitted identity must be byte-identical"
     );
+    assert_eq!(
+        eval_a.canonical_bytes().expect("canonical bytes"),
+        eval_b.canonical_bytes().expect("canonical bytes"),
+        "an exact replay must preserve the actual canonical bytes"
+    );
     eval_a
         .check_replay_consistency(&eval_b)
         .expect("an exact replay is consistent");
