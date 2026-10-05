@@ -2957,6 +2957,7 @@ pub async fn solo_poll_queue_async(
 /// so the pair is the positive control for both the binding check and the
 /// queue push; tests mutate one field at a time for refusals.
 #[cfg(test)]
+#[allow(clippy::too_many_lines, clippy::expect_used)]
 pub(crate) fn solo_test_pair() -> (
     crate::agent_fabric::AdmittedSoloCoordinateRequest,
     SoloDelegateIntake,
@@ -3222,6 +3223,7 @@ pub(crate) fn solo_test_pair() -> (
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod solo_enqueue_push_tests {
     use super::*;
 

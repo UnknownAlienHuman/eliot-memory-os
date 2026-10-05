@@ -5552,6 +5552,7 @@ pub fn consume_admitted_solo_coordinate(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod admitted_solo_binding_tests {
     use super::*;
     use crate::solo_agent_driver::solo_test_pair;
