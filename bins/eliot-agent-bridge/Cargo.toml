@@ -19,6 +19,7 @@ eliot-profile-spine-functional = []
 eliot-profile-full-composition = []
 
 [dependencies]
+anyhow.workspace = true
 eliot-agent-bridge-core.workspace = true
 eliot-agent-opencode.workspace = true
 eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }

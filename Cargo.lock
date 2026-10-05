@@ -736,6 +736,7 @@ dependencies = [
 name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "eliot-agent-bridge-core",
  "eliot-agent-contracts",
  "eliot-agent-opencode",
