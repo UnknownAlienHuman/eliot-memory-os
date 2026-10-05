@@ -940,3 +940,63 @@ impl OrsRejectionParts {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    /// Saturating the single normal transaction slot leaves the protected
+    /// partition untouched (issue #1679). The positive control comes FIRST and
+    /// its permit is held across the assertions: a reserve that refused
+    /// everything would also refuse normal work, so only an admitted
+    /// cancellation proves the protected slot is genuinely still available
+    /// while ordinary work is being shed. The shedding refusal then names the
+    /// exact bottleneck, so exhaustion of one dimension is never reported as
+    /// global exhaustion.
+    #[test]
+    fn ors_normal_transaction_saturation_leaves_protected_slot_available() {
+        let reserve = OrsReserve::partitioned(
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("first slot");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // slot while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-ctl-1",
+                epoch,
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let err = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-shed-1",
+                epoch,
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+    }
+}
