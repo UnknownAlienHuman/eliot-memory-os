@@ -2149,47 +2149,170 @@ pub fn read_inflight_marker(
     Ok(Some(marker))
 }
 
+/// Outcome of one `InFlight`-marker write (issue #2786 AUD3): the fixed
+/// marker name is first-writer-wins, so a late claim can never silently
+/// take over another identity's un-reaped claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InFlightClaimOutcome {
+    /// This claim's marker was newly staged.
+    Acquired,
+    /// This claim's marker is already staged: idempotent re-drive, no rewrite.
+    ExistingInFlight,
+    /// This identity already has a durable served result: it must not
+    /// re-execute under a fresh claim.
+    RetainedResult,
+    /// The slot holds bytes naming another (or no identifiable) claim: the
+    /// first writer wins, this claim refuses.
+    Conflict,
+    /// The slot state could not be established: local IO failed.
+    Unavailable,
+}
+
 /// Writes the `InFlight` marker atomically (process-scoped partial, flushed,
-/// then renamed): the reader never observes partial JSON. Callers must
-/// propagate a write failure and refuse execution without durable claim
-/// evidence.
+/// then renamed): the reader never observes partial JSON. First-writer-wins:
+/// a marker naming another identity, or unidentifiable bytes, is never
+/// overwritten — the previous writer owns the name until it clears it. A
+/// served result settling this identity refuses a fresh claim outright, so
+/// a restarted drive republishes the retained sequence instead of
+/// re-executing. Returns the closed outcome; callers fail closed on
+/// anything but [`InFlightClaimOutcome::Acquired`] and
+/// [`InFlightClaimOutcome::ExistingInFlight`].
 pub fn write_inflight_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
     claimed_at_unix_ms: u64,
-) -> std::io::Result<()> {
+) -> InFlightClaimOutcome {
+    match served_settlement(install_dir, identity) {
+        ServedSettlement::Settled => return InFlightClaimOutcome::RetainedResult,
+        ServedSettlement::Unknown => return InFlightClaimOutcome::Unavailable,
+        ServedSettlement::Free => {}
+    }
+    match read_inflight_marker(install_dir) {
+        Ok(None) => {}
+        Ok(Some(mark)) if mark.names(identity) => {
+            return InFlightClaimOutcome::ExistingInFlight;
+        }
+        Ok(_) => return InFlightClaimOutcome::Conflict,
+        Err(_) => return InFlightClaimOutcome::Conflict,
+    }
     let marker = InFlightDeliveryMarker::from_identity(identity, claimed_at_unix_ms);
-    let bytes =
-        serde_json::to_vec(&marker).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let bytes = match serde_json::to_vec(&marker) {
+        Ok(bytes) => bytes,
+        Err(_) => return InFlightClaimOutcome::Unavailable,
+    };
     let partial = install_dir.join(format!(
         ".{}.{}.partial",
         WASM_HOST_INFLIGHT_FILE_NAME,
         std::process::id()
     ));
     let _ = std::fs::remove_file(&partial);
-    std::fs::write(&partial, &bytes)?;
-    std::fs::File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME))?;
-    Ok(())
+    if std::fs::write(&partial, &bytes).is_err() {
+        return InFlightClaimOutcome::Unavailable;
+    }
+    // Sync through a write handle: flushing a read-only handle is denied on
+    // some platforms, which would fail every claim.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)
+        .and_then(|file| file.sync_all())
+        .is_err()
+    {
+        return InFlightClaimOutcome::Unavailable;
+    }
+    if std::fs::rename(&partial, install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).is_err() {
+        return InFlightClaimOutcome::Unavailable;
+    }
+    InFlightClaimOutcome::Acquired
+}
+
+/// Settlement state of one staged identity against the durable
+/// served-result record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServedSettlement {
+    /// The record settles this identity: sealed before any release.
+    Settled,
+    /// No record settles this identity: nothing was served under it.
+    Free,
+    /// The record bytes exist but prove nothing: unreadable or unparseable
+    /// evidence is never read as absence.
+    Unknown,
+}
+
+/// Classifies the durable served-result record for one staged identity: an
+/// operation, claim, and generation triple match means the result was sealed
+/// before any physical release, so no fresh claim for this identity may
+/// execute. A missing record settles nothing; unreadable or unparseable
+/// bytes settle nothing either, but report `Unknown` instead of `Free` so
+/// the caller fails closed rather than claiming over unknowable state.
+fn served_settlement(
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> ServedSettlement {
+    let bytes = match std::fs::read(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ServedSettlement::Free;
+        }
+        Err(_) => return ServedSettlement::Unknown,
+    };
+    let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(_) => return ServedSettlement::Unknown,
+    };
+    let settles = record.get("operation_id").and_then(|value| value.as_str())
+        == Some(identity.operation_id.as_str())
+        && record.get("claim_id").and_then(|value| value.as_str())
+            == Some(identity.claim_id.as_str())
+        && record.get("generation").and_then(|value| value.as_u64()) == Some(identity.generation);
+    if settles {
+        ServedSettlement::Settled
+    } else {
+        ServedSettlement::Free
+    }
 }
 
 /// Clears the `InFlight` marker once the served marker is durable: only a
-/// marker naming exactly this identity is removed, so a successor claim is
-/// never touched. Best-effort by contract — the served marker remains the
-/// primary replay guard, so a leftover only replays, never re-executes.
-/// Returns whether no marker for this identity remains.
+/// marker still naming exactly this identity after a claim-by-rename move
+/// is removed, so a successor claim staged between the read and the removal
+/// is restored instead of deleted (issue #2786 W5). Best-effort by contract
+/// — the served marker remains the primary replay guard, so a leftover only
+/// replays, never re-executes. Returns whether no marker for this identity
+/// remains.
 #[must_use]
 pub fn clear_inflight_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
 ) -> bool {
     match read_inflight_marker(install_dir) {
-        Ok(Some(mark)) if mark.names(identity) => {
-            std::fs::remove_file(install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).is_ok()
-        }
-        Ok(Some(_) | None) => true,
-        Err(_) => false,
+        Ok(Some(mark)) if !mark.names(identity) => return true,
+        Ok(None) => return true,
+        Err(_) => return false,
+        Ok(Some(_)) => {}
     }
+    // Claim the marker aside by rename, then re-verify: a successor staged
+    // after the read above now sits aside instead of under the fixed name,
+    // and only bytes that still name this identity are removed.
+    let aside = install_dir.join(format!(".{}.clearing", WASM_HOST_INFLIGHT_FILE_NAME));
+    let _ = std::fs::remove_file(&aside);
+    let fixed = install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME);
+    match std::fs::rename(&fixed, &aside) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    }
+    let still_names = std::fs::read(&aside)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InFlightDeliveryMarker>(&bytes).ok())
+        .is_some_and(|mark| mark.names(identity));
+    if still_names {
+        return std::fs::remove_file(&aside).is_ok();
+    }
+    // A successor owns these bytes: put them back unless something already
+    // re-occupied the fixed name, and report the clear as not done.
+    if std::fs::symlink_metadata(&fixed).is_err() {
+        let _ = std::fs::rename(&aside, &fixed);
+    }
+    false
 }
 
 /// The exact bounded result-event sequence one drive retained for its served
@@ -3354,6 +3477,143 @@ mod tests {
             .expect("oversize fixture writable");
         assert_eq!(read_staged_bytes(&path), Err(MaterialError::TooLarge));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn inflight_identity(claim: &str) -> StagedDeliveryIdentity {
+        StagedDeliveryIdentity {
+            claim_id: claim.to_owned(),
+            operation_id: "op-2786".to_owned(),
+            generation: 7,
+            launch_nonce: "nonce-2786".to_owned(),
+            grant_digest: "d".repeat(64),
+            fence_generation: 1,
+            artifact_digest: "a".repeat(64),
+            input_digest: "i".repeat(64),
+            admitted_at_unix_ms: 4_000_000_000_000,
+            expires_at: 4_000_000_060_000,
+            authority_epoch_json: "{}".to_owned(),
+            envelope_digest: Sha256Digest::new("e".repeat(64)).expect("digest"),
+            host_artifact_digest: Sha256Digest::new("f".repeat(64)).expect("digest"),
+        }
+    }
+
+    fn inflight_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("inflight dir writable");
+        dir
+    }
+
+    /// A first claim stages its marker.
+    #[test]
+    fn inflight_first_write_acquires() {
+        let dir = inflight_dir("eliot-2786-inflight-acquire");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 1),
+            InFlightClaimOutcome::Acquired
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-driving the same claim is idempotent and rewrites nothing.
+    #[test]
+    fn inflight_same_identity_is_existing() {
+        let dir = inflight_dir("eliot-2786-inflight-existing");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 1),
+            InFlightClaimOutcome::Acquired
+        );
+        let snapshot =
+            std::fs::read(dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).expect("marker readable");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 2),
+            InFlightClaimOutcome::ExistingInFlight
+        );
+        assert_eq!(
+            std::fs::read(dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).expect("marker readable"),
+            snapshot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A late claim never takes over another identity's marker.
+    #[test]
+    fn inflight_foreign_identity_conflicts() {
+        let dir = inflight_dir("eliot-2786-inflight-conflict");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 1),
+            InFlightClaimOutcome::Acquired
+        );
+        let snapshot =
+            std::fs::read(dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).expect("marker readable");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-b"), 2),
+            InFlightClaimOutcome::Conflict
+        );
+        assert_eq!(
+            std::fs::read(dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).expect("marker readable"),
+            snapshot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unidentifiable slot bytes belong to their writer, not to us.
+    #[test]
+    fn inflight_garbage_conflicts() {
+        let dir = inflight_dir("eliot-2786-inflight-garbage");
+        std::fs::write(dir.join(WASM_HOST_INFLIGHT_FILE_NAME), b"not-json")
+            .expect("marker writable");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 1),
+            InFlightClaimOutcome::Conflict
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A served identity never re-executes under a fresh claim.
+    #[test]
+    fn inflight_served_identity_is_retained() {
+        let dir = inflight_dir("eliot-2786-inflight-retained");
+        std::fs::write(
+            dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME),
+            serde_json::to_vec(&serde_json::json!({"operation_id": "op-2786",
+                "generation": 7, "claim_id": "claim-a", "grant_digest": "g",
+                "retained_at_unix_ms": 1}))
+            .expect("record serializes"),
+        )
+        .expect("record writable");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 1),
+            InFlightClaimOutcome::RetainedResult
+        );
+        assert!(!dir.join(WASM_HOST_INFLIGHT_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clearing removes the caller's own marker.
+    #[test]
+    fn inflight_clear_matching_removes() {
+        let dir = inflight_dir("eliot-2786-inflight-clear");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-a"), 1),
+            InFlightClaimOutcome::Acquired
+        );
+        assert!(clear_inflight_marker(&dir, &inflight_identity("claim-a")));
+        assert!(!dir.join(WASM_HOST_INFLIGHT_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clearing never touches a successor's marker.
+    #[test]
+    fn inflight_clear_foreign_keeps() {
+        let dir = inflight_dir("eliot-2786-inflight-clear-foreign");
+        assert_eq!(
+            write_inflight_marker(&dir, &inflight_identity("claim-b"), 1),
+            InFlightClaimOutcome::Acquired
+        );
+        assert!(clear_inflight_marker(&dir, &inflight_identity("claim-a")));
+        assert!(dir.join(WASM_HOST_INFLIGHT_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_envelope_json(input: &DispatchMaterialInput) -> Vec<u8> {

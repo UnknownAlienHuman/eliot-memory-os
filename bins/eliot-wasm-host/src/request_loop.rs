@@ -5813,16 +5813,21 @@ fn seal_inflight_claim(
     claim: &crate::dispatch_material::DeliveryClaim,
     now_ms: u64,
 ) -> Result<(), OrdinaryDriveError> {
-    crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms).map_err(
-        |_| {
+    // Only a fresh or an idempotent re-drive claim executes: a retained
+    // result, a foreign first writer, or unknowable slot state all fail
+    // closed with the staged set left for the owner (issue #2786 AUD3).
+    match crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms) {
+        crate::dispatch_material::InFlightClaimOutcome::Acquired
+        | crate::dispatch_material::InFlightClaimOutcome::ExistingInFlight => Ok(()),
+        _ => {
             let identity = claim.identity();
-            OrdinaryDriveError::DeliveryInProgress {
+            Err(OrdinaryDriveError::DeliveryInProgress {
                 operation_id: identity.operation_id.clone(),
                 generation: identity.generation,
                 claim_id: identity.claim_id.clone(),
-            }
-        },
-    )
+            })
+        }
+    }
 }
 
 /// Seals the durable served evidence for one terminal outcome (#2786 step
