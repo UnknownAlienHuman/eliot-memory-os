@@ -647,6 +647,48 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat = ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue), allow_overlapping_prereqs=True)
         self.assertEqual(len(cat.rows), 2)
 
+        # A serialized overlap pins order through acceptance only. Launch stays
+        # ungated by it: without prerequisite evidence the plan refuses, and the
+        # accepted dependency never enters the selected denominator.
+        d_dep = make_desc(851, "D-WU-DEP", 44)
+        r_dep = make_row(d_dep, disposition=c.CatalogueDisposition.ACCEPTED_HISTORICAL, override_desc=None)
+        d_main = make_desc(852, "D-WU-MAIN", 42, source_roots=("scripts/work_unit_gate/cohort.py",))
+        r_main = make_row(d_main, prerequisites=(d_dep.issue,))
+
+        cat_serialized = ch.materialize_catalogue([r_dep, r_main], (d_dep.issue, d_main.issue))
+        self.assertEqual(len(cat_serialized.rows), 2)
+
+        selection_main = c.VerificationSelection(
+            cat_serialized.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_main.issue,)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_serialized, selection_main, [d_main])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
+        ev_serialized = c.PrerequisiteEvidence(
+            make_assignment(
+                d_dep,
+                state=c.IssueState.CLOSED,
+                source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE,
+            ),
+            "a" * 40,
+            "b" * 64,
+        )
+        plan_serialized = ch.materialize_selection_plan(
+            cat_serialized, selection_main, [d_main], prerequisites=[ev_serialized]
+        )
+        self.assertEqual(plan_serialized.prerequisites, (ev_serialized,))
+
+        # The same overlapping assigned pair without the serialization
+        # allowance stays a write-scope conflict.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_dep), r_main],
+                (d_dep.issue, d_main.issue),
+                allow_overlapping_prereqs=False,
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.WRITE_SCOPE_OVERLAP)
+
     # WORK_UNIT_CASE: 852/22
     def test_root_shared_generated_claims_rejected_for_ordinary_leaf(self):
         d_root = make_desc(852, "D-WU-LEAF", 42, source_roots=("Cargo.toml",))
@@ -930,6 +972,28 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_selection_plan(cat, selection, [d_parent], prerequisites=())
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
+        # A replaced parent kept as accepted historical is never scheduled with
+        # the replacement child that depends on it.
+        d_par = make_desc(837, "D-WU-FINAL", 42, source_roots=("scripts/work_unit_gate/cohort.py",))
+        d_chi = make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/work_unit_gate/plan.py",))
+        r_par = make_row(d_par, disposition=c.CatalogueDisposition.ACCEPTED_HISTORICAL)
+        r_chi = make_row(d_chi, prerequisites=(d_par.issue,))
+
+        cat_both = ch.materialize_catalogue([r_par, r_chi], (d_par.issue, d_chi.issue))
+        selection_both = c.VerificationSelection(
+            cat_both.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_par.issue, d_chi.issue)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_both, selection_both, [d_par, d_chi])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.PARENT_SCHEDULED_WITH_CHILDREN)
+
+        # A requirement outside the denominator stays blocking instead of
+        # validating as a resolvable prerequisite.
+        r_orphan = make_row(d_chi, prerequisites=(c.IssueIdentity(REPO, 999),))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([r_orphan], (d_chi.issue,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNRESOLVED_PREREQUISITE)
 
     # WORK_UNIT_CASE: 852/32
     def test_accepted_closed_prerequisite_versus_closed_without_proof_or_unresolved_legacy_umbrella(self):
