@@ -2464,6 +2464,61 @@ function New-GovernorRetirementCandidateFreeze(
     }
 }
 
+function Resolve-GovernorRetirementIssuerCertificate([object]$AdmittedIssuer, [string]$IssuerCertificatePath) {
+    # Explicit issuer-certificate resolution for retirement approval
+    # issuance (issue #2968 CCV1/W2). The owner-pinned trust policy
+    # admits exactly one issuer and pins its receipt certificate
+    # thumbprint; the caller supplies the explicit thumbprint or the
+    # absolute certificate path. Nothing is invented here: no identity
+    # is derived from the certificate, no receipt is signed, and every
+    # mismatch refuses before issuance runs.
+    if ([string]::IsNullOrWhiteSpace($IssuerCertificatePath)) {
+        throw 'retirement approval issuance requires the admitted owner release controller certificate as an explicit thumbprint or absolute certificate path'
+    }
+    $pinnedThumbprint = ([string](Read-GovernorApprovalField $AdmittedIssuer 'receipt_certificate_thumbprint')).Replace(' ', '').ToUpperInvariant()
+    if ($pinnedThumbprint -cnotmatch '^[0-9A-F]{40}$') {
+        throw 'the owner-pinned trust policy admits no exact receipt certificate thumbprint'
+    }
+    $certificate = $null
+    if ($IssuerCertificatePath -cmatch '^[0-9a-fA-F]{40}$') {
+        # An explicit 40-hex thumbprint resolves against the owner
+        # host's personal stores only; there is no other search path.
+        $wantedThumbprint = $IssuerCertificatePath.Replace(' ', '').ToUpperInvariant()
+        foreach ($store in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\My')) {
+            $found = @(Get-ChildItem -LiteralPath $store -ErrorAction SilentlyContinue |
+                Where-Object { ([string]$_.Thumbprint).Replace(' ', '').ToUpperInvariant() -ceq $wantedThumbprint })
+            if ($found.Count -gt 0) {
+                $certificate = $found[0]
+                break
+            }
+        }
+        if ($null -eq $certificate) {
+            throw "no certificate with thumbprint $IssuerCertificatePath was found for the owner release controller"
+        }
+    }
+    else {
+        if (-not [System.IO.Path]::IsPathRooted($IssuerCertificatePath)) {
+            throw 'the owner release controller certificate must be an explicit thumbprint or an explicit absolute path'
+        }
+        if (-not (Test-Path -LiteralPath $IssuerCertificatePath -PathType Leaf)) {
+            throw "the owner release controller certificate file was not found: $IssuerCertificatePath"
+        }
+        $full = [System.IO.Path]::GetFullPath($IssuerCertificatePath)
+        # No password is ever supplied: a password-protected PFX throws
+        # out of the constructor, so issuance fails closed instead of
+        # accepting a key it cannot read.
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($full)
+    }
+    $loadedThumbprint = ([string]$certificate.Thumbprint).Replace(' ', '').ToUpperInvariant()
+    if ($loadedThumbprint -cne $pinnedThumbprint) {
+        throw 'the supplied issuer certificate does not match the admitted receipt certificate thumbprint'
+    }
+    if (-not $certificate.HasPrivateKey) {
+        throw 'the owner release controller certificate carries no accessible private key; issuance runs on the owner host so the issuer never signs with a transported key'
+    }
+    return $certificate
+}
+
 function New-GovernorRetirementApproval(
     [string]$Repo,
     [string]$SourceCommit,
