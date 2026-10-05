@@ -301,6 +301,30 @@ schema_version = "eliot-work-unit-descriptor-v2"
             ch.materialize_selection_plan(cat, selection, [d1, d_extra])
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNEXPECTED_DESCRIPTOR)
 
+        # The numeric descriptor class must be *discovered* as the denominator,
+        # not merely consumed: only the canonical `<issue>.toml` spelling is a
+        # member. A temporary directory, never the real `.github/work-units`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "852.toml").write_bytes(b"")
+            self.assertEqual(
+                ch.discover_numeric_descriptor_files(root),
+                ((852, "852.toml"),),
+            )
+
+            # A noncanonical spelling of the same issue number is not a member.
+            (root / "0852.toml").write_bytes(b"")
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.discover_numeric_descriptor_files(root)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.FILENAME_MISMATCH)
+            (root / "0852.toml").unlink()
+
+            # An unknown non-numeric artifact fails closed.
+            (root / "notes.toml").write_bytes(b"")
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.discover_numeric_descriptor_files(root)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNEXPECTED_DESCRIPTOR)
+
     # WORK_UNIT_CASE: 852/7
     def test_malformed_unknown_field_fails(self):
         toml_with_unknown = b"""
@@ -938,6 +962,22 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         selection_promoted = c.VerificationSelection(cat.sha256, "e" * 64, c.SelectionScope.FULL_PROJECT, (d1.issue,))
         with self.assertRaises(c.ContractViolation):
             c.SelectedVerificationPlan(cat, selection_promoted, (d1,), ())
+
+        # An omitted required selected row fails the selection/descriptor
+        # denominator contract: the selection names both catalogue rows while the
+        # plan carries only one of them.
+        selection_omitted = c.VerificationSelection(cat.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue, d2.issue))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection_omitted, [d1])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
+        # A substituted required selected row - same issue, different descriptor
+        # identity - is well-formed yet stales the retained mirror binding.
+        d_changed = make_desc(852, "D-WU-B", 99, source_roots=("scripts/changed.py",))
+        self.assertNotEqual(d2.sha256, d_changed.sha256)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection_omitted, [d1, d_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
 
     # WORK_UNIT_CASE: 852/39
     def test_same_task_prerequisite_created_path_valid_planned_but_missing_actual_source_fails_attempt(self):
