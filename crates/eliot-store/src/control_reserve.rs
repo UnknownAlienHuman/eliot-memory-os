@@ -1268,4 +1268,44 @@ mod tests {
             matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_CONNECTION_BOTTLENECK)
         );
     }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679 A6/W4).
+    /// The single protected transaction slot is filled first and its permit
+    /// is held across the assertions, so the refusal observes a live
+    /// saturated partition rather than a released one. The refusal names
+    /// `STORE_TRANSACTION_BOTTLENECK`: exhaustion of one dimension is a
+    /// local disposition, never a global one (I14.3).
+    #[test]
+    fn store_protected_transaction_exhaustion_names_bottleneck() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-fill-1",
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_transaction(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-tx-shed-1",
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_TRANSACTION_BOTTLENECK)
+        );
+    }
 }
