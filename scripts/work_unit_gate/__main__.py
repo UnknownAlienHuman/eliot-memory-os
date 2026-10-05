@@ -2132,7 +2132,15 @@ def main(argv: list[str] | None = None) -> int:
                     owned_spawned += 1
                     owned_reaped += 1
                     # Compose typed discovery/execution bindings (once per test).
-                    for entry in discovery_doc.get("tests", []):
+                    # Exact selected denominator: extra discovery is a
+                    # mismatch failure before any execution, never a silent
+                    # clip and never execute-then-fail (mirrors the rust
+                    # mismatch rule once test binaries are produced).
+                    discovered_ids = discovery_doc.get("tests", [])
+                    if len(discovered_ids) > d.matrix_cases:
+                        return finish(fail_result(f"discovery denominator mismatch: issue-{num} (discovered {len(discovered_ids)}, matrix {d.matrix_cases})", 1,
+                                                  failed=[f"issue-{num}"]))
+                    for entry in discovered_ids:
                         tid = entry.get("id")
                         line = entry.get("line", 1)
                         try:

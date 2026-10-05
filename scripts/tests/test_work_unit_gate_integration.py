@@ -1424,6 +1424,27 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         self.assertIn('discovery failure', out + err)
 
 
+    # WORK_UNIT_CASE: 837/48
+    def test_selected_python_extra_discovery_denominator_mismatch(self):
+        # CCV6 exact selected denominator on the python path: the marked
+        # suite discovers exactly 2 tests against matrix_cases = 2, so a
+        # third test must fail closed before any execution (not clip, not
+        # execute-then-fail). The descriptor/assignment binding stays
+        # intact (rewriting matrix_cases would break it with
+        # STALE_ASSIGNMENT_BINDING instead); only the suite grows.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            suite = tmp / 'suite' / 'test_marked.py'
+            raw = suite.read_text(encoding='utf-8')
+            self.assertEqual(2, raw.count('def test_selected_'))
+            suite.write_text(raw + '\n    def test_selected_extra_denominator(self):\n        self.assertTrue(True)\n',
+                             encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        self.assertIn('discovery denominator mismatch: issue-837 (discovered 3, matrix 2)', out + err)
+
 
 if __name__ == '__main__':
     unittest.main()
