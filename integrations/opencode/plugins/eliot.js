@@ -49,7 +49,6 @@ const BRIDGE_ENV_KEYS = [
   "WINDIR",
   "ELIOT_AUTHORITY_EPOCH",
   "ELIOT_AGENT_BRIDGE_EXE",
-  "ELIOT_GOVERNOR_EXE",
   "ELIOT_HOST_PROFILE",
   "ELIOT_INSTALLATION_ID",
   "ELIOT_SESSION_ID",
@@ -105,9 +104,9 @@ function attachedTask() {
 }
 
 function bridgeExecutable() {
-  if (process.env.ELIOT_GOVERNOR_EXE) return process.env.ELIOT_GOVERNOR_EXE
+  if (process.env.ELIOT_AGENT_BRIDGE_EXE) return process.env.ELIOT_AGENT_BRIDGE_EXE
   if (!process.env.LOCALAPPDATA) return null
-  return `${process.env.LOCALAPPDATA}/Eliot/host-integrations/opencode/bin/eliot-governor.exe`
+  return `${process.env.LOCALAPPDATA}/Eliot/host-integrations/opencode/bin/eliot-agent-bridge.exe`
 }
 
 function bridgeEnvironment() {
@@ -882,7 +881,7 @@ async function invokeLegacyProcessBridge(kind, payload, { required = false } = {
   let child
   try {
     child = Bun.spawn({
-      cmd: [executable, "host", "event", "--host", "opencode", "--event", kind],
+      cmd: [executable, "host-event", "--host", "opencode", "--event", kind],
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
