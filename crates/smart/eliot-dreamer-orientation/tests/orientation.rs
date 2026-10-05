@@ -1997,3 +1997,23 @@ fn no_model_provider_store_authority_effect_finish_path() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("reprojection");
     assert_eq!(packet, replay);
 }
+
+// Issue #2901 W10: model commitment change moves packet_id
+#[test]
+fn model_commitment_change_changes_packet_id() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet_a =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("base projection");
+    let (job_b, bundle_b, candidate_b, policy_b, handles_b) = assemble_with(|options| {
+        options.counterevidence = vec!["w10 changed model commitment".into()];
+    });
+    let packet_b = project_orientation(&job_b, &bundle_b, &candidate_b, &handles_b, &policy_b)
+        .expect("changed projection");
+    assert_eq!(packet_a.packet_id.len(), 64);
+    assert_eq!(packet_b.packet_id.len(), 64);
+    assert_ne!(
+        packet_a.packet_id, packet_b.packet_id,
+        "model content change must move packet_id"
+    );
+    assert_ne!(packet_a.output_digest, packet_b.output_digest);
+}
