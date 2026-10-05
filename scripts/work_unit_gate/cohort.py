@@ -504,6 +504,17 @@ def materialize_catalogue(
     if len(set(active_units)) != len(active_units):
         raise CohortError(CohortProblem.DUPLICATE_UNIT, "duplicate unit across active catalogue rows")
 
+    # Prerequisite edges resolve inside the denominator: a row depending on
+    # an issue outside the rows being materialized is orphaned and stays
+    # blocking instead of validating.
+    known_issues = set(row_issues)
+    for r in rows:
+        if any(p not in known_issues for p in r.prerequisites):
+            raise CohortError(
+                CohortProblem.UNRESOLVED_PREREQUISITE,
+                f"row #{r.issue.number} requires a prerequisite outside the denominator",
+            )
+
     if integration_owners is not None and type(integration_owners) is not IntegrationOwnerProfile:
         raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owners profile mistyped")
     if type(package_sharing) is tuple:
@@ -635,12 +646,6 @@ def materialize_selection_plan(
             raise CohortError(CohortProblem.SELECTION_MISMATCH, f"selected row #{d.issue.number} is not ASSIGNED")
         if row.descriptor != d:
             raise CohortError(CohortProblem.STALE_MIRROR_BINDING, f"descriptor #{d.issue.number} does not match catalogue row")
-        for prereq in row.prerequisites:
-            if prereq not in cat_rows:
-                raise CohortError(
-                    CohortProblem.UNRESOLVED_PREREQUISITE,
-                    f"selected row #{d.issue.number} requires absent prerequisite #{prereq.number}",
-                )
 
     try:
         plan = c.SelectedVerificationPlan(
