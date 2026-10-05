@@ -32,22 +32,23 @@ def _snapshot(root: Path) -> dict[str, bytes]:
 
 
 class TestContextMeasurementInventory(unittest.TestCase):
-    def test_header_closed_versioned_31(self) -> None:
+    def test_header_closed_versioned_72(self) -> None:
         inv = _live()
         h = inv["header"]
-        self.assertEqual(h["schema"], "eliot.context-measurement-inventory.v1")
-        self.assertEqual(h["rule_revision"], "866.1")
+        self.assertEqual(h["schema"], "eliot.context-measurement-inventory.v2")
+        self.assertEqual(h["rule_revision"], "866.3")
         self.assertRegex(str(h["source_sha"]), r"\A[0-9a-f]{64}\Z")
         self.assertRegex(str(h["rule_digest"]), r"\A[0-9a-f]{64}\Z")
         self.assertRegex(str(h["owner_digest"]), r"\A[0-9a-f]{64}\Z")
-        self.assertEqual(h["candidate_count"], 31)
-        self.assertEqual(h["classified_count"], 31)
-        self.assertEqual(len(inv["rows"]), 31)
-        self.assertEqual(len(h["classifications"]), 10)
-        self.assertEqual(len(set(h["classifications"])), 10)
+        self.assertEqual(h["candidate_count"], 72)
+        self.assertEqual(h["classified_count"], 72)
+        self.assertEqual(len(inv["rows"]), 72)
+        self.assertEqual(len(h["classifications"]), 15)
+        self.assertEqual(len(set(h["classifications"])), 15)
         alloc = [str(x) for x in h["owner_allocations"]]  # type: ignore[union-attr]
         self.assertNotIn("#785", "".join(alloc))
-        self.assertEqual(sum(int(x.split(":")[1]) for x in alloc), 31)
+        self.assertEqual(sum(int(x.split(":")[1]) for x in alloc), 72)
+        self.assertEqual(sorted(alloc), ['#704:9', '#783:21', '#878:17', '#880:21', 'unresolved:4'])
         self.assertEqual(sorted(alloc), alloc)
         self.assertRegex(str(inv["inventory_digest"]), r"\A[0-9a-f]{64}\Z")
 
