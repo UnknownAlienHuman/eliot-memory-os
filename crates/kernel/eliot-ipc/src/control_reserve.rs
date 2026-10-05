@@ -686,4 +686,39 @@ mod tests {
             }
         ));
     }
+
+    /// The IPC owner must publish a live, validated
+    /// [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+    /// join (issue #1679): the row names exactly
+    /// [`IPC_PIPE_BYTES_BOTTLENECK`] with the frozen-map owner, so the
+    /// composition joins real owner evidence rather than a borrowed or
+    /// invented capacity story.
+    #[test]
+    fn ipc_publish_claimed_row_names_the_frozen_pipe_owner() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        // A returned row already passed `row.validate()`, so a contract
+        // failure here would be the fail-closed property itself.
+        let row = reserve
+            .publish_claimed_row("gen-7", "proof-ipc-1", "ev-ipc-1", "inv-ipc-1")
+            .expect("claimed row");
+
+        assert_eq!(row.bottleneck, IPC_PIPE_BYTES_BOTTLENECK);
+        assert_eq!(row.coverage_state, BottleneckCoverageState::Claimed);
+
+        // The owner string is read from the frozen contract rather than
+        // restated here: a hard-coded owner would only prove that the test
+        // agrees with itself.
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|b| b.bottleneck == IPC_PIPE_BYTES_BOTTLENECK)
+            .expect("frozen pipe owner");
+        assert_eq!(row.owner_ref, bound.owner);
+
+        // This owner claims no emergency partition.
+        assert!(row.emergency_limit.is_none());
+    }
 }
