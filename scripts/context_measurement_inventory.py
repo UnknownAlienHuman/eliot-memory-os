@@ -236,13 +236,13 @@ BASELINE_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("704/1", "#704", "crates/smart/eliot-context-measurement/src/stu.rs", "stu_for_bytes"),
     ("704/2", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "measure_serialized_context"),
     ("704/3", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "measure_exact_utf8"),
-    ("704/4", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "declared_len"),
-    ("704/5", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "content_digest"),
-    ("704/6", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "rendered_utf8_bytes"),
-    ("704/7", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "estimator_id"),
-    ("704/8", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "candidate_digests"),
+    ("704/4", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "declared_len@@0"),
+    ("704/5", "#704", "crates/smart/eliot-context-measurement/src/envelope.rs", "content_digest@@0"),
+    ("704/6", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "rendered_utf8_bytes@@0"),
+    ("704/7", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "estimator_id@@0"),
+    ("704/8", "#704", "crates/smart/eliot-context-measurement/src/lib.rs", "candidate_digests@@0"),
     ("704/9", "#704", "crates/smart/eliot-context-measurement/src/receipt.rs", "receipt_digest"),
-    ("783/1", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "final_bytes"),
+    ("783/1", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "final_bytes@@0"),
     ("783/2", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "envelope_digest"),
     ("783/3", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "serializer_id"),
     ("783/4", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "route_id"),
@@ -250,20 +250,20 @@ BASELINE_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/6", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "proves_fit"),
     ("783/7", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "fixed_overhead"),
     ("783/8", "#783", "crates/smart/eliot-context-assembly/src/measurement.rs", "ExactUtf8"),
-    ("878/1", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_id"),
-    ("878/2", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_options_digest"),
+    ("878/1", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_id@@0"),
+    ("878/2", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "serializer_options_digest@@0"),
     ("878/3", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "schema_version"),
-    ("878/4", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "StuEstimate"),
-    ("878/5", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "TokenizerObservation"),
-    ("878/6", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "utf8_bytes"),
-    ("880/1", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "fixed_overhead"),
-    ("880/2", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "headroom"),
-    ("880/3", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "observed_tokens"),
-    ("880/4", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "ProviderTokenizerRun"),
-    ("880/5", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Transformed"),
-    ("880/6", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Stale"),
-    ("880/7", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Absent"),
-    ("880/8", "#880", "crates/smart/eliot-context-measurement/tests/measurement.rs", "#[test]"),
+    ("878/4", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "StuEstimate@@0"),
+    ("878/5", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "TokenizerObservation@@0"),
+    ("878/6", "#878", "crates/smart/eliot-context-contracts/src/measurement.rs", "utf8_bytes@@0"),
+    ("880/1", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "fixed_overhead@@0"),
+    ("880/2", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "headroom@@0"),
+    ("880/3", "#880", "crates/smart/eliot-context-measurement/src/capacity.rs", "observed_tokens@@0"),
+    ("880/4", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "ProviderTokenizerRun@@0"),
+    ("880/5", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Transformed@@0"),
+    ("880/6", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Stale@@0"),
+    ("880/7", "#880", "crates/smart/eliot-context-measurement/src/observation.rs", "Absent@@0"),
+    ("880/8", "#880", "crates/smart/eliot-context-measurement/tests/measurement.rs", "#[test]@@0"),
 )
 
 EXPECTED_BASELINE_COUNT = 31
@@ -277,7 +277,7 @@ EXPECTED_BASELINE_COUNT = 31
 CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     # #783 app seam -- crates/eliot-app
     ("783/10", "#783", "crates/eliot-app/src/mcp_stdio.rs", "stu_for_bytes(envelope.byte_len)"),
-    ("783/11", "#783", "crates/eliot-app/src/mcp_stdio.rs", "combined_ul_tokens"),
+    ("783/11", "#783", "crates/eliot-app/src/mcp_stdio.rs", "combined_ul_tokens@@0"),
     ("783/12", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "serialized_bytes: measurement.byte_len"),
     ("783/13", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units: measurement.stu_estimate"),
     # 783/14 is the legacy memory `token_units` wire the migration ADDED beside
@@ -292,8 +292,8 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     # occurrences are 144 (the publishing site), 783 (the declaration), 793
     # (its per-record value constructor) and 1007 (783/13's `token_units`
     # field). The anchor is the bare token `token_units`, which matches the
-    # same identifier embedded in those three callee-path lines, so the FIRST
-    # masked occurrence is 144 -- the publishing site, not 783 and not 783/13's
+    # same identifier embedded in those three callee-path lines, so occurrence @@0
+    # (the first masked occurrence) is 144 -- the publishing site, not 783 and
     # 1007. Verified with the module's own `_mask_rust` + `_locate_signal`
     # against the current tree: span 144-144, 86 span bytes, inside
     # `fn dispatch_memory_distillation_preview`, production scope.
@@ -302,10 +302,10 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     # name earns, and the key is a wire key, never a second measurement owner:
     # the value it carries is produced by the closed legacy decoder, never by
     # the canonical owner.
-    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units"),
-    ("783/15", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "estimated_tokens,"),
-    ("783/16", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "details.section_tokens"),
-    ("783/17", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "runtime.ledger.cost_or_token_units"),
+    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units@@0"),
+    ("783/15", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "estimated_tokens,@@0"),
+    ("783/16", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "details.section_tokens@@0"),
+    ("783/17", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "runtime.ledger.cost_or_token_units@@0"),
     ("783/18", "#783", "crates/eliot-app/src/mcp_stdio/task_handlers.rs", "estimated_tokens: 431"),
     ("783/19", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "&& intent.cost_or_token_units == 0)"),
     ("783/20", "#783", "crates/eliot-app/src/mcp_stdio/operator.rs", ", score.context_cost, false),"),
@@ -319,10 +319,10 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("878/14", "#878", "crates/eliot-engine/src/context_contracts.rs", "pub estimated_tokens: usize,"),
     ("878/15", "#878", "crates/eliot-engine/src/context/packet_quality.rs", "report.estimated_tokens = estimated_tokens;"),
     ("878/16", "#878", "crates/eliot-engine/src/host.rs", "let value = stu_for_bytes(envelope.byte_len)?;"),
-    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "declared_len"),
+    ("878/17", "#878", "crates/eliot-engine/src/host.rs", "declared_len@@0"),
     ("878/18", "#878", "crates/eliot-engine/src/host.rs", "let expected_stu = stu_for_bytes(envelope.byte_len)?;"),
     ("878/19", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
-    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "serializer_id"),
+    ("878/20", "#878", "crates/eliot-engine/src/host.rs", "serializer_id@@0"),
     # #880 engine Skill / memory seam
     ("880/10", "#880", "crates/eliot-engine/src/skill.rs", "fn measure_skill_context_envelope("),
     ("880/11", "#880", "crates/eliot-engine/src/skill.rs", "pub(crate) fn estimated_context_cost(&self) -> u64 {"),
@@ -344,9 +344,9 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
 # They stay rows with owner "unresolved"; no owner is invented for them.
 # ---------------------------------------------------------------------------
 UNRESOLVED_CASES: tuple[tuple[str, str, str, str], ...] = (
-    ("unres/1", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", "pub cost_or_token_units: u64,"),
-    ("unres/2", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".cost_or_token_budget"),
-    ("unres/3", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".saturating_add(intent.cost_or_token_units)"),
+    ("unres/1", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", "pub cost_or_token_units: u64,@@0"),
+    ("unres/2", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".cost_or_token_budget@@0"),
+    ("unres/3", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".saturating_add(intent.cost_or_token_units)@@0"),
     ("unres/4", UNRESOLVED_OWNER, "crates/eliot-engine/src/cognition.rs", "|| treatment.estimated_tokens < control.estimated_tokens"),
 )
 
@@ -373,7 +373,7 @@ EXCLUSION_CASES: tuple[tuple[str, str, str, str], ...] = (
      "seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic"),
     ("exc/3", "crates/eliot-app/src/host_runtime/supervised_process.rs", "hash.chars().count() <= 128",
      "digest text length bound on a hash string; no byte/char/token/STU semantic"),
-    ("exc/4", "crates/eliot-app/src/host_runtime/supervised_process.rs", "if detail.chars().count() > 512",
+    ("exc/4", "crates/eliot-app/src/host_runtime/supervised_process.rs", "if detail.chars().count() > 512@@0",
      "log-detail truncation bound; no byte/char/token/STU semantic"),
     ("exc/5", "crates/eliot-engine/src/host.rs", "let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()",
      "nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens"),
@@ -549,6 +549,11 @@ ROW_KEYS = frozenset(
         "invalidation",
     }
 )
+
+# Alias the closed row-key set under the name the versioned suite asserts.
+# The suite must fail loudly if a row ever gains or loses a key, so the name
+# is part of the stable oracle surface reused by #787 (never copy the set).
+REQUIRED_ROW_KEYS = frozenset(ROW_KEYS)
 
 WORKSET_KEYS = frozenset(
     {
@@ -986,26 +991,80 @@ def _load_files(root: Path, rels: tuple[str, ...] | list[str]) -> dict[str, dict
     return cache
 
 
-def _locate_signal(record: dict[str, object], rel: str, signal: str) -> tuple[int, int]:
-    """First masked line holding ``signal``; whole item span for fn needles."""
+_OCCURRENCE_SELECTOR_RE = re.compile(r"@@(\d+)$")
+
+
+def _split_occurrence_selector(signal: str) -> tuple[str, int | None]:
+    """Split a frozen reconciliation hint into base needle + occurrence index.
+
+    A trailing ``@@<n>`` pins the n-th masked occurrence (0-based) of the base
+    needle. ``@@`` never occurs in valid Rust, so the suffix is unambiguous.
+    The suffix is a stable, explicit occurrence identity, never a silent
+    first-pick: an unqualified needle matching several occurrences fails
+    closed, and a stale index fails closed with SIGNAL_ABSENT. Strip the
+    suffix before classification: the class is earned by the base needle,
+    never by the identity suffix.
+    """
+    match = _OCCURRENCE_SELECTOR_RE.search(signal)
+    if match is None:
+        return (signal, None)
+    return (signal[: match.start()], int(match.group(1)))
+
+
+def _locate_all_occurrences(
+    record: dict[str, object], rel: str, base: str
+) -> list[tuple[int, int]]:
+    """Every masked occurrence span of ``base`` in file order (#866 W2).
+
+    Whole item span for ``fn `` needles, single lines otherwise. The caller,
+    never this function, decides which occurrence a row owns.
+    """
+    _ = rel
     masked_lines = record["masked_lines"]
     assert isinstance(masked_lines, list)
-    span_start = 0
+    occurrences: list[tuple[int, int]] = []
     for lineno, line in enumerate(masked_lines, start=1):
-        if signal in line:
-            span_start = lineno
-            break
-    if span_start == 0:
+        if base in line:
+            span_end = lineno
+            if base.startswith("fn "):
+                depths = record["depths"]
+                assert isinstance(depths, list)
+                span_end = _item_extent(masked_lines, depths, lineno)
+            occurrences.append((lineno, span_end))
+    return occurrences
+
+
+def _locate_signal(record: dict[str, object], rel: str, signal: str) -> tuple[int, int]:
+    """One masked span for ``signal``; whole item span for fn needles (#866 W2).
+
+    ``signal`` may carry an explicit ``@@<n>`` occurrence pin. An unqualified
+    needle resolving to zero occurrences raises SIGNAL_ABSENT; resolving to
+    several raises AMBIGUOUS_SIGNAL instead of silently taking the first. A
+    stale pin raises SIGNAL_ABSENT. This is the stable discovery API reused
+    by #787 (import these helpers, never copy their rules).
+    """
+    base, selected = _split_occurrence_selector(signal)
+    occurrences = _locate_all_occurrences(record, rel, base)
+    if not occurrences:
         raise InventoryError(
             "SIGNAL_ABSENT",
             f"denominator signal {signal!r} absent from masked source: {rel}",
         )
-    span_end = span_start
-    if signal.startswith("fn "):
-        depths = record["depths"]
-        assert isinstance(depths, list)
-        span_end = _item_extent(masked_lines, depths, span_start)
-    return (span_start, span_end)
+    if selected is None:
+        if len(occurrences) > 1:
+            raise InventoryError(
+                "AMBIGUOUS_SIGNAL",
+                f"reconciliation hint {signal!r} resolves to {len(occurrences)} "
+                f"occurrences in {rel}; pin one explicitly with @@<n>",
+            )
+        return occurrences[0]
+    if selected >= len(occurrences):
+        raise InventoryError(
+            "SIGNAL_ABSENT",
+            f"denominator signal {signal!r} pins occurrence {selected} but only "
+            f"{len(occurrences)} occur in masked source: {rel}",
+        )
+    return occurrences[selected]
 
 
 def _span_bytes(record: dict[str, object], span_start: int, span_end: int) -> int:
@@ -1167,7 +1226,10 @@ def classify_context_measurement(
             "bare_measurement_field_or_conversion",
             f"bare measurement field or projection: {signal!r}; carries no estimator policy of its own",
         )
-    if any(signal == needle for _ref, _path, needle, _reason in EXCLUSION_CASES):
+    if any(
+        signal == _split_occurrence_selector(needle)[0]
+        for _ref, _path, needle, _reason in EXCLUSION_CASES
+    ):
         return (
             "unrelated_byte_or_character_metric",
             f"declared unrelated byte/character metric: {signal!r}; excluded with exact evidence, not a package skip",
@@ -1336,7 +1398,8 @@ def discover_context_measurements(
         depths = record["depths"]
         assert isinstance(depths, list)
         item, item_scope = _scope_of(masked_lines, depths, span_start, rel)
-        classification, evidence = classify_context_measurement(signal, rel, item_scope)
+        base_signal, _occurrence = _split_occurrence_selector(signal)
+        classification, evidence = classify_context_measurement(base_signal, rel, item_scope)
         if classification not in CLASSIFICATIONS:
             raise InventoryError(
                 "CLASSIFICATION_NOT_CLOSED", f"class is outside the closed set: {classification!r}"
@@ -1359,6 +1422,26 @@ def discover_context_measurements(
                 "item_scope": item_scope,
             }
         )
+    spans_by_path: dict[str, list[tuple[int, int, str]]] = {}
+    for candidate in candidates:
+        spans_by_path.setdefault(str(candidate["path"]), []).append(
+            (
+                int(candidate["span_start"]),  # type: ignore[arg-type]
+                int(candidate["span_end"]),  # type: ignore[arg-type]
+                str(candidate["case_ref"]),
+            )
+        )
+    for path, spans in spans_by_path.items():
+        for first in range(len(spans)):
+            for second in range(first + 1, len(spans)):
+                start_a, end_a, ref_a = spans[first]
+                start_b, end_b, ref_b = spans[second]
+                if start_a <= end_b and start_b <= end_a:
+                    raise InventoryError(
+                        "OVERLAPPING_SPANS",
+                        f"rows {ref_a} and {ref_b} claim overlapping spans "
+                        f"in {path}; refine one anchor",
+                    )
     candidates.sort(key=lambda item: _case_sort_key(str(item["case_ref"])))
     return file_records, candidates
 
@@ -1382,7 +1465,8 @@ def discover_exclusions(
         if record is None:
             raise InventoryError("SCAN_INPUT_MISSING", f"exclusion input was not loaded: {rel}")
         span_start, span_end = _locate_signal(record, rel, needle)
-        label, label_reason = classify_context_measurement(needle, rel)
+        base_needle, _index = _split_occurrence_selector(needle)
+        label, label_reason = classify_context_measurement(base_needle, rel)
         if label != "unrelated_byte_or_character_metric":
             raise InventoryError(
                 "EXCLUSION_NOT_UNRELATED",
@@ -2988,7 +3072,8 @@ def run_self_tests() -> int:
     assert tuple(BASELINE_CASES) == tuple(DENOMINATOR_CASES[:EXPECTED_BASELINE_COUNT])
     # Every rule arm resolves to a closed class; unknown fails closed.
     for _ref, _owner, _path, signal in DENOMINATOR_CASES:
-        label, evidence = classify_context_measurement(signal)
+        base, _index = _split_occurrence_selector(signal)
+        label, evidence = classify_context_measurement(base)
         assert label in CLASSIFICATIONS, signal
         assert evidence, signal
     for signal in ("#[test]", "cfg(test)"):
@@ -3007,8 +3092,9 @@ def run_self_tests() -> int:
         == "bare_measurement_field_or_conversion"
     )
     for _ref, _path, needle, _reason in EXCLUSION_CASES:
+        base, _index = _split_occurrence_selector(needle)
         assert (
-            classify_context_measurement(needle)[0] == "unrelated_byte_or_character_metric"
+            classify_context_measurement(base)[0] == "unrelated_byte_or_character_metric"
         ), needle
     try:
         classify_context_measurement("definitely-not-a-measurement-signal-xyz")
