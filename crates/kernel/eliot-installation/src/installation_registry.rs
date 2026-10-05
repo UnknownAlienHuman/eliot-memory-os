@@ -62,12 +62,12 @@ use crate::validate_approval_against_manifest;
 use crate::{
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
-    ApprovedGenerationRegistry, CommittedCutoverActivation, HostPhaseBMaterializationIntent,
-    HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
-    InstallationActivationApproval, InstallationError, PendingActivation,
-    PendingActivationAbortReceipt, PreparedDestinationAdmission,
-    PreparedDestinationMaterialisation, WindowsPathIdentity, activation_terminal_digest,
-    candidate_manifest_digest, valid_installation_key,
+    ApprovedGeneration, ApprovedGenerationRegistry, CommittedCutoverActivation,
+    HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
+    HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
+    InstallationError, PendingActivation, PendingActivationAbortReceipt,
+    PreparedDestinationAdmission, PreparedDestinationMaterialisation, WindowsPathIdentity,
+    activation_terminal_digest, candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -952,6 +952,7 @@ impl RedbInstallationRegistry {
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         admission: &PreparedDestinationAdmission,
+        destination_generation: &ApprovedGeneration,
         materialisation: &PreparedDestinationMaterialisation,
         current_purge_ledger_revision: u64,
     ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
@@ -981,11 +982,19 @@ impl RedbInstallationRegistry {
         // nothing is deleted by name: removal stays with the handle-bound
         // publication teardown that can only act on an object it created itself.
         verify_materialised_destination_root(materialisation)?;
+        destination_generation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination.destination_generation".to_owned(),
+                reason: error.to_string(),
+            })?;
         let admission = admission.clone();
+        let destination_generation = destination_generation.clone();
         let materialisation = materialisation.clone();
         self.mutate_atomic(expected_revision, |registry| {
             registry.record_prepared_isolated_destination_creation_unchecked(
                 &admission,
+                &destination_generation,
                 &materialisation,
                 current_purge_ledger_revision,
             )
@@ -1046,6 +1055,7 @@ impl RedbInstallationRegistry {
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         admission: &PreparedDestinationAdmission,
+        destination_generation: &ApprovedGeneration,
         current_purge_ledger_revision: u64,
     ) -> Result<PreparedDestinationAdmission, InstallationError> {
         let _guard = host
@@ -1058,10 +1068,18 @@ impl RedbInstallationRegistry {
                 field: "prepared_isolated_destination".to_owned(),
                 reason: error.to_string(),
             })?;
+        destination_generation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination.destination_generation".to_owned(),
+                reason: error.to_string(),
+            })?;
         let admission = admission.clone();
+        let destination_generation = destination_generation.clone();
         self.mutate_atomic(expected_revision, |registry| {
             registry.record_prepared_isolated_destination_unchecked(
                 &admission,
+                &destination_generation,
                 current_purge_ledger_revision,
             )
         })
@@ -1097,6 +1115,41 @@ impl RedbInstallationRegistry {
                         .to_owned(),
                 )
             })
+    }
+
+    /// Reads back the retained destination [`ApprovedGeneration`] row for an
+    /// operation.
+    ///
+    /// This is the proof readback for the allocated destination installation:
+    /// its own installation identity, lineage and allocation fence, through a
+    /// real registry read. It grants no mutation authority, and the row is
+    /// re-validated on the way out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::IncompleteObservation`] when this authority
+    /// retains no destination row for that operation.
+    pub fn read_prepared_destination_generation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        operation_id: &PlatformHandle,
+    ) -> Result<ApprovedGeneration, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.validate_host_owner_capability(host)?;
+        let registry = self.load()?;
+        let row = registry
+            .prepared_destination_generation(operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "this authority retains no destination generation row for that operation"
+                        .to_owned(),
+                )
+            })?;
+        row.validate()?;
+        Ok(row)
     }
 
     /// Reads back the ADMISSION and the MATERIALISATION of one isolated

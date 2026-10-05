@@ -31,7 +31,7 @@ use super::{must, registering_transaction, test_activation_approval, test_handle
 use crate::isolated_destination::{
     DestinationLeafObservation, IsolationEvidence, PreparedDestinationAdmission,
     PreparedDestinationMaterialisation, ProposedRestorationRequirements,
-    resolve_current_approved_target,
+    destination_generation_for_admission, resolve_current_approved_target,
 };
 // The real-filesystem cases below drive the materialise seam itself, which needs
 // a retained protected-root lease and therefore a real Windows contour. The
@@ -164,6 +164,36 @@ fn fixture() -> Fixture {
     fixture
 }
 
+/// The destination generation row one admission allocates, built through the
+/// production builder rather than a hand-written value, so these proofs hold
+/// the same row the installation authority would record: the approved source
+/// build re-identified for the destination, fenced by that build's own
+/// allocation fence, never active.
+fn destination_generation_for(
+    fixture: &Fixture,
+    admission: &PreparedDestinationAdmission,
+) -> ApprovedGeneration {
+    let approved_target = fixture
+        .registry
+        .generations
+        .iter()
+        .find(|generation| generation.manifest.generation == fixture.active_generation)
+        .expect("the fixture retains its active approved row");
+    let allocation_fence = approved_target
+        .manifest
+        .runtime_launch
+        .authority_state_fence
+        .clone();
+    must(destination_generation_for_admission(
+        approved_target,
+        &admission.operation_id,
+        &admission.destination_installation,
+        &admission.admission_digest,
+        &allocation_fence,
+        &test_handle("owner:958-isolated-destination"),
+    ))
+}
+
 /// Records one admission at the purge revision the ORS owner reports now.
 ///
 /// The live revision is an argument at every call site rather than a fixture
@@ -174,9 +204,14 @@ fn record(
     admission: &PreparedDestinationAdmission,
     live_purge_revision: u64,
 ) -> Result<PreparedDestinationAdmission, InstallationError> {
+    let destination_generation = destination_generation_for(fixture, admission);
     fixture
         .registry
-        .record_prepared_isolated_destination_unchecked(admission, live_purge_revision)
+        .record_prepared_isolated_destination_unchecked(
+            admission,
+            &destination_generation,
+            live_purge_revision,
+        )
 }
 
 /// Records one admission together with the root created for it, as one fact.
@@ -186,10 +221,12 @@ fn record_creation(
     materialisation: &PreparedDestinationMaterialisation,
     live_purge_revision: u64,
 ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
+    let destination_generation = destination_generation_for(fixture, admission);
     fixture
         .registry
         .record_prepared_isolated_destination_creation_unchecked(
             admission,
+            &destination_generation,
             materialisation,
             live_purge_revision,
         )

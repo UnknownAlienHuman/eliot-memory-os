@@ -10,25 +10,27 @@
 //! restoration requirements. A client-supplied arbitrary path, active/source
 //! installation or preexisting foreign owner is rejected.`
 //!
-//! # Why this is not an `ApprovedGeneration`
+//! # Why the destination ALSO gets an `ApprovedGeneration` row
 //!
-//! Every row in [`ApprovedGenerationRegistry::generations`] is an *approved*
-//! generation and carries an [`InstallationActivationApproval`], whose only
-//! constructor is `pub(crate)` and whose production issuer is the signed
-//! activation bridge — the **activation** boundary. It additionally requires a
-//! live exclusive installer `HostOwnerEpochCapability` and a stopped SCM
-//! contour. Writing such a row during preparation would therefore (a) fabricate
-//! owner material this crate forbids forging, and (b) perform an activation,
-//! which the same issue forbids ("no automatic source stop", "A later
-//! dedicated cutover child alone activates/retire installations"). The crate had
-//! no representation at all for "allocated but not approved", so this module
-//! adds exactly that representation —
-//! [`PreparedDestinationAdmission`] — and the public CAS seam
-//! [`RedbInstallationRegistry::record_prepared_isolated_destination`] that
-//! inserts it. It is deliberately NOT a second installation representation: it
-//! is a bounded, operation-keyed admission record inside the same registry
-//! projection, carrying no generation, no approval and no activation authority.
+//! Every row in [`ApprovedGenerationRegistry::generations`] carries an
+//! [`InstallationActivationApproval`]. The signed activation bridge issues
+//! such approvals for installer-produced candidates — the **activation**
+//! boundary — and preparation never performs an activation ("no automatic
+//! source stop", "A later dedicated cutover child alone activates/retires
+//! installations"). But the allocated destination installation still needs its
+//! own row with its own installation identity, lineage and allocation fence:
+//! that is what [`destination_generation_for_admission`] builds, with the
+//! approval issued through the explicit preparation issuer
+//! (`InstallationActivationApproval::from_preparation_parts`) rather than the
+//! signed bridge. The row is never active and never last-known-good — the same
+//! staged-but-inactive shape `stage_pending_activation` already uses — so the
+//! source row stays current and no cutover happens here.
 //!
+//! [`PreparedDestinationAdmission`] remains the operation-keyed admission
+//! record beside it: it says the destination was ADMITTED (and, with the
+//! materialisation, what was created and where it is staged), while the
+//! generation row says what installation it WILL BE after a separately
+//! admitted cutover activates it.
 //! # Order: validation before effects
 //!
 //! [`admit_prepared_isolated_destination`] is pure. It performs no filesystem
@@ -111,9 +113,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ApprovedGeneration, FileIdentity, InstallationError, InstallationHostRootClass, PlatformHandle,
-    RuntimeStateRoots, canonical_json_bytes, classify_installation_host_root, handle,
-    joined_windows_path, sha256_handle, sha256_hex, text, valid_installation_key,
+    ApprovedGeneration, FileIdentity, InstallationActivationApproval, InstallationEpoch,
+    InstallationError, InstallationHostRootClass, InstallationProfile, PHASE_B_PENDING_MARKER,
+    PlatformHandle, RuntimeStateRoots, StateFence, SupervisionAuthorityBinding,
+    canonical_json_bytes, classify_installation_host_root, handle, joined_windows_path,
+    sha256_handle, sha256_hex, text, valid_installation_key,
 };
 
 /// Durable wire discriminator of one prepared, unactivated destination
@@ -216,6 +220,17 @@ pub enum IsolatedDestinationRefusal {
     /// not own it.
     #[error("the destination leaf already exists and is not owned by this operation")]
     DestinationNotAbsent,
+
+    /// The approved target carries a provisioned (transaction-bound)
+    /// supervision authority, which names the source generation and cannot be
+    /// re-bound to a new destination generation. A destination is only
+    /// allocated for an approved target whose supervision authority is still
+    /// pending; anything else is refused rather than re-issued.
+    #[error(
+        "the approved target carries a provisioned supervision authority bound to its own \
+         generation, so no destination generation can be derived from it"
+    )]
+    ProvisionedSupervisionAuthority,
 }
 
 /// Durable wire discriminator of one materialised destination root.
@@ -1506,6 +1521,10 @@ pub struct IsolatedDestinationAllocation {
     pub destination_installation_root: String,
     /// The durable admission record the registry stores for this allocation.
     pub admission: PreparedDestinationAdmission,
+    /// The destination [`ApprovedGeneration`] row the registry stores for this
+    /// allocation: the allocated destination installation with its own
+    /// lineage and allocation fence, never active and never last-known-good.
+    pub destination_generation: ApprovedGeneration,
 }
 
 /// Owner-issued inputs of one prepared-destination admission.
@@ -1576,6 +1595,14 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
     /// This is the EXISTING-INSTALLATION set, and it is compared against the
     /// destination identity and nothing else.
     pub known_installations: &'a [PlatformHandle],
+    /// Exact state fence the admitted request was observed under. It becomes
+    /// the destination row's own allocation fence (authority generation and
+    /// state fence), so the row is fenced at allocation and a later cutover
+    /// advances it explicitly rather than inheriting a stale one.
+    pub allocation_fence: &'a StateFence,
+    /// Authenticated principal the owner admitted for this operation. It
+    /// becomes the destination approval's required owner.
+    pub required_owner: &'a PlatformHandle,
 }
 
 /// Resolves the approved target generation a destination is prepared FOR, out of
@@ -1636,6 +1663,171 @@ pub(crate) fn resolve_current_approved_target<'a>(
         ));
     }
     Ok(approved_target)
+}
+
+/// Domain separator of the prepared-destination lineage derivation.
+const DESTINATION_LINEAGE_DOMAIN: &str = "eliot.installation.prepared-destination-lineage.v1";
+
+/// Derives the future installation roots of a profiled (non-portable)
+/// destination installation: the same topology derivation the installer uses,
+/// under `installations/<destination-key>` instead of the source key.
+///
+/// The directories do not exist yet — only the staged destination root in the
+/// isolated area was created. The row is a staged candidate for the cutover
+/// child, exactly like a pending-activation manifest describes a not-yet-active
+/// state, and the cutover verifies and populates these roots before it may
+/// activate the row.
+fn destination_profiled_roots(
+    approved_target: &ApprovedGeneration,
+    destination_installation: &PlatformHandle,
+) -> Result<RuntimeStateRoots, IsolatedDestinationError> {
+    RuntimeStateRoots::derive_profiled(
+        approved_target.manifest.runtime_launch.profile,
+        approved_target
+            .manifest
+            .runtime_launch
+            .runtime_state_roots
+            .profile_anchor_root
+            .clone(),
+        destination_installation.as_str(),
+    )
+    .map_err(IsolatedDestinationError::Installation)
+}
+
+/// Builds the destination [`ApprovedGeneration`] row one admission allocates
+/// (issue #958, A2).
+///
+/// The row is a REAL approved-generation row in the authority's `generations`
+/// collection, with its own installation identity, its own lineage and its own
+/// allocation fence — and it is never active and never last-known-good, so
+/// allocation is not activation and the source row stays current until a
+/// separately admitted cutover moves it. The manifest is the approved source
+/// build's manifest re-identified for the destination (same artifacts, which is
+/// what makes the row a restore of that build): only the generation identity,
+/// the installation epoch, the allocation fence and the recomputed digests
+/// differ. The approval is issued through
+/// [`InstallationActivationApproval::from_preparation_parts`], the explicit
+/// preparation issuer, never through the signed activation bridge.
+///
+/// Fail-closed properties, in order: a provisioned (transaction-bound)
+/// supervision authority names the source generation and cannot be re-bound,
+/// so it refuses; the allocation fence must be a non-zero generation with a
+/// consistent state fence, otherwise the approval's own validation refuses;
+/// the recomputed descriptor digest, the manifest validation and the
+/// approval-against-manifest binding are all re-verified before the row is
+/// returned.
+pub fn destination_generation_for_admission(
+    approved_target: &ApprovedGeneration,
+    operation_id: &PlatformHandle,
+    destination_installation: &PlatformHandle,
+    admission_digest: &PlatformHandle,
+    allocation_fence: &StateFence,
+    required_owner: &PlatformHandle,
+) -> Result<ApprovedGeneration, IsolatedDestinationError> {
+    if allocation_fence.resource_generation.value() == 0 {
+        return Err(IsolatedDestinationError::Installation(
+            InstallationError::IncompleteObservation(
+                "the allocation fence carries no authority generation for the destination row"
+                    .to_owned(),
+            ),
+        ));
+    }
+    if !matches!(
+        approved_target
+            .manifest
+            .runtime_launch
+            .supervision_authority,
+        SupervisionAuthorityBinding::Pending { .. }
+    ) {
+        return Err(IsolatedDestinationRefusal::ProvisionedSupervisionAuthority.into());
+    }
+    let mut manifest = approved_target.manifest.clone();
+    manifest.generation = destination_installation.clone();
+    manifest.runtime_launch.generation = destination_installation.clone();
+    let lineage_bytes = canonical_json_bytes(&(
+        DESTINATION_LINEAGE_DOMAIN,
+        operation_id.as_str(),
+        destination_installation.as_str(),
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "prepared_destination.lineage".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let lineage_id = PlatformHandle::new(sha256_hex(&lineage_bytes)).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "prepared_destination.lineage".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    manifest.runtime_launch.installation_epoch = InstallationEpoch {
+        installation: destination_installation.clone(),
+        lineage_id,
+        sequence: 1,
+    };
+    manifest.runtime_launch.authority_generation = allocation_fence.resource_generation;
+    manifest.runtime_launch.authority_state_fence = allocation_fence.clone();
+    manifest.runtime_launch.authority_descriptor_digest =
+        PlatformHandle::new(PHASE_B_PENDING_MARKER).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "prepared_destination.authority_descriptor_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    if manifest.runtime_launch.profile == InstallationProfile::PortableDev {
+        // I3.1 versions the portable immutable root BY generation, so renaming
+        // the generation without re-deriving the root would leave the row
+        // naming the old build's binaries; the derivation below is the same
+        // join the manifest validation enforces. The runtime roots are shared
+        // by design: portable_dev has no per-installation roots, its
+        // installation root always equals the single retained portable root.
+        let portable_root = manifest.runtime_launch.portable_root.clone().ok_or(
+            IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+                "the approved target names no portable root to derive the destination \
+                         immutable root from"
+                    .to_owned(),
+            )),
+        )?;
+        manifest
+            .runtime_launch
+            .profile_governed_roots
+            .immutable_binaries = joined_windows_path(
+            &joined_windows_path(
+                &joined_windows_path(portable_root.as_str(), "target"),
+                "eliot-dev",
+            ),
+            destination_installation.as_str(),
+        );
+        manifest.runtime_launch.runtime_state_roots = approved_target
+            .manifest
+            .runtime_launch
+            .runtime_state_roots
+            .clone();
+    } else {
+        manifest.runtime_launch.runtime_state_roots =
+            destination_profiled_roots(approved_target, destination_installation)?;
+    }
+    manifest.runtime_launch = manifest.runtime_launch.with_computed_digest()?;
+    manifest.validate()?;
+    let approval = InstallationActivationApproval::from_preparation_parts(
+        operation_id.clone(),
+        admission_digest.clone(),
+        &manifest,
+        required_owner.clone(),
+        allocation_fence.resource_generation,
+        allocation_fence.clone(),
+    )?;
+    approval.validate()?;
+    crate::approved_generation_registry::validate_approval_against_manifest(
+        &approval,
+        &manifest,
+        "prepared_destination.destination_generation",
+    )?;
+    Ok(ApprovedGeneration {
+        manifest,
+        approval,
+        active: false,
+        last_known_good: false,
+    })
 }
 
 /// Admits and allocates a new, distinct, isolated destination installation.
@@ -2002,11 +2194,27 @@ pub fn admit_prepared_isolated_destination(
     };
     admission.validate()?;
 
+    // 10. The allocated destination installation gets its own
+    //     [`ApprovedGeneration`] row — its own installation identity, lineage
+    //     and allocation fence, never active — built from the approved target
+    //     row this same admission proved current above. The row is part of the
+    //     allocation (pure, pre-effect) so the registry record writes it
+    //     together with the admission under one CAS.
+    let destination_generation = destination_generation_for_admission(
+        approved_target,
+        &input.facts.operation_id,
+        &input.facts.destination_installation,
+        &admission.admission_digest,
+        input.allocation_fence,
+        input.required_owner,
+    )?;
+
     Ok(IsolatedDestinationAllocation {
         operation_id: admission.operation_id.clone(),
         destination_installation: destination_key,
         destination_installation_root,
         admission,
+        destination_generation,
     })
 }
 

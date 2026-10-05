@@ -6891,6 +6891,16 @@ impl HostComposition {
         // against that same row's manifest.
         let approved_generations = evidence.approved_generations();
         let approved_target_generation = evidence.approved().manifest.generation.clone();
+        // The allocation fence is the exact state fence the admitted request
+        // was observed under: it becomes the destination row's own fence, so
+        // the row is fenced at allocation rather than inheriting a stale one.
+        // The required owner is the authenticated principal the owner admitted.
+        let required_owner = eliot_installation::PlatformHandle::new(
+            body.identity.principal.principal.as_str(),
+        )
+        .map_err(
+            |_| "the admitted principal cannot name the required owner of the destination row",
+        )?;
         let allocation = eliot_installation::admit_prepared_isolated_destination(
             &IsolatedDestinationAdmissionInput {
                 facts: &facts,
@@ -6903,6 +6913,8 @@ impl HostComposition {
                 restoration_requirements: &requirements,
                 current_purge_ledger_revision: purge_revision,
                 known_installations: &known,
+                allocation_fence: &body.identity.fence,
+                required_owner: &required_owner,
             },
         )
         .map_err(|error| Self::isolated_destination_reason(&error))?;
@@ -6972,6 +6984,7 @@ impl HostComposition {
                 &capability,
                 evidence.revision(),
                 &allocation.admission,
+                &allocation.destination_generation,
                 &materialisation,
                 purge_revision,
             )
@@ -7073,6 +7086,12 @@ impl HostComposition {
             }
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationNotAbsent) => {
                 "the derived destination leaf already exists and is not owned by this operation"
+            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::ProvisionedSupervisionAuthority,
+            ) => {
+                "the approved target carries a provisioned supervision authority bound to its own \
+                 generation, so no destination generation can be derived from it"
             }
             IsolatedDestinationError::BoundRecord(_) => {
                 "an owner-issued backup record bound to this operation did not validate"
