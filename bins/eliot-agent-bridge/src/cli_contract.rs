@@ -463,3 +463,116 @@ where
         client_declaration: client_declaration.ok_or(CliError::MissingClientDeclaration)?,
     })
 }
+
+/// `mcp catalog` selection (issue #18, CATALOG-REFINED): mirrors the facade
+/// `McpCommand::Catalog` shape exactly — `--host` (default `claude`),
+/// `--surface` (default `desktop`). Rendering lives in the forthcoming
+/// `packager_catalog` module; this contract owns argv only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpCatalogArgs {
+    pub host: String,
+    pub surface: eliot_types::ClaudeSurface,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "checked CLI contract: one arm per documented catalog argument"
+)]
+pub fn parse_mcp_catalog_args<I, S>(arguments: I) -> Result<McpCatalogArgs, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
+    let mut host = "claude".to_owned();
+    let mut surface = "desktop".to_owned();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--host" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument("--host requires a value".to_owned())
+                })?;
+                host = value.clone();
+                index += 2;
+            }
+            value if value.starts_with("--host=") => {
+                let value = value.trim_start_matches("--host=");
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--host= requires a value".to_owned(),
+                    ));
+                }
+                host = value.to_owned();
+                index += 1;
+            }
+            "--surface" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument("--surface requires a value".to_owned())
+                })?;
+                surface = value.clone();
+                index += 2;
+            }
+            value if value.starts_with("--surface=") => {
+                let value = value.trim_start_matches("--surface=");
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--surface= requires a value".to_owned(),
+                    ));
+                }
+                surface = value.to_owned();
+                index += 1;
+            }
+            value => return Err(CliError::MalformedArgument(value.to_owned())),
+        }
+    }
+    if !host.trim().eq_ignore_ascii_case("claude") {
+        return Err(CliError::MalformedArgument(
+            "only the Claude host family exposes surface catalogs".to_owned(),
+        ));
+    }
+    let surface = eliot_types::ClaudeSurface::parse(&surface).ok_or_else(|| {
+        CliError::MalformedArgument(format!(
+            "unknown Claude surface {surface}; expected `code` or `desktop`"
+        ))
+    })?;
+    Ok(McpCatalogArgs { host, surface })
+}
+
+#[cfg(test)]
+mod cli_catalog_tests {
+    use super::{parse_mcp_catalog_args, CliError};
+    use eliot_types::ClaudeSurface;
+
+    #[test]
+    fn catalog_defaults_mirror_facade() {
+        let args = parse_mcp_catalog_args(Vec::<String>::new()).expect("defaults parse");
+        assert_eq!(args.host, "claude");
+        assert_eq!(args.surface, ClaudeSurface::ClaudeDesktopMcpb);
+    }
+
+    #[test]
+    fn catalog_accepts_code_surface() {
+        let args = parse_mcp_catalog_args(["--host", "claude", "--surface", "code"])
+            .expect("code surface parses");
+        assert_eq!(args.surface, ClaudeSurface::ClaudeCodePlugin);
+        let args = parse_mcp_catalog_args(["--surface=desktop"]).expect("equals form parses");
+        assert_eq!(args.surface, ClaudeSurface::ClaudeDesktopMcpb);
+    }
+
+    #[test]
+    fn catalog_rejects_non_claude_host_and_unknown_surface() {
+        assert!(matches!(
+            parse_mcp_catalog_args(["--host", "codex"]),
+            Err(CliError::MalformedArgument(_))
+        ));
+        assert!(matches!(
+            parse_mcp_catalog_args(["--surface", "phone"]),
+            Err(CliError::MalformedArgument(_))
+        ));
+        assert!(matches!(
+            parse_mcp_catalog_args(["--profile", "SPINE_FUNCTIONAL"]),
+            Err(CliError::MalformedArgument(_))
+        ));
+    }
+}
