@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$GovernorExe,
+    [string]$BridgeExe,
     [string]$McpbCli,
     [string]$PnpmCli,
     [string]$NpxCli
@@ -42,37 +42,39 @@ $packageCacheRoot = if ($env:ELIOT_PACKAGE_ROOT) {
 } else {
     Join-Path $env:LOCALAPPDATA 'Eliot\packages'
 }
-$targetRoot = Join-Path $packageCacheRoot 'claude-desktop-mcpb\eliot-governor'
+$targetRoot = Join-Path $packageCacheRoot 'claude-desktop-mcpb\eliot-agent-bridge'
 $targetParent = [System.IO.Path]::GetFullPath((Split-Path $targetRoot -Parent))
 $distRoot = Join-Path $packageCacheRoot 'claude'
 
-if (-not $GovernorExe) {
+if (-not $BridgeExe) {
     # Cargo output is redirected out of OneDrive. Cargo metadata is the source
     # of truth even when an environment or developer-local config overrides it.
+    # The default packager input is the pinned bridge build
+    # (`cargo --locked -p eliot-agent-bridge --bin eliot-agent-bridge`).
     $metadataText = @(& cargo metadata --format-version 1 --no-deps 2>&1)
     if ($LASTEXITCODE -ne 0) {
         throw "cargo metadata failed: $($metadataText -join [Environment]::NewLine)"
     }
     $cargoTargetDir = [string](($metadataText -join [Environment]::NewLine) | ConvertFrom-Json).target_directory
     if (-not $cargoTargetDir) { throw 'cargo metadata returned no target_directory' }
-    $GovernorExe = Join-Path $cargoTargetDir 'release\eliot-governor.exe'
+    $BridgeExe = Join-Path $cargoTargetDir 'release\eliot-agent-bridge.exe'
 }
-$GovernorExe = [System.IO.Path]::GetFullPath($GovernorExe)
-if (-not (Test-Path -LiteralPath $GovernorExe -PathType Leaf)) {
-    throw "release Governor binary is missing: $GovernorExe"
+$BridgeExe = [System.IO.Path]::GetFullPath($BridgeExe)
+if (-not (Test-Path -LiteralPath $BridgeExe -PathType Leaf)) {
+    throw "release bridge binary is missing: $BridgeExe"
 }
 if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'manifest.json') -PathType Leaf)) {
     throw "Claude Desktop manifest is missing under $sourceRoot"
 }
 $sourceManifest = Get-Content -LiteralPath (Join-Path $sourceRoot 'manifest.json') -Raw | ConvertFrom-Json
 $packagePath = Join-Path $distRoot "eliot-$($sourceManifest.version)-windows-x64.mcpb"
-$governorSha256 = Get-Sha256Hex $GovernorExe
+$bridgeSha256 = Get-Sha256Hex $BridgeExe
 $priorReportPath = Join-Path $distRoot 'compatibility-report.json'
 if (Test-Path -LiteralPath $priorReportPath -PathType Leaf) {
     $priorReport = Get-Content -LiteralPath $priorReportPath -Raw | ConvertFrom-Json
     if ([string]$priorReport.extension_version -eq [string]$sourceManifest.version -and
-        [string]$priorReport.governor_sha256 -and
-        -not ([string]$priorReport.governor_sha256).Equals($governorSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+        [string]$priorReport.bridge_sha256 -and
+        -not ([string]$priorReport.bridge_sha256).Equals($bridgeSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Claude Desktop extension version $($sourceManifest.version) already identifies different package bytes; bump integrations/claude/claude-desktop/mcpb/manifest.json before rebuilding"
     }
 }
@@ -88,21 +90,21 @@ New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $targetRoot 'server') -Force | Out-Null
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $targetRoot -Recurse -Force
-Copy-Item -LiteralPath $GovernorExe -Destination (Join-Path $targetRoot 'server\eliot-governor.exe')
+Copy-Item -LiteralPath $BridgeExe -Destination (Join-Path $targetRoot 'server\eliot-agent-bridge.exe')
 
-# The Governor is the only tool/prompt catalog authority. The tracked manifest
+# The bridge is the only tool/prompt catalog authority. The tracked manifest
 # is deliberately just a package template; materialize the MCPB metadata from
 # the exact binary being bundled so package claims cannot drift from runtime.
-$catalogOutput = @(& $GovernorExe mcp catalog --host claude --surface desktop)
+$catalogOutput = @(& $BridgeExe mcp catalog --host claude --surface desktop)
 if ($LASTEXITCODE -ne 0) {
-    throw "Governor MCP catalog generation failed with exit code $LASTEXITCODE"
+    throw "bridge MCP catalog generation failed with exit code $LASTEXITCODE"
 }
 $catalog = ($catalogOutput -join [Environment]::NewLine) | ConvertFrom-Json
 if ($catalog.schema_version -ne 'eliot-mcp-catalog-v2') {
-    throw "unexpected Governor MCP catalog schema: $($catalog.schema_version)"
+    throw "unexpected bridge MCP catalog schema: $($catalog.schema_version)"
 }
 if (@($catalog.mcpb_tools).Count -eq 0 -or @($catalog.mcpb_prompts).Count -eq 0) {
-    throw 'Governor MCP catalog did not produce MCPB tools and prompts'
+    throw 'bridge MCP catalog did not produce MCPB tools and prompts'
 }
 $targetManifestPath = Join-Path $targetRoot 'manifest.json'
 $targetManifest = Get-Content -LiteralPath $targetManifestPath -Raw | ConvertFrom-Json
@@ -175,7 +177,7 @@ $pinnedMcpbVersion = $toolVersions.tools.mcpb_cli.version
 if ($mcpbVersion -ne $pinnedMcpbVersion) {
     throw "MCPB CLI version mismatch: tool-versions.json pins $pinnedMcpbVersion but the packager reports $mcpbVersion"
 }
-$stagedGovernor = Join-Path $targetRoot 'server\eliot-governor.exe'
+$stagedBridge = Join-Path $targetRoot 'server\eliot-agent-bridge.exe'
 $buildManifest = [ordered]@{
     schema_version = 'eliot-claude-desktop-build-v1'
     extension_version = $sourceManifest.version
@@ -183,11 +185,11 @@ $buildManifest = [ordered]@{
     mcpb_cli_version = $mcpbVersion
     manifest_schema = $sourceManifest.'$schema'
     manifest_sha256 = Get-Sha256Hex (Join-Path $targetRoot 'manifest.json')
-    governor_sha256 = $governorSha256
-    governor_source = $GovernorExe
+    bridge_sha256 = $bridgeSha256
+    bridge_source = $BridgeExe
     server_entry_point = $sourceManifest.server.entry_point
     host_argument = 'claude-desktop'
-    another_governor_or_store_bundled = $false
+    another_bridge_or_store_bundled = $false
     credentials_or_project_files_bundled = $false
     generated_at = [DateTimeOffset]::UtcNow.ToString('O')
 }
@@ -209,7 +211,7 @@ $report = [ordered]@{
     package = $package.FullName
     package_bytes = $package.Length
     package_sha256 = Get-Sha256Hex $packagePath
-    governor_sha256 = $governorSha256
+    bridge_sha256 = $bridgeSha256
     manifest_sha256 = Get-Sha256Hex $manifestPath
     manifest_version = $manifest.manifest_version
     extension_version = $manifest.version
@@ -218,7 +220,7 @@ $report = [ordered]@{
     entry_point = $manifest.server.entry_point
     host_argument = 'claude-desktop'
     compatibility = $manifest.compatibility
-    another_governor_or_store_bundled = $false
+    another_bridge_or_store_bundled = $false
     credentials_or_project_files_bundled = $false
     packager = if ($McpbCli) {
         $McpbCli
