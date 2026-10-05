@@ -394,6 +394,40 @@ fn issued_evaluation(
         .expect("owner-issued evaluation")
 }
 
+/// The same twenty owner commitments [`issued_evaluation`] holds, as a mutable value.
+///
+/// Each issuer-refusal case mutates exactly one field (scope, manifest revision, clock, identity)
+/// and asserts the exact refusal; the unmutated value must issue exactly what
+/// [`issued_evaluation`] issues, which the positive control in the foreign-scope issuer test pins.
+/// This helper exists so those cases stay one link each instead of restating the commitment set.
+fn issuer_params_for(
+    manifest: &AuthorizedManifest,
+    frozen_scope_digest: &str,
+) -> NoMatchEvaluationIssuerParams {
+    NoMatchEvaluationIssuerParams {
+        predicate_id: "no-match/absent-valley-alloy".to_owned(),
+        predicate_revision: "r1".to_owned(),
+        predicate_form: "exists(snapshot_bytes, alloy == member_alloy) == false".to_owned(),
+        issuer_id: "evaluator-owner-700".to_owned(),
+        evaluator_id: "no-match-evaluator-700".to_owned(),
+        evaluator_revision: "evaluator-700.1".to_owned(),
+        admission_receipt_id: "admission-700.1".to_owned(),
+        fence: fence(),
+        work_scope: "propulsion thermal envelope".to_owned(),
+        scope_digest: frozen_scope_digest.to_owned(),
+        scope_revision: "scope-700.1".to_owned(),
+        denominator_digest: inquiry_denominator_digest(),
+        manifest_digest: manifest.canonical_digest().expect("manifest commitment"),
+        manifest_revision: ABSENCE_MANIFEST_REVISION,
+        index_revision: "index-700.1".to_owned(),
+        source_revision: "corpus-700.1".to_owned(),
+        observed_at_ms: 1_700_000_250_000,
+        current_until_ms: 1_700_000_400_000,
+        applicability: NoMatchApplicability::Current,
+        proof_ceiling_grade: Some(2),
+    }
+}
+
 /// The denominator digest of the single frozen inquiry this suite shares.
 ///
 /// Both the authorized manifest and the issuer name the same denominator, because
@@ -1101,7 +1135,7 @@ fn absence_foreign_scope_is_unproven() {
     // `AbsencePreconditions::derive` checks only the *shape* of the frozen scope
     // digest, and `DIGEST_A` is a well-formed 64-hex digest, so the preconditions
     // are derived rather than refused there; the binding of the evaluation to the
-    // claimed scope is `ass_absence`'s own work at `foreign_evaluation_scope`
+    // claimed scope is `assess_absence`'s own work at `foreign_evaluation_scope`
     // (`src/evidence_portfolio.rs`).
     let (account, records, manifest, evaluation) = proven_absence();
     let foreign = AbsencePreconditions::derive(
