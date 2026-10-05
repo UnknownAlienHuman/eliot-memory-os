@@ -1624,6 +1624,9 @@ def discover_context_measurements(
         depths = record["depths"]
         assert isinstance(depths, list)
         item, item_scope = _scope_of(masked_lines, depths, span_start, rel)
+        opener = ITEM_RE.match(masked_lines[span_start - 1])
+        if opener:
+            item = f"{opener.group('kind')} {opener.group('name')}"
         body_lines = [
             stripped
             for stripped in (
