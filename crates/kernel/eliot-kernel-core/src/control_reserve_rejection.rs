@@ -377,7 +377,7 @@ mod tests {
     /// naming the wrong bottleneck fails here while still showing
     /// `Busy` there. The observation binds the front-door bottleneck
     /// in its exact unit (`docs/architecture/I14-04-backpressure-responses.md:13`:
-    /// every response includes a RecoveryDirective naming the real
+    /// every response includes a `RecoveryDirective` naming the real
     /// bottleneck).
     #[test]
     fn normal_saturation_response_binds_front_door_bottleneck_in_exact_unit()

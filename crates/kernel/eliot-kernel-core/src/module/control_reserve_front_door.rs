@@ -1987,7 +1987,7 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_zero_normal_capacity_fails_closed() -> Result<(), KernelError> {
+    fn partitioned_zero_normal_capacity_fails_closed() {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([25u8; 32]),
             genesis_epoch(),
@@ -2007,11 +2007,10 @@ mod tests {
                 ..
             }
         ));
-        Ok(())
     }
 
     #[test]
-    fn partitioned_zero_protected_capacity_fails_closed() -> Result<(), KernelError> {
+    fn partitioned_zero_protected_capacity_fails_closed() {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([33u8; 32]),
             genesis_epoch(),
@@ -2032,11 +2031,10 @@ mod tests {
                 ..
             }
         ));
-        Ok(())
     }
 
     #[test]
-    fn ledger_zero_capacity_fails_closed() -> Result<(), KernelError> {
+    fn ledger_zero_capacity_fails_closed() {
         // The ledger constructor floor (issue #1679, A7): a zero-capacity
         // idempotency ledger cannot order any entry, so building one fails
         // at build instead of producing a ledger that evicts everything
@@ -2051,7 +2049,6 @@ mod tests {
                 ..
             }
         ));
-        Ok(())
     }
 
     #[test]

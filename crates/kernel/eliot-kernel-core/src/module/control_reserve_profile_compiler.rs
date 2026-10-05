@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_duplicate_owner_evidence_fails_closed() -> KernelResult<()> {
+    fn compile_duplicate_owner_evidence_fails_closed() {
         let epoch = EpochId::new(
             EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
             NonZeroU64::MIN,
@@ -460,7 +460,6 @@ mod tests {
             KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
                 if bottleneck == map[0].bottleneck.as_contract_str()
         ));
-        Ok(())
     }
 
     #[test]
@@ -626,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_contradictory_owner_fails_closed() -> KernelResult<()> {
+    fn compile_contradictory_owner_fails_closed() {
         let epoch = EpochId::new(
             EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
             NonZeroU64::MIN,
@@ -689,7 +688,6 @@ mod tests {
             err,
             KernelError::ControlReserveEvidenceContradiction { .. }
         ));
-        Ok(())
     }
 
     /// A record taken under another configuration snapshot lowers to an explicit
