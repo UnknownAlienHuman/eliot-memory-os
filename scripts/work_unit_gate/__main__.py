@@ -2478,9 +2478,11 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
         ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
     except Exception:
         ws_doc = {}
-    members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
+    # Closed single-file observation (no search): the root manifest exclude
+    # list only. Member search has no admitted port, so workspace_members
+    # stays [] by construction and real members stay UNAVAILABLE
+    # fail-closed; the discarded local members read is removed, not kept.
     exclude = ws_doc.get("workspace", {}).get("exclude", []) if isinstance(ws_doc, dict) else []
-    _ = members
     entries = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or artifact.get("package") != name:
