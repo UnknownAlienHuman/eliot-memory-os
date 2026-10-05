@@ -1777,7 +1777,10 @@ fn sha_hex(parts: &[&[u8]]) -> String {
 /// purpose. With it in the derivation, a caller could enumerate values until it
 /// liked the produced identity, and an archive-supplied value would make the
 /// identity archive-determined.
-fn owner_identity_evidence(
+///
+/// Public so a caller stages the exact owner-derived destination an admission
+/// resolves to (never a caller-chosen name); see the 958/6 plant.
+pub fn owner_identity_evidence(
     admission: &DestinationAdmission,
     owner_resolved_parent: &Path,
 ) -> String {

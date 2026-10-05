@@ -25,7 +25,8 @@ use eliot_host::backup_preparation::{
     DestinationCustody, OwnerEvidence, PreparationClass, PreparationError, PreparationJournal,
     PreparedDestination, PresentedPreparationRequest, ReconcileDisposition, RootIdentity,
     cancel_preparation, cleanup_preparations, derive_destination_epoch, derive_destination_id,
-    prepare_isolated_destination, reconcile_preparation,
+    owner_identity_evidence, prepare_isolated_destination, reconcile_preparation,
+    verify_staging_parent_lease,
 };
 use eliot_platform_windows::test_support::override_protected_root;
 use serde_json::Value;
@@ -384,9 +385,19 @@ fn valid_admitted_destination_prepares() {
         let _ = std::fs::remove_dir_all(&source_root);
         return;
     }
-    let (source_root, sentinel) = source_tree("05");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("05", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
-    let parent = isolated_root("05", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let admission =
         admission_from_fixture("destination-admission-valid.json", &source_root, &parent);
     assert_eq!(admission.operation_id, "op-958-dest-05");
@@ -408,8 +419,7 @@ fn valid_admitted_destination_prepares() {
     assert_eq!(sentinel_bytes(&sentinel), before, "source untouched");
     assert!(journal.intents.contains_key("op-958-dest-05"));
     assert!(journal.results.contains_key("op-958-dest-05"));
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/6
@@ -419,8 +429,18 @@ fn source_active_and_foreign_destinations_rejected() {
         eprintln!("SKIP 958/6 on non-Windows: admission ordering needs the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("06");
-    let parent = isolated_root("06", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("06", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     // Staging parent IS the source root: active installation refused.
     let active = admission("op-958-active", &source_root, &source_root);
@@ -437,17 +457,24 @@ fn source_active_and_foreign_destinations_rejected() {
         PreparationError::ArbitraryPath { .. }
     ),);
     // Preexisting foreign content at the exact destination path: refused,
-    // never adopted or overwritten. The foreign-owner fixture binds the
-    // takeover values (operation, nonce, foreign installation identity).
+    // never adopted or overwritten. The plant resolves the same owner-derived
+    // destination the admission does (operation plus owner identity evidence
+    // over the verified parent), so the simulated takeover is exact; a
+    // caller-chosen name such as the nonce can never coincide by design.
     let foreign = admission_from_fixture(
         "destination-admission-foreign-owner.json",
         &source_root,
         &parent,
     );
     assert_eq!(foreign.source_installation_id, "install-958-foreign");
-    let planted = parent.join(format!(
+    let verified_parent =
+        verify_staging_parent_lease(&foreign.operation_id, &parent).expect("parent verifies");
+    let planted = verified_parent.join(format!(
         "dest-{}",
-        derive_destination_id(&foreign.operation_id, &foreign.authority_nonce)
+        derive_destination_id(
+            &foreign.operation_id,
+            &owner_identity_evidence(&foreign, &verified_parent)
+        )
     ));
     std::fs::create_dir_all(&planted).expect("plant foreign dir");
     std::fs::write(planted.join("foreign-bytes.bin"), b"not-ours").expect("plant file");
@@ -460,8 +487,7 @@ fn source_active_and_foreign_destinations_rejected() {
         planted.join("foreign-bytes.bin").exists(),
         "foreign bytes preserved"
     );
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/7
@@ -561,7 +587,18 @@ fn alias_substitution_refused_and_identity_pinned() {
         return;
     }
     let (source_root, _) = source_tree("08");
-    let parent = isolated_root("08", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("08", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     // A symlinked staging parent is an alias substitution, refused before
     // any destination effect. Symlink creation needs privilege: when the
@@ -606,12 +643,14 @@ fn alias_substitution_refused_and_identity_pinned() {
     std::fs::create_dir_all(&prepared.root).expect("recreate");
     match reconcile_preparation(&journal, "op-958-alias").expect("reconcile") {
         ReconcileDisposition::Uncertain { reason } => {
-            assert!(reason.contains("identity changed"), "names cause: {reason}");
+            assert!(
+                reason.contains("identity mismatch"),
+                "names cause: {reason}"
+            );
         }
         other => panic!("expected Uncertain, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/9
@@ -722,10 +761,20 @@ fn no_implicit_source_shutdown_or_replacement() {
         eprintln!("SKIP 958/11 on non-Windows: preparation effects need the OS identity contour");
         return;
     }
-    let (source_root, sentinel) = source_tree("11");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("11", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
     let before_meta = std::fs::metadata(&sentinel).expect("meta");
-    let parent = isolated_root("11", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
@@ -746,8 +795,7 @@ fn no_implicit_source_shutdown_or_replacement() {
             .expect("mtime"),
         before_meta.modified().expect("mtime"),
     );
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/12
@@ -757,8 +805,18 @@ fn exact_repeat_returns_same_destination() {
         eprintln!("SKIP 958/12 on non-Windows: idempotency effects need the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("12");
-    let parent = isolated_root("12", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("12", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     let first = prepare_isolated_destination(
         &mut journal,
@@ -783,8 +841,7 @@ fn exact_repeat_returns_same_destination() {
         ReconcileDisposition::Current(current) => assert_eq!(current, first),
         other => panic!("expected Current, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/13
@@ -794,8 +851,18 @@ fn changed_same_operation_input_conflicts_by_field() {
         eprintln!("SKIP 958/13 on non-Windows: conflict detection needs the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("13");
-    let parent = isolated_root("13", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("13", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
@@ -819,8 +886,7 @@ fn changed_same_operation_input_conflicts_by_field() {
             field: "authority_nonce"
         },
     );
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/14
@@ -908,9 +974,19 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
         );
         return;
     }
-    let (source_root, sentinel) = source_tree("15");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("15", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
-    let parent = isolated_root("15", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     let prepared = prepare_isolated_destination(
         &mut journal,
@@ -943,8 +1019,7 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
         cancel_preparation(&mut journal, "op-958-nope"),
         Err(PreparationError::UnknownState { .. })
     ),);
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/16
@@ -1106,10 +1181,20 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
         );
         return;
     }
-    let (source_root, _) = source_tree("18");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("18", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     // Recursive listing before and after: preparation adds exactly one
     // destination directory under the staging parent, nothing in source.
-    let parent = isolated_root("18", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let source_before = listing(&source_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
@@ -1148,6 +1233,5 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
     match PreparationClass::IsolatedRestoreRehearsal {
         PreparationClass::IsolatedRestoreRehearsal => {}
     }
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
