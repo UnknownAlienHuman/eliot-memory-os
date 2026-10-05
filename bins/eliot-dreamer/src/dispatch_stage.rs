@@ -85,7 +85,7 @@ use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet, Pr
 use crate::production_orientation::OrientationSupply;
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
-    KernelJobAdmission, SourceCoverage,
+    KernelJobAdmission, OrientationDisposition, SourceCoverage, pulse::PulseStageId,
 };
 
 /// Terminal fail-closed reason when the A-31 fan-in cannot be invoked: the
@@ -1974,13 +1974,11 @@ mod slice_7_native_owner_tests {
         }
     }
 
-    /// Orientation genuinely projects from the admitted pair: the structured
-    /// A-05 receipt is proved at the dispatch gate, then the v1 hypothesis
-    /// pair validates through the real v1 A-05 entry, the owner
-    /// `build_projection` succeeds, packet identity bindings travel verbatim,
-    /// and the G4 residues are preserved in `rival_models_and_dissent`.
+    /// No Governor supply channel exists yet: with no orientation
+    /// carrier admitted, dispatch must publish Blocked with the
+    /// full mandatory denominator and no packet.
     #[test]
-    fn orientation_projects_packet_with_g4_preserved() {
+    fn orientation_without_supply_blocks_with_full_denominator() {
         let admission = admission();
         let job = semantic_job(JobClass::Orientation);
         let (grounding, validated) = validated_for(&admission, &job);
@@ -1992,55 +1990,24 @@ mod slice_7_native_owner_tests {
             Some(&validated),
             Some(PipelineOrientationRecords::new(&grounding, &validated)),
         );
-        let Ok(DreamResult::Packet(packet)) = result else {
-            panic!("orientation must project, got {result:?}");
+        let Ok(DreamResult::Orientation(blocked)) = result else {
+            panic!("orientation without Governor supply must block, got {result:?}");
         };
-        assert_eq!(packet.packet_id.len(), 64);
-        assert_eq!(packet.question, QUESTION);
-        assert_eq!(packet.scope_id, SCOPE);
-        assert_eq!(packet.state_fence, job.state_fence);
-        assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-        assert_eq!(packet.source_coverage.memory, job.memory_handles);
-        assert_eq!(
-            packet.source_coverage.architecture,
-            job.architecture_handles
-        );
-        assert_eq!(
-            packet.source_coverage.implementation,
-            job.implementation_handles
-        );
-        assert_eq!(packet.source_coverage.conformance, job.conformance_handles);
-        assert_eq!(packet.synthesized_interpretations.len(), 1);
-        let interpretation = &packet.synthesized_interpretations[0];
-        assert_eq!(interpretation.statement, QUESTION);
-        assert_eq!(interpretation.support_handles, job.evidence_handles);
-        assert_eq!(interpretation.epistemic_status, "candidate_only");
-        // ABSOLUTE G4 RULE: the admitted model carries no counterevidence
-        // text, so the rival list is exactly the two owner residue texts —
-        // neither marker dropped nor thinned.
-        assert_eq!(
-            packet.rival_models_and_dissent.len(),
-            2,
-            "rival list must carry exactly both residue markers, got {:?}",
-            packet.rival_models_and_dissent
-        );
-        // The four screening-side families are accounted as omissions and
-        // surface as unknowns, never silently dropped.
-        assert_eq!(
-            packet.unknowns_and_gaps.len(),
-            4,
-            "unknowns must account the four omitted families, got {:?}",
-            packet.unknowns_and_gaps
-        );
-        assert_eq!(
-            packet.recommended_probes_or_next_actions,
-            Vec::<String>::new()
-        );
-        assert_eq!(packet.invalidation_conditions, vec![CONFLICT.to_owned()]);
+        assert_eq!(blocked.disposition, OrientationDisposition::Blocked);
         assert!(
-            packet.provenance.contains(&OPERATION.to_owned()),
-            "provenance must carry the projection-input proof, got {:?}",
-            packet.provenance
+            blocked.packet.is_none(),
+            "blocked pulse must carry no packet"
+        );
+        assert_eq!(blocked.scope_id, SCOPE);
+        assert_eq!(blocked.state_fence, job.state_fence);
+        assert_eq!(
+            blocked.stages.len(),
+            PulseStageId::ORDER.len(),
+            "blocked ledger must cover the whole mandatory denominator"
+        );
+        assert!(
+            !blocked.missing_owners.is_empty(),
+            "blocked pulse must name its missing owners"
         );
     }
 
