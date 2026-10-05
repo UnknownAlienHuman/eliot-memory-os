@@ -5562,4 +5562,62 @@ mod admitted_solo_binding_tests {
         assert_eq!(request.deadline_unix_ms, intake.deadline_unix_ms);
         assert!(validate_admitted_solo_binding(&request, &intake).is_ok());
     }
+
+    #[test]
+    fn admitted_solo_binding_refuses_cancelled_and_foreign_operation() {
+        let (mut request, intake, _) = solo_test_pair();
+        request.cancelled = true;
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected Contract refusal, got {other:?}"),
+        }
+        let (mut request, intake, _) = solo_test_pair();
+        request.operation = "audit".to_owned();
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected Contract refusal, got {other:?}"),
+        }
+        let (mut request, intake, _) = solo_test_pair();
+        request.principal = "   ".to_owned();
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected Contract refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admitted_solo_binding_refuses_binding_mismatches() {
+        let (mut request, intake, _) = solo_test_pair();
+        request.delegate_bytes = b"solo-2567-other".to_vec();
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::IdentityConflict(_))) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+        let (mut request, intake, _) = solo_test_pair();
+        request.task_id = "task-other".to_owned();
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::IdentityConflict(_))) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+        let (mut request, intake, _) = solo_test_pair();
+        let lineage = eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+            .expect("lineage parses");
+        let epoch = eliot_contracts::EpochId::new(
+            lineage,
+            std::num::NonZeroU64::new(2).expect("non-zero sequence"),
+        )
+        .expect("epoch builds");
+        request.fence =
+            eliot_contracts::StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis());
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::StaleFence(_))) => {}
+            other => panic!("expected StaleFence refusal, got {other:?}"),
+        }
+        let (mut request, intake, _) = solo_test_pair();
+        request.deadline_unix_ms = intake.deadline_unix_ms + 1;
+        match validate_admitted_solo_binding(&request, &intake) {
+            Err(crate::DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected Contract refusal, got {other:?}"),
+        }
+    }
 }
