@@ -657,6 +657,57 @@ mod tests {
         ));
     }
 
+    /// The mirror of [`ipc_normal_saturation_leaves_protected_bytes_available`]
+    /// in the other direction (issue #1679): saturating the protected
+    /// partition must never block normal work, and normal work must never
+    /// borrow protected control bytes (I14.3).
+    #[test]
+    fn ipc_protected_saturation_leaves_normal_bytes_available() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(1).expect("bytes"),
+        );
+
+        // Saturating the single protected byte holds the partition: the
+        // permit must stay alive for the saturation proven below.
+        let _held = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-ctl-fill-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("first protected byte");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+
+        // Positive control first: normal work keeps its path open while
+        // the protected partition is saturated.
+        let _norm = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-norm-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("normal path stays open");
+
+        // Control traffic observes exhaustion naming the exact dimension,
+        // never a collapsed scalar reason.
+        let err = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-ctl-2",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect_err("exhausted protected partition must refuse");
+        assert!(matches!(
+            err,
+            IpcReserveError::ProtectedReserveExhausted { bottleneck, .. }
+                if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
+        ));
+    }
+
     #[test]
     fn ipc_exhaustion_response_refuses_an_admitting_partition() {
         let reserve = IpcReserve::partitioned(
