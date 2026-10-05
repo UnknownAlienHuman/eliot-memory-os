@@ -600,4 +600,80 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// A record taken under another configuration snapshot lowers to an explicit
+    /// `UNKNOWN` row before validation instead of joining stale numbers as
+    /// current evidence (issue #1679 W2/A1; I14.3).
+    #[test]
+    fn compile_stale_claimed_row_lowers_to_unknown() -> KernelResult<()> {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch");
+        let identity = ControlReserveProfileIdentity {
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            product_identity_ref: "product-1".to_owned(),
+            source_build_and_runtime_generation_refs: vec!["gen-1".to_owned()],
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch.clone(),
+            compiled_at_ms: 1_000,
+            profile_evidence_refs: Vec::new(),
+            invalidation_set: Vec::new(),
+        };
+
+        // The claimed row is the passing-through row with exactly one field
+        // changed: the record was read under another configuration snapshot, so
+        // it is stale and must be lowered rather than presented as this
+        // dimension's current capacity (issue #1679 A1).
+        let bottleneck = CapacityBottleneck::OrsTransactionSlots;
+        let owner = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == bottleneck)
+            .expect("frozen owner map binds an ORS dimension")
+            .owner;
+        let unit = bottleneck.unit();
+        let row = BottleneckCapacityProfile {
+            bottleneck,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: owner.to_owned(),
+            owner_generation_ref: "gen-7".to_owned(),
+            unit,
+            physical_total_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(4).expect("total"),
+            }),
+            normal_work_applicable: true,
+            normal_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("normal"),
+            }),
+            protected_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("protected"),
+            }),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: "proof-1".to_owned(),
+            evidence_refs: vec!["ev-1".to_owned()],
+            invalidation_set: vec!["inv-1".to_owned()],
+        };
+        let evidence = BottleneckOwnerEvidence {
+            config_snapshot_ref: "snap-2".to_owned(),
+            authority_epoch_ref: epoch,
+            row,
+        };
+
+        let profile = compile_control_reserve_profile(identity, std::slice::from_ref(&evidence))?;
+
+        assert_eq!(profile.bottleneck_rows.len(), 15);
+        let got = profile
+            .bottleneck_rows
+            .iter()
+            .find(|r| r.bottleneck == CapacityBottleneck::OrsTransactionSlots)
+            .expect("dimension present");
+        assert_eq!(got.coverage_state, BottleneckCoverageState::Unknown);
+        Ok(())
+    }
 }
