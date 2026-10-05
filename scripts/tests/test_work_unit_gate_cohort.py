@@ -291,6 +291,49 @@ schema_version = "eliot-work-unit-descriptor-v2"
                 disposition=c.CatalogueDisposition.ASSIGNED,
                 descriptor=None,
             )
+        # On-disk discovery leg: a generated lock over the admitted snapshot
+        # validates against the observed numeric class, and an unexpectedly
+        # missing executable descriptor fails closed (A14-08:56 counts are not
+        # progress without proof; I00-14:54 identity follows the bytes).
+        g1 = make_desc(851, "D-WU-A", 3)
+        snapshot = {
+            "header": {
+                "repository": "UnknownAlienHuman/eliot-memory-os",
+                "base_revision": "0" * 40,
+                "acquisition": "probe",
+                "acquired_at": "2026-10-05T00:00:00Z",
+                "complete": True,
+            },
+            "rows": [
+                {"issue": 851, "unit": "D-WU-A", "body_sha256": g1.body_sha256,
+                 "disposition": "assigned", "prerequisites": []},
+                {"issue": 852, "unit": "D-WU-B", "body_sha256": "c" * 64,
+                 "disposition": "blocked", "prerequisites": []},
+            ],
+            "numeric_descriptors": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            wu_dir = Path(tmp) / "work-units"
+            wu_dir.mkdir()
+            lock_path = Path(tmp) / "cohort.toml"
+            lock_path.write_bytes(ch.generate_cohort_lock(snapshot, {851: g1}))
+            receipt = ch.verify_cohort_lock(lock_path, wu_dir, {851: g1})
+            self.assertEqual(
+                receipt.sha256,
+                ch.read_cohort_lock(lock_path).aggregate.sha256,
+            )
+
+            # The executable descriptor is unexpectedly missing on disk: the
+            # same rows claiming numeric class [851] fail closed, because the
+            # discovered class does not match the lock.
+            snapshot_missing = dict(snapshot, numeric_descriptors=[851])
+            lock_missing = Path(tmp) / "cohort-missing.toml"
+            lock_missing.write_bytes(
+                ch.generate_cohort_lock(snapshot_missing, {851: g1}))
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.verify_cohort_lock(lock_missing, wu_dir, {851: g1})
+            self.assertEqual(
+                ctx.exception.problem, ch.CohortProblem.INVALID_AGGREGATE_LOCK)
 
     # WORK_UNIT_CASE: 852/6
     def test_unexpected_extra_descriptor_fails(self):
@@ -602,6 +645,95 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             with self.assertRaises(ch.CohortError) as ctx:
                 ch.validate_path_safety(bad)
             self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNSAFE_PATH)
+        # Physical alias leg: a junction (Windows, no privilege needed) or a
+        # symlink (POSIX) smuggling an outside tree under an innocent root
+        # value resolves outside the repository root, so attempt-path
+        # containment rejects it (UNSAFE_PATH); a real directory inside the
+        # root passes. Tmp only; the link itself is removed, never the target.
+        import ctypes
+        from ctypes import wintypes
+
+        def _make_alias(link: Path, target: Path) -> None:
+            if os.name != "nt":
+                os.symlink(target, link)
+                return
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.DeviceIoControl.restype = wintypes.BOOL
+            kernel32.DeviceIoControl.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+            ]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            os.mkdir(link)
+            handle = kernel32.CreateFileW(
+                str(link), 0x40000000, 0, None, 3,
+                0x00200000 | 0x02000000, None)
+            if handle == wintypes.HANDLE(-1).value:
+                raise OSError(
+                    f"open reparse point failed: {ctypes.get_last_error()}")
+            try:
+                sub = ("\\??\\" + os.path.abspath(target)).encode("utf-16-le")
+                prn = os.path.abspath(target).encode("utf-16-le")
+                buf = (
+                    (0xA0000003).to_bytes(4, "little")
+                    + (len(sub) + 2 + len(prn) + 2 + 8).to_bytes(2, "little")
+                    + b"\x00\x00"
+                    + (0).to_bytes(2, "little")
+                    + len(sub).to_bytes(2, "little")
+                    + (len(sub) + 2).to_bytes(2, "little")
+                    + len(prn).to_bytes(2, "little")
+                    + sub + b"\x00\x00" + prn + b"\x00\x00"
+                )
+                inbuf = ctypes.create_string_buffer(buf)
+                returned = wintypes.DWORD(0)
+                ok = kernel32.DeviceIoControl(
+                    handle, 0x900A4, inbuf, len(buf),
+                    None, 0, ctypes.byref(returned), None)
+                if not ok:
+                    raise OSError(
+                        "set reparse point failed: "
+                        f"{ctypes.get_last_error()}")
+            finally:
+                kernel32.CloseHandle(handle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (outside / "evil.py").write_text("x = 1\n", encoding="utf-8")
+            (root / "real").mkdir()
+            (root / "real" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            link = root / "link"
+            _make_alias(link, outside)
+            try:
+                d_escape = make_desc(
+                    852, "D-WU-ESC", 1,
+                    source_roots=("link/evil.py",),
+                    test_roots=("link/evil.py",),
+                )
+                with self.assertRaises(ch.CohortError) as ctx:
+                    ch.verify_attempt_paths_exist(d_escape, root)
+                self.assertEqual(
+                    ctx.exception.problem, ch.CohortProblem.UNSAFE_PATH)
+                d_inside = make_desc(
+                    852, "D-WU-OK", 1,
+                    source_roots=("real/ok.py",),
+                    test_roots=("real/ok.py",),
+                )
+                ch.verify_attempt_paths_exist(d_inside, root)
+            finally:
+                if os.name == "nt":
+                    os.rmdir(link)
+                else:
+                    link.unlink()
 
     # WORK_UNIT_CASE: 852/19
     def test_concurrent_exclusive_source_overlap_rejected(self):
@@ -1630,6 +1762,94 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         # The changed assignment carries its exact obligations under a DISTINCT
         # leaf owner, so a changed matrix count never duplicated one.
         self.assertNotEqual(d1.unit, d2_changed.unit)
+    def test_generated_lock_is_deterministic_and_validates(self):
+        # Owner-side generation end-to-end (D-SNAPSHOT): deterministic bytes,
+        # truncated snapshots never generate, and the production
+        # `generate-cohort-lock` subcommand round-trips through discovery.
+        # No WORK_UNIT_CASE marker: this proves the generator, not a matrix case.
+        g1 = make_desc(851, "D-WU-A", 3)
+        snapshot = {
+            "header": {
+                "repository": "UnknownAlienHuman/eliot-memory-os",
+                "base_revision": "0" * 40,
+                "acquisition": "probe",
+                "acquired_at": "2026-10-05T00:00:00Z",
+                "complete": True,
+            },
+            "rows": [
+                {"issue": 851, "unit": "D-WU-A", "body_sha256": g1.body_sha256,
+                 "disposition": "assigned", "prerequisites": []},
+                {"issue": 852, "unit": "D-WU-B", "body_sha256": "c" * 64,
+                 "disposition": "blocked", "prerequisites": []},
+            ],
+            "numeric_descriptors": [],
+        }
+        first = ch.generate_cohort_lock(snapshot, {851: g1})
+        self.assertEqual(first, ch.generate_cohort_lock(snapshot, {851: g1}))
+
+        # A truncated snapshot (complete False plus missing sections) never
+        # generates: the owner-side minter fails closed before rendering.
+        truncated = dict(
+            snapshot,
+            header=dict(
+                snapshot["header"], complete=False, missing_sections=["issues"]),
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.generate_cohort_lock(truncated, {851: g1})
+        self.assertEqual(
+            ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # Production subcommand: the tmp root carries a real numeric
+        # descriptor for the assigned row, so generation binds the observed
+        # descriptor, the numeric class matches discovery, and the emitted
+        # digest equals the read-back lock aggregate. An assigned row with no
+        # observed descriptor would stay INCOMPLETE (never fabricated).
+        toml_851 = (
+            'schema_version = "eliot-work-unit-descriptor-v2"\n'
+            'identity = { value = "work-unit-851" }\n'
+            'issue = { repository = { owner = "UnknownAlienHuman", '
+            'name = "eliot-memory-os" }, number = 851 }\n'
+            'unit = { value = "D-WU-A" }\n'
+            'mode = "python-unittest"\n'
+            'source_roots = [{ value = "scripts/work_unit_gate/cohort.py" }]\n'
+            'test_roots = [{ value = "scripts/tests/test_work_unit_gate_cohort.py" }]\n'
+            'matrix_cases = 3\n'
+            'proof_ceiling = { value = "catalogue-integrity-only" }\n'
+            'revision = 1\n'
+            f'body_sha256 = "{g1.body_sha256}"\n'
+            f'matrix_sha256 = "{g1.matrix_sha256}"\n'
+            'require_workspace_member = false\n'
+            'requirements = { source_floor = 1, public_floor = 0, test_floor = 3, '
+            'required_guards = [{ value = "source-shape" }] }\n'
+            'bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+            'line_bytes = 65536, discovery_tests = 1000, child_processes = 4 }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wu = root / ".github" / "work-units"
+            wu.mkdir(parents=True)
+            (wu / "851.toml").write_bytes(toml_851.encode("utf-8"))
+            snap_path = root / "snapshot.json"
+            snap_path.write_text(
+                json.dumps(dict(snapshot, numeric_descriptors=[851])),
+                encoding="utf-8",
+            )
+            out_path = root / "cohort.toml"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = gate_main.main([
+                    "generate-cohort-lock",
+                    "--snapshot", str(snap_path),
+                    "--out", str(out_path),
+                    "--root", str(root),
+                    "--json",
+                ])
+            self.assertEqual(code, 0)
+            doc = json.loads(buf.getvalue())
+            self.assertEqual(
+                doc["digest"],
+                ch.read_cohort_lock(out_path).aggregate.sha256,
+            )
 
     def test_blocked_row_with_restricted_root_descriptor_rejected(self):
         # A blocked row carrying a descriptor is unresolved work, not an
