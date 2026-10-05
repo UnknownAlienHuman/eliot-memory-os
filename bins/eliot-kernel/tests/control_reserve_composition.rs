@@ -112,3 +112,30 @@ fn composition_projects_bounded_status_snapshot() {
     assert_eq!(snapshot.profile_id, profile.profile_id);
     assert_eq!(snapshot.profile_revision, profile.profile_revision);
 }
+
+/// W2: the profile carries the composition's own resolved identity
+/// scalars - the standalone assembly name when no Host-approved
+/// config hash exists, the revision bound to the admitted
+/// generation, the composition's own clock reading and the resolved
+/// runtime generation ref - never defaults.
+#[test]
+fn composition_profile_carries_standalone_assembly_identity() {
+    let (kernel, _guard) = test_kernel_with_pipe("w2-identity");
+    let profile = kernel.control_reserve_profile();
+    assert_eq!(
+        profile.config_snapshot_ref, "eliot-kernel-standalone",
+        "the test config carries no Host-approved hash, so the composition names the standalone assembly"
+    );
+    assert!(
+        profile.profile_revision.contains("generation="),
+        "the revision is bound to the admitted generation"
+    );
+    assert!(
+        profile.compiled_at_ms > 0,
+        "the composition's own clock reading, never a default"
+    );
+    assert!(
+        !profile.source_build_and_runtime_generation_refs.is_empty(),
+        "the resolved runtime generation ref is present"
+    );
+}
