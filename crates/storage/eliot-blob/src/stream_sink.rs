@@ -393,12 +393,47 @@ impl BlobStreamSinkStoreBinding {
     }
 }
 
+/// The append-only temporary raw evidence object of
+/// `docs/architecture/I10-08-05-ip3-streaming-evidence-and-normalization.md:9`.
+/// Vec-backed seam; the durable append-only object replaces the backing in a
+/// later task, the push-only API stays.
+#[derive(Clone, Debug, Default)]
+struct StagedPrefix {
+    bytes: Vec<u8>,
+}
+
+impl StagedPrefix {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+    }
+}
+
 struct SinkState {
     session: Option<ProcessStreamSinkSession>,
     /// Admitted-but-not-yet-published plaintext. It is handed to the publish
     /// ticket as a CLONE and stays in the session until `record_locked` drops
     /// it, so planning or dropping a publish never destroys the only copy.
-    staged: Vec<u8>,
+    staged: StagedPrefix,
     /// The exact publication outcome proven for this session, once a terminal
     /// recorded it. `None` means no terminal has landed yet.
     publication: Option<BlobStreamPublication>,
@@ -753,7 +788,7 @@ impl SinkState {
     fn new() -> Self {
         Self {
             session: None,
-            staged: Vec::new(),
+            staged: StagedPrefix::new(),
             publication: None,
             transport: TransportDigest::new(),
             preview: BoundedPreviewDigest::new(),
@@ -968,7 +1003,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         let start = usize::try_from(offset).ok()?;
         let length = usize::try_from(length).ok()?;
         let end = start.checked_add(length)?;
-        state.staged.get(start..end)
+        state.staged.as_bytes().get(start..end)
     }
 
     fn check_session(
@@ -1036,7 +1071,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 reason: "preview retained length does not fit the platform".to_owned(),
             }
         })?;
-        if retained > state.staged.len() || preview.bytes() != &state.staged[..retained] {
+        if retained > state.staged.len() || preview.bytes() != &state.staged.as_bytes()[..retained]
+        {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "transport preview does not match admitted bytes".to_owned(),
             });
@@ -1462,7 +1498,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         reservation.phase = FinalizePhase::ReadbackPending {
             ready: Box::new(ready.clone()),
         };
-        state.staged = Vec::new();
+        state.staged.clear();
         Ok(ready)
     }
 
@@ -1634,7 +1670,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                     ready: Box::new(ready),
                 },
                 None => PublishStep::Stage {
-                    staged: state.staged.clone(),
+                    staged: state.staged.as_bytes().to_vec(),
                 },
             };
             return Ok(FinalizePlan::Publish(Box::new(PublishTicket {
@@ -1770,7 +1806,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             // `record_locked` drops them, so a dropped future stays
             // recoverable and a retry re-derives the same terminal.
             step: PublishStep::Stage {
-                staged: state.staged.clone(),
+                staged: state.staged.as_bytes().to_vec(),
             },
         }))
     }
@@ -1809,7 +1845,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         // is precisely the pressure the ceiling above is there to refuse.
         state.persistence_queue.queued_chunks = 0;
         state.persistence_queue.queued_bytes = 0;
-        state.staged = Vec::new();
+        state.staged.clear();
         state.publication = Some(publication);
         state.terminal = Some(terminal.clone());
         Ok(terminal)
@@ -2123,6 +2159,42 @@ fn map_blob_error(error: &BlobError) -> ProcessStreamSinkError {
             }
         }
         _ => ProcessStreamSinkError::ProviderUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StagedPrefix;
+
+    /// Pins the whole push-only seam API so a later durable swap is caught by
+    /// name.
+    #[test]
+    fn staged_prefix_push_and_len() {
+        let mut staged = StagedPrefix::new();
+        assert!(staged.is_empty());
+        assert_eq!(staged.len(), 0);
+        assert!(staged.as_bytes().is_empty());
+
+        staged.extend_from_slice(b"ab");
+        staged.extend_from_slice(b"c");
+
+        assert!(!staged.is_empty());
+        assert_eq!(staged.len(), 3);
+        assert_eq!(staged.as_bytes(), b"abc");
+    }
+
+    /// Pins that clear drops every staged byte and leaves the seam reusable.
+    #[test]
+    fn staged_prefix_clear_drops_bytes() {
+        let mut staged = StagedPrefix::new();
+        staged.extend_from_slice(b"abc");
+        assert_eq!(staged.as_bytes(), b"abc");
+
+        staged.clear();
+
+        assert!(staged.is_empty());
+        assert_eq!(staged.len(), 0);
+        assert!(staged.as_bytes().is_empty());
     }
 }
 
