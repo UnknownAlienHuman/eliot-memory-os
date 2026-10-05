@@ -287,6 +287,12 @@ pub struct AttemptLearningDeltaCandidate {
     pub equivalent_retry: Option<EquivalentRetry>,
     /// Candidate is always bounded by this closed ceiling.
     pub proof_ceiling: ProofCeiling,
+    /// Digest binding the frozen pre-evaluation fields to this candidate.
+    /// Covered by the canonical seal; `None` when the source revision froze
+    /// nothing. A plain digest (never the overlay `freeze` bundle type, which
+    /// this crate must not depend on).
+    #[serde(default)]
+    pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical candidate shape digest, excluding this field.
     pub canonical_digest: String,
 }
@@ -303,6 +309,9 @@ impl AttemptLearningDeltaCandidate {
         }
         if self.proof_ceiling != ProofCeiling::CandidateArtifact {
             return Err(LearningContractError::CandidateCeiling);
+        }
+        if let Some(digest) = &self.frozen_pre_evaluation_digest {
+            validate_digest(digest, "delta.frozen_pre_evaluation_digest")?;
         }
         crate::identity::validate_external_id(self.target.as_str(), "delta.target")?;
         validate_digest(&self.base_view_digest, "delta.base_view_digest")?;

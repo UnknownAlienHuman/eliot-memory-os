@@ -101,6 +101,12 @@ pub struct ClosureHandoff {
     pub external_promotion_refs: Vec<ArtifactId>,
     /// Requested decision class, without recording its result.
     pub requested_decision: ExternalDecisionClass,
+    /// Digest binding the frozen pre-evaluation fields to this handoff.
+    /// Covered by the canonical seal; `None` when the source revision froze
+    /// nothing. A plain digest (never the overlay `freeze` bundle type, which
+    /// this crate must not depend on).
+    #[serde(default)]
+    pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical handoff digest, excluding this field.
     pub canonical_digest: String,
 }
@@ -119,6 +125,9 @@ impl ClosureHandoff {
         }
         self.overlay_id.validate()?;
         validate_digest(&self.assessment_digest, "closure.assessment_digest")?;
+        if let Some(digest) = &self.frozen_pre_evaluation_digest {
+            validate_digest(digest, "closure.frozen_pre_evaluation_digest")?;
+        }
         if self.required_owner_proofs.is_empty() {
             return Err(LearningContractError::MissingOwnerEvidence {
                 field: "closure.required_owner_proofs",
