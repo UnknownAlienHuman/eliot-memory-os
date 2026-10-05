@@ -1966,3 +1966,61 @@ fn absence_replay_conflicts_on_changed_member_result() {
         "the conflict must name the member results: {err}"
     );
 }
+
+#[test]
+fn absence_replay_conflicts_on_changed_work_scope() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.work_scope = "propulsion acoustic envelope".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the work scope must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed work scope must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed work scope under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.canonical_body"),
+        "the conflict must name the canonical body: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_scope_revision() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.scope_revision = "scope-700.2".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the scope revision must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed scope revision must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed scope revision under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.canonical_body"),
+        "the conflict must name the canonical body: {err}"
+    );
+}
