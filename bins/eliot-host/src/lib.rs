@@ -6849,15 +6849,7 @@ impl HostComposition {
                 );
             }
             Ok((retained, materialisation)) => {
-                if retained.archive_id != facts.archive_id
-                    || retained.archive_digest != facts.archive_digest
-                    || retained.archive_class != facts.archive_class
-                    || retained.target_schema_digest != facts.target_schema_digest
-                    || retained.source_installation != facts.source_installation
-                    || retained.destination_installation != facts.destination_installation
-                    || materialisation.destination_installation != retained.destination_installation
-                    || materialisation.destination_installation_root
-                        != retained.isolation.destination_installation_root
+                if !Self::retained_isolated_destination_matches(&retained, &materialisation, &facts)
                 {
                     return Err(
                         "a different isolated destination was already admitted for this operation, \
@@ -6962,12 +6954,11 @@ impl HostComposition {
             "the source installation owner evidence could not be re-inspected, so the \
                      currency of the destination cannot be proved before it is created"
         })?;
-        let re_inspected_active_generation = re_inspected.approved().manifest.generation.clone();
         let materialisation = eliot_installation::materialise_prepared_isolated_destination(
             &allocation.admission,
             &area_lease,
             re_inspected.approved_generations(),
-            &re_inspected_active_generation,
+            &re_inspected.approved().manifest.generation,
         )
         .map_err(|error| Self::isolated_destination_reason(&error))?;
 
@@ -6988,6 +6979,24 @@ impl HostComposition {
             .map_err(|_| {
                 "the installation authority refused to retain the admitted isolated destination"
             })
+    }
+
+    /// Compares retained destination content with the exact admitted request.
+    #[cfg(windows)]
+    fn retained_isolated_destination_matches(
+        retained: &eliot_installation::PreparedDestinationAdmission,
+        materialisation: &eliot_installation::PreparedDestinationMaterialisation,
+        facts: &eliot_installation::PreparedDestinationFacts,
+    ) -> bool {
+        retained.archive_id == facts.archive_id
+            && retained.archive_digest == facts.archive_digest
+            && retained.archive_class == facts.archive_class
+            && retained.target_schema_digest == facts.target_schema_digest
+            && retained.source_installation == facts.source_installation
+            && retained.destination_installation == facts.destination_installation
+            && materialisation.destination_installation == retained.destination_installation
+            && materialisation.destination_installation_root
+                == retained.isolation.destination_installation_root
     }
 
     /// Renders one installation-authority refusal as its own static reason.

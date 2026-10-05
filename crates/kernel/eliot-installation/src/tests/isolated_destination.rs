@@ -62,7 +62,7 @@ fn approval_for(
     test_activation_approval(
         manifest,
         test_handle("transaction:958-isolated-destination"),
-        test_handle(&"c".repeat(64)),
+        test_handle("c".repeat(64)),
         test_handle(approval_ref),
     )
 }
@@ -155,8 +155,8 @@ fn fixture() -> Fixture {
         ..ApprovedGenerationRegistry::new()
     };
     let fixture = Fixture {
-        active_generation,
         registry,
+        active_generation,
         source_installation,
         other_installation,
     };
@@ -215,7 +215,7 @@ fn requirements(target_schema_digest: &PlatformHandle) -> ProposedRestorationReq
         max_restore_bytes: 65_536,
         target_schema_digest: target_schema_digest.clone(),
         requires_source_key_material: true,
-        requirements_digest: test_handle(&"0".repeat(64)),
+        requirements_digest: test_handle("0".repeat(64)),
     };
     // The commitment is computed from the values themselves, exactly as the
     // issuer does, so `validate` accepts the record for its own content rather
@@ -249,7 +249,7 @@ fn isolation(
         source_host_root: r"C:\ProgramData\Eliot\installations\1\host".to_owned(),
         source_active_generation: source_active_generation.clone(),
         destination_leaf_observation: observation,
-        evidence_digest: test_handle(&"0".repeat(64)),
+        evidence_digest: test_handle("0".repeat(64)),
     };
     evidence.evidence_digest = must(evidence.computed_digest());
     evidence
@@ -257,14 +257,14 @@ fn isolation(
 
 /// A fully valid admission bound to the fixture's own values.
 fn admission_for(fixture: &Fixture, destination: &PlatformHandle) -> PreparedDestinationAdmission {
-    let target_schema_digest = test_handle(&"a".repeat(64));
+    let target_schema_digest = test_handle("a".repeat(64));
     let mut admission = PreparedDestinationAdmission {
         wire: test_handle(PreparedDestinationAdmission::WIRE),
         operation_id: test_handle("operation:958-isolated-destination"),
         source_installation: fixture.source_installation.clone(),
         destination_installation: destination.clone(),
         archive_id: test_handle("archive:958"),
-        archive_digest: test_handle(&"b".repeat(64)),
+        archive_digest: test_handle("b".repeat(64)),
         archive_class: BackupClassWire::FullRecovery,
         current_purge_ledger_revision: LIVE_PURGE_REVISION,
         target_schema_digest: target_schema_digest.clone(),
@@ -276,7 +276,7 @@ fn admission_for(fixture: &Fixture, destination: &PlatformHandle) -> PreparedDes
             &fixture.active_generation,
             DestinationLeafObservation::Absent,
         ),
-        admission_digest: test_handle(&"0".repeat(64)),
+        admission_digest: test_handle("0".repeat(64)),
     };
     admission.admission_digest = must(admission.computed_digest());
     must(admission.validate());
@@ -301,7 +301,7 @@ fn materialisation_for(
             file_index: 13,
         },
         destination_leaf_observation: DestinationLeafObservation::Absent,
-        materialisation_digest: test_handle(&"0".repeat(64)),
+        materialisation_digest: test_handle("0".repeat(64)),
     };
     materialisation.materialisation_digest = must(materialisation.computed_digest());
     must(materialisation.validate());
@@ -597,7 +597,7 @@ fn a_destination_is_owned_by_exactly_one_operation() {
     );
 
     let mut changed = first.clone();
-    changed.archive_digest = test_handle(&"d".repeat(64));
+    changed.archive_digest = test_handle("d".repeat(64));
     changed.admission_digest = must(changed.computed_digest());
     must(changed.validate());
     assert!(
@@ -659,7 +659,7 @@ fn materialised_root_is_recorded_only_against_the_admission_it_realises() {
     );
 
     let mut unrelated = materialisation;
-    unrelated.admission_digest = test_handle(&"e".repeat(64));
+    unrelated.admission_digest = test_handle("e".repeat(64));
     unrelated.materialisation_digest = must(unrelated.computed_digest());
     must(unrelated.validate());
     assert!(
@@ -799,7 +799,7 @@ fn a_non_absent_leaf_observation_is_refused_by_both_records() {
             wire: test_handle(PreparedDestinationMaterialisation::WIRE),
             operation_id: test_handle("operation:958-observation"),
             destination_installation: destination.clone(),
-            admission_digest: test_handle(&"a".repeat(64)),
+            admission_digest: test_handle("a".repeat(64)),
             isolated_area_root: evidence.isolated_area_root.clone(),
             isolated_area_identity: evidence.isolated_area_identity,
             destination_installation_root: evidence.destination_installation_root.clone(),
@@ -808,7 +808,7 @@ fn a_non_absent_leaf_observation_is_refused_by_both_records() {
                 file_index: 13,
             },
             destination_leaf_observation: observation,
-            materialisation_digest: test_handle(&"0".repeat(64)),
+            materialisation_digest: test_handle("0".repeat(64)),
         };
         materialisation.materialisation_digest = must(materialisation.computed_digest());
         assert!(
@@ -937,7 +937,7 @@ fn live_source_roots() -> (String, String) {
     let installation = must(crate::protected_program_data_root())
         .join("Eliot")
         .join("installations")
-        .join(&"a".repeat(64));
+        .join("a".repeat(64));
     let installation_root = installation.to_string_lossy().into_owned();
     let host_root = crate::joined_windows_path(&installation_root, "host");
     (installation_root, host_root)
@@ -962,7 +962,7 @@ fn live_admission(
     let mut admission = PreparedDestinationAdmission {
         wire: test_handle(PreparedDestinationAdmission::WIRE),
         operation_id: test_handle("operation:958-live-materialise"),
-        source_installation: test_handle(&"a".repeat(64)),
+        source_installation: test_handle("a".repeat(64)),
         destination_installation: destination.clone(),
         archive_id: test_handle("archive:958-live"),
         archive_digest: test_handle("b".repeat(64)),
@@ -984,9 +984,9 @@ fn live_admission(
             source_host_root,
             source_active_generation: source_active_generation.clone(),
             destination_leaf_observation: DestinationLeafObservation::Absent,
-            evidence_digest: test_handle(&"0".repeat(64)),
+            evidence_digest: test_handle("0".repeat(64)),
         },
-        admission_digest: test_handle(&"0".repeat(64)),
+        admission_digest: test_handle("0".repeat(64)),
     };
     admission.isolation.evidence_digest = must(admission.isolation.computed_digest());
     admission.admission_digest = must(admission.computed_digest());
