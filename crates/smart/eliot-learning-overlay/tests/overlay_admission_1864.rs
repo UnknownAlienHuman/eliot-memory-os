@@ -358,6 +358,24 @@ fn bind_slot_source_contract(
             .slot_projection_digests
             .push(CampaignSlotProjectionDigest {
                 slot_id: projection.slot_id.clone(),
+                digest: digest.clone(),
+            });
+        // WHY: ExactReference equality (state_view.rs:1307-1310) requires the
+        // recipe's expected_reference to equal the provenance resolution's
+        // reference; pushing only the recipe side diverges with ScopeMismatch
+        // on view.provenance.current_source_reference. Mirror the identical
+        // digest into the provenance side to restore equality.
+        provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved")
+            .reference
+            .as_mut()
+            .expect("slot source has a current resolution reference")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
                 digest,
             });
     }
@@ -372,7 +390,11 @@ fn fixture() -> Fixture {
         owner: OwnerId::from_artifact(aid("owner-1864")),
         source_role: CampaignSourceRole::ArtifactProjection,
         target: target.clone(),
-        requirement: SlotRequirement::Optional,
+        // WHY: the projection is honestly KnownEmpty with owner evidence and empty
+        // declared_members; Optional plus KnownEmpty derives Partial so the view's
+        // CompleteForDeclaredRecipe fails validate_against; Required plus KnownEmpty
+        // plus evidence stays Complete via evidenced_empty. Norm I12-24:1883.
+        requirement: SlotRequirement::Required,
         declared_members: vec![],
         accepted_type: "verification/v1".to_owned(),
         schema_digest: digest("schema-1864"),
