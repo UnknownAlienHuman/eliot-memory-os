@@ -428,6 +428,19 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
                 descriptor=d1,
             )
 
+        # A changed matrix digest is well-formed but no longer the descriptor the
+        # catalogue row retains, so the mirror binding is stale: proven through
+        # the plan, not only through the row constructor.
+        d_orig = make_desc(852, "D-WU-COHORT", 42)
+        d_changed = make_desc(852, "D-WU-COHORT", 42, matrix_sha256="f" * 64)
+        self.assertNotEqual(d_orig.sha256, d_changed.sha256)
+        cat = ch.materialize_catalogue([make_row(d_orig)], (d_orig.issue,))
+        selection = c.VerificationSelection(cat.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_orig.issue,))
+
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection, [d_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
     # WORK_UNIT_CASE: 852/16
     def test_changed_mode_source_test_root_invalidates_row(self):
         d_orig = make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/work_unit_gate/cohort.py",))
@@ -440,6 +453,21 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_selection_plan(cat, selection, [d_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # A changed runner mode is equally well-formed and equally stales the
+        # mirror binding of the same catalogue row.
+        d_mode_changed = make_desc(852, "D-WU-COHORT", 42, mode=c.RunnerMode.METADATA_PYTHON)
+        self.assertNotEqual(d_orig.sha256, d_mode_changed.sha256)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection, [d_mode_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # A changed test root likewise invalidates the retained mirror.
+        d_test_root_changed = make_desc(852, "D-WU-COHORT", 42, test_roots=("scripts/other-tests",))
+        self.assertNotEqual(d_orig.sha256, d_test_root_changed.sha256)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection, [d_test_root_changed])
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
 
     # WORK_UNIT_CASE: 852/17
