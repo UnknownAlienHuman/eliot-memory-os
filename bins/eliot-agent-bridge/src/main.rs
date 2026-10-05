@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod hook_intake;
+mod host_event_oneshot;
 mod request_input;
 
 use eliot_agent_bridge::opencode_host_events::{
@@ -786,6 +787,9 @@ fn main() {
     let host_events_mode = argv
         .first()
         .is_some_and(|first| first == HOST_EVENTS_MODE_TOKEN);
+    let host_event_oneshot_mode = argv
+        .first()
+        .is_some_and(|first| first == host_event_oneshot::HOST_EVENT_ONESHOT_MODE_TOKEN);
     if hook_mode {
         argv.remove(0);
     }
@@ -795,10 +799,25 @@ fn main() {
     if host_events_mode {
         argv.remove(0);
     }
+    if host_event_oneshot_mode {
+        argv.remove(0);
+    }
     if hook_mode {
         // The hook intake owns its stdio exchange from here: host hook JSON
         // on stdin, the host decision schema on stdout.
         let code = match hook_intake::run_hook_intake(&argv) {
+            Ok(()) => 0,
+            Err(error) => {
+                emit_error(error.code(), &error.detail());
+                error.exit_code()
+            }
+        };
+        std::process::exit(code);
+    }
+    if host_event_oneshot_mode {
+        // The one-shot host-event intake owns its stdio exchange from here:
+        // host event JSON on stdin, the host decision JSON on stdout.
+        let code = match host_event_oneshot::run_host_event_oneshot(&argv) {
             Ok(()) => 0,
             Err(error) => {
                 emit_error(error.code(), &error.detail());

@@ -37,6 +37,7 @@ eliot-receipts.workspace = true
 eliot-runtime.workspace = true
 eliot-types.workspace = true
 eliot-user-broker-core.workspace = true
+eliot-windows-ipc.workspace = true
 eliot-workscope.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -44,6 +45,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 eliot-agent-contracts.workspace = true

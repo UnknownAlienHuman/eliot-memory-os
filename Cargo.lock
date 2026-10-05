@@ -758,6 +758,7 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-types",
  "eliot-user-broker-core",
+ "eliot-windows-ipc",
  "eliot-workscope",
  "secrecy",
  "serde",
@@ -765,6 +766,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
