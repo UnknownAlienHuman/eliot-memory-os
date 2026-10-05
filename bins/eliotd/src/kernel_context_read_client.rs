@@ -3282,7 +3282,15 @@ impl KernelContextReadClient {
 mod tests {
     use super::*;
 
+    use eliot_context_contracts::{
+        DOWNSTREAM_HEADROOM_SCHEMA_VERSION, HeadroomConsumer, HeadroomDemand, HeadroomQuantity,
+        HeadroomReleaseCondition,
+    };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_kernel_core::KernelAuthority;
+    use eliot_runtime_contracts::{
+        CapacityLimit, CapacityRequest, CapacityUnit, NormalWorkClass, RequestedOperationClass,
+    };
     use eliot_store_api::ScopeId;
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -3301,6 +3309,73 @@ mod tests {
             test_epoch(1)?,
             ResourceGeneration::new(generation)?,
         ))
+    }
+
+    /// W8 join fixture (issue #1679): a headroom request carrying exactly one
+    /// ownerless-dimension demand. `HeadroomDimension::Gpu` has no frozen owner
+    /// row (`owner_bottleneck()` is `None`), so `PacketHeadroomJoin::acquire`
+    /// must refuse it with `NoFrozenOwner` without consulting any owner. The
+    /// demand still carries a well-formed owner request: the refusal is about
+    /// the missing owner, never about a malformed demand.
+    fn gpu_demand_request(
+        fence: &StateFence,
+    ) -> Result<DownstreamHeadroomRequest, Box<dyn std::error::Error>> {
+        let demand = HeadroomDemand {
+            dimension: HeadroomDimension::Gpu,
+            quantity: HeadroomQuantity::Unknown {
+                reason: eliot_contracts::ArtifactId::new("reason-gpu-unknown")?,
+            },
+            request: CapacityRequest {
+                operation: RequestedOperationClass::Normal(NormalWorkClass::Interactive),
+                operation_id: "op-gpu-1".to_owned(),
+                requested_bottleneck: CapacityBottleneck::KernelRunnableControlSlots,
+                requested_limit: CapacityLimit {
+                    unit: CapacityUnit::Items,
+                    quantity: NonZeroU64::new(1).ok_or("non-zero demand")?,
+                },
+                requesting_owner_ref: "owner-a".to_owned(),
+                requesting_generation_ref: ResourceGeneration::new(1)?,
+                authority_epoch_ref: test_epoch(1)?,
+                profile_id: "profile-1".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                deadline_ms: 1_000,
+            },
+        };
+        Ok(DownstreamHeadroomRequest {
+            schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+            pipeline_id: eliot_contracts::ArtifactId::new("pipe-gpu-1")?,
+            attempt_id: eliot_contracts::ArtifactId::new("attempt-gpu-1")?,
+            stage_id: eliot_contracts::ArtifactId::new("stage-gpu-1")?,
+            consumer: HeadroomConsumer::Verifier,
+            binding: ContextBinding {
+                task_id: eliot_contracts::TaskId::new("task-one")?,
+                attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-one")?,
+                scope_id: eliot_receipts::WorkScopeId::new("governor")?,
+                state_fence: fence.clone(),
+                decision_id: eliot_contracts::DecisionId::new("decision-one")?,
+                operation_id: None,
+            },
+            route_id: "route-gpu-1".to_owned(),
+            serializer_id: "serializer-gpu-1".to_owned(),
+            recipe_digest: "recipe-gpu-1".to_owned(),
+            demands: vec![demand],
+            release: HeadroomReleaseCondition {
+                completion_receipt: eliot_contracts::ArtifactId::new("receipt-gpu-1")?,
+                release_on_cancel: true,
+                expires_at_ms: 9_999_999,
+            },
+        })
+    }
+
+    /// W8 join fixture (issue #1679): a live front door behind the join tests.
+    /// Partitions are roomy (4/4) so fixture setup never saturates: saturation
+    /// is arranged by each test, never by this helper.
+    fn test_front_door() -> Result<FrontDoor, Box<dyn std::error::Error>> {
+        let authority = KernelAuthority::new(
+            eliot_kernel_core::KernelAuthorityKey::from_bytes([5u8; 32]),
+            test_epoch(1)?,
+        );
+        Ok(FrontDoor::partitioned(authority, 4, 4, 8)?)
     }
 
     fn evidence_request(
