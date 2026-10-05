@@ -65,6 +65,14 @@ pub const WASM_DISPATCH_MATERIAL_WIRE_VERSION: u16 = 1;
 /// Grant window: the launch grant funds permits for sixty seconds from the
 /// durable admission time. Freshness opens at admission, never at derivation.
 pub const WASM_DISPATCH_GRANT_WINDOW_MS: u64 = 60_000;
+
+/// Process-wide publish serialization: the owner half of the one install
+/// guard (issue #2786 A1/AUD1). Publication, slot staging, and owner-side
+/// release all run inside [`publish_wasm_dispatch_bundle`]; the child half
+/// (claim, marker, release) is single-threaded by drive construction, and
+/// cross-process pairs use atomic renames with re-verification. Poisoning
+/// fails the publication closed rather than proceeding unguarded.
+static PUBLISH_SERIAL_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Versioned delivery-identity wire version (#2786 step 1). The child
 /// never parses this (the envelope stays wire v1); slot markers and the
 /// owner join table bind it.
@@ -2320,6 +2328,19 @@ pub fn publish_wasm_dispatch_bundle(
     claim: &WasmOwnerClaim,
     joins: &mut WasmJoinTable,
 ) -> Result<WasmPublishedBundle, WasmDispatchError> {
+    // The one install guard (issue #2786 A1/AUD1): concurrent same-process
+    // publishers (daemon `JoinSet` threads) serialize here across the whole
+    // stage/expose/prune sequence, so two replacements can never interleave
+    // on the shared fixed names. The guard covers only bounded local file
+    // I/O — validation, staging, exposure, pruning — never guest execution
+    // (this function spawns nothing) and never crosses an await (it is
+    // synchronous). Cross-process pairs need no lock: the child drive is
+    // single-threaded, the child never writes slots, the owner never writes
+    // markers, and every shared-name mutation on either side is an atomic
+    // rename with re-verification.
+    let _serial = PUBLISH_SERIAL_GUARD
+        .lock()
+        .map_err(|_| invalid("delivery-guard"))?;
     if host_executable_path.trim().is_empty() {
         return Err(invalid("registry-host-path"));
     }
@@ -2784,6 +2805,67 @@ mod tests {
         assert!(dir.join("00000000000000000007-0000000000000009").exists());
         assert!(dir.join("00000000000000000007-residue").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent same-process publishers serialize to exactly one winner:
+    /// without the install guard two threads could both observe no live set
+    /// and stage a torn mix; with it every loser takes typed backpressure
+    /// and the surviving set stays coherent.
+    #[test]
+    fn concurrent_publishes_serialize_to_one_winner() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..10u64 {
+            let dir = std::env::temp_dir().join(format!("eliot-2786-serial-{round}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("serial dir writable");
+            let barrier = Arc::new(Barrier::new(4));
+            let dir_ref = &dir;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for thread in 0..4u64 {
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(scope.spawn(move || {
+                        let mut claim = test_claim();
+                        claim.claim_id = format!("claim-serial-{round}-{thread}");
+                        claim.operation_id = format!("operation-serial-{round}-{thread}");
+                        claim.launch_nonce = format!("nonce-serial-{round}-{thread}");
+                        claim.artifact_bytes = format!("artifact-{round}-{thread}").into_bytes();
+                        claim.input_bytes = format!("input-{round}-{thread}").into_bytes();
+                        claim.guest.artifact_digest = sha256_hex(&claim.artifact_bytes);
+                        claim.guest.input_digest = sha256_hex(&claim.input_bytes);
+                        let mut joins = WasmJoinTable::default();
+                        barrier.wait();
+                        publish_wasm_dispatch_bundle(
+                            "C:\\Kernel\\eliot-wasm-host.exe",
+                            &"d".repeat(64),
+                            dir_ref,
+                            &claim,
+                            &mut joins,
+                        )
+                    }));
+                }
+                let mut winners = 0u32;
+                for handle in handles {
+                    match handle.join().expect("thread joins") {
+                        Ok(_) => winners += 1,
+                        Err(WasmDispatchError::Backpressure(_)) => {}
+                        Err(_) => panic!("loser takes typed backpressure"),
+                    }
+                }
+                assert_eq!(winners, 1);
+            });
+            let material_bytes =
+                std::fs::read(dir.join(WASM_HOST_MATERIAL_FILE_NAME)).expect("material readable");
+            let material: WasmDispatchMaterial =
+                serde_json::from_slice(&material_bytes).expect("material reparses");
+            let artifact = std::fs::read(dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))
+                .expect("artifact readable");
+            let input =
+                std::fs::read(dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME)).expect("input readable");
+            assert_eq!(sha256_hex(&artifact), material.guest.artifact_digest);
+            assert_eq!(sha256_hex(&input), material.guest.input_digest);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Pruning never removes the slot that owns the live fixed names.
