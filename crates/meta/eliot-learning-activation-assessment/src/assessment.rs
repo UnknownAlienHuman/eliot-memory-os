@@ -538,6 +538,28 @@ fn derive_sections(
 /// [`HarnessActivationReceiptCandidate::validate_against_lineage`] then
 /// re-checks the ack-as-use substitution and evidence-free observed
 /// adherence rules on the derived values.
+/// Bind the assessed overlay's frozen pre-evaluation fields by digest.
+///
+/// Reuses the overlay `freeze` digest over the sealed input overlay's own
+/// texts, identity and canonical digest, so the receipt records the identical
+/// value the admission receipt stores (W3 of #1864).
+fn frozen_digest_of_overlay(overlay: &CampaignHarnessOverlayCandidate) -> String {
+    eliot_learning_overlay::frozen_digest(
+        &eliot_learning_overlay::FrozenPreEvaluation {
+            intended_mechanism: overlay.intended_mechanism.clone(),
+            prediction: overlay.prediction.clone(),
+            expected_observable: overlay.expected_observable.clone(),
+            possible_regressions: overlay.possible_regressions.clone(),
+            confounders: overlay.confounders.clone(),
+            preserved_success_constraint: overlay.preserved_success_constraint.clone(),
+            next_discriminator_text: overlay.next_discriminator_text.clone(),
+            rollback_condition: overlay.rollback_condition.clone(),
+        },
+        overlay.overlay_id.as_str(),
+        &overlay.canonical_digest,
+    )
+}
+
 fn build_activation_candidate(
     input: &AssessmentInput<'_>,
     stages: Vec<StageObservation>,
@@ -585,6 +607,7 @@ fn build_activation_candidate(
             .receipt_completeness_and_missing_fields
             .to_vec(),
         invalidation_expiry_and_missingness: input.invalidation_expiry_and_missingness.to_vec(),
+        frozen_pre_evaluation_digest: Some(frozen_digest_of_overlay(input.overlay)),
         canonical_digest: String::new(),
     };
     activation
