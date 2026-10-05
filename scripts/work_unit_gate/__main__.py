@@ -100,7 +100,7 @@ except ImportError:  # fallback for direct file loading (delegate context)
 # bootstrap repositories without routers still verify).
 FROZEN_LEAF_ROUTER_SHA256 = {
     "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
-    "scripts/docs_router_core.py": "455aec470ab6f3f8bf7e64578d264ca0877a06cfec411d9aa415ffa62ae4a06a",
+    "scripts/docs_router_core.py": "19532a3505c6c94ccb3f4868ffa2d62fa0f666a6389c1166407937c15eb7ff9c",
     "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
     "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
 }
@@ -781,11 +781,125 @@ def _typed_from_decoded(data: dict):  # type: ignore[no-untyped-def]
     return c.WorkUnitDescriptor.from_mapping(converted)
 
 
+def _run_generate_cohort_lock(argv: list[str]) -> int:
+    """Explicit owner-side cohort-lock generation (outside read-only validation).
+
+    Reads a controller-supplied snapshot JSON file, decodes the observed
+    numeric descriptors under --root, renders deterministic lock bytes via
+    cohort.generate_cohort_lock, writes --out, then read-back-validates the
+    emitted lock and checks its numeric class against discovery. Validation
+    paths stay read-only: nothing here runs during catalogue-only, selected
+    or full-project proofs. Existing proof kinds, selectors and exits are
+    untouched (dispatched before parsing, like doc-read-evidence).
+    """
+    parser = argparse.ArgumentParser(
+        prog="verify-work-unit.py generate-cohort-lock",
+        description="Generate a cohort aggregate lock from a controller snapshot.")
+    parser.add_argument("--snapshot", required=True, help="Controller-supplied snapshot JSON file.")
+    parser.add_argument("--out", required=True, help="Output lock TOML path.")
+    parser.add_argument("--root", default=".", help="Repository root carrying .github/work-units.")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    gen = parser.parse_args(argv)
+    root, err = _resolve_root(gen.root)
+    if err is not None:
+        return err
+    assert root is not None
+    try:
+        snapshot_raw = Path(gen.snapshot).read_bytes()
+    except OSError:
+        _emit_error("error: --snapshot file unavailable; rejected before execution")
+        return 2
+    if len(snapshot_raw) > 1048576:
+        _emit_error("error: --snapshot file too large; rejected before execution")
+        return 2
+
+    def _gen_fail(detail: str) -> int:
+        if gen.json:
+            _emit(json.dumps({"exit": 1, "terminal": "INCOMPLETE", "completion": "NOT_VERIFIED",
+                              "terminal_detail": detail}, sort_keys=True))
+        else:
+            _emit(f"generate-cohort-lock INCOMPLETE: {detail}")
+        return 1
+
+    try:
+        snapshot = json.loads(snapshot_raw.decode("utf-8"))
+    except Exception:
+        return _gen_fail("snapshot is not valid JSON")
+    if type(snapshot) is not dict:
+        return _gen_fail("snapshot is not a JSON object")
+    discovered = _discover_descriptor_files(root)
+    typed_by_issue: dict[int, object] = {}
+    for num, path in discovered:
+        try:
+            raw_desc = path.read_bytes()
+        except OSError:
+            return _gen_fail(f"missing selected implementation: {num}")
+        try:
+            data = descriptor_runner.decode_descriptor(raw_desc, f".github/work-units/{num}.toml")
+        except descriptor_runner.RunnerInputError as exc:
+            return _gen_fail(f"descriptor contract failure: {_redact(exc)}")
+        except c.ContractViolation:
+            return _gen_fail("descriptor contract failure: binding mismatch")
+        except Exception:
+            return _gen_fail("descriptor internal failure")
+        try:
+            typed = _typed_from_decoded(data)
+        except c.ContractViolation:
+            return _gen_fail("catalogue contract failure: descriptor rejected")
+        except Exception:
+            return _gen_fail("catalogue internal failure")
+        if type(typed) is not c.WorkUnitDescriptor:
+            return _gen_fail("catalogue internal failure: malformed descriptor")
+        typed_by_issue[num] = typed
+    try:
+        lock_bytes = cohort.generate_cohort_lock(snapshot, typed_by_issue)
+    except cohort.CohortError as exc:
+        problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
+        return _gen_fail(f"snapshot rejected: {_redact(problem)}")
+    except c.ContractViolation:
+        return _gen_fail("snapshot contract failure")
+    except Exception:
+        _emit_error("error: generation internal failure")
+        return 2
+    out_path = Path(gen.out)
+    try:
+        if out_path.parent != Path(".") and not out_path.parent.is_dir():
+            return _gen_fail("output directory missing")
+        out_path.write_bytes(lock_bytes)
+    except OSError:
+        return _gen_fail("generated lock unwritable")
+    try:
+        lock = cohort.read_cohort_lock(out_path)
+    except cohort.CohortError as exc:
+        problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
+        return _gen_fail(f"generated lock unreadable: {_redact(problem)}")
+    try:
+        observed_class = sorted(num for num, _ in
+                                cohort.discover_numeric_descriptor_files(root / ".github" / "work-units"))
+    except cohort.CohortError as exc:
+        problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
+        return _gen_fail(f"discovery unavailable: {_redact(problem)}")
+    if observed_class != list(lock.aggregate.numeric_descriptors):
+        return _gen_fail("generated lock numeric class does not match discovery")
+    summary = {"exit": 0, "terminal": "PASS", "completion": "VERIFIED",
+               "terminal_detail": "cohort lock generated and validated",
+               "digest": lock.aggregate.sha256, "rows": len(lock.rows),
+               "numeric_descriptors": observed_class}
+    if gen.json:
+        _emit(json.dumps(summary, sort_keys=True))
+    else:
+        _emit(f"generate-cohort-lock PASS: digest={lock.aggregate.sha256} "
+              f"rows={len(lock.rows)} numeric={observed_class}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     # #2965 merge-boundary subcommand. Dispatched before any other parsing so
     # the existing work-unit/legacy CLI contract below is byte-for-byte
     # unchanged: no other option, selector, proof kind or exit code is touched.
+    if args_list[:1] == ["generate-cohort-lock"]:
+        return _run_generate_cohort_lock(args_list[1:])
     if args_list[:1] == ["doc-read-evidence"]:
         return doc_read_evidence.main(args_list[1:])
     dup = _reject_duplicates(args_list)
@@ -923,6 +1037,115 @@ def main(argv: list[str] | None = None) -> int:
             _emit(_render_human(result))
         return int(result["exit"])
 
+    class _AdmissionHalt(Exception):
+        """Carries a fail_result shape out of the admission helper. (probe)"""
+
+        def __init__(self, terminal_detail: str, exit_code: int,
+                     missing: list | None = None, failed: list | None = None):
+            super().__init__(terminal_detail)
+            self.terminal_detail = terminal_detail
+            self.exit_code = exit_code
+            self.missing = missing or []
+            self.failed = failed or []
+
+    def _admit_row_receipt(num: int, issue_id: object, unit: object) -> object:
+        """Admit one authoritative assignment receipt into memo_assignment.
+
+        The single acquisition implementation for selected and full-project
+        paths: builds the source request from the caller-supplied (already
+        typed) issue/unit identity, reads the live or explicitly admitted
+        offline source with no fallback, and stores the typed document.
+        Missing required evidence halts incomplete; it is never fabricated.
+        """
+        try:
+            request = assignment_source.SourceRequest(issue=issue_id, unit=unit,
+                                                      source_use=c.AssignmentSourceUse.ACTIVE_ASSIGNMENT)
+        except assignment_source.SourceError:
+            raise _AdmissionHalt("configuration failure: source request", 2)
+        except c.ContractViolation:
+            raise _AdmissionHalt("contract failure: source request", 1,
+                                 failed=[f"issue-{num}"])
+        except Exception:
+            raise _AdmissionHalt("internal failure: source request", 2)
+        offline_cfg = None
+        if mode is c.SourceAuthority.EXPLICIT_OFFLINE_SNAPSHOT:
+            assert offline_path is not None
+            try:
+                import json as _json
+
+                sidecar = offline_path.with_name(offline_path.name + ".admission.json")
+                try:
+                    admission_raw = sidecar.read_bytes()
+                except OSError:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                if len(admission_raw) > 65536:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                try:
+                    admission = _json.loads(admission_raw.decode("utf-8"))
+                except Exception:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                if type(admission) is not dict:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                snap_sha = admission.get("snapshot_sha256")
+                prod_raw = admission.get("producer")
+                cap_raw = admission.get("capture_receipt_sha256")
+                fresh_raw = admission.get("freshness_policy_sha256")
+                max_age_raw = admission.get("max_age_seconds", 86400)
+                if not (isinstance(snap_sha, str) and isinstance(prod_raw, str)
+                        and isinstance(cap_raw, str) and isinstance(fresh_raw, str)):
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                if type(max_age_raw) is not int or not 1 <= max_age_raw <= 86400:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                try:
+                    producer = c.WorkUnitIdentity(prod_raw)
+                except c.ContractViolation:
+                    raise _AdmissionHalt("offline failure: producer invalid", 1,
+                                         failed=[f"issue-{num}"])
+                try:
+                    offline_cfg = assignment_source.TrustedOfflineCapture(
+                        request=request, path=offline_path, snapshot_sha256=snap_sha,
+                        producer=producer, capture_receipt_sha256=cap_raw,
+                        freshness_policy_sha256=fresh_raw, max_age_seconds=max_age_raw)
+                except assignment_source.SourceError:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+            except assignment_source.SourceError as exc:
+                raise _AdmissionHalt(f"offline failure: {_redact(exc.code.value)}", 1,
+                                     failed=[f"issue-{num}"])
+            except _AdmissionHalt:
+                raise
+            except Exception:
+                raise _AdmissionHalt("offline failure: snapshot unavailable", 1,
+                                     failed=[f"issue-{num}"])
+        try:
+            source = assignment_source.AssignmentSource(request, offline=offline_cfg)
+        except assignment_source.SourceError:
+            raise _AdmissionHalt("configuration failure: assignment source", 2)
+        except Exception:
+            raise _AdmissionHalt("internal failure: assignment source", 2)
+        if type(source) is not assignment_source.AssignmentSource:
+            raise _AdmissionHalt("malformed child return: assignment source", 2)
+        try:
+            doc = source.read(mode)
+        except assignment_source.SourceError as exc:
+            code = exc.code.value if hasattr(exc, "code") else "SOURCE_UNAVAILABLE"
+            raise _AdmissionHalt(f"assignment failure: {_redact(code)}", 1,
+                                 failed=[f"issue-{num}"])
+        except c.ContractViolation:
+            raise _AdmissionHalt("assignment contract failure", 1, failed=[f"issue-{num}"])
+        except Exception:
+            raise _AdmissionHalt("assignment internal failure", 2)
+        if type(doc) is not assignment_source.AssignmentDocument:
+            raise _AdmissionHalt("malformed child return: assignment document", 2)
+        memo_assignment[num] = doc
+        return doc
+
     try:
         # Catalogue-only: no runner, no assignment, catalogue integrity only.
         if proof == "catalogue-only":
@@ -992,7 +1215,9 @@ def main(argv: list[str] | None = None) -> int:
                         lock_path, root / ".github" / "work-units", typed_by_issue,
                         expected_base_commit=_observed_base_commit(root),
                         expected_repository=_expected_repository(typed_descs),
-                        assignment_receipts=_assignment_receipts(memo_assignment))
+                        assignment_receipts=_assignment_receipts(memo_assignment),
+                        integration_owners=cohort.derive_integration_owners((), {}),
+                        package_sharing=())
                 except cohort.CohortError as exc:
                     return finish(fail_result(f"catalogue aggregate lock invalid: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                               ceiling="catalogue-integrity-only", scope="selected",
@@ -1030,7 +1255,15 @@ def main(argv: list[str] | None = None) -> int:
                                             disposition=c.CatalogueDisposition.ASSIGNED,
                                             descriptor=d, prerequisites=()) for d in sorted(typed_descs, key=lambda d: d.issue))
                 expected = tuple(sorted({r.issue for r in rows}))
-                catalogue = cohort.materialize_catalogue(rows, expected)
+                # No lock ships row dispositions here: every row is ASSIGNED
+                # with no prerequisites, so sharing derives from the observed
+                # descriptors alone; the owner profile is empty (catalogue-only
+                # admits no source mode, hence no relations) and fail-closed.
+                no_lock_owners = cohort.derive_integration_owners((), {})
+                no_lock_sharing = cohort.derive_package_sharing(list(typed_descs), {}, no_lock_owners)
+                catalogue = cohort.materialize_catalogue(
+                    rows, expected, integration_owners=no_lock_owners,
+                    package_sharing=no_lock_sharing)
             except cohort.CohortError as exc:
                 return finish(fail_result(f"catalogue structural failure: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                           ceiling="catalogue-integrity-only", scope="selected",
@@ -1371,7 +1604,53 @@ def main(argv: list[str] | None = None) -> int:
                 row for number, row in sorted(locked.items())
                 if number not in synthesized)
             expected_all = tuple(sorted({r.issue for r in rows_all}))
-            catalogue_full = cohort.materialize_catalogue(rows_all, expected_all)
+            # Authority handoff (AUD1/AUD3/AUD4): the admitted assignment
+            # documents are the only owner-role source. The profile projects
+            # admitted integrated-by relations (never spelling); sharing edges
+            # derive from accepted scopes, prereq edges and that profile.
+            admitted_docs = [doc for doc in memo_assignment.values()
+                             if type(doc) is assignment_source.AssignmentDocument]
+            full_profile = cohort.derive_integration_owners(
+                [doc.relation for doc in admitted_docs if doc.relation is not None],
+                {doc.receipt.issue: doc.receipt.unit for doc in admitted_docs})
+            # Every ASSIGNED denominator row needs its admitted receipt before
+            # validation; a row without one stays incomplete, never valid.
+            try:
+                for row in rows_all:
+                    if (row.disposition is c.CatalogueDisposition.ASSIGNED
+                            and row.issue.number not in memo_assignment):
+                        _admit_row_receipt(row.issue.number, row.issue, row.unit)
+            except _AdmissionHalt as halt:
+                return finish(fail_result(halt.terminal_detail, halt.exit_code,
+                                          missing=halt.missing, failed=halt.failed))
+            # Currency plus assignment rebinding over the retained lock
+            # (absent lock: locked is {} and there is nothing retained).
+            if locked:
+                try:
+                    full_lock = cohort.read_cohort_lock(lock_path)
+                    cohort.verify_lock_currency(
+                        full_lock,
+                        expected_base_commit=_observed_base_commit(root),
+                        expected_repository=_expected_repository(all_typed))
+                    cohort.verify_assignment_binding(
+                        full_lock,
+                        {d.issue.number: d for d in all_typed},
+                        _assignment_receipts(memo_assignment))
+                except cohort.CohortError as exc:
+                    return finish(fail_result(
+                        f"catalogue aggregate lock invalid: {_redact(exc.problem.value)}", 1,
+                        failed=["catalogue-lock"]))
+                except c.ContractViolation:
+                    return finish(fail_result("catalogue contract failure", 1, failed=["catalogue"]))
+                except Exception:
+                    return finish(fail_result("catalogue internal failure", 2))
+            full_prereqs = {r.issue.number: set(p.number for p in r.prerequisites) for r in rows_all}
+            full_sharing = cohort.derive_package_sharing(
+                [r.descriptor for r in rows_all if r.descriptor is not None],
+                full_prereqs, full_profile)
+            catalogue_full = cohort.materialize_catalogue(
+                rows_all, expected_all, integration_owners=full_profile,
+                package_sharing=full_sharing)
         except cohort.CohortError as exc:
             problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
             return finish(fail_result(f"catalogue structural failure: {_redact(problem)}", 1,
@@ -1458,7 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 return finish(fail_result("internal failure: attempt paths", 2))
             try:
-                cohort.validate_descriptor_scope(d)
+                cohort.validate_descriptor_scope(d, integration_owners=full_profile)
             except cohort.CohortError:
                 return finish(fail_result(f"contract failure: descriptor scope issue-{d.issue.number}", 1,
                                           failed=[f"issue-{d.issue.number}"]))
