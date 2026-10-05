@@ -2015,7 +2015,7 @@ function Invoke-IntegrationHarnessPrepare {
     }
     if ($null -ne $primaryFailure) {
         $cleanup = Invoke-IntegrationHarnessCleanup -Run $approved -Resources @($started) `
-            -Provider $Provider -CleanedState @{}
+            -Provider $Provider -CleanedState @{} -GroupBindings $GroupBindings -Clock $Clock
         return @{
             success         = $false
             primaryFailure  = $primaryFailure
@@ -2056,7 +2056,10 @@ function Invoke-IntegrationHarnessCleanup {
         [hashtable]$CleanedState,
         [Parameter()]
         [AllowNull()]
-        [object[]]$GroupBindings = @()
+        [object[]]$GroupBindings = @(),
+        [Parameter()]
+        [AllowNull()]
+        [scriptblock]$Clock
     )
     if (-not $Run.ContainsKey('binding')) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-RUN: run has no binding.')
@@ -2156,9 +2159,9 @@ function Invoke-IntegrationHarnessCleanup {
         }
         try {
             [void](Invoke-IntegrationHarnessProviderOperation -Operation 'Stop' `
-                -Provider $Provider -Binding $opBinding -Arguments @{ resourceKey = $key })
+                -Provider $Provider -Binding $opBinding -Arguments @{ resourceKey = $key } -Clock $Clock)
             $verification = Invoke-IntegrationHarnessProviderOperation -Operation 'VerifyCleanup' `
-                -Provider $Provider -Binding $opBinding -Arguments @{ resourceKey = $key }
+                -Provider $Provider -Binding $opBinding -Arguments @{ resourceKey = $key } -Clock $Clock
             $verified = $false
             if ($verification.ContainsKey('verified')) {
                 $verified = [bool]$verification['verified']
@@ -4247,7 +4250,7 @@ function Invoke-HarnessRun {
         if ($providerPlans.Count -gt 0) {
             $cleanupResult = Invoke-IntegrationHarnessCleanup -Run $run -Resources @($providerPlans) `
                 -Provider $Provider -CleanedState $cleanedState `
-                -GroupBindings @($groupBindings)
+                -GroupBindings @($groupBindings) -Clock $runtimeClock
             foreach ($cleanupRecord in @($cleanupResult['records'])) {
                 [void]$finalCleanupRecords.Add($cleanupRecord)
             }
