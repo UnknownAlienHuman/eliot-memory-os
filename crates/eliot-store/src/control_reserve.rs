@@ -832,3 +832,61 @@ impl StoreReserve {
         Ok(row)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    /// Saturating the single normal connection slot leaves the protected
+    /// partition untouched (issue #1679). The positive control comes FIRST and
+    /// its permit is held across the assertions: a reserve that refused
+    /// everything would also refuse normal work, so only an admitted
+    /// cancellation proves the protected slot is genuinely still available
+    /// while ordinary Store writes are being shed. The shedding refusal then
+    /// names the exact bottleneck, so exhaustion of one dimension is never
+    /// reported as global exhaustion.
+    #[test]
+    fn store_normal_connection_saturation_leaves_protected_slot_available() {
+        let reserve = StoreReserve::partitioned(
+            1,
+            2,
+            4,
+            4,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-fill-1",
+            )
+            .expect("first slot");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // slot while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-ctl-1",
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_connections(), 1);
+
+        let err = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-shed-1",
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(
+            matches!(err, StoreReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == STORE_CONNECTION_BOTTLENECK)
+        );
+    }
+}
