@@ -54,10 +54,10 @@ use crate::evidence_portfolio::{
     AuthorizedManifest, AuthorizedManifestParams, ClaimConditionSources, ClaimCoverageMap,
     ClaimVerdict, CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource,
     MaterialClaimRoster, NoMatchEvaluation, ObservedOutsideScope, PortfolioError,
-    PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text, check_precision,
-    digest, fence_preimage, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
-    text,
+    PrecisionAssertion, PrecisionKind, PresentedEvaluation, RiskState, SourceDisposition,
+    SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text,
+    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -3327,9 +3327,11 @@ impl CoverageReceipt {
             absence_evidence.map(|evidence| &evidence.manifest),
             assessment_time_ms,
             frozen_scope_digest,
-            absence_evidence.map(|evidence| evidence.evaluation.clone()),
-            None,
-            absence_evidence.map(|evidence| &evidence.evaluation),
+            PresentedEvaluation {
+                evaluation: absence_evidence.map(|evidence| evidence.evaluation.clone()),
+                admitted_query: None,
+                retained_evaluation: absence_evidence.map(|evidence| &evidence.evaluation),
+            },
         )?;
         let absence_verdict = assess_absence(account, &absence_preconditions);
         // The retained identity and ceiling come from the record the derivation

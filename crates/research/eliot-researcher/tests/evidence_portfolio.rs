@@ -311,9 +311,11 @@ fn preconditions(
         None,
         1_700_000_300_000,
         frozen_scope_digest,
-        evaluation,
-        None,
-        retained_eval.as_ref(),
+        PresentedEvaluation {
+            evaluation,
+            admitted_query: None,
+            retained_evaluation: retained_eval.as_ref(),
+        },
     )
     .expect("preconditions")
 }
@@ -891,9 +893,11 @@ fn absence_requires_complete_authoritative_lookup() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation.clone()),
-        Some(&admitted_query()),
-        Some(&evaluation),
+        PresentedEvaluation {
+            evaluation: Some(evaluation.clone()),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&evaluation),
+        },
     )
     .expect("preconditions over real evidence");
     assert_eq!(
@@ -951,9 +955,11 @@ fn absence_requires_complete_authoritative_lookup() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation.clone()),
-        Some(&admitted_query()),
-        Some(&evaluation),
+        PresentedEvaluation {
+            evaluation: Some(evaluation.clone()),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&evaluation),
+        },
     )
     .expect("preconditions over a withheld record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &blocked) else {
@@ -1046,9 +1052,11 @@ fn absence_substituted_record_is_unproven() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation),
-        Some(&admitted_query()),
-        Some(&retained_eval),
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
     )
     .expect("preconditions over a substituted record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &substituted) else {
@@ -1089,9 +1097,11 @@ fn absence_stale_record_is_unproven() {
         None,
         ASSESSMENT_MS,
         &scope_digest,
-        None,
-        None,
-        None,
+        PresentedEvaluation {
+            evaluation: None,
+            admitted_query: None,
+            retained_evaluation: None,
+        },
     )
     .expect("preconditions over a stale record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &stale_preconditions) else {
@@ -1144,9 +1154,11 @@ fn absence_missing_handle_is_unproven() {
         None,
         ASSESSMENT_MS,
         &inquiry_denominator_digest(),
-        None,
-        None,
-        None,
+        PresentedEvaluation {
+            evaluation: None,
+            admitted_query: None,
+            retained_evaluation: None,
+        },
     )
     .expect("preconditions over a missing handle");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &handle_less) else {
@@ -1183,9 +1195,11 @@ fn absence_foreign_scope_is_unproven() {
         Some(&manifest),
         ASSESSMENT_MS,
         DIGEST_A,
-        Some(evaluation),
-        Some(&admitted_query()),
-        Some(&retained_eval),
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
     )
     .expect("preconditions over a foreign scope");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &foreign) else {
@@ -1578,9 +1592,11 @@ fn absence_changed_record_breaks_result_binding() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation),
-        Some(&admitted_query()),
-        Some(&retained_eval),
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
     )
     .expect("preconditions over a changed record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &changed_binding) else {
@@ -1874,9 +1890,11 @@ fn absence_closed_denominator_missing_result_is_unproven() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation),
-        Some(&admitted_query()),
-        Some(&retained_eval),
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
     )
     .expect("preconditions over a closed denominator with a missing result");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &preconditions) else {
@@ -2215,9 +2233,11 @@ fn absence_presented_without_retained_refused_on_consuming_path() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(foreign),
-        Some(&foreign_admitted),
-        None,
+        PresentedEvaluation {
+            evaluation: Some(foreign),
+            admitted_query: Some(&foreign_admitted),
+            retained_evaluation: None,
+        },
     )
     .expect_err("a presented record with no retained record must be refused");
     let rendered = err.to_string();
@@ -2258,9 +2278,11 @@ fn absence_unadmitted_presented_refused_on_consuming_path() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(foreign),
-        Some(&admitted_query()),
-        Some(&retained_foreign),
+        PresentedEvaluation {
+            evaluation: Some(foreign),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_foreign),
+        },
     )
     .expect_err("a presented record under an unadmitted query must be refused");
     let rendered = err.to_string();
@@ -2294,9 +2316,11 @@ fn absence_replay_conflict_refused_on_consuming_path() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(changed),
-        Some(&admitted_query()),
-        Some(&evaluation),
+        PresentedEvaluation {
+            evaluation: Some(changed),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&evaluation),
+        },
     )
     .expect_err("a presented record diverging from the retained record must be refused");
     let rendered = err.to_string();
