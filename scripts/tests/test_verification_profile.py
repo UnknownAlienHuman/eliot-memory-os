@@ -341,12 +341,16 @@ def normalize_gate(name: str) -> str:
         return "cargo-metadata"
     if "deny" in slug:
         return "cargo-deny"
+    if "changed" in slug and "clippy" in slug:
+        return "cargo-clippy-changed"
     if "clippy" in slug:
         return "cargo-clippy-workspace"
     if "fmt" in slug:
         return "cargo-fmt"
     if "check" in slug:
         return "cargo-check-workspace"
+    if "all-targets" in slug and "test" in slug:
+        return "cargo-test-workspace-all-targets"
     if "test" in slug:
         return "cargo-test-workspace"
     return slug
