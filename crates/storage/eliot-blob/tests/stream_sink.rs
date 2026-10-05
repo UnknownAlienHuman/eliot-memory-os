@@ -1,0 +1,1003 @@
+//! Durable process-stream sink behavior for ELIOT issue #297.
+//!
+//! One substantive executable Rust test per `// WORK_UNIT_CASE: 297/<case>`
+//! marker immediately above its attributes. Case 297/A1 drives the exact #296
+//! sink port (`ProcessStreamSinkClient`) implemented by `BlobStoreStreamSink`
+//! in `crates/storage/eliot-blob/src/stream_sink.rs` against the `eliot-blob`
+//! service as it stands in this working tree -- the #297 delta, not `main`.
+//!
+//! The fixture harness below is MIRRORED verbatim from
+//! `crates/storage/eliot-blob/tests/storage_exhausted.rs`: the `ok` and
+//! `block_on` helpers and the `Fixture*` fakes keep their names and their exact
+//! fake semantics, and nothing is redesigned. WHY `block_on`: like its sibling
+//! suite this target declares no async runtime. The harness builds ONE store,
+//! ONE `BlobStreamSinkStoreBinding` and ONE `BlobStoreStreamSink`; the adapter
+//! is handed a `.clone()` of the shared service handle because it holds the
+//! handle without claiming any root -- a second `BlobStoreService::new` on the
+//! same root would raise `OwnerConflict` (A8) and must never appear here. That
+//! construction is why the four stateless port fakes additionally carry
+//! `Clone`: `BlobStoreService` derives `Clone` over all five of its port
+//! parameters. No fake method, name or semantic changed to get there.
+//!
+//! Citations into `src/stream_sink.rs` and into
+//! `eliot-process/src/stream_sink/{port,requests}.rs` name SYMBOLS, never line
+//! numbers. Those files are still being rewritten underneath this suite, so a
+//! raw line pointer here goes stale on its own; a named symbol does not.
+//!
+//! Governing fragments: I10.8.5 (append-only temporary raw evidence object; a
+//! zero-byte source still publishes and verifies as a real immutable object),
+//! I5.12 (one active root owner; blob durability proves bytes only).
+//!
+//! No test here fills a real disk or performs live recovery: every durable
+//! write goes through the existing `BlobPlatformPort` seam held in memory by
+//! `FixturePlatform`.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::task::{Context, Poll, Waker};
+
+use sha2::{Digest, Sha256};
+
+use eliot_blob::{
+    AeadOpenRequest, AeadSealRequest, BlobAeadPort, BlobCapacityCause, BlobCapacityCleanup,
+    BlobCapacityEffect, BlobCapacityEvidence, BlobCapacityFailure, BlobCapacityIdentity,
+    BlobCapacityRecovery, BlobCapacityStage, BlobCasProviderResult, BlobCompressionPort, BlobError,
+    BlobKeyPort, BlobKeySelection, BlobLiveSetPort, BlobPathState, BlobPlatformPort,
+    BlobStoreService, BlobStoreStreamSink, BlobStreamPublication, BlobStreamSinkStoreBinding,
+    LiveSetRevalidation, PublishState, RootClaimProof,
+};
+use eliot_blob_api::{
+    BlobCasCapability, BlobHash, BlobId, BlobIssuerTrustAnchor, BlobPolicyBinding,
+    BlobReceiptContext, BlobRootLease, BlobStageRequest, CompressionDescriptor, CryptoDescriptor,
+    ObjectResidencyKey, RetentionClass, VersionedContentDigest,
+};
+use eliot_platform::{PlatformHandle, WorkScopePath};
+use eliot_process::{
+    DurableStreamLocatorKind, DurableStreamRepresentation, ProcessExecutionBinding,
+    ProcessStreamDigestAlgorithm, ProcessStreamKind, ProcessStreamPolicyBinding,
+    ProcessStreamPrefixPreview, ProcessStreamSinkClient, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
+    ProcessStreamSinkSessionId, ProcessStreamSinkSourceId, ProcessStreamSinkState,
+    ProcessStreamSinkTerminalId, StreamPersistenceStatus, StreamTransportStatus,
+};
+use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
+
+fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => panic!("unexpected error: {error:?}"),
+    }
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut future = Pin::from(Box::new(future));
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+fn context_json(effect: &str, operation: &str, request: &str) -> String {
+    let epoch = r#"{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":4}"#;
+    let fence = format!(
+        "{{\"authority_epoch\":{epoch},\"resource_generation\":7,\"task_revision\":null,\"policy_revision\":null,\"integration_revision\":null}}"
+    );
+    let metadata = format!(
+        r#"{{"request_id":"{request}","session_id":null,"task_id":null,"product_id":"product-1","source_id":"source-1","state_fence":{fence},"clock":{{"valid_time_ms":1,"known_time_ms":1,"transaction_sequence":null,"monotonic_ns":1}}}}"#
+    );
+    format!(
+        r#"{{"work_scope":{{"scope_id":"scope-1","product_id":"product-1","resource_generation":7,"state_fence":{fence}}},"task":null,"session":null,"causal":{{"state_fence":{fence},"transaction_sequence":1,"parent_receipt_id":null,"predecessor_receipt_ids":[]}},"request":{{"metadata":{metadata},"state_fence":{fence}}},"operation":{{"operation_id":"{operation}","request_id":"{request}","idempotency_key":"idem-1","operation_kind":"blob-capacity-test","effect":"{effect}","state_fence":{fence}}},"authority":{{"authority_id":"authority-1","authority_owner":"test-owner","authority_epoch":{epoch},"state_fence":{fence},"allowed_effect":"{effect}","proof_ceiling":"OBSERVED_EXTERNAL_EFFECT"}}}}"#
+    )
+}
+
+fn receipt_context(operation: &str) -> BlobReceiptContext {
+    ok(serde_json::from_str(&context_json(
+        "REVERSIBLE_MUTATION",
+        operation,
+        &format!("request-{operation}"),
+    )))
+}
+
+fn residency(bytes: &[u8]) -> (BlobHash, ObjectResidencyKey) {
+    let hash = ok(BlobHash::new(blake3::hash(bytes).to_hex().to_string()));
+    let key = ObjectResidencyKey {
+        scope_domain_id: ok(BlobId::new("scope-test")),
+        access_domain_id: ok(BlobId::new("access-test")),
+        confidentiality_domain_id: ok(BlobId::new("conf-test")),
+        encryption_key_domain_id: ok(BlobId::new("test-lineage")),
+        retention_domain_id: ok(BlobId::new("retention-test")),
+        erasure_domain_id: ok(BlobId::new("erasure-test")),
+        content_digest: VersionedContentDigest {
+            algorithm: ok(BlobId::new("blake3")),
+            version: 1,
+            digest: hash.clone(),
+        },
+    };
+    ok(key.validate().map(|()| (hash, key)))
+}
+
+/// The root generation every root lease in this suite is minted with.
+///
+/// `lease_for` is the ONE place that mints it, and `stage_locked` reads the
+/// generation straight off the request's lease (`root_generation:
+/// request.root_lease.root_generation`), so a locator built from this constant
+/// carries the generation a live stage actually settles rather than a
+/// restatement of it. The lease's own fence binding is `context.request`, whose
+/// `state_fence` carries the same `resource_generation: 7` (`context_json`, this
+/// file), so the lease and its fence binding cannot disagree about which
+/// generation is in force.
+const ROOT_GENERATION: u64 = 7;
+
+fn lease_for(context: &BlobReceiptContext, root: &str) -> BlobRootLease {
+    ok(serde_json::from_value(serde_json::json!({
+        "root_id": root,
+        "owner_id": "owner-1",
+        "lease_id": "lease-1",
+        "root_generation": ROOT_GENERATION,
+        "fence_binding": context.request,
+    })))
+}
+
+fn policy() -> BlobPolicyBinding {
+    BlobPolicyBinding {
+        privacy_class: PrivacyClass::Private,
+        retention_class: RetentionClass::Task,
+        policy_ref: ok(PlatformHandle::new("policy-1")),
+        instruction_taint: InstructionTaint::DataOnly,
+        effect_ceiling: EffectCeiling::CandidateOnly,
+    }
+}
+
+fn stage_request(operation: &str, bytes: &[u8], root: &str) -> BlobStageRequest {
+    let context = receipt_context(operation);
+    let (_, residency_key) = residency(bytes);
+    BlobStageRequest {
+        root_lease: lease_for(&context, root),
+        context,
+        bytes: bytes.to_vec(),
+        policy: policy(),
+        residency: residency_key,
+    }
+}
+
+static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn unique_test_root() -> String {
+    let sequence = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("capacity-root-{sequence}")
+}
+
+#[derive(Default)]
+struct FaultState {
+    files: BTreeMap<String, Vec<u8>>,
+    claim: Option<RootClaimProof>,
+    claim_capacity: bool,
+    fail_write_new_on: Option<u64>,
+    /// A standing payload-write capacity fault: every durable write to the
+    /// staged PAYLOAD envelope fails, for as long as this condition holds.
+    ///
+    /// `fail_write_new_on` is a one-shot CALL ORDINAL -- it names the Nth
+    /// `write_new_durable` call and self-clears -- so it cannot express the
+    /// persistent fault case 19 states in its own doc comment ("a persistent
+    /// payload fault; two identical attempts"): attempt two would issue writes
+    /// 3..6 and meet no fault at all. This flag is keyed on the DESTINATION
+    /// IDENTITY instead, exactly like `is_metadata_destination`, so it can only
+    /// ever fire on the payload leg: the journal and the commit record both
+    /// live under `transactions/`, the metadata leg is `staging/...metadata`,
+    /// and the two final publications are installed by
+    /// `rename_no_replace_durable`, never by this method. Naive call-order
+    /// stickiness would re-fire on the second attempt's JOURNAL write and report
+    /// `JournalWrite` where the test asserts `PayloadWrite`.
+    ///
+    /// Default off, and `fail_write_new_on` keeps its one-shot semantics, so the
+    /// cases that share `write_new_durable` and do not opt in are
+    /// byte-identical to before.
+    ///
+    /// The flag itself is the condition: there is no retry budget, counter or
+    /// timer behind it.
+    fail_payload_write_while_full: bool,
+    /// The commit create installs its actual bytes, then its directory-flush
+    /// boundary reports unconfirmed durability and only then marks the volume
+    /// full for all following journal replacements.
+    ///
+    /// This destination-keyed seam cannot fire on the earlier payload,
+    /// metadata, or journal writes. It therefore lets both publication
+    /// checkpoints succeed before the commit boundary arms
+    /// `fail_replace_while_full`.
+    fail_commit_write_after_install_while_full: bool,
+    fail_replace_once: bool,
+    /// The volume is still full: the journal durable-state replace keeps
+    /// failing for as long as this condition holds, across every call.
+    ///
+    /// `fail_replace_once` models exactly one failed sync and self-clears;
+    /// capacity that has not been freed yet is a standing condition, not a
+    /// single attempt, so it needs its own flag. The flag itself is the
+    /// condition -- there is no retry budget, counter or timer behind it.
+    fail_replace_while_full: bool,
+    fail_rename: bool,
+    /// The rename installs the final destination bytes and only THEN fails at
+    /// the port's own directory-flush durability boundary.
+    ///
+    /// This is the only seam that produces "destination bytes visible, durable
+    /// rename unconfirmed": `fail_rename` fails before anything is installed.
+    fail_rename_after_install: bool,
+    /// The same install-then-flush seam, keyed on the METADATA publication's
+    /// final identity instead of the payload's, so the metadata publication
+    /// phase is reachable too.
+    ///
+    /// s-04.12 lays the two publications out under disjoint filename kinds --
+    /// `...{hash}.r{residency}.p{gen}` for the payload and
+    /// `...{hash}.r{residency}.m{gen}` for the metadata -- and the service reads
+    /// exactly that distinction back in `parse_scoped_path`. Keying on the
+    /// destination identity is what makes the second phase reachable with one
+    /// boolean. This is NOT a call ordinal, a counter, a retry budget or a timer:
+    /// the flag is the condition itself, and the flag is what is armed. Default
+    /// off, so the payload seam and every case that does not opt in keep
+    /// byte-identical behaviour.
+    fail_metadata_rename_after_install: bool,
+    fail_remove: bool,
+    write_new_calls: u64,
+    replace_calls: u64,
+    /// Every identity `replace_durable` actually installed, in call order.
+    ///
+    /// `replace_calls` counts durable writes but cannot say WHICH boundary the
+    /// owner was asked to re-establish, and that is precisely what separates a
+    /// real same-identity durable re-establishment from a bare byte-equality
+    /// promotion: both reach a ready receipt, but only the first asks the owner
+    /// to write the destination again. Recorded so that distinction can be
+    /// asserted on a named path rather than on a magic total.
+    replace_targets: Vec<String>,
+    /// Every `rename_no_replace_durable` attempt, including a failed one.
+    ///
+    /// Same-operation replay must add no rename after the commit checkpoint is
+    /// durable, so a file snapshot alone is not enough to prove that the owner
+    /// was left untouched.
+    rename_calls: u64,
+    remove_calls: u64,
+}
+
+#[derive(Clone, Default)]
+struct FixturePlatform {
+    state: Arc<Mutex<FaultState>>,
+}
+
+impl FixturePlatform {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FaultState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => panic!("fixture platform lock poisoned"),
+        }
+    }
+
+    /// A typed capacity failure as this port's owner reports it.
+    ///
+    /// `recovery` is left at the non-reconciling default on purpose. The
+    /// service recomputes the disposition from the bound effect inside
+    /// `bind_platform_capacity_with_effect` and never reads the one a port wrote,
+    /// so stating a reconciling disposition here would assert an invariant nothing
+    /// checks.
+    fn port_capacity(
+        stage: BlobCapacityStage,
+        effect: BlobCapacityEffect,
+        attempted_bytes: Option<u64>,
+    ) -> BlobError {
+        BlobError::StorageCapacity {
+            failure: Box::new(BlobCapacityFailure {
+                identity: BlobCapacityIdentity::Journal {
+                    operation_id: "provider-operation".to_owned(),
+                    idempotency_key: "provider-idempotency".to_owned(),
+                    locator: None,
+                },
+                stage,
+                evidence: BlobCapacityEvidence {
+                    cause: BlobCapacityCause::IoStorageFull,
+                    attempted_bytes,
+                    effect,
+                },
+                cas_request: None,
+                cas_observed: None,
+                cas_backend_generation: None,
+                cas_durability: None,
+                cleanup: BlobCapacityCleanup::NotApplicable,
+                cleanup_stage: None,
+                cleanup_evidence: None,
+                gc_state: None,
+                recovery: BlobCapacityRecovery::CapacityRevalidationRequired,
+            }),
+        }
+    }
+
+    /// Whether `destination` is the metadata publication's final identity.
+    ///
+    /// s-04.12 lays the two publications out under disjoint filename kinds --
+    /// `...{hash}.r{residency}.p{gen}` for the payload and
+    /// `...{hash}.r{residency}.m{gen}` for the metadata -- and the service reads
+    /// that same distinction back in `parse_scoped_path`, which parses kind `p`
+    /// versus kind `m`. The residency digest ahead of the kind marker is exactly
+    /// 64 hex characters, so the marker cannot be mistaken for part of a digest,
+    /// and `PATH_GENERATION` is `1`, the generation every scoped placement in
+    /// this suite carries.
+    fn is_metadata_destination(destination: &WorkScopePath) -> bool {
+        has_file_extension(destination.normalized_identity(), "m1")
+    }
+
+    /// Whether `destination` is the staged PAYLOAD envelope, i.e. the one
+    /// `write_new_durable` call that is the payload leg of a stage.
+    ///
+    /// `temp_path` lays the two staged objects out as `staging/<hash>.payload`
+    /// and `staging/<hash>.metadata`, while the journal and the commit record are
+    /// both `transactions/<hash>.stage` and `transactions/<hash>.commit`, per
+    /// `operation_path_from`. The namespace and the suffix are disjoint, so this
+    /// predicate can never select a journal write. That is the whole point: a
+    /// payload fault that also fired on the journal would report the wrong phase
+    /// for the operation it belongs to.
+    fn is_payload_temp_destination(destination: &WorkScopePath) -> bool {
+        let identity = destination.normalized_identity();
+        identity.starts_with("staging/") && identity.ends_with(".payload")
+    }
+
+    /// Whether `destination` is this operation's commit-marker create.
+    fn is_commit_destination(destination: &WorkScopePath) -> bool {
+        destination
+            .normalized_identity()
+            .starts_with("transactions/")
+            && destination.normalized_identity().ends_with(".commit")
+    }
+}
+
+impl BlobPlatformPort for FixturePlatform {
+    fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
+        let mut state = self.lock();
+        if state.claim_capacity {
+            return Err(BlobError::StorageCapacity {
+                failure: Box::new(BlobCapacityFailure {
+                    identity: BlobCapacityIdentity::RootLease {
+                        root_id: lease.root_id.as_str().to_owned(),
+                        lease_id: Some(lease.lease_id.as_str().to_owned()),
+                    },
+                    stage: BlobCapacityStage::RootLeaseCreate,
+                    evidence: BlobCapacityEvidence {
+                        cause: BlobCapacityCause::IoStorageFull,
+                        attempted_bytes: None,
+                        effect: BlobCapacityEffect::NotAttempted,
+                    },
+                    cas_request: None,
+                    cas_observed: None,
+                    cas_backend_generation: None,
+                    cas_durability: None,
+                    cleanup: BlobCapacityCleanup::NotApplicable,
+                    cleanup_stage: None,
+                    cleanup_evidence: None,
+                    gc_state: None,
+                    recovery: BlobCapacityRecovery::CapacityRevalidationRequired,
+                }),
+            });
+        }
+        let proof = RootClaimProof {
+            root_id: lease.root_id.as_str().to_owned(),
+            owner_id: lease.owner_id.as_str().to_owned(),
+            lease_id: lease.lease_id.as_str().to_owned(),
+            root_generation: lease.root_generation,
+            containment_proven: true,
+            permissions_proven: true,
+        };
+        state.claim = Some(proof.clone());
+        Ok(proof)
+    }
+
+    fn inspect_root(&self, _lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
+        self.lock().claim.clone().ok_or(BlobError::OwnerConflict)
+    }
+
+    fn prove_contained(
+        &self,
+        _lease: &BlobRootLease,
+        _path: &WorkScopePath,
+    ) -> Result<(), BlobError> {
+        Ok(())
+    }
+
+    fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        let state = self.lock();
+        let bytes = state
+            .files
+            .get(path.normalized_identity())
+            .cloned()
+            .ok_or(BlobError::NotFound)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(BlobError::InvalidContract(
+                "bounded platform read ceiling exceeded".to_owned(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+        let mut state = self.lock();
+        state.write_new_calls += 1;
+        if state.fail_write_new_on == Some(state.write_new_calls)
+            || (state.fail_payload_write_while_full && Self::is_payload_temp_destination(path))
+        {
+            return Err(Self::port_capacity(
+                BlobCapacityStage::PayloadWrite,
+                BlobCapacityEffect::PartialWriteUnknown,
+                Some(bytes.len() as u64),
+            ));
+        }
+        if state.files.contains_key(path.normalized_identity()) {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        state
+            .files
+            .insert(path.normalized_identity().to_owned(), bytes.to_vec());
+        if state.fail_commit_write_after_install_while_full && Self::is_commit_destination(path) {
+            // The bytes are installed before the owner reports its own
+            // directory-flush boundary. The volume becomes full only at this
+            // commit boundary, after payload and metadata journal checkpoints
+            // have already succeeded.
+            state.fail_replace_while_full = true;
+            return Err(Self::port_capacity(
+                BlobCapacityStage::DirectoryFlush,
+                BlobCapacityEffect::DurabilityUnconfirmed {
+                    state: PublishState::MetadataDurable,
+                    possible_effect: true,
+                },
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+        let mut state = self.lock();
+        state.replace_calls += 1;
+        if state.fail_replace_while_full {
+            // The volume is still full, so every journal durable-state replace
+            // fails until the condition is cleared. This is what makes "space
+            // freed" observable to the service: nothing else changes and the
+            // same operation simply keeps meeting the same boundary.
+            return Err(Self::port_capacity(
+                BlobCapacityStage::JournalWrite,
+                BlobCapacityEffect::PartialWriteUnknown,
+                Some(bytes.len() as u64),
+            ));
+        }
+        if state.fail_replace_once {
+            state.fail_replace_once = false;
+            return Err(Self::port_capacity(
+                BlobCapacityStage::JournalWrite,
+                BlobCapacityEffect::PartialWriteUnknown,
+                Some(bytes.len() as u64),
+            ));
+        }
+        if !state.files.contains_key(path.normalized_identity()) {
+            return Err(BlobError::NotFound);
+        }
+        state
+            .files
+            .insert(path.normalized_identity().to_owned(), bytes.to_vec());
+        state
+            .replace_targets
+            .push(path.normalized_identity().to_owned());
+        Ok(())
+    }
+
+    fn cas_capability(&self) -> BlobCasCapability {
+        BlobCasCapability::AtomicCompareAndReplace
+    }
+
+    fn compare_and_replace_durable(
+        &mut self,
+        _request: &eliot_blob_api::BlobCasRequest,
+        _bytes: &[u8],
+    ) -> Result<BlobCasProviderResult, BlobError> {
+        Err(BlobError::PlanGap(
+            "capacity fixture performs no conditional mutation".to_owned(),
+        ))
+    }
+
+    fn cas_status(&self, _operation_id: &str) -> Result<Option<BlobCasProviderResult>, BlobError> {
+        Ok(None)
+    }
+
+    fn backend_generation(&self) -> Result<u64, BlobError> {
+        Ok(1)
+    }
+
+    fn rename_no_replace_durable(
+        &mut self,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+    ) -> Result<(), BlobError> {
+        let mut state = self.lock();
+        state.rename_calls += 1;
+        if state.fail_rename {
+            // The WRAPPED port's own label, deliberately different from the
+            // caller's. A rename port cannot know which Blob object the service
+            // asked it to publish, so it states the object-level phase label it
+            // does know -- the case `bind_platform_capacity_with_effect`'s own doc
+            // calls "an internal phase label of one port call" -- while the
+            // service's caller states `PayloadPublication` for this leg. Reporting
+            // the caller's value here would make "the caller's stage wins" and "the
+            // port's stage wins" indistinguishable and would leave that doc's
+            // stage-collision rule unexercised. It names no durability boundary of
+            // its own, which is what makes this the losing side of the rule.
+            return Err(Self::port_capacity(
+                BlobCapacityStage::PayloadWrite,
+                BlobCapacityEffect::PossiblePublication {
+                    state: PublishState::JournalPrepared,
+                },
+                None,
+            ));
+        }
+        if state.files.contains_key(destination.normalized_identity()) {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let value = state
+            .files
+            .remove(source.normalized_identity())
+            .ok_or(BlobError::NotFound)?;
+        state
+            .files
+            .insert(destination.normalized_identity().to_owned(), value);
+        let metadata_leg = Self::is_metadata_destination(destination);
+        if state.fail_rename_after_install
+            || (state.fail_metadata_rename_after_install && metadata_leg)
+        {
+            // The final name is now visible in its directory; only the port's own
+            // `fsync` of that directory fails. I5.12 makes durable rename a
+            // precondition of the receipt, so this is "published, durability
+            // unconfirmed" -- a state `fail_rename` can never reach, because it
+            // fails before a single byte is installed.
+            //
+            // `DirectoryFlush` is a durability boundary, so
+            // `bind_platform_capacity_with_effect`'s stage-collision row keeps this
+            // stage verbatim where the caller would have stated its own
+            // `PayloadPublication`/`MetadataPublication`. That collision is real and
+            // observable: those are different values.
+            //
+            // The EFFECT axis cannot be read the same way. Because the port named a
+            // boundary, the caller's override is declined, so this value survives --
+            // but it is byte-identical to what the caller would have supplied for
+            // the same boundary, so an assertion on it proves only that no phase
+            // was promoted, never which side supplied it. The origin proof is the
+            // identity, which the service rewrites and this port cannot. The effect
+            // does state what the boundary produced: the payload leg runs while the
+            // journal is `JournalPrepared`, and the metadata leg runs only after
+            // `finish_journal` persisted `PayloadDurable` between the two calls.
+            return Err(Self::port_capacity(
+                BlobCapacityStage::DirectoryFlush,
+                BlobCapacityEffect::DurabilityUnconfirmed {
+                    state: if metadata_leg {
+                        PublishState::PayloadDurable
+                    } else {
+                        PublishState::JournalPrepared
+                    },
+                    possible_effect: true,
+                },
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError> {
+        let mut state = self.lock();
+        state.remove_calls += 1;
+        if state.fail_remove {
+            return Err(Self::port_capacity(
+                BlobCapacityStage::Cleanup,
+                BlobCapacityEffect::PossiblePublication {
+                    state: PublishState::CommitDurable,
+                },
+                None,
+            ));
+        }
+        state.files.remove(path.normalized_identity());
+        Ok(())
+    }
+
+    fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError> {
+        Ok(self.lock().files.get(path.normalized_identity()).map_or(
+            BlobPathState::Missing,
+            |bytes| BlobPathState::File {
+                length: bytes.len() as u64,
+                modified_unix_ms: 0,
+            },
+        ))
+    }
+
+    fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError> {
+        self.lock()
+            .files
+            .keys()
+            .filter(|path| path.starts_with(prefix.normalized_identity()))
+            .map(|path| {
+                WorkScopePath::new(path.clone())
+                    .map_err(|error| BlobError::InvalidContract(error.to_string()))
+            })
+            .collect()
+    }
+
+    fn now_unix_ms(&mut self) -> Result<u64, BlobError> {
+        Ok(0)
+    }
+}
+
+// `BlobStoreService` derives `Clone` over ALL FIVE port parameters, so the
+// shared-handle construction the sink requires (`store.clone()`: the adapter
+// holds the one owner without claiming a root, and a second
+// `BlobStoreService::new` on the same root would raise `OwnerConflict`, A8)
+// needs every injected port to be `Clone`. `FixturePlatform` already is; the
+// other four gain the derive here. That changes no fake behaviour: all four are
+// stateless unit types whose every method is unchanged.
+#[derive(Clone)]
+struct FixtureCompression;
+
+impl BlobCompressionPort for FixtureCompression {
+    fn descriptor(&mut self) -> Result<CompressionDescriptor, BlobError> {
+        Ok(CompressionDescriptor {
+            algorithm: ok(BlobId::new("test-identity-codec")),
+            version: 1,
+        })
+    }
+
+    fn compress(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, BlobError> {
+        Ok(plaintext.to_vec())
+    }
+
+    fn decompress_bounded(
+        &self,
+        descriptor: &CompressionDescriptor,
+        compressed: &[u8],
+        max_output_bytes: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        descriptor.validate()?;
+        if compressed.len() as u64 > max_output_bytes {
+            return Err(BlobError::InvalidContract(
+                "decompression output ceiling exceeded".to_owned(),
+            ));
+        }
+        Ok(compressed.to_vec())
+    }
+}
+
+#[derive(Clone)]
+struct FixtureKeys;
+
+impl FixtureKeys {
+    fn selection(generation: u64) -> BlobKeySelection {
+        BlobKeySelection {
+            key_ref: ok(BlobId::new(format!("test-key-{generation}"))),
+            crypto: CryptoDescriptor {
+                algorithm: ok(BlobId::new("test-only-authenticated-envelope")),
+                version: 1,
+                key_lineage: ok(BlobId::new("test-lineage")),
+                key_generation: generation,
+            },
+        }
+    }
+}
+
+impl BlobKeyPort for FixtureKeys {
+    fn current(&mut self) -> Result<BlobKeySelection, BlobError> {
+        Ok(Self::selection(3))
+    }
+
+    fn resolve(&self, descriptor: &CryptoDescriptor) -> Result<BlobKeySelection, BlobError> {
+        Ok(Self::selection(descriptor.key_generation))
+    }
+}
+
+#[derive(Clone)]
+struct FixtureAead;
+
+impl FixtureAead {
+    /// The single envelope-marker byte this port's AEAD prepends to every
+    /// sealed payload.
+    ///
+    /// It is a named constant rather than an inline `0x01` so that a test which
+    /// must state a length at the native write boundary derives it from `seal`
+    /// itself instead of restating it. `stage_locked` seals and then writes the
+    /// SEALED buffer (`&sealed`) to the payload temp path, so the bytes offered to
+    /// `write_new_durable` are the plaintext length plus this marker -- the
+    /// plaintext never reaches the boundary at all.
+    const ENVELOPE_MARKER: [u8; 1] = [0x01];
+}
+
+impl BlobAeadPort for FixtureAead {
+    fn seal(&mut self, request: AeadSealRequest<'_>) -> Result<Vec<u8>, BlobError> {
+        let mut sealed = Self::ENVELOPE_MARKER.to_vec();
+        sealed.extend_from_slice(request.plaintext);
+        Ok(sealed)
+    }
+
+    fn open(&self, request: AeadOpenRequest<'_>) -> Result<Vec<u8>, BlobError> {
+        request
+            .ciphertext
+            .strip_prefix(&Self::ENVELOPE_MARKER)
+            .map(<[u8]>::to_vec)
+            .ok_or(BlobError::IntegrityMismatch)
+    }
+}
+
+#[derive(Clone, Default)]
+struct FixtureLiveSets;
+
+impl BlobLiveSetPort for FixtureLiveSets {
+    fn revalidate(
+        &mut self,
+        proof: &eliot_blob_api::BlobLiveSetProof,
+    ) -> Result<LiveSetRevalidation, BlobError> {
+        Ok(LiveSetRevalidation {
+            proof_id: proof.proof_id.clone(),
+            snapshot_sha256: proof.snapshot_sha256.clone(),
+            revision: proof.revision,
+            still_complete_and_current: true,
+        })
+    }
+}
+
+fn test_anchor() -> BlobIssuerTrustAnchor {
+    ok(BlobIssuerTrustAnchor::new(
+        "s04-capacity-issuer",
+        "s04-capacity-key-v1",
+        vec![0x5a; 32],
+    ))
+}
+
+type FixtureStore = BlobStoreService<
+    FixturePlatform,
+    FixtureCompression,
+    FixtureKeys,
+    FixtureAead,
+    FixtureLiveSets,
+>;
+
+fn store_with_platform(platform: FixturePlatform, root: &str) -> FixtureStore {
+    let bootstrap = stage_request("bootstrap", b"bootstrap", root);
+    ok(BlobStoreService::new(
+        bootstrap.root_lease,
+        platform,
+        FixtureCompression,
+        FixtureKeys,
+        FixtureAead,
+        FixtureLiveSets,
+        test_anchor(),
+    ))
+}
+
+/// Whether the normalized identity's FILE EXTENSION is `extension`, compared
+/// case-insensitively.
+///
+/// s-04.12 puts the publication kind in the filename's extension: the payload is
+/// `{hash}.r{residency}.p{gen}` (`scoped_payload_path`) and the metadata is
+/// `{hash}.r{residency}.m{gen}` (`scoped_metadata_path`), so on the generation
+/// this suite uses (`PATH_GENERATION` = 1) `Path::extension` yields exactly `p1`
+/// and `m1`. Comparing the EXTENSION rather than a string suffix is what keeps
+/// the two kinds disjoint: `eq_ignore_ascii_case("m1")` is false for `p1`, so a
+/// payload destination can never satisfy the metadata predicate, and the
+/// residency digest ahead of the kind marker is irrelevant to the split.
+fn has_file_extension(identity: &str, extension: &str) -> bool {
+    std::path::Path::new(identity)
+        .extension()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension))
+}
+
+/// Source: `BlobStreamSinkStoreBinding::new` + `BlobStoreStreamSink::new`
+/// (`src/stream_sink.rs`), and `ProcessStreamSinkClient::open`/`finalize`/
+/// `readback` (`eliot-process/src/stream_sink/port.rs`) with
+/// `ProcessStreamSinkOpenRequest`/`ProcessStreamSinkFinalizeRequest` from
+/// `eliot-process/src/stream_sink/requests.rs`.
+/// Discovery: the W7 zero-byte contract stated on
+/// `BlobStreamPublication::Complete`, on `complete_source` and on
+/// `verify_readback` -- a zero-byte source publishes and verifies as a real
+/// immutable object and is never reported as "no source".
+/// Executed-pass: the live service is opened over the port, given ZERO appended
+/// chunks and one complete-source finalize, and the assertions below are real
+/// ones against the settled terminal, the owner-backed publication and the
+/// durable source identity -- never count-only.
+// WORK_UNIT_CASE: 297/A1-empty
+#[allow(
+    clippy::too_many_lines,
+    reason = "the open, zero-chunk publish, owner readback and publication proof is one case"
+)]
+#[test]
+fn empty_source_publishes_and_verifies_as_real_object() {
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    // The ONE active root owner of this case. The sink below receives a clone of
+    // this shared handle, never a second construction on the same root: that
+    // would raise `OwnerConflict` (A8) and is exactly what must not appear here.
+    let store = store_with_platform(platform, &root);
+
+    // The five store-side identities `BlobStreamSinkStoreBinding::new`
+    // validates. The residency template's content digest is a placeholder only:
+    // `stage_request` replaces it with the BLAKE3 of the exact staged bytes, so
+    // no byte of this case is described by the template itself.
+    let stage_context = receipt_context("sink-empty-stage");
+    let read_context: BlobReceiptContext = ok(serde_json::from_str(&context_json(
+        "READ",
+        "sink-empty-read",
+        "request-sink-empty-read",
+    )));
+    let root_lease = lease_for(&stage_context, &root);
+    let (_, residency_template) = residency(b"");
+    let binding = ok(BlobStreamSinkStoreBinding::new(
+        root_lease,
+        stage_context,
+        read_context,
+        policy(),
+        residency_template,
+    ));
+    let sink = BlobStoreStreamSink::new(store.clone(), binding);
+
+    let binding_json = ok(serde_json::from_value::<ProcessExecutionBinding>(
+        serde_json::json!({
+            "operation_id": "operation-1",
+            "process_tree_id": "tree-1",
+            "job_id": "job-1",
+            "image_id": "image-1",
+            "session_id": "session-1",
+            "generation": 3,
+            "action_lease_ref": "lease-1",
+            "authority_id": "authority-1",
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 7
+            },
+            "state_fence": {
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 7
+                },
+                "generation": 3,
+                "nonce": "fence-1"
+            },
+            "request_digest": "a".repeat(64),
+            "permit_digest": "b".repeat(64),
+            "effect_digest": "c".repeat(64),
+            "validation_revision": 2
+        }),
+    ));
+    let stream_policy = ok(ProcessStreamPolicyBinding::new(
+        "policy:sink-empty",
+        "privacy:project",
+        "visibility:owner",
+        "retention:task",
+        "redaction:exact-v1",
+    ));
+    let open = ok(ProcessStreamSinkOpenRequest::new(
+        ok(ProcessStreamSinkSessionId::new("sink-empty-session")),
+        ok(ProcessStreamSinkSourceId::new("source:sink-empty-session")),
+        ok(ProcessStreamSinkTerminalId::new(
+            "terminal:sink-empty-session",
+        )),
+        binding_json,
+        ProcessStreamKind::Stdout,
+        stream_policy,
+        ok(ProcessStreamSinkLimits::new(4, 16, 4, 8, 2, 8, 10, 20, 20)),
+        ProcessStreamDigestAlgorithm::Sha256,
+        ProcessStreamDigestAlgorithm::Sha256,
+    ));
+    let session = ok(block_on(sink.open(open)));
+
+    // ZERO appends. The admitted transport stream is empty, so the admitted
+    // digest and count are the empty ones and the bounded preview retains and
+    // represents nothing: no byte was ever handed to the adapter.
+    let empty_sha256 = format!("{:x}", Sha256::digest(b""));
+    let request = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        0,
+        0,
+        10,
+        StreamTransportStatus::Complete,
+        empty_sha256.clone(),
+        0,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            Vec::new(),
+            0,
+        )),
+        None,
+        Vec::new(),
+    ));
+    // A complete, gap-free, transport-complete source with no declared
+    // transformation is the ONLY shape that reaches `publish_reserved`, so this
+    // call is what hands zero bytes to the one blob owner under the bound stage
+    // operation identity.
+    let terminal = ok(block_on(sink.finalize(session.clone(), request)));
+
+    // The terminal is a complete source, not a withheld one: `complete_source`
+    // ran, so a real ready receipt existed and `verify_readback` had already read
+    // that very object back and matched its byte commitment. Nothing else can
+    // mint this state.
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+    assert_eq!(terminal.final_sequence(), 0);
+    assert_eq!(terminal.final_offset(), 0);
+    assert_eq!(terminal.admitted_chunks(), 0);
+    assert_eq!(terminal.admitted_bytes(), 0);
+    assert_eq!(terminal.admitted_sha256(), empty_sha256);
+
+    let evidence = terminal.evidence();
+    assert_eq!(evidence.transport(), StreamTransportStatus::Complete);
+    assert_eq!(
+        evidence.persistence(),
+        StreamPersistenceStatus::CompleteSource
+    );
+    assert!(evidence.gaps().is_empty());
+    assert_eq!(evidence.observed_bytes(), 0);
+    assert_eq!(evidence.observed_sha256(), empty_sha256);
+    let Some(source) = evidence.source() else {
+        panic!("a complete source terminal must carry its durable expansion source");
+    };
+    // The durable source names a real object, not "no source": the locator hash
+    // is the empty-content digest and it still resolves through its own
+    // owner-issued ready receipt.
+    assert_eq!(source.kind(), DurableStreamLocatorKind::Blob);
+    assert_eq!(
+        source.representation(),
+        DurableStreamRepresentation::ExactTransportBytes
+    );
+    assert_eq!(
+        source.byte_length(),
+        0,
+        "the readback this terminal rests on returned zero bytes"
+    );
+    assert_eq!(source.sha256(), empty_sha256);
+    assert_eq!(
+        source.locator(),
+        format!("blob:{}", blake3::hash(b"").to_hex()),
+        "the published object is addressed by the empty-content identity, never by a restated locator"
+    );
+    assert!(
+        !source.ready_receipt_ref().is_empty(),
+        "a complete source is resolvable only through an owner-issued receipt reference"
+    );
+    assert!(
+        source.transformation().is_none(),
+        "this adapter stages exact transport bytes and records no transformation output"
+    );
+
+    // The recorded publication is the same proven object: `Complete` is set only
+    // from a real owner receipt whose readback matched, and never from a
+    // nonempty locator alone.
+    let Some(BlobStreamPublication::Complete(complete)) = sink.publication() else {
+        panic!("a verified zero-byte source must record a real object, never `Unavailable`");
+    };
+    assert_eq!(complete.locator, source.locator());
+    assert_eq!(complete.ready_receipt_ref, source.ready_receipt_ref());
+    assert_eq!(complete.byte_length, 0);
+    assert_eq!(complete.sha256, empty_sha256);
+    assert_eq!(complete.measures.transport.byte_count, 0);
+    assert_eq!(complete.measures.transport.sha256, empty_sha256);
+    assert_eq!(complete.measures.admissible_source.byte_count, 0);
+    assert_eq!(
+        complete.measures.bounded_preview.retained_byte_count, 0,
+        "an empty stream retains no inline preview bytes"
+    );
+    assert_eq!(
+        complete.measures.bounded_preview.represented_byte_count, 0,
+        "an empty stream is fully represented by its empty preview, so it omits nothing"
+    );
+    assert!(complete.measures.bounded_preview.omitted_ranges.is_empty());
+
+    // The settled session reads back the ONE recorded terminal under the same
+    // command identity: no second object, no bare session view and no unknown
+    // outcome once the publication is proven.
+    let ProcessStreamSinkReadback::Terminal { terminal: recorded } =
+        ok(block_on(sink.readback(session.clone())))
+    else {
+        panic!("a proven publication reads back as its terminal");
+    };
+    assert_eq!(recorded, terminal);
+}
