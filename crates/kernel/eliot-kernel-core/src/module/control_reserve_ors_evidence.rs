@@ -1,4 +1,4 @@
-//! I14.3 Kernel composition join for ORS owner evidence (issue #1679, W3 ORS wave).
+﻿//! I14.3 Kernel composition join for ORS owner evidence (issue #1679, W3 ORS wave).
 //!
 //! The Kernel ORS owner enforces and reports its own capacities through
 //! `eliot_ors::OrsReserve::publish_owner_rows`; this module is the Kernel
@@ -130,6 +130,9 @@ fn contradiction(bottleneck: CapacityBottleneck, reason: &'static str) -> Kernel
 mod tests {
     use super::*;
     use eliot_contracts::EpochLineageId;
+    use eliot_runtime_contracts::{
+        BottleneckCoverageState, CapacityEnforcement, CapacityLimit, frozen_bottleneck_owner_map,
+    };
     use std::num::NonZeroU64;
 
     #[test]
@@ -148,5 +151,146 @@ mod tests {
             }
             other => panic!("expected InvalidField, got {other:?}"),
         }
+    }
+
+    /// One contract-valid claimed row for an ORS dimension, mirroring exactly
+    /// what the ORS owner publishes: the owner is read from the frozen map
+    /// rather than restated, and the disjoint normal and protected partitions
+    /// are bounded by the physical total (issue #1679 W3).
+    fn valid_ors_row(bottleneck: CapacityBottleneck) -> BottleneckCapacityProfile {
+        let owner = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == bottleneck)
+            .expect("frozen owner map binds the ORS dimension")
+            .owner;
+        let unit = bottleneck.unit();
+        BottleneckCapacityProfile {
+            bottleneck,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: owner.to_owned(),
+            owner_generation_ref: "gen-7".to_owned(),
+            unit,
+            physical_total_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(4).expect("total"),
+            }),
+            normal_work_applicable: true,
+            normal_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("normal"),
+            }),
+            protected_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("protected"),
+            }),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: "proof-1".to_owned(),
+            evidence_refs: vec!["ev-1".to_owned()],
+            invalidation_set: vec!["inv-1".to_owned()],
+        }
+    }
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("epoch")
+    }
+
+    /// Positive control for the helper: two valid ORS rows join into exactly
+    /// the two composition-bound evidence records, in frozen contract order,
+    /// carrying the composition-resolved snapshot and epoch (issue #1679 W3).
+    #[test]
+    fn join_ors_owner_evidence_joins_both_ors_dimensions() {
+        let epoch = test_epoch();
+        let rows = [
+            valid_ors_row(CapacityBottleneck::OrsTransactionSlots),
+            valid_ors_row(CapacityBottleneck::OrsDurableQueueBytes),
+        ];
+
+        let joined = join_ors_owner_evidence(&rows, "snap-1", &epoch).expect("valid rows join");
+
+        assert_eq!(
+            joined[0].row.bottleneck,
+            CapacityBottleneck::OrsTransactionSlots
+        );
+        assert_eq!(
+            joined[1].row.bottleneck,
+            CapacityBottleneck::OrsDurableQueueBytes
+        );
+        for record in &joined {
+            assert_eq!(record.config_snapshot_ref, "snap-1");
+            assert_eq!(record.authority_epoch_ref, epoch);
+        }
+    }
+
+    /// One owner's numbers are never presented as proof for another dimension:
+    /// a row for a non-ORS bottleneck is refused outright, before any
+    /// per-dimension matching (issue #1679 W3).
+    #[test]
+    fn join_ors_owner_evidence_refuses_non_ors_row() {
+        let epoch = test_epoch();
+        let mut foreign = valid_ors_row(CapacityBottleneck::OrsTransactionSlots);
+        foreign.bottleneck = CapacityBottleneck::StoreConnectionSlots;
+        let rows = [
+            valid_ors_row(CapacityBottleneck::OrsTransactionSlots),
+            foreign,
+        ];
+
+        let error =
+            join_ors_owner_evidence(&rows, "snap-1", &epoch).expect_err("non-ORS row must fail");
+
+        assert!(
+            matches!(
+                error,
+                KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
+                if bottleneck == CapacityBottleneck::StoreConnectionSlots.as_contract_str()
+            ),
+            "expected contradiction naming the foreign dimension, got {error:?}"
+        );
+    }
+
+    /// A missing ORS dimension is a contradiction, not a silent gap: the join
+    /// promises exactly one record per ORS dimension (issue #1679 W3).
+    #[test]
+    fn join_ors_owner_evidence_refuses_missing_dimension() {
+        let epoch = test_epoch();
+        let rows = [valid_ors_row(CapacityBottleneck::OrsTransactionSlots)];
+
+        let error =
+            join_ors_owner_evidence(&rows, "snap-1", &epoch).expect_err("missing row must fail");
+
+        assert!(
+            matches!(
+                error,
+                KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
+                if bottleneck == CapacityBottleneck::OrsDurableQueueBytes.as_contract_str()
+            ),
+            "expected contradiction naming the missing dimension, got {error:?}"
+        );
+    }
+
+    /// Two owner rows claiming one dimension contradict: the join carries
+    /// exactly one record per dimension, never a choice between two claims
+    /// (issue #1679 W3).
+    #[test]
+    fn join_ors_owner_evidence_refuses_duplicate_dimension() {
+        let epoch = test_epoch();
+        let row = valid_ors_row(CapacityBottleneck::OrsTransactionSlots);
+        let rows = [row.clone(), row];
+
+        let error =
+            join_ors_owner_evidence(&rows, "snap-1", &epoch).expect_err("duplicate must fail");
+
+        assert!(
+            matches!(
+                error,
+                KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
+                if bottleneck == CapacityBottleneck::OrsTransactionSlots.as_contract_str()
+            ),
+            "expected contradiction naming the duplicated dimension, got {error:?}"
+        );
     }
 }
