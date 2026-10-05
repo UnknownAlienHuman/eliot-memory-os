@@ -1208,4 +1208,54 @@ mod tests {
             }
         ));
     }
+
+    /// The positive complement of
+    /// `ors_transaction_exhaustion_response_refuses_an_admitting_partition`:
+    /// that test pins that an admitting partition refuses to manufacture
+    /// pressure evidence, this one pins that a truly saturated normal
+    /// transaction partition yields a real `BUSY` report naming the transaction
+    /// dimension (issue #1679 A3).
+    #[test]
+    fn ors_transaction_exhaustion_response_reports_live_saturation() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop, and the report
+        // below must observe the live saturated partition.
+        let _held_a = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("first slot");
+        let _held_b = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-2",
+                epoch,
+            )
+            .expect("second slot");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        let response = reserve
+            .normal_transaction_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-tx-report-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect("live saturation must report");
+        assert!(matches!(
+            response.disposition,
+            BackpressureDisposition::Busy
+        ));
+    }
 }
