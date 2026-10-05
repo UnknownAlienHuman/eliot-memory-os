@@ -2012,6 +2012,27 @@ fn refused_ack(
     }
 }
 
+/// Reports whether a staged ack digest matches the owner's digest shape
+/// (64 lowercase hex): the same rule `validate_control_ack`
+/// (eliot-kernel-service) applies through `require_digest`.
+fn ack_digest_ok(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Reports whether a staged ack detail matches the owner's detail shape
+/// (within bound, no control chars, never blank when present): the same
+/// rule `validate_control_ack` applies through `require_detail`.
+fn ack_detail_ok(detail: Option<&str>) -> bool {
+    detail.is_none_or(|value| {
+        value.len() <= WASM_CONTROL_MAX_DETAIL_BYTES
+            && !value.chars().any(char::is_control)
+            && !value.trim().is_empty()
+    })
+}
+
 /// One polled-but-unconfirmed control delivery: validated and yielded to the
 /// loop, but not yet admitted and enqueued, so still unacknowledged and
 /// fully replayable. Every identity field it carries is the delivery's own,
@@ -2547,24 +2568,10 @@ impl KernelControlReader {
         {
             return AckSlot::Unjoined;
         }
-        // Same shape rules the owner applies in `validate_control_ack`:
-        // lowercase-hex digests, details with no control chars that are
-        // never blank, Enqueued/Refused carrying no outcome digest.
-        fn digest_ok(value: &str) -> bool {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        }
-        fn detail_ok(detail: &Option<String>) -> bool {
-            detail.as_ref().is_none_or(|value| {
-                value.len() <= WASM_CONTROL_MAX_DETAIL_BYTES
-                    && !value.chars().any(char::is_control)
-                    && !value.trim().is_empty()
-            })
-        }
+        // Same shape rules the owner applies in `validate_control_ack`; see
+        // `ack_digest_ok` / `ack_detail_ok` beside `refused_ack`.
         match (&ack.phase, &ack.detail, &ack.outcome_digest) {
-            (ControlAckPhase::Enqueued, _, None) if detail_ok(&ack.detail) => {
+            (ControlAckPhase::Enqueued, _, None) if ack_detail_ok(ack.detail.as_deref()) => {
                 let mine = self.accepted.as_ref().is_some_and(|accepted| {
                     accepted.generation == generation && accepted.sequence == sequence
                 });
@@ -2575,12 +2582,14 @@ impl KernelControlReader {
                 }
             }
             (ControlAckPhase::Completed, _, outcome)
-                if detail_ok(&ack.detail)
-                    && outcome.as_ref().is_none_or(|value| digest_ok(value)) =>
+                if ack_detail_ok(ack.detail.as_deref())
+                    && outcome.as_deref().is_none_or(ack_digest_ok) =>
             {
                 AckSlot::Decided
             }
-            (ControlAckPhase::Refused, Some(_), None) if detail_ok(&ack.detail) => AckSlot::Decided,
+            (ControlAckPhase::Refused, Some(_), None) if ack_detail_ok(ack.detail.as_deref()) => {
+                AckSlot::Decided
+            }
             _ => AckSlot::Unjoined,
         }
     }
