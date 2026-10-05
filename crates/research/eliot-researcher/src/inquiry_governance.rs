@@ -9451,7 +9451,28 @@ fn coverage_account(
     {
         members.insert(handle.clone());
     }
-    let mut account = CoverageAccount::open(members).map_err(InquiryError::from)?;
+    // An admitted manifest that declares no member is not an error when the run
+    // examined candidates: the examined records are the run evidence the
+    // verified-empty account is opened over, and an empty manifest with an
+    // empty run still refuses below (an enumeration that never ran leaves an
+    // absent measurement, never a verified-empty scope). The observe loop then
+    // replays the same bindings idempotently: with an empty denominator every
+    // candidate lands outside the frozen scope, exactly as retained at open.
+    let mut account = if members.is_empty() {
+        let examined: Vec<ObservedOutsideScope> = admissibility
+            .iter()
+            .map(|record| ObservedOutsideScope {
+                handle: record.record.handle.clone(),
+                disposition: record.record.acquisition,
+                content_digest: record.record.content_digest.clone(),
+                operation_id: record.record.operation_id.clone(),
+                admitted_manifest_digest: manifest.digest.clone(),
+            })
+            .collect();
+        CoverageAccount::open_verified_empty(&examined).map_err(InquiryError::from)?
+    } else {
+        CoverageAccount::open(members).map_err(InquiryError::from)?
+    };
     for record in admissibility {
         account.observe(
             &record.record.handle,
