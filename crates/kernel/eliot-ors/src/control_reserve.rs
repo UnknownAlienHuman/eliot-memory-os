@@ -1401,6 +1401,30 @@ mod tests {
         ));
     }
 
+    /// The protected-partition complement of the normal floor (issue #1679):
+    /// a reserve with no protected transaction slots can never admit protected
+    /// ORS work, so building one must fail at build rather than surprise a
+    /// caller at runtime with an always-shedding partition. The refusal names
+    /// the exact field.
+    #[test]
+    fn ors_partitioned_zero_protected_transactions_fails_closed() {
+        let Err(err) = OrsReserve::partitioned(
+            4,
+            0,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        ) else {
+            panic!("zero protected transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.protected_transaction_slots",
+                ..
+            }
+        ));
+    }
+
     /// The owner-identity complement of the acquisition paths (issue #1679
     /// A10): every permit binds owner, operation and epoch, so a blank owner
     /// must never hold an ORS permit. The refusal names the exact field
