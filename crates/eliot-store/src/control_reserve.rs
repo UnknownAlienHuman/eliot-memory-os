@@ -889,4 +889,60 @@ mod tests {
             matches!(err, StoreReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == STORE_CONNECTION_BOTTLENECK)
         );
     }
+
+    /// Store pending-write memory is the third Store dimension, so saturating
+    /// the normal pending-write byte partition leaves the protected
+    /// pending-write path available (issue #1679). The positive control comes
+    /// FIRST and its permit is held across the assertions: a reserve that
+    /// refused everything would also refuse normal work, so only an admitted
+    /// cancellation proves the protected byte budget is genuinely still
+    /// available while ordinary Store writes are being shed. The shedding
+    /// refusal then names the exact bottleneck, so exhaustion of one dimension
+    /// is never reported as global exhaustion.
+    #[test]
+    fn store_normal_pending_saturation_leaves_protected_bytes_available() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_pending_write_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-pend-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+            )
+            .expect("normal pending bytes");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // bytes while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_pending_write_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-pend-ctl-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_pending_write_bytes(), 3);
+
+        let err = reserve
+            .try_acquire_normal_pending_write_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-pend-shed-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("saturated normal pending bytes must refuse");
+        assert!(
+            matches!(err, StoreReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == STORE_PENDING_WRITE_BOTTLENECK)
+        );
+    }
 }
