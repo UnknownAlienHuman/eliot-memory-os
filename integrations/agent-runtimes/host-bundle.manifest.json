@@ -115,7 +115,7 @@
           "destination": "plugins/eliot.js",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "cd226d351a1e9b0f91041b92b6b7d9841a3c8c5fa28d177f48d65fe38840f7fb"
+          "sha256": "b7f62216b0c9b076fe1374c810fad5ef8cd2930f33c4f02c2d026f954405b728"
         },
         {
           "source": "integrations/opencode/instructions/eliot.md",
