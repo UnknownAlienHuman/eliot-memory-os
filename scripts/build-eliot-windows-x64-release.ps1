@@ -4515,7 +4515,6 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
-$frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
 # Issue #2968: the retirement decision is resolved BEFORE any bundle content
 # is decided, and only from an explicit detached approval input. The input is
 # the only caller-supplied retirement artifact; the trust root is one exact
@@ -4549,6 +4548,14 @@ if ([string]$governorDisposition.Kind -ceq 'RetirementCandidate') {
     throw "governor retirement is a candidate, not accepted; plan/stage aborted as blocked/partial: $([string]$governorDisposition.Reason)"
 }
 $legacyGovernorPresent = [string]$governorDisposition.Kind -ceq 'Retained'
+# Issue #1719 W3: the front-door plan is disposition-aware and computed AFTER the
+# disposition resolves. Retained keeps the caller selection; Retired always provisions
+# agent-bridge; an explicit legacy selection against Retired aborts here at plan time.
+$frontDoorSelection = if ($legacyGovernorPresent) { $ClaudeCodeFrontDoor } else { 'agent-bridge' }
+if ((-not $legacyGovernorPresent) -and ($ClaudeCodeFrontDoor -ceq 'legacy') -and $PSBoundParameters.ContainsKey('ClaudeCodeFrontDoor')) {
+    throw 'explicit -ClaudeCodeFrontDoor legacy contradicts the resolved Retired governor disposition; re-run with -ClaudeCodeFrontDoor agent-bridge'
+}
+$frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $frontDoorSelection
 $governorEvidence = $governorDisposition.Evidence
 $governorApprovalReference = $governorDisposition.ApprovalReference
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
@@ -4633,7 +4640,7 @@ $plan = [ordered]@{
         issuer_reason = [string]$governorIssuer.reason
     }
     claude_code_front_door = [ordered]@{
-        selection = $ClaudeCodeFrontDoor
+        selection = $frontDoorSelection
         operator_flag = 'ELIOT_CLAUDE_FRONT_DOOR'
         legacy_available = [bool]$legacyGovernorPresent
         legacy_command = if ($legacyGovernorPresent) { 'eliot-governor.exe' } else { $null }
@@ -5330,7 +5337,7 @@ try {
         governor_retirement_approval = $plan.governor_retirement_approval
         governor_retirement_approval_trust = $plan.governor_retirement_approval_trust
         claude_code_front_door = [ordered]@{
-            selection = $ClaudeCodeFrontDoor
+            selection = $frontDoorSelection
             operator_flag = 'ELIOT_CLAUDE_FRONT_DOOR'
             bridge_path = 'eliot-agent-bridge.exe'
             bridge_provisioned = [bool]$frontDoorBridgeStaged
