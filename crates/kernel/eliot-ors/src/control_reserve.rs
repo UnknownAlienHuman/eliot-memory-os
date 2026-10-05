@@ -1304,4 +1304,49 @@ mod tests {
             }
         ));
     }
+
+    /// The byte-dimension identity complement of
+    /// `ors_transaction_exhaustion_response_reports_live_saturation`: that test
+    /// pins a real `BUSY` report from a live-saturated partition, this one pins
+    /// that the saturated durable byte partition still refuses a blank operation
+    /// identity as `InvalidField { field: "ors_rejection.operation_id" }`, so no
+    /// report carries an identity the contract cannot name (issue #1679 A10).
+    #[test]
+    fn ors_durable_response_rejects_malformed_operation_id() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(1).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        let _held = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect("normal bytes");
+        assert_eq!(reserve.available_normal_durable_bytes(), 0);
+
+        let err = reserve
+            .normal_durable_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_rejection.operation_id",
+                ..
+            }
+        ));
+    }
 }
