@@ -763,4 +763,47 @@ mod tests {
             BackpressureDisposition::Busy
         ));
     }
+
+    /// The identity complement of `ipc_bytes_exhaustion_response_reports_live_saturation`:
+    /// that test pins a real `BUSY` report from a live-saturated pipe partition,
+    /// this one pins that the same saturated partition still refuses a blank
+    /// operation identity as
+    /// `InvalidField { field: "ipc_rejection.operation_id" }`, so no report
+    /// carries an identity the contract cannot name (issue #1679 A10).
+    #[test]
+    fn ipc_bytes_response_rejects_malformed_operation_id() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(1).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        // The whole normal pipe partition is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the malformed
+        // identity and not from an unsaturated partition.
+        let _held = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-pipe-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("normal pipe bytes");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+
+        let err = reserve
+            .normal_bytes_exhaustion_response(
+                NormalWorkClass::Interactive,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_rejection.operation_id",
+                ..
+            }
+        ));
+    }
 }
