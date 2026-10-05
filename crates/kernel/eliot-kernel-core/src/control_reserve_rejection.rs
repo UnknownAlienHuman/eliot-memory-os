@@ -404,4 +404,45 @@ mod tests {
         ));
         Ok(())
     }
+
+    /// The positive complement of
+    /// `guarantee_lost_response_refuses_a_remaining_last_resort_path` in
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
+    /// that test pins refusal while a recording path is live, this one pins a
+    /// real guarantee-loss record once both the protected partition and the
+    /// preallocated last-resort slot are truly gone, so the loss is never
+    /// dropped silently.
+    #[test]
+    fn guarantee_lost_response_records_live_guarantee_loss() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([23u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // Both recording paths are consumed and held: the permits release on
+        // drop, so the record below observes the live guarantee loss.
+        let _held_protected = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        let _held_emergency = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-gap-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+        assert_eq!(front_door.available_emergency(), 0);
+
+        let response = front_door.guarantee_lost_response(
+            "op-loss-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert!(matches!(
+            response.disposition,
+            eliot_runtime_contracts::BackpressureDisposition::CapabilityDegraded
+        ));
+        Ok(())
+    }
 }
