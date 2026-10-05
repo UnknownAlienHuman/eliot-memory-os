@@ -2032,4 +2032,23 @@ mod tests {
         );
         Ok(())
     }
+
+    /// No-scaling construction plus the preallocated last-resort slot
+    /// (issue #1679): a fresh front door reports exactly its
+    /// configured normal/protected capacities and a live emergency
+    /// slot (I14.3: quantities are copied from configuration, never
+    /// derived; the last-resort slot is preallocated outside normal
+    /// accounting).
+    #[test]
+    fn fresh_front_door_reports_configured_partitions() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([37u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 3, 8)?;
+        assert_eq!(front_door.available_normal(), 2);
+        assert_eq!(front_door.available_protected(), 3);
+        assert!(front_door.available_emergency() > 0);
+        Ok(())
+    }
 }
