@@ -354,6 +354,7 @@ pub fn project_control_reserve_status(
 mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_runtime_contracts::{CapacityEnforcement, CapacityLimit};
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -456,6 +457,80 @@ mod tests {
             KernelError::ControlReserveEvidenceContradiction { bottleneck, .. }
                 if bottleneck == map[0].bottleneck.as_contract_str()
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn compile_current_claimed_row_passes_through() -> KernelResult<()> {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch");
+        let identity = ControlReserveProfileIdentity {
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            product_identity_ref: "product-1".to_owned(),
+            source_build_and_runtime_generation_refs: vec!["gen-1".to_owned()],
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch.clone(),
+            compiled_at_ms: 1_000,
+            profile_evidence_refs: Vec::new(),
+            invalidation_set: Vec::new(),
+        };
+
+        // One current claimed owner record. The owner reference is read from the
+        // frozen owner map rather than restated here, and the disjoint normal
+        // and protected partitions are bounded by the physical total, exactly
+        // as the ORS owner publishes its own rows (issue #1679 A1).
+        let bottleneck = CapacityBottleneck::OrsTransactionSlots;
+        let owner = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == bottleneck)
+            .expect("frozen owner map binds an ORS dimension")
+            .owner;
+        let unit = bottleneck.unit();
+        let row = BottleneckCapacityProfile {
+            bottleneck,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: owner.to_owned(),
+            owner_generation_ref: "gen-7".to_owned(),
+            unit,
+            physical_total_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(4).expect("total"),
+            }),
+            normal_work_applicable: true,
+            normal_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("normal"),
+            }),
+            protected_limit: Some(CapacityLimit {
+                unit,
+                quantity: NonZeroU64::new(2).expect("protected"),
+            }),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: "proof-1".to_owned(),
+            evidence_refs: vec!["ev-1".to_owned()],
+            invalidation_set: vec!["inv-1".to_owned()],
+        };
+        let evidence = BottleneckOwnerEvidence {
+            config_snapshot_ref: "snap-1".to_owned(),
+            authority_epoch_ref: epoch,
+            row,
+        };
+
+        let profile = compile_control_reserve_profile(identity, std::slice::from_ref(&evidence))?;
+
+        assert_eq!(profile.bottleneck_rows.len(), 15);
+        let got = profile
+            .bottleneck_rows
+            .iter()
+            .find(|row| row.bottleneck == bottleneck)
+            .expect("claimed dimension present");
+        assert_eq!(got.coverage_state, BottleneckCoverageState::Claimed);
+        assert_eq!(got.owner_ref, owner);
         Ok(())
     }
 }
