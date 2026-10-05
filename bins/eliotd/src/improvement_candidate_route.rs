@@ -610,6 +610,40 @@ mod tests {
         )
     }
 
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:60`
+    /// - the pipeline runs to evaluation before any promotion, so the `Evaluate` row
+    /// is what binds the record's grader.
+    #[test]
+    fn evaluate_row_binds_the_verifier_family_not_the_executor() {
+        // Read the Evaluate row out of the production map rather than restating the
+        // family literal beside it, so this proof covers the same projection the
+        // route builds its records from.
+        let owners = improvement_operation_owners(ROLLBACK_OWNER);
+        let evaluator = operation_owner(&owners, ImprovementOperation::Evaluate);
+        assert_eq!(evaluator, VERIFIER_OWNER_FAMILY);
+        assert!(
+            evaluator.starts_with("instrument-verifier-"),
+            "the Evaluate row must name the Instrument verifier family, got {evaluator}"
+        );
+        // The executor is a different principal: A14.6 separates the production path
+        // (Testd executes the bounded experiment) from the measurement path (the
+        // verifier grades it), and A00.3 requires fail-closed behaviour where an
+        // error could create hidden control capture - a party grading its own
+        // experiment. `check_evaluator_independence` in the pipeline enforces the
+        // same split.
+        let executor = operation_owner(&owners, ImprovementOperation::ExecuteExperiment);
+        assert_eq!(executor, TESTD_OWNER);
+        assert_ne!(evaluator, executor);
+        assert_eq!(evaluator, experiment_evaluator());
+        // The records the route submits carry that map row, because `joined_group`
+        // builds the plan and the evidence through `experiment_evaluator()`; a drift
+        // between map and record refuses downstream as `UnboundRelation` instead of
+        // passing silently.
+        let group = joined_group("a");
+        assert_eq!(group.experiment.evaluator_id, evaluator);
+        assert_eq!(group.evidence.verifier_id, evaluator);
+    }
+
     /// The admission policy record, built by its own owner-side constructor.
     fn policy_of(group: &str) -> ImprovementAdmissionPolicy {
         improvement_admission_policy(OP_ADMIT, &idempotency_key(group), ROLLBACK_OWNER)
