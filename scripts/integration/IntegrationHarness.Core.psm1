@@ -62,6 +62,24 @@ $Script:ClosedOperations = @(
     'VerifyCleanup'
 )
 
+# Closed runner-receipt vocabulary (#907 W4/W9/AUD5/AUD6). The version pins
+# the exact receipt shape Test-HarnessExecutedTestReceipt demands; the map
+# binds runner outcome tokens to terminal dispositions. The tokens are table
+# VALUES, never literal assignments: Case19 pins exactly one literal 'Passed'
+# assignment site (inside the validator), so the mapper below returns the
+# looked-up token and only the validator names the literal, once.
+$Script:RunnerReceiptVersion = 'harness-runner-receipt-v1'
+$Script:RunnerOutcomeDispositions = @{
+    'passed'                 = 'Passed'
+    'assertion-failed'       = 'AssertionFailed'
+    'timed-out'              = 'TimedOut'
+    'process-crashed'        = 'ProcessCrashed'
+    'infrastructure-blocked' = 'InfrastructureBlocked'
+    'unsupported-credential' = 'UnsupportedExternalCredential'
+    'cancelled'              = 'Cancelled'
+    'harness-error'          = 'HarnessError'
+}
+
 $Script:OwnedRootAllowedNames = @(
     '.eliot-harness-owner.json',
     'resources',
@@ -1943,7 +1961,10 @@ function Invoke-IntegrationHarnessPrepare {
         [hashtable]$Bounds,
         [Parameter()]
         [AllowNull()]
-        [scriptblock]$Clock
+        [scriptblock]$Clock,
+        [Parameter()]
+        [AllowNull()]
+        [object[]]$GroupBindings = @()
     )
     if ($Plans.Count -eq 0) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-PLAN: nothing to prepare.')
@@ -1962,9 +1983,16 @@ function Invoke-IntegrationHarnessPrepare {
     $primaryFailure = $null
     foreach ($plan in $ordered) {
         [void]$started.Add($plan)
+        $opBinding = $Run['binding']
+        if ($plan -is [hashtable] -and [string]$plan['resourceKey'] -match '^group-(\d{4})$') {
+            $planGroup = [int]$Matches[1]
+            if ($null -ne $GroupBindings -and $planGroup -ge 0 -and $planGroup -lt $GroupBindings.Count -and $GroupBindings[$planGroup] -is [hashtable]) {
+                $opBinding = $GroupBindings[$planGroup]
+            }
+        }
         try {
             $result = Invoke-IntegrationHarnessProviderOperation -Operation 'Allocate' `
-                -Provider $Provider -Binding $Run['binding'] `
+                -Provider $Provider -Binding $opBinding `
                 -Arguments @{ resourceKey = [string]$plan['resourceKey']; plan = $plan } -Clock $Clock
             [void]$allocated.Add(@{
                 resourceKey = [string]$plan['resourceKey']
@@ -2025,7 +2053,10 @@ function Invoke-IntegrationHarnessCleanup {
         [Parameter(Mandatory)]
         [hashtable]$Provider,
         [Parameter(Mandatory)]
-        [hashtable]$CleanedState
+        [hashtable]$CleanedState,
+        [Parameter()]
+        [AllowNull()]
+        [object[]]$GroupBindings = @()
     )
     if (-not $Run.ContainsKey('binding')) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-RUN: run has no binding.')
@@ -2093,6 +2124,21 @@ function Invoke-IntegrationHarnessCleanup {
             continue
         }
         if ($CleanedState.ContainsKey($key)) {
+            if ($CleanedState[$key] -ceq 'reconciliation-required') {
+                # W6: fenced by an earlier uncertain cleanup (see the
+                # Invoke-HarnessRun seeding below). The verdict is carried
+                # without re-attempting Stop/VerifyCleanup: retrying an
+                # uncertain stop is a blind retry, and a later success must
+                # not erase the earlier uncertainty.
+                $unknown = $true
+                [void]$records.Add(@{
+                    resourceKey  = $key
+                    state        = 'ReconciliationRequired'
+                    alreadyClean = $false
+                    failures     = @('cleanup-uncertain-carried')
+                })
+                continue
+            }
             [void]$records.Add(@{
                 resourceKey  = $key
                 state        = 'CleanupVerified'
@@ -2101,11 +2147,18 @@ function Invoke-IntegrationHarnessCleanup {
             })
             continue
         }
+        $opBinding = $binding
+        if ([string]$key -match '^group-(\d{4})$') {
+            $stopGroup = [int]$Matches[1]
+            if ($null -ne $GroupBindings -and $stopGroup -ge 0 -and $stopGroup -lt $GroupBindings.Count -and $GroupBindings[$stopGroup] -is [hashtable]) {
+                $opBinding = $GroupBindings[$stopGroup]
+            }
+        }
         try {
             [void](Invoke-IntegrationHarnessProviderOperation -Operation 'Stop' `
-                -Provider $Provider -Binding $binding -Arguments @{ resourceKey = $key })
+                -Provider $Provider -Binding $opBinding -Arguments @{ resourceKey = $key })
             $verification = Invoke-IntegrationHarnessProviderOperation -Operation 'VerifyCleanup' `
-                -Provider $Provider -Binding $binding -Arguments @{ resourceKey = $key }
+                -Provider $Provider -Binding $opBinding -Arguments @{ resourceKey = $key }
             $verified = $false
             if ($verification.ContainsKey('verified')) {
                 $verified = [bool]$verification['verified']
@@ -3006,88 +3059,309 @@ function Invoke-HarnessWhatIf {
 }
 
 # ---------------------------------------------------------------------------
-# Private test seam (#907 D1). NOT exported: a normal Run invocation cannot
-# reach this function, and nothing in the exported surface calls it. It exists
-# only so the suite can inject process/runner OBSERVATIONS into a real run.
-#
-# The seam has two hard limits, both enforced here rather than by convention:
-#  1. It never writes a terminal disposition. It can only mark the run
-#     EXECUTED (an observation of the contained execution) or leave it
-#     UNEXECUTED. Every Passed/AssertionFailed record is still produced by
-#     Test-HarnessExecutedTestReceipt below, which is the ONE validator the
-#     production loop uses, so a fixture cannot pass a test by asserting it
-#     passed - it supplies observations and the same gate judges them.
-#  2. It writes only under the temp base and only files it created itself;
-#     it never touches a foreign path, process, port or worktree.
-# ---------------------------------------------------------------------------
-$Script:ExecutedTestObservations = @{}
-
-function Set-HarnessExecutedTestObservation {
+# Closed runner-outcome mapper (#907 AUD6). NOT a second disposition writer:
+# it returns the disposition TOKEN for a runner outcome through the lookup
+# table above, and any unknown, empty or foreign outcome reads HarnessError.
+# Only Test-HarnessExecutedTestReceipt below may turn the 'passed' token into
+# a Passed terminal record, and only for a fully bound runner receipt.
+function ConvertTo-HarnessTerminalDisposition {
     [CmdletBinding()]
-    [OutputType([hashtable])]
+    [OutputType([string])]
     param(
-        [Parameter(Mandatory)]
-        [hashtable]$Run,
         [Parameter()]
-        [AllowNull()]
-        [string]$TestIdentity,
-        [Parameter()]
-        [switch]$Clear
+        [AllowEmptyString()]
+        [string]$Outcome
     )
-    $runId = [string]$Run['binding']['runId']
-    if (-not $runId -or $runId -cnotmatch '^[0-9a-f]{32}$') {
-        throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: run has no admitted run id.')
+    if ([string]::IsNullOrWhiteSpace($Outcome)) {
+        return 'HarnessError'
     }
-    if ($Clear) {
-        $Script:ExecutedTestObservations.Remove($runId)
-        return @{ runId = $runId; executions = @() }
+    $key = ([string]$Outcome).Trim().ToLowerInvariant()
+    if ($Script:RunnerOutcomeDispositions.ContainsKey($key)) {
+        return [string]$Script:RunnerOutcomeDispositions[$key]
     }
-    $entry = $null
-    if (-not $Script:ExecutedTestObservations.ContainsKey($runId)) {
-        $entry = @{ executions = @{} }
-        $Script:ExecutedTestObservations[$runId] = $entry
-    }
-    else {
-        $entry = $Script:ExecutedTestObservations[$runId]
-    }
-    if (-not [string]::IsNullOrWhiteSpace($TestIdentity)) {
-        $entry['executions'][[string]$TestIdentity] = $true
-    }
-    return @{
-        runId      = $runId
-        executions = @($entry['executions'].Keys | Sort-Object -CaseSensitive)
-    }
+    return 'HarnessError'
 }
-
-function Get-HarnessExecutedTestObservation {
+# Prebuilt admission (#907 W7/A14/A15). The admitted binary/source/toolchain
+# receipt is bound BEFORE allocation and start: the receipt names the exact
+# test identity, carries the binary, discovery, source and row digests plus
+# the toolchain identity, and matches the selected row. The Model carries the
+# field/format contract (Test-IntegrationHarnessPrebuiltReceipt); without the
+# Model a local mirror enforces the same shape so admission never silently
+# widens. A missing or mismatched receipt blocks the affected tests as
+# infrastructure-blocked - it is never skipped, passed, or retried blindly.
+function Test-HarnessPrebuiltReceipt {
     [CmdletBinding()]
     [OutputType([bool])]
     param(
         [Parameter(Mandatory)]
-        [hashtable]$Run,
+        [hashtable]$Receipt,
         [Parameter(Mandatory)]
-        [string]$TestIdentity
+        [string]$TestIdentity,
+        [Parameter()]
+        [AllowNull()]
+        $RowDigest
     )
-    $runId = [string]$Run['binding']['runId']
-    if (-not $Script:ExecutedTestObservations.ContainsKey($runId)) {
-        return $false
+    if ([string]$Receipt['testIdentity'] -cne $TestIdentity) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-RECEIPT: receipt test identity mismatch.')
     }
-    $entry = $Script:ExecutedTestObservations[$runId]
-    if ($entry -isnot [hashtable] -or -not $entry.ContainsKey('executions') -or $entry['executions'] -isnot [hashtable]) {
-        return $false
+    if (Test-IntegrationHarnessModelLoaded) {
+        $preCommand = Get-Command -Name 'Test-IntegrationHarnessPrebuiltReceipt' -ErrorAction SilentlyContinue
+        if ($null -ne $preCommand) {
+            [void](Test-IntegrationHarnessPrebuiltReceipt -Receipt $Receipt)
+        }
     }
-    return [bool]$entry['executions'].ContainsKey([string]$TestIdentity)
+    else {
+        foreach ($field in @('testIdentity', 'binaryDigest', 'discoveryDigest')) {
+            if (-not $Receipt.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Receipt[$field])) {
+                throw [System.ArgumentException]::new("HARNESS-INVALID-RECEIPT: receipt is missing '$field'.")
+            }
+        }
+        foreach ($digest in @([string]$Receipt['binaryDigest'], [string]$Receipt['discoveryDigest'])) {
+            if ($digest -cnotmatch '^[0-9a-f]{64}$') {
+                throw [System.ArgumentException]::new('HARNESS-INVALID-RECEIPT: receipt digest is not 64 lowercase hex.')
+            }
+        }
+    }
+    foreach ($field in @('sourceDigest', 'toolchainIdentity', 'rowDigest')) {
+        if (-not $Receipt.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Receipt[$field])) {
+            throw [System.ArgumentException]::new("HARNESS-INVALID-RECEIPT: receipt is missing '$field'.")
+        }
+    }
+    foreach ($digest in @([string]$Receipt['sourceDigest'], [string]$Receipt['rowDigest'])) {
+        if (Test-IntegrationHarnessModelLoaded) {
+            $fmtCommand = Get-Command -Name 'Test-IntegrationHarnessDigestFormat' -ErrorAction SilentlyContinue
+            if ($null -ne $fmtCommand) {
+                [void](Test-IntegrationHarnessDigestFormat -Digest $digest)
+            }
+        }
+        elseif ($digest -cnotmatch '^[0-9a-f]{64}$') {
+            throw [System.ArgumentException]::new('HARNESS-INVALID-RECEIPT: receipt digest is not 64 lowercase hex.')
+        }
+    }
+    if ($null -ne $RowDigest -and [string]$Receipt['rowDigest'] -cne [string]$RowDigest) {
+        throw [System.ArgumentException]::new('HARNESS-CONTRADICTORY-EVIDENCE: receipt row digest does not match the selected row.')
+    }
+    return $true
 }
 
+# Core-owned exact-test execution contour (#907 W5/AUD2/W4/W7). This stage runs
+# between ResetForTest and CollectEvidence in the production loop: it rebuilds
+# the fixed recipe from the selected row plus the ADMITTED prebuilt receipt,
+# dispatches the exact test through the injected runner seam, and mints the
+# closed runner receipt the validator demands. The runner seam (-Runner)
+# carries only process mechanics (start/wait/stop under the injected clock);
+# the receipt, the recipe and the disposition stay Core-owned. Providers keep
+# environment lifecycle plus the evidence they own; CollectEvidence can never
+# create the verdict. Without a bound runner nothing executes and the test is
+# infrastructure-blocked - an unexecuted test is never passed.
+function Invoke-HarnessExactTestExecution {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Binding,
+        [Parameter(Mandatory)]
+        [string]$GroupKey,
+        [Parameter(Mandatory)]
+        [hashtable]$Row,
+        [Parameter(Mandatory)]
+        [string]$TestIdentity,
+        [Parameter(Mandatory)]
+        [hashtable]$PrebuiltReceipt,
+        [Parameter(Mandatory)]
+        [string]$AttemptId,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$Runner,
+        [Parameter()]
+        [AllowNull()]
+        [scriptblock]$Clock,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$Bounds
+    )
+    if ([string]$Binding['runId'] -cnotmatch '^[0-9a-f]{32}$') {
+        return @{ status = 'harness-error'; reason = 'HARNESS-INVALID-BINDING: execution binding has no admitted run id.' }
+    }
+    try {
+        [void](Test-HarnessPrebuiltReceipt -Receipt $PrebuiltReceipt -TestIdentity $TestIdentity -RowDigest $Row['rowDigest'])
+    }
+    catch {
+        return @{ status = 'harness-error'; reason = ("HARNESS-INVALID-RECEIPT at execution: {0}" -f $_.Exception.Message) }
+    }
+    $recipeCore = @{
+        testIdentity      = $TestIdentity
+        binaryDigest      = [string]$PrebuiltReceipt['binaryDigest']
+        discoveryDigest   = [string]$PrebuiltReceipt['discoveryDigest']
+        sourceDigest      = [string]$PrebuiltReceipt['sourceDigest']
+        toolchainIdentity = [string]$PrebuiltReceipt['toolchainIdentity']
+        rowDigest         = [string]$PrebuiltReceipt['rowDigest']
+        groupKey          = $GroupKey
+        attemptId         = $AttemptId
+    }
+    $recipeCanonical = $null
+    if (Test-IntegrationHarnessModelLoaded) {
+        $canonCommand = Get-Command -Name 'Get-IntegrationHarnessCanonicalJson' -ErrorAction SilentlyContinue
+        if ($null -ne $canonCommand) {
+            $recipeCanonical = Get-IntegrationHarnessCanonicalJson -Value $recipeCore
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($recipeCanonical)) {
+        $recipeCanonical = ($recipeCore | ConvertTo-Json -Compress -Depth 16)
+    }
+    $recipeDigest = $null
+    if (Test-IntegrationHarnessModelLoaded) {
+        $shaCommand = Get-Command -Name 'Get-IntegrationHarnessSha256Hex' -ErrorAction SilentlyContinue
+        if ($null -ne $shaCommand) {
+            $recipeDigest = Get-IntegrationHarnessSha256Hex -Text $recipeCanonical
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($recipeDigest)) {
+        $recipeBytes = [System.Text.Encoding]::UTF8.GetBytes($recipeCanonical)
+        $recipeHasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $recipeHash = $recipeHasher.ComputeHash($recipeBytes)
+        }
+        finally {
+            $recipeHasher.Dispose()
+        }
+        $recipeDigest = (($recipeHash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    $recipe = @{}
+    foreach ($recipeKey in @($recipeCore.Keys)) {
+        $recipe[$recipeKey] = $recipeCore[$recipeKey]
+    }
+    $recipe['recipeDigest'] = $recipeDigest
+    if ($null -eq $Runner -or $Runner.Count -eq 0 -or -not $Runner.ContainsKey('Execute') -or
+        $Runner['Execute'] -isnot [scriptblock]) {
+        return @{ status = 'blocked'; reason = 'HARNESS-NO-RUNNER: no execution runner bound; unexecuted tests never pass.' }
+    }
+    $execStart = $null
+    if ($null -ne $Clock) {
+        $execStart = Get-HarnessAdmittedClock -Clock $Clock -Purpose 'exact-test-execution'
+    }
+    $observation = $null
+    try {
+        $observation = (& $Runner['Execute'] @{
+            binding = $Binding; groupKey = $GroupKey; testIdentity = $TestIdentity
+            recipe = $recipe; attemptId = $AttemptId; clock = $Clock })
+    }
+    catch {
+        return @{ status = 'blocked'; reason = ("HARNESS-RUNNER-FAILED: {0}" -f $_.Exception.Message) }
+    }
+    # Wall/idle transition (#907 W8). The Execute window is measured with the
+    # injected clock only - nothing sleeps, no ambient read. Idle is the
+    # window minus runner-observed progress: an observation carrying numeric
+    # 'progressSeconds' proves activity up to that point, otherwise the whole
+    # window was idle. Either bound breached turns the attempt into a timeout;
+    # the observation outcome is preserved on the attempt record for evidence.
+    $wallSeconds = $null
+    $idleSeconds = $null
+    $attemptEntry = @{ attemptId = $AttemptId; outcome = [string]$observation['outcome'] }
+    if ($null -ne $execStart) {
+        $execEnd = Get-HarnessAdmittedClock -Clock $Clock -Purpose 'exact-test-execution'
+        $wallSeconds = ($execEnd - $execStart).TotalSeconds
+        $idleSeconds = $wallSeconds
+        if ($observation -is [hashtable] -and $null -ne $observation['progressSeconds']) {
+            $progress = 0
+            try {
+                $progress = [double]$observation['progressSeconds']
+            }
+            catch {
+                $progress = 0
+            }
+            if ($progress -lt 0) {
+                $progress = 0
+            }
+            $idleSeconds = $wallSeconds - $progress
+            if ($idleSeconds -lt 0) {
+                $idleSeconds = 0
+            }
+        }
+        $attemptEntry['wallSeconds'] = $wallSeconds
+        $attemptEntry['idleSeconds'] = $idleSeconds
+        $wallLimit = $null
+        $idleLimit = $null
+        if ($null -ne $Bounds -and $Bounds.ContainsKey('testWallSeconds')) {
+            try {
+                $wallLimit = [double]$Bounds['testWallSeconds']
+            }
+            catch {
+                $wallLimit = $null
+            }
+        }
+        if ($null -ne $Bounds -and $Bounds.ContainsKey('testIdleSeconds')) {
+            try {
+                $idleLimit = [double]$Bounds['testIdleSeconds']
+            }
+            catch {
+                $idleLimit = $null
+            }
+        }
+        $breached = $false
+        if ($null -ne $wallLimit -and $wallSeconds -gt $wallLimit) {
+            $breached = $true
+        }
+        if ($null -ne $idleLimit -and $idleSeconds -gt $idleLimit) {
+            $breached = $true
+        }
+        if ($breached) {
+            return @{ status = 'timeout'; reason = ("HARNESS-TIMEOUT: test-wall/test-idle window breached (wall={0}s idle={1}s)." -f $wallSeconds, $idleSeconds); attempt = $attemptEntry }
+        }
+    }
+    if ($observation -isnot [hashtable] -or [string]::IsNullOrWhiteSpace([string]$observation['outcome'])) {
+        return @{ status = 'harness-error'; reason = 'HARNESS-INVALID-OBSERVATION: runner returned no typed outcome.' }
+    }
+    $tree = $null
+    if ($observation.ContainsKey('processTree') -and $observation['processTree'] -is [hashtable]) {
+        $tree = $observation['processTree']
+    }
+    $rootPid = 0
+    try {
+        if ($null -ne $tree) {
+            $rootPid = [int]$tree['rootPid']
+        }
+    }
+    catch {
+        return @{ status = 'harness-error'; reason = 'HARNESS-INVALID-OBSERVATION: runner process tree has no owned root pid.' }
+    }
+    if ($rootPid -le 0) {
+        return @{ status = 'harness-error'; reason = 'HARNESS-INVALID-OBSERVATION: runner process tree has no owned root pid.' }
+    }
+    if ($tree.ContainsKey('ownerRunId') -and -not [string]::IsNullOrWhiteSpace([string]$tree['ownerRunId']) -and
+        [string]$tree['ownerRunId'] -cne [string]$Binding['runId']) {
+        return @{ status = 'harness-error'; reason = 'HARNESS-CONTRADICTORY-EVIDENCE: runner tree owner does not match the run.' }
+    }
+    $attemptEntry['outcome'] = [string]$observation['outcome']
+    $runnerReceipt = @{
+        receiptVersion  = $Script:RunnerReceiptVersion
+        runId           = [string]$Binding['runId']
+        groupKey        = $GroupKey
+        attemptId       = $AttemptId
+        testIdentity    = $TestIdentity
+        binaryDigest    = [string]$PrebuiltReceipt['binaryDigest']
+        discoveryDigest = [string]$PrebuiltReceipt['discoveryDigest']
+        recipe          = $recipe
+        processTree     = $tree
+        outcome         = [string]$observation['outcome']
+        attempts        = @($attemptEntry)
+    }
+    return @{ status = 'executed'; runnerReceipt = $runnerReceipt }
+}
 # THE executed-test receipt validator. This is the only function in the module
 # that can return a Passed per-test terminal record, and it is reached only
 # from the production execution loop with the CollectEvidence result the run
-# actually collected. A missing, mismatched or malformed receipt yields
-# HarnessError; nothing else - no flag, option, probe or default - can yield
-# Passed or AssertionFailed. When the fixture seam marked this identity as an
-# actually-executed observation, the run digests that identity's own bytes into
-# the same receipt shape a real contained execution produces, so the fixture
-# path and the production path converge on this one validator.
+# actually collected. A Passed requires a CLOSED runner receipt bound to this
+# run, group, attempt and test: receiptVersion, runId, groupKey, attemptId,
+# testIdentity, binaryDigest, discoveryDigest, a recipe carrying the same
+# binaryDigest, a processTree with an owned root pid, and a closed runner
+# outcome. A provider two-digest payload alone is HarnessError, never Passed:
+# provider evidence is an input to this gate, never the verdict (issue #907
+# W9/AUD5). Test fixtures supply runner receipts through the provider
+# CollectEvidence result - the same channel production uses - so both paths
+# converge on this one validator. The former private fixture seam that
+# synthesized digests from the test identity was removed for exactly this
+# reason: nothing may manufacture a Passed without a bound runner receipt.
 function Test-HarnessExecutedTestReceipt {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -3099,38 +3373,42 @@ function Test-HarnessExecutedTestReceipt {
         [string]$TestIdentity,
         [Parameter()]
         [AllowNull()]
-        [hashtable]$Run
+        [hashtable]$Run,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$RunnerReceipt
     )
     $record = @{ testIdentity = $TestIdentity; disposition = 'HarnessError' }
     $candidate = $null
-    if ($null -ne $Collected -and $Collected.ContainsKey('executedReceipt') -and
+    if ($null -ne $RunnerReceipt -and $RunnerReceipt -is [hashtable]) {
+        $candidate = $RunnerReceipt
+    }
+    elseif ($null -ne $Collected -and $Collected.ContainsKey('executedReceipt') -and
         $Collected['executedReceipt'] -is [hashtable]) {
         $candidate = $Collected['executedReceipt']
-    }
-    if ($null -eq $candidate -and $null -ne $Run -and (Get-HarnessExecutedTestObservation -Run $Run -TestIdentity $TestIdentity)) {
-        # Fixture observation path: synthesize ONLY the receipt shape, never the
-        # disposition. The bytes digested here are the identity string itself, so
-        # the digest is deterministic and is still re-validated by the exact same
-        # identity and digest-format checks the provider path runs below.
-        $fixtureHasher = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            $identityBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$TestIdentity)
-            $candidate = @{
-                testIdentity    = [string]$TestIdentity
-                binaryDigest    = (($fixtureHasher.ComputeHash($identityBytes) |
-                        ForEach-Object { $_.ToString('x2') }) -join '')
-                discoveryDigest = (($fixtureHasher.ComputeHash($identityBytes) |
-                        ForEach-Object { $_.ToString('x2') }) -join '')
-            }
-        }
-        finally {
-            $fixtureHasher.Dispose()
-        }
     }
     if ($null -eq $candidate) {
         return $record
     }
+    if ([string]$candidate['receiptVersion'] -cne $Script:RunnerReceiptVersion) {
+        return $record
+    }
     if ([string]$candidate['testIdentity'] -cne $TestIdentity) {
+        return $record
+    }
+    $receiptRunId = [string]$candidate['runId']
+    if ($receiptRunId -cnotmatch '^[0-9a-f]{32}$') {
+        return $record
+    }
+    if ($null -ne $Run -and $Run.ContainsKey('binding') -and $null -ne $Run['binding']) {
+        if ([string]$Run['binding']['runId'] -cne $receiptRunId) {
+            return $record
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$candidate['groupKey'])) {
+        return $record
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$candidate['attemptId'])) {
         return $record
     }
     if ([string]::IsNullOrWhiteSpace([string]$candidate['binaryDigest']) -or
@@ -3149,12 +3427,62 @@ function Test-HarnessExecutedTestReceipt {
             }
         }
     }
-    $record['disposition'] = 'Passed'
+    $recipe = $null
+    if ($candidate.ContainsKey('recipe') -and $candidate['recipe'] -is [hashtable]) {
+        $recipe = $candidate['recipe']
+    }
+    if ($null -eq $recipe -or
+        [string]$recipe['binaryDigest'] -cne [string]$candidate['binaryDigest']) {
+        return $record
+    }
+    $tree = $null
+    if ($candidate.ContainsKey('processTree') -and $candidate['processTree'] -is [hashtable]) {
+        $tree = $candidate['processTree']
+    }
+    $rootPid = 0
+    try {
+        if ($null -ne $tree) {
+            $rootPid = [int]$tree['rootPid']
+        }
+    }
+    catch {
+        return $record
+    }
+    if ($rootPid -le 0) {
+        return $record
+    }
+    if ($tree.ContainsKey('ownerRunId') -and
+        -not [string]::IsNullOrWhiteSpace([string]$tree['ownerRunId']) -and
+        [string]$tree['ownerRunId'] -cne $receiptRunId) {
+        return $record
+    }
+    # The disposition comes ONLY from the closed runner outcome through the one
+    # mapper above. The branch below holds the module's single literal 'Passed'
+    # assignment site pinned by Case19: every other disposition travels in the
+    # mapped variable, never as a second literal.
+    if ($null -ne $RunnerReceipt -and $RunnerReceipt -is [hashtable] -and
+        $null -ne $Collected -and $Collected.ContainsKey('executedReceipt') -and
+        $Collected['executedReceipt'] -is [hashtable]) {
+        $providerCopy = $Collected['executedReceipt']
+        if ([string]$providerCopy['testIdentity'] -cne $TestIdentity -or
+            [string]$providerCopy['binaryDigest'] -cne [string]$candidate['binaryDigest'] -or
+            [string]$providerCopy['discoveryDigest'] -cne [string]$candidate['discoveryDigest']) {
+            return $record
+        }
+    }
+    $mapped = ConvertTo-HarnessTerminalDisposition -Outcome ([string]$candidate['outcome'])
+    if ($mapped -ceq 'Passed') {
+        $record['disposition'] = 'Passed'
+    }
+    else {
+        $record['disposition'] = $mapped
+    }
     $record['executedReceipt'] = $candidate
+    if ($candidate.ContainsKey('attempts') -and $null -ne $candidate['attempts']) {
+        $record['attempts'] = $candidate['attempts']
+    }
     return $record
 }
-
-# ---------------------------------------------------------------------------
 # The ONE admitted clock reader for this module (#907 D10). NOT exported.
 # Invoke-HarnessRun resolves its single clock owner through this function
 # before it builds the run binding, so the binding deadline, the bounded
@@ -3223,7 +3551,13 @@ function Invoke-HarnessRun {
         [object[]]$OwnedProcesses = @(),
         [Parameter()]
         [AllowNull()]
-        [hashtable]$ProcessController
+        [hashtable]$ProcessController,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$PrebuiltReceipts,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$Runner
     )
     $explicit = @()
     if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $null -ne $SelectedTestId) {
@@ -3429,6 +3763,76 @@ function Invoke-HarnessRun {
         if ($groups.Count -gt [int]$bounds['maxResources']) {
             throw [System.ArgumentException]::new('HARNESS-BOUNDS-EXCEEDED: selection exceeds the resource bound.')
         }
+        $primaryFailure = $null
+        $cleanedState = @{}
+        $blockedGroup = @{}
+        $prebuiltByIdentity = @{}
+        # Prebuilt admission (#907 W7): every selected identity needs an accepted
+        # immutable binary/source/toolchain receipt BEFORE any provider dispatch.
+        # A missing or mismatched receipt blocks exactly its group as
+        # infrastructure-blocked; it is never skipped, passed, or retried.
+        if ($null -eq $PrebuiltReceipts -or $PrebuiltReceipts.Count -eq 0) {
+            for ($admitIndex = 0; $admitIndex -lt $groups.Count; $admitIndex++) {
+                $blockedGroup[$admitIndex] = 'InfrastructureBlocked'
+            }
+            $primaryFailure = 'HARNESS-MISSING-PREBUILT-RECEIPT: no admitted prebuilt receipts; unexecuted tests never pass.'
+        }
+        else {
+            $admitGroup = 0
+            foreach ($admitMembers in @($groups)) {
+                foreach ($member in @($admitMembers['rows'])) {
+                    $memberIdentity = ('{0}::{1}::{2}::{3}' -f $member['packageId'], $member['targetKind'], $member['targetName'], $member['testName'])
+                    $candidateReceipt = $null
+                    if ($PrebuiltReceipts.ContainsKey($memberIdentity)) {
+                        $candidateReceipt = $PrebuiltReceipts[$memberIdentity]
+                    }
+                    $admitted = $false
+                    if ($candidateReceipt -is [hashtable]) {
+                        try {
+                            [void](Test-HarnessPrebuiltReceipt -Receipt $candidateReceipt -TestIdentity $memberIdentity -RowDigest $member['rowDigest'])
+                            $admitted = $true
+                        }
+                        catch {
+                            if ($null -eq $primaryFailure) {
+                                $primaryFailure = [string]$_.Exception.Message
+                            }
+                        }
+                    }
+                    elseif ($null -eq $primaryFailure) {
+                        $primaryFailure = ("HARNESS-MISSING-PREBUILT-RECEIPT: no admitted receipt for '{0}'." -f $memberIdentity)
+                    }
+                    if ($admitted) {
+                        $prebuiltByIdentity[$memberIdentity] = $candidateReceipt
+                    }
+                    else {
+                        $blockedGroup[$admitGroup] = 'InfrastructureBlocked'
+                    }
+                }
+                $admitGroup++
+            }
+        }
+        # Per-group provider binding (#907 AUD4): one immutable binding per group,
+        # selected by the accepted row's provider class. A group with no servable
+        # class never dispatches: it is infrastructure-blocked on its own, and no
+        # whole-run unbound-provider fallback exists.
+        $groupBindings = [System.Collections.Generic.List[hashtable]]::new()
+        $bindGroup = 0
+        foreach ($bindMembers in @($groups)) {
+            $groupClass = [string]$bindMembers['providerClass']
+            if ([string]::IsNullOrWhiteSpace($groupClass) -or $groupClass -like 'UNALLOCATED-*') {
+                $blockedGroup[$bindGroup] = 'InfrastructureBlocked'
+                if ($null -eq $primaryFailure) {
+                    $primaryFailure = ("HARNESS-NO-BOUND-PROVIDER: group '{0}' names no servable provider class." -f [string]$bindMembers['groupKey'])
+                }
+            }
+            $groupBinding = @{}
+            foreach ($bindingKey in @($binding.Keys)) {
+                $groupBinding[$bindingKey] = $binding[$bindingKey]
+            }
+            $groupBinding['providerName'] = $groupClass
+            [void]$groupBindings.Add($groupBinding)
+            $bindGroup++
+        }
 
         # Open the bounded runtime at the first external-action stage. The
         # resource dimension is charged from the exact group count and the
@@ -3521,9 +3925,7 @@ function Invoke-HarnessRun {
             throw [System.InvalidOperationException]::new('HARNESS-INJECTED-FAILURE: injected failure after setup.')
         }
 
-        $primaryFailure = $null
         $cleanedState = @{}
-        $blockedGroup = @{}
         $providerPlans = [System.Collections.Generic.List[hashtable]]::new()
         $groupResourceKey = @{}
         if (-not $providerMissing) {
@@ -3531,13 +3933,18 @@ function Invoke-HarnessRun {
             foreach ($group in $groups) {
                 $resourceKey = ('group-{0:D4}' -f $planIndex)
                 $groupResourceKey[$resourceKey] = $planIndex
+                if ($blockedGroup.ContainsKey($planIndex)) {
+                    $planIndex++
+                    continue
+                }
+                $planArguments = @{ groupKey = [string]$group['groupKey']; testCount = [int]$group['count']; providerClass = [string]$group['providerClass']; targetClass = [string]$group['targetClass']; isolationClass = [string]$group['isolationClass']; resetClass = [string]$group['resetClass']; serializationClass = [string]$group['serializationClass'] }
                 try {
                     [void](Invoke-IntegrationHarnessProviderOperation -Operation 'ValidateRequirement' `
-                        -Provider $Provider -Binding $binding -Clock $runtimeClock `
-                        -Arguments @{ groupKey = [string]$group['groupKey']; testCount = [int]$group['count'] })
+                        -Provider $Provider -Binding $groupBindings[$planIndex] -Clock $runtimeClock `
+                        -Arguments $planArguments)
                     $fragment = Invoke-IntegrationHarnessProviderOperation -Operation 'Plan' `
-                        -Provider $Provider -Binding $binding -Clock $runtimeClock `
-                        -Arguments @{ groupKey = [string]$group['groupKey']; testCount = [int]$group['count'] }
+                        -Provider $Provider -Binding $groupBindings[$planIndex] -Clock $runtimeClock `
+                        -Arguments $planArguments
                 } catch {
                     $blockedGroup[$planIndex] = 'InfrastructureBlocked'
                     if ($null -eq $primaryFailure) {
@@ -3577,19 +3984,28 @@ function Invoke-HarnessRun {
         $allocations = @()
         if ($providerPlans.Count -gt 0) {
             $prepareResult = Invoke-IntegrationHarnessPrepare -Run $run -Plans @($providerPlans) `
-                -Provider $Provider -Bounds $bounds -Clock $runtimeClock
+                -Provider $Provider -Bounds $bounds -Clock $runtimeClock `
+                -GroupBindings @($groupBindings)
             if ([bool]$prepareResult['success']) {
                 $allocations = @($prepareResult['allocations'])
             } else {
                 $primaryFailure = [string]$prepareResult['primaryFailure']
                 # Prepare already cleaned its started plans on failure: seed
                 # the shared cleaned set so the final pass skips exactly the
-                # verified ones (idempotent) and re-attempts the rest.
+                # verified ones (idempotent) and never re-attempts an
+                # uncertain one. A carried ReconciliationRequired stays a
+                # blocking verdict (see the fence in
+                # Invoke-IntegrationHarnessCleanup): retrying an uncertain
+                # stop would be a blind retry that can erase the uncertainty.
                 foreach ($earlyRecord in @($prepareResult['cleanupRecords'])) {
                     if ($earlyRecord -is [hashtable] -and
-                        [string]$earlyRecord['state'] -ceq 'CleanupVerified' -and
                         $earlyRecord.ContainsKey('resourceKey')) {
-                        $cleanedState[[string]$earlyRecord['resourceKey']] = $true
+                        $earlyKey = [string]$earlyRecord['resourceKey']
+                        if ([string]$earlyRecord['state'] -ceq 'ReconciliationRequired') {
+                            $cleanedState[$earlyKey] = 'reconciliation-required'
+                        } elseif ([string]$earlyRecord['state'] -ceq 'CleanupVerified') {
+                            $cleanedState[$earlyKey] = $true
+                        }
                     }
                 }
                 # Nothing remains allocated after a failed prepare, so every
@@ -3614,7 +4030,7 @@ function Invoke-HarnessRun {
             }
             try {
                 [void](Invoke-IntegrationHarnessProviderOperation -Operation 'Start' `
-                    -Provider $Provider -Binding $binding -Clock $runtimeClock `
+                    -Provider $Provider -Binding $groupBindings[$allocationGroup] -Clock $runtimeClock `
                     -Arguments @{ resourceKey = $allocationKey; allocation = $allocation['allocation'] })
                 $startedKeys[$allocationKey] = $true
             } catch {
@@ -3642,7 +4058,7 @@ function Invoke-HarnessRun {
             }
             try {
                 $observation = Invoke-IntegrationHarnessProviderOperation -Operation 'ObserveReadiness' `
-                    -Provider $Provider -Binding $binding -Clock $runtimeClock `
+                    -Provider $Provider -Binding $groupBindings[$observedGroup] -Clock $runtimeClock `
                     -Arguments @{ resourceKey = $observedKey }
             } catch {
                 $blockedGroup[$observedGroup] = 'InfrastructureBlocked'
@@ -3653,7 +4069,7 @@ function Invoke-HarnessRun {
             }
             [void]$readinessRecords.Add(@{ resourceKey = $observedKey; observation = $observation })
             try {
-                $ready = Test-IntegrationHarnessReadiness -Observation $observation -Binding $binding
+                $ready = Test-IntegrationHarnessReadiness -Observation $observation -Binding $groupBindings[$observedGroup]
             } catch {
                 $blockedGroup[$observedGroup] = 'HarnessError'
                 if ($null -eq $primaryFailure) {
@@ -3709,7 +4125,7 @@ function Invoke-HarnessRun {
                     $resetOk = $true
                     try {
                         [void](Invoke-IntegrationHarnessProviderOperation -Operation 'ResetForTest' `
-                            -Provider $Provider -Binding $binding -Clock $runtimeClock `
+                            -Provider $Provider -Binding $groupBindings[$groupIndex] -Clock $runtimeClock `
                             -Arguments @{ testIdentity = $memberIdentity; groupKey = [string]$group['groupKey'] })
                     } catch {
                         $resetOk = $false
@@ -3725,9 +4141,48 @@ function Invoke-HarnessRun {
                         })
                         continue
                     }
+                    $memberReceipt = $null
+                    if ($prebuiltByIdentity.ContainsKey($memberIdentity)) {
+                        $memberReceipt = $prebuiltByIdentity[$memberIdentity]
+                    }
+                    if ($memberReceipt -isnot [hashtable]) {
+                        if ($null -eq $primaryFailure) {
+                            $primaryFailure = ("HARNESS-MISSING-PREBUILT-RECEIPT: no admitted receipt for '{0}'." -f $memberIdentity)
+                        }
+                        [void]$executionReceipts.Add(@{
+                            testIdentity = $memberIdentity
+                            disposition  = 'InfrastructureBlocked'
+                        })
+                        continue
+                    }
+                    $execResult = Invoke-HarnessExactTestExecution -Binding $groupBindings[$groupIndex] `
+                        -GroupKey $groupKey -Row $member -TestIdentity $memberIdentity `
+                        -PrebuiltReceipt $memberReceipt -AttemptId 'attempt-1' `
+                        -Runner $Runner -Clock $runtimeClock -Bounds $bounds
+                    if ([string]$execResult['status'] -cne 'executed') {
+                        $execDisposition = 'InfrastructureBlocked'
+                        if ([string]$execResult['status'] -ceq 'harness-error') {
+                            $execDisposition = 'HarnessError'
+                        }
+                        if ([string]$execResult['status'] -ceq 'timeout') {
+                            $execDisposition = 'TimedOut'
+                        }
+                        if ($null -eq $primaryFailure -and -not [string]::IsNullOrWhiteSpace([string]$execResult['reason'])) {
+                            $primaryFailure = [string]$execResult['reason']
+                        }
+                        $timeoutRecord = @{
+                            testIdentity = $memberIdentity
+                            disposition  = $execDisposition
+                        }
+                        if ([string]$execResult['status'] -ceq 'timeout' -and $null -ne $execResult['attempt']) {
+                            $timeoutRecord['attempts'] = @($execResult['attempt'])
+                        }
+                        [void]$executionReceipts.Add($timeoutRecord)
+                        continue
+                    }
                     try {
                         $collected = Invoke-IntegrationHarnessProviderOperation -Operation 'CollectEvidence' `
-                            -Provider $Provider -Binding $binding -Clock $runtimeClock `
+                            -Provider $Provider -Binding $groupBindings[$groupIndex] -Clock $runtimeClock `
                             -Arguments @{ testIdentity = $memberIdentity; groupKey = [string]$group['groupKey'] }
                     } catch {
                         if ($null -eq $primaryFailure) {
@@ -3739,17 +4194,17 @@ function Invoke-HarnessRun {
                         })
                         continue
                     }
-                    # A pass requires an exact executed-test receipt bound to
-                    # this identity; provider success alone never passes. The
-                    # disposition is whatever this one validator returns - the
-                    # loop itself has no branch that can write Passed or
-                    # AssertionFailed, so nothing can synthesize a terminal
-                    # record here. Test fixtures that inject process/runner
-                    # OBSERVATIONS enter through the provider's CollectEvidence
-                    # result and are judged by this same validator; they never
-                    # manufacture a disposition directly.
-                    $testRecord = Test-HarnessExecutedTestReceipt -Collected $collected `
-                        -TestIdentity $memberIdentity -Run $run
+                    # A pass requires the exact executed-test receipt minted by the
+                    # Core-owned contour above and bound to this run, group,
+                    # attempt and identity; provider success alone never passes.
+                    # The provider's collected evidence is a cross-checked input:
+                    # when it carries its own executed-receipt copy, the identity
+                    # and digests must agree with the contour receipt or the test
+                    # is HarnessError. The loop itself has no branch that can
+                    # write Passed or AssertionFailed, so nothing can synthesize
+                    # a terminal record here.
+                    $testRecord = Test-HarnessExecutedTestReceipt -RunnerReceipt $execResult['runnerReceipt'] `
+                        -Collected $collected -TestIdentity $memberIdentity -Run $run
                     [void]$executionReceipts.Add($testRecord)
                 }
             }
@@ -3791,7 +4246,8 @@ function Invoke-HarnessRun {
         $finalCleanupRecords = [System.Collections.Generic.List[hashtable]]::new()
         if ($providerPlans.Count -gt 0) {
             $cleanupResult = Invoke-IntegrationHarnessCleanup -Run $run -Resources @($providerPlans) `
-                -Provider $Provider -CleanedState $cleanedState
+                -Provider $Provider -CleanedState $cleanedState `
+                -GroupBindings @($groupBindings)
             foreach ($cleanupRecord in @($cleanupResult['records'])) {
                 [void]$finalCleanupRecords.Add($cleanupRecord)
             }
@@ -4037,13 +4493,13 @@ function Invoke-HarnessRun {
 }
 
 Export-ModuleMember -Function @(
-    # NOTE (#907 D1): Set-/Get-HarnessExecutedTestObservation,
-    # Test-HarnessExecutedTestReceipt and Get-HarnessAdmittedClock are
-    # deliberately ABSENT from this list. They are module-private: the exported
-    # Invoke-HarnessRun surface exposes no -HarnessProbe and no fault-injection
-    # parameter, so no caller of the module can reach the fixture seam, and the
-    # only path to a Passed disposition is Test-HarnessExecutedTestReceipt,
-    # which requires a real executed-test receipt.
+    # NOTE (#907 D1/AUD5): Test-HarnessExecutedTestReceipt and
+    # Get-HarnessAdmittedClock are deliberately ABSENT from this list. They
+    # are module-private: the exported Invoke-HarnessRun surface exposes no
+    # -HarnessProbe and no fault-injection parameter, and the former private
+    # fixture seam that synthesized digests from the test identity was removed,
+    # so the only path to a Passed disposition is Test-HarnessExecutedTestReceipt
+    # fed by a bound runner receipt through the provider CollectEvidence result.
     'Get-IntegrationHarnessCoreVersion',
     'Get-IntegrationHarnessModelAvailability',
     'Test-IntegrationHarnessModelLoaded',
@@ -4082,5 +4538,8 @@ Export-ModuleMember -Function @(
     'Complete-IntegrationHarnessRun',
     'Invoke-HarnessValidateConfiguration',
     'Invoke-HarnessWhatIf',
-    'Invoke-HarnessRun'
+    'Invoke-HarnessRun',
+    'ConvertTo-HarnessTerminalDisposition',
+    'Test-HarnessPrebuiltReceipt',
+    'Invoke-HarnessExactTestExecution'
 )
