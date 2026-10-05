@@ -1886,6 +1886,53 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(rows[0].state, RowState.UNCLASSIFIED.value)
         self.assertEqual(rows[0].remediation_owner, "test-declaration-owner")
 
+        # W7/W24 (issue #905): a supported Store word must not certify an
+        # additional unknown provider - the composed set keeps UNKNOWN and the
+        # row stays UNCLASSIFIED (refuting comment 5981399706; I18.32:3).
+        self.assertEqual(
+            _requirements("requires SurrealDB and Redis"),
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        self.assertEqual(
+            _requirements("requires store with PostgreSQL"),
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        # All-known compositions are unaffected by the provider guard.
+        self.assertEqual(
+            _requirements("requires store and runtime windows pipe"),
+            (Requirement.RUNTIME.value, Requirement.STORE.value),
+        )
+        self.assertEqual(
+            _requirements("requires store database"),
+            (Requirement.STORE.value,),
+        )
+
+        mixed_code = """
+        #[test]
+        #[ignore = "requires SurrealDB and Redis"]
+        fn test_store_unknown_provider() {}
+        """
+        mixed_tests = _scan_snippet(mixed_code)
+        self.assertEqual(len(mixed_tests), 1)
+        mixed_source = mixed_tests[0]
+        self.assertEqual(
+            mixed_source.requirements,
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        mixed_compiled = CompiledTest(
+            package_id=mixed_source.package_id,
+            package_name=mixed_source.package_name,
+            target_name=mixed_source.target_name,
+            target_kind=mixed_source.target_kind,
+            executable="target/debug/deps/lib",
+            executable_digest="ed",
+            test_name=mixed_source.test_name,
+        )
+        mixed_rows = reconcile([mixed_source], [mixed_compiled])
+        self.assertEqual(len(mixed_rows), 1)
+        self.assertEqual(mixed_rows[0].state, RowState.UNCLASSIFIED.value)
+        self.assertEqual(mixed_rows[0].remediation_owner, "test-declaration-owner")
+
     # WORK_UNIT_CASE: 905/16
     def test_local_authenticated_surrealdb_version_binary_requirement_maps_to_store(self) -> None:
         """Local authenticated SurrealDB/version/binary requirement maps to Store."""

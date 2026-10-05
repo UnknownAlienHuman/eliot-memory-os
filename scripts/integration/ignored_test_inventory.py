@@ -2094,11 +2094,44 @@ _NEGATION_SUFFIX: Final = re.compile(
 )
 
 
+# Provider-position unknown-vocabulary guard (issue #905 W7/W24: conservative
+# unknown dependency treatment, refuting comment 5981399706). A supported
+# Store/Runtime/... word must not certify the whole row while the reason names
+# another explicit provider the rule table does not know ("requires SurrealDB
+# and Redis", "requires store with PostgreSQL"): the extra provider is an
+# unleased dependency (I18.32:3), so the composed set keeps UNKNOWN and
+# reconcile leaves the row UNCLASSIFIED. Only conjunction-governed tokens are
+# inspected, so all-known phrases ("requires local authenticated SurrealDB",
+# "... store and governor host runtime") are unaffected. Bare articles after a
+# conjunction ("a", "an", "the") are determiners, never providers. The unit
+# after a conjunction is the whole following phrase, not one word: "runtime
+# windows pipe" is known through its "windows pipe" phrase even though lone
+# "runtime" is no vocabulary word, while "Redis" in "SurrealDB and Redis" is
+# covered by nothing.
+
+_PROVIDER_CONJUNCTION_SPLIT: Final = re.compile(r"\b(?:and|or|with|plus)\b")
+_PROVIDER_NON_PROVIDER_WORDS: Final = frozenset({"a", "an", "the"})
+
+
+def _has_unknown_provider(value: str) -> bool:
+    """An explicit additional provider the rule table does not cover."""
+    segments = _PROVIDER_CONJUNCTION_SPLIT.split(value)
+    for segment in segments[1:]:
+        words = segment.strip().split()
+        if not words:
+            continue
+        if all(word in _PROVIDER_NON_PROVIDER_WORDS for word in words):
+            continue
+        if not any(matcher.search(segment) for matcher in _REQUIREMENT_MATCHERS):
+            return True
+    return False
+
+
 # Versioned finite rule-table identity (issue #905: "versioned finite rule
 # table"). RULE_TABLE_VERSION is the human identity; RULE_TABLE_SHA256 binds the
 # exact pattern literals, so any rule edit changes the emitted header and
 # aggregate digest even when no row's composed requirement set changes.
-RULE_TABLE_VERSION: Final = "1.2.0"
+RULE_TABLE_VERSION: Final = "1.3.0"
 RULE_TABLE_SHA256: Final = _sha256(
     _canonical_bytes(
         {
@@ -2111,6 +2144,10 @@ RULE_TABLE_SHA256: Final = _sha256(
                 "clauses": _NEGATION_CLAUSES.pattern,
                 "prefix": _NEGATION_PREFIX.pattern,
                 "suffix": _NEGATION_SUFFIX.pattern,
+            },
+            "provider_conjunction": {
+                "conjunction": _PROVIDER_CONJUNCTION_SPLIT.pattern,
+                "non_provider_words": sorted(_PROVIDER_NON_PROVIDER_WORDS),
             },
         }
     )
@@ -2144,6 +2181,8 @@ def _requirements(text: str) -> tuple[str, ...]:
     if _EXTERNAL_MATCHER.search(value):
         result.add(Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY)
     if not result:
+        result.add(Requirement.UNKNOWN)
+    elif _has_unknown_provider(value):
         result.add(Requirement.UNKNOWN)
     return tuple(sorted(item.value for item in result))
 
@@ -3673,7 +3712,7 @@ def reconcile(source: Sequence[SourceTest], compiled: Sequence[CompiledTest]) ->
             rows.append(_row(None, compiled_item, RowState.COMPILED_ONLY, "build-test-graph-owner"))
         elif compiled_item is None:
             rows.append(_row(source_item, None, RowState.SOURCE_ONLY, "test-target-owner"))
-        elif source_item.reason is None or source_item.requirements == (Requirement.UNKNOWN.value,):
+        elif source_item.reason is None or Requirement.UNKNOWN.value in source_item.requirements:
             rows.append(_row(source_item, compiled_item, RowState.UNCLASSIFIED, "test-declaration-owner"))
         else:
             rows.append(_row(source_item, compiled_item, RowState.CLASSIFIED, "declared-environment-owner"))
