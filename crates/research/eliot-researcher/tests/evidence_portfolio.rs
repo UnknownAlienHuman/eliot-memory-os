@@ -1861,12 +1861,12 @@ fn absence_replay_conflicts_on_changed_source_revision() {
         .expect_err("same identity with a changed source revision must conflict");
     assert!(
         matches!(err, PortfolioError::Conflict { .. }),
-        "a changed predicate under one identity must conflict: {err}"
+        "a changed source revision under one identity must conflict: {err}"
     );
     assert!(
         err.to_string()
             .contains("no_match_evaluation.source_revision"),
-        "the conflict must name the predicate bytes: {err}"
+        "the conflict must name the source revision: {err}"
     );
 }
 
@@ -1890,11 +1890,11 @@ fn absence_replay_conflicts_on_changed_evaluator() {
         .expect_err("same identity with a changed evaluator must conflict");
     assert!(
         matches!(err, PortfolioError::Conflict { .. }),
-        "a changed predicate under one identity must conflict: {err}"
+        "a changed evaluator under one identity must conflict: {err}"
     );
     assert!(
         err.to_string().contains("no_match_evaluation.evaluator_id"),
-        "the conflict must name the predicate bytes: {err}"
+        "the conflict must name the evaluator identity: {err}"
     );
 }
 
