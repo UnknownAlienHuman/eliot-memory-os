@@ -806,4 +806,33 @@ mod tests {
             }
         ));
     }
+
+    /// The acquisition-side identity guard: `try_acquire_normal_bytes` refuses a
+    /// blank owner as `InvalidField { field: "ipc_permit.owner" }` on a
+    /// partition with free bytes, so no permit ever binds an identity the
+    /// contract cannot name and capacity is never held anonymously
+    /// (issue #1679 A10; `I14.3` every permit binds owner/operation/epoch).
+    #[test]
+    fn ipc_acquire_rejects_blank_owner() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_normal_bytes(
+            NormalWorkClass::Interactive,
+            "",
+            "op-owner-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank owner must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.owner",
+                ..
+            }
+        ));
+    }
 }
