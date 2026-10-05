@@ -1451,4 +1451,46 @@ mod tests {
         assert_eq!(reserve.available_normal_pending_write_bytes(), 11);
         assert_eq!(reserve.available_protected_pending_write_bytes(), 13);
     }
+
+    /// A dropped normal permit returns its slot exactly once (issue
+    /// #1679): `StorePermit` has no release method, so `Drop` is the
+    /// only release path. Dropping the permit restores exactly the
+    /// pre-acquire availability, and a fresh operation can then
+    /// re-acquire the returned slot (I14.3).
+    #[test]
+    fn store_dropped_normal_permit_returns_slot_exactly_once() {
+        let reserve = StoreReserve::partitioned(
+            1,
+            2,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_connections(), 1);
+
+        let permit = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-rel-1",
+            )
+            .expect("normal connection slot");
+        assert_eq!(reserve.available_normal_connections(), 0);
+
+        // `StorePermit` exposes no release method: drop is the only
+        // release path, and it returns the slot exactly once.
+        drop(permit);
+        assert_eq!(reserve.available_normal_connections(), 1);
+
+        let _permit = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-rel-2",
+            )
+            .expect("returned slot");
+        assert_eq!(reserve.available_normal_connections(), 0);
+    }
 }
