@@ -60,10 +60,12 @@ use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_process::{
     DurableStreamLocatorKind, DurableStreamRepresentation, ProcessExecutionBinding,
     ProcessStreamDigestAlgorithm, ProcessStreamKind, ProcessStreamPolicyBinding,
-    ProcessStreamPrefixPreview, ProcessStreamSinkClient, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamPrefixPreview, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
     ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
-    ProcessStreamSinkSessionId, ProcessStreamSinkSourceId, ProcessStreamSinkState,
-    ProcessStreamSinkTerminalId, StreamPersistenceStatus, StreamTransportStatus,
+    ProcessStreamSinkSession, ProcessStreamSinkSessionId, ProcessStreamSinkSourceId,
+    ProcessStreamSinkState, ProcessStreamSinkTerminalId, StreamPersistenceStatus,
+    StreamTransportStatus,
 };
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
 
@@ -1000,4 +1002,393 @@ fn empty_source_publishes_and_verifies_as_real_object() {
         panic!("a proven publication reads back as its terminal");
     };
     assert_eq!(recorded, terminal);
+}
+
+/// The session limits the replay cases below open with.
+///
+/// WHY these ceilings and not the ones case 297/A1 states: `append_locked`
+/// charges every arriving chunk against `max_in_flight_bytes` at its
+/// SERIALIZATION size, and `PersistenceQueueBound::record_bytes` charges four
+/// `u64` slots plus the digest's 64 hex characters plus the payload. A charged
+/// chunk is therefore 96 bytes or more, so A1's eight-byte in-flight ceiling --
+/// correct for a case that appends nothing -- would shed every chunk here as
+/// `Backpressured` before the replay-identity comparison is ever reached.
+/// `max_in_flight_bytes` must also not exceed `max_total_admitted_bytes`.
+fn replay_limits() -> ProcessStreamSinkLimits {
+    ok(ProcessStreamSinkLimits::new(
+        64, 4096, 8, 4096, 8, 4096, 10, 20, 20,
+    ))
+}
+
+/// The store, binding, sink and open request the replay cases share.
+///
+/// Every value here is the one case 297/A1 states -- the same five store-side
+/// identities, the same `ProcessExecutionBinding`, the same digest algorithms --
+/// so this states no new contract; it exists so the three replay cases drive
+/// ONE `ProcessStreamSinkClient` shape instead of restating the construction
+/// three times. Only the labels differ, so each case owns a disjoint root and a
+/// disjoint session/source/terminal identity.
+fn open_replay_sink(case: &str) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    // The ONE active root owner of this case; the sink receives a clone of this
+    // shared handle, never a second construction on the same root.
+    let store = store_with_platform(platform, &root);
+
+    let stage_context = receipt_context(&format!("sink-{case}-stage"));
+    let read_context: BlobReceiptContext = ok(serde_json::from_str(&context_json(
+        "READ",
+        &format!("sink-{case}-read"),
+        &format!("request-sink-{case}-read"),
+    )));
+    let root_lease = lease_for(&stage_context, &root);
+    let (_, residency_template) = residency(b"");
+    let binding = ok(BlobStreamSinkStoreBinding::new(
+        root_lease,
+        stage_context,
+        read_context,
+        policy(),
+        residency_template,
+    ));
+    let sink = BlobStoreStreamSink::new(store.clone(), binding);
+
+    let binding_json = ok(serde_json::from_value::<ProcessExecutionBinding>(
+        serde_json::json!({
+            "operation_id": "operation-1",
+            "process_tree_id": "tree-1",
+            "job_id": "job-1",
+            "image_id": "image-1",
+            "session_id": "session-1",
+            "generation": 3,
+            "action_lease_ref": "lease-1",
+            "authority_id": "authority-1",
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 7
+            },
+            "state_fence": {
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 7
+                },
+                "generation": 3,
+                "nonce": "fence-1"
+            },
+            "request_digest": "a".repeat(64),
+            "permit_digest": "b".repeat(64),
+            "effect_digest": "c".repeat(64),
+            "validation_revision": 2
+        }),
+    ));
+    let stream_policy = ok(ProcessStreamPolicyBinding::new(
+        format!("policy:sink-{case}"),
+        "privacy:project",
+        "visibility:owner",
+        "retention:task",
+        "redaction:exact-v1",
+    ));
+    let open = ok(ProcessStreamSinkOpenRequest::new(
+        ok(ProcessStreamSinkSessionId::new(format!(
+            "sink-{case}-session"
+        ))),
+        ok(ProcessStreamSinkSourceId::new(format!(
+            "source:sink-{case}-session"
+        ))),
+        ok(ProcessStreamSinkTerminalId::new(format!(
+            "terminal:sink-{case}-session"
+        ))),
+        binding_json,
+        ProcessStreamKind::Stdout,
+        stream_policy,
+        replay_limits(),
+        ProcessStreamDigestAlgorithm::Sha256,
+        ProcessStreamDigestAlgorithm::Sha256,
+    ));
+    let session = ok(block_on(sink.open(open)));
+    (sink, session)
+}
+
+/// Appends one chunk at explicit coordinates through the port.
+///
+/// `ProcessStreamSinkAppend::from_bytes` computes the chunk's own SHA-256, so
+/// the digest in every request is the real digest of the bytes sent and a
+/// refused case can vary the BYTES, LENGTH or OFFSET without ever tripping the
+/// request's own digest validation first.
+fn append_chunk(
+    sink: &BlobStoreStreamSink<FixtureStore>,
+    session: &ProcessStreamSinkSession,
+    sequence: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+    let request = ProcessStreamSinkAppend::from_bytes(sequence, offset, bytes.to_vec(), 10);
+    block_on(sink.append(session.clone(), request))
+}
+
+/// Asserts that a disposition is exactly `Accepted`/`Replayed` at these
+/// coordinates, by name, rather than by count.
+fn assert_disposition(
+    disposition: ProcessStreamSinkAppendDisposition,
+    expected: ProcessStreamSinkAppendDisposition,
+) {
+    assert_eq!(disposition, expected);
+}
+
+/// Source: the chunk-replay identity block in `src/stream_sink.rs`
+/// (`append_locked`): an append whose `sequence` is BELOW `next_sequence` is a
+/// replay candidate, and it is accepted only when the recorded
+/// `AdmittedChunk` metadata AND the admitted bytes at that chunk's coordinates
+/// both match -- otherwise `MismatchedReplay`. An append AHEAD of
+/// `next_sequence` is a `SequenceGap` with the exact expected/observed
+/// coordinates.
+/// Discovery: a transport that re-sends a chunk after a dropped reply must not
+/// publish a second object, so the exact replay settles as `Replayed` and the
+/// final publication carries `C+E` exactly.
+/// Executed-pass: chunk `C` (nonempty) and empty chunk `E` are appended, then
+/// BOTH are re-appended with identical sequence/offset/length/sha256; the
+/// dispositions and the published object's length and digest are the assertions,
+/// never a count.
+/// I10.8.5: the append-only temporary raw evidence object grows once, by the
+/// admitted bytes, no matter how many times a chunk is re-sent.
+// WORK_UNIT_CASE: 297/A3-replay
+#[test]
+fn exact_replay_is_accepted_including_empty_chunk() {
+    const C: &[u8] = b"chunk-c";
+    const E: &[u8] = b"";
+    let (sink, session) = open_replay_sink("replay");
+
+    // The admitted stream is `C` then an EMPTY chunk. The empty chunk is a real
+    // admitted chunk with its own sequence, offset and SHA-256 of the empty
+    // byte string, so it must be replayable by the same arms as a nonempty one.
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, C)),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: C.len() as u64,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, C.len() as u64, E)),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 2,
+            next_offset: C.len() as u64,
+        },
+    );
+
+    // The exact replay of `C`, and then of the empty chunk `E`. Both are
+    // admitted chunks already, so both settle as `Replayed` and both report the
+    // UNCHANGED cursors: a replay advances neither the sequence nor the offset.
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, C)),
+        ProcessStreamSinkAppendDisposition::Replayed {
+            next_sequence: 2,
+            next_offset: C.len() as u64,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, C.len() as u64, E)),
+        ProcessStreamSinkAppendDisposition::Replayed {
+            next_sequence: 2,
+            next_offset: C.len() as u64,
+        },
+    );
+
+    // Two replays admitted nothing: the session still counts two chunks and
+    // `C.len()` bytes.
+    let ProcessStreamSinkReadback::Session { view } = ok(block_on(sink.readback(session.clone())))
+    else {
+        panic!("an unfinalized session reads back as its session view");
+    };
+    assert_eq!(view.admitted_chunks(), 2);
+    assert_eq!(view.admitted_bytes(), C.len() as u64);
+
+    let expected_sha256 = format!("{:x}", Sha256::digest(C));
+    let request = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        2,
+        C.len() as u64,
+        20,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        C.len() as u64,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            C.to_vec(),
+            C.len() as u64,
+        )),
+        None,
+        Vec::new(),
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), request)));
+
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+    assert_eq!(terminal.admitted_chunks(), 2);
+    assert_eq!(terminal.admitted_bytes(), C.len() as u64);
+    assert_eq!(terminal.admitted_sha256(), expected_sha256);
+
+    // The ONE published object is exactly `C+E`. Its length and digest are the
+    // proof that the two replays minted no second object and appended no second
+    // byte: a duplicate append would have published `C+E+C+E`.
+    let Some(BlobStreamPublication::Complete(complete)) = sink.publication() else {
+        panic!("a complete source must record a real object, never `Unavailable`");
+    };
+    assert_eq!(complete.byte_length, C.len() as u64);
+    assert_eq!(complete.sha256, expected_sha256);
+    assert_eq!(
+        complete.locator,
+        format!("blob:{}", blake3::hash(C).to_hex()),
+        "the replayed stream published the content it actually admitted"
+    );
+    let Some(source) = terminal.evidence().source() else {
+        panic!("a complete source terminal must carry its durable expansion source");
+    };
+    assert_eq!(source.byte_length(), C.len() as u64);
+    assert_eq!(source.sha256(), expected_sha256);
+}
+
+/// Source: the same `append_locked` replay-identity block cited by case
+/// 297/A3-replay, and specifically its `MismatchedReplay` arm.
+/// Discovery: a replay is accepted only when the sequence, offset, length,
+/// sha256 AND the bytes at that offset ALL match the recorded
+/// `AdmittedChunk`; any disagreement is a mismatched replay, and a mismatched
+/// replay is refused BEFORE the persistence-queue charge and before `staged`
+/// is extended.
+/// Executed-pass: three refusals against one admitted chunk -- same sequence
+/// with changed bytes, with a short length, and with a wrong offset -- and then
+/// a finalize whose published object is the ORIGINAL chunk.
+/// I10.8.5: a refused replay never reaches the append-only evidence object, so
+/// the published bytes stay the bytes the transport actually sent.
+// WORK_UNIT_CASE: 297/A3-changed
+#[allow(
+    clippy::too_many_lines,
+    reason = "three refusal sub-cases and the finalization proof are one case"
+)]
+#[test]
+fn changed_replay_leaves_state_unchanged() {
+    const C: &[u8] = b"chunk-c-original";
+    let (sink, session) = open_replay_sink("changed");
+
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, C)),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: C.len() as u64,
+        },
+    );
+
+    // (a) The same sequence and coordinates with DIFFERENT BYTES. The length and
+    // the offset agree, so this is refused on the byte comparison alone.
+    assert_eq!(
+        append_chunk(&sink, &session, 0, 0, b"chunk-c-changed!"),
+        Err(ProcessStreamSinkError::MismatchedReplay),
+        "a replay whose bytes differ from the admitted chunk is not the same chunk"
+    );
+
+    // (b) The same sequence and offset with a SHORT LENGTH: a prefix of the
+    // admitted chunk. Its digest is a real digest of the bytes it carries, so
+    // the refusal is the length/metadata arm and not a request digest failure.
+    assert_eq!(
+        append_chunk(&sink, &session, 0, 0, &C[..C.len() - 1]),
+        Err(ProcessStreamSinkError::MismatchedReplay),
+        "a replay that carries fewer bytes than the admitted chunk is not the same chunk"
+    );
+
+    // (c) The same sequence and bytes at a WRONG OFFSET. The offset arm runs
+    // before the length and digest arms, so this isolates it.
+    assert_eq!(
+        append_chunk(&sink, &session, 0, 1, C),
+        Err(ProcessStreamSinkError::MismatchedReplay),
+        "a replay at an offset the admitted chunk never occupied is not the same chunk"
+    );
+
+    // None of the three refusals advanced a cursor or admitted a byte: the
+    // session still counts exactly the one original chunk.
+    let ProcessStreamSinkReadback::Session { view } = ok(block_on(sink.readback(session.clone())))
+    else {
+        panic!("an unfinalized session reads back as its session view");
+    };
+    assert_eq!(view.admitted_chunks(), 1);
+    assert_eq!(view.admitted_bytes(), C.len() as u64);
+    assert_eq!(view.next_sequence(), 1);
+    assert_eq!(view.next_offset(), C.len() as u64);
+
+    let expected_sha256 = format!("{:x}", Sha256::digest(C));
+    let request = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        1,
+        C.len() as u64,
+        20,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        C.len() as u64,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            C.to_vec(),
+            C.len() as u64,
+        )),
+        None,
+        Vec::new(),
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), request)));
+
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+    assert_eq!(terminal.admitted_chunks(), 1);
+
+    // The published object is the ORIGINAL `C`: had any refused replay reached
+    // the staged plaintext, the length or the digest below would differ.
+    let Some(BlobStreamPublication::Complete(complete)) = sink.publication() else {
+        panic!("a complete source must record a real object, never `Unavailable`");
+    };
+    assert_eq!(complete.byte_length, C.len() as u64);
+    assert_eq!(complete.sha256, expected_sha256);
+    assert_eq!(
+        complete.locator,
+        format!("blob:{}", blake3::hash(C).to_hex())
+    );
+}
+
+/// Source: the `SequenceGap` arm of `append_locked`: an append whose sequence
+/// is ABOVE `next_sequence` names the exact expected and observed cursors and
+/// is refused before any byte is admitted.
+/// Discovery: a caller that skips a sequence would otherwise leave a hole in
+/// the append-only evidence object that no later append could fill, so the gap
+/// is refused with the cursor it expected and the one it saw.
+/// Executed-pass: sequence 0 is admitted, then a chunk at sequence 2 is offered
+/// -- skipping sequence 1 -- and the error names both cursors; the session view
+/// then shows the gap admitted nothing.
+// WORK_UNIT_CASE: 297/A3-gap
+#[test]
+fn sequence_gap_is_refused() {
+    const C: &[u8] = b"chunk-c";
+    let (sink, session) = open_replay_sink("gap");
+
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, C)),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: C.len() as u64,
+        },
+    );
+
+    // Sequence 2 with sequence 1 never admitted. The refusal names the cursor
+    // the sink expected (1) and the one the caller offered (2).
+    assert_eq!(
+        append_chunk(&sink, &session, 2, C.len() as u64, b"chunk-d"),
+        Err(ProcessStreamSinkError::SequenceGap {
+            expected: 1,
+            observed: 2,
+        }),
+        "a chunk that skips a sequence would leave an unfillable hole in the evidence object"
+    );
+
+    // The refused gap admitted nothing and left the cursor where it was, so the
+    // skipped sequence is still the next one a caller may append.
+    let ProcessStreamSinkReadback::Session { view } = ok(block_on(sink.readback(session.clone())))
+    else {
+        panic!("an unfinalized session reads back as its session view");
+    };
+    assert_eq!(view.admitted_chunks(), 1);
+    assert_eq!(view.admitted_bytes(), C.len() as u64);
+    assert_eq!(view.next_sequence(), 1);
+    assert_eq!(view.next_offset(), C.len() as u64);
 }
