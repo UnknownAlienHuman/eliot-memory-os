@@ -1254,6 +1254,41 @@ fn absence_issuer_foreign_scope_refused() {
     );
 }
 
+/// The issuer holds the exact revision of the manifest it attests, so an issuer
+/// asked to mint against a manifest it does not hold would produce a record whose
+/// own commitments claim completeness on a revision of the sources it never
+/// reviewed. Completeness is proved on the frozen scope and the exact frozen
+/// source revision (I21-06: `complete_scope` is the only basis on which a scoped
+/// absence may be claimed), so the revision binding is the issuer's to refuse at
+/// minting rather than the assessor's to discover on readback.
+///
+/// The scope binding passes here, so the refusal is caused by the revision alone:
+/// `issue_for` runs `check_manifest_binding` after `check_scope_binding`, and the
+/// presented manifest still carries the digest, scope and denominator the issuer
+/// holds - only its frozen `revision` is one the issuer did not take.
+#[test]
+fn absence_issuer_manifest_revision_refused() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.manifest_revision = ABSENCE_MANIFEST_REVISION + 1;
+    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let err = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect_err("a manifest revision the issuer does not hold must be refused");
+    // `Conflict` renders as `{field} conflicts with frozen content`, so the display
+    // is what names the exact field path the issuer refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unheld manifest revision must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.manifest_revision"),
+        "the refused field must be the manifest revision binding itself: {rendered}"
+    );
+}
+
 // WORK_UNIT_CASE: 700/11
 #[test]
 fn malformed_circular_and_unresolved_citations() {
