@@ -1,4 +1,4 @@
-inventory_digest = "19e4a53f5d18f0aa17a354640b3c631b309493c154599e4f2fff2bd95eb76031"
+inventory_digest = "3e816c5e692b0d04c2e82dc4d31dfe3d735e575e8948e9351b694cb836fcff0d"
 proposed_splits = []
 
 [header]
@@ -14,13 +14,13 @@ owner_map_status = "SUPPLIED"
 owner_map_digest = "1e598dc28c46b8556831edaf4962a7ba703aa30f72b4020eef13c2208454dee0"
 scan_denominator_files = 27
 scan_denominator_bytes = 1470423
-candidate_count = 72
-classified_count = 72
+candidate_count = 126
+classified_count = 126
 owned_count = 68
-unresolved_count = 4
+unresolved_count = 58
 generation_command = "python scripts/context_measurement_inventory.py sync --root ."
 coverage_disposition = "INCOMPLETE"
-coverage_reason = "incomplete: 4 candidate(s) have no exact-scope owner"
+coverage_reason = "incomplete: 58 candidate(s) have no exact-scope owner"
 proof_ceiling = "STATIC_SOURCE_CLASSIFICATION_ONLY"
 stu_accounting_rule = "STU = ceil(UTF-8 bytes / 3) per docs/architecture/I02-16-crate-size-and-agent-context-envelope.md"
 upper_review_band_stu = 65000
@@ -1733,6 +1733,1356 @@ invalidation = "row invalid when the source span digest, file sha, rule revision
 
 [[rows]]
 id = "c0069"
+case_ref = "auto/autonomy.rs/305"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-app/src/mcp_stdio/autonomy.rs"
+package = "eliot-app"
+item = "fn autonomy_cost_measurement"
+item_scope = "production"
+signal = "Some(loaded.runtime.ledger.cost_or_token_units),"
+span_start = 305
+span_end = 305
+span_bytes = 57
+source_sha256 = "a73b7c207d589dc1989769159462e85e27ae97234498c8c7acb33858ca29ca92"
+span_digest = "631cea9c843a96d0602f209371ea665868096b1e99ebbe8d59febaf61396dcf4"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "1d9b3e7a50ea3d476f81be910ca2d6ae203922365c6e54945e38f31fabcc7aef"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/autonomy.rs:305-305 inside `fn autonomy_cost_measurement` with no frozen case covering the span; bare measurement field or projection: 'Some(loaded.runtime.ledger.cost_or_token_units),'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/autonomy.rs:305-305 inside `fn autonomy_cost_measurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/autonomy.rs/305 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0070"
+case_ref = "auto/capacity.rs/105"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "struct CapacityAnalysis"
+item_scope = "production"
+signal = "pub observed_headroom: Option<u64>,"
+span_start = 105
+span_end = 105
+span_bytes = 40
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "42e819f33993d56c19b23ddcf7e057e2e79bec79865175b0662e4f992eaf448c"
+classification = "unresolved"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "be7cefcc0ad7da09f2004c81896cef470424bc7204e537a1a9cecac151d73be0"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:105-105 inside `struct CapacityAnalysis` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'pub observed_headroom: Option<u64>,'); recorded unresolved and never deleted to obtain green; measured at crates/smart/eliot-context-measurement/src/capacity.rs:105-105 inside `struct CapacityAnalysis`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/105 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0071"
+case_ref = "auto/capacity.rs/121"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "<file>"
+item_scope = "production"
+signal = "fn fit_headroom(capacity: Option<u64>, total: Option<u64>) -> (Option<bool>, Option<u64>) {"
+span_start = 121
+span_end = 121
+span_bytes = 92
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "df416736e66600c8ea7989e77bf5c51dafb305aab29332a38651d48a00d56d7a"
+classification = "unresolved"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "6f475b31852f3a838a7b5e2b21e399461d97ab2c1238cad14723e64e53c99b42"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:121-121 inside `<file>` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'fn fit_headroom(capacity: Option<u64>, total: Option<u64>) -> (Option<bool>, Option<u64>) {'); recorded unresolved and never deleted to obtain green; measured at crates/smart/eliot-context-measurement/src/capacity.rs:121-121 inside `<file>`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/121 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0072"
+case_ref = "auto/capacity.rs/142"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "fn analyze_capacity"
+item_scope = "production"
+signal = "plan.fixed_overhead,"
+span_start = 142
+span_end = 142
+span_bytes = 29
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "d0d6dfb275c4d4496aff1d8667acf3c687b5c84ed185ce4071b92cb5000ad933"
+classification = "capacity-fit-analysis"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "85c7620bea30c03a08c7b78e5a0122063aae917d443097a313fe07fa31fac165"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:142-142 inside `fn analyze_capacity` with no frozen case covering the span; capacity signal 'plan.fixed_overhead,': reserves/fit/headroom/error/receipt binding; measured at crates/smart/eliot-context-measurement/src/capacity.rs:142-142 inside `fn analyze_capacity`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/142 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0073"
+case_ref = "auto/capacity.rs/172"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "fn analyze_capacity"
+item_scope = "production"
+signal = "let (fit, headroom) = fit_headroom(plan.route_capacity, estimated_total);"
+span_start = 172
+span_end = 172
+span_bytes = 78
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "87180ba544f94c4b0c80473c1cf494be4fc47bbc15684d26b9dac38d868cdf44"
+classification = "capacity-fit-analysis"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "467b8d07f1f1629c37266a29dfc346a898d88a6f87a629f1885d793c9bc558d1"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:172-172 inside `fn analyze_capacity` with no frozen case covering the span; capacity signal 'let (fit, headroom) = fit_headroom(plan.route_capacity, estimated_total);': reserves/fit/headroom/error/receipt binding; measured at crates/smart/eliot-context-measurement/src/capacity.rs:172-172 inside `fn analyze_capacity`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/172 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0074"
+case_ref = "auto/capacity.rs/175"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "fn analyze_capacity"
+item_scope = "production"
+signal = "let observed_cost = match (observed_tokens, plan.unit) {"
+span_start = 175
+span_end = 175
+span_bytes = 61
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "cbd722d6932be05b967658aa74808fccea58de65d34f10b939471326ff59cd90"
+classification = "exact-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "92da7dc53ac610b03dbe52e2aad912bbc4fd590d15a1d6a499ab7cd61200b436"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:175-175 inside `fn analyze_capacity` with no frozen case covering the span; exact observation signal 'let observed_cost = match (observed_tokens, plan.unit) {': actually-run route tokenizer count; measured at crates/smart/eliot-context-measurement/src/capacity.rs:175-175 inside `fn analyze_capacity`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/175 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0075"
+case_ref = "auto/capacity.rs/185"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "fn analyze_capacity"
+item_scope = "production"
+signal = "let (observed_fit, observed_headroom) = fit_headroom(plan.route_capacity, observed_total);"
+span_start = 185
+span_end = 185
+span_bytes = 95
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "85dbe595df541068896468c1b51bdd48a4619d057b64833bd7d2cebefc953ed6"
+classification = "capacity-fit-analysis"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "633838b1860bcfb9438519c5977d3cf7f0f5b884af74970d1623fc1d173eca4e"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:185-185 inside `fn analyze_capacity` with no frozen case covering the span; capacity signal 'let (observed_fit, observed_headroom) = fit_headroom(plan.route_capacity, observed_total);': reserves/fit/headroom/error/receipt binding; measured at crates/smart/eliot-context-measurement/src/capacity.rs:185-185 inside `fn analyze_capacity`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/185 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0076"
+case_ref = "auto/capacity.rs/191"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "fn analyze_capacity"
+item_scope = "production"
+signal = "headroom,"
+span_start = 191
+span_end = 191
+span_bytes = 18
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "2494372c58f08550098583a609584d8041c2df3d75a731dbdc6708ba62dc33fb"
+classification = "capacity-fit-analysis"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "167c30aadb64fc73c010506a67123ff98fb0335e8658e503c957d731cdfa3b43"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:191-191 inside `fn analyze_capacity` with no frozen case covering the span; capacity signal 'headroom,': reserves/fit/headroom/error/receipt binding; measured at crates/smart/eliot-context-measurement/src/capacity.rs:191-191 inside `fn analyze_capacity`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/191 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0077"
+case_ref = "auto/capacity.rs/195"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+package = "eliot-context-measurement"
+item = "fn analyze_capacity"
+item_scope = "production"
+signal = "observed_headroom,"
+span_start = 195
+span_end = 195
+span_bytes = 27
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "a90d05820810bd7db3c48d78c33cff4ed7dce1839c6f59e462bfcc37f6b28ffb"
+classification = "unresolved"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "ae0c99df511a64687e2c9783aca8747c54abd7515c1328c0548e0e0a9a5a0989"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/capacity.rs:195-195 inside `fn analyze_capacity` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'observed_headroom,'); recorded unresolved and never deleted to obtain green; measured at crates/smart/eliot-context-measurement/src/capacity.rs:195-195 inside `fn analyze_capacity`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/capacity.rs/195 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0078"
+case_ref = "auto/control_plane.rs/1101"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/control_plane.rs"
+package = "eliot-engine"
+item = "fn validate_restored_state"
+item_scope = "production"
+signal = ".cost_or_token_budget"
+span_start = 1101
+span_end = 1101
+span_bytes = 34
+source_sha256 = "a777a262e2fb95a67c05d744876baf45d7b0c89581cf8fef23f79b3c6d3d40dc"
+span_digest = "e93961cfa891fa89dc0f34de56ef3e3b9c1fe7e38c886ff9c281e1db398a978a"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "abbc04f2b4a5cb1853fcf6390014da725826fa32d7adafa04e6e953dfdba59ce"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/control_plane.rs:1101-1101 inside `fn validate_restored_state` with no frozen case covering the span; bare measurement field or projection: '.cost_or_token_budget'; carries no estimator policy of its own; measured at crates/eliot-engine/src/control_plane.rs:1101-1101 inside `fn validate_restored_state`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/control_plane.rs/1101 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0079"
+case_ref = "auto/control_plane.rs/1303"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/control_plane.rs"
+package = "eliot-engine"
+item = "fn budget_reasons"
+item_scope = "production"
+signal = ".cost_or_token_budget"
+span_start = 1303
+span_end = 1303
+span_bytes = 30
+source_sha256 = "a777a262e2fb95a67c05d744876baf45d7b0c89581cf8fef23f79b3c6d3d40dc"
+span_digest = "3d90e6815dbb2e1b9428dd162aa9281c541174ec4f6a15feb8a4df0529946f15"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "8cd626bb133d7f740106b90efce8f8db87d1989ce76a96cfcb964a225a640c03"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/control_plane.rs:1303-1303 inside `fn budget_reasons` with no frozen case covering the span; bare measurement field or projection: '.cost_or_token_budget'; carries no estimator policy of its own; measured at crates/eliot-engine/src/control_plane.rs:1303-1303 inside `fn budget_reasons`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/control_plane.rs/1303 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0080"
+case_ref = "auto/control_plane.rs/1308"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/control_plane.rs"
+package = "eliot-engine"
+item = "fn budget_reasons"
+item_scope = "production"
+signal = ".saturating_add(intent.cost_or_token_units)"
+span_start = 1308
+span_end = 1308
+span_bytes = 56
+source_sha256 = "a777a262e2fb95a67c05d744876baf45d7b0c89581cf8fef23f79b3c6d3d40dc"
+span_digest = "0c45ca7eee98e1195b0ce831ab0bf4cb4731b310bfd1eb1b0ba462ca8ad7ebfc"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "2cd10747ff0abeef3e04d1522de0658a0ecb8e39ee17ae68029296f683aecf7d"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/control_plane.rs:1308-1308 inside `fn budget_reasons` with no frozen case covering the span; bare unit conversion feeding a measurement field: '.saturating_add(intent.cost_or_token_units)'; no estimator policy; measured at crates/eliot-engine/src/control_plane.rs:1308-1308 inside `fn budget_reasons`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/control_plane.rs/1308 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0081"
+case_ref = "auto/control_plane.rs/255"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/control_plane.rs"
+package = "eliot-engine"
+item = "struct AutonomyStepIntent"
+item_scope = "production"
+signal = "pub cost_or_token_units: u64,"
+span_start = 255
+span_end = 255
+span_bytes = 34
+source_sha256 = "a777a262e2fb95a67c05d744876baf45d7b0c89581cf8fef23f79b3c6d3d40dc"
+span_digest = "e141aee9f48f11a0caa9e88906383f997d27aa5e1ee2fe598335d3310d77cf23"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "615dbf68abc9211209bb423a8b843c57283c7a3cb2f4d0c2e80b8a932d84fdc3"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/control_plane.rs:255-255 inside `struct AutonomyStepIntent` with no frozen case covering the span; bare measurement field or projection: 'pub cost_or_token_units: u64,'; carries no estimator policy of its own; measured at crates/eliot-engine/src/control_plane.rs:255-255 inside `struct AutonomyStepIntent`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/control_plane.rs/255 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0082"
+case_ref = "auto/dispatch.rs/317"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-app/src/mcp_stdio/dispatch.rs"
+package = "eliot-app"
+item = "fn dispatch_error_response"
+item_scope = "production"
+signal = ": details.section_tokens,"
+span_start = 317
+span_end = 317
+span_bytes = 58
+source_sha256 = "138a8e14d7ef156e58f81c15c8ffa33e9e21415417e42e9b29ba384d4d701be0"
+span_digest = "906d18753c0bfb4f3f4a1b7e35c8dffa520b3a11fbb04ddb738994f083ca598f"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "e98009539744c7fbdaed373a8afaab4f815e91c95a3cfe9e3a3df1a7bf2beaba"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/dispatch.rs:317-317 inside `fn dispatch_error_response` with no frozen case covering the span; bare measurement field or projection: ': details.section_tokens,'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/dispatch.rs:317-317 inside `fn dispatch_error_response`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/dispatch.rs/317 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0083"
+case_ref = "auto/dispatch.rs/341"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-app/src/mcp_stdio/dispatch.rs"
+package = "eliot-app"
+item = "fn dispatch_error_response"
+item_scope = "production"
+signal = ": estimated_tokens,"
+span_start = 341
+span_end = 341
+span_bytes = 54
+source_sha256 = "138a8e14d7ef156e58f81c15c8ffa33e9e21415417e42e9b29ba384d4d701be0"
+span_digest = "3dda1b20877bf317b580e22d44a6acbe192f0cf7c04bc1ebc138c3dd80d0c706"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "b97bbb450466dd8d95f5ef230401426a494a359c0cb8b96cf8085f74157b1fb2"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/dispatch.rs:341-341 inside `fn dispatch_error_response` with no frozen case covering the span; bare measurement field or projection: ': estimated_tokens,'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio/dispatch.rs:341-341 inside `fn dispatch_error_response`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/dispatch.rs/341 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0084"
+case_ref = "auto/envelope.rs/100"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/envelope.rs"
+package = "eliot-context-measurement"
+item = "fn validate_envelope"
+item_scope = "production"
+signal = "if declared_len != actual {"
+span_start = 100
+span_end = 100
+span_bytes = 32
+source_sha256 = "5907c5ab9681175a48cb9d4ffcae8c11f75411c75cdf27058193fb4d3a1c1362"
+span_digest = "a4744ae339da65cdda753a950737831d731313bd98ecd4044f2a5e426b71fad5"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "f8f27beb4c700b0271949a9ac984d0170786d241d8987d3ca92e6b829c2ab46c"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/envelope.rs:100-100 inside `fn validate_envelope` with no frozen case covering the span; exact envelope signal 'if declared_len != actual {': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-measurement/src/envelope.rs:100-100 inside `fn validate_envelope`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/envelope.rs/100 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0085"
+case_ref = "auto/envelope.rs/103"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/envelope.rs"
+package = "eliot-context-measurement"
+item = "fn validate_envelope"
+item_scope = "production"
+signal = "validate_digest(content_digest,                             )?;"
+span_start = 103
+span_end = 103
+span_bytes = 68
+source_sha256 = "5907c5ab9681175a48cb9d4ffcae8c11f75411c75cdf27058193fb4d3a1c1362"
+span_digest = "0e5f8419e8ddcf6c510ddc63dde87e6f5cd159a9b3d3b8bc5f02a1a5575f6ab3"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "fdfc17a3eab97dd2bf7d616072a06d02f84a7a3ebc9cbf9daebe517d8c451fb5"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/envelope.rs:103-103 inside `fn validate_envelope` with no frozen case covering the span; exact envelope signal 'validate_digest(content_digest,                             )?;': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-measurement/src/envelope.rs:103-103 inside `fn validate_envelope`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/envelope.rs/103 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0086"
+case_ref = "auto/envelope.rs/105"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/envelope.rs"
+package = "eliot-context-measurement"
+item = "fn validate_envelope"
+item_scope = "production"
+signal = "if digest != content_digest {"
+span_start = 105
+span_end = 105
+span_bytes = 34
+source_sha256 = "5907c5ab9681175a48cb9d4ffcae8c11f75411c75cdf27058193fb4d3a1c1362"
+span_digest = "43bfdddff92589cd8c630b468c77da6027b1a989ce270fb2106acc94bc358627"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "aa899a850d1ff2d3ba4c7bbd840946077d23d47c15dcc80b2af199c749813310"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/envelope.rs:105-105 inside `fn validate_envelope` with no frozen case covering the span; exact envelope signal 'if digest != content_digest {': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-measurement/src/envelope.rs:105-105 inside `fn validate_envelope`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/envelope.rs/105 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0087"
+case_ref = "auto/host.rs/126"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/host.rs"
+package = "eliot-engine"
+item = "fn validate_listing_envelope"
+item_scope = "production"
+signal = "if self.listing_serializer_id != serializer_id"
+span_start = 126
+span_end = 126
+span_bytes = 55
+source_sha256 = "7c512a2e7efa0364687c2d2f1cc20c36891f3fbd5d42a2f7c76b815c4579ad4e"
+span_digest = "c2ac4c69fe152d56e58a8a316dd3ef396747599b8d1af7b389d8769946519938"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "635cfbebc7aa8f296c0cef7ee150d5228e4b346b52ddfa0199dd1f78f1a2368b"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/host.rs:126-126 inside `fn validate_listing_envelope` with no frozen case covering the span; serializer identity signal 'if self.listing_serializer_id != serializer_id': serializer/schema binding; measured at crates/eliot-engine/src/host.rs:126-126 inside `fn validate_listing_envelope`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/host.rs/126 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0088"
+case_ref = "auto/host.rs/292"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/host.rs"
+package = "eliot-engine"
+item = "fn lint"
+item_scope = "production"
+signal = "listing_serializer_id,"
+span_start = 292
+span_end = 292
+span_bytes = 35
+source_sha256 = "7c512a2e7efa0364687c2d2f1cc20c36891f3fbd5d42a2f7c76b815c4579ad4e"
+span_digest = "f96a49a5e58a97fa39c466012902fc2848da93ac3b3c5f9018e955ebafc36b8e"
+classification = "unresolved"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "8e48061f5391ca34af61b612808d0953c74781a99a7ca45c1c3984dee6aa553b"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/host.rs:292-292 inside `fn lint` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'listing_serializer_id,'); recorded unresolved and never deleted to obtain green; measured at crates/eliot-engine/src/host.rs:292-292 inside `fn lint`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/host.rs/292 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0089"
+case_ref = "auto/host.rs/359"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/host.rs"
+package = "eliot-engine"
+item = "fn lint"
+item_scope = "production"
+signal = "listing_serializer_id,"
+span_start = 359
+span_end = 359
+span_bytes = 35
+source_sha256 = "7c512a2e7efa0364687c2d2f1cc20c36891f3fbd5d42a2f7c76b815c4579ad4e"
+span_digest = "f96a49a5e58a97fa39c466012902fc2848da93ac3b3c5f9018e955ebafc36b8e"
+classification = "unresolved"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "804b3ec863f94d3dabba6b7c7b97cfedd0a87e580e05e2f934af751aceee0f70"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/host.rs:359-359 inside `fn lint` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'listing_serializer_id,'); recorded unresolved and never deleted to obtain green; measured at crates/eliot-engine/src/host.rs:359-359 inside `fn lint`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/host.rs/359 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0090"
+case_ref = "auto/host.rs/379"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/host.rs"
+package = "eliot-engine"
+item = "fn exact_text_measurement"
+item_scope = "production"
+signal = "let envelope = validate_envelope(bytes, declared_len, &content_digest, MAX_MEASUREMENT_BYTES)?;"
+span_start = 379
+span_end = 379
+span_bytes = 100
+source_sha256 = "7c512a2e7efa0364687c2d2f1cc20c36891f3fbd5d42a2f7c76b815c4579ad4e"
+span_digest = "6c54a05ffc6555884bb209a44eab8ca45046f149a72c3f3c1d09e1fd0ab42d40"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "e34e15c91ea76d45ac5e1977f663f99d058b4f27f006aa26989919e001340277"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/host.rs:379-379 inside `fn exact_text_measurement` with no frozen case covering the span; exact envelope signal 'let envelope = validate_envelope(bytes, declared_len, &content_digest, MAX_MEASUREMENT_BYTES)?;': final UTF-8 bytes and digest binding; measured at crates/eliot-engine/src/host.rs:379-379 inside `fn exact_text_measurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/host.rs/379 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0091"
+case_ref = "auto/host.rs/69"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-engine/src/host.rs"
+package = "eliot-engine"
+item = "struct SkillPackLintReport"
+item_scope = "production"
+signal = "pub listing_serializer_id: String,"
+span_start = 69
+span_end = 69
+span_bytes = 39
+source_sha256 = "7c512a2e7efa0364687c2d2f1cc20c36891f3fbd5d42a2f7c76b815c4579ad4e"
+span_digest = "8f11023173b67bb383e18c723ebf1a38d5b72af77912dcbe5761b12f5d498bf0"
+classification = "unresolved"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "b309eacc2dbb2a238f4ff67e464c3c0f78203c2b6ac24f8a25bcdbb78e9ea402"
+evidence = "discovered repeated-needle at crates/eliot-engine/src/host.rs:69-69 inside `struct SkillPackLintReport` with no frozen case covering the span; extracted body carries no closed-class token (signal is outside the closed 15-class set: 'pub listing_serializer_id: String,'); recorded unresolved and never deleted to obtain green; measured at crates/eliot-engine/src/host.rs:69-69 inside `struct SkillPackLintReport`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/host.rs/69 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0092"
+case_ref = "auto/lib.rs/253"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+package = "eliot-context-measurement"
+item = "fn validate"
+item_scope = "production"
+signal = "validate_identity_text(&self.estimator_id,                         )?;"
+span_start = 253
+span_end = 253
+span_bytes = 79
+source_sha256 = "3d04b1b0545785d1dc8ef1fa325272fec840193331ff85cd2bc1b71f9adfa6e4"
+span_digest = "8e8d773d1f903625008f4a9bd2a757d3de0f46dbbb3c47367ec0d63e3942521e"
+classification = "estimator-policy-unvalidated"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "a9b3117d4a611281b0634b678fb6db36e85b65ddf34520725fc9f2b14c1fbb3b"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/lib.rs:253-253 inside `fn validate` with no frozen case covering the span; estimator signal 'validate_identity_text(&self.estimator_id,                         )?;': UNVALIDATED planning evidence, candidates cited only; measured at crates/smart/eliot-context-measurement/src/lib.rs:253-253 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/lib.rs/253 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0093"
+case_ref = "auto/lib.rs/258"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+package = "eliot-context-measurement"
+item = "fn validate"
+item_scope = "production"
+signal = "if self.candidate_digests.len() > 64 {"
+span_start = 258
+span_end = 258
+span_bytes = 47
+source_sha256 = "3d04b1b0545785d1dc8ef1fa325272fec840193331ff85cd2bc1b71f9adfa6e4"
+span_digest = "7896a6c0b05506d72412958d3614c27de10787412578786cec0f761417474aa2"
+classification = "estimator-policy-unvalidated"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "c7913362aa525b71108ba29ca48b81acd10a32bfd8730e4489ac919689892e4b"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/lib.rs:258-258 inside `fn validate` with no frozen case covering the span; estimator signal 'if self.candidate_digests.len() > 64 {': UNVALIDATED planning evidence, candidates cited only; measured at crates/smart/eliot-context-measurement/src/lib.rs:258-258 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/lib.rs/258 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0094"
+case_ref = "auto/lib.rs/263"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+package = "eliot-context-measurement"
+item = "fn validate"
+item_scope = "production"
+signal = "for candidate in &self.candidate_digests {"
+span_start = 263
+span_end = 263
+span_bytes = 51
+source_sha256 = "3d04b1b0545785d1dc8ef1fa325272fec840193331ff85cd2bc1b71f9adfa6e4"
+span_digest = "c929f097d6d9a1f24d0c32fecd367b0ae95326b3c055670af474d16013b5d860"
+classification = "estimator-policy-unvalidated"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "eaa5d06431411708eab9a10d8a40037414dc54fe3d63d708f4da9897c65a8b7f"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/lib.rs:263-263 inside `fn validate` with no frozen case covering the span; estimator signal 'for candidate in &self.candidate_digests {': UNVALIDATED planning evidence, candidates cited only; measured at crates/smart/eliot-context-measurement/src/lib.rs:263-263 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/lib.rs/263 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0095"
+case_ref = "auto/lib.rs/388"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+package = "eliot-context-measurement"
+item = "fn build_receipt_input"
+item_scope = "production"
+signal = "estimator_id: inputs.estimator.estimator_id.clone(),"
+span_start = 388
+span_end = 388
+span_bytes = 61
+source_sha256 = "3d04b1b0545785d1dc8ef1fa325272fec840193331ff85cd2bc1b71f9adfa6e4"
+span_digest = "224f233f3e9f051360ded0bf0842118d2579e7c961c4c5a287bb6d9806e88c8e"
+classification = "estimator-policy-unvalidated"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "5559afaa6f4fad6d1f38aaa7dd9ca12169902516335e5acd27eeb95ff4796b63"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/lib.rs:388-388 inside `fn build_receipt_input` with no frozen case covering the span; estimator signal 'estimator_id: inputs.estimator.estimator_id.clone(),': UNVALIDATED planning evidence, candidates cited only; measured at crates/smart/eliot-context-measurement/src/lib.rs:388-388 inside `fn build_receipt_input`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/lib.rs/388 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0096"
+case_ref = "auto/lib.rs/391"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+package = "eliot-context-measurement"
+item = "fn build_receipt_input"
+item_scope = "production"
+signal = "candidate_digests: inputs.estimator.candidate_digests.clone(),"
+span_start = 391
+span_end = 391
+span_bytes = 71
+source_sha256 = "3d04b1b0545785d1dc8ef1fa325272fec840193331ff85cd2bc1b71f9adfa6e4"
+span_digest = "1c498c8b18938da486e2f839b4c4dc14de63ea9dc547858848f64a1ee5b49320"
+classification = "estimator-policy-unvalidated"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "3bd1a0749729d6b0c8e8c9b8c17fee71f898d4996eec68832ad4331c7c273af8"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/lib.rs:391-391 inside `fn build_receipt_input` with no frozen case covering the span; estimator signal 'candidate_digests: inputs.estimator.candidate_digests.clone(),': UNVALIDATED planning evidence, candidates cited only; measured at crates/smart/eliot-context-measurement/src/lib.rs:391-391 inside `fn build_receipt_input`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/lib.rs/391 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0097"
+case_ref = "auto/lib.rs/516"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+package = "eliot-context-measurement"
+item = "fn measure_serialized_context"
+item_scope = "production"
+signal = "rendered_utf8_bytes: envelope.byte_len,"
+span_start = 516
+span_end = 516
+span_bytes = 48
+source_sha256 = "3d04b1b0545785d1dc8ef1fa325272fec840193331ff85cd2bc1b71f9adfa6e4"
+span_digest = "c9b77c1363129962f8a5b43924d3126a72aa60aa47bcbab5a42e8c42a849d578"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "086bbd930567138942e9bca8238cfb787fb6479d02e2f2ccb4d5feaaa71d0193"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/lib.rs:516-516 inside `fn measure_serialized_context` with no frozen case covering the span; exact envelope signal 'rendered_utf8_bytes: envelope.byte_len,': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-measurement/src/lib.rs:516-516 inside `fn measure_serialized_context`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/lib.rs/516 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0098"
+case_ref = "auto/mcp_stdio.rs/357"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-app/src/mcp_stdio.rs"
+package = "eliot-app"
+item = "fn part_e_surface_report"
+item_scope = "production"
+signal = ": combined_ul_tokens,"
+span_start = 357
+span_end = 357
+span_bytes = 62
+source_sha256 = "035ec5ef22968fe45c4d265309b170a89d8749e3e94b2822c1be8a3cb6ab6dd0"
+span_digest = "2930a0b68e782f78461b88553da6464a09cfa45a6bdf71cd9ec8df330e6ba325"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "451fc0f1e04ab39de2672f1f22d0f385bb0f616f2dff0a090bf6333791dff94c"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio.rs:357-357 inside `fn part_e_surface_report` with no frozen case covering the span; bare measurement field or projection: ': combined_ul_tokens,'; carries no estimator policy of its own; measured at crates/eliot-app/src/mcp_stdio.rs:357-357 inside `fn part_e_surface_report`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/mcp_stdio.rs/357 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0099"
+case_ref = "auto/measurement.rs/119"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "struct SerializedContextMeasurement"
+item_scope = "production"
+signal = "pub serializer_id: String,"
+span_start = 119
+span_end = 119
+span_bytes = 31
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "760da60ccd73864d0711da2f46630a708f439a3c6fc36db58c9cd293d3bfd975"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "93d94e08b72204f3d65610e076e188bf3502175e2cb455645d9a74687a38b826"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:119-119 inside `struct SerializedContextMeasurement` with no frozen case covering the span; serializer identity signal 'pub serializer_id: String,': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:119-119 inside `struct SerializedContextMeasurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/119 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0100"
+case_ref = "auto/measurement.rs/121"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "struct SerializedContextMeasurement"
+item_scope = "production"
+signal = "pub serializer_options_digest: String,"
+span_start = 121
+span_end = 121
+span_bytes = 43
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "cec712fe0b26619e19279c47b762bcd262063d3a118aca6094bbe26266c28e21"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "52d1e00f8d0a606609cf5a619fdb849720a42e5a21fea33366e6b79025b14a53"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:121-121 inside `struct SerializedContextMeasurement` with no frozen case covering the span; serializer identity signal 'pub serializer_options_digest: String,': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:121-121 inside `struct SerializedContextMeasurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/121 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0101"
+case_ref = "auto/measurement.rs/125"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "struct SerializedContextMeasurement"
+item_scope = "production"
+signal = "pub stu_estimate: Option<StuEstimate>,"
+span_start = 125
+span_end = 125
+span_bytes = 43
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "5a5d81d5223028497f1e1aa1fd0897befb2d6efc1873a5ae863237cbae3c7401"
+classification = "normative-stu-estimate"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "cd1299bf38db07017c32f9e999707d9a40ea5e9de6eaa290c75ee2ecafe690ce"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:125-125 inside `struct SerializedContextMeasurement` with no frozen case covering the span; normative STU signal 'pub stu_estimate: Option<StuEstimate>,': ceil(bytes/3) estimate, never proves fit; measured at crates/smart/eliot-context-contracts/src/measurement.rs:125-125 inside `struct SerializedContextMeasurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/125 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0102"
+case_ref = "auto/measurement.rs/126"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "struct SerializedContextMeasurement"
+item_scope = "production"
+signal = "pub tokenizer: Option<TokenizerObservation>,"
+span_start = 126
+span_end = 126
+span_bytes = 49
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "336eb0504e6e3b1ff3e85a43386c2df9989b432f2b253d5a19f0b744d4fe9654"
+classification = "exact-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "cd622cab4b2e4a3df0e9d5033c76cc0fef48c819c7973fb59b80f7fe3dafd740"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:126-126 inside `struct SerializedContextMeasurement` with no frozen case covering the span; exact observation signal 'pub tokenizer: Option<TokenizerObservation>,': actually-run route tokenizer count; measured at crates/smart/eliot-context-contracts/src/measurement.rs:126-126 inside `struct SerializedContextMeasurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/126 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0103"
+case_ref = "auto/measurement.rs/142"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn validate"
+item_scope = "production"
+signal = "&self.serializer_options_digest,"
+span_start = 142
+span_end = 142
+span_bytes = 45
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "174064c07e8b9f207de299b6a2cae9a62c080514c0e611569c5df16805b1aedc"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "3a5065ddf51d371489eadf9067b94e9b5971221241ef1b3accb6bab210b27fda"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:142-142 inside `fn validate` with no frozen case covering the span; serializer identity signal '&self.serializer_options_digest,': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:142-142 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/142 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0104"
+case_ref = "auto/measurement.rs/145"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn validate"
+item_scope = "production"
+signal = "validate_text(&self.serializer_id,                            )?;"
+span_start = 145
+span_end = 145
+span_bytes = 74
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "22c01c4b3cb1bf2cff9d57ada6ed923d47ae28f7dd09ca678899fc5efaee91c5"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "b11041f0a62a52fa69a78590852603221b65d8f79d971ad7271fbc3e262c7307"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:145-145 inside `fn validate` with no frozen case covering the span; serializer identity signal 'validate_text(&self.serializer_id,                            )?;': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:145-145 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/145 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0105"
+case_ref = "auto/measurement.rs/150"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+package = "eliot-context-assembly"
+item = "fn canonical_matches"
+item_scope = "production"
+signal = "let bytes = final_bytes(binding, recipe_digest, fence_digest, rendered)?;"
+span_start = 150
+span_end = 150
+span_bytes = 78
+source_sha256 = "a247bd1ab2b029038eec9c441ee6f1b74815ee0c68d366c1deecb0a503d90473"
+span_digest = "fa9087e7caba146b17cb6606ee475118699e5fd040ea97c99d90dba969da595f"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "802994b2809a77c92a5d4a9a11896a1c0bd2ef33ca277b36c34e0ac031a904ff"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-assembly/src/measurement.rs:150-150 inside `fn canonical_matches` with no frozen case covering the span; exact envelope signal 'let bytes = final_bytes(binding, recipe_digest, fence_digest, rendered)?;': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-assembly/src/measurement.rs:150-150 inside `fn canonical_matches`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/150 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0106"
+case_ref = "auto/measurement.rs/174"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "impl SerializedContextMeasurement"
+item_scope = "production"
+signal = "pub fn utf8_bytes(serialized: &str) -> u64 {"
+span_start = 174
+span_end = 174
+span_bytes = 49
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "21f75bb669139c9b58d5014cc1be9ef85a90783e65be8ff43130fb6892519bdc"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "4234da58b9c3a2e7f93b3471f290e50f90466055b896ae2e085bc531eb0cfa55"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:174-174 inside `impl SerializedContextMeasurement` with no frozen case covering the span; exact envelope signal 'pub fn utf8_bytes(serialized: &str) -> u64 {': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:174-174 inside `impl SerializedContextMeasurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/174 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0107"
+case_ref = "auto/measurement.rs/182"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn proves_fit"
+item_scope = "production"
+signal = "MeasurementStatus::ExactUtf8 => self.rendered_utf8_bytes,"
+span_start = 182
+span_end = 182
+span_bytes = 70
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "d1214cf29dda436d25ca1709aa60f1917ec50679e5e99a3cb845dc06e87108c4"
+classification = "exact-utf8-envelope"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "385f9fb53242f20a30783491bb74347cdc361247aec48439c2c00bfc4562924c"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:182-182 inside `fn proves_fit` with no frozen case covering the span; exact envelope signal 'MeasurementStatus::ExactUtf8 => self.rendered_utf8_bytes,': final UTF-8 bytes and digest binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:182-182 inside `fn proves_fit`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/182 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0108"
+case_ref = "auto/measurement.rs/58"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn validate"
+item_scope = "production"
+signal = "validate_text(&self.serializer_id,                          )?;"
+span_start = 58
+span_end = 58
+span_bytes = 72
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "a6ec3fb4e3b94fe497b11e243dc682246b0f2e357a8c87fc501400482603ff1e"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "1a9c3befaadea60afa58c29923df61a0aae34e7e39df93f0ed4378c9a9edb5f8"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:58-58 inside `fn validate` with no frozen case covering the span; serializer identity signal 'validate_text(&self.serializer_id,                          )?;': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:58-58 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/58 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0109"
+case_ref = "auto/measurement.rs/63"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn validate"
+item_scope = "production"
+signal = "&self.serializer_options_digest,"
+span_start = 63
+span_end = 63
+span_bytes = 45
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "174064c07e8b9f207de299b6a2cae9a62c080514c0e611569c5df16805b1aedc"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "34bfc778e3b357ff17696a36dada23b5d337cc0341488f5e8b964c9242c216d7"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:63-63 inside `fn validate` with no frozen case covering the span; serializer identity signal '&self.serializer_options_digest,': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:63-63 inside `fn validate`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/63 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0110"
+case_ref = "auto/measurement.rs/80"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn binds_measurement"
+item_scope = "production"
+signal = "if self.serializer_id != measurement.serializer_id"
+span_start = 80
+span_end = 80
+span_bytes = 59
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "a1785b2c1321ff400264956ba10a4e8a54f4d6c684462f718c69c644b584c47c"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "73fcc28eb0af2b60a1c0c1d80a3d83d45e047d02e5c2c611f15c03d5364259a9"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:80-80 inside `fn binds_measurement` with no frozen case covering the span; serializer identity signal 'if self.serializer_id != measurement.serializer_id': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:80-80 inside `fn binds_measurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/80 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0111"
+case_ref = "auto/measurement.rs/82"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+package = "eliot-context-contracts"
+item = "fn binds_measurement"
+item_scope = "production"
+signal = "|| self.serializer_options_digest != measurement.serializer_options_digest"
+span_start = 82
+span_end = 82
+span_bytes = 87
+source_sha256 = "f686a154a420bf98da1b239b922aacf3d8834188cf50d856b8cb14c032c7d8f1"
+span_digest = "4d2cd72630afb2bbcc71a3e7464e33a6a734cb8b9be22a91ffa5f557e9f989d0"
+classification = "serializer-identity-bound"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "eb6ad6d05e5c826741779cf12ac5ab5bfcb4992e7f80789aec5b60fd830b7cb0"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-contracts/src/measurement.rs:82-82 inside `fn binds_measurement` with no frozen case covering the span; serializer identity signal '|| self.serializer_options_digest != measurement.serializer_options_digest': serializer/schema binding; measured at crates/smart/eliot-context-contracts/src/measurement.rs:82-82 inside `fn binds_measurement`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/measurement.rs/82 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0112"
+case_ref = "auto/memory.rs/783"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-app/src/mcp_stdio/memory.rs"
+package = "eliot-app"
+item = "<file>"
+item_scope = "production"
+signal = "pub(super) fn legacy_memory_token_units_wire("
+span_start = 783
+span_end = 783
+span_bytes = 46
+source_sha256 = "f87be50e7942bbf787a493d022df9acf772a90b2bca30ea8cb01036c4b6eaaae"
+span_digest = "6bd937ec1d6bd2d467ed7242bf1d2abdfefa4d686a7610104edde23fc85f7f95"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "e5516bb384bc8b8bd4462559114043baaa66222d7c9b0f1a3e044da30305b296"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/memory.rs:783-783 inside `<file>` with no frozen case covering the span; call binding the token_units measurement: 'pub(super) fn legacy_memory_token_units_wire('; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-app/src/mcp_stdio/memory.rs:783-783 inside `<file>`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/memory.rs/783 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0113"
+case_ref = "auto/memory.rs/793"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/eliot-app/src/mcp_stdio/memory.rs"
+package = "eliot-app"
+item = "fn legacy_memory_token_units_wire"
+item_scope = "production"
+signal = "legacy_memory_token_units_wire_value("
+span_start = 793
+span_end = 793
+span_bytes = 50
+source_sha256 = "f87be50e7942bbf787a493d022df9acf772a90b2bca30ea8cb01036c4b6eaaae"
+span_digest = "7b2092ceb092f913e47c04b93dc04e2756a4cb41a5b56244e345f849b7386dca"
+classification = "bare_measurement_field_or_conversion"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "f46c0378c5a1ff05e064d3f8e6686e558bce0a2d9817483b882b3e7f60271b05"
+evidence = "discovered repeated-needle at crates/eliot-app/src/mcp_stdio/memory.rs:793-793 inside `fn legacy_memory_token_units_wire` with no frozen case covering the span; call binding the token_units measurement: 'legacy_memory_token_units_wire_value('; the named field is consumed or produced through a declared call, never an estimator policy; measured at crates/eliot-app/src/mcp_stdio/memory.rs:793-793 inside `fn legacy_memory_token_units_wire`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/memory.rs/793 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0114"
+case_ref = "auto/observation.rs/184"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "enum ObservationInput"
+item_scope = "production"
+signal = "Absent,"
+span_start = 184
+span_end = 184
+span_bytes = 12
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "3aaab08e5a8a99e8eaf195b482e0709f5c2400efbed6b432354db41a251478de"
+classification = "stale-or-absent-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "d5b24f6704b411eb6fdc8454c9594341fc138592b4e721fa9bd35d056e7a896f"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:184-184 inside `enum ObservationInput` with no frozen case covering the span; non-exact signal 'Absent,': absent/unavailable/stale/unsupported/unknown, never zero; measured at crates/smart/eliot-context-measurement/src/observation.rs:184-184 inside `enum ObservationInput`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/184 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0115"
+case_ref = "auto/observation.rs/241"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn validate_observation"
+item_scope = "production"
+signal = "ObservationInput::Absent => Ok(ValidatedObservation {"
+span_start = 241
+span_end = 241
+span_bytes = 62
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "90f71dcdea2907e87ccc3c4272388eec6d5e2af87be54ae542a3fa6980ca7d8f"
+classification = "stale-or-absent-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "fb5f53b420c849d3c43e158d113121b233cfee608a0423862dad9a496f159744"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:241-241 inside `fn validate_observation` with no frozen case covering the span; non-exact signal 'ObservationInput::Absent => Ok(ValidatedObservation {': absent/unavailable/stale/unsupported/unknown, never zero; measured at crates/smart/eliot-context-measurement/src/observation.rs:241-241 inside `fn validate_observation`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/241 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0116"
+case_ref = "auto/observation.rs/242"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn validate_observation"
+item_scope = "production"
+signal = "status: ObservationStatus::Absent,"
+span_start = 242
+span_end = 242
+span_bytes = 47
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "bfd62585c8d3f3b7fdccf4ef6bbdb60434ae42e538bede510aa87bdc71149f53"
+classification = "stale-or-absent-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "f4acad25ef2693965b2c4a84c5d18f42b5668e7947b8c0cd25ca04dc2f59360b"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:242-242 inside `fn validate_observation` with no frozen case covering the span; non-exact signal 'status: ObservationStatus::Absent,': absent/unavailable/stale/unsupported/unknown, never zero; measured at crates/smart/eliot-context-measurement/src/observation.rs:242-242 inside `fn validate_observation`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/242 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0117"
+case_ref = "auto/observation.rs/318"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn validate_exact"
+item_scope = "production"
+signal = "status: ObservationStatus::Stale,"
+span_start = 318
+span_end = 318
+span_bytes = 42
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "a492428384d0cac2badb908b0234992db4ccce83b5cbdc9a6781f92f286428f0"
+classification = "stale-or-absent-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "a82fb828dfa7b9a8939618a5484a75021a1500a0218313e13336ee2ce9774f72"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:318-318 inside `fn validate_exact` with no frozen case covering the span; non-exact signal 'status: ObservationStatus::Stale,': absent/unavailable/stale/unsupported/unknown, never zero; measured at crates/smart/eliot-context-measurement/src/observation.rs:318-318 inside `fn validate_exact`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/318 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0118"
+case_ref = "auto/observation.rs/347"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn validate_exact"
+item_scope = "production"
+signal = "status: ObservationStatus::Transformed,"
+span_start = 347
+span_end = 347
+span_bytes = 52
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "871b918923f253c1041de5e416b7e97316ccf0bf7650ac70f8500b9a3e34360e"
+classification = "transformed-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "fc4aa5a0ac8f9a5d6cfc757ff11b45cd80d5164b98e9c35b40f368530cef4121"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:347-347 inside `fn validate_exact` with no frozen case covering the span; transformed signal 'status: ObservationStatus::Transformed,': provider rewrite evidence, no count comparison; measured at crates/smart/eliot-context-measurement/src/observation.rs:347-347 inside `fn validate_exact`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/347 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0119"
+case_ref = "auto/observation.rs/40"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn as_str"
+item_scope = "production"
+signal = "Self::Absent =>         ,"
+span_start = 40
+span_end = 40
+span_bytes = 38
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "6c1e740f99eaf2ab4465e194461a8009e8ad3c93f2bb8e7cd5736067bf5da023"
+classification = "stale-or-absent-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "6bb4f1c5c4a5347cfd7f5432e02bd42455773193019cac75017d7bdb596e3d14"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:40-40 inside `fn as_str` with no frozen case covering the span; non-exact signal 'Self::Absent =>         ,': absent/unavailable/stale/unsupported/unknown, never zero; measured at crates/smart/eliot-context-measurement/src/observation.rs:40-40 inside `fn as_str`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/40 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0120"
+case_ref = "auto/observation.rs/44"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn as_str"
+item_scope = "production"
+signal = "Self::Stale =>        ,"
+span_start = 44
+span_end = 44
+span_bytes = 36
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "41876beee7e490c82434c72994dd4cfce0c9fcd1b2841805df67b0e7fd43fa32"
+classification = "stale-or-absent-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "a7ee1fd59924e5c207e17ccee55ac174edf6fa7fabbef149232ab83286da361e"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:44-44 inside `fn as_str` with no frozen case covering the span; non-exact signal 'Self::Stale =>        ,': absent/unavailable/stale/unsupported/unknown, never zero; measured at crates/smart/eliot-context-measurement/src/observation.rs:44-44 inside `fn as_str`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/44 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0121"
+case_ref = "auto/observation.rs/45"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn as_str"
+item_scope = "production"
+signal = "Self::Transformed =>              ,"
+span_start = 45
+span_end = 45
+span_bytes = 48
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "61531c9f98596b7b712007439717aac6b1d7f065b8bf62b0c0e11f63b8eb1067"
+classification = "transformed-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "83433a4bf22721cabdc43fe541b2efe1a20d5e84e7e0f81034a0c50d1c257f1a"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:45-45 inside `fn as_str` with no frozen case covering the span; transformed signal 'Self::Transformed =>              ,': provider rewrite evidence, no count comparison; measured at crates/smart/eliot-context-measurement/src/observation.rs:45-45 inside `fn as_str`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/45 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0122"
+case_ref = "auto/observation.rs/90"
+tier = "unallocated-candidate"
+owner = "unresolved"
+seam = "unassigned"
+write_scope = "none"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+package = "eliot-context-measurement"
+item = "fn as_str"
+item_scope = "production"
+signal = "Self::ProviderTokenizerRun =>                         ,"
+span_start = 90
+span_end = 90
+span_bytes = 68
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "84dee0f914e8812fbdb3288dc96736af5dccacdc4dbcfc1ebe78bcc3b0b210ff"
+classification = "exact-observation"
+status = "unresolved"
+dispatch_blocked = true
+row_digest = "a2372efde94de6d009893896f10eaaeb16013200aafcbe680aecb82b0761607e"
+evidence = "discovered repeated-needle at crates/smart/eliot-context-measurement/src/observation.rs:90-90 inside `fn as_str` with no frozen case covering the span; exact observation signal 'Self::ProviderTokenizerRun =>                         ,': actually-run route tokenizer count; measured at crates/smart/eliot-context-measurement/src/observation.rs:90-90 inside `fn as_str`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
+successor_scope = "blocked: candidate auto/observation.rs/90 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
+invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
+
+[[rows]]
+id = "c0123"
 case_ref = "unres/1"
 tier = "unallocated-candidate"
 owner = "unresolved"
@@ -1751,13 +3101,13 @@ span_digest = "e141aee9f48f11a0caa9e88906383f997d27aa5e1ee2fe598335d3310d77cf23"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "c1aba96001e6421e61a5b876eba17b7cf677b2eba0417990c082f98da590f758"
+row_digest = "d1c7afe864f529d7483892b8cb1e2253262ae6680ee40ea39713b0ed7814ff1f"
 evidence = "bare measurement field or projection: 'pub cost_or_token_units: u64,'; carries no estimator policy of its own; measured at crates/eliot-engine/src/control_plane.rs:239-239 inside `struct AutonomyBudgetLedger`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate unres/1 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
 [[rows]]
-id = "c0070"
+id = "c0124"
 case_ref = "unres/2"
 tier = "unallocated-candidate"
 owner = "unresolved"
@@ -1776,13 +3126,13 @@ span_digest = "e93961cfa891fa89dc0f34de56ef3e3b9c1fe7e38c886ff9c281e1db398a978a"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "63428a3b0f15da65d203e00e82cc2f79172e8dead8494812d50094c0ade5f165"
+row_digest = "2c58a32b7698fc4c3c5ef75bc0734916a4cc390e691a83de705eb8833843304d"
 evidence = "bare measurement field or projection: '.cost_or_token_budget'; carries no estimator policy of its own; measured at crates/eliot-engine/src/control_plane.rs:417-417 inside `fn validate_contract`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate unres/2 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
 [[rows]]
-id = "c0071"
+id = "c0125"
 case_ref = "unres/3"
 tier = "unallocated-candidate"
 owner = "unresolved"
@@ -1801,13 +3151,13 @@ span_digest = "722cc4fcaadd01e1c7eba86627ea913206dad453193d0d4ead0c0560a064d901"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "9ad9ad3bad0892e7488039601055f3ce513f4a29213350bba4a7d3e31d1e1c61"
+row_digest = "c1eaf1675440e05b1d80dc7c51d300c703b0d29e31adc74651943808c42a07f6"
 evidence = "bare unit conversion feeding a measurement field: '.saturating_add(intent.cost_or_token_units);'; no estimator policy; measured at crates/eliot-engine/src/control_plane.rs:714-714 inside `fn record_step`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate unres/3 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
 
 [[rows]]
-id = "c0072"
+id = "c0126"
 case_ref = "unres/4"
 tier = "unallocated-candidate"
 owner = "unresolved"
@@ -1826,7 +3176,7 @@ span_digest = "61684735fdb20c426966fd30adc6f866d80df592e8dcbe3cd2920681d3e87acc"
 classification = "bare_measurement_field_or_conversion"
 status = "unresolved"
 dispatch_blocked = true
-row_digest = "fb8a236df63630ad43ccb0f30383d96da6837263324bce9d4274d22840c7614e"
+row_digest = "b0d372aa0d1b5bc3c91ed78da9f256de48eda2370613a2710d6e2fa12ae880b4"
 evidence = "bare measurement field or projection: '|| treatment.estimated_tokens < control.estimated_tokens;'; carries no estimator policy of its own; measured at crates/eliot-engine/src/cognition.rs:184-184 inside `fn compare_memory_value`; candidate is outside every declared #704/#783/#878/#880 seam; no exact-scope owner exists"
 successor_scope = "blocked: candidate unres/4 has no existing exact-scope owner; #787 must allocate it or #704 must classify it, and the row is never deleted to obtain green"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"

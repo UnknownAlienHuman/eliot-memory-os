@@ -1411,6 +1411,157 @@ def _owner_confirmed(
     return ("owned", f"frozen owner map confirms exact-scope ownership for {path}")
 
 
+def _discover_unmatched_candidates(
+    cache: dict[str, dict[str, object]],
+    ordered_cases: list[tuple[str, str, str, str]],
+) -> list[dict[str, object]]:
+    """Enumerate measurement candidates no frozen case covers (#866 W1).
+
+    Two bounded pattern families over the masked sources of the declared
+    scan roots: (P1) estimator definitions matching ESTIMATOR_HELPER_RE, and
+    (P5) further production-scope occurrences of frozen needles beyond the
+    pinned occurrence. Comments and strings are already masked away, so
+    marker-like text there never becomes a candidate; test-scope matches are
+    skipped (production after ``#[cfg(test)]`` still counts, per ``_scope_of``).
+    Frozen case references are reconciliation metadata here, never the
+    discovery source: a span contained in (or containing) a frozen span is
+    covered by that row and yields no auto candidate. Among auto spans the
+    outermost wins, so an estimator item absorbs its own body lines instead
+    of double counting; true partial overlaps fail closed. Bodies that earn
+    no closed class are recorded with classification ``unresolved``, never
+    deleted and never given an invented owner. Deterministic: files sorted,
+    outermost spans first, lines ascending.
+    """
+    frozen_by_file: dict[str, list[tuple[int, int]]] = {}
+    needles_by_file: dict[str, list[tuple[str, int]]] = {}
+    for _ref, _owner, rel, signal in ordered_cases:
+        base, selected = _split_occurrence_selector(signal)
+        record = cache[rel]
+        occurrences = _locate_all_occurrences(record, rel, base)
+        if not occurrences:
+            raise InventoryError(
+                "SIGNAL_ABSENT",
+                f"denominator signal {signal!r} absent from masked source: {rel}",
+            )
+        if selected is None:
+            if len(occurrences) > 1:
+                raise InventoryError(
+                    "AMBIGUOUS_SIGNAL",
+                    f"reconciliation hint {signal!r} resolves to {len(occurrences)} "
+                    f"occurrences in {rel}; pin one explicitly with @@<n>",
+                )
+            pinned = 0
+        elif selected >= len(occurrences):
+            raise InventoryError(
+                "SIGNAL_ABSENT",
+                f"denominator signal {signal!r} pins occurrence {selected} but only "
+                f"{len(occurrences)} occur in masked source: {rel}",
+            )
+        else:
+            pinned = selected
+        frozen_by_file.setdefault(rel, []).append(occurrences[pinned])
+        needles_by_file.setdefault(rel, []).append((base, pinned))
+    raw: list[tuple[str, int, int, str, str]] = []
+    # Denominator files only: exclusion-declared inputs stay excluded and can
+    # never yield candidates, no matter what patterns they contain.
+    for rel in sorted(needles_by_file):
+        record = cache[rel]
+        masked_lines = record["masked_lines"]
+        assert isinstance(masked_lines, list)
+        depths = record["depths"]
+        assert isinstance(depths, list)
+        for lineno, line in enumerate(masked_lines, start=1):
+            if ESTIMATOR_HELPER_RE.match(line.strip()):
+                end = _item_extent(masked_lines, depths, lineno)
+                raw.append((rel, lineno, end, line.strip(), "estimator-definition"))
+        for base, pinned in needles_by_file.get(rel, []):
+            for index, (start, end) in enumerate(
+                _locate_all_occurrences(record, rel, base)
+            ):
+                if index == pinned:
+                    continue
+                trigger = masked_lines[start - 1].strip()
+                raw.append((rel, start, end, trigger, "repeated-needle"))
+    kept: list[tuple[str, int, int, str, str]] = []
+    for rel, start, end, trigger, kind in sorted(
+        raw, key=lambda entry: (entry[0], -(entry[2] - entry[1]), entry[1])
+    ):
+        frozen = frozen_by_file.get(rel, [])
+        if any(fstart <= start and end <= fend for fstart, fend in frozen):
+            continue
+        if any(start <= fstart and fend <= end for fstart, fend in frozen):
+            continue
+        covered = False
+        for krel, kstart, kend, _k, _kind in kept:
+            if krel != rel or end < kstart or kend < start:
+                continue
+            if kstart <= start and end <= kend:
+                covered = True
+                break
+            raise InventoryError(
+                "OVERLAPPING_SPANS",
+                f"discovered {kind} at {rel}:{start}-{end} partially overlaps kept "
+                f"candidate {krel}:{kstart}-{kend}; refine the discovery patterns",
+            )
+        if covered:
+            continue
+        kept.append((rel, start, end, trigger, kind))
+    candidates: list[dict[str, object]] = []
+    for rel, start, end, trigger, kind in kept:
+        record = cache[rel]
+        masked_lines = record["masked_lines"]
+        assert isinstance(masked_lines, list)
+        depths = record["depths"]
+        assert isinstance(depths, list)
+        item, item_scope = _scope_of(masked_lines, depths, start, rel)
+        if item_scope != "production":
+            continue
+        body = "\n".join(
+            stripped
+            for stripped in (
+                masked_lines[lineno - 1].strip()
+                for lineno in range(start, end + 1)
+                if 1 <= lineno <= len(masked_lines)
+            )
+            if stripped
+        )
+        if not body:
+            continue
+        try:
+            classification, class_evidence = classify_context_measurement(body, rel, item_scope)
+        except InventoryError as exc:
+            if exc.code != "CLASSIFICATION_OPEN":
+                raise
+            classification = "unresolved"
+            class_evidence = (
+                f"extracted body carries no closed-class token ({exc.detail}); "
+                f"recorded unresolved and never deleted to obtain green"
+            )
+        basename = rel.rsplit("/", 1)[-1]
+        candidates.append(
+            {
+                "case_ref": f"auto/{basename}/{start}",
+                "owner": UNRESOLVED_OWNER,
+                "path": rel,
+                "signal": trigger[:160],
+                "span_start": start,
+                "span_end": end,
+                "span_bytes": _span_bytes(record, start, end),
+                "source_sha256": str(record["sha256"]),
+                "span_digest": _span_digest(record, start, end),
+                "classification": classification,
+                "evidence": (
+                    f"discovered {kind} at {rel}:{start}-{end} inside `{item}` with no "
+                    f"frozen case covering the span; {class_evidence}"
+                ),
+                "package": str(record["package"]),
+                "item": item,
+                "item_scope": item_scope,
+            }
+        )
+    return candidates
+
+
 def discover_context_measurements(
     root: Path,
     cases: tuple[tuple[str, str, str, str], ...] | None = None,
@@ -1507,6 +1658,8 @@ def discover_context_measurements(
                 "item_scope": item_scope,
             }
         )
+    auto_candidates = _discover_unmatched_candidates(cache, list(ordered_cases))
+    candidates.extend(auto_candidates)
     spans_by_path: dict[str, list[tuple[int, int, str]]] = {}
     for candidate in candidates:
         spans_by_path.setdefault(str(candidate["path"]), []).append(
@@ -1981,10 +2134,16 @@ def build_inventory(
                 "COUNT_MISMATCH",
                 f"default denominator holds {len(active_cases)}, expected {EXPECTED_DENOMINATOR_COUNT}",
             )
-        if len(candidates) != EXPECTED_DENOMINATOR_COUNT:
+        reconciled = [
+            candidate
+            for candidate in candidates
+            if not str(candidate["case_ref"]).startswith("auto/")
+        ]
+        if len(reconciled) != EXPECTED_DENOMINATOR_COUNT:
             raise InventoryError(
                 "COUNT_MISMATCH",
-                f"default scan yielded {len(candidates)}, expected {EXPECTED_DENOMINATOR_COUNT}",
+                f"default scan reconciled {len(reconciled)} frozen cases, "
+                f"expected {EXPECTED_DENOMINATOR_COUNT}",
             )
     source_pairs = sorted(f"{record['path']}:{record['sha256']}" for record in file_records)
     source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))
