@@ -1536,8 +1536,9 @@ pub fn reclaim_claimed_file(
 /// the claimed aside bytes against the material-set digest recorded when
 /// this claim was taken, so a replacement envelope that merely carries the
 /// same typed field values is never deleted either. A matching readable
-/// served marker is required before reclaim: absent or uncertain served
-/// state leaves the claimed bytes for recovery. No single-owner condition
+/// served marker plus the served result record naming this identity are
+/// required before reclaim: absent or uncertain served state leaves the
+/// claimed bytes for recovery. No single-owner condition
 /// is asserted — the owner publisher stages replacements and retires
 /// expired sets concurrently by design — which is exactly why every
 /// deletion re-verifies after the move. Residual windows: the Unix restore
@@ -1573,6 +1574,19 @@ pub fn reclaim_claimed_delivery(
     let identity = claim.identity();
     match read_served_marker(install_dir) {
         Ok(Some(mark)) if mark.names(identity) => {}
+        Ok(_) | Err(_) => {
+            return ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            };
+        }
+    }
+    // The owner decides from the retained result, never from the marker
+    // alone: the marker seals before the result record, so a crash between
+    // the two seals must not delete the only bytes the replay could
+    // republish to the owner. Without the result naming this identity, no
+    // file is removed (issue #2786 W6).
+    match read_served_result(install_dir) {
+        Ok(Some(record)) if record.names(identity) => {}
         Ok(_) | Err(_) => {
             return ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
@@ -3718,6 +3732,83 @@ mod tests {
             assert!(versioned_markers_present(&dir));
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    fn stage_full_set(dir: &std::path::Path) -> DeliveryClaim {
+        let input = test_input();
+        let envelope = test_envelope_json(&input);
+        std::fs::write(dir.join(WASM_HOST_MATERIAL_FILE_NAME), &envelope)
+            .expect("envelope writable");
+        std::fs::write(
+            dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
+            &input.artifact_bytes,
+        )
+        .expect("artifact writable");
+        std::fs::write(
+            dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
+            &input.input_bytes,
+        )
+        .expect("input writable");
+        match read_claimed_dispatch_material_from(dir).expect("claim reads") {
+            Some((claim, _)) => claim,
+            None => panic!("staged set claims"),
+        }
+    }
+
+    fn seal_marker(dir: &std::path::Path, claim: &DeliveryClaim) {
+        let marker = ServedDeliveryMarker::from_identity(claim.identity(), 1);
+        std::fs::write(
+            dir.join(WASM_HOST_SERVED_FILE_NAME),
+            serde_json::to_vec(&marker).expect("marker serializes"),
+        )
+        .expect("marker writable");
+    }
+
+    fn seal_result(dir: &std::path::Path, claim: &DeliveryClaim) {
+        let identity = claim.identity();
+        std::fs::write(
+            dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME),
+            serde_json::to_vec(&serde_json::json!({
+                "operation_id": identity.operation_id,
+                "generation": identity.generation,
+                "claim_id": identity.claim_id,
+                "grant_digest": identity.grant_digest,
+                "retained_at_unix_ms": 1,
+                "frame": {},
+            }))
+            .expect("record serializes"),
+        )
+        .expect("record writable");
+    }
+
+    /// A sealed marker without the result record releases nothing: the
+    /// replay could not republish to the owner.
+    #[test]
+    fn reclaim_waits_for_result_record() {
+        let dir = inflight_dir("eliot-2786-reclaim-waits");
+        let claim = stage_full_set(&dir);
+        seal_marker(&dir, &claim);
+        assert!(matches!(
+            reclaim_claimed_delivery(&claim, &dir),
+            ClaimedReclamation::RetainedForRecovery { .. }
+        ));
+        assert!(dir.join(WASM_HOST_MATERIAL_FILE_NAME).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With marker and result both naming the claim, the set releases fully.
+    #[test]
+    fn reclaim_releases_with_result_record() {
+        let dir = inflight_dir("eliot-2786-reclaim-releases");
+        let claim = stage_full_set(&dir);
+        seal_marker(&dir, &claim);
+        seal_result(&dir, &claim);
+        match reclaim_claimed_delivery(&claim, &dir) {
+            ClaimedReclamation::Reclaimed(detail) => assert!(detail.fully_reclaimed()),
+            _ => panic!("expected full reclamation"),
+        }
+        assert!(!dir.join(WASM_HOST_MATERIAL_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_envelope_json(input: &DispatchMaterialInput) -> Vec<u8> {
