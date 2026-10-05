@@ -4921,6 +4921,34 @@ def _external_receipt_evidence(root: Path, manifest_data: dict) -> dict:
     return evidence
 
 
+def _scanner_output_status(
+    profile: str, returncode: int, combined_output: str, has_advisory_policy_finding: bool
+) -> str | None:
+    """Classify a finished cargo-deny execution that needs a non-pass status (issue #1229 W8/A4).
+
+    Returns STATUS_ADVISORY_SOURCE_UNAVAILABLE when the advisory database
+    could not be fetched, STATUS_STALE when its evidence went stale, or None
+    when the output carries no unavailable/stale signal. A pure predicate so
+    self-tests can cover the stale branch without a live scanner run; the
+    live path below gates on it and then records the matching finding.
+    """
+
+    if profile == "current-advisories" and returncode != 0 and not has_advisory_policy_finding:
+        advisory_unavailable_markers = (
+            "advisory database",
+            "failed to fetch",
+            "could not fetch",
+            "unable to fetch",
+            "network",
+        )
+        if any(marker in combined_output for marker in advisory_unavailable_markers):
+            return STATUS_ADVISORY_SOURCE_UNAVAILABLE
+        stale_markers = ("stale", "out of date", "older than")
+        if any(marker in combined_output for marker in stale_markers):
+            return STATUS_STALE
+    return None
+
+
 def run_cargo_deny(
     root: Path,
     profile: str,
@@ -5280,7 +5308,7 @@ def run_cargo_deny(
     )
     execution["scanner_exit_accepted"] = proc.returncode == 0 or advisory_policy_finding
     execution["advisory_binding_digest"] = _scanner_advisory_binding_digest(execution)
-    if profile == "current-advisories" and proc.returncode != 0 and not advisory_policy_finding:
+    if _scanner_output_status(profile, proc.returncode, combined_output, advisory_policy_finding) is not None:
         advisory_unavailable_markers = (
             "advisory database",
             "failed to fetch",
@@ -6624,7 +6652,100 @@ def run_self_tests() -> int:
         print("SELF_TEST_FAILURE: valid disposition must reconcile cleanly", file=sys.stderr)
         return 1
 
-    print("DEPENDENCY_POLICY_SELF_TEST: PASS (14/14 cases verified)")
+    # Case 15: wildcard ban diagnostic surfaces as a DEP-004 finding (issue #1229 W8/A4)
+    _CASE15_STREAM = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "diagnostic",
+                    "fields": {
+                        "code": "bans",
+                        "severity": "error",
+                        "message": "crate foo v1.2.3 depends on bar with a wildcard requirement",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "summary",
+                    "fields": {"bans": {"errors": 1, "warnings": 0, "notes": 0, "helps": 0}},
+                }
+            ),
+        ]
+    )
+    _case15_findings: list[Finding] = []
+    _case15_summary: dict = {}
+    _parse_scanner_stream(_CASE15_STREAM, "stderr", _case15_findings, _case15_summary, set())
+    if not any(f.code == "DEP-004" and "wildcard" in f.detail for f in _case15_findings):
+        print("SELF_TEST_FAILURE: expected DEP-004 for wildcard ban diagnostic", file=sys.stderr)
+        return 1
+
+    # Case 16: unknown registry and unknown git sources surface as DEP-005 (issue #1229 W8/A4)
+    _CASE16_STREAM = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "diagnostic",
+                    "fields": {
+                        "code": "sources",
+                        "severity": "error",
+                        "message": "detected unallowed registry source 'https://example.com/index'",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "diagnostic",
+                    "fields": {
+                        "code": "sources",
+                        "severity": "error",
+                        "message": "detected unallowed git source 'https://example.com/dep.git'",
+                    },
+                }
+            ),
+        ]
+    )
+    _case16_findings: list[Finding] = []
+    _parse_scanner_stream(_CASE16_STREAM, "stderr", _case16_findings, {}, set())
+    if not any(f.code == "DEP-005" and "registry" in f.detail for f in _case16_findings):
+        print("SELF_TEST_FAILURE: expected DEP-005 for unknown-registry diagnostic", file=sys.stderr)
+        return 1
+    if not any(f.code == "DEP-005" and "git source" in f.detail for f in _case16_findings):
+        print("SELF_TEST_FAILURE: expected DEP-005 for unknown-git diagnostic", file=sys.stderr)
+        return 1
+
+    # Case 17: unapproved license diagnostic surfaces as a DEP-004 finding (issue #1229 W8/A4)
+    _CASE17_STREAM = json.dumps(
+        {
+            "type": "diagnostic",
+            "fields": {
+                "code": "licenses",
+                "severity": "error",
+                "message": "crate foo v1.2.3 has unapproved license 'GPL-3.0'",
+            },
+        }
+    )
+    _case17_findings: list[Finding] = []
+    _parse_scanner_stream(_CASE17_STREAM, "stderr", _case17_findings, {}, set())
+    if not any(f.code == "DEP-004" and "GPL-3.0" in f.detail for f in _case17_findings):
+        print("SELF_TEST_FAILURE: expected DEP-004 for unapproved license diagnostic", file=sys.stderr)
+        return 1
+
+    # Case 18: stale/unavailable scanner output classifies without a live run (issue #1229 W8/A4)
+    if _scanner_output_status("current-advisories", 1, "cached evidence is stale, older than 7 days", False) != STATUS_STALE:
+        print("SELF_TEST_FAILURE: expected STATUS_STALE for stale advisory output", file=sys.stderr)
+        return 1
+    if (
+        _scanner_output_status("current-advisories", 1, "failed to fetch advisory database: network unreachable", False)
+        != STATUS_ADVISORY_SOURCE_UNAVAILABLE
+    ):
+        print("SELF_TEST_FAILURE: expected STATUS_ADVISORY_SOURCE_UNAVAILABLE for unfetched advisories", file=sys.stderr)
+        return 1
+    if _scanner_output_status("current-advisories", 0, "all checks passed", False) is not None:
+        print("SELF_TEST_FAILURE: clean scanner output must not classify as stale or unavailable", file=sys.stderr)
+        return 1
+
+    print("DEPENDENCY_POLICY_SELF_TEST: PASS (18/18 cases verified)")
     return 0
 
 
