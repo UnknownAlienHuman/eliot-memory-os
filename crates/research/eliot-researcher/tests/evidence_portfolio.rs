@@ -1811,3 +1811,153 @@ fn absence_replay_is_identical_under_one_identity() {
         .check_replay_consistency(&eval_b)
         .expect("an exact replay is consistent");
 }
+
+#[test]
+fn absence_replay_conflicts_on_changed_predicate() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_form = "exists(snapshot_bytes, alloy == other_alloy) == false".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the predicate bytes must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed predicate must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed predicate under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.predicate_form"),
+        "the conflict must name the predicate bytes: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_source_revision() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.source_revision = "corpus-700.2".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the source revision must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed source revision must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed predicate under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.source_revision"),
+        "the conflict must name the predicate bytes: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_evaluator() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.evaluator_id = "no-match-evaluator-701".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the evaluator identity must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed evaluator must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed predicate under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string().contains("no_match_evaluation.evaluator_id"),
+        "the conflict must name the predicate bytes: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_member_result() {
+    let (account, mut records, _, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = source_params("src-primary#0");
+    params.title = "a changed title for src-primary#0".to_owned();
+    records.insert(
+        "src-primary#0".to_owned(),
+        SourceRecord::new(params).expect("changed record"),
+    );
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: ABSENCE_MANIFEST_REVISION,
+    })
+    .expect("authorized manifest");
+    let issuer = NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, &scope_digest))
+        .expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the member result must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed member result must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed member result under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string().contains("no_match_evaluation.results"),
+        "the conflict must name the member results: {err}"
+    );
+}
