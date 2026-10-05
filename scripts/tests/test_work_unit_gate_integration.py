@@ -1378,6 +1378,22 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
                                       '--offline-capture', str(capture), '--json')
         self.assertEqual(0, code)
 
+    # WORK_UNIT_CASE: 837/46
+    def test_selected_success_digest_binds_cohort_aggregate(self):
+        # CCV7: the immutable result digest must be the cross-checked cohort
+        # aggregate (binding catalogue, selection, descriptors, snapshots,
+        # receipts, discovered tests and executions) - not a counts-only hash.
+        # The success-path identity list carries the same aggregate prefix, so
+        # the projection cannot claim a digest it did not compute.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(0, code)
+        payload = json.loads(out)
+        self.assertIn('cohort:' + payload['digest'][:12], payload['identities'])
+
 
 
 if __name__ == '__main__':
