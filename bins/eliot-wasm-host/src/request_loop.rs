@@ -153,7 +153,7 @@ use crate::dispatch_material::{
     WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
     admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
     parse_control_delivery, parse_control_name, read_control_bytes, retire_legacy_control,
-    stage_control_bytes,
+    stage_ack_bytes, stage_control_bytes,
 };
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{
@@ -3081,11 +3081,20 @@ impl KernelControlReader {
         ack: &WasmControlAck,
     ) -> Result<(), LoopError> {
         let bytes = serde_json::to_vec(ack).map_err(|_| LoopError::ChannelUnavailable)?;
-        stage_control_bytes(
+        // Compare-before-write (issue #2896 W10): a slot that already holds
+        // other bytes belongs to whoever staged them. Every caller either
+        // ignores this result or retries through `ack_staged`, so absorbing
+        // the conflict is the only non-impersonating choice — failing the
+        // loop on foreign-owned evidence would wedge intake, and overwriting
+        // would impersonate it.
+        match stage_ack_bytes(
             &self.directory.join(control_ack_name(generation, sequence)),
             &bytes,
-        )
-        .map_err(|_| LoopError::ChannelUnavailable)
+        ) {
+            Ok(_) => Ok(()),
+            Err(MaterialError::DigestMismatch) => Ok(()),
+            Err(_) => Err(LoopError::ChannelUnavailable),
+        }
     }
 
     /// Pins a legacy Shutdown frame to this operation. The parse carries its
@@ -6678,6 +6687,161 @@ mod spool_tests {
             reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
             AckSlot::Decided
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A foreign open acceptance re-offers for UNKNOWN recovery.
+    #[test]
+    fn ack_slot_reoffer_on_foreign_enqueued() {
+        let dir = spool_dir("eliot-2896-ack-slot-reoffer");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Enqueued, None, None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Reoffer(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Our own still-open acceptance occupies the slot.
+    #[test]
+    fn ack_slot_own_open_for_accepted() {
+        let dir = spool_dir("eliot-2896-ack-slot-own");
+        let mut reader = test_reader(&dir, 7);
+        reader.accepted = Some(AcceptedControl {
+            kind: WasmControlKind::Reconcile,
+            operation_id: "operation-2896".to_owned(),
+            generation: 7,
+            sequence: 0,
+            replay_key: "e".repeat(64),
+            delivery_digest: "f".repeat(64),
+            ack_staged: true,
+        });
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Enqueued, None, None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::OwnOpen
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listed slot with no readable file is someone's evidence, not a free slot.
+    #[test]
+    fn ack_slot_unreadable_without_ack_file() {
+        let dir = spool_dir("eliot-2896-ack-slot-unreadable");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unreadable
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A digest the delivery never carried fails the exact join.
+    #[test]
+    fn ack_slot_unjoined_on_foreign_digest() {
+        let dir = spool_dir("eliot-2896-ack-slot-digest");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let mut ack = test_ack(&delivery, ControlAckPhase::Enqueued, None, None);
+        ack.delivery_digest = "0".repeat(64);
+        stage_ack(&dir, 7, 0, &ack);
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unjoined
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blank refusal detail fails the owner's shape rule.
+    #[test]
+    fn ack_slot_unjoined_on_blank_refused_detail() {
+        let dir = spool_dir("eliot-2896-ack-slot-detail");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Refused, Some("   "), None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unjoined
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An outcome digest on Enqueued is a shape violation.
+    #[test]
+    fn ack_slot_unjoined_on_enqueued_outcome() {
+        let dir = spool_dir("eliot-2896-ack-slot-outcome");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(
+                &delivery,
+                ControlAckPhase::Enqueued,
+                None,
+                Some(&"f".repeat(64)),
+            ),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unjoined
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal never overwrites an occupied slot: the staged acceptance stands.
+    #[test]
+    fn refuse_never_overwrites_occupied_slot() {
+        let dir = spool_dir("eliot-2896-ack-slot-occupied");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let ack = test_ack(&delivery, ControlAckPhase::Enqueued, None, None);
+        stage_ack(&dir, 7, 0, &ack);
+        let snapshot = std::fs::read(dir.join(control_ack_name(7, 0))).expect("ack readable");
+        reader.refuse_slot(7, 0, &delivery, "control-test", false);
+        assert_eq!(
+            std::fs::read(dir.join(control_ack_name(7, 0))).expect("ack readable"),
+            snapshot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal stages into a genuinely free slot as Refused.
+    #[test]
+    fn refuse_stages_into_free_slot() {
+        let dir = spool_dir("eliot-2896-ack-slot-refuse-free");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        reader.refuse_slot(7, 0, &delivery, "control-test", false);
+        let bytes = std::fs::read(dir.join(control_ack_name(7, 0))).expect("refused ack readable");
+        let staged: WasmControlAck = serde_json::from_slice(&bytes).expect("refused ack parses");
+        assert_eq!(staged.phase, ControlAckPhase::Refused);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
