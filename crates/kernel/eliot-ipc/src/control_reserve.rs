@@ -1139,4 +1139,42 @@ mod tests {
             .expect("dropped bytes return exactly once");
         assert_eq!(reserve.available_normal_bytes(), 0);
     }
+
+    /// A dropped protected permit returns exactly the bytes it consumed
+    /// (issue #1679): the `Drop` match routes by capacity class, so dropping
+    /// a protected-bytes permit restores the protected partition - never the
+    /// normal one - and the same bytes can be acquired exactly once more
+    /// (A7 release-at-most-once on the protected path).
+    #[test]
+    fn ipc_dropped_protected_permit_returns_bytes_exactly_once() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        assert_eq!(reserve.available_protected_bytes(), 4);
+
+        let permit = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-prel-1",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("protected pipe bytes");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+
+        drop(permit);
+        assert_eq!(reserve.available_protected_bytes(), 4);
+
+        let _reacquired = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-prel-2",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("dropped bytes return exactly once");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+    }
 }
