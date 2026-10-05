@@ -1556,6 +1556,58 @@ mod carrier_deadline_tests {
 }
 
 #[cfg(test)]
+mod model_disposition_tests {
+    use super::unusable_model_reason;
+    use eliot_dreamer_contracts::ModelRouteDisposition;
+
+    /// Every model-route disposition maps to exactly one gate answer
+    /// (issue #2901 A1): usable outcomes pass with no reason, and each
+    /// unusable outcome names its own static reason, so the
+    /// `unusable_model_blocked` builder below can never publish one
+    /// condition's pulse under another's reason.
+    #[test]
+    fn every_disposition_maps_to_one_answer() {
+        assert_eq!(
+            unusable_model_reason(ModelRouteDisposition::Completed),
+            None,
+            "a completed outcome is usable"
+        );
+        assert_eq!(
+            unusable_model_reason(ModelRouteDisposition::Partial),
+            None,
+            "a partial outcome is usable"
+        );
+        let reasons = [
+            unusable_model_reason(ModelRouteDisposition::Malformed),
+            unusable_model_reason(ModelRouteDisposition::Cancelled),
+            unusable_model_reason(ModelRouteDisposition::Timeout),
+        ];
+        for reason in reasons {
+            let reason = match reason {
+                Some(reason) => reason,
+                None => panic!("an unusable outcome must name its reason"),
+            };
+            assert!(
+                !reason.is_empty(),
+                "refusal reasons are static codes, never blank"
+            );
+        }
+        assert_ne!(
+            reasons[0], reasons[1],
+            "malformed and cancelled stay distinct"
+        );
+        assert_ne!(
+            reasons[1], reasons[2],
+            "cancelled and timeout stay distinct"
+        );
+        assert_ne!(
+            reasons[0], reasons[2],
+            "malformed and timeout stay distinct"
+        );
+    }
+}
+
+#[cfg(test)]
 mod blocked_result_tests {
     use std::num::NonZeroU64;
 
