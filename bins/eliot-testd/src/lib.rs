@@ -27,9 +27,9 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, SourceObservationGitPort,
-    TargetRoots, TestJob, TestdError, TestdSourceObservation, TestdStore,
+    EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
+    KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision,
+    SourceObservationGitPort, TargetRoots, TestJob, TestdError, TestdSourceObservation, TestdStore,
     is_admitted_testd_profile, issue_process_admission, testd_profile_resource_limits,
     validate_running_lease, verify_envelope_layout_binding, verify_layout_binding,
 };
@@ -459,6 +459,13 @@ impl TestdComposition {
     /// The request is intentionally supplied freshly by Kernel for this
     /// attempt; the durable `TestdJob` projection can never be substituted for
     /// its consuming permit.
+    ///
+    /// Issue #456 (WB2): no caller-selected evidence sink is accepted. The
+    /// composition constructs the single `EvidenceCollector` for this claimed
+    /// job/attempt and returns it with the start outcome, so supervision and
+    /// finish observe exactly what the executor saw. A productive
+    /// tool-identity observation travels as a datum and is recorded into that
+    /// collector before the executor starts.
     pub async fn start_claimed<E: ProcessExecutor + 'static>(
         &self,
         job: &TestJob,
@@ -466,10 +473,32 @@ impl TestdComposition {
         now: u64,
         permit: ProcessAdmissionPermit,
         executor: &E,
-        sink: Arc<dyn ProcessEvidenceSink>,
-    ) -> Result<ProcessStartReceipt, TestdError> {
-        start_claimed_from_store(&self.store, job, lease, now, permit, executor, sink).await
+        tool_observation: Option<TestdToolObservation>,
+    ) -> ClaimedStart {
+        start_claimed_from_store(
+            &self.store,
+            job,
+            lease,
+            now,
+            permit,
+            executor,
+            tool_observation,
+        )
+        .await
     }
+}
+
+/// Outcome of one claimed start: the executor's start result plus the
+/// composition-owned evidence collector the executor wrote into.
+///
+/// The collector exists whether or not the start launched: finish and
+/// supervision observe through it in both cases, so no caller ever needs (or
+/// can supply) its own sink (issue #456, WB2).
+pub struct ClaimedStart {
+    /// The executor's consuming-start result for the claimed job/attempt.
+    pub result: Result<ProcessStartReceipt, TestdError>,
+    /// The single composition-constructed collector for this claimed start.
+    pub collector: Arc<EvidenceCollector>,
 }
 
 /// Starts one claimed process against a caller-supplied durable store.
@@ -485,7 +514,41 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     now: u64,
     permit: ProcessAdmissionPermit,
     executor: &E,
-    sink: Arc<dyn ProcessEvidenceSink>,
+    tool_observation: Option<TestdToolObservation>,
+) -> ClaimedStart {
+    let collector = Arc::new(EvidenceCollector::default());
+    // Issue #456 (WB2): the productive tool-identity observation is recorded
+    // into the composition-owned collector before validation and before the
+    // consuming process starts; a conflicting value can never overwrite it.
+    let observation_result =
+        tool_observation.map(|observation| collector.record_tool_observation(observation));
+    if let Some(Err(error)) = observation_result {
+        return ClaimedStart {
+            result: Err(error),
+            collector,
+        };
+    }
+    let result = start_claimed_from_store_inner(
+        store,
+        job,
+        lease,
+        now,
+        permit,
+        executor,
+        Arc::clone(&collector),
+    )
+    .await;
+    ClaimedStart { result, collector }
+}
+
+async fn start_claimed_from_store_inner<E: ProcessExecutor + 'static>(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &Lease,
+    now: u64,
+    permit: ProcessAdmissionPermit,
+    executor: &E,
+    collector: Arc<EvidenceCollector>,
 ) -> Result<ProcessStartReceipt, TestdError> {
     let current = store.get(&job.job_id)?.ok_or(TestdError::Invalid {
         field: "job_id",
@@ -564,6 +627,11 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     {
         return Err(TestdError::InvalidBinding);
     }
+    // Issue #456 (WB2): the only evidence sink the executor ever sees is
+    // cloned from the composition-constructed collector above, which already
+    // carries the productive tool-identity observation when one travels.
+    let owned: Arc<EvidenceCollector> = Arc::clone(&collector);
+    let sink: Arc<dyn ProcessEvidenceSink> = owned;
     executor
         .start(request, sink)
         .await
@@ -3224,6 +3292,149 @@ mod tests {
         assert_eq!(receipt.job_id, "job-1");
         assert_eq!(receipt.state, "Cancelled");
         assert_eq!(*executor.starts.lock().unwrap(), 0);
+        std::fs::remove_dir_all(fixture.base).unwrap();
+    }
+
+    /// Test-only executor that captures the exact sink the composition hands
+    /// to the consuming start, then reports the executor-owned unknown path.
+    struct SinkCapturingExecutor {
+        starts: Mutex<usize>,
+        seen: Mutex<Option<Arc<dyn ProcessEvidenceSink>>>,
+    }
+
+    impl ProcessExecutor for SinkCapturingExecutor {
+        async fn start(
+            &self,
+            _request: ProcessRequest,
+            sink: Arc<dyn ProcessEvidenceSink>,
+        ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+            *self.starts.lock().unwrap() += 1;
+            *self.seen.lock().unwrap() = Some(sink);
+            Err(ProcessExecutionError::UnknownOutcome)
+        }
+
+        async fn inspect(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+            Err(ProcessExecutionError::NotFound)
+        }
+
+        async fn cancel(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<CancellationReceipt, ProcessExecutionError> {
+            Err(ProcessExecutionError::NotFound)
+        }
+
+        async fn reconcile(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<ProcessEvidence, ProcessExecutionError> {
+            Err(ProcessExecutionError::NotFound)
+        }
+    }
+
+    #[test]
+    fn start_claimed_constructs_collector_internally_without_caller_sink() {
+        // Issue #456 (WB2/D7): the claimed start accepts no caller-selected
+        // sink. The composition constructs the single evidence collector for
+        // the exact claimed job/attempt; the executor's sink must be that
+        // collector (the same allocation), and a productive tool-identity
+        // observation passed as a datum must be recorded into it.
+        let fixture = admitted_drive_fixture("claimed-sink");
+        let store = fixture.composition.store();
+        let claimed = store
+            .claim_next(SERVICE_NAME, unix_ms(), ADMITTED_WORKER_LEASE_MS)
+            .unwrap();
+        assert!(claimed.is_some(), "fixture job must be claimable");
+        let job = claimed.unwrap();
+        let lease = job.lease.clone();
+        assert!(lease.is_some(), "claimed job carries a lease");
+        let lease = lease.unwrap();
+        // Fresh bound admission mirroring the worker drive: the same process
+        // construction the fixture submitted, issued through a fresh provider.
+        let provider = ExternalKernelProvider {
+            process: Mutex::new(Some(external_process_request(
+                &fixture.source,
+                &fixture.build,
+                &fixture.build,
+            ))),
+            contour_root: fixture.contour.clone(),
+        };
+        let admission_request = KernelProcessAdmissionRequest {
+            job_id: job.job_id.clone(),
+            project_id: job.project_id.clone(),
+            invocation: job.invocation.clone(),
+            source_root: job.target_roots.source_root.clone(),
+            target_root: job.target_roots.target_root.clone(),
+            cache_root: job.target_roots.cache_root.clone(),
+        };
+        let permit_result = issue_process_admission(&provider, &admission_request);
+        assert!(
+            permit_result.is_ok(),
+            "fixture admission must issue a permit"
+        );
+        let permit = permit_result.unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let observation = eliot_testd_core::TestdToolObservation {
+            nextest_path: executable.clone(),
+            nextest_sha256: "d".repeat(64),
+            cargo_path: executable.clone(),
+            cargo_sha256: "1".repeat(64),
+            rustc_path: executable,
+            rustc_sha256: "2".repeat(64),
+            selected_toolchain: "selected-toolchain".to_owned(),
+        };
+        let executor = SinkCapturingExecutor {
+            starts: Mutex::new(0),
+            seen: Mutex::new(None),
+        };
+        let claimed = worker::block_on_one_shot(start_claimed_from_store(
+            store,
+            &job,
+            &lease,
+            unix_ms(),
+            permit,
+            &executor,
+            Some(observation.clone()),
+        ));
+        // The executor ran exactly once, so admission, lease, roots, grant,
+        // and the observation datum all validated before the start.
+        assert_eq!(*executor.starts.lock().unwrap(), 1);
+        // The executor-owned unknown path surfaces; there is no receipt.
+        assert!(claimed.result.is_err());
+        // The sink the executor received IS the composition-constructed
+        // collector: the same allocation, so no caller sink exists anywhere
+        // on this path.
+        let seen_guard = executor.seen.lock().unwrap();
+        let seen = seen_guard.clone();
+        assert!(seen.is_some(), "executor must receive a sink");
+        let seen = seen.unwrap();
+        let returned: Arc<dyn ProcessEvidenceSink> = claimed.collector.clone();
+        assert!(Arc::ptr_eq(&returned, &seen));
+        // The refused start emitted nothing into the collector.
+        assert!(claimed.collector.snapshot().is_empty());
+        // The observation datum was recorded into the returned collector:
+        // re-recording the identical value is accepted, a conflicting one
+        // is refused without silent overwrite.
+        assert!(
+            claimed
+                .collector
+                .record_tool_observation(observation.clone())
+                .is_ok()
+        );
+        let mut conflicting = observation;
+        conflicting.nextest_sha256 = "e".repeat(64);
+        assert!(
+            claimed
+                .collector
+                .record_tool_observation(conflicting)
+                .is_err()
+        );
         std::fs::remove_dir_all(fixture.base).unwrap();
     }
 

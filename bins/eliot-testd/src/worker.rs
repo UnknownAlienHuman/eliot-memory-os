@@ -59,7 +59,7 @@
 //! decision when the admitted drive goes live.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -71,9 +71,9 @@ use eliot_process::{
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, RawArtifactStream, SourceObservationGitPort, TestJob, TestdError, TestdProviderEvidence,
-    TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
-    evaluate_testd_verification, issue_process_admission,
+    Lease, ProcessAdmissionPermit, RawArtifactStream, SourceObservationGitPort, TestJob,
+    TestdError, TestdProviderEvidence, TestdSourceObservation, TestdSourceObservationRange,
+    TestdStore, TestdToolObservation, evaluate_testd_verification, issue_process_admission,
 };
 
 use crate::kernel_client::{
@@ -247,6 +247,25 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
     drive_claimed(store, &job, &mut lease, presented, contour, owner, lease_ms)
 }
 
+/// Derives the productive tool-identity datum for one claimed start.
+///
+/// Non-productive profiles travel with no observation. A failed owner
+/// observation is returned as the finish reason so the caller finishes the
+/// shot as unknown without executing (issue #456, WB2).
+fn observed_tool_datum(
+    permit: &ProcessAdmissionPermit,
+    profile: &str,
+) -> Result<Option<TestdToolObservation>, String> {
+    if !eliot_testd_core::is_productive_testd_profile(profile) {
+        return Ok(None);
+    }
+    observe_tool_identity(permit.request())
+        .map(Some)
+        .map_err(|error| {
+            format!("productive tool identity was not owner-observed; no process started: {error}")
+        })
+}
+
 /// Drives one claimed job against the presented admission to a deterministic
 /// disposition. The job is already leased to this shot; every path below ends
 /// in `finish` or `cancel` so the lease is always released.
@@ -317,42 +336,36 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             )?));
         }
     };
-    let collector = Arc::new(EvidenceCollector::default());
-    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let observation = match observe_tool_identity(permit.request()) {
-            Ok(observation) => observation,
-            Err(error) => {
-                finish_unknown(
-                    store,
-                    job,
-                    lease,
-                    &collector,
-                    format!(
-                        "productive tool identity was not owner-observed; no process started: {error}"
-                    ),
-                )?;
-                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                    || TestdError::Corrupt("job disappeared after tool observation".to_owned()),
-                )?));
-            }
-        };
-        collector.record_tool_observation(observation)?;
-    }
-    let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = collector.clone();
+    // Issue #456 (WB2): the production path never selects its own evidence
+    // sink. The productive tool-identity observation travels into the claimed
+    // start as a datum; the composition constructs the single collector from
+    // the exact claimed job/attempt and returns it, so supervision and finish
+    // below observe exactly what the executor saw.
+    let tool_observation = match observed_tool_datum(&permit, &job.invocation.profile) {
+        Ok(datum) => datum,
+        Err(reason) => {
+            finish_unknown(store, job, lease, &EvidenceCollector::default(), reason)?;
+            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+                || TestdError::Corrupt("job disappeared after tool observation".to_owned()),
+            )?));
+        }
+    };
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
     // worker-owned `inspect` is the only observation that dispositions the
     // attempt.
-    let start_result = block_on_one_shot(crate::start_claimed_from_store(
+    let claimed = block_on_one_shot(crate::start_claimed_from_store(
         store,
         job,
         lease,
         current_clock_ms(),
         permit,
         contour.executor(),
-        sink,
+        tool_observation,
     ));
+    let start_result = claimed.result;
+    let collector = claimed.collector;
     let started_at = start_result
         .as_ref()
         .ok()

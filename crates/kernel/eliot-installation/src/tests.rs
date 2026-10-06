@@ -24,6 +24,7 @@ use crate::approved_generation_registry::{
 use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
 
+mod isolated_destination;
 mod registry_concurrent_read;
 mod registry_wire_launch;
 mod rollback_recovery;
@@ -6239,6 +6240,107 @@ fn runtime_roots_reject_system_escape_and_portable_system_alias() {
     );
 }
 
+/// A `SystemService` installation binding validates with the installation
+/// tree strictly below the I3.1 durable-data root, and refuses a durable
+/// root that is not the profile's own anchor child (issue #958: the
+/// admitted dispatch contour seeds a `SystemService` manifest, which can only
+/// validate when this join compares the installation root rather than the
+/// profile root, which is the durable root itself).
+#[cfg(windows)]
+#[test]
+fn system_service_installation_roots_validate_below_durable_data() {
+    let program_data = must(protected_program_data_root());
+    let anchor = test_handle(program_data.to_string_lossy().into_owned());
+    let roots = must(RuntimeStateRoots::derive_profiled(
+        InstallationProfile::SystemService,
+        anchor.clone(),
+        &"e".repeat(64),
+    ));
+    let user_root = std::env::temp_dir()
+        .join("eliot-958-user-root")
+        .to_string_lossy()
+        .into_owned();
+    let governed = InstallationRoots {
+        binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+        durable_data: format!(r"{}\Eliot", anchor.as_str()),
+        user_config: user_root.clone(),
+        user_cache: user_root,
+        runtime_state_roots: roots,
+    };
+    must(governed.validate(InstallationProfile::SystemService));
+    let mut moved = governed.clone();
+    moved.durable_data = std::env::temp_dir()
+        .join("eliot-958-elsewhere")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        moved.validate(InstallationProfile::SystemService).is_err(),
+        "a durable root off the profile anchor still refuses"
+    );
+}
+
+/// A `UserMode` installation binding validates with the installation tree
+/// strictly below the I3.1 durable-data sibling (`<anchor>\Eliot\data`),
+/// and refuses a durable root off the anchor (issue #958-continue: the join
+/// arm compared the durable root against the profile root — which
+/// `<anchor>\Eliot\data` can never contain — refusing every `UserMode` binding
+/// including production; the derivation, the sibling layout and
+/// `RuntimeStateRoots::validate` all require the
+/// `Eliot\data\installations\<key>` shape, so the join compares the
+/// installation root like the `SystemService` arm does).
+#[cfg(windows)]
+#[test]
+fn user_mode_installation_roots_validate_below_durable_data() {
+    let local_app_data = must(current_user_local_app_data_root());
+    let anchor = test_handle(local_app_data.to_string_lossy().into_owned());
+    // The derived UserMode topology itself validates: derivation and
+    // validation agree on the `data` infix.
+    let roots = must(RuntimeStateRoots::derive_profiled(
+        InstallationProfile::UserMode,
+        anchor.clone(),
+        &"e".repeat(64),
+    ));
+    must(roots.validate());
+    assert_eq!(
+        must(roots.installations_root()).as_str(),
+        format!(r"{}\Eliot\data\installations", anchor.as_str()),
+        "the declared installations root is the parent of every derived UserMode installation root"
+    );
+    let governed = InstallationRoots {
+        binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+        durable_data: format!(r"{}\Eliot\data", anchor.as_str()),
+        user_config: format!(r"{}\Eliot\config", anchor.as_str()),
+        user_cache: format!(r"{}\Eliot\cache", anchor.as_str()),
+        runtime_state_roots: roots,
+    };
+    must(governed.validate(InstallationProfile::UserMode));
+    let mut moved = governed.clone();
+    moved.durable_data = std::env::temp_dir()
+        .join("eliot-958-elsewhere")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        moved.validate(InstallationProfile::UserMode).is_err(),
+        "a durable root off the profile anchor still refuses"
+    );
+    // A `SystemService`-shaped tree is not a UserMode installation: the
+    // suffix check is per-profile, not shape-blind.
+    let program_data = must(protected_program_data_root());
+    let mut system = must(RuntimeStateRoots::derive_profiled(
+        InstallationProfile::SystemService,
+        test_handle(program_data.to_string_lossy().into_owned()),
+        &"e".repeat(64),
+    ));
+    system.profile = InstallationProfile::UserMode;
+    reseal_roots(&mut system);
+    assert!(
+        system.validate().is_err(),
+        "a SystemService-shaped tree under a UserMode profile still refuses"
+    );
+}
+
 #[test]
 fn retained_root_hook_rejects_reparse_evidence() {
     let directory = std::env::temp_dir().join("eliot-retained-root-test");
@@ -8842,6 +8944,34 @@ fn installation_registry_host_root_shape_is_exact_and_non_reparse_lexical() {
         assert!(
             validate_installation_host_root(&rejected).is_err(),
             "accepted wrong/reparse-shaped host root {}",
+            rejected.display()
+        );
+    }
+}
+
+/// A `UserMode` installation Host root (`<anchor>\Eliot\data\installations\
+/// <key>\host`) is an installation Host root (issue #958-continue: the
+/// shape check admitted only the `SystemService` suffix, so the
+/// current-user registry open refused every `UserMode` root before any
+/// authority check ran).
+#[test]
+fn installation_registry_user_mode_host_root_shape_accepted() {
+    let key = "b".repeat(64);
+    let accepted = PathBuf::from(format!(
+        r"C:\Users\alice\AppData\Local\Eliot\data\installations\{key}\host"
+    ));
+    assert!(validate_installation_host_root(&accepted).is_ok());
+    for rejected in [
+        PathBuf::from(format!(
+            r"C:\Users\alice\AppData\Local\Eliot\data\installations\{key}\wrong"
+        )),
+        PathBuf::from(
+            r"C:\Users\alice\AppData\Local\Eliot\data\installations\not-a-key\host".to_owned(),
+        ),
+    ] {
+        assert!(
+            validate_installation_host_root(&rejected).is_err(),
+            "accepted wrong-shaped user host root {}",
             rejected.display()
         );
     }

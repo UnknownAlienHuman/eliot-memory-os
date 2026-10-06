@@ -291,6 +291,30 @@ impl RuntimeStateRoots {
             ));
         }
         Self::validate_profile_anchor_path_os(profile, &profile_anchor_root)?;
+        Self::derive_profiled_below_proved_anchor(profile, profile_anchor_root, installation_key)
+    }
+
+    /// Derives profiled roots below an anchor the caller already proved
+    /// through a retained OS lease.
+    ///
+    /// No OS anchor is consulted here: the caller proved the anchor when it
+    /// retained the lease the derivation is computed under (e.g. the
+    /// owner-evidence inspection that admitted the operation deriving a
+    /// destination below the inspected source's own anchor). Re-resolving it
+    /// would duplicate that proof while refusing every override-pinned test
+    /// contour, and it would add no fact the lease proof did not already
+    /// establish. Callers with no such proof must use
+    /// [`Self::derive_profiled`].
+    pub(crate) fn derive_profiled_below_proved_anchor(
+        profile: InstallationProfile,
+        profile_anchor_root: PlatformHandle,
+        installation_key: &str,
+    ) -> Result<Self, InstallationError> {
+        if profile == InstallationProfile::PortableDev {
+            return Err(InstallationError::ProfileViolation(
+                "portable_dev requires derive_portable with one retained root".to_owned(),
+            ));
+        }
         validate_installation_key(installation_key)?;
         let suffix = match profile {
             InstallationProfile::SystemService => {
@@ -435,6 +459,56 @@ impl RuntimeStateRoots {
         }
     }
 
+    /// Derives the exact owner-declared root that contains EVERY installation
+    /// of this profile (`<profile_root>\installations` for `system_service`,
+    /// `<profile_root>\data\installations` for `user_mode` — the parent of
+    /// every `derive_profiled` installation root of that profile).
+    ///
+    /// This is the owner's own declaration of where installations live, derived
+    /// from the same already-validated profile anchor as every other declared
+    /// root. It exists because "is this path inside an installation contour?"
+    /// can only be answered against a DECLARED root: a path-shape guess (a
+    /// component that happens to be spelled `installations`) is decided by a
+    /// name, not by this installation owner's layout, and answers a different
+    /// question than the one a caller is asking.
+    ///
+    /// Derived, not serialized, exactly like [`Self::isolated_restore_root`] and
+    /// [`Self::canary_evidence_root`]: it adds no field to the digest-bound
+    /// topology, re-keys no committed installation and is not a second
+    /// independently asserted authority. [`Self::installer_root_hierarchy`] is
+    /// its single consumer, so the hierarchy and every reader agree on one
+    /// derived value.
+    ///
+    /// `portable_dev` is refused for the same reason
+    /// [`Self::isolated_restore_root`] refuses it: a portable contour retains
+    /// no shared installation area, so there is no declared root to answer an
+    /// installation-contour question against.
+    pub fn installations_root(&self) -> Result<PlatformHandle, InstallationError> {
+        if self.profile == InstallationProfile::PortableDev {
+            return Err(InstallationError::ProfileViolation(
+                "portable_dev declares no shared installations root, so it cannot classify a path \
+                 against an installation contour"
+                    .to_owned(),
+            ));
+        }
+        let profile_root = self.installer_profile_root()?;
+        // The shared installations area sits directly below the profile root
+        // for `system_service` but below the I3.1 durable-data sibling for
+        // `user_mode` — the same `data` infix `derive_profiled` produces, so
+        // this stays the parent of every derived installation root instead
+        // of naming a directory no UserMode installation lives under.
+        let leaf = match self.profile {
+            InstallationProfile::UserMode => "data\\installations",
+            _ => "installations",
+        };
+        PlatformHandle::new(joined_windows_path(profile_root.as_str(), leaf)).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "runtime_state_roots.installations_root".to_owned(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
     pub(super) fn expected_staging_root(
         &self,
     ) -> Result<Option<PlatformHandle>, InstallationError> {
@@ -530,12 +604,7 @@ impl RuntimeStateRoots {
                     "profiled roots require a deterministic packages root".to_owned(),
                 )
             })?;
-            let installations_root =
-                PlatformHandle::new(joined_windows_path(profile_root.as_str(), "installations"))
-                    .map_err(|error| InstallationError::InvalidField {
-                        field: "runtime_state_roots.installations_root".to_owned(),
-                        reason: error.to_string(),
-                    })?;
+            let installations_root = self.installations_root()?;
             hierarchy.push(("profile_root", profile_root));
             hierarchy.push(("packages_root", packages_root));
             hierarchy.push(("installations_root", installations_root));
@@ -663,11 +732,20 @@ impl RuntimeStateRoots {
                     ));
                 };
                 validate_installation_key(key)?;
-                if installation.components.len() < 3
-                    || !installation.ends_with(&["eliot", "installations", key])
-                {
+                // `SystemService` refines `<anchor>\Eliot` into per-installation
+                // trees directly; `UserMode` refines the I3.1 durable-data
+                // sibling (`<anchor>\Eliot\data`), so its fixed suffix carries
+                // the `data` infix the derivation produces — a UserMode root
+                // without it is a SystemService-shaped path under the wrong
+                // anchor, never a UserMode installation.
+                let suffix: &[&str] = match self.profile {
+                    InstallationProfile::SystemService => &["eliot", "installations", key],
+                    _ => &["eliot", "data", "installations", key],
+                };
+                if installation.components.len() < 3 || !installation.ends_with(suffix) {
                     return Err(InstallationError::ProfileViolation(
-                        "profiled installation root must end in Eliot/installations/<key>"
+                        "profiled installation root must end in Eliot/installations/<key> \
+                         (system_service) or Eliot/data/installations/<key> (user_mode)"
                             .to_owned(),
                     ));
                 }
