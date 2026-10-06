@@ -687,6 +687,18 @@ impl SurrealStoreAdapter {
         .await
     }
 
+    /// Inventories every persisted payload with its explicit per-record
+    /// disposition (issue #10, W7/A5).
+    ///
+    /// Read-only: one authority+evidence snapshot, no writes, no receipt
+    /// changes. Post-fix rows report intact; legacy and damaged rows dispose
+    /// by signature and never claim intact.
+    pub async fn inventory_historical_payloads(
+        &self,
+    ) -> Result<eliot_store_api::HistoricalInventoryReport, AdapterError> {
+        apply::inventory_historical_payloads(self).await
+    }
+
     /// Reconciles an ambiguous write by reading only its durable receipt.
     pub async fn reconcile(
         &self,

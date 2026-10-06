@@ -284,6 +284,52 @@ impl ExactJsonBytes {
     /// narrowing numbers fail closed, and duplicate keys were already
     /// rejected at parse time so the map collapse is exact.
     pub fn decode_object_parameters(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        let map = self.decode_object_parameters_without_control_check()?;
+        for name in map.keys() {
+            reject_control_parameter_name(name)?;
+        }
+        Ok(map)
+    }
+
+    /// Decodes a top-level object authority for one named operation (issue
+    /// #10, W6).
+    ///
+    /// Mirrors `validate_typed_mutation_parameters` (exact declared membership):
+    /// names declared
+    /// for `operation` are legitimate operation parameters even when they
+    /// appear on [`CONTROL_FIELD_DENYLIST`] (`task_id`, `session_id`,
+    /// `operation_id`, `idempotency_key`); any other control name fails
+    /// closed exactly as [`Self::decode_object_parameters`] refuses it. The
+    /// declaration gate ([`crate::verify_declaration_holds_no_payload_encoding`])
+    /// already proved that no structured payload encoding hides behind a
+    /// control name, so allowing the declared scalar names here creates no
+    /// second payload owner.
+    pub fn decode_object_parameters_for(
+        &self,
+        operation: crate::NamedMutationOperation,
+    ) -> Result<BTreeMap<String, Value>, StoreError> {
+        let map = self.decode_object_parameters_without_control_check()?;
+        let declared = crate::operation_parameters::declared_mutation_parameters(operation);
+        for name in map.keys() {
+            if CONTROL_FIELD_DENYLIST.contains(&name.as_str())
+                && !declared.iter().any(|field| field.name == name.as_str())
+            {
+                reject_control_parameter_name(name)?;
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes a top-level object authority without the control-field check.
+    ///
+    /// Intermediate step only, never a terminal validation: shape,
+    /// blank/control-name, narrowing-number, and duplicate-key checks still
+    /// run here, but every caller must re-validate names — via
+    /// [`Self::decode_object_parameters`] or
+    /// [`Self::decode_object_parameters_for`] — before trusting the map.
+    pub fn decode_object_parameters_without_control_check(
+        &self,
+    ) -> Result<BTreeMap<String, Value>, StoreError> {
         let value = self.projection_value()?;
         let Value::Object(object) = value else {
             return Err(StoreError::InvalidField {
@@ -292,7 +338,6 @@ impl ExactJsonBytes {
             });
         };
         for name in object.keys() {
-            reject_control_parameter_name(name)?;
             if name.trim().is_empty() || name.chars().any(char::is_control) {
                 return Err(StoreError::InvalidField {
                     field: "operation.parameter_name",
@@ -1003,4 +1048,283 @@ fn collect_number_tokens(text: &str) -> Result<Vec<String>, StoreError> {
         });
     }
     Ok(tokens)
+}
+
+/// One historical stored record participating in migration inventory (issue
+/// #10, W7/A5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalRecordInventoryEntry {
+    /// The durable stored bytes of the record.
+    pub stored: Vec<u8>,
+    /// Write-path provenance of the record (never inferred from bytes).
+    pub provenance: HistoricalRecordProvenance,
+    /// Exact canonical/external source bytes when they exist; the stored
+    /// bytes are never trusted when these are present.
+    pub exact_source: Option<Vec<u8>>,
+}
+
+/// Per-record inventory outcome: the explicit disposition plus the replayed
+/// authority when replay succeeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalRecordReport {
+    /// Explicit reconstructable/unreconstructable disposition.
+    pub disposition: HistoricalRecordDisposition,
+    /// The replayed [`PayloadSource::MigrationReplay`] authority, present
+    /// exactly when replay of the trusted bytes succeeded.
+    pub replayed: Option<ExactJsonBytes>,
+    /// The replay failure, present exactly when replay failed. A record can
+    /// carry post-fix provenance yet damaged current bytes; the disposition
+    /// classifies the write path and the value signature, this field carries
+    /// the current-bytes damage.
+    pub replay_error: Option<String>,
+}
+
+/// Whole-population inventory report: one entry per input record, in input
+/// order, so callers can dispose per record (issue #10, A5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalInventoryReport {
+    /// Per-record outcomes in input order.
+    pub records: Vec<HistoricalRecordReport>,
+}
+
+impl HistoricalInventoryReport {
+    /// Reports whether every record replayed from trusted bytes.
+    ///
+    /// Vacuous truth is rejected: an empty population proves nothing, so it
+    /// reports false. Only [`HistoricalRecordDisposition::PreservedIntact`]
+    /// and [`HistoricalRecordDisposition::ReplayFromExactSource`] with a
+    /// bound authority count as intact; quarantined records never do, even
+    /// when their stored bytes happen to parse.
+    #[must_use]
+    pub fn all_intact(&self) -> bool {
+        !self.records.is_empty()
+            && self.records.iter().all(|record| {
+                matches!(
+                    record.disposition,
+                    HistoricalRecordDisposition::PreservedIntact
+                        | HistoricalRecordDisposition::ReplayFromExactSource
+                ) && record.replayed.is_some()
+            })
+    }
+}
+
+/// Assigns the explicit per-record disposition and replays the trusted bytes
+/// for a population of historical stored records (issue #10, W7/A5).
+///
+/// Pure: no I/O, no clock. Disposition follows the same evidence rules as
+/// [`dispose_historical_record`] and
+/// [`ExactJsonBytes::replay_historical_record`]: exact source always wins
+/// (replay from it); a pre-fix record with no exact source whose value tree
+/// matches [`HISTORICAL_TRUNCATION_SIGNATURE`] is corrupted/stale; any other
+/// pre-fix record with no exact source — including unparseable bytes and
+/// string-free values — is unverified, never intact; a post-fix record is
+/// intact-provenance and replays its stored bytes verbatim. Replay itself
+/// runs through [`ExactJsonBytes::replay_historical_record`], so the
+/// returned authority always carries [`PayloadSource::MigrationReplay`]
+/// provenance and the stored bytes are never trusted when an exact source
+/// exists.
+#[must_use]
+pub fn inventory_historical_payloads(
+    entries: &[HistoricalRecordInventoryEntry],
+) -> HistoricalInventoryReport {
+    HistoricalInventoryReport {
+        records: entries.iter().map(inventory_one_record).collect(),
+    }
+}
+
+/// Disposes and replays one historical stored record.
+fn inventory_one_record(entry: &HistoricalRecordInventoryEntry) -> HistoricalRecordReport {
+    let replay = ExactJsonBytes::replay_historical_record(
+        &entry.stored,
+        entry.provenance,
+        entry.exact_source.as_deref(),
+    );
+    let replay_error = replay.as_ref().err().map(ToString::to_string);
+    let replayed = replay.ok();
+    let disposition = if entry.provenance.exact_source_bytes_available {
+        HistoricalRecordDisposition::ReplayFromExactSource
+    } else {
+        // The truncation signature classifies pre-fix bytes only: a post-fix
+        // record carries positive preservation evidence (it was written
+        // through the fixed path and its digest binding revalidated upstream),
+        // so legitimately stored signature-shaped values (`scope:scope`,
+        // `memory:operator`) stay intact instead of disposing as corrupted.
+        // This mirrors `dispose_historical_record`, which returns
+        // `PreservedIntact` for every post-fix string.
+        match serde_json::from_slice::<Value>(&entry.stored) {
+            Ok(value)
+                if entry.provenance.written_before_record_coercion_fix
+                    && value_holds_truncation_signature(&value) =>
+            {
+                HistoricalRecordDisposition::CorruptedStaleUnreconstructable {
+                    signature: HISTORICAL_TRUNCATION_SIGNATURE,
+                }
+            }
+            Ok(_) if entry.provenance.written_before_record_coercion_fix => {
+                HistoricalRecordDisposition::UnverifiedPreFix
+            }
+            Ok(_) => HistoricalRecordDisposition::PreservedIntact,
+            Err(_) => HistoricalRecordDisposition::UnverifiedPreFix,
+        }
+    };
+    HistoricalRecordReport {
+        disposition,
+        replayed,
+        replay_error,
+    }
+}
+
+#[cfg(test)]
+mod historical_inventory_tests {
+    use super::*;
+
+    const POST_FIX: HistoricalRecordProvenance = HistoricalRecordProvenance {
+        written_before_record_coercion_fix: false,
+        exact_source_bytes_available: false,
+    };
+    const PRE_FIX: HistoricalRecordProvenance = HistoricalRecordProvenance {
+        written_before_record_coercion_fix: true,
+        exact_source_bytes_available: false,
+    };
+    const PRE_FIX_EXACT: HistoricalRecordProvenance = HistoricalRecordProvenance {
+        written_before_record_coercion_fix: true,
+        exact_source_bytes_available: true,
+    };
+
+    fn entry(
+        stored: &[u8],
+        provenance: HistoricalRecordProvenance,
+    ) -> HistoricalRecordInventoryEntry {
+        HistoricalRecordInventoryEntry {
+            stored: stored.to_vec(),
+            provenance,
+            exact_source: None,
+        }
+    }
+
+    #[test]
+    fn post_fix_record_replays_verbatim_and_reports_intact() {
+        let stored = br#"{"subject":"memory:operator-runtime-proof"}"#;
+        let report = inventory_historical_payloads(std::slice::from_ref(&entry(stored, POST_FIX)));
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(
+            report.records[0].disposition,
+            HistoricalRecordDisposition::PreservedIntact
+        );
+        assert_eq!(
+            report.records[0]
+                .replayed
+                .as_ref()
+                .map(ExactJsonBytes::byte_len),
+            Some(stored.len())
+        );
+        assert!(report.records[0].replay_error.is_none());
+        assert!(report.all_intact());
+    }
+
+    #[test]
+    fn post_fix_signature_shaped_values_stay_intact() {
+        // The truncation signature classifies pre-fix bytes only: legitimately
+        // stored signature-shaped values written through the post-fix path
+        // carry positive preservation evidence and stay intact.
+        let report = inventory_historical_payloads(&[
+            entry(br#"{"subject":"scope:scope"}"#, POST_FIX),
+            entry(br#"{"subject":"memory:operator"}"#, POST_FIX),
+            entry(br#"{"subject":"sha256:abc"}"#, POST_FIX),
+            entry(br#"{"subject":"observation:f31e5b3f"}"#, POST_FIX),
+        ]);
+        assert_eq!(report.records.len(), 4);
+        for record in &report.records {
+            assert_eq!(
+                record.disposition,
+                HistoricalRecordDisposition::PreservedIntact,
+                "unexpected disposition: {:?}",
+                record.disposition
+            );
+            assert!(record.replayed.is_some());
+            assert!(record.replay_error.is_none());
+        }
+        assert!(report.all_intact());
+    }
+
+    #[test]
+    fn exact_source_replays_source_bytes_never_stored_bytes() {
+        let stored = br#"{"subject":"memory:operator"}"#;
+        let source = br#"{"subject":"memory:operator-runtime-proof"}"#;
+        let report =
+            inventory_historical_payloads(std::slice::from_ref(&HistoricalRecordInventoryEntry {
+                stored: stored.to_vec(),
+                provenance: PRE_FIX_EXACT,
+                exact_source: Some(source.to_vec()),
+            }));
+        assert_eq!(
+            report.records[0].disposition,
+            HistoricalRecordDisposition::ReplayFromExactSource
+        );
+        assert_eq!(
+            report.records[0]
+                .replayed
+                .as_ref()
+                .map(ExactJsonBytes::byte_len),
+            Some(source.len())
+        );
+        assert!(report.all_intact());
+    }
+
+    #[test]
+    fn claimed_exact_source_without_bytes_fails_closed() {
+        let report = inventory_historical_payloads(std::slice::from_ref(&entry(
+            br#"{"subject":"memory:operator"}"#,
+            PRE_FIX_EXACT,
+        )));
+        assert_eq!(
+            report.records[0].disposition,
+            HistoricalRecordDisposition::ReplayFromExactSource
+        );
+        assert!(report.records[0].replayed.is_none());
+        assert!(report.records[0].replay_error.is_some());
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn pre_fix_truncated_strings_dispose_corrupted_root_and_nested() {
+        let report = inventory_historical_payloads(&[
+            entry(br#""observation:f31e5b3f""#, PRE_FIX),
+            entry(br#"{"seen":["memory:operator"]}"#, PRE_FIX),
+        ]);
+        for record in &report.records {
+            assert!(
+                matches!(
+                    record.disposition,
+                    HistoricalRecordDisposition::CorruptedStaleUnreconstructable { .. }
+                ),
+                "unexpected disposition: {:?}",
+                record.disposition
+            );
+            assert!(record.replayed.is_none());
+        }
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn pre_fix_multi_colon_and_string_free_values_stay_unverified() {
+        let report = inventory_historical_payloads(&[
+            entry(br#""collective:task:message""#, PRE_FIX),
+            entry(br#"{"n":42}"#, PRE_FIX),
+            entry(b"\xff\xfe-not-json", PRE_FIX),
+        ]);
+        for record in &report.records {
+            assert_eq!(
+                record.disposition,
+                HistoricalRecordDisposition::UnverifiedPreFix
+            );
+            assert!(record.replayed.is_none());
+        }
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn empty_population_is_not_intact() {
+        assert!(!inventory_historical_payloads(&[]).all_intact());
+    }
 }
