@@ -1731,7 +1731,7 @@ PROTECTED_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".log", ".out")
 
 
 class GateFailure(Exception):
-    """Bounded gate non-success. Never a NOT_RUN/NOT_CHECKED verdict."""
+    """Bounded gate non-success. Never an unexecuted-verdict shape."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2071,7 +2071,7 @@ def execute_rust_selection(descriptor, package: str, package_manifest: str,
     that exact rejection occurs, this records a structured binding gap and
     continues with the accepted builders/parsers that do apply (discovery
     list, exact transcripts, return codes). No invented receipts, no
-    fabricated binding, no NOT_RUN verdict.
+    fabricated binding, no unexecuted verdict.
     """
     _, _, c, r = _gate_modules()
     env = _cargo_env()
@@ -2189,7 +2189,7 @@ def run_accepted_gate():
     """Run the accepted assignment/descriptor/execution/reconciliation/composition chain once.
 
     Returns the bound GateEvidence. Any non-success raises GateFailure: there
-    is no NOT_RUN/NOT_CHECKED verdict shape anywhere on this path.
+    is no unexecuted-verdict shape anywhere on this path.
     """
     global _gate_evidence
     if _gate_evidence is not None:
