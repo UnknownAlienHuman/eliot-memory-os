@@ -3759,7 +3759,34 @@ mod solo_consume_chain_tests {
     /// needs a live composition, the second another owner's bridge module.
     #[tokio::test]
     async fn admitted_request_consumes_to_typed_drive_refusal() {
-        let (request, intake, now) = solo_test_pair();
+        let (mut request, mut intake, now) = solo_test_pair();
+        // W2 carrier bind: the delegate body and the request envelope bytes
+        // come from a real `eliot_mcp::CoordinateInput::Delegate` parse (the
+        // same canonical JSON `canonical_delegate_binds_contract_shape`
+        // proves), never hand-made bytes. The admitted-envelope halves the
+        // #2565 producer supplies (claimed halves, fence, plan) stay the
+        // fixture pair on purpose: this test binds the carrier, not the
+        // producer.
+        let source_bytes = serde_json::to_vec(&serde_json::json!({
+            "operation": "delegate",
+            "goal": "bounded valve survey",
+            "owned_resources": ["rig-1"],
+            "expected_result": "valve-report",
+        }))
+        .expect("canonical delegate bytes build");
+        let input: eliot_mcp::CoordinateInput =
+            serde_json::from_slice(&source_bytes).expect("carrier parses");
+        let eliot_mcp::CoordinateInput::Delegate(carrier) = input else {
+            panic!("expected a Delegate carrier, got {input:?}");
+        };
+        intake.delegate = SoloDelegateBody::from_canonical_delegate(
+            &carrier.goal,
+            carrier.owned_resources.clone(),
+            &carrier.expected_result,
+            &source_bytes,
+        )
+        .expect("carrier builds the intake body");
+        request.delegate_bytes = source_bytes;
         crate::agent_fabric::validate_admitted_solo_binding(&request, &intake)
             .expect("admitted pair validates at the consumer head");
         let mut state = SoloDriverState::new();
