@@ -101,8 +101,8 @@ pub(crate) use health_probe::{adapter_health, health};
 #[cfg(test)]
 use read_boundary::{READ_VALIDATION_SNAPSHOT, build_validation_snapshot};
 pub(crate) use read_boundary::{
-    execute_named, read_ordering_heads, read_revision_heads, read_scope_view,
-    read_validation_snapshot,
+    execute_named, inventory_historical_payloads, read_ordering_heads, read_revision_heads,
+    read_scope_view, read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
 use receipt_reconciliation::{
