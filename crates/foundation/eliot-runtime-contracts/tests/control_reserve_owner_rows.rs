@@ -1,5 +1,6 @@
 //! W1 (#1679): the fifteen frozen owner rows carry partition, generation,
 //! evidence and invalidation at the profile-row level.
+#![allow(clippy::expect_used)]
 //!
 //! The frozen denominator (`frozen_bottleneck_owner_map`, mirroring the
 //! `[[bottleneck_contract]]` rows of `control-reserve.contract.toml`) names

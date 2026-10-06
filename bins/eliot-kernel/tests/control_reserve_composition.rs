@@ -8,11 +8,13 @@
 //! function is called directly: the profile under test is the one the running
 //! composition retained.
 //!
-//! No owner adapter publishes evidence yet (W3 open), so the composition
-//! joins zero records. The closed answers are therefore fifteen explicit
-//! `UNKNOWN` rows, never a value described from a neighbouring owner's
-//! numbers. A case asserting claimed capacity here would fabricate evidence
-//! the owners have not published.
+//! Owner adapters publish evidence (`ControlReserve::publish_owner_row`,
+//! `OrsReserve::publish_owner_rows`, `StoreReserve::publish_claimed_row`,
+//! `IpcReserve::publish_claimed_row`), but no reserve instance exists at
+//! assembly, so the composition joins zero records. The closed answers are
+//! therefore fifteen explicit `UNKNOWN` rows, never a value described from
+//! a neighbouring owner's numbers. A case asserting claimed capacity here
+//! would fabricate evidence no live reserve has published at assembly.
 
 use eliot_kernel::{KernelComposition, KernelConfig};
 use eliot_runtime_contracts::BottleneckCoverageState;

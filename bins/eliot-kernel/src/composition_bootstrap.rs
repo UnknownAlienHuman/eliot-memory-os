@@ -2160,10 +2160,13 @@ impl KernelComposition {
         // `control-reserve.contract.toml:21`): the composition joins
         // owner-produced capacity evidence into the control-reserve profile
         // here, from the resolved Authority Epoch, generation, approved
-        // config hash and clock above. No owner adapter publishes evidence
-        // yet (W3 open), so the composition joins zero records and every
-        // dimension lowers to an explicit UNKNOWN row; the frozen validator
-        // still enforces the exact 15-row denominator. The identity strings
+        // config hash and clock above. Owner adapters publish evidence
+        // (`ControlReserve::publish_owner_row`, `OrsReserve::publish_owner_rows`,
+        // `StoreReserve::publish_claimed_row`, `IpcReserve::publish_claimed_row`),
+        // but no reserve instance exists at assembly — the running service
+        // admits through its own counters — so the composition joins zero
+        // records and every dimension lowers to an explicit UNKNOWN row; the
+        // frozen validator still enforces the exact 15-row denominator. The identity strings
         // are the composition's own resolved values, never defaults: the
         // service name it was built as, the generation and epoch it was
         // admitted under, the Host-approved config hash (or the standalone

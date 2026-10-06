@@ -13,11 +13,13 @@
 //! as a healthy dimension.
 //!
 //! Consequently this join currently has no in-tree caller. The production
-//! composition that resolves the configuration snapshot, Authority Epoch and
-//! reference strings does not exist in this tree. `STITCH`: the join is landed
-//! without a caller rather than given a manufactured one (no startup hook, no
-//! `fn main` call, no discarded-result statement). Full installed-saturation
-//! proof stays #11 Product scope.
+//! composition (`KernelComposition::assemble` in `bins/eliot-kernel`) resolves
+//! the configuration snapshot, Authority Epoch and reference strings and
+//! compiles the profile, but no reserve instance exists at assembly, so it
+//! joins zero records. `STITCH`: the join is landed without a caller rather
+//! than given a manufactured one (no startup hook, no `fn main` call, no
+//! discarded-result statement). Full installed-saturation proof stays #11
+//! Product scope.
 
 use eliot_contracts::EpochId;
 use eliot_runtime_contracts::{BottleneckCapacityProfile, CapacityBottleneck};
