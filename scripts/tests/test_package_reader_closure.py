@@ -39,6 +39,7 @@ from scripts.code_navigation_lib.package_docs import (
     check as check_package_docs,
     render as render_package_docs,
     self_test as package_docs_self_test,
+    target_relations,
     validate as validate_package_docs,
 )
 from scripts.code_navigation_lib.prototype_docs import (
@@ -116,7 +117,7 @@ def _reverse_section(rendered: str) -> dict[str, dict[str, set[str]]]:
 
 
 class TestPackageReaderClosure(unittest.TestCase):
-    """55 substantive test cases for issue #690."""
+    """57 substantive test cases for issue #690."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1406,6 +1407,176 @@ class TestPackageReaderClosure(unittest.TestCase):
                     without_index,
                     "a source-input change did not change the expected bytes",
                 )
+
+    # WORK_UNIT_CASE: 690/56
+    def test_56_sibling_targets_resolve_divergent_block_chains(self) -> None:
+        """Sibling targets under divergent block globs each close their own chain."""
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            (t / "crates/a/src").mkdir(parents=True)
+            (t / "crates/a/tool").mkdir(parents=True)
+            (t / "crates/a/Cargo.toml").write_text("[package]\nname = 'a'\n", encoding="utf-8")
+            (t / "crates/a/src/lib.rs").write_text("pub fn a(){}\n", encoding="utf-8")
+            (t / "crates/a/tool/main.rs").write_text("fn main(){}\n", encoding="utf-8")
+            (t / PROTOCOL_PATH).parent.mkdir(parents=True, exist_ok=True)
+            (t / PROTOCOL_PATH).write_text("# protocol\n", encoding="utf-8")
+            (t / "crates/AGENTS.md").write_text(
+                f"{ROUTING_START}\npython scripts/docs_read.py read\n"
+                f"[protocol](../{PROTOCOL_PATH})\n{ROUTING_END}\n"
+                f"[index](../{PACKAGE_INDEX_PATH})\n",
+                encoding="utf-8",
+            )
+            (t / "docs/architecture").mkdir(parents=True, exist_ok=True)
+            (t / "docs/architecture/H.md").write_text("## Core\n## Tool\n", encoding="utf-8")
+            (t / "docs/architecture/handle-index.json").write_text(
+                json.dumps({
+                    "schema_version": "eliot-handle-index-v1",
+                    "handles": {
+                        "H-CORE": {
+                            "source": "implementation",
+                            "title": "H-CORE",
+                            "path": "docs/architecture/H.md",
+                            "anchor": "core",
+                        },
+                        "H-TOOL": {
+                            "source": "implementation",
+                            "title": "H-TOOL",
+                            "path": "docs/architecture/H.md",
+                            "anchor": "tool",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            package = {
+                "root_path": "crates/a",
+                "manifest_path": "crates/a/Cargo.toml",
+                "workspace_member": True,
+                "default_member": True,
+                "targets": [
+                    {"kind": "lib", "name": "a", "path": "src/lib.rs"},
+                    {"kind": "bin", "name": "main", "path": "tool/main.rs"},
+                ],
+                "logical_blocks": ["core", "tool"],
+            }
+            reg = {
+                "workspace_manifest": {"members": ["crates/a"], "default_members": ["crates/a"]},
+                "packages": [package],
+                "logical_blocks": [
+                    {
+                        "id": "core",
+                        "path_globs": ["crates/a/src/**"],
+                        "documentation_handles": ["H-CORE"],
+                        "documentation_route_ids": ["r-core"],
+                    },
+                    {
+                        "id": "tool",
+                        "path_globs": ["crates/a/tool/**"],
+                        "documentation_handles": ["H-TOOL"],
+                        "documentation_route_ids": ["r-tool"],
+                    },
+                ],
+            }
+            # Both sibling targets close: the package model alone is green too,
+            # so this passing proves nothing about per-target selection yet.
+            validate_package_docs(t, reg)
+            # The shared per-target relation binds each target to its own
+            # blocks and handles - no cartesian package-blocks x all-targets.
+            relations = target_relations(package, _blocks(reg))
+            by_path = {relation["path"]: relation for relation in relations}
+            self.assertEqual(
+                by_path["crates/a/src/lib.rs"]["blocks"], ["core"]
+            )
+            self.assertEqual(
+                by_path["crates/a/src/lib.rs"]["handles"], ["H-CORE"]
+            )
+            self.assertEqual(
+                by_path["crates/a/tool/main.rs"]["blocks"], ["tool"]
+            )
+            self.assertEqual(
+                by_path["crates/a/tool/main.rs"]["handles"], ["H-TOOL"]
+            )
+            # The rendered reverse index follows the same records: each
+            # handle row lists only its own targets, never the sibling's.
+            rendered = render_package_docs(reg, t)
+            core_rows = [
+                line for line in rendered.splitlines() if line.startswith("| [`H-CORE`]")
+            ]
+            tool_rows = [
+                line for line in rendered.splitlines() if line.startswith("| [`H-TOOL`]")
+            ]
+            self.assertEqual(len(core_rows), 1)
+            self.assertEqual(len(tool_rows), 1)
+            self.assertIn("src/lib.rs", core_rows[0])
+            self.assertNotIn("tool/main.rs", core_rows[0])
+            self.assertIn("tool/main.rs", tool_rows[0])
+            self.assertNotIn("src/lib.rs", tool_rows[0])
+
+    # WORK_UNIT_CASE: 690/57
+    def test_57_target_outside_every_block_glob_is_refused(self) -> None:
+        """A target matching no block glob fails even with a green package model."""
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            (t / "crates/a/src").mkdir(parents=True)
+            (t / "crates/a/extra").mkdir(parents=True)
+            (t / "crates/a/Cargo.toml").write_text("[package]\nname = 'a'\n", encoding="utf-8")
+            (t / "crates/a/src/lib.rs").write_text("pub fn a(){}\n", encoding="utf-8")
+            (t / "crates/a/extra/orphan.rs").write_text("pub fn o(){}\n", encoding="utf-8")
+            (t / PROTOCOL_PATH).parent.mkdir(parents=True, exist_ok=True)
+            (t / PROTOCOL_PATH).write_text("# protocol\n", encoding="utf-8")
+            (t / "crates/AGENTS.md").write_text(
+                f"{ROUTING_START}\npython scripts/docs_read.py read\n"
+                f"[protocol](../{PROTOCOL_PATH})\n{ROUTING_END}\n"
+                f"[index](../{PACKAGE_INDEX_PATH})\n",
+                encoding="utf-8",
+            )
+            (t / "docs/architecture").mkdir(parents=True, exist_ok=True)
+            (t / "docs/architecture/H.md").write_text("## Core\n## Tool\n", encoding="utf-8")
+            (t / "docs/architecture/handle-index.json").write_text(
+                json.dumps({
+                    "schema_version": "eliot-handle-index-v1",
+                    "handles": {
+                        "H-CORE": {
+                            "source": "implementation",
+                            "title": "H-CORE",
+                            "path": "docs/architecture/H.md",
+                            "anchor": "core",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            reg = {
+                "workspace_manifest": {"members": ["crates/a"], "default_members": ["crates/a"]},
+                "packages": [{
+                    "root_path": "crates/a",
+                    "manifest_path": "crates/a/Cargo.toml",
+                    "workspace_member": True,
+                    "default_member": True,
+                    "targets": [
+                        {"kind": "lib", "name": "a", "path": "src/lib.rs"},
+                        {"kind": "lib", "name": "orphan", "path": "extra/orphan.rs"},
+                    ],
+                    "logical_blocks": ["core", "tool"],
+                }],
+                "logical_blocks": [
+                    {
+                        "id": "core",
+                        "path_globs": ["crates/a/src/**"],
+                        "documentation_handles": ["H-CORE"],
+                        "documentation_route_ids": ["r-core"],
+                    },
+                    {
+                        "id": "tool",
+                        "path_globs": ["crates/a/tool/**"],
+                        "documentation_handles": ["H-CORE"],
+                        "documentation_route_ids": ["r-core"],
+                    },
+                ],
+            }
+            with self.assertRaises(NavigationError) as cm:
+                validate_package_docs(t, reg)
+            self.assertIn("matches no logical block", str(cm.exception).lower())
 
 
 if __name__ == "__main__":

@@ -14,6 +14,11 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_research_exchange_api::{DisclosureClass, SourceClass};
 use eliot_researcher::evidence_portfolio::*;
+use eliot_researcher::inquiry_governance::{
+    CoverageGoal, EvidenceFreeze, EvidenceFreezeParams, EvidenceGrade, FreezeMemberReceipt,
+    HypothesisPolicy, IndependenceBlindingPolicy, InquiryError, InquiryLane, InquiryOutputContract,
+    InquiryProtocol, InquiryProtocolProfile, InquiryStopRule, ReopenCondition, StopRuleKind,
+};
 use eliot_researcher::{
     AdmittedExcerpt, AdmittedExcerptParams, ExcerptPosition, RetainedSourceRevision,
     RetainedSourceRevisionParams, audit_claim_with_excerpts,
@@ -301,13 +306,21 @@ fn preconditions(
     evaluation: Option<NoMatchEvaluation>,
     frozen_scope_digest: &str,
 ) -> AbsencePreconditions {
+    // Bare-preconditions helper carries no issuer context, so the admitted side
+    // is `None`; the retained twin is the presented record itself, exactly what
+    // the arrive-together doctrine threads on the production route.
+    let retained_eval = evaluation.clone();
     AbsencePreconditions::derive(
         account,
         &BTreeMap::new(),
         None,
         1_700_000_300_000,
         frozen_scope_digest,
-        evaluation,
+        PresentedEvaluation {
+            evaluation,
+            admitted_query: None,
+            retained_evaluation: retained_eval.as_ref(),
+        },
     )
     .expect("preconditions")
 }
@@ -354,7 +367,60 @@ fn issued_evaluation(
     manifest: &AuthorizedManifest,
     frozen_scope_digest: &str,
 ) -> NoMatchEvaluation {
-    let issuer = NoMatchEvaluationIssuer::new(NoMatchEvaluationIssuerParams {
+    let issuer = NoMatchEvaluationIssuer::new(
+        NoMatchEvaluationIssuerParams {
+            predicate_id: "no-match/absent-valley-alloy".to_owned(),
+            predicate_revision: "r1".to_owned(),
+            predicate_form: "exists(snapshot_bytes, alloy == member_alloy) == false".to_owned(),
+            issuer_id: "evaluator-owner-700".to_owned(),
+            evaluator_id: "no-match-evaluator-700".to_owned(),
+            evaluator_revision: "evaluator-700.1".to_owned(),
+            admission_receipt_id: "admission-700.1".to_owned(),
+            fence: fence(),
+            work_scope: "propulsion thermal envelope".to_owned(),
+            scope_digest: frozen_scope_digest.to_owned(),
+            scope_revision: "scope-700.1".to_owned(),
+            denominator_digest: inquiry_denominator_digest(),
+            manifest_digest: manifest.canonical_digest().expect("manifest commitment"),
+            manifest_revision: ABSENCE_MANIFEST_REVISION,
+            index_revision: "index-700.1".to_owned(),
+            source_revision: "corpus-700.1".to_owned(),
+            // At or after every record's retrieval time and at or before the
+            // assessment instant, and the currentness bound at or after both, so the
+            // observation window covers this assessment rather than merely parsing.
+            observed_at_ms: 1_700_000_250_000,
+            current_until_ms: 1_700_000_400_000,
+            applicability: NoMatchApplicability::Current,
+            // Grade 2 is the weakest grade `source_params` gives every record, so a
+            // ceiling at that rank is checkable against the joined records rather
+            // than an overclaim `check_ceiling` would refuse.
+            proof_ceiling_grade: Some(2),
+        },
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+    issuer
+        .issue_for(
+            account,
+            records,
+            manifest,
+            frozen_scope_digest,
+            ASSESSMENT_MS,
+        )
+        .expect("owner-issued evaluation")
+}
+
+/// The same twenty owner commitments [`issued_evaluation`] holds, as a mutable value.
+///
+/// Each issuer-refusal case mutates exactly one field (scope, manifest revision, clock, identity)
+/// and asserts the exact refusal; the unmutated value must issue exactly what
+/// [`issued_evaluation`] issues, which the positive control in the foreign-scope issuer test pins.
+/// This helper exists so those cases stay one link each instead of restating the commitment set.
+fn issuer_params_for(
+    manifest: &AuthorizedManifest,
+    frozen_scope_digest: &str,
+) -> NoMatchEvaluationIssuerParams {
+    NoMatchEvaluationIssuerParams {
         predicate_id: "no-match/absent-valley-alloy".to_owned(),
         predicate_revision: "r1".to_owned(),
         predicate_form: "exists(snapshot_bytes, alloy == member_alloy) == false".to_owned(),
@@ -371,27 +437,23 @@ fn issued_evaluation(
         manifest_revision: ABSENCE_MANIFEST_REVISION,
         index_revision: "index-700.1".to_owned(),
         source_revision: "corpus-700.1".to_owned(),
-        // At or after every record's retrieval time and at or before the
-        // assessment instant, and the currentness bound at or after both, so the
-        // observation window covers this assessment rather than merely parsing.
         observed_at_ms: 1_700_000_250_000,
         current_until_ms: 1_700_000_400_000,
         applicability: NoMatchApplicability::Current,
-        // Grade 2 is the weakest grade `source_params` gives every record, so a
-        // ceiling at that rank is checkable against the joined records rather
-        // than an overclaim `check_ceiling` would refuse.
         proof_ceiling_grade: Some(2),
-    })
-    .expect("owner issuer");
-    issuer
-        .issue_for(
-            account,
-            records,
-            manifest,
-            frozen_scope_digest,
-            ASSESSMENT_MS,
-        )
-        .expect("owner-issued evaluation")
+    }
+}
+
+/// The admitted query the suite's no-match records are bound to
+/// (I21-09:17): the predicate identity and index revision the
+/// frozen inquiry admitted, equal to the commitments
+/// [`issuer_params_for`] holds.
+fn admitted_query() -> AdmittedQueryCommitments {
+    AdmittedQueryCommitments::new(
+        "no-match/absent-valley-alloy".to_owned(),
+        "index-700.1".to_owned(),
+    )
+    .expect("admitted query")
 }
 
 /// The denominator digest of the single frozen inquiry this suite shares.
@@ -836,7 +898,11 @@ fn absence_requires_complete_authoritative_lookup() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation.clone()),
+        PresentedEvaluation {
+            evaluation: Some(evaluation.clone()),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&evaluation),
+        },
     )
     .expect("preconditions over real evidence");
     assert_eq!(
@@ -894,7 +960,11 @@ fn absence_requires_complete_authoritative_lookup() {
         Some(&manifest),
         ASSESSMENT_MS,
         &scope_digest,
-        Some(evaluation.clone()),
+        PresentedEvaluation {
+            evaluation: Some(evaluation.clone()),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&evaluation),
+        },
     )
     .expect("preconditions over a withheld record");
     let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &blocked) else {
@@ -967,6 +1037,580 @@ fn absence_requires_complete_authoritative_lookup() {
         assess_absence(&gapped, &preconditions(&gapped, None, DIGEST_B)),
         AbsenceVerdict::Unproven { .. }
     ));
+}
+
+#[test]
+fn absence_substituted_record_is_unproven() {
+    // A substituted record is the same evidence with the handle/identity binding
+    // broken: the accounting handle `src-primary#0` resolves to a vetted record
+    // whose own handle is `src-intruder`. Completeness is proved on the frozen
+    // scope (I21-06: `complete_scope` is the only basis on which a scoped absence
+    // may be claimed), so a member closed against a record that is not itself that
+    // member's record cannot support `Proven`.
+    let (account, mut records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    records.insert("src-primary#0".to_owned(), record("src-intruder"));
+    let retained_eval = evaluation.clone();
+    let substituted = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
+    )
+    .expect("preconditions over a substituted record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &substituted) else {
+        panic!("a substituted vetted record must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=record_handle_mismatch"),
+        "the substituted member and its specific unmet join must be retained: {reason}"
+    );
+}
+
+#[test]
+fn absence_stale_record_is_unproven() {
+    // A stale record is the same evidence with the currentness join unmet: the
+    // accounting handle `src-primary#0` still resolves to a vetted record under
+    // that exact handle, but its frozen freshness boundary now sits before the
+    // assessment instant. Completeness is proved on the frozen scope (I21-06:
+    // `complete_scope` is the only basis on which a scoped absence may be
+    // claimed), so a member closed against a record that was already stale when
+    // the claim was made cannot support `Proven`.
+    let (account, mut records, _, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    // Same handle, same everything else, earlier boundary: the constructor puts no
+    // constraint on the boundary and `is_stale_at` reports true because the
+    // assessment instant is already past it.
+    let mut params = source_params("src-primary#0");
+    params.freshness_boundary_ms = Some(ASSESSMENT_MS - 1);
+    let stale = SourceRecord::new(params).expect("stale record");
+    records.insert("src-primary#0".to_owned(), stale);
+    // No evaluation and no manifest, on purpose. The record now differs from the
+    // one the issuer committed, so binding the evaluation would report the
+    // earlier result-record mismatch rather than staleness; the handle, record and
+    // currentness joins are the ones that hold or fail without a bound
+    // evaluation, and currentness is the claim under test here.
+    let stale_preconditions = AbsencePreconditions::derive(
+        &account,
+        &records,
+        None,
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: None,
+            admitted_query: None,
+            retained_evaluation: None,
+        },
+    )
+    .expect("preconditions over a stale record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &stale_preconditions) else {
+        panic!("a record past its frozen freshness boundary must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=record_stale_at_assessment"),
+        "the stale member and its specific unmet join must be retained: {reason}"
+    );
+}
+
+#[test]
+fn absence_missing_handle_is_unproven() {
+    // A closing member with no acquired handle is the same evidence with the
+    // accounting-to-record join impossible: the member *is* closed as `Observed`,
+    // so nothing of the denominator is left open, yet no handle exists that could
+    // resolve that closure to a vetted record. Completeness is proved on the
+    // frozen scope (I21-06: `complete_scope` is the only basis on which a scoped
+    // absence may be claimed), so a member that cannot be joined to any record at
+    // all cannot support `Proven`.
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let (_, records, _, _) = proven_absence();
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        // Every member carries the same handle the vetted record map is keyed by,
+        // except `primary#0`: it is closed with no handle at all, which is the
+        // accounting this case is about.
+        account
+            .record(
+                member,
+                SourceDisposition::Observed,
+                if member == "primary#0" {
+                    None
+                } else {
+                    Some(format!("src-{member}"))
+                },
+            )
+            .expect("record");
+    }
+    // No bound evaluation and no manifest, on purpose: the manifest
+    // `proven_absence()` built commits that fixture's accounting and coverage
+    // digest, not this one, and presenting it here would report an accounting
+    // mismatch instead of the join under test. The handle join applies on its own
+    // without an evaluation, and it is returned first for a member that closed
+    // with no handle.
+    let handle_less = AbsencePreconditions::derive(
+        &account,
+        &records,
+        None,
+        ASSESSMENT_MS,
+        &inquiry_denominator_digest(),
+        PresentedEvaluation {
+            evaluation: None,
+            admitted_query: None,
+            retained_evaluation: None,
+        },
+    )
+    .expect("preconditions over a missing handle");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &handle_less) else {
+        panic!("a closing member with no acquired handle must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=missing_acquired_handle"),
+        "the handle-less member and its specific unmet join must be retained: {reason}"
+    );
+}
+
+#[test]
+fn absence_foreign_scope_is_unproven() {
+    // A foreign scope is the same positive evidence with the scope binding broken:
+    // every closing member still resolves to its own vetted record, the manifest
+    // still commits those exact records and the owner-issued evaluation still
+    // carries a result for every member — but that evaluation was bounded to the
+    // digest of the frozen scope snapshot this suite shares, while the claim is
+    // scoped to `DIGEST_A`. Completeness is proved on the frozen scope (I21-06:
+    // `complete_scope` is the only basis on which a scoped absence may be claimed),
+    // so evidence bounded to a different snapshot cannot support `Proven` however
+    // complete it is over its own.
+    //
+    // `AbsencePreconditions::derive` checks only the *shape* of the frozen scope
+    // digest, and `DIGEST_A` is a well-formed 64-hex digest, so the preconditions
+    // are derived rather than refused there; the binding of the evaluation to the
+    // claimed scope is `assess_absence`'s own work at `foreign_evaluation_scope`
+    // (`src/evidence_portfolio.rs`).
+    let (account, records, manifest, evaluation) = proven_absence();
+    let retained_eval = evaluation.clone();
+    let foreign = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        DIGEST_A,
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
+    )
+    .expect("preconditions over a foreign scope");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &foreign) else {
+        panic!("an evaluation bounded to a different frozen scope must not prove absence");
+    };
+    assert!(
+        reason.contains(&format!("not to {DIGEST_A}")),
+        "the scope the claim is scoped to must be retained: {reason}"
+    );
+}
+
+#[test]
+fn absence_issuer_blank_predicate_refused() {
+    // The issuer's own predicate identity is one of the twenty commitments it
+    // attests to, so a blank one is an evaluation over an arbitrary string
+    // rather than over an identified predicate. Completeness is proved on the
+    // frozen scope (I21-06: `complete_scope` is the only basis on which a scoped
+    // absence may be claimed), and a claim whose predicate identity is blank
+    // cannot be the predicate that completeness was proved for, so the issuer
+    // refuses to exist rather than mint one. Only `predicate_id` is mutated here;
+    // every other owner commitment is the value `issued_evaluation` holds, so the
+    // refusal names this field alone.
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = String::new();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a blank predicate identity must be refused");
+    // `Blank` renders as `{field} must be non-blank`, so the display is what
+    // names the exact field path the constructor refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Blank { .. }),
+        "a blank identity must be refused as `Blank`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.predicate_id"),
+        "the refused field must be the predicate identity itself: {rendered}"
+    );
+}
+
+#[test]
+fn absence_issuer_blank_index_refused() {
+    // The same refusal on the other identity this pair covers: the revision of
+    // the source/index the predicate runs against. A blank index revision attests
+    // to an evaluation over whatever the index happened to hold at claim time, so
+    // the exact-negative claim it would back is not the one completeness was
+    // proved for on the frozen scope (I21-06: `complete_scope` is the only basis
+    // on which a scoped absence may be claimed). Only `index_revision` is
+    // mutated, so this names its own field rather than the predicate identity
+    // the sibling case refuses.
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.index_revision = String::new();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a blank index identity must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Blank { .. }),
+        "a blank identity must be refused as `Blank`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.index_revision"),
+        "the refused field must be the index identity itself: {rendered}"
+    );
+}
+
+/// A well-formed predicate the admitted query does not carry is a
+/// different query, not a malformed one (issue #2893 W10/A2): every
+/// shape validation passes, so the admitted binding is what refuses
+/// the mint. Only `predicate_id` is mutated, so this names that
+/// binding alone.
+#[test]
+fn absence_unadmitted_predicate_refused_at_issuance() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a predicate the admitted query does not carry must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unadmitted predicate identity must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.predicate_id"),
+        "the refused field must be the predicate identity binding itself: {rendered}"
+    );
+}
+
+/// The same refusal on the other half of the admitted binding: a
+/// well-formed but unadmitted index revision passes every shape
+/// validation, so the admitted comparison is what refuses the mint.
+/// Only `index_revision` is mutated, so this names that binding alone.
+#[test]
+fn absence_unadmitted_index_refused_at_issuance() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.index_revision = "index-UNADMITTED.9".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("an index revision the admitted query does not carry must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unadmitted index revision must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.index_revision"),
+        "the refused field must be the index revision binding itself: {rendered}"
+    );
+}
+
+#[test]
+fn absence_issuer_foreign_scope_refused() {
+    // The issuer holds the frozen scope its evaluation is bounded to, so an
+    // issuer asked to attest a scope it does not hold would mint a record whose
+    // own `scope_digest` contradicts the completeness it claims. Completeness is
+    // proved on the frozen scope (I21-06: `complete_scope` is the only basis on
+    // which a scoped absence may be claimed), so the binding is the issuer's to
+    // refuse at minting rather than the assessor's to discover on readback:
+    // `issue_for` runs `check_scope_binding` before any other commitment, and
+    // `DIGEST_A` is a well-formed digest, so this refusal names the scope binding
+    // alone.
+    //
+    // The positive control first pins that the unmutated helper value issues
+    // exactly what `issued_evaluation` issues, so the refusal below is caused by
+    // the mutated scope alone.
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+    issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("positive control issues");
+
+    let bad =
+        NoMatchEvaluationIssuer::new(issuer_params_for(&manifest, DIGEST_A), &admitted_query())
+            .expect("issuer holds another scope");
+    let err = bad
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect_err("a foreign scope must be refused");
+    // `Conflict` renders as `{field} conflicts with frozen content`, so the display
+    // is what names the exact field path the issuer refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a foreign frozen scope must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.scope_digest"),
+        "the refused field must be the scope binding itself: {rendered}"
+    );
+}
+
+/// The issuer holds the exact revision of the manifest it attests, so an issuer
+/// asked to mint against a manifest it does not hold would produce a record whose
+/// own commitments claim completeness on a revision of the sources it never
+/// reviewed. Completeness is proved on the frozen scope and the exact frozen
+/// source revision (I21-06: `complete_scope` is the only basis on which a scoped
+/// absence may be claimed), so the revision binding is the issuer's to refuse at
+/// minting rather than the assessor's to discover on readback.
+///
+/// The scope binding passes here, so the refusal is caused by the revision alone:
+/// `issue_for` runs `check_manifest_binding` after `check_scope_binding`, and the
+/// presented manifest still carries the digest, scope and denominator the issuer
+/// holds - only its frozen `revision` is one the issuer did not take.
+#[test]
+fn absence_issuer_manifest_revision_refused() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.manifest_revision = ABSENCE_MANIFEST_REVISION + 1;
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let err = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect_err("a manifest revision the issuer does not hold must be refused");
+    // `Conflict` renders as `{field} conflicts with frozen content`, so the display
+    // is what names the exact field path the issuer refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unheld manifest revision must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.manifest_revision"),
+        "the refused field must be the manifest revision binding itself: {rendered}"
+    );
+}
+
+/// An accounting that never enumerated its whole denominator cannot back a
+/// scoped absence claim.
+///
+/// Completeness is proved on the frozen scope, and `complete_scope` is the only
+/// basis on which a scoped absence may be claimed (I21.6: `denominator_kind =
+/// complete_scope` is the only basis on which a scoped absence may be claimed).
+/// An account opened over the exact denominator members that records only some
+/// of them still holds the rest open, so the enumeration this record would
+/// claim never completed — the unrecorded member is not a disposition at all,
+/// it is a missing step. The authorized manifest here commits that exact
+/// accounting (`coverage_digest` is this account's own digest) and the issuer
+/// holds the presented manifest and the frozen scope, so both bindings pass and
+/// `check_enumeration` is what refuses, before any per-member join runs.
+///
+/// The refusal names the enumeration rather than a disposition: a member
+/// recorded `Unknown` would be closed but non-closing and would take the later
+/// per-member refusal path instead, so the two cases stay distinguishable.
+#[test]
+fn absence_issuer_open_enumeration_refused() {
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let (_, records, _, _) = proven_absence();
+
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        // Skipping the `record` call is what leaves `primary#0` one of the
+        // account's `open_members`: the accounting enumerated its denominator
+        // only partially. A `Unknown` disposition would close the member and
+        // take a different refusal path.
+        if member == "primary#0" {
+            continue;
+        }
+        account
+            .record(
+                member,
+                SourceDisposition::Observed,
+                Some(format!("src-{member}")),
+            )
+            .expect("record");
+    }
+
+    // The manifest is the same authorized manifest `proven_absence` freezes,
+    // field for field, over the same records and denominator; only the
+    // `coverage_digest` is this account's own, so the manifest commits the
+    // partial accounting instead of the complete one.
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: ABSENCE_MANIFEST_REVISION,
+    })
+    .expect("authorized manifest");
+
+    let scope_digest = inquiry_denominator_digest();
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+    let err = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect_err("an unclosed enumeration must be refused");
+    // `IncompleteDenominator` renders as `{field} is not an exact accounted
+    // denominator`, so the display is what names the exact field path refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::IncompleteDenominator { .. }),
+        "an unclosed enumeration must be refused as `IncompleteDenominator`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.open_members"),
+        "the refused field must be the unclosed enumeration itself: {rendered}"
+    );
+}
+
+/// The owner issuer attests what it observed and only while its account remains
+/// current, so it refuses an assessment instant its own window does not cover.
+///
+/// The scope, manifest and enumeration bindings all pass on this exact setup, so
+/// the refusal is caused by the instant alone: `issue_for` runs
+/// `check_observation_window` after `check_scope_binding`,
+/// `check_manifest_binding` and `check_enumeration`. Both directions matter and
+/// are distinct fields: an instant before the issuer observed anything cannot be
+/// inside an observation it has not made yet, and an instant past its
+/// currentness bound would assess a window that has already gone stale — either
+/// one would let a scoped absence claim rest on completeness the issuer cannot
+/// vouch for (I21-06: `complete_scope` is the only basis on which a scoped
+/// absence may be claimed).
+#[test]
+fn absence_issuer_observation_window_refused() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    // `issuer_params_for` holds `observed_at_ms = 1_700_000_250_000` and
+    // `current_until_ms = 1_700_000_400_000`, so the two instants below sit just
+    // outside either edge of that window.
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+
+    // Too early: the issuer is asked to attest an observation taken before it
+    // observed anything.
+    let err = issuer
+        .issue_for(
+            &account,
+            &records,
+            &manifest,
+            &scope_digest,
+            1_700_000_200_000,
+        )
+        .expect_err("an instant before the observation must be refused");
+    // `Conflict` renders as `{field} conflicts with frozen content`, so the
+    // display is what names the exact field path the issuer refused.
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an instant before the observation must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.observed_at_ms"),
+        "the refused field must be the observation instant itself: {rendered}"
+    );
+
+    // Too late: the issuer is asked to attest inside a window that already
+    // expired at minting time.
+    let err = issuer
+        .issue_for(
+            &account,
+            &records,
+            &manifest,
+            &scope_digest,
+            1_700_000_500_000,
+        )
+        .expect_err("an instant past the currentness bound must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an instant past the currentness bound must be refused as `Conflict`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.current_until_ms"),
+        "the refused field must be the currentness bound itself: {rendered}"
+    );
+}
+
+/// A vetted record rewritten after the owner issued its result no longer commits
+/// that result, so the same evidence that proved absence over the original bytes
+/// stops proving anything.
+///
+/// The handle, the accounting, the manifest and the evaluation are exactly
+/// `proven_absence`'s; only the bytes behind one member differ, so the per-member
+/// result the owner minted no longer names the record now standing behind that
+/// member. `member_join_reason` compares the result's `record_digest` against the
+/// joined record's own canonical digest before staleness and before the manifest
+/// joins, so the retained reason is the digest mismatch itself (I21-06:
+/// `complete_scope` is the only basis on which a scoped absence may be claimed).
+#[test]
+fn absence_changed_record_breaks_result_binding() {
+    let (account, mut records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    // Any field change alters the record's canonical digest, so the result issued
+    // over the original record no longer commits this one.
+    let mut params = source_params("src-primary#0");
+    params.title = "a changed title for src-primary#0".to_owned();
+    let changed = SourceRecord::new(params).expect("changed record");
+    records.insert("src-primary#0".to_owned(), changed);
+    let retained_eval = evaluation.clone();
+    let changed_binding = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
+    )
+    .expect("preconditions over a changed record");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &changed_binding) else {
+        panic!("a changed vetted record must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#0=result_record_digest_mismatch"),
+        "the changed member and its specific unmet join must be retained: {reason}"
+    );
 }
 
 // WORK_UNIT_CASE: 700/11
@@ -1157,4 +1801,677 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
     assert!(GOLDEN.contains("INCOMPLETE_ACCOUNTING"));
     assert!(GOLDEN.contains("SUPPORTED"));
     assert!(GOLDEN.contains("weakest_link"));
+}
+
+#[test]
+fn absence_issuer_nonblank_predicate_refused() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "no-match/absent-valley-alloy\u{7}".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a control-bearing predicate identity must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::ControlCharacter { .. }),
+        "a control-bearing identity must be refused as `ControlCharacter`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.predicate_id"),
+        "the refused field must be the predicate identity itself: {rendered}"
+    );
+}
+
+#[test]
+fn absence_issuer_nonblank_index_refused() {
+    let (_, _, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.index_revision = "index-700.1\u{7}".to_owned();
+    let err = NoMatchEvaluationIssuer::new(params, &admitted_query())
+        .expect_err("a control-bearing index revision must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::ControlCharacter { .. }),
+        "a control-bearing revision must be refused as `ControlCharacter`, not as some other refusal: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_issuer.index_revision"),
+        "the refused field must be the index revision itself: {rendered}"
+    );
+}
+
+#[test]
+fn absence_closed_denominator_missing_result_is_unproven() {
+    let (_, mut records, _, evaluation) = proven_absence();
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let mut members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    members.push("primary#extra".to_owned());
+    let mut account = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
+        let handle = format!("src-{member}");
+        if member == "primary#extra" {
+            records.insert(handle.clone(), record(&handle));
+        }
+        account
+            .record(member, SourceDisposition::Observed, Some(handle))
+            .expect("record");
+    }
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: ABSENCE_MANIFEST_REVISION,
+    })
+    .expect("authorized manifest");
+    let scope_digest = inquiry_denominator_digest();
+    let retained_eval = evaluation.clone();
+    let preconditions = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: Some(evaluation),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_eval),
+        },
+    )
+    .expect("preconditions over a closed denominator with a missing result");
+    let AbsenceVerdict::Unproven { reason } = assess_absence(&account, &preconditions) else {
+        panic!("a closed member with no owner-issued result must not prove absence");
+    };
+    assert!(
+        reason.contains("primary#extra=no_predicate_result"),
+        "the result-less member and its specific unmet join must be retained: {reason}"
+    );
+    assert!(
+        reason.contains("5 closed member(s)"),
+        "all five members must be closed (no open/unclosed arm may fire first): {reason}"
+    );
+}
+
+#[test]
+fn absence_replay_is_identical_under_one_identity() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let issuer_a = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+    let eval_a = issuer_a
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("first issuance");
+    let issuer_b = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+    let eval_b = issuer_b
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("replayed issuance");
+    assert_eq!(
+        eval_a.canonical_digest().expect("digest"),
+        eval_b.canonical_digest().expect("digest"),
+        "an exact replay under one admitted identity must be byte-identical"
+    );
+    assert_eq!(
+        eval_a.canonical_bytes().expect("canonical bytes"),
+        eval_b.canonical_bytes().expect("canonical bytes"),
+        "an exact replay must preserve the actual canonical bytes"
+    );
+    eval_a
+        .check_replay_consistency(&eval_b)
+        .expect("an exact replay is consistent");
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_predicate() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_form = "exists(snapshot_bytes, alloy == other_alloy) == false".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the predicate bytes must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed predicate must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed predicate under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.predicate_form"),
+        "the conflict must name the predicate bytes: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_source_revision() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.source_revision = "corpus-700.2".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the source revision must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed source revision must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed source revision under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.source_revision"),
+        "the conflict must name the source revision: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_evaluator() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.evaluator_id = "no-match-evaluator-701".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the evaluator identity must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed evaluator must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed evaluator under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string().contains("no_match_evaluation.evaluator_id"),
+        "the conflict must name the evaluator identity: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_member_result() {
+    let (account, mut records, _, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = source_params("src-primary#0");
+    params.title = "a changed title for src-primary#0".to_owned();
+    records.insert(
+        "src-primary#0".to_owned(),
+        SourceRecord::new(params).expect("changed record"),
+    );
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let allowlist: Vec<String> = records.keys().cloned().collect();
+    let manifest = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: inquiry.digest.clone(),
+        denominator_digest: inquiry.denominator_digest(),
+        sources: records
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    handle.clone(),
+                    ManifestSource {
+                        record_digest: entry.digest().expect("source record commitment"),
+                        content_digest: entry.content_digest.clone(),
+                        transformed_from: entry.transformed_from.clone(),
+                    },
+                )
+            })
+            .collect(),
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: vec!["grade: weakest link applies".to_owned()],
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: DisclosureClass::ProjectBound,
+        expires_ms: 1_900_000_000_000,
+        revision: ABSENCE_MANIFEST_REVISION,
+    })
+    .expect("authorized manifest");
+    let issuer = NoMatchEvaluationIssuer::new(
+        issuer_params_for(&manifest, &scope_digest),
+        &admitted_query(),
+    )
+    .expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the member result must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed member result must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed member result under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string().contains("no_match_evaluation.results"),
+        "the conflict must name the member results: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_work_scope() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.work_scope = "propulsion acoustic envelope".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the work scope must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed work scope must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed work scope under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.canonical_body"),
+        "the conflict must name the canonical body: {err}"
+    );
+}
+
+#[test]
+fn absence_replay_conflicts_on_changed_scope_revision() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.scope_revision = "scope-700.2".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        changed.canonical_digest().expect("digest"),
+        "the scope revision must be load-bearing in the record identity"
+    );
+    let err = evaluation
+        .check_replay_consistency(&changed)
+        .expect_err("same identity with a changed scope revision must conflict");
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a changed scope revision under one identity must conflict: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("no_match_evaluation.canonical_body"),
+        "the conflict must name the canonical body: {err}"
+    );
+}
+
+/// A well-formed evaluation under a different predicate identity is a
+/// different claim, not a replay (issue #2893 W10/A2 round-2).
+///
+/// The admitted issuer holds `no-match/absent-valley-alloy`. An issuer
+/// holding the well-formed but unadmitted `unadmitted-arbitrary-predicate`
+/// still issues successfully over the same closed account, vetted records
+/// and authorized manifest — issuance joins the presented evidence against
+/// the issuer's own held commitments, and a different predicate is a
+/// different admitted identity, not malformed text. Across the two records
+/// `check_replay_consistency` is `Ok`: records under different identities
+/// are different claims and nothing is compared.
+#[test]
+fn absence_foreign_predicate_is_a_different_claim() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let foreign_issuer = NoMatchEvaluationIssuer::new(
+        params,
+        &AdmittedQueryCommitments::new(
+            "unadmitted-arbitrary-predicate".to_owned(),
+            "index-700.1".to_owned(),
+        )
+        .expect("foreign admitted"),
+    )
+    .expect("foreign issuer");
+    let foreign = foreign_issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("well-formed foreign issuance still issues");
+    assert_ne!(
+        evaluation.canonical_digest().expect("digest"),
+        foreign.canonical_digest().expect("digest"),
+        "the predicate identity must be load-bearing in the record identity"
+    );
+    evaluation
+        .check_replay_consistency(&foreign)
+        .expect("different admitted identities are different claims, never a conflict");
+}
+
+/// Assessing a well-formed foreign-predicate evaluation pins the retained
+/// gap (issue #2893 W10/A2 round-2).
+///
+/// The foreign record above is fully self-consistent: it was issued over
+/// the real closed account, vetted records and authorized manifest, so every
+/// join `AbsencePreconditions::derive` performs recomputes cleanly and the
+/// verdict is `Proven`. That verdict proves only the record's own
+/// consistency — this crate holds no predicate registry or admission ledger
+/// against which the presented `predicate_id` could be bound to the
+/// inquiry's admitted query (stated residual on `NoMatchEvaluation`; owner
+/// route: the live evaluator composition, #1762). A caller that mints a
+/// second well-formed issuer answers a different query and still closes.
+/// This test pins that behavior so the gap stays visible instead of being
+/// covered by a malformed-text shape check.
+#[test]
+fn absence_presented_without_retained_refused_on_consuming_path() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let foreign_admitted = AdmittedQueryCommitments::new(
+        "unadmitted-arbitrary-predicate".to_owned(),
+        "index-700.1".to_owned(),
+    )
+    .expect("foreign admitted");
+    let foreign_issuer =
+        NoMatchEvaluationIssuer::new(params, &foreign_admitted).expect("foreign issuer");
+    let foreign = foreign_issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("well-formed foreign issuance still issues");
+    // The admitted join passes (foreign admitted matches the presented
+    // record), so the refusal below names the retained join alone.
+    let err = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: Some(foreign),
+            admitted_query: Some(&foreign_admitted),
+            retained_evaluation: None,
+        },
+    )
+    .expect_err("a presented record with no retained record must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a presented-but-unretained record must be refused as `Conflict`: {rendered}"
+    );
+    assert!(
+        rendered.contains("absence.presented_without_retained"),
+        "the refusal must name the retained join itself: {rendered}"
+    );
+}
+
+/// A presented record answering a query the admitted side does not carry
+/// refuses on the consuming path even when a retained twin exists (issue
+/// #2893 W10/A2-consume): the retained join passes (twin of the presented
+/// record), so the refusal below names the admitted join alone.
+#[test]
+fn absence_unadmitted_presented_refused_on_consuming_path() {
+    let (account, records, manifest, _) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.predicate_id = "unadmitted-arbitrary-predicate".to_owned();
+    let foreign_admitted = AdmittedQueryCommitments::new(
+        "unadmitted-arbitrary-predicate".to_owned(),
+        "index-700.1".to_owned(),
+    )
+    .expect("foreign admitted");
+    let foreign_issuer =
+        NoMatchEvaluationIssuer::new(params, &foreign_admitted).expect("foreign issuer");
+    let foreign = foreign_issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("well-formed foreign issuance still issues");
+    let retained_foreign = foreign.clone();
+    let err = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: Some(foreign),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&retained_foreign),
+        },
+    )
+    .expect_err("a presented record under an unadmitted query must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "an unadmitted presented record must be refused as `Conflict`: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_evaluation.predicate_id"),
+        "the refusal must name the predicate identity binding itself: {rendered}"
+    );
+}
+
+/// A presented record diverging from the retained record under one admitted
+/// identity refuses on the consuming path (issue #2893 A5/W8-consume): the
+/// admitted join passes (predicate and index unchanged), so the refusal below
+/// names the replay join alone.
+#[test]
+fn absence_replay_conflict_refused_on_consuming_path() {
+    let (account, records, manifest, evaluation) = proven_absence();
+    let scope_digest = inquiry_denominator_digest();
+    let mut params = issuer_params_for(&manifest, &scope_digest);
+    params.work_scope = "propulsion acoustic envelope".to_owned();
+    let issuer = NoMatchEvaluationIssuer::new(params, &admitted_query()).expect("owner issuer");
+    let changed = issuer
+        .issue_for(&account, &records, &manifest, &scope_digest, ASSESSMENT_MS)
+        .expect("changed issuance still issues");
+    let err = AbsencePreconditions::derive(
+        &account,
+        &records,
+        Some(&manifest),
+        ASSESSMENT_MS,
+        &scope_digest,
+        PresentedEvaluation {
+            evaluation: Some(changed),
+            admitted_query: Some(&admitted_query()),
+            retained_evaluation: Some(&evaluation),
+        },
+    )
+    .expect_err("a presented record diverging from the retained record must be refused");
+    let rendered = err.to_string();
+    assert!(
+        matches!(err, PortfolioError::Conflict { .. }),
+        "a same-identity divergence must be refused as `Conflict`: {rendered}"
+    );
+    assert!(
+        rendered.contains("no_match_evaluation.canonical_body"),
+        "the conflict must name the canonical body: {rendered}"
+    );
+}
+
+// Issue #1765 W1/A4/A5: the freeze carries its admission/persistence receipts
+// and owns its retained bytes. A freeze built by `EvidenceFreeze::freeze`
+// round-trips through `retained_bytes`/`reload` against itself with its digest
+// re-proved from the bytes; truncated bytes refuse as undecodable, and bytes
+// of another freeze refuse as the wrong origin.
+const FREEZE_DIGEST: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+fn freeze_profile() -> InquiryProtocolProfile {
+    let grade = EvidenceGrade::from_name("CORROBORATED").expect("canonical grade");
+    InquiryProtocolProfile {
+        profile_id: "profile-fz-1".to_owned(),
+        revision: 1,
+        supersedes: None,
+        inquiry_id: "freeze-inq-1".to_owned(),
+        operation_id: "op-fz-1".to_owned(),
+        exchange_id: "ex-fz-1".to_owned(),
+        question: "which valve alloy survives the thermal envelope".to_owned(),
+        intended_decision_or_artifact: "decide valve alloy".to_owned(),
+        scope: "thermal envelope alloy review".to_owned(),
+        requester_principal: "principal-fz".to_owned(),
+        admitted_inquiry_digest: FREEZE_DIGEST.to_owned(),
+        protocol: InquiryProtocol::EvidenceReview,
+        selection_features_digest: FREEZE_DIGEST.to_owned(),
+        evidence_grade: grade,
+        lane: InquiryLane::Exploratory,
+        coverage_goal: CoverageGoal::Exhaustive,
+        admitted_coverage_goal: "exhaustive".to_owned(),
+        admitted_coverage_goal_resolved: true,
+        hypothesis_policy: HypothesisPolicy::FalsificationRequired,
+        truth_surfaces_and_admissible_providers: vec!["surface-fz".to_owned()],
+        admissible_source_classes: vec![SourceClass::Paper],
+        reference_manifest_digest: FREEZE_DIGEST.to_owned(),
+        admitted_denominator_digest: FREEZE_DIGEST.to_owned(),
+        independence_and_blinding_policy: IndependenceBlindingPolicy::resolve(
+            grade,
+            InquiryLane::Exploratory,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .expect("exploratory policy"),
+        independence_and_blinding_policy_digest: FREEZE_DIGEST.to_owned(),
+        registration_binding_digest: FREEZE_DIGEST.to_owned(),
+        fidelity_ceiling: "ceiling-fz".to_owned(),
+        stop_rule: InquiryStopRule::resolve(
+            8,
+            1_800_000_000_000,
+            StopRuleKind::BudgetOrDeadlineExhausted,
+            "cancel-fz",
+        )
+        .expect("stop rule"),
+        output_contract: InquiryOutputContract::resolve(
+            "result-schema-fz",
+            vec![ReopenCondition::NewEvidenceAvailable],
+        )
+        .expect("output contract"),
+        disclosure_ceiling: DisclosureClass::ProjectBound,
+        state_fence: fence(),
+        change_reason: "initial".to_owned(),
+        integrity_digest: FREEZE_DIGEST.to_owned(),
+    }
+}
+
+fn freeze_receipt(handle: &str) -> FreezeMemberReceipt {
+    FreezeMemberReceipt {
+        source_handle: handle.to_owned(),
+        admission_digest: FREEZE_DIGEST.to_owned(),
+        content_digest: FREEZE_DIGEST.to_owned(),
+        persistence_digest: FREEZE_DIGEST.to_owned(),
+        retained_artifact_ref: format!("artifact:{handle}"),
+    }
+}
+
+fn frozen(handle: &str, inquiry: &str) -> EvidenceFreeze {
+    let profile = freeze_profile();
+    EvidenceFreeze::freeze(
+        EvidenceFreezeParams {
+            inquiry_id: inquiry.to_owned(),
+            portfolio_digest: FREEZE_DIGEST.to_owned(),
+            manifest_digest: FREEZE_DIGEST.to_owned(),
+            coverage_receipt_digest: FREEZE_DIGEST.to_owned(),
+            evidence_set_id: "freeze-es-1".to_owned(),
+            included_evidence_refs: vec![handle.to_owned()],
+            member_receipts: vec![freeze_receipt(handle)],
+            excluded_evidence: Vec::new(),
+            unresolved_contradictions: Vec::new(),
+            open_research_debts: Vec::new(),
+            frozen_at_ms: 1_700_000_400_000,
+            supersedes: None,
+            supersede_reason: None,
+            expected_revision: None,
+        },
+        &profile,
+    )
+    .expect("freeze")
+}
+
+#[test]
+fn freeze_retained_bytes_reload_roundtrip() {
+    let origin = frozen("frz-a", "freeze-inq-1");
+    let bytes = origin.retained_bytes().expect("retained bytes");
+    let reloaded = EvidenceFreeze::reload(&bytes, &origin).expect("reload");
+    assert_eq!(
+        reloaded, origin,
+        "retained bytes reload to the freeze they were written from"
+    );
+    assert_eq!(
+        reloaded.digest, origin.digest,
+        "the digest is re-proved from the bytes, not trusted from outside"
+    );
+}
+
+#[test]
+fn freeze_reload_refuses_tampered_and_foreign() {
+    let origin = frozen("frz-a", "freeze-inq-1");
+    let bytes = origin.retained_bytes().expect("retained bytes");
+    let cut = &bytes[..bytes.len() - 10];
+    assert!(
+        matches!(
+            EvidenceFreeze::reload(cut, &origin),
+            Err(InquiryError::FreezeStoreDecode { .. })
+        ),
+        "truncated bytes are not a freeze of the declared shape"
+    );
+    let other = frozen("frz-b", "freeze-inq-1");
+    assert!(
+        matches!(
+            EvidenceFreeze::reload(&bytes, &other),
+            Err(InquiryError::UnknownHandle { .. })
+        ),
+        "bytes of another freeze are not the origin they are read against"
+    );
 }

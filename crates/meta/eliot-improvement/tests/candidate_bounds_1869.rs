@@ -724,6 +724,88 @@ fn cross_task_carryover_with_owner_issued_permit() {
 }
 
 #[test]
+fn cross_task_retrieval_with_owner_carryover_returns_cross_task() {
+    let now = OffsetDateTime::now_utc();
+    let governor = governor_1869(3);
+    let fence = fence_1869(3);
+    let backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
+    let permit = issue_learning_admission(&governor, &claim_1869(&fence, OVERLAY_1869, None))
+        .expect("owner issues for task-1869-a");
+    let verified = verify_learning_admission(&governor, &permit, &fence).expect("owner verifies");
+    let foreign_claim = LearningAdmissionClaim {
+        target_task_id: "task-1869-b".to_string(),
+        ..claim_1869(&fence, OVERLAY_1869, None)
+    };
+    let (cross_permit, record) = permit
+        .issue_cross_task_admission(&governor, &foreign_claim)
+        .expect("owner mints a distinct cross-task admission for task-1869-b");
+    let verified_cross = verify_learning_admission(&governor, &cross_permit, &fence)
+        .expect("owner verifies cross-task permit");
+    let carryover = CrossTaskCarryover::verify(
+        &governor,
+        &verified,
+        &verified_cross,
+        &record,
+        &fence,
+        &fence,
+    )
+    .expect("owner-issued pair carries over");
+    let decision = retrieve_governed(GovernedRetrieval {
+        requesting_campaign_id: CAMPAIGN_1869,
+        requesting_task_id: "task-1869-b",
+        overlay: &backing_overlay_1869(&fence, now),
+        reusable: None,
+        draft_delta_present: false,
+        cross_task: Some(&carryover),
+        backlog: &backlog,
+        verified: &verified,
+        now,
+    })
+    .expect("owner-carried cross-task retrieval succeeds");
+    assert!(
+        decision.cross_task,
+        "foreign-task retrieval with a carryover is cross-task"
+    );
+    assert_eq!(
+        decision.cross_task_admission_id,
+        Some(record.admission_id.clone())
+    );
+}
+
+#[test]
+fn unclosed_reusable_refused_at_governed_gate() {
+    let governor = governor_1869(3);
+    let fence = fence_1869(3);
+    let backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
+    let now = OffsetDateTime::now_utc();
+    let permit = issue_learning_admission(
+        &governor,
+        &claim_1869(&fence, OVERLAY_1869, Some("candidate-reusable-1869")),
+    )
+    .expect("owner issues");
+    let verified = verify_learning_admission(&governor, &permit, &fence).expect("owner verifies");
+    let unclosed = ReusableCandidateRef {
+        candidate_id: "candidate-reusable-1869".to_string(),
+        closure_ref: None,
+        owner: Some(AUTHORITY_1869.to_string()),
+        origin_campaign_id: CAMPAIGN_1869.to_string(),
+    };
+    let err = retrieve_governed(GovernedRetrieval {
+        requesting_campaign_id: CAMPAIGN_1869,
+        requesting_task_id: TASK_1869,
+        overlay: &backing_overlay_1869(&fence, now),
+        reusable: Some(&unclosed),
+        draft_delta_present: false,
+        cross_task: None,
+        backlog: &backlog,
+        verified: &verified,
+        now,
+    })
+    .expect_err("unclosed reusable never reaches assembly");
+    assert_eq!(err, BoundsError::UnclosedReusable);
+}
+
+#[test]
 fn archived_reusable_loses_retrieval() {
     let now = OffsetDateTime::now_utc();
     let governor = governor_1869(3);
