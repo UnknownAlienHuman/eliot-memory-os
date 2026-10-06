@@ -41352,4 +41352,98 @@ mod bridge_handoff_retirement_2731 {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    #[test]
+    fn repair_restores_handoff_under_original_identity() -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item A4: a handoff lost to a crash (simulated here by
+        // removing its row straight from the table) is restored under the
+        // ORIGINAL identity — same key, sequence, digest — while a namespace
+        // with no staged events gains nothing: repair never synthesizes.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=2_u64 {
+            let tag = format!("rep-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        let lost_key = format!("{namespace}::rep-2731-00001");
+        {
+            let write = store.database.begin_write().map_err(storage)?;
+            {
+                let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                handoffs.remove(lost_key.as_str()).map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+        }
+        let repaired = store.repair_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            repaired.get("repaired").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "repair must restore exactly the lost handoff"
+        );
+        // The restored handoff binds the original identity: acknowledgement
+        // plus reconcile accept both events with no conflict.
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": 2,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(&namespace, 2, &"b".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "the restored handoff must reconcile under its original identity"
+        );
+        // A namespace with no staged events gains nothing: repair of a
+        // never-staged (unknown but well-formed) identity refuses with
+        // RecoveryOwnerMismatch instead of synthesizing a handoff, and a
+        // repeat repair with nothing lost restores nothing.
+        let unknown_namespace = "c".repeat(64);
+        assert_ne!(
+            unknown_namespace, namespace,
+            "the unknown probe must not collide with the staged namespace"
+        );
+        let unknown_repair = store.repair_bridge_event_handoffs_checked(&json!({
+            "namespace": unknown_namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }));
+        assert!(
+            matches!(unknown_repair, Err(OrsError::RecoveryOwnerMismatch)),
+            "repair of a never-staged identity must refuse, got {unknown_repair:?}"
+        );
+        let repeat = store.repair_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            repeat.get("repaired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "repair with nothing lost must restore nothing"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }
