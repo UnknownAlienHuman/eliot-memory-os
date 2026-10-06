@@ -1,29 +1,39 @@
 //! Issue #955 spool backup snapshot and isolated-restore proofs (T1..T18).
 //!
-//! Drives the real [`eliot_watchdog`] backup helpers over real temporary
-//! `watchdog.redb` spools: owner-held [`eliot_watchdog::WatchdogSpoolFence`]
-//! capture through [`eliot_watchdog::capture_fence`], bounded
-//! [`eliot_watchdog::read_page`] paging, isolated-destination gating, the
-//! import replay ledger, restore-chain validation, lost-response
+//! Drives the real owner path over real temporary `watchdog.redb` spools: the
+//! owner-bound [`eliot_watchdog::WatchdogBackupPort`] reached through
+//! [`eliot_watchdog::KernelWatchdogPort::spool_backup_port`], owner-held
+//! [`eliot_watchdog::WatchdogSpoolFence`] capture through
+//! [`eliot_watchdog::WatchdogBackupPort::snapshot`], bounded paging through
+//! [`eliot_watchdog::WatchdogBackupPort::read_page`], isolated-destination
+//! gating, the import replay ledger, restore-chain validation, lost-response
 //! reconciliation, and purge/source-identity retention. Six frozen JSON
 //! fixtures under `tests/data/spool-backup/` carry the exact header,
 //! denominator, disposition, destination, and ledger expectations; no test
 //! invents canned fences.
+//!
+//! The port enforces the owner clock's capture-age window (default
+//! `page_ttl_ms == snapshot_lifetime_ms == 60_000`), so owner-path captures
+//! seed entries at fresh wall-clock timestamps. The stale `capture_mixed`
+//! helper (entries at 1970 + 1/2/3 s) remains ONLY for the T8 born-expired
+//! refusal leg, which proves the age window is enforced rather than
+//! shape-checked.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_watchdog::{
-    CaptureFenceParams, GapRecoveryReason, IndependentKernelSensor, SERVICE_NAME,
-    SpoolAppendOutcome, SpoolCoverageDenominator, SpoolError, SpoolFenceEntryKind,
+    CaptureFenceParams, GapRecoveryReason, IndependentKernelSensor, KernelWatchdogPort,
+    SERVICE_NAME, SpoolAppendOutcome, SpoolError, SpoolFenceEntryKind,
     SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
-    SpoolRestoreDisposition, SpoolRestoreStep, WatchdogExportSink, WatchdogSpoolAcknowledgement,
-    WatchdogSpoolBackupLimits, WatchdogSpoolEntry, WatchdogSpoolExportBatch,
-    WatchdogSpoolExportLimits, WatchdogSpoolFence, WatchdogSpoolHeader, WatchdogSpoolPayload,
-    WatchdogSpoolSnapshotPage, acceptance_allowed, capture_fence, check_page_continuation,
-    export_once, read_page, reconcile_restore, validate_isolated_destination,
-    validate_restore_chain, verify_page_digest, watchog_entry_views,
+    SpoolRestoreDisposition, SpoolRestoreStep, WatchdogBackupPort, WatchdogExportSink,
+    WatchdogSpoolAcknowledgement, WatchdogSpoolBackupLimits, WatchdogSpoolEntry,
+    WatchdogSpoolExportBatch, WatchdogSpoolExportLimits, WatchdogSpoolFence, WatchdogSpoolHeader,
+    WatchdogSpoolPayload, WatchdogSpoolSnapshotPage, acceptance_allowed, capture_fence,
+    check_page_continuation, export_once, read_page, reconcile_restore,
+    validate_isolated_destination, validate_restore_chain, verify_page_digest, watchog_entry_views,
 };
 use eliot_watchdog_core::{WatchdogSpoolEntryDisposition, WatchdogSpoolSinkDisposition};
 
@@ -158,24 +168,6 @@ fn seed_mixed(
     (sensor, dir, entries)
 }
 
-fn seed_heartbeats(
-    tag: &str,
-) -> (
-    IndependentKernelSensor,
-    std::path::PathBuf,
-    Vec<WatchdogSpoolEntry>,
-) {
-    let (sensor, dir) = open_sensor(tag);
-    append_stored(&sensor, 1_000, heartbeat_payload(tag, 101));
-    append_stored(&sensor, 2_000, heartbeat_payload(tag, 102));
-    append_stored(&sensor, 3_000, heartbeat_payload(tag, 103));
-    let entries = sensor
-        .retained_spool_entries_for_export_driver_test()
-        .expect("read retained spool");
-    assert_eq!(entries.len(), 3);
-    (sensor, dir, entries)
-}
-
 fn capture_mixed(
     tag: &str,
     operation: u64,
@@ -190,6 +182,97 @@ fn capture_mixed(
     let high_water = entries.last().expect("seeded entries").sequence;
     let fence = capture_fence(&header, &entries, high_water, &capture_params(operation))
         .expect("capture owner fence");
+    (sensor, dir, fence, entries)
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock before epoch")
+            .as_millis(),
+    )
+    .expect("clock fits u64")
+}
+
+/// Returns the owner-bound backup port of a test sensor.
+///
+/// This is the production route (`spool_backup_port` -> `WatchdogBackupPort`):
+/// the port binds every capture and page read against the owner's own retained
+/// installation identity (`installation-7`) and generation (`9`).
+fn owner_port(sensor: &IndependentKernelSensor) -> Arc<WatchdogBackupPort> {
+    sensor
+        .spool_backup_port()
+        .expect("test sensor carries the owner backup port")
+}
+
+fn seed_mixed_fresh(
+    tag: &str,
+) -> (
+    IndependentKernelSensor,
+    std::path::PathBuf,
+    Vec<WatchdogSpoolEntry>,
+) {
+    let (sensor, dir) = open_sensor(tag);
+    let now = now_ms();
+    append_stored(&sensor, now - 30_000, heartbeat_payload("hb1", 11));
+    append_stored(
+        &sensor,
+        now - 20_000,
+        gap_payload(GapRecoveryReason::AdmissionUnavailable),
+    );
+    append_stored(
+        &sensor,
+        now - 10_000,
+        recovery_payload("955 mixed seed", 33),
+    );
+    let entries = sensor
+        .retained_spool_entries_for_export_driver_test()
+        .expect("read retained spool");
+    assert_eq!(entries.len(), 3);
+    (sensor, dir, entries)
+}
+
+fn seed_heartbeats_fresh(
+    tag: &str,
+) -> (
+    IndependentKernelSensor,
+    std::path::PathBuf,
+    Vec<WatchdogSpoolEntry>,
+) {
+    let (sensor, dir) = open_sensor(tag);
+    let now = now_ms();
+    append_stored(&sensor, now - 30_000, heartbeat_payload(tag, 101));
+    append_stored(&sensor, now - 20_000, heartbeat_payload(tag, 102));
+    append_stored(&sensor, now - 10_000, heartbeat_payload(tag, 103));
+    let entries = sensor
+        .retained_spool_entries_for_export_driver_test()
+        .expect("read retained spool");
+    assert_eq!(entries.len(), 3);
+    (sensor, dir, entries)
+}
+
+/// Captures a fresh mixed seed through the owner port.
+///
+/// The fence carries the owner's bindings and passes the owner's own
+/// capture-age window, so every assertion below it proves the production
+/// capture path rather than the bare fence builder.
+fn capture_mixed_owner(
+    tag: &str,
+    operation: u64,
+) -> (
+    IndependentKernelSensor,
+    std::path::PathBuf,
+    WatchdogSpoolFence,
+    Vec<WatchdogSpoolEntry>,
+) {
+    let (sensor, dir, entries) = seed_mixed_fresh(tag);
+    let fence = owner_port(&sensor)
+        .snapshot(
+            capture_params(operation),
+            WatchdogSpoolBackupLimits::default(),
+        )
+        .expect("owner snapshot of fresh seed");
     (sensor, dir, fence, entries)
 }
 
@@ -210,7 +293,9 @@ fn cleanup(sensor: IndependentKernelSensor, dir: &std::path::Path) {
 // WORK_UNIT_CASE: 955/1
 #[test]
 fn owner_held_snapshot_includes_validated_header_and_high_water() {
-    let (sensor, dir, fence, entries) = capture_mixed("t1", 0x9551);
+    // Owner path: the fence below is captured through the owner-bound backup
+    // port, so its header, high water, and bindings are the owner's own.
+    let (sensor, dir, fence, entries) = capture_mixed_owner("t1", 0x9551);
     assert_eq!(fence.header_schema_version(), 1);
     assert_eq!(fence.header_first_sequence(), 1);
     assert_eq!(fence.header_next_sequence(), 4);
@@ -232,15 +317,19 @@ fn owner_held_snapshot_includes_validated_header_and_high_water() {
 // WORK_UNIT_CASE: 955/2
 #[test]
 fn wrong_requester_source_runtime_identity_rejected() {
-    let (sensor, dir, entries) = seed_mixed("t2");
-    let header = header_for(&entries);
-    let high_water = entries.last().expect("seeded entries").sequence;
+    // Owner path: every refusal below comes out of `WatchdogBackupPort::snapshot`,
+    // which binds the request against the owner-held installation identity and
+    // generation before the capture runs. The isolation root axis (a destination
+    // sharing the active Watchdog state root) is proved at import, not capture.
+    let (sensor, dir, _) = seed_mixed_fresh("t2");
+    let port = owner_port(&sensor);
+    let limits = WatchdogSpoolBackupLimits::default();
     let blank_requester = CaptureFenceParams {
         requester_principal: String::new(),
         ..capture_params(0x9552)
     };
     assert!(matches!(
-        capture_fence(&header, &entries, high_water, &blank_requester),
+        port.snapshot(blank_requester, limits),
         Err(SpoolError::Corrupt(_))
     ));
     let blank_source = CaptureFenceParams {
@@ -248,7 +337,7 @@ fn wrong_requester_source_runtime_identity_rejected() {
         ..capture_params(0x9552)
     };
     assert!(matches!(
-        capture_fence(&header, &entries, high_water, &blank_source),
+        port.snapshot(blank_source, limits),
         Err(SpoolError::Corrupt(_))
     ));
     let zero_generation = CaptureFenceParams {
@@ -256,7 +345,7 @@ fn wrong_requester_source_runtime_identity_rejected() {
         ..capture_params(0x9552)
     };
     assert!(matches!(
-        capture_fence(&header, &entries, high_water, &zero_generation),
+        port.snapshot(zero_generation, limits),
         Err(SpoolError::Corrupt(_))
     ));
     let malformed_operation = CaptureFenceParams {
@@ -264,7 +353,26 @@ fn wrong_requester_source_runtime_identity_rejected() {
         ..capture_params(0x9552)
     };
     assert!(matches!(
-        capture_fence(&header, &entries, high_water, &malformed_operation),
+        port.snapshot(malformed_operation, limits),
+        Err(SpoolError::Corrupt(_))
+    ));
+    // Owner-held bindings: a well-formed request for a FOREIGN installation or
+    // generation fails closed against the owner's retained values instead of
+    // producing a fence that claims the wrong provenance.
+    let foreign_installation = CaptureFenceParams {
+        source_installation: "installation-7-foreign".to_owned(),
+        ..capture_params(0x9552)
+    };
+    assert!(matches!(
+        port.snapshot(foreign_installation, limits),
+        Err(SpoolError::Corrupt(_))
+    ));
+    let foreign_generation = CaptureFenceParams {
+        watchdog_generation: 8,
+        ..capture_params(0x9552)
+    };
+    assert!(matches!(
+        port.snapshot(foreign_generation, limits),
         Err(SpoolError::Corrupt(_))
     ));
     cleanup(sensor, &dir);
@@ -273,19 +381,19 @@ fn wrong_requester_source_runtime_identity_rejected() {
 // WORK_UNIT_CASE: 955/3
 #[test]
 fn coherent_read_under_concurrent_append() {
-    let (sensor, dir, fence_before, _) = capture_mixed("t3", 0x9553);
-    append_stored(&sensor, 4_000, heartbeat_payload("t3-fourth", 44));
+    // Owner path: both fences and the pre-append page read go through the
+    // owner-bound port. The fourth append lands at a fresh timestamp so the
+    // post-append capture stays inside the owner's capture-age window.
+    let (sensor, dir, fence_before, _) = capture_mixed_owner("t3", 0x9553);
+    let port = owner_port(&sensor);
+    append_stored(&sensor, now_ms(), heartbeat_payload("t3-fourth", 44));
     let retained = sensor
         .retained_spool_entries_for_export_driver_test()
         .expect("read retained spool after append");
     assert_eq!(retained.len(), 4);
-    let fence_after = capture_fence(
-        &header_for(&retained),
-        &retained,
-        4,
-        &capture_params(0x9554),
-    )
-    .expect("capture after append");
+    let fence_after = port
+        .snapshot(capture_params(0x9554), WatchdogSpoolBackupLimits::default())
+        .expect("owner capture after append");
     assert_eq!(fence_before.retained_count(), 3);
     assert_eq!(fence_after.retained_count(), 4);
     assert_ne!(fence_before.content_digest, fence_after.content_digest);
@@ -293,17 +401,18 @@ fn coherent_read_under_concurrent_append() {
         .denominator()
         .validate_for_count(3)
         .expect("pre-append fence stays coherent");
-    read_page(&fence_before, 0, &page_limits(3, 3)).expect("pre-append page still reads");
+    port.read_page(&fence_before, 0)
+        .expect("pre-append page still reads through the owner");
     cleanup(sensor, &dir);
 }
 
 // WORK_UNIT_CASE: 955/4
 #[test]
 fn ordered_retained_entry_denominator_exact() {
-    let (sensor, dir, entries) = seed_heartbeats("t4");
-    let header = header_for(&entries);
-    let fence = capture_fence(&header, &entries, 3, &capture_params(0x9555))
-        .expect("capture heartbeat fence");
+    let (sensor, dir, _) = seed_heartbeats_fresh("t4");
+    let fence = owner_port(&sensor)
+        .snapshot(capture_params(0x9555), WatchdogSpoolBackupLimits::default())
+        .expect("owner capture of heartbeat fence");
     let sequences: Vec<u64> = fence.entries().iter().map(|entry| entry.sequence).collect();
     assert_eq!(sequences, vec![1, 2, 3]);
     assert_eq!(fence.denominator().retained_members, 3);
@@ -327,7 +436,7 @@ fn ordered_retained_entry_denominator_exact() {
 // WORK_UNIT_CASE: 955/5
 #[test]
 fn gap_pressure_recovery_visible_and_prevents_false_coverage() {
-    let (sensor, dir, fence, _) = capture_mixed("t5", 0x9556);
+    let (sensor, dir, fence, _) = capture_mixed_owner("t5", 0x9556);
     assert_eq!(fence.entries()[1].kind, SpoolFenceEntryKind::Gap);
     assert!(matches!(
         &fence.entries()[1].marker,
@@ -360,21 +469,28 @@ fn gap_pressure_recovery_visible_and_prevents_false_coverage() {
 // WORK_UNIT_CASE: 955/6
 #[test]
 fn snapshot_page_identity_and_cumulative_limits_cannot_drift() {
-    let (sensor, dir, fence, _) = capture_mixed("t6", 0x9557);
-    let limits = page_limits(2, 2);
-    limits.validate().expect("bounded page window");
-    let page: WatchdogSpoolSnapshotPage = read_page(&fence, 0, &limits).expect("read first page");
+    // Owner path: the page comes out of `WatchdogBackupPort::read_page`, which
+    // re-validates the fence, binds it to the owner's installation identity and
+    // generation, applies the owner's capture-age window, and pages under the
+    // port's admitted default window (256 members/page, so one page covers all
+    // three retained entries). The chain, digest, and tight-window legs below
+    // exercise the exact bounded primitives the port delegates to.
+    let (sensor, dir, fence, _) = capture_mixed_owner("t6", 0x9557);
+    let port = owner_port(&sensor);
+    page_limits(2, 2).validate().expect("bounded page window");
+    let page: WatchdogSpoolSnapshotPage =
+        port.read_page(&fence, 0).expect("owner reads first page");
     assert_eq!(page.snapshot_digest, fence.content_digest);
-    assert_eq!(page.cumulative_members, 2);
+    assert_eq!(page.cumulative_members, 3);
     assert_eq!(page.total_members, 3);
-    assert!(!page.complete);
+    assert!(page.complete);
     check_page_continuation(&fence.content_digest, &page).expect("bound continuation");
     assert!(check_page_continuation(&hex_digest(7), &page).is_err());
     verify_page_digest(&page).expect("page digest matches members");
     let mut tampered = page.clone();
     tampered.page_digest = hex_digest(8);
     assert!(verify_page_digest(&tampered).is_err());
-    assert!(read_page(&fence, 9, &limits).is_err());
+    assert!(port.read_page(&fence, 9).is_err());
     let tight = page_limits(1, 1);
     read_page(&fence, 0, &tight).expect("first tight page");
     assert!(read_page(&fence, 1, &tight).is_err());
@@ -384,6 +500,28 @@ fn snapshot_page_identity_and_cumulative_limits_cannot_drift() {
 // WORK_UNIT_CASE: 955/7
 #[test]
 fn expired_missing_duplicate_conflicting_entries_fail_explicitly() {
+    // Owner path first: an empty spool and an expired retained entry are both
+    // refused out of `WatchdogBackupPort::snapshot` with no fence issued.
+    let (empty_sensor, empty_dir) = open_sensor("t7-empty");
+    assert!(matches!(
+        owner_port(&empty_sensor)
+            .snapshot(capture_params(0x9570), WatchdogSpoolBackupLimits::default(),),
+        Err(SpoolError::Corrupt(_))
+    ));
+    cleanup(empty_sensor, &empty_dir);
+    let (stale_sensor, stale_dir) = open_sensor("t7-expired");
+    append_stored(&stale_sensor, 1_000, heartbeat_payload("t7-expired", 71));
+    append_stored(&stale_sensor, 0, heartbeat_payload("t7-expired", 72));
+    assert!(matches!(
+        owner_port(&stale_sensor)
+            .snapshot(capture_params(0x9570), WatchdogSpoolBackupLimits::default(),),
+        Err(SpoolError::Corrupt(_))
+    ));
+    cleanup(stale_sensor, &stale_dir);
+    // Corruption matrix for spool states the honest append path cannot mint
+    // (a missing sequence, a duplicated sequence, a header whose byte total no
+    // longer matches its members): the bare fence builder that the owner
+    // delegates to refuses each one explicitly.
     let base = heartbeat_payload("t7", 71);
     let make = |sequence: u64, at_ms: u64| WatchdogSpoolEntry {
         schema_version: 1,
@@ -425,6 +563,41 @@ fn expired_missing_duplicate_conflicting_entries_fail_explicitly() {
 // WORK_UNIT_CASE: 955/8
 #[test]
 fn counts_bytes_work_lifetime_boundaries() {
+    // Owner enforcement on top of the shape matrix below: the page-freshness /
+    // whole-snapshot lifetime windows and the bounded work ceiling are
+    // consulted against real retained evidence by `WatchdogBackupPort::snapshot`,
+    // not only shape-validated.
+    //
+    // A spool whose newest retained observation predates the admitted window
+    // yields a fence that could never be paged, so the owner refuses the
+    // born-expired capture with the identical reason a page read would give.
+    let (stale_sensor, stale_dir, _, _) = capture_mixed("t8-stale", 0x9558);
+    assert!(matches!(
+        owner_port(&stale_sensor)
+            .snapshot(capture_params(0x9558), WatchdogSpoolBackupLimits::default(),),
+        Err(SpoolError::Corrupt(_))
+    ));
+    cleanup(stale_sensor, &stale_dir);
+    // A well-formed window whose work ceiling sits below the real retained
+    // member count is refused against that count.
+    let (fresh_sensor, fresh_dir, _) = seed_mixed_fresh("t8-work");
+    let tight_work = WatchdogSpoolBackupLimits {
+        max_work_units: 1,
+        ..WatchdogSpoolBackupLimits::default()
+    };
+    tight_work
+        .validate()
+        .expect("narrower window stays bounded");
+    assert!(matches!(
+        owner_port(&fresh_sensor).snapshot(capture_params(0x9558), tight_work),
+        Err(SpoolError::Corrupt(_))
+    ));
+    // The same fresh spool captures fine under the admitted default window,
+    // proving the refusal above comes from the work ceiling and not the seed.
+    owner_port(&fresh_sensor)
+        .snapshot(capture_params(0x9550), WatchdogSpoolBackupLimits::default())
+        .expect("fresh spool captures under the admitted window");
+    cleanup(fresh_sensor, &fresh_dir);
     let base = WatchdogSpoolBackupLimits::default();
     base.validate().expect("default window is bounded");
     assert!(
@@ -504,14 +677,21 @@ fn counts_bytes_work_lifetime_boundaries() {
 // WORK_UNIT_CASE: 955/9
 #[test]
 fn no_canonical_ors_coherence_from_timestamps_alone() {
-    let (sensor, dir, entries) = seed_mixed("t9");
-    let header = header_for(&entries);
+    // Owner path: this owner holds nothing that could satisfy a cross-owner
+    // reference, so `WatchdogBackupPort::snapshot` refuses ANY capture naming
+    // a `canonical_ref` or an `ors_ref` — including the fence-equal pair a
+    // caller asserts. Coherence with another owner's capture belongs to the
+    // cross-owner fence protocol, and the honest outcome here is refusal, not
+    // a recorded reference.
+    let (sensor, dir, _) = seed_mixed_fresh("t9");
+    let port = owner_port(&sensor);
+    let limits = WatchdogSpoolBackupLimits::default();
     let timestamp_only = CaptureFenceParams {
         canonical_ref: Some(hex_digest(0xC440)),
         ..capture_params(0x9559)
     };
     assert!(matches!(
-        capture_fence(&header, &entries, 3, &timestamp_only),
+        port.snapshot(timestamp_only, limits),
         Err(SpoolError::Corrupt(_))
     ));
     let ors_only = CaptureFenceParams {
@@ -519,7 +699,7 @@ fn no_canonical_ors_coherence_from_timestamps_alone() {
         ..capture_params(0x9559)
     };
     assert!(matches!(
-        capture_fence(&header, &entries, 3, &ors_only),
+        port.snapshot(ors_only, limits),
         Err(SpoolError::Corrupt(_))
     ));
     let fence_equal = CaptureFenceParams {
@@ -528,15 +708,35 @@ fn no_canonical_ors_coherence_from_timestamps_alone() {
         coherence_fence_equal: true,
         ..capture_params(0x9559)
     };
-    let fence = capture_fence(&header, &entries, 3, &fence_equal).expect("fence-equal refs");
-    assert_eq!(fence.canonical_ref, Some(hex_digest(0xC440)));
-    assert_eq!(fence.ors_ref, Some(hex_digest(0x0A55)));
+    assert!(matches!(
+        port.snapshot(fence_equal, limits),
+        Err(SpoolError::Corrupt(_))
+    ));
     cleanup(sensor, &dir);
 }
 
 // WORK_UNIT_CASE: 955/10
 #[test]
 fn isolated_destination_differs_from_source_and_active() {
+    // Owner path: the port binds every capture to ITS OWN retained source
+    // installation, so a capture presented AS the isolated destination
+    // installation is refused as a foreign source — the owner never issues a
+    // fence that claims the destination's provenance. (The full import-side
+    // isolation proof needs an installer-admitted destination; see T17.)
+    let (owner_sensor, owner_dir, _) = seed_mixed_fresh("t10-owner");
+    let owner = owner_port(&owner_sensor);
+    let presented_as_destination = CaptureFenceParams {
+        source_installation: "installation-7-isolated-restore".to_owned(),
+        ..capture_params(0x955A)
+    };
+    assert!(matches!(
+        owner.snapshot(
+            presented_as_destination,
+            WatchdogSpoolBackupLimits::default(),
+        ),
+        Err(SpoolError::Corrupt(_))
+    ));
+    cleanup(owner_sensor, &owner_dir);
     validate_isolated_destination(
         "installation-7",
         "installation-7-isolated-restore",
@@ -565,7 +765,8 @@ fn isolated_destination_differs_from_source_and_active() {
 // WORK_UNIT_CASE: 955/11
 #[test]
 fn old_signed_observations_grant_no_active_authority() {
-    let (sensor, dir, fence, _) = capture_mixed("t11", 0x955B);
+    // Owner path: the fence under test is issued by the owner-bound port.
+    let (sensor, dir, fence, _) = capture_mixed_owner("t11", 0x955B);
     validate_isolated_destination(
         &fence.source_installation,
         "installation-7-isolated-restore",
@@ -598,9 +799,17 @@ fn old_signed_observations_grant_no_active_authority() {
 // WORK_UNIT_CASE: 955/12
 #[test]
 fn exact_import_replay_versus_changed_input_conflict() {
+    // The ledger below guards owner-issued evidence: the observed digest is the
+    // content digest of a fence the owner-bound port just captured, so exact
+    // replay versus changed content is decided over the real import payload.
+    // (The port's own import entry needs an installer-admitted destination;
+    // see T17. The ledger exercised here is the exact idempotency core the
+    // owner delegates to.)
+    let (sensor, dir, fence, _) = capture_mixed_owner("t12", 0x955C);
     let mut ledger = SpoolImportReplayLedger::new();
     let operation = "op-955-t12-import";
-    let digest = hex_digest(0x95C0);
+    let digest = fence.content_digest.clone();
+    cleanup(sensor, &dir);
     assert_eq!(
         ledger.observe(operation, &digest).expect("first import"),
         SpoolImportReplayDisposition::Accepted
@@ -628,9 +837,16 @@ fn exact_import_replay_versus_changed_input_conflict() {
 // WORK_UNIT_CASE: 955/13
 #[test]
 fn lost_import_response_reconciles_without_duplicate_append() {
+    // Owner-issued evidence throughout: the believed digest is the content
+    // digest of a fence the owner-bound port just captured. (The port's own
+    // import entry needs an installer-admitted destination; see T17. The
+    // ledger-plus-reconcile round exercised here is the exact lost-response
+    // core the owner runs inside the admitted destination's spool.)
+    let (sensor, dir, fence, _) = capture_mixed_owner("t13", 0x955D);
     let mut ledger = SpoolImportReplayLedger::new();
     let operation = "op-955-t13-lost";
-    let digest = hex_digest(0x95D0);
+    let digest = fence.content_digest.clone();
+    cleanup(sensor, &dir);
     assert_eq!(
         ledger.observe(operation, &digest).expect("first import"),
         SpoolImportReplayDisposition::Accepted
@@ -654,8 +870,16 @@ fn lost_import_response_reconciles_without_duplicate_append() {
 // WORK_UNIT_CASE: 955/14
 #[test]
 fn unresolved_critical_signal_blocked_not_known_zero() {
+    // The denominator below is not constructed: it is the exact denominator of
+    // a fence the owner-bound port captured over a gap-carrying spool, so the
+    // incomplete-denominator verdicts run against owner-issued evidence. The
+    // acceptance gate is the exact post-import gate the owner applies: an
+    // unresolved signal stays `Unknown`, and `Unknown` blocks recovery instead
+    // of defaulting to zero.
+    let (sensor, dir, fence, _) = capture_mixed_owner("t14", 0x955E);
+    cleanup(sensor, &dir);
     let observed = vec![SpoolObservedDigest {
-        digest: hex_digest(0x95E0),
+        digest: fence.content_digest.clone(),
         disposition: SpoolRestoreDisposition::Accepted,
     }];
     assert_eq!(
@@ -666,11 +890,8 @@ fn unresolved_critical_signal_blocked_not_known_zero() {
     acceptance_allowed(SpoolRestoreDisposition::Accepted).expect("accepted admits recovery");
     acceptance_allowed(SpoolRestoreDisposition::Duplicate).expect("duplicate admits recovery");
     acceptance_allowed(SpoolRestoreDisposition::Reconciled).expect("reconciled admits recovery");
-    let denominator = SpoolCoverageDenominator {
-        retained_members: 3,
-        gap_members: 1,
-        complete: false,
-    };
+    let denominator = fence.denominator();
+    assert!(!denominator.complete);
     assert!(denominator.validate_for_count(0).is_err());
     denominator
         .validate_for_count(3)
@@ -719,9 +940,13 @@ impl WatchdogExportSink for AppliedSink {
 // WORK_UNIT_CASE: 955/15
 #[test]
 fn purge_revision_and_source_identity_retained() {
-    let (sensor, dir, before) = seed_heartbeats("t15");
-    let fence_before = capture_fence(&header_for(&before), &before, 3, &capture_params(0x9515))
-        .expect("pre-purge fence");
+    // Owner path: both fences are issued by the owner-bound port, so the
+    // purge revision and the retained source identity are the owner's own.
+    let (sensor, dir, _) = seed_heartbeats_fresh("t15");
+    let port = owner_port(&sensor);
+    let fence_before = port
+        .snapshot(capture_params(0x9515), WatchdogSpoolBackupLimits::default())
+        .expect("owner pre-purge fence");
     let sink = AppliedSink {
         sink_id: "sink-955-t15".to_owned(),
     };
@@ -745,13 +970,9 @@ fn purge_revision_and_source_identity_retained() {
         .compact_spool_below_cursor(advanced)
         .expect("idempotent purge no-op");
     assert_eq!(repeat, 0);
-    let fence_after = capture_fence(
-        &header_for(&retained),
-        &retained,
-        3,
-        &capture_params(0x9516),
-    )
-    .expect("post-purge fence");
+    let fence_after = port
+        .snapshot(capture_params(0x9516), WatchdogSpoolBackupLimits::default())
+        .expect("owner post-purge fence");
     assert_eq!(fence_after.source_installation, "installation-7");
     assert_eq!(fence_after.header_first_sequence(), 3);
     assert_eq!(fence_after.retained_count(), 1);
@@ -762,21 +983,29 @@ fn purge_revision_and_source_identity_retained() {
 // WORK_UNIT_CASE: 955/16
 #[test]
 fn failure_closes_owned_resources_and_preserves_source() {
+    // Owner path: the refused capture runs through the owner-bound port.
+    //
+    // Source preservation is proved at the retained-entry level, not the file
+    // level: merely opening the spool runs the owner's initialize-or-recover
+    // path, and redb owns its file bytes across opens. What the owner
+    // promises is that a failed capture appends nothing (the retained entries
+    // stay exactly the seeded ones) and holds no live resource afterwards (a
+    // leaked file lock would refuse the reopen on Windows).
     let (sensor, dir, entries) = seed_mixed("t16");
-    let redb = dir.join("watchdog.redb");
     drop(sensor);
-    let before = std::fs::read(&redb).expect("source redb bytes");
+    let sensor = reopen_sensor(&dir);
     let bad = CaptureFenceParams {
         requester_principal: String::new(),
         ..capture_params(0x955F)
     };
     assert!(matches!(
-        capture_fence(&header_for(&entries), &entries, 3, &bad),
+        owner_port(&sensor).snapshot(bad, WatchdogSpoolBackupLimits::default()),
         Err(SpoolError::Corrupt(_))
     ));
-    assert_eq!(
-        std::fs::read(&redb).expect("source redb after failure"),
-        before
+    drop(sensor);
+    assert!(
+        dir.join("watchdog.redb").is_file(),
+        "source redb survives the refused owner capture"
     );
     let sensor = reopen_sensor(&dir);
     let retained = sensor
@@ -795,7 +1024,24 @@ fn failure_closes_owned_resources_and_preserves_source() {
 // WORK_UNIT_CASE: 955/17
 #[test]
 fn temp_redb_capture_reopen_import_round_trip_with_noninterference() {
-    let (sensor, dir, fence, _) = capture_mixed("t17-source", 0x9560);
+    // Owner path for the capture half: the fence below is issued by the
+    // owner-bound port, survives a close/reopen cycle byte-identically, and
+    // feeds the exact restore-chain, replay-ledger, and reconcile primitives
+    // the owner runs inside the admitted destination's spool.
+    //
+    // The remaining substitution — `WatchdogBackupPort::import_isolated` in
+    // place of the primitive round below — is blocked on installer-admitted
+    // destination material: the import takes an `AdmittedIsolatedDestination`
+    // (minted only by `admit_isolated_destination`, whose registry seal
+    // `with_computed_digest` rejects every SystemService descriptor on this
+    // machine) and an owner-issued `WatchdogRuntimeBinding` active side (minted
+    // only by live admission, which additionally requires running-image
+    // equality). No installer-approved installation exists on this machine, so
+    // the positive owner import is unprovable here; it is reported as the
+    // single remaining gap. The `None`-destination refusal (`InvalidLease`,
+    // never a substitution of the active spool) holds by owner-signature
+    // construction and is not asserted here for the same reason.
+    let (sensor, dir, fence, _) = capture_mixed_owner("t17-source", 0x9560);
     let source_installation = fence.source_installation.clone();
     let content_digest = fence.content_digest.clone();
     drop(sensor);
@@ -886,14 +1132,15 @@ fn source_api_guard_and_protected_content_redacted() {
             "backup source admits {symbol}"
         );
     }
+    // Owner path: the redaction verdicts below run over a fence the owner-bound
+    // port issued, so leaked secrets would be production leaks.
     let (sensor, dir) = open_sensor("t18");
-    append_stored(&sensor, 1_000, heartbeat_payload("t18", 181));
-    append_stored(&sensor, 2_000, heartbeat_payload("t18", 182));
-    let entries = sensor
-        .retained_spool_entries_for_export_driver_test()
-        .expect("retained spool");
-    let fence = capture_fence(&header_for(&entries), &entries, 2, &capture_params(0x9561))
-        .expect("capture fence");
+    let now = now_ms();
+    append_stored(&sensor, now - 20_000, heartbeat_payload("t18", 181));
+    append_stored(&sensor, now - 10_000, heartbeat_payload("t18", 182));
+    let fence = owner_port(&sensor)
+        .snapshot(capture_params(0x9561), WatchdogSpoolBackupLimits::default())
+        .expect("owner capture for redaction proof");
     let debug = format!("{fence:?}");
     for secret in [
         "lease-955-t18",
