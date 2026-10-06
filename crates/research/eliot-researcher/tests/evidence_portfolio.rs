@@ -14,6 +14,11 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_research_exchange_api::{DisclosureClass, SourceClass};
 use eliot_researcher::evidence_portfolio::*;
+use eliot_researcher::inquiry_governance::{
+    CoverageGoal, EvidenceFreeze, EvidenceFreezeParams, EvidenceGrade, FreezeMemberReceipt,
+    HypothesisPolicy, IndependenceBlindingPolicy, InquiryError, InquiryLane, InquiryOutputContract,
+    InquiryProtocol, InquiryProtocolProfile, InquiryStopRule, ReopenCondition, StopRuleKind,
+};
 use eliot_researcher::{
     AdmittedExcerpt, AdmittedExcerptParams, ExcerptPosition, RetainedSourceRevision,
     RetainedSourceRevisionParams, audit_claim_with_excerpts,
@@ -2331,5 +2336,142 @@ fn absence_replay_conflict_refused_on_consuming_path() {
     assert!(
         rendered.contains("no_match_evaluation.canonical_body"),
         "the conflict must name the canonical body: {rendered}"
+    );
+}
+
+// Issue #1765 W1/A4/A5: the freeze carries its admission/persistence receipts
+// and owns its retained bytes. A freeze built by `EvidenceFreeze::freeze`
+// round-trips through `retained_bytes`/`reload` against itself with its digest
+// re-proved from the bytes; truncated bytes refuse as undecodable, and bytes
+// of another freeze refuse as the wrong origin.
+const FREEZE_DIGEST: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+fn freeze_profile() -> InquiryProtocolProfile {
+    let grade = EvidenceGrade::from_name("CORROBORATED").expect("canonical grade");
+    InquiryProtocolProfile {
+        profile_id: "profile-fz-1".to_owned(),
+        revision: 1,
+        supersedes: None,
+        inquiry_id: "freeze-inq-1".to_owned(),
+        operation_id: "op-fz-1".to_owned(),
+        exchange_id: "ex-fz-1".to_owned(),
+        question: "which valve alloy survives the thermal envelope".to_owned(),
+        intended_decision_or_artifact: "decide valve alloy".to_owned(),
+        scope: "thermal envelope alloy review".to_owned(),
+        requester_principal: "principal-fz".to_owned(),
+        admitted_inquiry_digest: FREEZE_DIGEST.to_owned(),
+        protocol: InquiryProtocol::EvidenceReview,
+        selection_features_digest: FREEZE_DIGEST.to_owned(),
+        evidence_grade: grade,
+        lane: InquiryLane::Exploratory,
+        coverage_goal: CoverageGoal::Exhaustive,
+        admitted_coverage_goal: "exhaustive".to_owned(),
+        admitted_coverage_goal_resolved: true,
+        hypothesis_policy: HypothesisPolicy::FalsificationRequired,
+        truth_surfaces_and_admissible_providers: vec!["surface-fz".to_owned()],
+        admissible_source_classes: vec![SourceClass::Paper],
+        reference_manifest_digest: FREEZE_DIGEST.to_owned(),
+        admitted_denominator_digest: FREEZE_DIGEST.to_owned(),
+        independence_and_blinding_policy: IndependenceBlindingPolicy::resolve(
+            grade,
+            InquiryLane::Exploratory,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .expect("exploratory policy"),
+        independence_and_blinding_policy_digest: FREEZE_DIGEST.to_owned(),
+        registration_binding_digest: FREEZE_DIGEST.to_owned(),
+        fidelity_ceiling: "ceiling-fz".to_owned(),
+        stop_rule: InquiryStopRule::resolve(
+            8,
+            1_800_000_000_000,
+            StopRuleKind::BudgetOrDeadlineExhausted,
+            "cancel-fz",
+        )
+        .expect("stop rule"),
+        output_contract: InquiryOutputContract::resolve(
+            "result-schema-fz",
+            vec![ReopenCondition::NewEvidenceAvailable],
+        )
+        .expect("output contract"),
+        disclosure_ceiling: DisclosureClass::ProjectBound,
+        state_fence: fence(),
+        change_reason: "initial".to_owned(),
+        integrity_digest: FREEZE_DIGEST.to_owned(),
+    }
+}
+
+fn freeze_receipt(handle: &str) -> FreezeMemberReceipt {
+    FreezeMemberReceipt {
+        source_handle: handle.to_owned(),
+        admission_digest: FREEZE_DIGEST.to_owned(),
+        content_digest: FREEZE_DIGEST.to_owned(),
+        persistence_digest: FREEZE_DIGEST.to_owned(),
+        retained_artifact_ref: format!("artifact:{handle}"),
+    }
+}
+
+fn frozen(handle: &str, inquiry: &str) -> EvidenceFreeze {
+    let profile = freeze_profile();
+    EvidenceFreeze::freeze(
+        EvidenceFreezeParams {
+            inquiry_id: inquiry.to_owned(),
+            portfolio_digest: FREEZE_DIGEST.to_owned(),
+            manifest_digest: FREEZE_DIGEST.to_owned(),
+            coverage_receipt_digest: FREEZE_DIGEST.to_owned(),
+            evidence_set_id: "freeze-es-1".to_owned(),
+            included_evidence_refs: vec![handle.to_owned()],
+            member_receipts: vec![freeze_receipt(handle)],
+            excluded_evidence: Vec::new(),
+            unresolved_contradictions: Vec::new(),
+            open_research_debts: Vec::new(),
+            frozen_at_ms: 1_700_000_400_000,
+            supersedes: None,
+            supersede_reason: None,
+            expected_revision: None,
+        },
+        &profile,
+    )
+    .expect("freeze")
+}
+
+#[test]
+fn freeze_retained_bytes_reload_roundtrip() {
+    let origin = frozen("frz-a", "freeze-inq-1");
+    let bytes = origin.retained_bytes().expect("retained bytes");
+    let reloaded = EvidenceFreeze::reload(&bytes, &origin).expect("reload");
+    assert_eq!(
+        reloaded, origin,
+        "retained bytes reload to the freeze they were written from"
+    );
+    assert_eq!(
+        reloaded.digest, origin.digest,
+        "the digest is re-proved from the bytes, not trusted from outside"
+    );
+}
+
+#[test]
+fn freeze_reload_refuses_tampered_and_foreign() {
+    let origin = frozen("frz-a", "freeze-inq-1");
+    let bytes = origin.retained_bytes().expect("retained bytes");
+    let cut = &bytes[..bytes.len() - 10];
+    assert!(
+        matches!(
+            EvidenceFreeze::reload(cut, &origin),
+            Err(InquiryError::FreezeStoreDecode { .. })
+        ),
+        "truncated bytes are not a freeze of the declared shape"
+    );
+    let other = frozen("frz-b", "freeze-inq-1");
+    assert!(
+        matches!(
+            EvidenceFreeze::reload(&bytes, &other),
+            Err(InquiryError::UnknownHandle { .. })
+        ),
+        "bytes of another freeze are not the origin they are read against"
     );
 }
