@@ -39,13 +39,15 @@ use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::RequestId;
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_native_worker_core::{
-    CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
-    DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort, DurableRequestDecision,
-    EventAckReceipt, NativeCancellationEnvelope, NativeCheckpointEnvelope, NativeCheckpointId,
-    NativeHeartbeatEnvelope, NativeLifecycleBinding, NativeReadyReport, NativeResultEnvelope,
-    NativeWorkerClaim, NativeWorkerReadiness, NativeWorkerRegistration, ProviderFailure,
-    ReadinessSubmission, WorkerEventDraft, WorkerEventEnvelope,
+    CapacityAuthorityError, CheckpointProviderOutcome, CheckpointReceiptFacts,
+    ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort,
+    DurableRequestDecision, EventAckReceipt, NativeCancellationEnvelope, NativeCheckpointEnvelope,
+    NativeCheckpointId, NativeHeartbeatEnvelope, NativeLifecycleBinding, NativeReadyReport,
+    NativeResultEnvelope, NativeWorkerClaim, NativeWorkerReadiness, NativeWorkerRegistration,
+    ProcessCapacityAuthority, ProviderFailure, ReadinessSubmission, VerifiedCapacityIdentity,
+    WorkerEventDraft, WorkerEventEnvelope,
 };
+use eliot_runtime_contracts::{CapacityPermitBinding, CapacityRequest};
 use serde::{Deserialize, Serialize};
 
 use super::NativeWorkerError;
@@ -101,6 +103,17 @@ pub const NATIVE_WORKER_REPLAY_OPERATION: &str = "native_worker.replay";
 /// Paired with `NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION` in
 /// `bins/eliot-kernel/src/native_worker_replay_route.rs:97`.
 pub const NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION: &str = "native_worker.replay_acknowledge";
+/// Replays the owner's live issuance/currency check for one retained
+/// capacity pair (issue #1701, R2-owners/W5).
+///
+/// Paired with the Kernel capacity route the #1679 owner adds beside
+/// `bins/eliot-kernel/src/native_worker_reconcile_route.rs` (route name
+/// `native_worker.capacity_verify`); both lists must stay identical. Until
+/// that route lands the query fails closed (`Unavailable`): no permit is
+/// ever admitted on an unanswered lookup.
+pub const NATIVE_WORKER_CAPACITY_VERIFY_OPERATION: &str = "native_worker.capacity_verify";
+/// Expected `kind` of a capacity-verify answer.
+const CAPACITY_VERIFY_ANSWER_KIND: &str = "native_worker_capacity_verified";
 
 /// Capability whose owner-produced health projection must be current before
 /// this worker can create its first lifecycle registration.
@@ -667,6 +680,39 @@ impl KernelNativeWorkerClient {
         Ok(reply)
     }
 
+    /// Replays the owner's live issuance/currency check for one carried
+    /// capacity pair over the authenticated Kernel session (issue #1701,
+    /// R2-owners/W5).
+    ///
+    /// The presented claim is validated, never the client's retained unit:
+    /// this query runs at presentation time, before any registration the
+    /// drive would retain. The fence comes from the presented claim. Every
+    /// failure — unvalidated claim, unshaped payload, unbound identity,
+    /// unanswered query, or an answer that is not for this pair — is
+    /// [`CapacityAuthorityError::Unavailable`]: the lookup did not
+    /// authenticate, so nothing is admitted on it. A typed owner verdict
+    /// maps to its typed refusal.
+    pub fn submit_capacity_verify(
+        &mut self,
+        claim: &NativeWorkerClaim,
+        binding: &CapacityPermitBinding,
+        request: &CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+        claim
+            .validate()
+            .map_err(|_| CapacityAuthorityError::Unavailable)?;
+        let payload = capacity_verify_payload(claim, binding, request)
+            .map_err(|_| CapacityAuthorityError::Unavailable)?;
+        let fence_json = serde_json::to_value(&claim.state_fence)
+            .map_err(|_| CapacityAuthorityError::Unavailable)?;
+        bind_request_identity(&mut self.client, fence_json, claim.claim_id.as_str())
+            .map_err(|_| CapacityAuthorityError::Unavailable)?;
+        let reply = self
+            .transact(NATIVE_WORKER_CAPACITY_VERIFY_OPERATION, payload)
+            .map_err(|_| CapacityAuthorityError::Unavailable)?;
+        map_capacity_verify_reply(&reply, claim, binding)
+    }
+
     /// Sends one typed payload; transport failures stay transport failures.
     fn transact(
         &mut self,
@@ -727,6 +773,210 @@ impl KernelNativeWorkerClient {
             ));
         }
         Ok(ready.clone())
+    }
+}
+
+/// Builds the capacity-verify query payload (issue #1701, R2-owners/W5).
+///
+/// The claim projection mirrors `submit_reconcile` (claim echo, worker
+/// generation, authority-epoch sequence, state fence, registration), so the
+/// Kernel route gates see the same shape; the `permit` object carries the
+/// exact presented pair the owner must check its live holding against. Pure
+/// so the wire schema is pinned without a session. `pub` because this is
+/// the schema the Kernel capacity route implements: the route and this
+/// builder must agree field for field.
+pub fn capacity_verify_payload(
+    claim: &NativeWorkerClaim,
+    binding: &CapacityPermitBinding,
+    request: &CapacityRequest,
+) -> Result<serde_json::Value, NativeWorkerError> {
+    let claim_json = serde_json::to_value(claim)?;
+    let authority_epoch = claim_json
+        .get("authority_epoch")
+        .and_then(epoch_sequence)
+        .ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "claim authority epoch is missing".to_owned(),
+            )
+        })?;
+    Ok(serde_json::json!({
+        "claim_id": claim.claim_id.as_str(),
+        "binding_digest": claim.binding_digest.as_str(),
+        "worker_generation": claim.worker_generation,
+        "authority_epoch": authority_epoch,
+        "state_fence": claim_json.get("state_fence").cloned().unwrap_or(serde_json::Value::Null),
+        "registration_id": claim.registration_id.as_str(),
+        "permit": {
+            "request": serde_json::to_value(request)?,
+            "binding": serde_json::to_value(binding)?,
+        },
+    }))
+}
+
+/// Reads an epoch sequence the way the lifecycle projections do: an object
+/// carrying `sequence`, or a bare sequence number.
+fn epoch_sequence(epoch_json: &serde_json::Value) -> Option<u64> {
+    epoch_json
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| epoch_json.as_u64())
+}
+
+/// Reads a bare `u64` counter projection (the `counter!` vocabulary
+/// serializes generations as plain numbers).
+fn counter_sequence(value_json: &serde_json::Value) -> Option<u64> {
+    value_json
+        .as_u64()
+        .or_else(|| value_json.get("value").and_then(serde_json::Value::as_u64))
+}
+
+/// Maps one capacity-verify answer to the authenticated identity or its
+/// typed refusal (issue #1701, R2-owners/W5).
+///
+/// Echo first: `kind`, `claim_id`, `permit_id` and `operation_id` must name
+/// this query, or the answer is for another pair and the lookup did not
+/// authenticate (`Unavailable`). Then the owner verdict: only `verified`
+/// admits, and only when every authenticated field echoes the presented
+/// binding — a rotated or substituted answer conflicts instead of
+/// replaying, and the core re-proves the binding again before retaining.
+/// `pub` for the same route-schema reason as
+/// [`capacity_verify_payload`].
+pub fn map_capacity_verify_reply(
+    reply: &serde_json::Value,
+    claim: &NativeWorkerClaim,
+    binding: &CapacityPermitBinding,
+) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+    if reply.get("kind").and_then(serde_json::Value::as_str) != Some(CAPACITY_VERIFY_ANSWER_KIND) {
+        return Err(CapacityAuthorityError::Unavailable);
+    }
+    if reply.get("claim_id").and_then(serde_json::Value::as_str) != Some(claim.claim_id.as_str()) {
+        return Err(CapacityAuthorityError::Unavailable);
+    }
+    if reply.get("permit_id").and_then(serde_json::Value::as_str)
+        != Some(binding.permit_id.as_str())
+    {
+        return Err(CapacityAuthorityError::Unavailable);
+    }
+    if reply
+        .get("operation_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(binding.operation_id.as_str())
+    {
+        return Err(CapacityAuthorityError::Unavailable);
+    }
+    match reply.get("verdict").and_then(serde_json::Value::as_str) {
+        Some("verified") => verified_capacity_identity(reply, binding),
+        Some("not_held") => Err(CapacityAuthorityError::NotHeld),
+        Some("foreign_owner") => Err(CapacityAuthorityError::ForeignOwner),
+        Some("stale_epoch") => Err(CapacityAuthorityError::StaleEpoch),
+        Some("stale_owner") => Err(CapacityAuthorityError::StaleOwner),
+        Some("conflict") => Err(CapacityAuthorityError::Conflict),
+        _ => Err(CapacityAuthorityError::Unavailable),
+    }
+}
+
+/// Builds the authenticated identity from a `verified` answer, echo-checked
+/// against the presented binding field by field (issue #1701, R2-owners/W5).
+///
+/// Every typed value comes from the already-validated presented binding;
+/// the answer only vouches the verdict and echoes the fields. Any echo
+/// that does not name the presented binding is a substituted answer and
+/// conflicts instead of replaying.
+fn verified_capacity_identity(
+    reply: &serde_json::Value,
+    binding: &CapacityPermitBinding,
+) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+    let owner_ref = reply
+        .get("capacity_owner_ref")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| *value == binding.capacity_owner_ref.as_str())
+        .ok_or(CapacityAuthorityError::Conflict)?;
+    let binding_generation = serde_json::to_value(binding.capacity_owner_generation_ref)
+        .ok()
+        .and_then(|value| counter_sequence(&value))
+        .ok_or(CapacityAuthorityError::Conflict)?;
+    if reply
+        .get("owner_generation")
+        .and_then(serde_json::Value::as_u64)
+        != Some(binding_generation)
+    {
+        return Err(CapacityAuthorityError::Conflict);
+    }
+    for (field, expected) in [
+        ("profile_id", binding.profile_id.as_str()),
+        ("profile_revision", binding.profile_revision.as_str()),
+    ] {
+        if reply.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+            return Err(CapacityAuthorityError::Conflict);
+        }
+    }
+    let binding_epoch = serde_json::to_value(&binding.authority_epoch_ref)
+        .ok()
+        .and_then(|value| epoch_sequence(&value))
+        .ok_or(CapacityAuthorityError::Conflict)?;
+    if reply
+        .get("authority_epoch")
+        .and_then(serde_json::Value::as_u64)
+        != Some(binding_epoch)
+    {
+        return Err(CapacityAuthorityError::Conflict);
+    }
+    let binding_bottleneck = serde_json::to_value(binding.bottleneck)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(CapacityAuthorityError::Conflict)?;
+    if reply.get("bottleneck").and_then(serde_json::Value::as_str)
+        != Some(binding_bottleneck.as_str())
+    {
+        return Err(CapacityAuthorityError::Conflict);
+    }
+    Ok(VerifiedCapacityIdentity {
+        permit_id: binding.permit_id.clone(),
+        operation_id: binding.operation_id.clone(),
+        bottleneck: binding.bottleneck,
+        capacity_owner_ref: owner_ref.to_owned(),
+        owner_generation: binding.capacity_owner_generation_ref,
+        profile_id: binding.profile_id.clone(),
+        profile_revision: binding.profile_revision.clone(),
+        authority_epoch: binding.authority_epoch_ref.clone(),
+    })
+}
+
+/// Production live owner lookup over the shared Kernel session (issue
+/// #1701, R2-owners/W5).
+///
+/// The third handle on the one authenticated session (lifecycle and replay
+/// hold the other two): every presentation and every gate replay queries
+/// the owner through [`KernelNativeWorkerClient::submit_capacity_verify`],
+/// so a released holding, a foreign instance, or a moved owner/generation/
+/// profile/epoch refuses at the worker before P-03 starts anything. A
+/// poisoned session or an unanswered query fails closed (`Unavailable`).
+pub struct KernelSessionCapacityAuthority {
+    /// Shared authenticated session the verify query rides.
+    transport: SharedKernelTransport,
+    /// Exact admitted claim every query is bound to.
+    claim: NativeWorkerClaim,
+}
+
+impl KernelSessionCapacityAuthority {
+    /// Binds one exact admitted claim to the shared session lookup.
+    pub fn new(
+        transport: SharedKernelTransport,
+        claim: NativeWorkerClaim,
+    ) -> Result<Self, NativeWorkerError> {
+        claim.validate().map_err(NativeWorkerError::from)?;
+        Ok(Self { transport, claim })
+    }
+}
+
+impl ProcessCapacityAuthority for KernelSessionCapacityAuthority {
+    fn verify_live_capacity(
+        &self,
+        binding: &CapacityPermitBinding,
+        request: &CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+        self.transport
+            .submit_capacity_verify(&self.claim, binding, request)
     }
 }
 
@@ -1423,6 +1673,22 @@ impl SharedKernelTransport {
         self.inner.lock().map_err(|_| {
             NativeWorkerError::KernelAdmissionRequired("Kernel transport lock poisoned".to_owned())
         })
+    }
+
+    /// Replays the owner's live capacity check over the shared session
+    /// (issue #1701, R2-owners/W5). A poisoned session fails closed
+    /// (`Unavailable`): the lookup did not authenticate.
+    pub fn submit_capacity_verify(
+        &self,
+        claim: &NativeWorkerClaim,
+        binding: &CapacityPermitBinding,
+        request: &CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| CapacityAuthorityError::Unavailable)?;
+        guard.submit_capacity_verify(claim, binding, request)
     }
 }
 

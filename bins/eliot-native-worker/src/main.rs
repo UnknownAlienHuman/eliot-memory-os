@@ -5,17 +5,18 @@ use std::sync::Arc;
 
 use eliot_native_worker::{
     AdmittedLifecycle, BoundedEvidenceSink, KERNEL_ADMISSION_REQUIRED, KernelCheckpointPort,
-    KernelNativeWorkerClient, NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError,
-    PresentationEchoAdmission, ReconcileSubmission, SharedKernelTransport,
+    KernelNativeWorkerClient, KernelSessionCapacityAuthority, NativeWorker,
+    NativeWorkerDispatchAuthority, NativeWorkerError, PresentationEchoAdmission,
+    ReconcileSubmission, SharedKernelTransport,
     admitted_material::{ValidatedAdmittedMaterial, read_admitted_material},
     derive_admitted_intent, dispatch_now_unix_ms,
     governed_action::{FinishState, RecordedEffect, ValidatedAction},
     select_factory_for_admitted,
 };
 use eliot_native_worker_core::{
-    CapabilityAdmissionPort, CheckpointRequest, ClaimAdmissionRequest, DurableCheckpointPort,
-    DurableReplayPort, JSON_ENCODING_PROFILE, NativeWorkerRegistration, PROTOCOL_VERSION,
-    ReadinessSubmission, WorkerCore, WorkerError, WorkerFrame, WorkerFrameBody,
+    CapabilityAdmissionPort, CapacityAuthorityLink, CheckpointRequest, ClaimAdmissionRequest,
+    DurableCheckpointPort, DurableReplayPort, JSON_ENCODING_PROFILE, NativeWorkerRegistration,
+    PROTOCOL_VERSION, ReadinessSubmission, WorkerCore, WorkerError, WorkerFrame, WorkerFrameBody,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use eliot_process_executor::WindowsProcessExecutor;
@@ -188,7 +189,7 @@ fn run() -> i32 {
         Ok(replay) => replay,
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
-    let checkpoint = match KernelCheckpointPort::new(shared.clone(), claim) {
+    let checkpoint = match KernelCheckpointPort::new(shared.clone(), claim.clone()) {
         Ok(checkpoint) => checkpoint,
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
@@ -205,17 +206,30 @@ fn run() -> i32 {
         Some(checkpoint),
         Some(Arc::new(BoundedEvidenceSink::new())),
     ));
-    // Issue #1701 (R2-owners/W5): the production launch composition presents
-    // the file-carried owner-issued process-launch capacity pair before the
-    // drive, under the same admission/attempt/operation identity the claimed
-    // gates re-check at every start and recovery. The pair was validated
-    // against the admitted claim at file read; a presentation failure denies
-    // fail-closed, and an absent section keeps the gates' missing-permit
+    // Issue #1701 (R2-owners/W5): the production launch composition admits
+    // the file-carried owner-issued process-launch capacity pair through the
+    // live owner lookup before the drive, under the same
+    // admission/attempt/operation identity the claimed gates re-check at
+    // every start and recovery. The lookup rides the shared authenticated
+    // Kernel session (`native_worker.capacity_verify`, served contour-side
+    // by #1679); until that route answers, the query fails closed and the
+    // presentation denies. An absent section keeps the gates' missing-permit
     // refusal — no permit is ever minted or caller-shaped here.
-    if let Some(carried) = material.capacity_permit.as_ref()
-        && let Err(error) = worker.admit_capacity_permit(&carried.binding, &carried.request, now)
-    {
-        return deny_invalid_material(&error.to_string());
+    if let Some(carried) = material.capacity_permit.as_ref() {
+        match KernelSessionCapacityAuthority::new(shared.clone(), claim) {
+            Ok(session) => {
+                let authority: CapacityAuthorityLink = Arc::new(session);
+                if let Err(error) = worker.admit_capacity_permit_verified(
+                    &carried.binding,
+                    &carried.request,
+                    now,
+                    authority,
+                ) {
+                    return deny_invalid_material(&error.to_string());
+                }
+            }
+            Err(error) => return deny_invalid_material(&error.to_string()),
+        }
     }
     drive_admitted_material(&mut lifecycle, &mut worker, &material, process, &admission)
 }
@@ -829,9 +843,10 @@ mod tests {
     };
     use eliot_native_worker::{
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
-        NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, PresentationEchoAdmission,
-        ReconcileSubmission, ValidatedDispatchGrant, derive_admitted_intent,
-        drive_admitted_claimed, governed_action::ActionEnvelope, require_launch_grant,
+        NATIVE_WORKER_CAPACITY_VERIFY_OPERATION, NativeWorker, NativeWorkerDispatchAuthority,
+        NativeWorkerError, PresentationEchoAdmission, ReconcileSubmission, ValidatedDispatchGrant,
+        capacity_verify_payload, derive_admitted_intent, drive_admitted_claimed,
+        governed_action::ActionEnvelope, map_capacity_verify_reply, require_launch_grant,
         select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
@@ -1950,13 +1965,17 @@ mod tests {
         }
     }
 
-    /// Presents the owner-issued process-launch capacity evidence the
-    /// claimed start/recovery gates require (issue #1701, R2-owners/W5),
-    /// with its live owner lookup. Test-only presentation: the dispatch
-    /// contour will carry the owner-issued binding; until then the drive
-    /// fixtures present the matching pair explicitly so the production gate
-    /// stays enforced.
-    fn admit_drive_capacity(worker: &mut SliceDWorker, operation: &str, epoch_value: &EpochId) {
+    /// Builds one claim-bound owner-issued capacity pair (issue #1701,
+    /// R2-owners/W5): the operation, requester generation, and epoch bind
+    /// the presenting claim; the owner generation/profile name the issuing
+    /// owner facts the live lookup checks currency against. The window
+    /// strictly covers the claim deadline (4_000_000_000_000), mirroring
+    /// the executable-binding deadline-before-expiry rule.
+    fn capacity_pair_for(
+        operation: &str,
+        worker_generation: u64,
+        epoch_value: &EpochId,
+    ) -> (CapacityRequest, CapacityPermitBinding) {
         let operation_tag = RequestedOperationClass::Normal(NormalWorkClass::Swarm);
         let slot = || CapacityLimit {
             unit: CapacityUnit::ProcessSlots,
@@ -1968,7 +1987,7 @@ mod tests {
             requested_bottleneck: CapacityBottleneck::ProcessLaunchSlots,
             requested_limit: slot(),
             requesting_owner_ref: "test-worker-owner".to_owned(),
-            requesting_generation_ref: load(ResourceGeneration::new(1)),
+            requesting_generation_ref: load(ResourceGeneration::new(worker_generation)),
             authority_epoch_ref: epoch_value.clone(),
             profile_id: "profile-test-1".to_owned(),
             profile_revision: "rev-7".to_owned(),
@@ -1984,21 +2003,343 @@ mod tests {
             capacity_owner_ref: "test-capacity-owner".to_owned(),
             capacity_owner_generation_ref: load(ResourceGeneration::new(9)),
             requesting_owner_ref: request.requesting_owner_ref.clone(),
-            requesting_generation_ref: load(ResourceGeneration::new(1)),
+            requesting_generation_ref: load(ResourceGeneration::new(worker_generation)),
             authority_epoch_ref: request.authority_epoch_ref.clone(),
             profile_id: request.profile_id.clone(),
             profile_revision: request.profile_revision.clone(),
             issued_at_ms: 1_000,
-            // The permit window must strictly cover the claim deadline
-            // (4_000_000_000_000), mirroring the executable-binding
-            // deadline-before-expiry rule.
             expires_at_ms: 4_000_000_001_000,
             owner_evidence_refs: vec!["test-evidence-1".to_owned()],
         };
+        (request, permit)
+    }
+
+    /// Presents the owner-issued process-launch capacity evidence the
+    /// claimed start/recovery gates require (issue #1701, R2-owners/W5),
+    /// with its live owner lookup. Test-only presentation: the dispatch
+    /// contour will carry the owner-issued binding; until then the drive
+    /// fixtures present the matching pair explicitly so the production gate
+    /// stays enforced.
+    fn admit_drive_capacity(worker: &mut SliceDWorker, operation: &str, epoch_value: &EpochId) {
+        let (request, permit) = capacity_pair_for(operation, 1, epoch_value);
         let authority = TestCapacityAuthority::mint(&permit);
         worker
             .admit_capacity_permit_verified(&permit, &request, fake_now_ms(), authority)
             .unwrap_or_else(|error| panic!("drive capacity admits: {error:?}"));
+    }
+
+    /// Live owner boundary facts a joint lookup checks the holding against
+    /// (issue #1701, R2-owners/W5): the owner's current generation, compiled
+    /// profile, and authority epoch. Test-owned, but independent of the
+    /// presented binding: advancing them after presentation is what makes a
+    /// stale owner/epoch refusal observable instead of self-consistent.
+    #[derive(Clone)]
+    struct CapacityBoundary {
+        owner_generation: ResourceGeneration,
+        profile_id: String,
+        profile_revision: String,
+        epoch: EpochId,
+    }
+
+    impl CapacityBoundary {
+        /// Boundary facts matching [`capacity_pair_for`]: the joint
+        /// positive starts current.
+        fn current() -> Self {
+            Self {
+                owner_generation: load(ResourceGeneration::new(9)),
+                profile_id: "profile-test-1".to_owned(),
+                profile_revision: "rev-7".to_owned(),
+                epoch: epoch(),
+            }
+        }
+    }
+
+    /// Test-side live owner lookup behind [`ProcessCapacityAuthority`]
+    /// (issue #1701, R2-owners/W5): holds the presented issuance record and
+    /// replays the owner's exact issuance/currency check — exact record,
+    /// request match, then the holding against the CURRENT boundary facts.
+    /// Unlike the fixed-record lookup above, the boundary moves: release,
+    /// epoch advance, and owner/profile advance are all observable, so the
+    /// gate replays at start/recovery are proved against a live owner
+    /// instead of a self-consistent copy.
+    struct BoundaryCapacityAuthority {
+        state: Mutex<BoundaryAuthorityState>,
+    }
+
+    struct BoundaryAuthorityState {
+        live: bool,
+        binding: CapacityPermitBinding,
+        boundary: CapacityBoundary,
+    }
+
+    impl BoundaryCapacityAuthority {
+        /// Holds one presented binding under the current boundary facts.
+        /// Returns the link to admit plus the owner handle: releasing or
+        /// advancing the handle after presentation is what the gate replays
+        /// observe.
+        fn live_for(binding: &CapacityPermitBinding) -> (CapacityAuthorityLink, Arc<Self>) {
+            let owner = Arc::new(Self {
+                state: Mutex::new(BoundaryAuthorityState {
+                    live: true,
+                    binding: binding.clone(),
+                    boundary: CapacityBoundary::current(),
+                }),
+            });
+            let link: CapacityAuthorityLink = owner.clone();
+            (link, owner)
+        }
+
+        /// Drops the live holding: the next lookup answers released.
+        fn release(&self) {
+            lock(&self.state).live = false;
+        }
+
+        /// Moves the boundary epoch: the next lookup answers stale epoch.
+        fn advance_epoch(&self, epoch: EpochId) {
+            lock(&self.state).boundary.epoch = epoch;
+        }
+
+        /// Moves the owner generation/profile: the next lookup answers
+        /// stale owner.
+        fn advance_owner(&self, generation: ResourceGeneration, profile_revision: &str) {
+            let mut state = lock(&self.state);
+            state.boundary.owner_generation = generation;
+            state.boundary.profile_revision = profile_revision.to_owned();
+        }
+    }
+
+    impl ProcessCapacityAuthority for BoundaryCapacityAuthority {
+        fn verify_live_capacity(
+            &self,
+            binding: &CapacityPermitBinding,
+            request: &CapacityRequest,
+        ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+            let state = lock(&self.state);
+            if !state.live {
+                return Err(CapacityAuthorityError::NotHeld);
+            }
+            if *binding != state.binding {
+                return Err(CapacityAuthorityError::Conflict);
+            }
+            if !binding.matches_request(request) {
+                return Err(CapacityAuthorityError::Conflict);
+            }
+            if binding.capacity_owner_generation_ref.value()
+                != state.boundary.owner_generation.value()
+            {
+                return Err(CapacityAuthorityError::StaleOwner);
+            }
+            if binding.profile_id != state.boundary.profile_id
+                || binding.profile_revision != state.boundary.profile_revision
+            {
+                return Err(CapacityAuthorityError::StaleOwner);
+            }
+            if !binding
+                .authority_epoch_ref
+                .is_same_authority(&state.boundary.epoch)
+            {
+                return Err(CapacityAuthorityError::StaleEpoch);
+            }
+            Ok(VerifiedCapacityIdentity {
+                permit_id: binding.permit_id.clone(),
+                operation_id: binding.operation_id.clone(),
+                bottleneck: binding.bottleneck,
+                capacity_owner_ref: binding.capacity_owner_ref.clone(),
+                owner_generation: state.boundary.owner_generation,
+                profile_id: state.boundary.profile_id.clone(),
+                profile_revision: state.boundary.profile_revision.clone(),
+                authority_epoch: state.boundary.epoch.clone(),
+            })
+        }
+    }
+
+    /// Builds the claim the capacity wire tests bind (issue #1701,
+    /// R2-owners/W5): the standard valid join over a fixture process, so the
+    /// payload and mapping proofs address a genuinely valid claim.
+    fn capacity_claim() -> NativeWorkerClaim {
+        let bat = write_bat("capacity-claim", SUCCESS_BAT);
+        let argv = vec!["/c".to_owned(), bat];
+        let (process, _) = build_process(
+            "operation-capacity-1",
+            "tree-capacity-1",
+            argv,
+            "nonce-capacity-1",
+        );
+        let claim = claim_for(&registration(), &hello(), &process);
+        remove_bat("capacity-claim");
+        claim
+    }
+
+    /// Builds one owner-shaped capacity-verify answer for the presented
+    /// binding (issue #1701, R2-owners/W5): every echo names the query, the
+    /// identity fields echo the binding, and only `verdict` varies — so each
+    /// verdict mapping is proved against an otherwise honest answer.
+    fn capacity_answer_for(
+        claim: &NativeWorkerClaim,
+        binding: &CapacityPermitBinding,
+        verdict: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "native_worker_capacity_verified",
+            "claim_id": claim.claim_id.as_str(),
+            "permit_id": binding.permit_id.as_str(),
+            "operation_id": binding.operation_id.as_str(),
+            "verdict": verdict,
+            "capacity_owner_ref": binding.capacity_owner_ref.as_str(),
+            "owner_generation": 9,
+            "profile_id": binding.profile_id.as_str(),
+            "profile_revision": binding.profile_revision.as_str(),
+            "authority_epoch": 1,
+            "bottleneck": serde_json::to_value(&binding.bottleneck).expect("bottleneck wire"),
+        })
+    }
+
+    #[test]
+    fn capacity_verify_wire_binds_claim_and_pair() {
+        assert_eq!(
+            NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
+            "native_worker.capacity_verify"
+        );
+        let claim = capacity_claim();
+        let (request, binding) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let payload = capacity_verify_payload(&claim, &binding, &request)
+            .unwrap_or_else(|error| panic!("capacity payload builds: {error:?}"));
+        assert_eq!(
+            payload.get("claim_id").and_then(serde_json::Value::as_str),
+            Some("claim-1")
+        );
+        assert_eq!(
+            payload
+                .get("permit")
+                .and_then(|permit| permit.get("binding"))
+                .and_then(|binding_json| binding_json.get("permit_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(binding.permit_id.as_str())
+        );
+        assert_eq!(
+            payload
+                .get("authority_epoch")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn capacity_verify_reply_maps_owner_verdicts() {
+        let claim = capacity_claim();
+        let (_, binding) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let verified = map_capacity_verify_reply(
+            &capacity_answer_for(&claim, &binding, "verified"),
+            &claim,
+            &binding,
+        )
+        .unwrap_or_else(|error| panic!("verified answer admits: {error:?}"));
+        assert!(verified.binds_permit(&binding));
+        for (verdict, expected) in [
+            ("not_held", CapacityAuthorityError::NotHeld),
+            ("foreign_owner", CapacityAuthorityError::ForeignOwner),
+            ("stale_epoch", CapacityAuthorityError::StaleEpoch),
+            ("stale_owner", CapacityAuthorityError::StaleOwner),
+            ("conflict", CapacityAuthorityError::Conflict),
+            ("unheard-of", CapacityAuthorityError::Unavailable),
+        ] {
+            assert_eq!(
+                map_capacity_verify_reply(
+                    &capacity_answer_for(&claim, &binding, verdict),
+                    &claim,
+                    &binding
+                ),
+                Err(expected),
+                "verdict {verdict} must map"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_verify_reply_refuses_substituted_answers() {
+        let claim = capacity_claim();
+        let (_, binding) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let mut wrong_kind = capacity_answer_for(&claim, &binding, "verified");
+        wrong_kind["kind"] = serde_json::Value::from("native_worker_reconciled");
+        assert_eq!(
+            map_capacity_verify_reply(&wrong_kind, &claim, &binding),
+            Err(CapacityAuthorityError::Unavailable)
+        );
+        let mut wrong_claim = capacity_answer_for(&claim, &binding, "verified");
+        wrong_claim["claim_id"] = serde_json::Value::from("claim-other");
+        assert_eq!(
+            map_capacity_verify_reply(&wrong_claim, &claim, &binding),
+            Err(CapacityAuthorityError::Unavailable)
+        );
+        let mut rotated_owner = capacity_answer_for(&claim, &binding, "verified");
+        rotated_owner["capacity_owner_ref"] = serde_json::Value::from("another-owner");
+        assert_eq!(
+            map_capacity_verify_reply(&rotated_owner, &claim, &binding),
+            Err(CapacityAuthorityError::Conflict)
+        );
+        let mut rotated_profile = capacity_answer_for(&claim, &binding, "verified");
+        rotated_profile["profile_revision"] = serde_json::Value::from("rev-8");
+        assert_eq!(
+            map_capacity_verify_reply(&rotated_profile, &claim, &binding),
+            Err(CapacityAuthorityError::Conflict)
+        );
+        let mut rotated_epoch = capacity_answer_for(&claim, &binding, "verified");
+        rotated_epoch["authority_epoch"] = serde_json::Value::from(2);
+        assert_eq!(
+            map_capacity_verify_reply(&rotated_epoch, &claim, &binding),
+            Err(CapacityAuthorityError::Conflict)
+        );
+    }
+
+    #[test]
+    fn boundary_owner_lookup_permits_live_and_refuses_released_or_foreign() {
+        let (_, binding) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let (_, other) = capacity_pair_for("operation-capacity-2", 1, &epoch());
+        let (request, _) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let (link, owner) = BoundaryCapacityAuthority::live_for(&binding);
+        let identity = link
+            .verify_live_capacity(&binding, &request)
+            .unwrap_or_else(|error| panic!("live holding verifies: {error:?}"));
+        assert!(identity.binds_permit(&binding));
+        owner.release();
+        assert_eq!(
+            link.verify_live_capacity(&binding, &request),
+            Err(CapacityAuthorityError::NotHeld)
+        );
+        let (foreign_link, _) = BoundaryCapacityAuthority::live_for(&other);
+        assert_eq!(
+            foreign_link.verify_live_capacity(&binding, &request),
+            Err(CapacityAuthorityError::Conflict)
+        );
+    }
+
+    #[test]
+    fn boundary_owner_lookup_refuses_moved_boundary() {
+        let (_, binding) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let (request, _) = capacity_pair_for("operation-capacity-1", 1, &epoch());
+        let (link, owner) = BoundaryCapacityAuthority::live_for(&binding);
+        let presented = link
+            .verify_live_capacity(&binding, &request)
+            .unwrap_or_else(|error| panic!("live holding verifies: {error:?}"));
+        let advanced_epoch = load(EpochId::new(
+            load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+            load(std::num::NonZeroU64::new(2).ok_or("non-zero")),
+        ));
+        owner.advance_epoch(advanced_epoch);
+        assert_eq!(
+            link.verify_live_capacity(&binding, &request),
+            Err(CapacityAuthorityError::StaleEpoch)
+        );
+        let (fresh_link, fresh_owner) = BoundaryCapacityAuthority::live_for(&binding);
+        let fresh_presented = fresh_link
+            .verify_live_capacity(&binding, &request)
+            .unwrap_or_else(|error| panic!("live holding verifies: {error:?}"));
+        assert_eq!(fresh_presented, presented);
+        fresh_owner.advance_owner(load(ResourceGeneration::new(10)), "rev-8");
+        assert_eq!(
+            fresh_link.verify_live_capacity(&binding, &request),
+            Err(CapacityAuthorityError::StaleOwner)
+        );
     }
 
     fn drive_carriers(
@@ -2201,6 +2542,128 @@ mod tests {
         );
         assert_ne!(worker.lifecycle(), WorkerLifecycle::Ready);
         remove_bat("governed-no-capacity");
+    }
+
+    /// A pair the live holding never issued refuses at presentation (issue
+    /// #1701, R2-owners/W5): the holding keeps another issuance record, so
+    /// the presented binding conflicts before anything is retained and
+    /// before P-03 starts anything.
+    #[test]
+    #[cfg(windows)]
+    fn kernel_capacity_foreign_pair_refuses_at_presentation() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, _lifecycle, _material, _process, _bat, _staged) = governed_drive_parts(
+            "capacity-foreign",
+            drive_carriers(&fence_json, &epoch_json),
+            false,
+        );
+        // The foreign pair is self-consistent (its binding matches its own
+        // request), so the evidence checks pass and the refusal under proof
+        // is the live lookup's: the holding keeps another issuance record.
+        let (_, held) = capacity_pair_for("operation-capacity-foreign", 1, &epoch());
+        let (foreign_request, foreign) = capacity_pair_for("operation-capacity-other", 1, &epoch());
+        let (link, _) = BoundaryCapacityAuthority::live_for(&held);
+        match worker.admit_capacity_permit_verified(&foreign, &foreign_request, fake_now_ms(), link)
+        {
+            Err(NativeWorkerError::Core(
+                eliot_native_worker_core::WorkerError::AdmissionMismatch(detail),
+            )) => assert_eq!(detail, "capacity_permit_authority_conflict"),
+            other => panic!("foreign pair must conflict, got {other:?}"),
+        }
+        remove_bat("capacity-foreign");
+    }
+
+    /// A moved boundary epoch refuses at the claimed gate (issue #1701,
+    /// R2-owners/W5): presentation admitted under the old epoch, then the
+    /// owner moved on — the start replay observes the stale epoch and
+    /// refuses with zero P-03 starts.
+    #[test]
+    #[cfg(windows)]
+    fn kernel_capacity_stale_epoch_refuses_before_start() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "capacity-stale-epoch",
+            drive_carriers(&fence_json, &epoch_json),
+            false,
+        );
+        let operation = "operation-capacity-stale-epoch";
+        let (request, binding) = capacity_pair_for(operation, 1, &epoch());
+        let (link, owner) = BoundaryCapacityAuthority::live_for(&binding);
+        worker
+            .admit_capacity_permit_verified(&binding, &request, fake_now_ms(), link)
+            .unwrap_or_else(|error| panic!("stale-epoch capacity admits: {error:?}"));
+        owner.advance_epoch(load(EpochId::new(
+            load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+            load(std::num::NonZeroU64::new(2).ok_or("non-zero")),
+        )));
+        let failure = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ));
+        let (actions, error) = match failure {
+            Ok(_) => panic!("a stale-epoch drive must refuse"),
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                (actions, error)
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                panic!("the capacity gate runs inside the drive, got {error:?}")
+            }
+        };
+        assert_eq!(actions.len(), 4);
+        assert!(
+            error
+                .to_string()
+                .contains("worker authority epoch is stale"),
+            "stale epoch must be named, got {error:?}"
+        );
+        assert_ne!(worker.lifecycle(), WorkerLifecycle::Ready);
+        remove_bat("capacity-stale-epoch");
+    }
+
+    /// A released holding refuses at the claimed gate (issue #1701,
+    /// R2-owners/W5): presentation admitted while the owner held the
+    /// permit, then the owner released it — the start replay observes no
+    /// live holding and refuses with zero P-03 starts.
+    #[test]
+    #[cfg(windows)]
+    fn kernel_capacity_released_holding_refuses_before_start() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "capacity-released",
+            drive_carriers(&fence_json, &epoch_json),
+            false,
+        );
+        let operation = "operation-capacity-released";
+        let (request, binding) = capacity_pair_for(operation, 1, &epoch());
+        let (link, owner) = BoundaryCapacityAuthority::live_for(&binding);
+        worker
+            .admit_capacity_permit_verified(&binding, &request, fake_now_ms(), link)
+            .unwrap_or_else(|error| panic!("released capacity admits: {error:?}"));
+        owner.release();
+        let failure = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ));
+        let (actions, error) = match failure {
+            Ok(_) => panic!("a released-holding drive must refuse"),
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                (actions, error)
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                panic!("the capacity gate runs inside the drive, got {error:?}")
+            }
+        };
+        assert_eq!(actions.len(), 4);
+        assert!(
+            error.to_string().contains("capacity_permit_released"),
+            "released holding must be named, got {error:?}"
+        );
+        assert_ne!(worker.lifecycle(), WorkerLifecycle::Ready);
+        remove_bat("capacity-released");
     }
 
     /// A lifecycle that fails the readiness submit after the three submits
@@ -2933,6 +3396,17 @@ mod tests {
             Some(sink.clone()),
         );
         let mut worker: KernelDriveWorker = NativeWorker::new(core);
+        // The Kernel-positive fixture carries owner-issued capacity for its
+        // claim: the pair binds the staged claim identity and the live
+        // owner lookup admits it verified, so the drive below proves the
+        // composed producer/consumer path instead of the missing-permit
+        // refusal.
+        let (permit_request, permit_binding) =
+            capacity_pair_for("operation-kernel-drive-1", 1, &claim_value.authority_epoch);
+        let (owner_link, _) = BoundaryCapacityAuthority::live_for(&permit_binding);
+        worker
+            .admit_capacity_permit_verified(&permit_binding, &permit_request, now, owner_link)
+            .unwrap_or_else(|error| panic!("kernel capacity admits verified: {error:?}"));
         let mut lifecycle = FakeLifecycle::new();
         let hello_connection = material.hello.connection_id.clone();
         let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
