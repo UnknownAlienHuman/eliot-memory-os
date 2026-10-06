@@ -1354,6 +1354,7 @@ fn phase_build_delta(
         dependencies,
         equivalent_retry,
         proof_ceiling: eliot_learning_contracts::ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     candidate.seal()?;

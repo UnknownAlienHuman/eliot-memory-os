@@ -526,6 +526,15 @@ fn frozen_digest_binds_delta_and_reads_back() -> Result<(), Box<dyn std::error::
         bound.canonical_digest, unbound.canonical_digest,
         "the frozen binding must be seal-covered"
     );
+    let mut legacy = serde_json::to_value(&unbound)?;
+    legacy
+        .as_object_mut()
+        .ok_or("legacy delta must be an object")?
+        .remove("frozen_pre_evaluation_digest");
+    legacy["canonical_digest"] =
+        serde_json::Value::String(identity::digest_without_field(&legacy, "canonical_digest")?);
+    let legacy: AttemptLearningDeltaCandidate = serde_json::from_value(legacy)?;
+    legacy.validate()?;
     let mut malformed = bound.clone();
     malformed.frozen_pre_evaluation_digest = Some("not-a-digest".to_owned());
     assert!(matches!(

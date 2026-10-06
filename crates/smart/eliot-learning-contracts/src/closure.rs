@@ -105,7 +105,7 @@ pub struct ClosureHandoff {
     /// Covered by the canonical seal; `None` when the source revision froze
     /// nothing. A plain digest (never the overlay `freeze` bundle type, which
     /// this crate must not depend on).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical handoff digest, excluding this field.
     pub canonical_digest: String,
