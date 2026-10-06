@@ -149,3 +149,19 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+# Issue #2567 (W2): tests bind the solo delegate body against the canonical
+# admitted carrier (`crates/surfaces/eliot-mcp/src/contract.rs::DelegateRequest`
+# under `CoordinateInput::Delegate`, I07-06:37) instead of hand-mirrored JSON
+# (I01-08:50: schemas come from the same contract types). Test-only: production
+# code takes primitives and gains no surfaces edge.
+# Issue #2567 (A2): retained-projection discovery proofs persist through the
+# production protected-path lease, whose containment root is fixed in normal
+# builds. The platform crate's explicit test-only RAII root override
+# (`test_support::override_protected_root`, thread-local, restored on drop)
+# lets bounded tests exercise the real lease against a scratch root.
+# Test-only: same pattern as bins/eliot-kernel and bins/eliot-watchdog;
+# production builds do not contain the surface.
+[dev-dependencies]
+eliot-mcp.workspace = true
+eliot-platform-windows = { workspace = true, features = ["test-support"] }
