@@ -3699,7 +3699,7 @@ mod solo_intake_consume_chain_tests {
             ),
         );
         kernel.seed_validated_session_binding_for_test("test-session-binding");
-        let drive = drive_solo_delegate_async(&kernel, intake, now);
+        let drive = Box::pin(drive_solo_delegate_async(&kernel, intake, now));
         let control = async {
             let (_, control_intake, control_now) = solo_test_pair();
             let mut state = SoloDriverState::new();
@@ -3707,7 +3707,7 @@ mod solo_intake_consume_chain_tests {
             Ok::<_, DaemonError>(state.queue.len())
         };
         let (drive_outcome, control_outcome) =
-            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::time::timeout(std::time::Duration::from_mins(1), async {
                 tokio::join!(drive, control)
             })
             .await
@@ -3752,7 +3752,7 @@ mod solo_intake_consume_chain_tests {
         };
         let material = intake.claimed.material();
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_mins(1),
             crate::DaemonComposition::agent_fabric_new_verified_from_resolved_async(
                 &kernel,
                 ports,
@@ -3762,9 +3762,10 @@ mod solo_intake_consume_chain_tests {
         )
         .await
         .expect("transport seam completes without stalling");
-        if !matches!(outcome, Err(DaemonError::Kernel(_))) {
-            panic!("expected typed Kernel transport refusal after the verifier await");
-        }
+        assert!(
+            matches!(outcome, Err(DaemonError::Kernel(_))),
+            "expected typed Kernel transport refusal after the verifier await"
+        );
     }
 
     #[tokio::test]
