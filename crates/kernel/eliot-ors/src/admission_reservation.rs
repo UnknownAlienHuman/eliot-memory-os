@@ -126,7 +126,7 @@ pub struct AdmissionReservationActivationEvidence {
     /// Control-reserve profile revision bound at activation. Empty on rows
     /// activated before profile binding existed; those rows read back as stale
     /// at verify time and must re-activate under the current revision.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub capacity_profile_revision: String,
 }
 
@@ -366,7 +366,7 @@ pub struct AdmissionReservationRecord {
     /// (#1679 W11). Bound at activation from the composition-retained profile,
     /// never defaulted and never recomputed; empty only on rows activated
     /// before profile binding existed, which verify as stale.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub capacity_profile_revision: String,
     /// Inactive reservation expiry boundary in Unix milliseconds.
     pub expires_at_ms: i64,
@@ -1233,6 +1233,13 @@ mod profile_revision_tests {
     #[test]
     fn legacy_row_without_revision_reads_back_and_verifies_stale() {
         let record = active_record(REVISION, REVISION);
+        let historical_payload = serde_json::to_string(&record)
+            .expect("1679 unit record serializes")
+            .replace(
+                &format!(",\"capacity_profile_revision\":\"{REVISION}\""),
+                "",
+            )
+            .into_bytes();
         // A row persisted before profile binding carried neither field: strip
         // both and prove the old bytes still deserialize with empty revisions.
         let mut value = serde_json::to_value(&record).expect("1679 unit record serializes");
@@ -1251,6 +1258,11 @@ mod profile_revision_tests {
             .expect("1679 unit evidence carries the revision");
         let legacy: AdmissionReservationRecord =
             serde_json::from_value(value).expect("1679 legacy bytes deserialize with defaults");
+        assert_eq!(
+            serde_json::to_vec(&legacy).expect("1679 legacy record serializes"),
+            historical_payload,
+            "ORS readback must preserve the historical payload bytes, digest and length"
+        );
         assert_eq!(
             legacy.capacity_profile_revision, "",
             "a pre-binding row reads back with an empty revision, never a defaulted current one"
