@@ -3897,7 +3897,12 @@ pub struct EvidenceFreeze {
 /// `verify_integrity` on readback. What this adds over that sibling is the
 /// direction: the freeze names the receipt that authorised its own member, so the
 /// freeze can be checked on its own bytes rather than only by correlation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The codec mirrors [`EvidenceFreeze`]: `deny_unknown_fields` and no field
+/// defaults, because a receipt is only ever decoded as part of a retained
+/// freeze whose shape is exact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FreezeMemberReceipt {
     /// The admitted source handle. Equal to this receipt's position in
     /// [`EvidenceFreeze::included_evidence_refs`]; the constructor refuses a
