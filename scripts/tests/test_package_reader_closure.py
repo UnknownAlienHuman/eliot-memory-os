@@ -1496,6 +1496,21 @@ class TestPackageReaderClosure(unittest.TestCase):
             self.assertEqual(
                 by_path["crates/a/tool/main.rs"]["handles"], ["H-TOOL"]
             )
+            # The rendered reverse index follows the same records: each
+            # handle row lists only its own targets, never the sibling's.
+            rendered = render_package_docs(reg, t)
+            core_rows = [
+                line for line in rendered.splitlines() if line.startswith("| [`H-CORE`]")
+            ]
+            tool_rows = [
+                line for line in rendered.splitlines() if line.startswith("| [`H-TOOL`]")
+            ]
+            self.assertEqual(len(core_rows), 1)
+            self.assertEqual(len(tool_rows), 1)
+            self.assertIn("src/lib.rs", core_rows[0])
+            self.assertNotIn("tool/main.rs", core_rows[0])
+            self.assertIn("tool/main.rs", tool_rows[0])
+            self.assertNotIn("src/lib.rs", tool_rows[0])
 
     # WORK_UNIT_CASE: 690/57
     def test_57_target_outside_every_block_glob_is_refused(self) -> None:
