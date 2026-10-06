@@ -4847,6 +4847,14 @@ fn mark_reconciled(
 ) -> Result<(), DispatchLaunchError> {
     let mut launches = launches_table(contour)?;
     if let Some(record) = launches.by_identity.get_mut(identity) {
+        if record.kind == DispatchedWorkerKind::NativeWorker
+            && record.phase != LaunchPhase::Reconciled
+            && record.effect_digest.is_none()
+        {
+            return Err(DispatchLaunchError::Inconsistent(
+                "native-worker reconciliation requires terminal owner evidence".to_owned(),
+            ));
+        }
         record.phase = LaunchPhase::Reconciled;
     }
     // Convergence is admission readback, not a terminal effect
@@ -6235,7 +6243,7 @@ fn unreconciled_when_capacity_stale(
 /// owner (`KernelService::reconcile_native_worker_claim_admission`) under
 /// live authority (same-authority epoch). A launched process keeps its
 /// `ProcessExecutor` proof until explicit terminal release; an unknown start
-/// with no live process receipt may close after receipt reconciliation.
+/// also remains outstanding until terminal owner evidence resolves it.
 /// Unknown identities report unknown instead of inventing state.
 pub fn reconcile_launched_native_worker_attempt(
     kernel: &KernelComposition,
@@ -6310,8 +6318,8 @@ pub fn reconcile_launched_native_worker_attempt(
     if let Some(outcome) = unreconciled_when_capacity_stale(contour, kernel, claim_id)? {
         return Ok(outcome);
     }
-    if retained.phase == LaunchPhase::Launched {
-        // Live child with no terminal child/effect evidence: the attempt
+    if retained.phase != LaunchPhase::Reconciled && retained.effect_digest.is_none() {
+        // Live or uncertain child with no terminal child/effect evidence: the attempt
         // is still outstanding, so the exact holding stays retained for
         // revalidation and the slot stays open for a later reconcile.
         // Admission readback binding here is not a terminal disposition
@@ -9695,6 +9703,15 @@ mod tests {
                 .expect("staged record");
             record.phase = LaunchPhase::Unreconciled;
         }
+        assert!(
+            mark_reconciled(contour, "claim-release-gate-1").is_err(),
+            "admission readback cannot resolve an uncertain native spawn"
+        );
+        assert_eq!(
+            launches_table(contour).expect("launches table").by_identity["claim-release-gate-1"]
+                .phase,
+            LaunchPhase::Unreconciled
+        );
         assert!(
             !release_launched_attempt(
                 DispatchedWorkerKind::NativeWorker,
