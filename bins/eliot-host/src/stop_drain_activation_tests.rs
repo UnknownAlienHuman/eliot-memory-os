@@ -441,6 +441,93 @@ fn readiness_contour_keeps_degraded_degraded_through_owner() {
     );
 }
 
+// WORK_UNIT_CASE: 891/A9
+#[test]
+fn managed_launch_admits_through_job_owner_without_readiness() {
+    let fixture = contour_fixture("a9-launch");
+    // The managed-launch owner only creates the two Job branches and
+    // observes the current process binding: no child is launched or
+    // adopted, no readiness row is selected, no terminal is armed.
+    let (captured, branches) = capture_contour(|| HostJobBranches::new(&fixture.composition.host));
+    let branches = branches.expect("the inert job branches must build");
+    assert!(
+        branches.kernel.is_none() && branches.store.is_none(),
+        "a managed launch admits branches but launches no child"
+    );
+    for boundary in [BOUNDARY_JOBS_REQUESTED, BOUNDARY_JOBS_ADMITTED] {
+        assert_eq!(
+            count_occurrences(&captured, &format!("detail=\"{}\"", boundary.event)),
+            1,
+            "the launch owner must emit {:?} exactly once: {captured}",
+            boundary.event
+        );
+    }
+    assert!(
+        !captured.contains("readiness"),
+        "a managed launch record must never carry readiness wording: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(&captured, "code="),
+        0,
+        "a managed launch arms no terminal: {captured}"
+    );
+}
+
+// WORK_UNIT_CASE: 891/A10
+#[test]
+fn liveness_tick_observes_without_readiness_through_owner() {
+    let mut fixture = contour_fixture("a10-liveness");
+    seed_active_activation(&mut fixture);
+    let (captured, tick) = capture_contour(|| fixture.composition.liveness_tick());
+    tick.expect("the liveness tick must answer");
+    for boundary in [BOUNDARY_LIVENESS_REQUESTED, BOUNDARY_LIVENESS_OBSERVED] {
+        assert_eq!(
+            count_occurrences(&captured, &format!("detail=\"{}\"", boundary.event)),
+            1,
+            "the liveness tick must emit {:?} exactly once: {captured}",
+            boundary.event
+        );
+    }
+    // With no live branches the gate records branch-degraded instead of
+    // claiming ready: the only readiness-named record is the degradation,
+    // never a readiness proof.
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            "boundary=\"host.readiness branch degraded observed\""
+        ),
+        1,
+        "the tick must record the degraded branch exactly once: {captured}"
+    );
+    for proof in [
+        "host.readiness requested proof",
+        "host.readiness ready proof",
+    ] {
+        assert!(
+            !captured.contains(&format!("detail=\"{proof}\"")),
+            "a liveness tick must never claim a readiness proof {proof:?}: {captured}"
+        );
+    }
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("code=\"{}\"", BOUNDARY_LIVENESS_TERMINAL.event)
+        ),
+        0,
+        "a live liveness tick disarms its guard and emits no terminal: {captured}"
+    );
+    let snapshot = fixture
+        .composition
+        .journal
+        .snapshot()
+        .expect("the journal must project");
+    assert_eq!(
+        snapshot.activation.as_ref().map(|record| record.state),
+        Some(ActivationState::Active),
+        "a liveness observation must never advance the activation"
+    );
+}
+
 // WORK_UNIT_CASE: 891/A7-ready-refused
 #[test]
 fn ready_transition_without_evidence_is_refused_through_owner() {
