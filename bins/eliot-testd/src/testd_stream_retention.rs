@@ -217,7 +217,7 @@ impl TestdStreamRetention {
     /// memory-only record with no source locator.
     fn finalize_inner(
         &self,
-        session: ProcessStreamSinkSession,
+        session: &ProcessStreamSinkSession,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
         let key = session.open_request_sha256().to_owned();
@@ -225,7 +225,7 @@ impl TestdStreamRetention {
         let live = sessions
             .get_mut(&key)
             .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
-        if live.session != session {
+        if live.session != *session {
             return Err(ProcessStreamSinkError::SessionMismatch);
         }
         let identity = request.command_identity()?;
@@ -411,7 +411,7 @@ impl ProcessStreamSinkClient for TestdStreamRetention {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        let result = self.finalize_inner(session, request);
+        let result = self.finalize_inner(&session, request);
         Self::ready(result)
     }
 
@@ -628,7 +628,7 @@ impl ProcessStreamSourceReadbackPort for TestdStreamRetention {
 
 /// Serves the current wall clock as a readback observation timestamp.
 fn serve_clock() -> ClockReading {
-    let now = current_clock_ms().min(i64::MAX as u64) as i64;
+    let now = current_clock_ms().min(i64::MAX as u64).cast_signed();
     ClockReading {
         valid_time_ms: Some(now),
         known_time_ms: Some(now),
@@ -648,6 +648,7 @@ fn current_clock_ms() -> u64 {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "retention proofs panic on fixture construction failures by design"
 )]
 mod tests {

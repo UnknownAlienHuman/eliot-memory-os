@@ -741,6 +741,80 @@ struct FinishInputs<'a> {
 /// (issue #1140, AC3). A productive profile without that port is never
 /// observed by an ungoverned fallback: the attempt finishes as `Unknown` with
 /// the reason recorded.
+/// Resolves retained bundles through the contour retention, when one is
+/// bound behind the executor.
+///
+/// Issue #456 (WB4/D6/I3): refusal and failure outcomes update the retained
+/// dispositions in place and never expose bytes; parser slots stay untouched
+/// when resolution fails, and the receipt cites readback-bound bundles. The
+/// byte bound accepts every admitted length: the finish path verifies exact
+/// lengths through the core and drops the bytes without a parse consumer, so
+/// the transient allocation stays bounded by the admitted session limits.
+/// The deadline is the admitted profile wall timeout.
+fn resolve_retained_sources<E: ?Sized>(
+    collector: &EvidenceCollector,
+    contour: &GovernedContour<'_, E>,
+    claimed: &TestJob,
+) -> Result<(), String> {
+    let Some(retention) = contour.stream_retention() else {
+        return Ok(());
+    };
+    let deadline_ms = profile_wall_timeout_ms(&claimed.invocation.profile)
+        .map_err(|error| format!("readback deadline unavailable: {error}"))?;
+    let context = TestdReadbackContext {
+        job_id: claimed.job_id.clone(),
+        invocation_id: claimed.invocation.request.request_id.as_str().to_owned(),
+        fence: claimed.invocation.request.state_fence.clone(),
+        max_bytes: u64::MAX,
+        deadline_ms,
+    };
+    collector
+        .resolve_typed_sources(retention.as_ref(), &context)
+        .map(|_| ())
+        .map_err(|error| format!("typed source resolution failed: {error}"))
+}
+
+/// Persists the restart record, then releases this job's uncited rows.
+///
+/// Issue #456 (WD1): the production path persists the admitted typed bundles
+/// with the durable job row, so a daemon restart reopens the same evidence
+/// identities without operation memory, while uncited rows cannot accumulate
+/// across attempts. Any failure refuses promotion instead of finishing
+/// without restart evidence.
+fn persist_restart_and_release_uncited(
+    store: &TestdStore,
+    collector: &EvidenceCollector,
+    claimed: &TestJob,
+    receipt: &eliot_testd_core::VerificationReceipt,
+) -> Result<(), String> {
+    let restart = collector
+        .checkpoint_typed_evidence(
+            &claimed.job_id,
+            claimed.invocation.request.request_id.as_str(),
+            &claimed.invocation.request.state_fence,
+        )
+        .map_err(|error| format!("typed restart checkpoint failed: {error}"))?;
+    store
+        .persist_typed_evidence_restart(&restart)
+        .map_err(|error| format!("typed restart persist failed: {error}"))?;
+    let mut keep = Vec::new();
+    for bundle in &receipt.typed_evidence {
+        for slot in [&bundle.stdout, &bundle.stderr] {
+            if let Some(locator) = slot
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.locator.as_ref())
+            {
+                keep.push(locator.clone());
+            }
+        }
+    }
+    store
+        .release_job_stream_sources_except(&claimed.job_id, &keep)
+        .map_err(|error| format!("stream source release failed: {error}"))?;
+    Ok(())
+}
+
 fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     lease: &mut Lease,
@@ -763,48 +837,15 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     // raw artifacts. Caller-observed preview bytes cannot become receipt
     // evidence under any handle; the receipt below cites admitted typed
     // bundles and readback bindings only.
-    // Issue #456 (WB4/D6/I3): with retention behind the executor, resolve
-    // every pending bundle through the readback port before the receipt is
-    // composed. Refusal and failure outcomes update the retained dispositions
-    // in place and never expose bytes; parser slots stay untouched when
-    // resolution fails, and the receipt below cites readback-bound bundles.
-    // The byte bound accepts every admitted length: the finish path verifies
-    // exact lengths through the core and drops the bytes without a parse
-    // consumer, so the transient allocation stays bounded by the admitted
-    // session limits. The deadline is the admitted profile wall timeout.
-    if let Some(retention) = contour.stream_retention() {
-        let deadline_ms = match profile_wall_timeout_ms(&claimed.invocation.profile) {
-            Ok(budget) => budget,
-            Err(error) => {
-                finish_unknown(
-                    store,
-                    claimed,
-                    lease,
-                    collector,
-                    format!(
-                        "readback deadline unavailable; outcome rescheduled as unknown: {error}"
-                    ),
-                )?;
-                return Ok(());
-            }
-        };
-        let context = TestdReadbackContext {
-            job_id: claimed.job_id.clone(),
-            invocation_id: claimed.invocation.request.request_id.as_str().to_owned(),
-            fence: claimed.invocation.request.state_fence.clone(),
-            max_bytes: u64::MAX,
-            deadline_ms,
-        };
-        if let Err(error) = collector.resolve_typed_sources(retention.as_ref(), &context) {
-            finish_unknown(
-                store,
-                claimed,
-                lease,
-                collector,
-                format!("typed source resolution failed; outcome rescheduled as unknown: {error}"),
-            )?;
-            return Ok(());
-        }
+    if let Err(reason) = resolve_retained_sources(collector, contour, claimed) {
+        finish_unknown(
+            store,
+            claimed,
+            lease,
+            collector,
+            format!("{reason}; outcome rescheduled as unknown"),
+        )?;
+        return Ok(());
     }
     let (source_observation, observation_fault) =
         observe_terminal_source(observed, contour, &mut execution);
@@ -860,28 +901,13 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
         )?;
         return Ok(());
     }
-    // Issue #456 (WD1 growth bound): drop this job's stream rows except the
-    // locators the finished receipt cites, so restart re-resolve keeps its
-    // bytes while uncited rows cannot accumulate across attempts.
-    let mut keep = Vec::new();
-    for bundle in &receipt.typed_evidence {
-        for slot in [&bundle.stdout, &bundle.stderr] {
-            if let Some(locator) = slot
-                .binding
-                .as_ref()
-                .and_then(|binding| binding.locator.as_ref())
-            {
-                keep.push(locator.clone());
-            }
-        }
-    }
-    if let Err(error) = store.release_job_stream_sources_except(&claimed.job_id, &keep) {
+    if let Err(reason) = persist_restart_and_release_uncited(store, collector, claimed, &receipt) {
         finish_unknown(
             store,
             claimed,
             lease,
             collector,
-            format!("stream source release failed; outcome rescheduled as unknown: {error}"),
+            format!("{reason}; outcome rescheduled as unknown"),
         )?;
         return Ok(());
     }
