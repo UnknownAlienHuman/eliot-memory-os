@@ -153,7 +153,7 @@ use crate::dispatch_material::{
     WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
     admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
     parse_control_delivery, parse_control_name, read_control_bytes, retire_legacy_control,
-    stage_ack_bytes, stage_control_bytes,
+    stage_ack_bytes,
 };
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{
