@@ -308,6 +308,67 @@ fn project_channel_coverage(
     projected
 }
 
+fn check_installation_channel_identities(
+    channels: &[InstallationChannelCoverage],
+) -> Result<(), EvaluationContractError> {
+    let mut seen = BTreeSet::new();
+    for channel in channels {
+        channel.validate()?;
+        if !seen.insert(channel.channel.as_str()) {
+            return Err(EvaluationContractError::DuplicateIdentity {
+                field: "installation_coverage.channels",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_foreign_replay_window(
+    binding: &InstallationCoverageBinding,
+    channels: &[InstallationChannelCoverage],
+) -> Result<(), EvaluationContractError> {
+    // A replayed window belongs to the declared interval only when it was
+    // recorded in it: a span replayed for another window can never back
+    // this interval's claim, so the provenance the spool owner stamped at
+    // the membership-gated call site must name this binding's start.
+    for channel in channels {
+        if channel.disposition.as_str() == "JOURNAL_REPLAYED"
+            && channel.replay_interval_start_ms != binding.interval_start_ms
+        {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "installation_channel.replay_interval_start_ms",
+                reason: "replayed window was not recorded in the declared interval",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn tally_installation_channels(
+    channels: &[InstallationChannelCoverage],
+) -> Result<(u64, u64, u64), EvaluationContractError> {
+    // A replayed channel is applied coverage by replay evidence, so it
+    // counts with the live-continuous channels; `unknown` is whatever was
+    // neither, never a conflation of replay with a gap.
+    let mut applied = 0_u64;
+    let mut unknown = 0_u64;
+    let mut dropped_total = 0_u64;
+    for channel in channels {
+        match channel.disposition.as_str() {
+            "CONTINUOUS" | "JOURNAL_REPLAYED" => applied += 1,
+            "UNKNOWN" => unknown += 1,
+            _ => {}
+        }
+        dropped_total = dropped_total
+            .checked_add(u64::from(channel.dropped_samples))
+            .ok_or(EvaluationContractError::EvidenceState {
+                field: "installation_coverage.dropped_samples",
+                reason: "dropped-sample counters overflow",
+            })?;
+    }
+    Ok((applied, unknown, dropped_total))
+}
+
 impl ObservationCoverageManifest {
     /// Validates the denominator shape. A `COMPLETE` denominator carries no
     /// blind intervals; anything else stays `PARTIAL`, `UNKNOWN`, or
@@ -570,50 +631,9 @@ impl ObservationCoverageManifest {
                 field: "installation_coverage.channels",
             });
         }
-        {
-            let mut seen = BTreeSet::new();
-            for channel in channels {
-                channel.validate()?;
-                if !seen.insert(channel.channel.as_str()) {
-                    return Err(EvaluationContractError::DuplicateIdentity {
-                        field: "installation_coverage.channels",
-                    });
-                }
-            }
-        }
-        // A replayed window belongs to the declared interval only when it was
-        // recorded in it: a span replayed for another window can never back
-        // this interval's claim, so the provenance the spool owner stamped at
-        // the membership-gated call site must name this binding's start.
-        for channel in channels {
-            if channel.disposition.as_str() == "JOURNAL_REPLAYED"
-                && channel.replay_interval_start_ms != binding.interval_start_ms
-            {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "installation_channel.replay_interval_start_ms",
-                    reason: "replayed window was not recorded in the declared interval",
-                });
-            }
-        }
-        // A replayed channel is applied coverage by replay evidence, so it
-        // counts with the live-continuous channels; `unknown` is whatever was
-        // neither, never a conflation of replay with a gap.
-        let mut applied = 0_u64;
-        let mut unknown = 0_u64;
-        let mut dropped_total = 0_u64;
-        for channel in channels {
-            match channel.disposition.as_str() {
-                "CONTINUOUS" | "JOURNAL_REPLAYED" => applied += 1,
-                "UNKNOWN" => unknown += 1,
-                _ => {}
-            }
-            dropped_total = dropped_total
-                .checked_add(u64::from(channel.dropped_samples))
-                .ok_or(EvaluationContractError::EvidenceState {
-                    field: "installation_coverage.dropped_samples",
-                    reason: "dropped-sample counters overflow",
-                })?;
-        }
+        check_installation_channel_identities(channels)?;
+        reject_foreign_replay_window(binding, channels)?;
+        let (applied, unknown, dropped_total) = tally_installation_channels(channels)?;
         let received = channels.len() as u64;
         let completeness = if applied == received {
             CoverageCompleteness::Complete
