@@ -78,15 +78,12 @@ fn project_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCover
             .collect(),
         observed_replayed_observations: record.observed_replayed_observations(),
         replay_evidence: record.replayed_evidence().cloned(),
-        replay_scope_root: provenance.map_or(String::new(), |provenance| {
-            provenance.scope_root.clone()
-        }),
+        replay_scope_root: provenance
+            .map_or(String::new(), |provenance| provenance.scope_root.clone()),
         replay_scope_generation: provenance.map_or(String::new(), |provenance| {
             provenance.scope_generation.clone()
         }),
-        replay_interval_start_ms: provenance.map_or(0, |provenance| {
-            provenance.interval_start_ms
-        }),
+        replay_interval_start_ms: provenance.map_or(0, |provenance| provenance.interval_start_ms),
         dropped_samples: record.dropped_samples(),
         interval_closed: record.interval_closed(),
         disposition: record.disposition().as_str().to_owned(),

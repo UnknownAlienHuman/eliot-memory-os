@@ -140,8 +140,7 @@ fn replay_one_scope(
     match observe_journal_replay(spool, &volume, scope.root(), max_bytes) {
         JournalReplayOutcome::Replayed { evidence, records } => {
             bind_replayed_scope(scope, membership);
-            match coverage.record_replayed(ObservationChannel::FilesystemJournal, evidence, scope)
-            {
+            match coverage.record_replayed(ObservationChannel::FilesystemJournal, evidence, scope) {
                 RecordOutcome::Recorded => {
                     tracing::debug!(
                         event = "watchdog.registered_scope_replayed",
@@ -439,8 +438,7 @@ mod tests {
     fn crash_between_save_and_ack_is_a_named_omission() {
         let cell = IntervalCoverageCell::new(1000);
         assert_eq!(cell.begin_interval(1000), None);
-        let scope = disposable_scope("crash-window")
-            .expect("crash-window scope registers");
+        let scope = disposable_scope("crash-window").expect("crash-window scope registers");
         assert_eq!(
             cell.record_replayed(
                 ObservationChannel::FilesystemJournal,
@@ -542,8 +540,7 @@ mod tests {
         ] {
             assert_eq!(cell.record(channel, class), RecordOutcome::Recorded);
         }
-        let scope =
-            disposable_scope("full-window").expect("full-window scope registers");
+        let scope = disposable_scope("full-window").expect("full-window scope registers");
         assert_eq!(
             cell.record_replayed(
                 ObservationChannel::FilesystemJournal,
