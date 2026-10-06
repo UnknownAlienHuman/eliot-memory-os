@@ -617,7 +617,17 @@ pub(crate) fn recompute_allocation(
 ///
 /// Length, digest, duplicate-key, control-field, and narrowing checks all
 /// run here, before any durable effect is planned: a mismatched authority
-/// fails the plan instead of reaching the transaction writer.
+/// Builds the exact-byte authority record for every named operation.
+///
+/// With a supplied authority the original raw bytes travel verbatim after
+/// validation against the admitted parameters. Without one (the production
+/// legacy path) the canonical JSON of the admitted parameters is the exact
+/// recoverable representation — the same fallback [`evidence_records`]
+/// applies to captures — so every body family (observation, evidence, claim,
+/// verification, failure) persists versioned, digest-bound exact bytes, not
+/// just `CaptureObservation` (issue #10, W6). A count mismatch or an
+/// authority/parameter disagreement fails the plan instead of reaching the
+/// transaction writer.
 fn payload_authority_records(
     transition: &PreparedTransition,
     authorities: &[Option<ExactJsonBytes>],
@@ -637,7 +647,7 @@ fn payload_authority_records(
     {
         if let Some(authority) = authority {
             authority.validate()?;
-            let decoded = authority.decode_object_parameters()?;
+            let decoded = authority.decode_object_parameters_for(operation.operation)?;
             if decoded != operation.parameters {
                 return Err(StoreError::InvalidField {
                     field: "payload.authority",
@@ -651,6 +661,18 @@ fn payload_authority_records(
                 digest_hex: authority.digest_hex(),
                 byte_len: authority.byte_len(),
                 bytes: authority.bytes.clone(),
+            });
+        } else {
+            let canonical = canonical_json_bytes(&operation.parameters)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &canonical)?;
+            records.push(PayloadAuthorityRecord {
+                operation_index: index,
+                version: bound.version,
+                encoding: bound.encoding.mnemonic().to_owned(),
+                digest_hex: bound.digest_hex(),
+                byte_len: bound.byte_len(),
+                bytes: bound.bytes.clone(),
             });
         }
     }
@@ -1234,8 +1256,9 @@ mod tests {
     };
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-        OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, ReceiptEnvelope,
-        ScopeId, SecurityContext, StateFence, TransitionClass, bind_issue18_digests,
+        OperationId, OperationIdentity, OrderingScopeId, ReceiptEnvelope, ScopeId, SecurityContext,
+        StateFence, TransitionClass, bind_issue18_digests, generated_operation_manifests,
+        operation_manifest_set_digest, supported_admission_contract_set_digest,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1281,8 +1304,15 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "a".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            // The admitted contract-set digest, never a placeholder: plan
+            // validation rejects anything else with `ManifestMismatch`
+            // (issue #10, same staleness as the live-test fixture).
+            admission_contract_set_digest: supported_admission_contract_set_digest()?,
+            // Same staleness as above: the admitted catalogue digest, never
+            // a placeholder (unknown digests fail with `UnknownOperation`).
+            operation_manifest_digest: operation_manifest_set_digest(
+                &generated_operation_manifests()?,
+            )?,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
             admission_digest: String::new(),
@@ -1294,8 +1324,11 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: Vec::new(),
-                projection_kinds: vec![String::from("task_state")],
-                relation_kinds: vec![String::from("causes")],
+                // No projection/relation intents: the closed catalogue
+                // declares no `task_state`/`causes` kinds (the live-test
+                // fixture binds empty intents for the same reason).
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
@@ -1348,17 +1381,33 @@ mod tests {
     }
 
     #[test]
-    fn plan_routing_keeps_legacy_path_without_authorities() -> Result<(), StoreError> {
+    fn plan_routing_binds_canonical_fallback_without_authorities() -> Result<(), StoreError> {
         use crate::plan::select_apply_plan;
+        use eliot_store_api::{ExactJsonBytes, PayloadSource};
 
         let (_, transition) = fixture()?;
+        // Issue #10 (W6): without a supplied authority every operation still
+        // persists exact bytes — the canonical JSON of the admitted parameters
+        // — so all body families carry a versioned, digest-bound authority,
+        // not just `CaptureObservation`.
         let legacy = plan_apply(&transition, &[], &[], 1, 1)?;
-        assert!(legacy.payload_authority.is_empty());
+        assert_eq!(
+            legacy.payload_authority.len(),
+            1,
+            "one operation plans exactly one fallback authority record"
+        );
+        let record = &legacy.payload_authority[0];
+        let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &record.bytes)?;
+        assert_eq!(bound.digest_hex(), record.digest_hex);
+        assert_eq!(
+            bound.decode_object_parameters()?,
+            transition.named_operations[0].parameters,
+            "fallback bytes decode to the admitted parameters"
+        );
         let routed = select_apply_plan(&transition, &[None], &[], &[], 1, 1)?;
-        assert!(routed.payload_authority.is_empty());
         assert_eq!(
             routed.outbox_records, legacy.outbox_records,
-            "all-None authorities keep the exact historical digest path"
+            "all-None authorities plan identically"
         );
         Ok(())
     }
@@ -1369,7 +1418,10 @@ mod tests {
         use eliot_store_api::{ExactJsonBytes, PayloadSource};
 
         let (_, transition) = fixture()?;
-        let raw = br#"{"subject":"op-envelope"}"#;
+        // Non-canonical spacing: decodes to exactly the admitted parameters
+        // but binds different bytes than the canonical fallback, so the
+        // digest assertion below proves verbatim carriage, not re-serialization.
+        let raw = br#"{"subject" : "op-envelope"}"#;
         let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)?;
         assert_eq!(
             authority.decode_object_parameters()?,
@@ -1457,8 +1509,10 @@ mod tests {
         assert_eq!(fresh.commit_sequence, 2);
         assert_eq!(stale.next_commit_sequence, 2);
         assert_eq!(fresh.next_commit_sequence, 3);
-        assert_eq!(stale.next_outbox_sequence, 2);
-        assert_eq!(fresh.next_outbox_sequence, 5);
+        // Two outbox rows per plan: the event intent plus the LAUNCH intent
+        // (I10.15 step 3 / I14.6), so sequences advance by two per plan.
+        assert_eq!(stale.next_outbox_sequence, 3);
+        assert_eq!(fresh.next_outbox_sequence, 6);
         assert_ne!(stale.committed_at, fresh.committed_at);
         assert_eq!(
             stale.outbox_records.len(),
@@ -1521,9 +1575,11 @@ mod tests {
         assert_eq!(recomputed.commit_sequence, 2);
         assert_eq!(recomputed.committed_at, "commit-sequence-0000000000000002");
         assert_eq!(recomputed.next_commit_sequence, 3);
-        assert_eq!(recomputed.next_outbox_sequence, 5);
-        assert_eq!(recomputed.outbox_records.len(), 1);
+        // Event intent plus the LAUNCH intent (I10.15 step 3 / I14.6).
+        assert_eq!(recomputed.next_outbox_sequence, 6);
+        assert_eq!(recomputed.outbox_records.len(), 2);
         assert_eq!(recomputed.outbox_records[0].sequence, 4);
+        assert_eq!(recomputed.outbox_records[1].sequence, 5);
         assert_eq!(recomputed.evidence_records.len(), 1);
         assert_eq!(recomputed.evidence_records[0].commit_sequence, 2);
         // Identical to the full plan at the same allocation.

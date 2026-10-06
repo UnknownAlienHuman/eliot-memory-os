@@ -701,10 +701,39 @@ impl StoreComposition {
         })?;
         let generation = self.store.config().expected_schema_generation.clone();
         let migration = SurrealStoreAdapter::initial_schema_migration(generation);
-        self.store
+        let receipt = self
+            .store
             .apply_migration(&migration, observed_clock, &self.state_fence)
             .await
-            .map_err(map_adapter_error)
+            .map_err(map_adapter_error)?;
+        // Issue #10 (W7): inventory the historical payload population on the
+        // production launch path (`launch_mode.rs` portable-dev init).
+        // Observability only: the migration receipt is returned unchanged and
+        // an inventory failure never fails startup — the rejected event
+        // carries the signal instead of a receipt shape change.
+        let mut inventory_events = BoundedEventLog::new();
+        match self.store.inventory_historical_payloads().await {
+            Ok(_report) => {
+                emit_lifecycle(
+                    &mut inventory_events,
+                    BridgeBoundary::SchemaMigration,
+                    "historical_payload_inventory",
+                    &BridgeIdentity::new().with_generation(receipt.generation_after.as_str()),
+                    None,
+                );
+            }
+            Err(_) => {
+                emit_validation_rejected(
+                    &mut inventory_events,
+                    BridgeBoundary::SchemaMigration,
+                    "historical_payload_inventory",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+            }
+        }
+        report_events(&inventory_events);
+        Ok(receipt)
     }
 
     /// Executes one explicitly bound `SystemService` schema bootstrap command.
