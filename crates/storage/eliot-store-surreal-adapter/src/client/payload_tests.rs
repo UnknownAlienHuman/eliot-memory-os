@@ -537,6 +537,22 @@ async fn real_surreal_payload_commit_exact_read_reopen_and_export() {
     for (subject, authority, receipt) in &committed {
         assert_readback(harness.adapter(), &ctx, subject, authority, receipt).await;
     }
+    // W7/A5: the product-path inventory runs over the same live population:
+    // every committed payload replays from re-validated exact bytes.
+    let inventory = harness
+        .adapter()
+        .inventory_historical_payloads()
+        .await
+        .expect("live historical inventory");
+    assert_eq!(
+        inventory.records.len(),
+        committed.len(),
+        "one inventory entry per committed payload"
+    );
+    assert!(
+        inventory.all_intact(),
+        "live population replays intact from exact bytes"
+    );
     harness.close().await;
     std::fs::remove_dir_all(&harness.root).expect("remove isolated test root");
 }
