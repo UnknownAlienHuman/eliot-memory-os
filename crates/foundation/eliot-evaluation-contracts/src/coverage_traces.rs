@@ -581,6 +581,20 @@ impl ObservationCoverageManifest {
                 }
             }
         }
+        // A replayed window belongs to the declared interval only when it was
+        // recorded in it: a span replayed for another window can never back
+        // this interval's claim, so the provenance the spool owner stamped at
+        // the membership-gated call site must name this binding's start.
+        for channel in channels {
+            if channel.disposition.as_str() == "JOURNAL_REPLAYED"
+                && channel.replay_interval_start_ms != binding.interval_start_ms
+            {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.replay_interval_start_ms",
+                    reason: "replayed window was not recorded in the declared interval",
+                });
+            }
+        }
         // A replayed channel is applied coverage by replay evidence, so it
         // counts with the live-continuous channels; `unknown` is whatever was
         // neither, never a conflation of replay with a gap.
@@ -680,8 +694,12 @@ impl ObservationCoverageManifest {
 /// interval publisher can produce (`CONTINUOUS`, `PARTIAL`, `BLIND`,
 /// `UNKNOWN`, `JOURNAL_REPLAYED`); the replay disposition is only valid with
 /// exact [`JournalReplayEvidence`], and no producer emits it until the W3
-/// journal-replay adapter reports a replayed window.
-pub const INSTALLATION_COVERAGE_BINDING_VERSION: u32 = 2;
+/// journal-replay adapter reports a replayed window. Version 3 resolves the
+/// cursor/count contract (issue #1755, CS1 return): the evidence carries the
+/// exact `record_count` instead of equating the USN cursor span with the
+/// count, and every replayed channel carries the registered scope
+/// root/generation and recording interval its window was gated through.
+pub const INSTALLATION_COVERAGE_BINDING_VERSION: u32 = 3;
 
 /// Fixed session-scope literal for installation-level coverage.
 ///
@@ -760,12 +778,15 @@ impl InstallationCoverageBinding {
 
 /// Journal-replay evidence backing one `JOURNAL_REPLAYED` channel record.
 ///
-/// The replay adapter (W3) covers a contiguous cursor window of one journal
-/// and reports exactly the records it replayed. `first_cursor` and
-/// `last_cursor` are the inclusive window bounds in that journal's cursor
-/// space (USN for the filesystem journal); `observed_replayed_observations`
-/// on the channel record must equal the window length, so a replay claim is
-/// exact coverage of a named window rather than an approximate count.
+/// The replay adapter (W3) covers a byte-contiguous run of records of one
+/// journal and reports exactly the records it replayed. `first_cursor` and
+/// `last_cursor` are the inclusive USN bounds of that run in the journal's
+/// cursor space — USNs are stream byte offsets, so the cursor span is never
+/// the record count and must never be equated with it (issue #1755, CS1
+/// return). `record_count` is the exact number of records the adapter
+/// replayed; `observed_replayed_observations` on the channel record must
+/// equal it, so a replay claim is exact coverage of a named window rather
+/// than an approximate count.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JournalReplayEvidence {
@@ -775,18 +796,27 @@ pub struct JournalReplayEvidence {
     pub first_cursor: u64,
     /// Inclusive last cursor of the replayed window.
     pub last_cursor: u64,
+    /// Exact records replayed inside the window (never zero).
+    pub record_count: u32,
 }
 
 impl JournalReplayEvidence {
-    /// Validates replay evidence shape: the journal is named and the window
-    /// is ordered.
+    /// Validates replay evidence shape: the journal is named, the window is
+    /// ordered, and at least one record is claimed.
     ///
     /// # Errors
     ///
-    /// Returns [`EvaluationContractError`] when the journal identity is blank
-    /// or the window is inverted or its inclusive length cannot fit in `u64`.
+    /// Returns [`EvaluationContractError`] when the journal identity is blank,
+    /// when no record is claimed, or when the window is inverted or its
+    /// inclusive length cannot fit in `u64`.
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         text(&self.journal_id, "replay_evidence.journal_id")?;
+        if self.record_count == 0 {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "replay_evidence.record_count",
+                reason: "replay evidence must name at least one replayed record",
+            });
+        }
         if self.window_len() == 0 {
             return Err(EvaluationContractError::InvalidInterval {
                 field: "replay_evidence.first/last_cursor",
@@ -810,7 +840,7 @@ impl JournalReplayEvidence {
 ///
 /// This mirrors the spool owner's per-channel record field for field —
 /// channel, competent source, expected classes, observed live classes,
-/// replayed count with its replay evidence (binding version 2; always zero
+/// replayed count with its replay evidence (binding version 3; always zero
 /// and absent until the W3 replay adapter reports a replayed window),
 /// dropped-sample count, whether the opening tick reached its close, the I8.2
 /// wire disposition, and the named gap reasons — without importing the spool
@@ -834,13 +864,24 @@ pub struct InstallationChannelCoverage {
     pub observed_replayed_observations: u32,
     /// Replay evidence for a `JOURNAL_REPLAYED` record; `None` otherwise.
     pub replay_evidence: Option<JournalReplayEvidence>,
+    /// Registered scope root the replayed window was read for, recorded at
+    /// the membership-gated call site; empty without the replay disposition.
+    pub replay_scope_root: String,
+    /// Generation of that registered scope; empty without the replay
+    /// disposition.
+    pub replay_scope_generation: String,
+    /// Owner-clock start of the interval the window was recorded in; zero
+    /// without the replay disposition. [`ObservationCoverageManifest::for_installation_interval`]
+    /// requires it to equal the declared interval start, so a span replayed
+    /// for another window can never back this interval's claim.
+    pub replay_interval_start_ms: u64,
     /// Live samples offered for this channel and then dropped.
     pub dropped_samples: u32,
     /// False for a window a tick opened and did not finish: only `UNKNOWN`
     /// may be claimed for it.
     pub interval_closed: bool,
     /// I8.2 wire disposition: `CONTINUOUS`, `PARTIAL`, `BLIND`, `UNKNOWN`,
-    /// or `JOURNAL_REPLAYED` (binding version 2, only with replay evidence).
+    /// or `JOURNAL_REPLAYED` (binding version 3, only with replay evidence).
     pub disposition: String,
     /// Named omission reasons keeping this channel short of full coverage.
     pub gap_reasons: Vec<String>,
@@ -858,10 +899,10 @@ impl InstallationChannelCoverage {
     ///
     /// Returns [`EvaluationContractError`] when any of those checks fails.
     /// `JOURNAL_REPLAYED` is refused without exact evidence: the replayed
-    /// count must equal the evidence window length, and evidence without the
+    /// count must equal the evidence record count, and evidence without the
     /// replay disposition is refused as an inconsistent record.
     /// Validates the disposition against the replay evidence it requires:
-    /// `JOURNAL_REPLAYED` only with exact evidence whose window length the
+    /// `JOURNAL_REPLAYED` only with exact evidence whose record count the
     /// replayed count equals, every other disposition with neither evidence
     /// nor count. Kept beside [`validate`](Self::validate) so the record
     /// check stays within its line budget.
@@ -880,6 +921,15 @@ impl InstallationChannelCoverage {
                         reason: "replayed observations need the JOURNAL_REPLAYED disposition with exact replay evidence",
                     });
                 }
+                if !self.replay_scope_root.is_empty()
+                    || !self.replay_scope_generation.is_empty()
+                    || self.replay_interval_start_ms != 0
+                {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "installation_channel.replay_scope_root",
+                        reason: "replay provenance without the JOURNAL_REPLAYED disposition is an inconsistent record",
+                    });
+                }
             }
             "JOURNAL_REPLAYED" => {
                 let Some(evidence) = self.replay_evidence.as_ref() else {
@@ -889,17 +939,31 @@ impl InstallationChannelCoverage {
                     });
                 };
                 evidence.validate()?;
-                if u64::from(self.observed_replayed_observations) != evidence.window_len() {
+                if self.observed_replayed_observations != evidence.record_count {
                     return Err(EvaluationContractError::EvidenceState {
                         field: "installation_channel.observed_replayed_observations",
-                        reason: "replayed observations must equal the replay evidence window length",
+                        reason: "replayed observations must equal the replay evidence record count",
+                    });
+                }
+                text(
+                    &self.replay_scope_root,
+                    "installation_channel.replay_scope_root",
+                )?;
+                text(
+                    &self.replay_scope_generation,
+                    "installation_channel.replay_scope_generation",
+                )?;
+                if self.replay_interval_start_ms == 0 {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "installation_channel.replay_interval_start_ms",
+                        reason: "JOURNAL_REPLAYED needs the interval its window was recorded in",
                     });
                 }
             }
             _ => {
                 return Err(EvaluationContractError::EvidenceState {
                     field: "installation_channel.disposition",
-                    reason: "unknown I8.2 disposition; version 2 binds CONTINUOUS, PARTIAL, BLIND, UNKNOWN and JOURNAL_REPLAYED only",
+                    reason: "unknown I8.2 disposition; version 3 binds CONTINUOUS, PARTIAL, BLIND, UNKNOWN and JOURNAL_REPLAYED only",
                 });
             }
         }
@@ -1928,6 +1992,7 @@ mod coverage_replay_evidence_tests_1755 {
             journal_id: "filesystem-usn-journal".to_owned(),
             first_cursor: 100,
             last_cursor: 109,
+            record_count: 10,
         }
     }
 
@@ -1942,6 +2007,9 @@ mod coverage_replay_evidence_tests_1755 {
             observed_classes: Vec::new(),
             observed_replayed_observations: count,
             replay_evidence: evidence,
+            replay_scope_root: "C:\\scope".to_owned(),
+            replay_scope_generation: "scope-gen-1".to_owned(),
+            replay_interval_start_ms: 1_000,
             dropped_samples: 0,
             interval_closed: true,
             disposition: "JOURNAL_REPLAYED".to_owned(),
@@ -1949,8 +2017,9 @@ mod coverage_replay_evidence_tests_1755 {
         }
     }
 
-    /// Binding version 2 (#1755 A2): a `JOURNAL_REPLAYED` record with exact
-    /// evidence whose window length equals the replayed count validates.
+    /// Binding version 3 (#1755 A2): a `JOURNAL_REPLAYED` record with exact
+    /// evidence whose record count equals the replayed count validates, with
+    /// the gated scope provenance it was recorded through.
     #[test]
     fn journal_replayed_with_exact_evidence_validates() {
         assert!(
@@ -1966,10 +2035,11 @@ mod coverage_replay_evidence_tests_1755 {
         assert!(replayed_channel(10, None).validate().is_err());
     }
 
-    /// The replayed count must equal the evidence window length exactly:
-    /// an approximate count is not coverage of a named window.
+    /// The replayed count must equal the evidence record count exactly:
+    /// an approximate count is not coverage of a named window, and the USN
+    /// cursor span is never the count.
     #[test]
-    fn replayed_count_must_equal_evidence_window_length() {
+    fn replayed_count_must_equal_evidence_record_count() {
         assert!(
             replayed_channel(9, Some(exact_evidence()))
                 .validate()
@@ -1979,6 +2049,61 @@ mod coverage_replay_evidence_tests_1755 {
             replayed_channel(11, Some(exact_evidence()))
                 .validate()
                 .is_err()
+        );
+    }
+
+    /// Evidence claiming zero records is not a window, refused even when the
+    /// cursor bounds are ordered.
+    #[test]
+    fn zero_record_count_evidence_is_refused() {
+        let mut empty = exact_evidence();
+        empty.record_count = 0;
+        assert!(empty.validate().is_err());
+        assert!(replayed_channel(0, Some(empty)).validate().is_err());
+    }
+
+    /// A replayed record without the gated scope provenance is refused: the
+    /// window must name the registered scope and generation it was read for
+    /// and the interval it was recorded in.
+    #[test]
+    fn replayed_record_without_scope_provenance_is_refused() {
+        let mut no_scope = replayed_channel(10, Some(exact_evidence()));
+        no_scope.replay_scope_root = String::new();
+        assert!(no_scope.validate().is_err());
+        let mut no_generation = replayed_channel(10, Some(exact_evidence()));
+        no_generation.replay_scope_generation = String::new();
+        assert!(no_generation.validate().is_err());
+        let mut no_interval = replayed_channel(10, Some(exact_evidence()));
+        no_interval.replay_interval_start_ms = 0;
+        assert!(no_interval.validate().is_err());
+    }
+
+    /// Provenance without the replay disposition is an inconsistent record.
+    #[test]
+    fn provenance_without_replay_disposition_is_refused() {
+        let mut channel = replayed_channel(0, None);
+        channel.disposition = "UNKNOWN".to_owned();
+        channel.gap_reasons = vec!["NO_COMPETENT_SOURCE".to_owned()];
+        assert!(channel.validate().is_err());
+    }
+
+    /// A window recorded for another interval cannot back this interval: the
+    /// join refuses the span even when the channel record itself validates.
+    #[test]
+    fn replayed_window_from_another_interval_is_refused() {
+        let binding = InstallationCoverageBinding {
+            installation_id: "installation-1755".to_owned(),
+            allowed_manifest_digest: "a".repeat(64),
+            sensor_map_revision: 4,
+            interval_start_ms: 1_000,
+            interval_end_ms: 2_000,
+            binding_version: INSTALLATION_COVERAGE_BINDING_VERSION,
+        };
+        let mut foreign = replayed_channel(10, Some(exact_evidence()));
+        foreign.replay_interval_start_ms = 2_000;
+        assert!(foreign.validate().is_ok());
+        assert!(
+            ObservationCoverageManifest::for_installation_interval(&binding, &[foreign]).is_err()
         );
     }
 
@@ -2024,6 +2149,7 @@ mod coverage_replay_evidence_tests_1755 {
             journal_id: "filesystem-usn-journal".to_owned(),
             first_cursor: 0,
             last_cursor: u64::MAX,
+            record_count: 1,
         };
         assert_eq!(evidence.window_len(), 0);
         assert!(matches!(
