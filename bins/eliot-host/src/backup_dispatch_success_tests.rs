@@ -103,15 +103,39 @@ fn dispatch_roots_digest(roots: &RuntimeStateRoots) -> eliot_installation::Platf
 /// lives in the `derive_*` constructors, while every VALIDATION rule the
 /// preparation enforces (`validate`, host-root suffix, digest) is satisfied.
 fn dispatch_roots(case_root: &Path, key: &str) -> RuntimeStateRoots {
+    dispatch_roots_for_profile(
+        case_root,
+        key,
+        eliot_installation::InstallationProfile::SystemService,
+    )
+}
+
+/// Builds the profiled roots for one case under an already-proved anchor.
+/// `SystemService` refines `<anchor>\Eliot` directly while `UserMode` refines
+/// the I3.1 durable-data sibling (`<anchor>\Eliot\data`): the suffix each
+/// profile's `validate` demands (F1-F4, issue #958-continue), so a `UserMode`
+/// contour is a `UserMode` installation, never a `SystemService`-shaped path
+/// under the wrong anchor.
+fn dispatch_roots_for_profile(
+    case_root: &Path,
+    key: &str,
+    profile: eliot_installation::InstallationProfile,
+) -> RuntimeStateRoots {
     let anchor = dispatch_handle(case_root.to_string_lossy().into_owned());
-    let installation = dispatch_handle(format!(
-        "{}\\Eliot\\installations\\{key}",
-        case_root.to_string_lossy()
-    ));
+    let installation = dispatch_handle(match profile {
+        eliot_installation::InstallationProfile::UserMode => format!(
+            "{}\\Eliot\\data\\installations\\{key}",
+            case_root.to_string_lossy()
+        ),
+        _ => format!(
+            "{}\\Eliot\\installations\\{key}",
+            case_root.to_string_lossy()
+        ),
+    });
     let installation_str = installation.as_str().to_owned();
     let child = |leaf: &str| dispatch_handle(format!("{installation_str}\\{leaf}"));
     let mut roots = RuntimeStateRoots {
-        profile: eliot_installation::InstallationProfile::SystemService,
+        profile,
         profile_anchor_root: anchor,
         installation_root: installation,
         host_state_root: child("host"),
@@ -142,12 +166,35 @@ fn dispatch_manifest(
     case_root: &Path,
     case_bin: &Path,
 ) -> eliot_installation::CandidateManifest {
+    dispatch_manifest_for_profile(
+        roots,
+        installation,
+        generation_name,
+        case_root,
+        case_bin,
+        eliot_installation::InstallationProfile::SystemService,
+    )
+}
+
+/// Builds the seeded source manifest for one case under the given profile:
+/// the roots, the launch profile and the governed-roots sibling layout all
+/// carry that profile, so a `UserMode` manifest binds the I3.1 durable-data
+/// sibling instead of the `SystemService` contour.
+fn dispatch_manifest_for_profile(
+    roots: &RuntimeStateRoots,
+    installation: &str,
+    generation_name: &str,
+    case_root: &Path,
+    case_bin: &Path,
+    profile: eliot_installation::InstallationProfile,
+) -> eliot_installation::CandidateManifest {
     ManifestSeed {
         roots,
         installation,
         generation_name,
         case_root,
         case_bin,
+        profile,
     }
     .manifest()
 }
@@ -162,6 +209,7 @@ struct ManifestSeed<'a> {
     generation_name: &'a str,
     case_root: &'a Path,
     case_bin: &'a Path,
+    profile: eliot_installation::InstallationProfile,
 }
 
 /// Every derived path and digest one case manifest binds.
@@ -216,12 +264,48 @@ impl ManifestSeed<'_> {
         // per-installation runtime tree sits strictly below), while binaries
         // and user config/cache keep the proven liveness layout re-anchored
         // onto the case root.
+        //
+        // I3.1 `UserMode` table: the durable-data root is the sibling
+        // `<anchor>\Eliot\data` with config/cache beside it
+        // (`<anchor>\Eliot\config`, `<anchor>\Eliot\cache`) — the exact
+        // layout `validate_durable_runtime_join` demands, so the join
+        // compares the installation root the F3 fix names.
         let anchor_eliot = self.case_root.join("Eliot").to_string_lossy().into_owned();
         // The I3.1 user root is a sibling of the durable contour
         // (production: `%LocalAppData%\Eliot` beside `%ProgramData%\Eliot`),
         // so it must not sit under the durable root the separation rule
         // compares it against.
-        let user_root = self.case_root.join("user").to_string_lossy().into_owned();
+        let (durable_data, user_root) = match self.profile {
+            eliot_installation::InstallationProfile::UserMode => (
+                self.case_root
+                    .join("Eliot")
+                    .join("data")
+                    .to_string_lossy()
+                    .into_owned(),
+                anchor_eliot.clone(),
+            ),
+            _ => (
+                anchor_eliot.clone(),
+                self.case_root.join("user").to_string_lossy().into_owned(),
+            ),
+        };
+        // `UserMode` pins the exact I3.1 sibling names; every other
+        // profile keeps the proven liveness layout.
+        let (user_config, user_cache) = match self.profile {
+            eliot_installation::InstallationProfile::UserMode => (
+                self.case_root
+                    .join("Eliot")
+                    .join("config")
+                    .to_string_lossy()
+                    .into_owned(),
+                self.case_root
+                    .join("Eliot")
+                    .join("cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            _ => (user_root.clone(), user_root),
+        };
         eliot_installation::InstallationRoots {
             binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
             immutable_binaries: self
@@ -230,9 +314,9 @@ impl ManifestSeed<'_> {
                 .join("test-version")
                 .to_string_lossy()
                 .into_owned(),
-            durable_data: anchor_eliot,
-            user_config: user_root.clone(),
-            user_cache: user_root,
+            durable_data,
+            user_config,
+            user_cache,
             runtime_state_roots: self.roots.clone(),
         }
     }
@@ -289,7 +373,6 @@ impl ManifestSeed<'_> {
     }
 
     fn runtime_launch(&self, paths: &ManifestPaths) -> eliot_installation::RuntimeLaunchDescriptor {
-        use eliot_installation::InstallationProfile;
         let epoch = |seq: u64| {
             eliot_contracts::EpochId::new(
                 eliot_host_state::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
@@ -300,7 +383,7 @@ impl ManifestSeed<'_> {
         };
         let lineage = dispatch_handle(format!("lineage:{}", self.installation));
         let launch = eliot_installation::RuntimeLaunchDescriptor {
-            profile: InstallationProfile::SystemService,
+            profile: self.profile,
             profile_component: dispatch_handle("eliot"),
             profile_version: dispatch_handle("test-version"),
             profile_installation_key: Some(dispatch_handle(
@@ -489,8 +572,21 @@ fn dispatch_commit_fence(
 /// `journal_tests` builder pattern: in-crate code sees the private fields,
 /// so no design decision is left to guesswork).
 fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
-    let filesystem = contour_filesystem(case);
-    let seed = contour_seed_registry(&filesystem, case);
+    dispatch_contour_for_profile(case, eliot_installation::InstallationProfile::SystemService)
+}
+
+/// Sets up one disposable dispatch contour under the given profile. The
+/// `SystemService` shape keeps the Host + Watchdog SCM approvals the
+/// registry demands of that profile; `UserMode` seeds approval-free through
+/// the same Pending stage/commit path (the two-approval rule is gated on
+/// `SystemService`), so the committed row is the same installer-driven shape
+/// minus the service registrations a user-mode activation never performs.
+fn dispatch_contour_for_profile(
+    case: &str,
+    profile: eliot_installation::InstallationProfile,
+) -> (DispatchContour, HostComposition) {
+    let filesystem = contour_filesystem(case, profile);
+    let seed = contour_seed_registry(&filesystem, case, profile);
     contour_apply_purge(&filesystem);
     contour_compose(filesystem, seed)
 }
@@ -518,7 +614,10 @@ struct ContourSeed {
     registry: eliot_installation::ApprovedGenerationRegistry,
 }
 
-fn contour_filesystem(case: &str) -> ContourFilesystem {
+fn contour_filesystem(
+    case: &str,
+    profile: eliot_installation::InstallationProfile,
+) -> ContourFilesystem {
     let unique = format!(
         "{case}-{}-{}",
         std::process::id(),
@@ -527,7 +626,7 @@ fn contour_filesystem(case: &str) -> ContourFilesystem {
     let case_root = std::env::temp_dir().join(format!("eliot-958-dispatch-{unique}"));
     std::fs::create_dir_all(&case_root).expect("case root");
     let key = dispatch_sha256(&format!("958-dispatch-installation-{unique}"));
-    let roots = dispatch_roots(&case_root, &key);
+    let roots = dispatch_roots_for_profile(&case_root, &key, profile);
     for root in [
         &roots.host_state_root,
         &roots.kernel_ors_root,
@@ -570,14 +669,19 @@ fn contour_filesystem(case: &str) -> ContourFilesystem {
     }
 }
 
-fn contour_seed_registry(filesystem: &ContourFilesystem, case: &str) -> ContourSeed {
+fn contour_seed_registry(
+    filesystem: &ContourFilesystem,
+    case: &str,
+    profile: eliot_installation::InstallationProfile,
+) -> ContourSeed {
     let installation = format!("installation:958-dispatch-{}", filesystem.unique);
-    let manifest = dispatch_manifest(
+    let manifest = dispatch_manifest_for_profile(
         &filesystem.roots,
         &installation,
         &format!("generation-958-dispatch-{case}"),
         &filesystem.case_root,
         &filesystem.bin,
+        profile,
     );
     let owner_lease =
         HostOwnerLease::acquire(&dispatch_handle(installation.clone())).expect("case owner lease");
@@ -605,26 +709,43 @@ fn contour_seed_registry(filesystem: &ContourFilesystem, case: &str) -> ContourS
     // Watchdog SCM approvals: the issuer derives the pair from this case's
     // own manifest (images, bootstrap, transaction), so the seeded row is
     // the same projection an installer-driven activation would commit.
-    let service_approvals = eliot_installation::issue_test_support_service_registration_approvals(
-        &transaction_id,
-        &manifest,
-    )
-    .expect("case SCM approvals");
-    assert_eq!(
-        service_approvals.len(),
-        2,
-        "SystemService seeding carries exactly the Host + Watchdog approvals"
-    );
-    store
-        .seed_active_generation_with_service_approvals_for_test_support(
-            &owner_lease.activation_capability(),
-            &manifest,
-            &transaction_id,
-            &plan_digest,
-            &fence,
-            &service_approvals,
-        )
-        .expect("case active generation");
+    // Every other profile seeds approval-free through the same Pending
+    // stage/commit path: the two-approval rule the registry enforces is
+    // gated on `SystemService`, and a user-mode activation registers no
+    // services.
+    if profile == eliot_installation::InstallationProfile::SystemService {
+        let service_approvals =
+            eliot_installation::issue_test_support_service_registration_approvals(
+                &transaction_id,
+                &manifest,
+            )
+            .expect("case SCM approvals");
+        assert_eq!(
+            service_approvals.len(),
+            2,
+            "SystemService seeding carries exactly the Host + Watchdog approvals"
+        );
+        store
+            .seed_active_generation_with_service_approvals_for_test_support(
+                &owner_lease.activation_capability(),
+                &manifest,
+                &transaction_id,
+                &plan_digest,
+                &fence,
+                &service_approvals,
+            )
+            .expect("case active generation");
+    } else {
+        store
+            .seed_active_generation_for_test_support(
+                &owner_lease.activation_capability(),
+                &manifest,
+                &transaction_id,
+                &plan_digest,
+                &fence,
+            )
+            .expect("case active generation");
+    }
     let registry = store.load().expect("case registry projection");
     drop(store);
     ContourSeed {
@@ -1214,6 +1335,92 @@ fn dispatch_arm_admits_and_records_destination() {
         ),
         other => panic!("status arm must answer Admitted, got {other:?}"),
     }
+    drop(composition);
+    release_contour(&contour);
+}
+
+/// Production-path success proof on a `UserMode` contour (#958-continue
+/// F1-F4): the same live queue arm admits a preparation whose source is a
+/// current-user installation, answers `PossibleEffect` once the effect
+/// boundary is crossed, and retains the destination `ApprovedGeneration` row
+/// (inactive, new installation, pending plan authority) with its creation
+/// pair naming the created root under the owner-issued staging parent. The
+/// validators the arm traverses (`RuntimeStateRoots::validate` per-profile
+/// suffix, the installation Host-root shape check, the durable-runtime join
+/// installation comparison, the profile-aware installations root) refused
+/// every `UserMode` root before F1-F4; this test drives all four on the
+/// production path. Refusal and replay halves stay proved by their
+/// profile-independent `SystemService` twins above.
+/// Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore
+/// ("restore to isolated root;").
+#[test]
+fn dispatch_user_mode_arm_admits_and_records_destination() {
+    use eliot_host_service::runtime_control::BackupOwnerOutcome;
+    use eliot_protocol::backup::BackupOperationKind;
+    let (contour, composition) = dispatch_contour_for_profile(
+        "user-mode-arm",
+        eliot_installation::InstallationProfile::UserMode,
+    );
+    assert_eq!(
+        contour.roots.profile,
+        eliot_installation::InstallationProfile::UserMode,
+        "the contour carries the production user profile"
+    );
+    let dest_key = dispatch_sha256(&format!("destination:{}", contour.installation));
+    let canonical_request_hash = dispatch_sha256(&format!(
+        "canonical-request-user-mode:{}",
+        contour.installation
+    ));
+    let identity = dispatch_identity(
+        &contour,
+        BackupOperationKind::PrepareIsolatedRestore,
+        &dest_key,
+        "prepare-958-user-mode-arm",
+        &canonical_request_hash,
+    );
+    let prepare = dispatch_envelope(
+        dispatch_prepare_body(identity, &dest_key),
+        "prepare-958-user-mode-arm",
+    );
+    match composition.dispatch_backup_owner_operation(&prepare) {
+        Ok(BackupOwnerOutcome::PossibleEffect { retained }) => assert_eq!(
+            retained.operation,
+            BackupOperationKind::PrepareIsolatedRestore,
+            "possible effect retains the exact admitted operation"
+        ),
+        other => panic!("prepare arm must answer PossibleEffect, got {other:?}"),
+    }
+    let store = open_case_registry(&contour);
+    let capability = composition.owner_lease.activation_capability();
+    let operation_id =
+        eliot_installation::PlatformHandle::new(&canonical_request_hash).expect("operation handle");
+    let row = store
+        .read_prepared_destination_generation(&capability, &operation_id)
+        .expect("destination row recorded");
+    assert!(
+        !row.active,
+        "prepared destination never activates at preparation"
+    );
+    assert!(
+        matches!(
+            row.manifest.runtime_launch.supervision_authority,
+            eliot_installation::SupervisionAuthorityBinding::Pending { .. }
+        ),
+        "destination row carries pending plan authority, not the source receipt"
+    );
+    let (_, materialisation) = store
+        .read_prepared_isolated_destination_creation(&capability, &operation_id)
+        .expect("creation pair recorded");
+    let created = Path::new(&materialisation.destination_installation_root);
+    assert!(created.exists(), "recorded root exists on disk");
+    let canonical_parent =
+        std::fs::canonicalize(&contour.staging_parent).expect("parent canonicalizes");
+    let canonical_root = std::fs::canonicalize(created).expect("root canonicalizes");
+    assert!(
+        canonical_root.starts_with(&canonical_parent),
+        "created root sits under the owner-issued staging parent"
+    );
+    drop(store);
     drop(composition);
     release_contour(&contour);
 }
