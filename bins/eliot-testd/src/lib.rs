@@ -575,7 +575,7 @@ async fn start_claimed_from_store_inner<E: ProcessExecutor + 'static>(
         current.work_envelope.as_ref(),
     ) {
         // Issue #1897 (AUD4): a job that carries the retained work envelope has
-        // exactly one root authority — the envelope's governed root — so the
+        // exactly one root authority â€” the envelope's governed root â€” so the
         // owner-issued layout is verified against the envelope instead of
         // resolving a second root from its build-class level. A job admitted
         // without a lane keeps the pre-lane layout check unchanged.
@@ -3696,25 +3696,33 @@ mod tests {
         std::fs::remove_dir_all(&cwd).expect("probe cwd must clean");
     }
 
-    /// LIVE issue #456 (WD3): a real OS child runs through the composed
-    /// executor with the testd-owned retention behind its stream sink; the
-    /// emitted terminal evidence admits, resolves to byte-identical sources
-    /// with stable readback identities, survives a store reopen without
-    /// operation memory, and still runs no parser or evaluator.
+    /// One live OS child run through the composed executor: the working
+    /// directory, the live store handle, the retention, the admitting
+    /// collector, the attempt fence, and the reconciled terminal evidence.
     ///
     /// Windows-only: the real executor cannot launch elsewhere by design.
-    #[test]
     #[cfg(windows)]
-    fn live_child_streams_resolve_and_survive_restart() {
-        use eliot_process::ProcessExecutor;
-        use eliot_testd_core::{
-            EvidenceCollector, RetryPolicy, TestdEvaluationStatus, TestdParsingStatus,
-            TestdProcessEvidenceBundle, TestdReadbackContext, TestdStore, TestdStreamDisposition,
-            TestdStreamResolution,
-        };
+    struct LiveChild {
+        dir: std::path::PathBuf,
+        store: std::sync::Arc<eliot_testd_core::TestdStore>,
+        retention: std::sync::Arc<super::TestdStreamRetention>,
+        collector: std::sync::Arc<eliot_testd_core::EvidenceCollector>,
+        fence: eliot_contracts::StateFence,
+        terminal_evidence: eliot_process::ProcessEvidence,
+    }
+
+    /// Runs one real OS child through the composed executor with the
+    /// testd-owned retention behind its stream sink.
+    ///
+    /// Windows-only: the real executor cannot launch elsewhere by design.
+    #[cfg(windows)]
+    #[allow(clippy::expect_used, reason = "live fixture panics on setup failure")]
+    fn run_live_child() -> LiveChild {
+        use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
+        use eliot_testd_core::{EvidenceCollector, RetryPolicy, TestdStore};
         use std::task::{Context, Poll, Waker};
 
-        fn block_on_drive_test<F: std::future::Future>(future: F) -> F::Output {
+        fn block_on<F: std::future::Future>(future: F) -> F::Output {
             let waker = Waker::noop();
             let mut context = Context::from_waker(&waker);
             let mut pinned = Box::pin(future);
@@ -3726,15 +3734,11 @@ mod tests {
             }
         }
 
-        const JOB_ID: &str = "job-live-1";
-        const OPERATION_ID: &str = "testd-op-live-1";
-
         let tool = admitted_tool_binding();
         let authority =
             super::TestdDispatchAuthority::new().expect("dispatch authority must construct");
-        let epoch = test_epoch(7);
         let fence = eliot_contracts::StateFence::new(
-            epoch,
+            test_epoch(7),
             eliot_contracts::ResourceGeneration::new(1).expect("non-zero test generation"),
         );
         let now = super::unix_ms();
@@ -3751,8 +3755,8 @@ mod tests {
             std::env::temp_dir().join(format!("eliot-testd-live-{now}-{}", std::process::id()));
         std::fs::create_dir_all(&cwd).expect("live cwd must create");
         let params = super::TestdDerivedIntentParams {
-            job_id: JOB_ID.to_owned(),
-            operation_id: OPERATION_ID.to_owned(),
+            job_id: "job-live-1".to_owned(),
+            operation_id: "testd-op-live-1".to_owned(),
             process_tree_id: "job-live-1-tree".to_owned(),
             profile: eliot_testd_core::TESTD_ADMITTED_PROFILE.to_owned(),
             slot_suffix: Vec::new(),
@@ -3769,30 +3773,25 @@ mod tests {
         let request = authority
             .issue(&intent, &grant, now)
             .expect("authority must issue");
-
-        let store_path = cwd.join("live-store.redb");
-        let collector: std::sync::Arc<EvidenceCollector> =
-            std::sync::Arc::new(EvidenceCollector::default());
-        let sink: std::sync::Arc<dyn eliot_process::ProcessEvidenceSink> = collector.clone();
-        // The retention is fenced for this driven job before any child runs.
-        // One store handle is shared so the exclusive file lock never
-        // contends with itself.
         let live_store = std::sync::Arc::new(
-            TestdStore::open(&store_path, RetryPolicy::default())
+            TestdStore::open(cwd.join("live-store.redb"), RetryPolicy::default())
                 .expect("live retention store must open"),
         );
+        let collector: std::sync::Arc<EvidenceCollector> =
+            std::sync::Arc::new(EvidenceCollector::default());
+        let sink: std::sync::Arc<dyn ProcessEvidenceSink> = collector.clone();
         let retention = std::sync::Arc::new(super::TestdStreamRetention::new(
             std::sync::Arc::clone(&live_store),
             fence.clone(),
         ));
         let executor =
             super::compose_process_executor(std::sync::Arc::new(authority), retention.clone());
-        let operation = eliot_process::OperationId::new(OPERATION_ID).expect("live operation id");
-        block_on_drive_test(executor.start(request, sink)).expect("live child must start");
+        let operation =
+            eliot_process::OperationId::new("testd-op-live-1").expect("live operation id");
+        block_on(executor.start(request, sink)).expect("live child must start");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let view = block_on_drive_test(executor.inspect(operation.clone()))
-                .expect("live inspect must answer");
+            let view = block_on(executor.inspect(operation.clone())).expect("inspect must answer");
             if view.lifecycle().is_terminal() {
                 break;
             }
@@ -3802,24 +3801,49 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        // Reconcile joins the capture sessions and publishes the terminal
-        // evidence into the same collector through the sink port.
-        let terminal_evidence = block_on_drive_test(executor.reconcile(operation))
+        let terminal_evidence = block_on(executor.reconcile(operation))
             .expect("live reconcile must publish terminal evidence");
+        drop(executor);
+        LiveChild {
+            dir: cwd,
+            store: live_store,
+            retention,
+            collector,
+            fence,
+            terminal_evidence,
+        }
+    }
 
-        // The admitted terminal bundle resolves to the exact child bytes.
+    /// LIVE issue #456 (WB4/WD3): the admitted terminal bundle of a real OS
+    /// child resolves to the exact child bytes with stable readback
+    /// identities, yet runs no parser and assesses nothing; preview-only
+    /// bytes without a readback receipt refuse parsing.
+    ///
+    /// Windows-only: the real executor cannot launch elsewhere by design.
+    #[test]
+    #[cfg(windows)]
+    #[allow(clippy::expect_used, reason = "live proof panics on failure by design")]
+    fn live_child_streams_resolve_with_readback_bindings() {
+        use eliot_testd_core::{
+            EvidenceCollector, TestdEvaluationStatus, TestdParsingStatus,
+            TestdProcessEvidenceBundle, TestdReadbackContext, TestdStreamDisposition,
+            TestdStreamResolution,
+        };
+
+        let live = run_live_child();
         let context = TestdReadbackContext {
-            job_id: JOB_ID.to_owned(),
+            job_id: "job-live-1".to_owned(),
             invocation_id: "invocation-live-1".to_owned(),
-            fence: fence.clone(),
+            fence: live.fence.clone(),
             max_bytes: 1 << 20,
             deadline_ms: 5_000,
         };
-        let outcomes = collector
-            .resolve_typed_sources(&*retention, &context)
+        let outcomes = live
+            .collector
+            .resolve_typed_sources(live.retention.as_ref(), &context)
             .expect("live resolution must run");
-        let bundles: Vec<TestdProcessEvidenceBundle> = collector.typed_bundles();
-        let live = bundles
+        let bundles: Vec<TestdProcessEvidenceBundle> = live.collector.typed_bundles();
+        let resolved_live = bundles
             .iter()
             .find(|bundle| {
                 bundle.stdout.disposition == TestdStreamDisposition::CompleteSource
@@ -3830,7 +3854,11 @@ mod tests {
                         .is_some_and(|binding| binding.readback_receipt_id.is_some())
             })
             .expect("live stdout must resolve to a complete readback-bound source");
-        let binding = live.stdout.binding.as_ref().expect("live stdout binding");
+        let binding = resolved_live
+            .stdout
+            .binding
+            .as_ref()
+            .expect("live stdout binding");
         let locator = binding.locator.as_ref().expect("live stdout locator");
         assert!(
             locator.starts_with("testd-retained:job-live-1:testd-op-live-1:stdout"),
@@ -3849,15 +3877,10 @@ mod tests {
             eliot_testd_core::sha256_hex(&resolved),
             binding.source_sha256.clone().expect("live digest")
         );
-        // A successful exit with resolved bytes still runs no parser and
-        // assesses nothing: exit status never becomes a verifier result here.
         assert_eq!(binding.parser.status, TestdParsingStatus::NotExecuted);
         assert_eq!(binding.evaluator.status, TestdEvaluationStatus::Unassessed);
-        // Preview-only bytes cannot feed the parser either: a fresh
-        // admission of the same terminal evidence, without resolution,
-        // refuses parsing for lack of a verified readback receipt.
         let fresh = EvidenceCollector::default();
-        eliot_process::ProcessEvidenceSink::record(&fresh, terminal_evidence)
+        eliot_process::ProcessEvidenceSink::record(&fresh, live.terminal_evidence.clone())
             .expect("fresh admission must succeed");
         let mut fresh_bundle = fresh
             .typed_bundles()
@@ -3882,52 +3905,93 @@ mod tests {
             fresh_binding.apply_parsing(&preview_parse).is_err(),
             "unresolved preview-only bytes must fail parsing"
         );
+        let dir = live.dir.clone();
+        drop(live);
+        std::fs::remove_dir_all(&dir).expect("live cwd must clean");
+    }
 
-        // The restart record persists; a reopen over the same file with a
-        // fresh retention re-resolves the identical bytes and identities.
-        let restart = collector
-            .checkpoint_typed_evidence(JOB_ID, "invocation-live-1", &fence)
+    /// LIVE issue #456 (WD1/WD2/WD3): the restart record of a real OS child
+    /// persists with readback-bound bundles; a reopen over the same file
+    /// with a fresh retention re-resolves the identical bytes and identities
+    /// without operation memory.
+    ///
+    /// Windows-only: the real executor cannot launch elsewhere by design.
+    #[test]
+    #[cfg(windows)]
+    #[allow(clippy::expect_used, reason = "live proof panics on failure by design")]
+    fn live_child_evidence_survives_restart() {
+        use eliot_testd_core::{
+            RetryPolicy, TestdReadbackContext, TestdStore, TestdStreamResolution,
+        };
+
+        const JOB_ID: &str = "job-live-1";
+        let live = run_live_child();
+        let context = TestdReadbackContext {
+            job_id: JOB_ID.to_owned(),
+            invocation_id: "invocation-live-1".to_owned(),
+            fence: live.fence.clone(),
+            max_bytes: 1 << 20,
+            deadline_ms: 5_000,
+        };
+        let outcomes = live
+            .collector
+            .resolve_typed_sources(live.retention.as_ref(), &context)
+            .expect("live resolution must run");
+        let resolved: Vec<u8> = outcomes
+            .into_iter()
+            .flatten()
+            .find_map(|outcome| match outcome {
+                TestdStreamResolution::Resolved { bytes, .. } => Some(bytes.bytes().to_vec()),
+                TestdStreamResolution::Refused { .. } => None,
+            })
+            .expect("at least one live stream must resolve");
+        let restart = live
+            .collector
+            .checkpoint_typed_evidence(JOB_ID, "invocation-live-1", &live.fence)
             .expect("live checkpoint must capture");
-        let first_receipt = binding
-            .readback_receipt_id
-            .clone()
-            .expect("live readback receipt");
-        live_store
-            .persist_typed_evidence_restart(&restart)
-            .expect("live restart record must persist");
-        drop(executor);
-        drop(retention);
-        drop(collector);
-        drop(live_store);
-        let reopened_arc = std::sync::Arc::new(
-            TestdStore::open(&store_path, RetryPolicy::default()).expect("store must reopen"),
-        );
-        let reopened =
-            super::TestdStreamRetention::new(std::sync::Arc::clone(&reopened_arc), fence);
-        let (reopened_bundles, reopened_outcomes) = reopened_arc
-            .reopen_typed_evidence(JOB_ID, &reopened, 1 << 20, 5_000)
-            .expect("live reopen must reconcile");
-        let reopened_live = reopened_bundles
+        let first_receipt = live
+            .collector
+            .typed_bundles()
             .iter()
-            .find(|bundle| {
+            .find_map(|bundle| {
                 bundle
                     .stdout
                     .binding
                     .as_ref()
-                    .is_some_and(|binding| binding.readback_receipt_id.is_some())
+                    .and_then(|binding| binding.readback_receipt_id.clone())
+            })
+            .expect("live readback receipt");
+        live.store
+            .persist_typed_evidence_restart(&restart)
+            .expect("live restart record must persist");
+        let dir = live.dir.clone();
+        drop(live);
+        let reopened_arc = std::sync::Arc::new(
+            TestdStore::open(dir.join("live-store.redb"), RetryPolicy::default())
+                .expect("store must reopen"),
+        );
+        let reopened = super::TestdStreamRetention::new(
+            std::sync::Arc::clone(&reopened_arc),
+            reopened_arc
+                .load_typed_evidence_restart(JOB_ID)
+                .expect("restart record must load")
+                .map(|record| record.fence)
+                .expect("restart fence"),
+        );
+        let (reopened_bundles, reopened_outcomes) = reopened_arc
+            .reopen_typed_evidence(JOB_ID, &reopened, 1 << 20, 5_000)
+            .expect("live reopen must reconcile");
+        let reopened_receipt = reopened_bundles
+            .iter()
+            .find_map(|bundle| {
+                bundle
+                    .stdout
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.readback_receipt_id.clone())
             })
             .expect("reopened stdout must stay readback-bound");
-        assert_eq!(
-            reopened_live
-                .stdout
-                .binding
-                .as_ref()
-                .expect("reopened binding")
-                .readback_receipt_id
-                .clone()
-                .expect("reopened receipt"),
-            first_receipt
-        );
+        assert_eq!(reopened_receipt, first_receipt);
         let reopened_bytes: Vec<u8> = reopened_outcomes
             .into_iter()
             .flatten()
@@ -3939,7 +4003,7 @@ mod tests {
         assert_eq!(reopened_bytes, resolved);
         drop(reopened);
         drop(reopened_arc);
-        std::fs::remove_dir_all(&cwd).expect("live cwd must clean");
+        std::fs::remove_dir_all(&dir).expect("live cwd must clean");
     }
 
     #[test]
