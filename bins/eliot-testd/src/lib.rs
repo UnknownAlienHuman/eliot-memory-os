@@ -44,6 +44,7 @@ pub use eliot_testd_core::{
 
 pub mod kernel_client;
 pub mod testd_material;
+pub mod testd_stream_retention;
 pub mod worker;
 pub use kernel_client::{
     KernelTestdIpcClient, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_OPERATION,
@@ -51,6 +52,7 @@ pub use kernel_client::{
     TESTD_TERMINAL_COMPLETION_OPERATION_VERSION, TestdTerminalCompletionRequest,
     TestdTerminalCompletionResponse, advertise_testd_admission, route_testd_admission,
 };
+pub use testd_stream_retention::TestdStreamRetention;
 pub use worker::{ADMITTED_WORKER_LEASE_MS, drive_admitted_one_shot};
 
 /// Stable daemon service identity.
