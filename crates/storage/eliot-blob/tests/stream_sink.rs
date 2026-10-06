@@ -49,7 +49,7 @@ use eliot_blob::{
     BlobCapacityRecovery, BlobCapacityStage, BlobCasProviderResult, BlobCompressionPort, BlobError,
     BlobKeyPort, BlobKeySelection, BlobLiveSetPort, BlobPathState, BlobPlatformPort,
     BlobStoreService, BlobStoreStreamSink, BlobStreamPublication, BlobStreamSinkStoreBinding,
-    LiveSetRevalidation, PublishState, RootClaimProof,
+    BlobStreamUnavailableReason, LiveSetRevalidation, PublishState, RootClaimProof,
 };
 use eliot_blob_api::{
     BlobCasCapability, BlobHash, BlobId, BlobIssuerTrustAnchor, BlobPolicyBinding,
@@ -1029,8 +1029,27 @@ fn replay_limits() -> ProcessStreamSinkLimits {
 /// three times. Only the labels differ, so each case owns a disjoint root and a
 /// disjoint session/source/terminal identity.
 fn open_replay_sink(case: &str) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
+    let (_, sink, session) = open_observed_sink(case);
+    (sink, session)
+}
+
+/// The store, binding, sink and open request the replay cases share, plus the
+/// platform handle behind the store so a case can observe durable effects.
+///
+/// `FixturePlatform` clones over one shared `Arc<Mutex<FaultState>>`, so the
+/// returned handle observes every durable write the sink's store performs —
+/// including writes the sink was never supposed to make. `open_replay_sink`
+/// is this same construction without the observation handle.
+fn open_observed_sink(
+    case: &str,
+) -> (
+    FixturePlatform,
+    BlobStoreStreamSink<FixtureStore>,
+    ProcessStreamSinkSession,
+) {
     let root = unique_test_root();
     let platform = FixturePlatform::default();
+    let platform_handle = platform.clone();
     // The ONE active root owner of this case; the sink receives a clone of this
     // shared handle, never a second construction on the same root.
     let store = store_with_platform(platform, &root);
@@ -1105,7 +1124,25 @@ fn open_replay_sink(case: &str) -> (BlobStoreStreamSink<FixtureStore>, ProcessSt
         ProcessStreamDigestAlgorithm::Sha256,
     ));
     let session = ok(block_on(sink.open(open)));
-    (sink, session)
+    (platform_handle, sink, session)
+}
+
+/// Counts every durable write the platform has performed.
+///
+/// A stage is never a pure-memory act: it issues `write_new_durable` calls
+/// for the payload, the metadata, the journal and the commit record. Any
+/// `stage` call therefore moves these counters, so equal counters across a
+/// terminal command prove no stage ran — without naming any file layout.
+fn durable_write_counts(platform: &FixturePlatform) -> (u64, u64, usize) {
+    let state = platform
+        .state
+        .lock()
+        .expect("fixture platform state is observable");
+    (
+        state.write_new_calls,
+        state.replace_calls,
+        state.files.len(),
+    )
 }
 
 /// Appends one chunk at explicit coordinates through the port.
@@ -1718,4 +1755,113 @@ fn cancelled_abort_retains_admitted_prefix_as_durable_partial_source() {
     assert_eq!(partial.locator, expected_locator);
     assert_eq!(partial.byte_length, prefix_len);
     assert_eq!(partial.sha256, expected_sha256);
+}
+
+/// Source: `withheld_plan` (`src/stream_sink.rs:1683`) and the no-retention
+/// abort arm: a gapped, policy-prohibited or failed-redaction finalize mints
+/// a withheld terminal, and a prohibition/redaction abort mints its terminal
+/// — in NEITHER case may a stage call run, so no raw bytes reach the owner.
+/// Discovery: the W3 retention path stages on purpose, which makes the
+/// negative proof load-bearing rather than vacuous: the same adapter that
+/// retains a cancelled prefix must still stage NOTHING for a prohibited one,
+/// and "no stage ran" is observed on the platform write counters, not
+/// inferred from the terminal state.
+/// Executed-pass: two sessions admit the same bytes; a `PolicyProhibited`
+/// finalize and a `RedactionFailure` abort each land their exact terminal and
+/// reason, and the durable write counters do not move across either command.
+/// I05-12: one active root owner; prohibition is enforced before any effect.
+// WORK_UNIT_CASE: 297/A6
+#[test]
+fn prohibition_and_redaction_failure_stage_nothing() {
+    const SECRET: &[u8] = b"must-never-stage";
+    let secret_len = SECRET.len() as u64;
+    let expected_sha256 = format!("{:x}", Sha256::digest(SECRET));
+
+    // Finalize half: a policy-prohibited finalize withholds, never publishes.
+    let (platform, sink, session) = open_observed_sink("policy-deny");
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, &SECRET[..8])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: 8,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, 8, &SECRET[8..])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 2,
+            next_offset: secret_len,
+        },
+    );
+    let before = durable_write_counts(&platform);
+    let finalize = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        2,
+        secret_len,
+        10,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        secret_len,
+        ProcessStreamPrefixPreview::withheld_by_policy(),
+        None,
+        vec![StreamEvidenceGap::PolicyProhibited],
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), finalize)));
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::PolicyProhibited);
+    assert_eq!(
+        sink.publication(),
+        Some(BlobStreamPublication::Unavailable {
+            reason: BlobStreamUnavailableReason::PolicyProhibited,
+        }),
+        "a prohibited finalize records no object, only its cause"
+    );
+    assert_eq!(
+        durable_write_counts(&platform),
+        before,
+        "a prohibited finalize issues no durable write: no stage ran"
+    );
+
+    // Abort half: a failed-redaction abort mints its terminal, stages nothing.
+    let (platform, sink, session) = open_observed_sink("redaction-deny");
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, SECRET)),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: secret_len,
+        },
+    );
+    let before = durable_write_counts(&platform);
+    // Transport is `Complete`: every byte arrived and the failure is the
+    // redaction step, not the pipe. A transport gap here would contradict the
+    // declared `RedactionFailed` coverage gap (each non-complete transport
+    // status demands its own gap).
+    let abort = ok(ProcessStreamSinkAbortRequest::new(
+        session.terminal_id().clone(),
+        ProcessStreamSinkAbortReason::RedactionFailure,
+        1,
+        secret_len,
+        10,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        secret_len,
+        ProcessStreamPrefixPreview::withheld_by_policy(),
+        None,
+        vec![StreamEvidenceGap::RedactionFailed],
+    ));
+    let terminal = ok(block_on(sink.abort(session.clone(), abort)));
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::RedactionFailed);
+    assert_eq!(
+        sink.publication(),
+        Some(BlobStreamPublication::Unavailable {
+            reason: BlobStreamUnavailableReason::RedactionFailed,
+        }),
+        "a failed-redaction abort records no object, only its cause"
+    );
+    assert_eq!(
+        durable_write_counts(&platform),
+        before,
+        "a failed-redaction abort issues no durable write: no stage ran"
+    );
 }
