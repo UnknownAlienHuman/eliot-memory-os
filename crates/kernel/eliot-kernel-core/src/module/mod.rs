@@ -10,6 +10,11 @@
 //!   capacity-profile compiler joining owner-produced evidence into one
 //!   canonical row per frozen bottleneck, kept separate from the front-door
 //!   slice because it describes no front-door capacity of its own;
+//! - [`control_reserve_process_owner`] — the I14.3 Host/Kernel process-tree
+//!   owner adapter issuing genuinely owner-accounted process
+//!   launch/termination permits against its own held partitions, kept
+//!   separate from the front-door slice because it enforces other frozen
+//!   dimensions;
 //! - [`control_reserve_ors_evidence`] — the I14.3 Kernel composition join
 //!   validating the ORS owner's two published rows into compiler-ready
 //!   evidence records, kept separate from the compiler because it copies
@@ -30,6 +35,7 @@
 pub mod compatibility_handshake;
 pub mod control_reserve_front_door;
 pub mod control_reserve_ors_evidence;
+pub mod control_reserve_process_owner;
 pub mod control_reserve_profile_compiler;
 pub mod epoch_and_fence;
 pub mod generation_readiness;
