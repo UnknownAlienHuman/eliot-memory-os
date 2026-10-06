@@ -203,6 +203,30 @@ pub fn project_actual_coverage_manifest(
     }
 }
 
+/// Retains one published shared coverage manifest in the owner spool (#1755
+/// W6).
+///
+/// `true` when the payload reached durable owner evidence. `false` when the
+/// interval was omitted (nothing to retain, and the previously retained row
+/// stands) or when no owner spool is bound or the retain failed: the tick
+/// traces the miss, and an omission never clears a previously published
+/// manifest, so the reader always sees a complete retained row or nothing.
+fn retain_published_shared_manifest(
+    port: Option<&WatchdogBackupPort>,
+    outcome: &crate::coverage_manifest_projection::CoverageManifestOutcome,
+) -> bool {
+    let crate::coverage_manifest_projection::CoverageManifestOutcome::Published {
+        manifest, ..
+    } = outcome
+    else {
+        return false;
+    };
+    let Some(port) = port else {
+        return false;
+    };
+    port.retain_shared_coverage_manifest(manifest).is_ok()
+}
+
 /// The actual manifest's own interval identity: the declared owner-clock
 /// bounds under the sensor map revision they were derived under.
 ///
@@ -544,18 +568,39 @@ impl WatchdogComposition {
                                     kernel.allowed_manifest_digest(),
                                     &closed,
                                 );
-                            match shared {
+                            // The payload reaches the owner spool on this
+                            // tick (#1755 W6); the log keeps the summary
+                            // only. A retain miss is warned: evidence that
+                            // was built but not retained must be visible, and
+                            // the next published interval replaces the row
+                            // anyway.
+                            let retained = retain_published_shared_manifest(
+                                kernel.spool_backup_port().as_deref(),
+                                &shared,
+                            );
+                            match &shared {
                                 crate::coverage_manifest_projection::CoverageManifestOutcome::Published {
                                     completeness,
                                     streams,
+                                    ..
                                 } => {
-                                    tracing::debug!(
-                                        event = "watchdog.shared_coverage_manifest_published",
-                                        observation = "published",
-                                        completeness = ?completeness,
-                                        streams = streams,
-                                        "shared ObservationCoverageManifest built from this interval"
-                                    );
+                                    if retained {
+                                        tracing::debug!(
+                                            event = "watchdog.shared_coverage_manifest_published",
+                                            observation = "published",
+                                            completeness = ?completeness,
+                                            streams = streams,
+                                            "shared ObservationCoverageManifest built and retained from this interval"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            event = "watchdog.shared_coverage_manifest_retain_missed",
+                                            observation = "unretained",
+                                            completeness = ?completeness,
+                                            streams = streams,
+                                            "shared ObservationCoverageManifest built but not retained in the owner spool"
+                                        );
+                                    }
                                 }
                                 crate::coverage_manifest_projection::CoverageManifestOutcome::Omitted(
                                     reason,
@@ -1727,6 +1772,27 @@ impl WatchdogBackupPort {
         self.spool.high_water_sequence()
     }
 
+    /// Retains the newest published shared I8.2 coverage manifest (#1755 W6).
+    ///
+    /// Thin delegation to
+    /// [`WatchdogSpool::retain_shared_coverage_manifest`](crate::watchdog_spool::WatchdogSpool::retain_shared_coverage_manifest):
+    /// the same owner spool every heartbeat and gap record is appended
+    /// through, so the wrapper-built payload reaches durable owner evidence on
+    /// the supervision tick instead of only a debug-log summary. Carries no
+    /// backup, restore, or export semantics: backup captures and export
+    /// batches never read the manifest row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the manifest does not validate or the row
+    /// cannot be committed.
+    pub(crate) fn retain_shared_coverage_manifest(
+        &self,
+        manifest: &eliot_evaluation_contracts::ObservationCoverageManifest,
+    ) -> Result<(), SpoolError> {
+        self.spool.retain_shared_coverage_manifest(manifest)
+    }
+
     /// Binds one capture request against the owner's retained identity.
     ///
     /// The requested source installation and watchdog generation are compared
@@ -2060,6 +2126,99 @@ mod boundary_evidence_tests {
             revalidate_boundary(&target, &evidence),
             Err(BoundaryRefusal::RegistrationUnavailable)
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_manifest_tick_tests {
+    use super::*;
+
+    use crate::coverage_manifest_projection::{
+        CoverageManifestOutcome, publish_interval_coverage_manifest,
+    };
+    use crate::observation_coverage::{
+        IntervalCoveragePublisher, ObservationChannel, channel_capability,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_port(name: &str) -> Result<WatchdogBackupPort, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-manifest-port-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let spool = Arc::new(crate::watchdog_spool::WatchdogSpool::open_test(&path)?);
+        Ok(WatchdogBackupPort::new(
+            Arc::clone(&spool),
+            "installation-1755".to_owned(),
+            7,
+            WatchdogSpoolBackupLimits::default(),
+            Arc::new(IntervalCoverageCell::new(1_000)),
+        )?)
+    }
+
+    /// The owner's own fully observed interval, published through the same
+    /// wrapper the tick calls.
+    fn published_outcome() -> CoverageManifestOutcome {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(2_000);
+        publish_interval_coverage_manifest(
+            Some("installation-1755"),
+            Some(&"a".repeat(64)),
+            &report,
+        )
+    }
+
+    /// A published interval reaches the owner spool through the port: the
+    /// payload the tick retains reads back identical (#1755 W6).
+    #[test]
+    fn published_interval_reaches_owner_spool_through_port() -> TestResult {
+        let port = test_port("tick")?;
+        let outcome = published_outcome();
+        let CoverageManifestOutcome::Published { ref manifest, .. } = outcome else {
+            return Err("both owner identities are present, expected a manifest".into());
+        };
+        assert!(retain_published_shared_manifest(Some(&port), &outcome));
+        assert_eq!(
+            port.spool.read_shared_coverage_manifest()?,
+            Some(manifest.as_ref().clone())
+        );
+        Ok(())
+    }
+
+    /// An omitted interval retains nothing and clears nothing: the reader
+    /// sees no manifest rather than a fabricated one.
+    #[test]
+    fn omitted_interval_retains_nothing() -> TestResult {
+        let port = test_port("omitted")?;
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(2_000);
+        let outcome = publish_interval_coverage_manifest(None, None, &report);
+        assert!(matches!(outcome, CoverageManifestOutcome::Omitted(_)));
+        assert!(!retain_published_shared_manifest(Some(&port), &outcome));
+        assert_eq!(port.spool.read_shared_coverage_manifest()?, None);
+        Ok(())
+    }
+
+    /// Without a bound owner spool nothing is retained and nothing fails:
+    /// the miss is for the tick to trace, not a refusal.
+    #[test]
+    fn missing_port_retains_nothing() -> TestResult {
+        let outcome = published_outcome();
+        assert!(matches!(outcome, CoverageManifestOutcome::Published { .. }));
+        assert!(!retain_published_shared_manifest(None, &outcome));
         Ok(())
     }
 }

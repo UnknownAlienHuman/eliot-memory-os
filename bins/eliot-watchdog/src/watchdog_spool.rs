@@ -143,6 +143,20 @@ pub(crate) const SPOOL_INTENT_RECEIPT_TABLE: TableDefinition<u64, &[u8]> =
 /// Distinct from the rule-state revision so a future receipt-shape change
 /// refuses to reinterpret an existing ledger instead of mixing generations.
 pub(crate) const INTENT_RECEIPT_SCHEMA_VERSION: u16 = 1;
+/// Single-key row of the latest shared I8.2 coverage manifest (#1755 W6).
+///
+/// The supervision tick retains the newest published
+/// `ObservationCoverageManifest` here, replacing the previous row, so the
+/// payload the wrapper builds reaches durable owner evidence instead of only
+/// a debug-log summary. One row only: history is bounded by replacement, and
+/// the manifest carries its own interval window, so a reader always sees
+/// which interval the retained manifest covers. Separate from the entries,
+/// high-water, cursor, and receipt tables: backup captures, export batches,
+/// and the retained-record denominator never read this table.
+pub(crate) const SPOOL_COVERAGE_MANIFEST_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eliot_watchdog_coverage_manifest_v1");
+/// Single-key row of the latest shared coverage manifest.
+pub(crate) const SPOOL_COVERAGE_MANIFEST_KEY: u64 = 0;
 /// Maximum accepted length for one persisted cursor identity string.
 ///
 /// Cursor identities are short installer-bound names such as
@@ -1170,6 +1184,90 @@ impl WatchdogSpool {
         })?;
         read_high_water(&table)?
             .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))
+    }
+
+    /// Retains the newest published shared I8.2 coverage manifest (#1755 W6).
+    ///
+    /// The manifest is validated before anything is written, so an invalid
+    /// manifest is refused whole and the previously retained row stands
+    /// untouched. On success the single manifest row is replaced: this is the
+    /// delivery of the wrapper-built payload into durable owner evidence. An
+    /// omitted interval retains nothing and clears nothing; the reader sees
+    /// the last published manifest with its own interval window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the manifest does not validate, cannot be
+    /// serialized, or the row cannot be committed.
+    pub(crate) fn retain_shared_coverage_manifest(
+        &self,
+        manifest: &eliot_evaluation_contracts::ObservationCoverageManifest,
+    ) -> Result<(), SpoolError> {
+        manifest.validate().map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "refused to retain an invalid coverage manifest: {error:?}"
+            ))
+        })?;
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_COVERAGE_MANIFEST_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_COVERAGE_MANIFEST_KEY, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reads the latest retained shared I8.2 coverage manifest (#1755 W6).
+    ///
+    /// `Ok(None)` when no interval has retained one yet. A stored row that no
+    /// longer parses or validates is refused as corrupt rather than served as
+    /// evidence: fail closed, never a best-effort manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the database cannot be read or the stored
+    /// row is corrupt.
+    pub(crate) fn read_shared_coverage_manifest(
+        &self,
+    ) -> Result<Option<eliot_evaluation_contracts::ObservationCoverageManifest>, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_COVERAGE_MANIFEST_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let row = table
+            .get(SPOOL_COVERAGE_MANIFEST_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let manifest: eliot_evaluation_contracts::ObservationCoverageManifest =
+            serde_json::from_slice(row.value()).map_err(|error| {
+                SpoolError::Corrupt(format!(
+                    "stored coverage manifest is not valid JSON: {error}"
+                ))
+            })?;
+        manifest.validate().map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "stored coverage manifest does not validate: {error:?}"
+            ))
+        })?;
+        Ok(Some(manifest))
     }
 
     /// Counts one genuinely observed Governor-unavailability proof and commits a
@@ -3578,4 +3676,109 @@ fn compaction_plan(entries: &[WatchdogSpoolEntry], acknowledged: u64) -> Vec<u64
         .filter(|entry| first_unresolved.is_none_or(|marker| entry.sequence < marker))
         .map(|entry| entry.sequence)
         .collect()
+}
+
+#[cfg(test)]
+mod shared_manifest_retention_tests {
+    use super::*;
+    use eliot_evaluation_contracts::ObservationCoverageManifest;
+
+    use crate::coverage_manifest_projection::{
+        CoverageManifestOutcome, publish_interval_coverage_manifest,
+    };
+    use crate::observation_coverage::{
+        IntervalCoveragePublisher, ObservationChannel, channel_capability,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_spool(name: &str) -> Result<WatchdogSpool, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-manifest-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        Ok(WatchdogSpool::open_test(&path)?)
+    }
+
+    /// The owner's own fully observed interval, published through the same
+    /// wrapper the tick calls, so the retained row is the production payload
+    /// rather than a hand-built fixture.
+    fn published_manifest() -> Result<ObservationCoverageManifest, Box<dyn std::error::Error>> {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(2_000);
+        match publish_interval_coverage_manifest(
+            Some("installation-1755"),
+            Some(&"a".repeat(64)),
+            &report,
+        ) {
+            CoverageManifestOutcome::Published { manifest, .. } => Ok(*manifest),
+            CoverageManifestOutcome::Omitted(reason) => {
+                Err(format!("both owner identities are present, got omission {reason}").into())
+            }
+        }
+    }
+
+    /// A published manifest retains and reads back identical: the payload
+    /// reaches durable owner evidence (#1755 W6).
+    #[test]
+    fn published_manifest_round_trips_through_owner_spool() -> TestResult {
+        let spool = test_spool("round-trip")?;
+        let manifest = published_manifest()?;
+        spool.retain_shared_coverage_manifest(&manifest)?;
+        assert_eq!(spool.read_shared_coverage_manifest()?, Some(manifest));
+        Ok(())
+    }
+
+    /// No interval retained yet reads as none, never as an empty manifest.
+    #[test]
+    fn absent_manifest_reads_none() -> TestResult {
+        let spool = test_spool("absent")?;
+        assert_eq!(spool.read_shared_coverage_manifest()?, None);
+        Ok(())
+    }
+
+    /// An invalid manifest is refused whole and the previously retained row
+    /// stands untouched: refusal repairs nothing and invents nothing.
+    #[test]
+    fn invalid_manifest_is_refused_and_prior_row_stands() -> TestResult {
+        let spool = test_spool("refused")?;
+        let manifest = published_manifest()?;
+        spool.retain_shared_coverage_manifest(&manifest)?;
+        let mut broken = manifest.clone();
+        broken.expected_event_sources_and_event_classes.clear();
+        assert!(broken.validate().is_err());
+        assert!(spool.retain_shared_coverage_manifest(&broken).is_err());
+        assert_eq!(spool.read_shared_coverage_manifest()?, Some(manifest));
+        Ok(())
+    }
+
+    /// A stored row that no longer parses is refused as corrupt rather than
+    /// served as evidence: fail closed, never a best-effort manifest.
+    #[test]
+    fn corrupt_row_is_refused_not_served() -> TestResult {
+        let spool = test_spool("corrupt")?;
+        let write = spool
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_COVERAGE_MANIFEST_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_COVERAGE_MANIFEST_KEY, b"not-json".as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        assert!(spool.read_shared_coverage_manifest().is_err());
+        Ok(())
+    }
 }

@@ -1318,6 +1318,10 @@ impl IntervalCoverageCell {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "the replay tests unwrap the owner's own published records; a record that cannot publish is a test failure"
+)]
 mod replay_disposition_tests {
     use super::*;
     use eliot_evaluation_contracts::JournalReplayEvidence;
@@ -1334,7 +1338,7 @@ mod replay_disposition_tests {
         report
             .records()
             .iter()
-            .find(|record| record.channel == ObservationChannel::FilesystemJournal)
+            .find(|record| record.channel() == ObservationChannel::FilesystemJournal)
             .expect("journal record present")
     }
 
@@ -1479,7 +1483,7 @@ mod replay_disposition_tests {
         assert_eq!(record.observed_replayed_observations(), 10);
         assert!(
             record
-                .observed_classes
+                .observed_classes()
                 .contains(&ObservationClass::PathChange)
         );
         assert!(report.valid());

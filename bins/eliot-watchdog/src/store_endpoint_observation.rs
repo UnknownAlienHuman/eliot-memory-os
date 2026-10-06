@@ -229,6 +229,10 @@ pub fn observe_store_endpoint(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "the probe tests unwrap the owner's own targets and loopback listeners; a fixture that cannot bind is a test failure"
+)]
 mod tests {
     use super::*;
 
