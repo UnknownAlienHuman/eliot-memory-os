@@ -26,11 +26,16 @@
 //! changed content conflicts instead of replaying (A7). The binding alone
 //! carries no slot liveness: the permit handle is the held capacity and must
 //! be retained until receipted release. [`ProcessTreeReserve::verify_process_permit`]
-//! is the authenticated owner lookup the consumer replays at its
-//! launch/recovery boundary: it proves the presented binding is owner-issued
-//! and current (owner, request match, profile, epoch) without consulting any
-//! counter, so a copied profile string or a stale receipt can never pass as
-//! live owner authority.
+//! is the authenticated owner-mediated lookup the consumer replays at its
+//! launch/recovery boundary: it takes the live [`ProcessPermit`] handle
+//! itself — never a detached binding alone — and proves the slot is still
+//! held at this owner instance, the presented binding is the exact issuance
+//! record of that handle, the binding matches its request, and everything is
+//! still current (owner, generation, profile, epoch). A caller-constructed
+//! shape-valid binding with a fabricated permit identity and no acquisition
+//! has no handle to present, so it can never pass as live owner authority;
+//! neither can a released permit, a foreign instance's permit, or a stale
+//! receipt.
 //!
 //! Release is exactly-once: [`ProcessPermit::release`] consumes the permit
 //! and returns bound [`ProcessReleaseEvidence`], with drop as the backstop
@@ -139,6 +144,14 @@ pub struct ProcessPermit {
     operation_id: String,
     owner: String,
     epoch: EpochId,
+    /// Owner-minted identity of the issuance this handle holds.
+    permit_id: String,
+    /// Compiled profile identity bound at issuance.
+    profile_id: String,
+    /// Compiled profile revision bound at issuance.
+    profile_revision: String,
+    /// Issuing owner generation bound at issuance.
+    owner_generation: ResourceGeneration,
 }
 
 /// Exactly-once release evidence for one [`ProcessPermit`].
@@ -717,6 +730,10 @@ impl ProcessTreeReserve {
                 epoch,
             ));
         }
+        // Direct acquisitions hold capacity but carry no issuance record:
+        // only `issue_process_permit` mints the permit identity and profile
+        // binding a lookup can authenticate, so a directly acquired permit
+        // can never pass `verify_process_permit`.
         Ok(ProcessPermit {
             inner: Some(self.inner.clone()),
             class,
@@ -725,6 +742,10 @@ impl ProcessTreeReserve {
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
             epoch,
+            permit_id: String::new(),
+            profile_id: String::new(),
+            profile_revision: String::new(),
+            owner_generation: ResourceGeneration::genesis(),
         })
     }
 
@@ -813,7 +834,7 @@ impl ProcessTreeReserve {
                 field: "process_owner_boundary.now_ms",
                 reason: "the issuing clock must be non-negative",
             })?;
-        let permit = self.try_acquire_process(
+        let mut permit = self.try_acquire_process(
             request.requested_bottleneck,
             request.operation,
             &request.requesting_owner_ref,
@@ -821,12 +842,20 @@ impl ProcessTreeReserve {
             request.authority_epoch_ref.clone(),
         )?;
         let sequence = self.inner.permit_sequence.fetch_add(1, Ordering::AcqRel);
+        // The handle records the exact issuance the lookup authenticates:
+        // identity, profile and owner generation bound here, never claimed.
+        permit.permit_id = format!(
+            "PT-{}-{sequence}-{}",
+            request.operation.as_contract_str(),
+            request.operation_id
+        );
+        permit.profile_id.clone_from(&boundary.profile_id);
+        permit
+            .profile_revision
+            .clone_from(&boundary.profile_revision);
+        permit.owner_generation = boundary.owner_generation;
         let binding = CapacityPermitBinding {
-            permit_id: format!(
-                "PT-{}-{sequence}-{}",
-                request.operation.as_contract_str(),
-                request.operation_id
-            ),
+            permit_id: permit.permit_id.clone(),
             operation_id: request.operation_id.clone(),
             capacity_class: request.operation.capacity_class(),
             operation: request.operation,
@@ -857,33 +886,73 @@ impl ProcessTreeReserve {
         Ok((permit, binding))
     }
 
-    /// Replays the authenticated owner lookup for one presented binding
-    /// against the live boundary (issue #1679, W11 consumer side).
+    /// Replays the authenticated owner-mediated lookup for one live permit
+    /// handle against the live boundary (issue #1679, W11 consumer side).
     ///
     /// This is the check the launch/recovery composition runs before any
-    /// P-03 effect: the binding must be owner-issued here, must exactly
-    /// match the presented request, and must still be current (profile,
-    /// epoch). It consults no counter on purpose: slot liveness is the
-    /// retained permit handle's property, while this lookup proves the
-    /// evidence is genuine and current. A copied profile string, a foreign
-    /// owner tag, changed content, or a fenced epoch fails closed; missing
-    /// evidence never passes as live authority.
+    /// P-03 effect, holding the retained [`ProcessPermit`] handle itself: a
+    /// detached binding alone is never sufficient, so a caller-constructed
+    /// shape-valid binding with a fabricated permit identity and no
+    /// acquisition cannot pass. The lookup proves, in order: the handle is
+    /// live (not released) and held at exactly this owner instance (same
+    /// partition set, so a foreign instance's permit fails here); the
+    /// presented binding is the exact issuance record of that handle
+    /// (identity, operation, owner, epoch, profile, owner generation —
+    /// changed content conflicts instead of replaying, A7); the binding
+    /// matches its request; and everything is still current (owner,
+    /// generation, profile, epoch). A copied profile string, a foreign
+    /// owner tag, a released or foreign permit, or a fenced epoch fails
+    /// closed; missing evidence never passes as live authority.
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::InvalidField`] when the binding is illegal,
-    /// names another owner, does not match the presented request, or is
-    /// bound to a stale profile, [`KernelError::StaleEpochTuple`] when the
-    /// binding epoch tuple is from another lineage, or
-    /// [`KernelError::StaleEpoch`] when the binding sequence differs within
-    /// the active lineage.
+    /// Returns [`KernelError::InvalidField`] when the permit is released or
+    /// held elsewhere, when the binding is illegal, is not this handle's
+    /// issuance record, names another owner, does not match the presented
+    /// request, or is bound to a stale owner generation or profile,
+    /// [`KernelError::StaleEpochTuple`] when the binding epoch tuple is from
+    /// another lineage, or [`KernelError::StaleEpoch`] when the binding
+    /// sequence differs within the active lineage.
     pub fn verify_process_permit(
+        &self,
+        permit: &ProcessPermit,
         binding: &CapacityPermitBinding,
         request: &CapacityRequest,
         boundary: &ProcessOwnerBoundary,
     ) -> Result<(), KernelError> {
         binding.validate()?;
         boundary.validate()?;
+        match &permit.inner {
+            Some(held) if Arc::ptr_eq(held, &self.inner) => {}
+            Some(_) => {
+                return Err(KernelError::InvalidField {
+                    field: "process_permit.owner",
+                    reason: "FOREIGN_OWNER: the permit is not held at this owner instance",
+                });
+            }
+            None => {
+                return Err(KernelError::InvalidField {
+                    field: "process_permit.holding",
+                    reason: "NO_LIVE_HOLDING: the permit was released; no live capacity is held",
+                });
+            }
+        }
+        if binding.permit_id != permit.permit_id
+            || binding.operation != permit.operation
+            || binding.operation_id != permit.operation_id
+            || binding.bottleneck != permit.bottleneck
+            || binding.capacity_class != permit.class
+            || binding.requesting_owner_ref != permit.owner
+            || binding.authority_epoch_ref != permit.epoch
+            || binding.profile_id != permit.profile_id
+            || binding.profile_revision != permit.profile_revision
+            || binding.capacity_owner_generation_ref != permit.owner_generation
+        {
+            return Err(KernelError::InvalidField {
+                field: "capacity_permit_binding",
+                reason: "CONFLICT: the presented binding is not this handle's issuance record; changed content never replays",
+            });
+        }
         if binding.capacity_owner_ref != PROCESS_TREE_OWNER {
             return Err(KernelError::InvalidField {
                 field: "capacity_permit_binding.capacity_owner_ref",
@@ -1539,8 +1608,12 @@ mod tests {
             epoch.clone(),
         );
         let live = boundary(epoch)?;
-        let (_permit, binding) = owner.issue_process_permit(&request, &live)?;
-        assert!(ProcessTreeReserve::verify_process_permit(&binding, &request, &live).is_ok());
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
+        assert!(
+            owner
+                .verify_process_permit(&permit, &binding, &request, &live)
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -1555,12 +1628,12 @@ mod tests {
             epoch.clone(),
         );
         let live = boundary(epoch)?;
-        let (_permit, binding) = owner.issue_process_permit(&request, &live)?;
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
         // Changed content never replays: a relabelled operation id conflicts.
         let mut changed = request.clone();
         changed.operation_id = "op-verify-2x".to_owned();
         assert!(matches!(
-            ProcessTreeReserve::verify_process_permit(&binding, &changed, &live),
+            owner.verify_process_permit(&permit, &binding, &changed, &live),
             Err(KernelError::InvalidField { .. })
         ));
         Ok(())
@@ -1577,11 +1650,11 @@ mod tests {
             epoch.clone(),
         );
         let live = boundary(epoch)?;
-        let (_permit, binding) = owner.issue_process_permit(&request, &live)?;
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
         let mut replaced_owner = live.clone();
         replaced_owner.owner_generation = ResourceGeneration::new(2)?;
         assert!(matches!(
-            ProcessTreeReserve::verify_process_permit(&binding, &request, &replaced_owner),
+            owner.verify_process_permit(&permit, &binding, &request, &replaced_owner),
             Err(KernelError::InvalidField {
                 field: "capacity_permit_binding.capacity_owner_generation_ref",
                 ..
@@ -1591,7 +1664,7 @@ mod tests {
         let mut moved = live.clone();
         moved.profile_revision = "rev-10".to_owned();
         assert!(matches!(
-            ProcessTreeReserve::verify_process_permit(&binding, &request, &moved),
+            owner.verify_process_permit(&permit, &binding, &request, &moved),
             Err(KernelError::InvalidField { .. })
         ));
         Ok(())
@@ -1608,12 +1681,92 @@ mod tests {
             epoch.clone(),
         );
         let live = boundary(epoch)?;
-        let (_permit, mut binding) = owner.issue_process_permit(&request, &live)?;
+        let (permit, mut binding) = owner.issue_process_permit(&request, &live)?;
         // A binding relabelled to another owner is not this owner's evidence.
         binding.capacity_owner_ref = "someone-else".to_owned();
         assert!(matches!(
-            ProcessTreeReserve::verify_process_permit(&binding, &request, &live),
+            owner.verify_process_permit(&permit, &binding, &request, &live),
             Err(KernelError::InvalidField { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn process_verify_refuses_fabricated_binding() -> Result<(), KernelError> {
+        let owner = reserve()?;
+        let epoch = genesis_epoch();
+        let request = make_request(
+            PROCESS_LAUNCH_BOTTLENECK,
+            RequestedOperationClass::Protected(ControlOperationClass::Recovery),
+            "op-verify-5",
+            epoch.clone(),
+        );
+        let live = boundary(epoch)?;
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
+        // A caller-constructed shape-valid binding with a fabricated permit
+        // identity and no acquisition behind it: it still validates and
+        // still matches its request, so the old static shape check accepted
+        // it. The handle-bound lookup must conflict it instead.
+        let mut fabricated = binding.clone();
+        fabricated.permit_id = "PT-FAKE-0-op-verify-5".to_owned();
+        assert!(fabricated.validate().is_ok());
+        assert!(fabricated.matches_request(&request));
+        assert!(matches!(
+            owner.verify_process_permit(&permit, &fabricated, &request, &live),
+            Err(KernelError::InvalidField {
+                field: "capacity_permit_binding",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn process_verify_refuses_stand_in_handle() -> Result<(), KernelError> {
+        let owner = reserve()?;
+        let epoch = genesis_epoch();
+        let request = make_request(
+            PROCESS_LAUNCH_BOTTLENECK,
+            RequestedOperationClass::Protected(ControlOperationClass::Recovery),
+            "op-verify-6",
+            epoch.clone(),
+        );
+        let live = boundary(epoch)?;
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
+        // Release consumes the handle, so no dangling handle can outlive
+        // the holding; even a fresh live handle for the same request
+        // carries another issuance identity and cannot authorize the old
+        // binding.
+        let _evidence = permit.release();
+        let (fresh, _) = owner.issue_process_permit(&request, &live)?;
+        assert!(matches!(
+            owner.verify_process_permit(&fresh, &binding, &request, &live),
+            Err(KernelError::InvalidField { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn process_verify_refuses_foreign_instance_permit() -> Result<(), KernelError> {
+        let owner = reserve()?;
+        let other = reserve()?;
+        let epoch = genesis_epoch();
+        let request = make_request(
+            PROCESS_LAUNCH_BOTTLENECK,
+            RequestedOperationClass::Protected(ControlOperationClass::Recovery),
+            "op-verify-7",
+            epoch.clone(),
+        );
+        let live = boundary(epoch)?;
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
+        // The same live permit presented at another owner instance: no
+        // holding here, so the lookup refuses.
+        assert!(matches!(
+            other.verify_process_permit(&permit, &binding, &request, &live),
+            Err(KernelError::InvalidField {
+                field: "process_permit.owner",
+                ..
+            })
         ));
         Ok(())
     }
