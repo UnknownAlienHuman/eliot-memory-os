@@ -763,22 +763,6 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     // raw artifacts. Caller-observed preview bytes cannot become receipt
     // evidence under any handle; the receipt below cites admitted typed
     // bundles and readback bindings only.
-    // Issue #456 (WB3/WB4): admit every emitted record into owner-neutral
-    // bundles before the receipt is composed, so both requested streams keep
-    // their explicit dispositions. Admission performs no readback and sets no
-    // parser/evaluator status.
-    for record in &records {
-        if let Err(error) = collector.admit_process_evidence(record) {
-            finish_unknown(
-                store,
-                claimed,
-                lease,
-                collector,
-                format!("typed evidence admission failed; outcome rescheduled as unknown: {error}"),
-            )?;
-            return Ok(());
-        }
-    }
     // Issue #456 (WB4/D6/I3): with retention behind the executor, resolve
     // every pending bundle through the readback port before the receipt is
     // composed. Refusal and failure outcomes update the retained dispositions
@@ -1412,8 +1396,7 @@ mod tests {
         // without a durable source, and the legacy reference stays
         // migration-required without ever resolving to a record.
         let collector = EvidenceCollector::default();
-        collector
-            .admit_process_evidence(&evidence)
+        eliot_process::ProcessEvidenceSink::record(&collector, evidence.clone())
             .expect("typed admission succeeds");
         let bundles = collector.typed_bundles();
         assert_eq!(bundles.len(), 1);

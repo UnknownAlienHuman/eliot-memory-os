@@ -20,7 +20,7 @@ use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
 use eliot_process::{
-    EnvironmentInheritance, EnvironmentProjection, ProcessEvidence, ProcessRequest, ResourceLimits,
+    EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
 };
 use eliot_protocol::RequestIdentity;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -2972,23 +2972,6 @@ impl EvidenceCollector {
         self.typed
             .lock()
             .map_or_else(|_| Vec::new(), |items| items.clone())
-    }
-
-    /// Admits one emitted executor record into an owner-neutral bundle.
-    ///
-    /// Issue #456 (WB3): the production finish path admits every snapshot
-    /// record here, so both requested streams keep their explicit
-    /// dispositions. Admission performs no readback and sets no
-    /// parser/evaluator status.
-    pub fn admit_process_evidence(&self, record: &ProcessEvidence) -> Result<(), TestdError> {
-        let bundle = TestdProcessEvidenceBundle::admit(record)
-            .map_err(|error| TestdError::Contract(error.to_string()))?;
-        let mut typed = self
-            .typed
-            .lock()
-            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
-        typed.push(bundle);
-        Ok(())
     }
 
     /// Snapshots the admitted typed bundles into a durable restart record.
@@ -6347,6 +6330,82 @@ mod tests {
         record.job_id = job.job_id.clone();
         record.invocation_id = String::new();
         assert!(store.persist_typed_evidence_restart(&record).is_err());
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    /// Issue #456 (WD1 store half): stream rows round-trip with identity
+    /// re-verification, mismatched bytes are refused before they land, and
+    /// finish-time release keeps cited locators while dropping the rest.
+    #[test]
+    fn stream_sources_store_verify_and_release_except() -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_process::{DurableStreamLocatorKind, ProcessStreamKind, ProcessStreamSinkState};
+
+        let path = std::env::temp_dir().join(format!(
+            "eliot-testd-stream-sources-{}.redb",
+            Uuid::new_v4()
+        ));
+        let store = TestdStore::open(&path, RetryPolicy::default())?;
+        let fence = eliot_contracts::StateFence::new(
+            test_epoch(7),
+            eliot_contracts::ResourceGeneration::new(1)?,
+        );
+        let sidecar = |locator: &str, job: &str, bytes: &[u8]| TestdStreamSourceSidecar {
+            locator: locator.to_owned(),
+            locator_kind: DurableStreamLocatorKind::ImmutableArtifact,
+            ready_receipt_ref: format!("testd-ready:{locator}"),
+            readback_receipt_id: format!("testd-readback:{locator}"),
+            sha256: sha256_hex(bytes),
+            byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            job_id: job.to_owned(),
+            stream: ProcessStreamKind::Stdout,
+            terminal_state: ProcessStreamSinkState::CompleteSource,
+            terminal_sha256: sha256_hex(format!("terminal:{locator}").as_bytes()),
+            fence: fence.clone(),
+            observed_at_ms: 1_700_000_000_000,
+        };
+        let cited = "testd-retained:job:operation:stdout";
+        let uncited = "testd-retained:job:operation:stderr";
+        let foreign = "testd-retained:other:operation:stdout";
+        store.store_stream_source(&sidecar(cited, "job", b"cited-bytes"), b"cited-bytes")?;
+        store.store_stream_source(&sidecar(uncited, "job", b"uncited"), b"uncited")?;
+        store.store_stream_source(&sidecar(foreign, "other", b"foreign"), b"foreign")?;
+        // Bytes that disagree with the sidecar never land.
+        let mut tampered = sidecar(cited, "job", b"cited-bytes");
+        tampered.byte_length += 1;
+        assert!(
+            store
+                .store_stream_source(&tampered, b"cited-bytes")
+                .is_err()
+        );
+        // A Blob-kind sidecar is refused: Blob rows never live here.
+        let mut blob = sidecar(cited, "job", b"cited-bytes");
+        blob.locator_kind = DurableStreamLocatorKind::Blob;
+        assert!(store.store_stream_source(&blob, b"cited-bytes").is_err());
+        // Loads re-verify digest and length; absent locators stay absent.
+        let (loaded, bytes) = store
+            .load_stream_source(cited)?
+            .ok_or_else(|| std::io::Error::other("cited source missing"))?;
+        assert_eq!(bytes, b"cited-bytes");
+        assert_eq!(
+            loaded.readback_receipt_id,
+            format!("testd-readback:{cited}")
+        );
+        assert!(
+            store
+                .load_stream_source("testd-retained:job:absent:stdout")?
+                .is_none()
+        );
+        assert!(store.load_stream_source("").is_err());
+        // Release keeps the cited row plus the foreign job's rows.
+        assert_eq!(
+            store.release_job_stream_sources_except("job", &[cited.to_owned()])?,
+            1
+        );
+        assert!(store.load_stream_source(cited)?.is_some());
+        assert!(store.load_stream_source(uncited)?.is_none());
+        assert!(store.load_stream_source(foreign)?.is_some());
         drop(store);
         std::fs::remove_file(path)?;
         Ok(())

@@ -644,3 +644,585 @@ fn current_clock_ms() -> u64 {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "retention proofs panic on fixture construction failures by design"
+)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_instrument_api::EvidenceAxes;
+    use eliot_process::{ProcessEvidence, ProcessExecutionView, ProcessStreamPolicyBinding};
+    use eliot_process_executor::{SinkAppendOutcome, StreamSinkPump};
+    use eliot_testd_core::{
+        EvidenceCollector, RetryPolicy, TestdReadbackContext, TestdStreamResolution,
+    };
+    use std::num::NonZeroU64;
+
+    const JOB_ID: &str = "job-1";
+    const INVOCATION_ID: &str = "invocation-1";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence() -> StateFence {
+        StateFence::new(
+            test_epoch(7),
+            ResourceGeneration::new(1).expect("non-zero test generation"),
+        )
+    }
+
+    fn test_binding() -> eliot_process::ProcessExecutionBinding {
+        serde_json::from_value(serde_json::json!({
+            "operation_id": "operation-1",
+            "process_tree_id": "tree-1",
+            "job_id": JOB_ID,
+            "image_id": "image-1",
+            "session_id": "session-1",
+            "generation": 3,
+            "action_lease_ref": "lease-1",
+            "authority_id": "authority-1",
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
+            "state_fence": {
+                "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
+                "generation": 3,
+                "nonce": "fence-1"
+            },
+            "request_digest": "a".repeat(64),
+            "permit_digest": "b".repeat(64),
+            "effect_digest": "c".repeat(64),
+            "validation_revision": 2
+        }))
+        .expect("valid test binding")
+    }
+
+    fn test_policy() -> ProcessStreamPolicyBinding {
+        ProcessStreamPolicyBinding::new(
+            "p04:stream-policy:transport-preview-v1",
+            "p04:privacy:raw-transport-preview",
+            "p04:visibility:operation-diagnostic",
+            "p04:retention:bounded-prefix-only",
+            "p04:redaction:none-raw-preview",
+        )
+        .expect("valid test stream policy")
+    }
+
+    fn test_limits() -> eliot_process::ProcessStreamSinkLimits {
+        eliot_process::ProcessStreamSinkLimits::new(
+            8_192,
+            1 << 20,
+            1_024,
+            4_096,
+            8,
+            65_536,
+            2_000,
+            2_000,
+            2_000,
+        )
+        .expect("valid test sink limits")
+    }
+
+    fn test_store(label: &str) -> (std::path::PathBuf, TestdStore) {
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-testd-retention-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("retention test dir must create");
+        let store = TestdStore::open(dir.join("testd-state.redb"), RetryPolicy::default())
+            .expect("retention test store must open");
+        (dir, store)
+    }
+
+    fn test_context() -> TestdReadbackContext {
+        TestdReadbackContext {
+            job_id: JOB_ID.to_owned(),
+            invocation_id: INVOCATION_ID.to_owned(),
+            fence: test_fence(),
+            max_bytes: 1 << 20,
+            deadline_ms: 5_000,
+        }
+    }
+
+    fn test_view(binding: &eliot_process::ProcessExecutionBinding) -> ProcessExecutionView {
+        serde_json::from_value(serde_json::json!({
+            "binding": serde_json::to_value(binding).expect("binding serializes"),
+            "lifecycle": "running",
+            "health": {"status": "healthy", "ready": true, "observed_at_unix_ms": 10, "detail": null},
+            "cancellation": "not_requested",
+            "identity": null,
+            "exit": null,
+            "descendants": null
+        }))
+        .expect("valid test view")
+    }
+
+    fn pump(
+        retention: &TestdStreamRetention,
+        binding: eliot_process::ProcessExecutionBinding,
+        stream: ProcessStreamKind,
+    ) -> StreamSinkPump {
+        StreamSinkPump::new(
+            Arc::new(retention.clone()) as Arc<dyn ProcessStreamSinkClient>,
+            binding,
+            stream,
+            test_policy(),
+            test_limits(),
+        )
+    }
+
+    fn resolved_bytes(resolution: TestdStreamResolution) -> Vec<u8> {
+        match resolution {
+            TestdStreamResolution::Resolved { bytes, .. } => bytes.bytes().to_vec(),
+            TestdStreamResolution::Refused { error, .. } => {
+                panic!("expected resolved source bytes, refused: {error:?}")
+            }
+        }
+    }
+
+    /// Issue #456 (WA11/WB1/I3): chunked stdout plus small stderr stream
+    /// through a real pump into retained rows, then admit and resolve to
+    /// byte-identical evidence with stable readback identities.
+    #[test]
+    fn retained_streams_round_trip_through_real_pump() {
+        let (dir, store) = test_store("round-trip");
+        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
+        let binding = test_binding();
+
+        let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 251) as u8).collect();
+        let mut stdout_pump = pump(&retention, binding.clone(), ProcessStreamKind::Stdout);
+        stdout_pump.open().expect("stdout session must open");
+        for chunk in [
+            &payload[..7_000],
+            &payload[7_000..14_000],
+            &payload[14_000..],
+        ] {
+            assert_eq!(
+                stdout_pump.append(chunk).expect("chunk must admit"),
+                SinkAppendOutcome::Admitted
+            );
+        }
+        let stdout_terminal = stdout_pump.finalize_eof().expect("stdout must finalize");
+        assert_eq!(
+            stdout_terminal.state(),
+            eliot_process::ProcessStreamSinkState::CompleteSource
+        );
+        let stdout_evidence = stdout_terminal.evidence().clone();
+        let stdout_source = stdout_evidence
+            .source()
+            .expect("complete terminal must carry a durable source");
+        assert!(
+            stdout_source
+                .locator()
+                .starts_with("testd-retained:job-1:operation-1:stdout")
+        );
+
+        let stderr_bytes = b"stderr-line".to_vec();
+        let mut stderr_pump = pump(&retention, binding.clone(), ProcessStreamKind::Stderr);
+        stderr_pump.open().expect("stderr session must open");
+        assert_eq!(
+            stderr_pump
+                .append(&stderr_bytes)
+                .expect("stderr chunk must admit"),
+            SinkAppendOutcome::Admitted
+        );
+        let stderr_terminal = stderr_pump.finalize_eof().expect("stderr must finalize");
+        let stderr_evidence = stderr_terminal.evidence().clone();
+
+        let record = ProcessEvidence::new_typed(
+            test_view(&binding),
+            Some(stdout_evidence),
+            Some(stderr_evidence),
+            EvidenceAxes::observed(),
+        )
+        .expect("pump terminal evidence must form a record");
+        let collector = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&collector, record)
+            .expect("terminal record must admit");
+        let mut outcomes = collector
+            .resolve_typed_sources(&retention, &test_context())
+            .expect("resolution must run");
+        assert_eq!(outcomes.len(), 1);
+        let mut bundle_outcomes = outcomes.pop().expect("one bundle outcome");
+        assert_eq!(bundle_outcomes.len(), 2);
+        assert_eq!(
+            resolved_bytes(bundle_outcomes.remove(0)),
+            payload,
+            "stdout must resolve to the exact pumped bytes"
+        );
+        assert_eq!(
+            resolved_bytes(bundle_outcomes.remove(0)),
+            stderr_bytes,
+            "stderr must resolve to the exact pumped bytes"
+        );
+        let bundles = collector.typed_bundles();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(
+            bundles[0].stdout.disposition,
+            TestdStreamDisposition::CompleteSource
+        );
+        assert_eq!(
+            bundles[0].stderr.disposition,
+            TestdStreamDisposition::CompleteSource
+        );
+        assert!(
+            bundles[0]
+                .stdout
+                .binding
+                .as_ref()
+                .expect("stdout binding")
+                .gaps
+                .is_empty()
+        );
+        let stdout_binding = bundles[0]
+            .stdout
+            .binding
+            .as_ref()
+            .expect("stdout slot must carry its binding");
+        assert!(
+            stdout_binding
+                .readback_receipt_id
+                .as_ref()
+                .expect("resolved stdout must carry a readback receipt")
+                .starts_with("testd-readback:")
+        );
+        assert!(
+            stdout_binding
+                .ready_receipt_ref
+                .as_ref()
+                .expect("resolved stdout must carry a ready receipt")
+                .starts_with("testd-ready:")
+        );
+        drop(retention);
+        std::fs::remove_dir_all(&dir).expect("retention test dir must clean");
+    }
+
+    /// Issue #456 (WB5): a zero-byte EOF finalizes to a real complete
+    /// source, distinct from a stream that was never emitted or retained.
+    #[test]
+    fn zero_byte_eof_is_complete_and_missing_is_unavailable() {
+        let (dir, store) = test_store("zero-byte");
+        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
+        let binding = test_binding();
+
+        let mut stdout_pump = pump(&retention, binding.clone(), ProcessStreamKind::Stdout);
+        stdout_pump.open().expect("stdout session must open");
+        let terminal = stdout_pump.finalize_eof().expect("empty EOF must finalize");
+        assert_eq!(
+            terminal.state(),
+            eliot_process::ProcessStreamSinkState::CompleteSource
+        );
+        assert_eq!(terminal.evidence().observed_bytes(), 0);
+
+        let record = ProcessEvidence::new_typed(
+            test_view(&binding),
+            Some(terminal.evidence().clone()),
+            None,
+            EvidenceAxes::observed(),
+        )
+        .expect("zero-byte terminal evidence must form a record");
+        let collector = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&collector, record)
+            .expect("zero-byte record must admit");
+        let mut outcomes = collector
+            .resolve_typed_sources(&retention, &test_context())
+            .expect("resolution must run");
+        let mut bundle_outcomes = outcomes.pop().expect("one bundle outcome");
+        assert_eq!(bundle_outcomes.len(), 2);
+        let stdout_bytes = resolved_bytes(bundle_outcomes.remove(0));
+        assert!(stdout_bytes.is_empty());
+        match bundle_outcomes.remove(0) {
+            TestdStreamResolution::Refused { .. } => {}
+            TestdStreamResolution::Resolved { .. } => {
+                panic!("a never-emitted stream must not resolve")
+            }
+        }
+        let bundles = collector.typed_bundles();
+        assert_eq!(
+            bundles[0].stdout.disposition,
+            TestdStreamDisposition::CompleteSource
+        );
+        assert_eq!(
+            bundles[0].stderr.disposition,
+            TestdStreamDisposition::StreamNotEmitted
+        );
+
+        // An unknown locator is unavailable, never an empty source.
+        let mut foreign_context = test_context();
+        foreign_context.job_id = "job-unknown".to_owned();
+        let foreign = collector
+            .resolve_typed_sources(&retention, &foreign_context)
+            .expect("foreign resolution must run");
+        assert!(
+            foreign
+                .iter()
+                .flatten()
+                .all(|outcome| matches!(outcome, TestdStreamResolution::Refused { .. }))
+        );
+        drop(retention);
+        std::fs::remove_dir_all(&dir).expect("retention test dir must clean");
+    }
+
+    /// Issue #456 (WA11 boundary): Blob locator classes and foreign jobs are
+    /// refused before any byte is served; the Blob adapter stays #297's.
+    #[test]
+    fn blob_locators_and_foreign_jobs_are_refused() {
+        let (dir, store) = test_store("refusals");
+        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
+        let binding = test_binding();
+
+        let payload = b"retained-bytes".to_vec();
+        let mut pump = pump(&retention, binding.clone(), ProcessStreamKind::Stdout);
+        pump.open().expect("session must open");
+        pump.append(&payload).expect("chunk must admit");
+        let terminal = pump.finalize_eof().expect("must finalize");
+        let record = ProcessEvidence::new_typed(
+            test_view(&binding),
+            Some(terminal.evidence().clone()),
+            None,
+            EvidenceAxes::observed(),
+        )
+        .expect("terminal evidence must form a record");
+        let collector = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&collector, record).expect("record must admit");
+        let bundle = collector.typed_bundles().pop().expect("one bundle");
+        let admitted = bundle.stdout.binding.as_ref().expect("stdout binding");
+        let request = eliot_testd_core::ProcessStreamSourceReadbackRequest {
+            job_id: JOB_ID.to_owned(),
+            invocation_id: INVOCATION_ID.to_owned(),
+            binding: binding.clone(),
+            stream: ProcessStreamKind::Stdout,
+            locator_kind: eliot_process::DurableStreamLocatorKind::Blob,
+            locator: admitted.locator.clone().expect("admitted locator"),
+            ready_receipt_ref: admitted
+                .ready_receipt_ref
+                .clone()
+                .expect("admitted receipt"),
+            expected_sha256: admitted.source_sha256.clone().expect("admitted digest"),
+            expected_byte_length: admitted.source_byte_length.expect("admitted length"),
+            policy: admitted.policy.clone(),
+            fence: test_fence(),
+            max_bytes: 1 << 20,
+            deadline_ms: 5_000,
+        };
+        assert!(
+            retention.resolve(&request).is_err(),
+            "a Blob locator class must never resolve through testd retention"
+        );
+
+        let mut foreign_context = test_context();
+        foreign_context.job_id = "job-foreign".to_owned();
+        let foreign = collector
+            .resolve_typed_sources(&retention, &foreign_context)
+            .expect("foreign resolution must run");
+        assert!(
+            foreign
+                .iter()
+                .flatten()
+                .all(|outcome| matches!(outcome, TestdStreamResolution::Refused { .. }))
+        );
+        drop(retention);
+        std::fs::remove_dir_all(&dir).expect("retention test dir must clean");
+    }
+
+    /// A cancelled drain lands exactly one terminal with no durable source:
+    /// nothing is retained, and admission stays explicitly unavailable.
+    #[test]
+    fn cancelled_drain_retains_no_source() {
+        let (dir, store) = test_store("abort");
+        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
+        let binding = test_binding();
+
+        let mut pump = pump(&retention, binding.clone(), ProcessStreamKind::Stdout);
+        pump.open().expect("session must open");
+        pump.append(b"partial-prefix")
+            .expect("prefix chunk must admit");
+        let terminal = pump.abort_cancelled().expect("cancel must settle");
+        assert_eq!(
+            terminal.state(),
+            eliot_process::ProcessStreamSinkState::Cancelled
+        );
+        assert!(terminal.evidence().source().is_none());
+
+        let record = ProcessEvidence::new_typed(
+            test_view(&binding),
+            Some(terminal.evidence().clone()),
+            None,
+            EvidenceAxes::observed(),
+        )
+        .expect("abort terminal evidence must form a record");
+        let collector = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&collector, record)
+            .expect("abort record must admit");
+        let outcomes = collector
+            .resolve_typed_sources(&retention, &test_context())
+            .expect("resolution must run");
+        assert!(
+            outcomes
+                .iter()
+                .flatten()
+                .all(|outcome| matches!(outcome, TestdStreamResolution::Refused { .. }))
+        );
+        let bundles = collector.typed_bundles();
+        assert_eq!(
+            bundles[0].stdout.disposition,
+            TestdStreamDisposition::SourceUnavailable
+        );
+        drop(retention);
+        std::fs::remove_dir_all(&dir).expect("retention test dir must clean");
+    }
+
+    /// Issue #456 (WD1/WD2): after the instance is dropped and the store is
+    /// reopened, a fresh retention over the same file reopens the same
+    /// identities and re-resolves byte-identical sources with no operation
+    /// memory.
+    #[test]
+    fn restart_reopens_identical_evidence_without_operation_memory() {
+        let (dir, store) = test_store("restart");
+        let store_path = dir.join("testd-state.redb");
+        let store_arc = Arc::new(store);
+        let retention = TestdStreamRetention::new(Arc::clone(&store_arc), test_fence());
+        let binding = test_binding();
+
+        let payload = b"restart-proof-bytes".to_vec();
+        let mut pump = pump(&retention, binding.clone(), ProcessStreamKind::Stdout);
+        pump.open().expect("session must open");
+        pump.append(&payload).expect("chunk must admit");
+        let terminal = pump.finalize_eof().expect("must finalize");
+        // The pump owns a client handle: release it so the store file can
+        // be reopened below.
+        drop(pump);
+        let record = ProcessEvidence::new_typed(
+            test_view(&binding),
+            Some(terminal.evidence().clone()),
+            None,
+            EvidenceAxes::observed(),
+        )
+        .expect("terminal evidence must form a record");
+        let collector = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&collector, record).expect("record must admit");
+        collector
+            .resolve_typed_sources(&retention, &test_context())
+            .expect("resolution must run");
+        let first_receipt = collector.typed_bundles()[0]
+            .stdout
+            .binding
+            .as_ref()
+            .expect("resolved binding")
+            .readback_receipt_id
+            .clone()
+            .expect("readback receipt");
+        let restart = collector
+            .checkpoint_typed_evidence(JOB_ID, INVOCATION_ID, &test_fence())
+            .expect("checkpoint must capture");
+        // Persist, then drop every handle: the reopen below proves file
+        // durability rather than memory aliasing.
+        store_arc
+            .persist_typed_evidence_restart(&restart)
+            .expect("restart record must persist");
+        drop(retention);
+        drop(collector);
+        drop(store_arc);
+
+        let reopened_arc = Arc::new(
+            TestdStore::open(&store_path, RetryPolicy::default()).expect("store must reopen"),
+        );
+        let reopened = TestdStreamRetention::new(Arc::clone(&reopened_arc), test_fence());
+        let (bundles, mut outcomes) = reopened_arc
+            .reopen_typed_evidence(JOB_ID, &reopened, 1 << 20, 5_000)
+            .expect("reopen must succeed");
+        assert_eq!(bundles.len(), 1);
+        let receipt = bundles[0]
+            .stdout
+            .binding
+            .as_ref()
+            .expect("reopened binding")
+            .readback_receipt_id
+            .clone()
+            .expect("reopened receipt");
+        assert_eq!(receipt, first_receipt);
+        let mut bundle_outcomes = outcomes.pop().expect("one bundle outcome");
+        assert_eq!(resolved_bytes(bundle_outcomes.remove(0)), payload);
+        drop(reopened);
+        drop(reopened_arc);
+        std::fs::remove_dir_all(&dir).expect("retention test dir must clean");
+    }
+
+    /// Issue #456 (WB6/I8): a legacy synthetic reference stays
+    /// migration-required even after caller-supplied matching bytes arrive;
+    /// it is never expanded and never satisfies verification.
+    #[test]
+    fn legacy_reference_never_upgrades_with_later_bytes() {
+        let (dir, store) = test_store("legacy");
+        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
+        let binding = test_binding();
+
+        let legacy = ProcessStreamEvidence::new_legacy_raw_reference(
+            binding.clone(),
+            ProcessStreamKind::Stderr,
+            "raw:legacy-stderr",
+        )
+        .expect("valid legacy stderr evidence");
+        let record = ProcessEvidence::new_typed(
+            test_view(&binding),
+            None,
+            Some(legacy),
+            EvidenceAxes::observed(),
+        )
+        .expect("legacy-bearing record must form");
+        let collector = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&collector, record)
+            .expect("legacy record must admit");
+        let outcomes = collector
+            .resolve_typed_sources(&retention, &test_context())
+            .expect("resolution must run");
+        assert!(
+            outcomes
+                .iter()
+                .flatten()
+                .all(|outcome| matches!(outcome, TestdStreamResolution::Refused { .. }))
+        );
+        // Later-supplied matching bytes change nothing on the typed path.
+        collector
+            .record_raw_artifact(
+                "raw:legacy-stderr",
+                "text/plain",
+                b"legacy-bytes".to_vec(),
+                false,
+            )
+            .expect("caller bytes record");
+        let again = collector
+            .resolve_typed_sources(&retention, &test_context())
+            .expect("resolution must run");
+        assert!(
+            again
+                .iter()
+                .flatten()
+                .all(|outcome| matches!(outcome, TestdStreamResolution::Refused { .. }))
+        );
+        let bundles = collector.typed_bundles();
+        assert_eq!(
+            bundles[0].stderr.disposition,
+            TestdStreamDisposition::LegacyMigrationRequired
+        );
+        assert!(
+            bundles[0]
+                .stderr
+                .binding
+                .as_ref()
+                .expect("legacy binding")
+                .readback_receipt_id
+                .is_none()
+        );
+        drop(retention);
+        std::fs::remove_dir_all(&dir).expect("retention test dir must clean");
+    }
+}
