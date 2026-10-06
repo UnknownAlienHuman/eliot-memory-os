@@ -45,6 +45,7 @@ committed as repository authority.
 | `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
 | `verify-branch-protection.py` | Read back live branch protection/rulesets and compare against the retained merge-enforcement rule (#3004) | Live enforcement readback evidence only; never configures protection |
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
+| `audit-context-measurement-ownership.py` | Source-shape context-measurement ownership auditor (#866) | Static source classification only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
 | `audit-serde-boundary-closure.py` | Serde-boundary closure coordinator (#710, Slice A) | Static source/boundary evidence only |
 | `long_lived_collection_inventory.py` | Deterministic source-bound inventory of mutable collections in long-lived owners (#885) | Static source classification only |
@@ -53,6 +54,8 @@ committed as repository authority.
 | `verify-legacy-config-retirement.py` | Verify legacy config filenames, modes, roots, and module manifests stay retired (#1219) | Static source and packaging evidence only |
 | `context_measurement_inventory.py` | Deterministic source-bound inventory of serialized-context measurement cases with closed classification and frozen denominator (#866) | Static source classification only |
 | `audit_cue_kind_retirement.py` | Cross-package `CueKind` retirement oracle library over the static source/wire/caller denominator (#835); exercised by `scripts/tests/test_cue_kind_retirement.py` | Static source denominator evidence only |
+| `gen_capability_cell_registry.py` | Generator/check entrypoint for capability cell registry declarations across daemon/worker crates | Static code generation/check evidence only |
+| `prepare-dependency-policy-inputs.py` | Offline dependency-policy preparation helper for offline scanner/resolver inputs (#1229) | Offline dependency input preparation evidence only |
 | `verify-excluded-dispositions-1811.py` | Fail-closed excluded/standalone disposition gate over standalone packages and root exclude entries with consumption evidence checks (#1811) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `capture_clippy_diagnostics.py` | Run `cargo clippy --locked --workspace --all-targets --message-format=json` once (#838 W1) and store the complete untruncated JSON stream with its source revision, tool identity, complete declared target denominator and the cfg predicates this run did not compile | Single-run source-capture evidence only; no lint-cleanliness, build-success or acceptance claim, and it never carries `-D warnings` |
