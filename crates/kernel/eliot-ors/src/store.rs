@@ -41190,4 +41190,79 @@ mod bridge_handoff_retirement_2731 {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    fn staged_event_payload(sequence: u64, event_tag: &str) -> serde_json::Value {
+        let envelope = json!({
+            "stream_id": "stream-2731",
+            "event_id": event_tag,
+            "sequence": sequence,
+            "producer_id": "producer-2731",
+            "producer_generation": 1,
+            "authority_epoch": {
+                "lineage_id": RETIRE_LINEAGE_2731,
+                "sequence": 1,
+            },
+            "note": format!("delivery-{event_tag}"),
+        });
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&envelope).expect("envelope canonicalizes");
+        let sha = eliot_contracts::sha256_hex(&bytes);
+        json!({
+            "stream_id": "stream-2731",
+            "event_id": event_tag,
+            "sequence": sequence,
+            "producer_id": "producer-2731",
+            "producer_generation": 1,
+            "authority_epoch": format!("{RETIRE_LINEAGE_2731}:1"),
+            "envelope": envelope,
+            "envelope_sha256": sha,
+            "staging_connection": "conn-2731",
+            "privacy_disposition": "redacted",
+            "redacted_classes": ["privacy_authorization_absent"],
+            "redaction_reason": "DECLARED_OUT_OF_SCOPE",
+            "adapter_version": "test-1",
+            "requested_route": "test-route",
+            "owner_principal": "principal-2731",
+            "owner_authority_lineage": RETIRE_LINEAGE_2731,
+            "owner_connection": "conn-2731",
+            "owner_launch_nonce": "nonce-2731",
+            "owner_session_epoch": 1,
+        })
+    }
+
+    #[test]
+    fn records_bound_sheds_with_typed_pressure_and_keeps_serving()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item A1: past 2048 cumulative staged records, fresh
+        // delivery sheds with the typed EventRecords pressure — delivery
+        // continues, nothing is discarded, and stored identities still
+        // replay. One stream keeps every other table under its bound, so
+        // the only reachable refusal is the record budget.
+        let (store, path) = temp_retire_store();
+        for index in 1..=2048_u64 {
+            let tag = format!("evt-2731-{index:05}");
+            store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} of 2048 must succeed, got {error:?}"))?;
+        }
+        let overflow =
+            store.stage_bridge_event_checked(&staged_event_payload(2049, "evt-2731-02049"));
+        let is_records_pressure = matches!(
+            overflow,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure))
+                if pressure.dimension
+                    == eliot_contracts::BridgeEventCapacityDimension::EventRecords
+        );
+        assert!(
+            is_records_pressure,
+            "the 2049th fresh event must shed with EventRecords pressure, got {overflow:?}"
+        );
+        // A stored identity still replays: delivery evidence survives the
+        // saturated table instead of being discarded with it.
+        store
+            .stage_bridge_event_checked(&staged_event_payload(5, "evt-2731-00005"))
+            .map_err(|error| format!("a stored identity must still replay, got {error:?}"))?;
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }
