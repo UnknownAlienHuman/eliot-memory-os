@@ -126,6 +126,7 @@ mod credential_provision;
 mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
+mod isolated_destination;
 mod managed_change_plan;
 mod package;
 mod package_planner;
@@ -145,11 +146,13 @@ mod transaction;
 mod user_broker_profile;
 
 pub use guard_containment::RetainedGuardRevert;
-pub use installation_registry::RedbInstallationRegistry;
 #[cfg(test)]
 use installation_registry::classify_registry_table;
 #[cfg(test)]
 use installation_registry::validate_installation_host_root;
+pub use installation_registry::{
+    InstallationHostRootClass, RedbInstallationRegistry, classify_installation_host_root,
+};
 use installation_registry::{
     LEGACY_REGISTRY_TABLE, REGISTRY_RELATIVE_PATH, REGISTRY_TABLE, installation_registry_path,
 };
@@ -185,6 +188,14 @@ pub use integration_discovery::{
     ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
+};
+pub use isolated_destination::{
+    DestinationLeafObservation, IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation,
+    IsolatedDestinationError, IsolatedDestinationRefusal, IsolationEvidence,
+    PREPARED_DESTINATION_ADMISSION_WIRE, PREPARED_DESTINATION_MATERIALISATION_WIRE,
+    PreparedDestinationAdmission, PreparedDestinationFacts, PreparedDestinationMaterialisation,
+    ProposedRestorationRequirements, admit_prepared_isolated_destination,
+    materialise_prepared_isolated_destination,
 };
 
 pub use managed_change_plan::{
@@ -277,6 +288,8 @@ pub use runtime_root_contract::{
     InstallationProfile, RuntimeRootLease, RuntimeRootLeaseProvider, RuntimeStateRoots,
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
 };
+#[cfg(feature = "test-support")]
+pub use scm_approval::issue_test_support_service_registration_approvals;
 pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval};
 pub use setup_binding::{
     SETUP_BINDING_WIRE_VERSION, SetupAdmissionError, SetupAdvanceInput, SetupBinding,
@@ -1733,6 +1746,26 @@ impl RuntimeLaunchDescriptor {
             "--eliotd-descriptor-sha256".to_owned(),
             self.eliotd_descriptor_digest.as_str().to_owned(),
         ]
+    }
+
+    /// Re-derives the kernel child argv from the descriptor's own fields
+    /// (issue #958: destination derivation moves the work root and resets
+    /// unpublished digests, so cloned argv would no longer select the
+    /// descriptor-bound config).
+    pub(crate) fn refresh_kernel_arguments(&mut self) -> Result<(), InstallationError> {
+        let store_config = self.store_config_path.clone();
+        let expected = self.expected_kernel_arguments(&store_config);
+        let mut refreshed = Vec::with_capacity(expected.len());
+        for value in expected {
+            refreshed.push(PlatformHandle::new(value).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "runtime_launch.kernel_arguments".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?);
+        }
+        self.kernel_arguments = refreshed;
+        Ok(())
     }
 
     /// Validates the launch contour against the exact approved generation
