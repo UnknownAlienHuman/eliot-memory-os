@@ -59,7 +59,7 @@
 //! decision when the admitted drive goes live.
 
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -81,7 +81,7 @@ use crate::kernel_client::{
     is_testd_diagnose_only_invocation, validate_envelope_invocation_binding,
     validate_process_binding,
 };
-use crate::{TestReceipt, TestdComposition};
+use crate::{TestReceipt, TestdComposition, TestdStreamRetention};
 
 /// Fence bound for one admitted claim, in Unix milliseconds.
 ///
@@ -126,12 +126,25 @@ pub struct GovernedContour<'a, E: ?Sized> {
     executor: &'a E,
     /// The same executor, presented as the physical Git port.
     git: Option<&'a dyn SourceObservationGitPort>,
+    /// Testd-owned stream retention behind the executor's sink port, when
+    /// the composed executor pumps into one (issue #456, D7). The finish
+    /// path resolves admitted sources through it; `None` keeps generic
+    /// executor doubles working without one.
+    stream_retention: Option<Arc<TestdStreamRetention>>,
 }
 
 impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// Binds one executor as both the launch contour and the Git port.
-    pub const fn new(executor: &'a E, git: Option<&'a dyn SourceObservationGitPort>) -> Self {
-        Self { executor, git }
+    pub const fn new(
+        executor: &'a E,
+        git: Option<&'a dyn SourceObservationGitPort>,
+        stream_retention: Option<Arc<TestdStreamRetention>>,
+    ) -> Self {
+        Self {
+            executor,
+            git,
+            stream_retention,
+        }
     }
 
     /// The admitted executor that owns the Job Object contour.
@@ -142,6 +155,11 @@ impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// The same executor presented as the physical Git port.
     pub const fn git(&self) -> Option<&'a dyn SourceObservationGitPort> {
         self.git
+    }
+
+    /// Testd-owned stream retention behind the executor's sink port, if any.
+    pub fn stream_retention(&self) -> Option<&Arc<TestdStreamRetention>> {
+        self.stream_retention.as_ref()
     }
 }
 

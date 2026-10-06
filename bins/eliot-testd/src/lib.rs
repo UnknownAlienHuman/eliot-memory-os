@@ -23,7 +23,8 @@ use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, ExitDisposition, FencingToken, Generation,
     ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink,
     ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessStreamSinkClient, ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
@@ -641,12 +642,19 @@ async fn start_claimed_from_store_inner<E: ProcessExecutor + 'static>(
 }
 
 /// Instantiates the sole concrete `ProcessExecutor` with an authority-owned
-/// validation port.  Testd owns this instance's operation trees; Kernel owns
-/// permit issuance and validation.
+/// validation port and the single accepted stream sink.  Testd owns this
+/// instance's operation trees; Kernel owns permit issuance and validation.
+///
+/// Issue #456 (D7): the executor always pumps policy-bound process output
+/// into the given testd-owned retention through the #267 sink port, so the
+/// emitted typed streams carry durable source locators the finish path can
+/// resolve. There is no sink-less production composition: without a sink,
+/// persistence stays `SourceUnavailable` with no locator by executor design.
 pub fn compose_process_executor(
     authority: Arc<dyn DispatchValidationPort>,
+    stream_sink: Arc<dyn ProcessStreamSinkClient>,
 ) -> WindowsProcessExecutor {
-    WindowsProcessExecutor::new(authority)
+    WindowsProcessExecutor::new_with_stream_sink(authority, stream_sink)
 }
 
 // ---- Governed Git source observation (issue #1140, AC3) ----
@@ -2488,8 +2496,21 @@ fn drive_validated_dispatch_material_inner(
     // `TestdDispatchAuthority` that later seals the productive tool
     // request, so both launches share one Job Object contour, one permit
     // authority, and one one-shot replay fence (issue #1140, AC3).
+    //
+    // Issue #456 (D7): the testd-owned stream retention is bound beside the
+    // same store handle, fenced for this driven job/attempt, and injected as
+    // the executor's single stream sink before any child runs. The finish
+    // path below resolves admitted sources through the same instance.
     let authority = Arc::new(TestdDispatchAuthority::new()?);
-    let executor = Arc::new(compose_process_executor(authority.clone()));
+    let store = Arc::new(store);
+    let retention = Arc::new(TestdStreamRetention::new(
+        Arc::clone(&store),
+        job.invocation.request.state_fence.clone(),
+    ));
+    let executor = Arc::new(compose_process_executor(
+        authority.clone(),
+        retention.clone(),
+    ));
     let git = Arc::new(GovernedGitSourceObservation::new(
         executor.clone(),
         authority.clone(),
@@ -2543,6 +2564,7 @@ fn drive_validated_dispatch_material_inner(
         &worker::GovernedContour::new(
             executor.as_ref(),
             Some(&*git as &dyn SourceObservationGitPort),
+            Some(Arc::clone(&retention)),
         ),
         SERVICE_NAME,
         ADMITTED_WORKER_LEASE_MS,
@@ -3247,7 +3269,7 @@ mod tests {
         // `GovernedContour` so they cannot be passed apart (#1140 AC3); this
         // fixture offers no Git observation, which is the documented `None`
         // case, and the productive paths it drives fail closed without one.
-        let contour = worker::GovernedContour::new(&executor, None);
+        let contour = worker::GovernedContour::new(&executor, None, None);
         let receipt = run_admitted_one_shot(
             &fixture.composition,
             presented,
@@ -3287,7 +3309,7 @@ mod tests {
         let executor = OneShotTestExecutor {
             starts: Mutex::new(0),
         };
-        let contour = worker::GovernedContour::new(&executor, None);
+        let contour = worker::GovernedContour::new(&executor, None, None);
         let receipt = run_admitted_one_shot(
             &fixture.composition,
             presented,
@@ -3327,7 +3349,7 @@ mod tests {
         };
         // As above: the contour binds the launch executor to the Git port, and
         // this fixture has no Git observation to present.
-        let contour = worker::GovernedContour::new(&executor, None);
+        let contour = worker::GovernedContour::new(&executor, None, None);
         let receipt = run_admitted_one_shot(
             &fixture.composition,
             presented,
@@ -3632,10 +3654,24 @@ mod tests {
             .expect("authority must issue");
         request.validate().expect("issued request must validate");
 
-        // The real composed executor runs the bounded probe. On Windows
-        // `cargo --version` exits fast under the binding caps; elsewhere
-        // the Windows executor is unavailable by design.
-        let executor = super::compose_process_executor(Arc::new(authority));
+        // The real composed executor runs the bounded probe with the
+        // testd-owned retention behind its stream sink (issue #456, D7). On
+        // Windows `cargo --version` exits fast under the binding caps;
+        // elsewhere the Windows executor is unavailable by design.
+        let probe_store = eliot_testd_core::TestdStore::open(
+            cwd.join("probe-store.redb"),
+            eliot_testd_core::RetryPolicy::default(),
+        )
+        .expect("probe retention store must open");
+        let probe_fence = eliot_contracts::StateFence::new(
+            test_epoch(7),
+            eliot_contracts::ResourceGeneration::new(1).expect("non-zero test generation"),
+        );
+        let probe_retention = Arc::new(super::TestdStreamRetention::new(
+            Arc::new(probe_store),
+            probe_fence,
+        ));
+        let executor = super::compose_process_executor(Arc::new(authority), probe_retention);
         let sink: Arc<dyn eliot_process::ProcessEvidenceSink> =
             Arc::new(eliot_testd_core::EvidenceCollector::default());
         let started = block_on_drive_test(executor.start(request, sink));
