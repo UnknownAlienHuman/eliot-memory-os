@@ -13,13 +13,14 @@
 //! store SDK, database credential, raw SQL, or database-file access exists
 //! here, and none is added to close any gap.
 //!
-//! Current bound (#1755 W2, open): binding the owner PID the listener table
-//! reports to a handle identity (PID, creation time, image path) needs a
-//! safe PID-to-identity wrapper that only `eliot-platform-windows` may own,
-//! and this crate forbids `unsafe_code`, so the probe cannot establish the
-//! image binding yet. Until that surface lands, a present listener yields an
-//! explicit `Inaccessible` refusal — never a sample, never health-by-absence
-//! — while an absent listener is a real `Absent` observation the tick already
+//! Bound closed (#1755 W2-rem): the owner PID the listener table reports is
+//! bound to a handle identity (PID, creation time, image path) through the
+//! safe `eliot-platform-windows` wrapper `observe_process_identity` (this
+//! crate forbids `unsafe_code`), and the observed image must equal the
+//! retained approved store image under the platform path comparison. A
+//! present listener with an unbindable or mismatched owner yields an explicit
+//! `Inaccessible` refusal — never a sample, never health-by-absence — while
+//! an absent listener is a real `Absent` observation the tick already
 //! exercises. A PID, a port-open result, or a self-reported healthy flag
 //! alone can never produce a sample here.
 //!
@@ -30,7 +31,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use eliot_platform_windows::{TcpListenerOwnerError, observe_loopback_tcp_listener_owner};
+use eliot_platform_windows::{
+    TcpListenerOwnerError, observe_loopback_tcp_listener_owner, observe_process_identity,
+    same_process_image_path,
+};
 
 use crate::independent_sensor::{ApprovedSensorBinding, SensorProbeError, SensorReadiness};
 
@@ -192,17 +196,19 @@ impl StoreEndpointObservation {
 /// Observes the owner of the approved store loopback listener.
 ///
 /// The listener owner table is read first. An absent listener is a real
-/// `Absent` observation. A present listener's owner PID cannot yet be bound
-/// to a handle identity inside this crate (`forbid(unsafe_code)`, and the
-/// safe wrapper belongs to `eliot-platform-windows`), so a present listener
-/// is an explicit `Inaccessible` refusal until that surface lands — never a
-/// sample, and never evidence for a PID the probe did not bind.
+/// `Absent` observation. A present listener's owner PID is bound to a handle
+/// identity through `eliot-platform-windows` (safe wrapper; this crate
+/// forbids `unsafe_code`), and the observed image must equal the retained
+/// approved store image: a substituted process holding the same port is a
+/// refusal, not a sample, and never evidence for a PID the probe did not
+/// bind.
 ///
 /// # Errors
 ///
 /// Returns [`SensorProbeError::Absent`] when no listener exists and
 /// [`SensorProbeError::Inaccessible`] when the table read is denied,
-/// unavailable, or the owner identity cannot yet be established.
+/// unavailable, the owner identity cannot be established, the approved image
+/// is unusable, or the bound image is not the approved store image.
 pub fn observe_store_endpoint(
     target: &StoreEndpointTarget,
 ) -> Result<StoreEndpointObservation, SensorProbeError> {
@@ -222,10 +228,25 @@ pub fn observe_store_endpoint(
             }
             _ => SensorProbeError::Inaccessible("STORE_LISTENER_UNAVAILABLE"),
         })?;
-    let _ = owner.process_id();
-    Err(SensorProbeError::Inaccessible(
-        "STORE_OWNER_IDENTITY_UNAVAILABLE",
-    ))
+    let identity = observe_process_identity(owner.process_id())
+        .map_err(|_| SensorProbeError::Inaccessible("STORE_OWNER_IDENTITY_UNAVAILABLE"))?;
+    let Some(approved) = target.image.to_str() else {
+        return Err(SensorProbeError::Inaccessible(
+            "STORE_APPROVED_IMAGE_INVALID",
+        ));
+    };
+    if !same_process_image_path(&identity.image_path, approved) {
+        return Err(SensorProbeError::Inaccessible("STORE_OWNER_IMAGE_MISMATCH"));
+    }
+    Ok(StoreEndpointObservation {
+        installation: target.installation.clone(),
+        generation: target.generation.clone(),
+        endpoint: target.endpoint,
+        process_id: identity.process_id,
+        start_time_100ns: identity.start_time_100ns,
+        image_path: identity.image_path,
+        readiness: SensorReadiness::Unprobed,
+    })
 }
 
 #[cfg(test)]
@@ -323,8 +344,8 @@ mod tests {
     /// A released loopback port has no listener: absence, not health, not zero.
     ///
     /// This proves the live chain (manifest-shaped target -> OS listener-owner
-    /// table -> typed refusal) end to end; a present listener stays
-    /// `Inaccessible` until the owner-identity surface lands.
+    /// table -> typed refusal) end to end; a present listener with a matching
+    /// image is now a sample, and a mismatched one stays `Inaccessible`.
     #[cfg(windows)]
     #[test]
     fn released_loopback_port_is_absent() {
@@ -344,12 +365,12 @@ mod tests {
         ));
     }
 
-    /// A live loopback listener owned by this test process is a present
-    /// subject whose identity this crate cannot yet bind: refusal, not a
-    /// sample and not a silent pass.
+    /// A live loopback listener owned by this test process binds to the test
+    /// executable image: a real sample, the first production caller of the
+    /// owner-identity surface (#1755 W2-rem).
     #[cfg(windows)]
     #[test]
-    fn live_loopback_listener_without_identity_surface_is_refused() {
+    fn live_loopback_listener_binds_matching_owner_identity() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let endpoint = listener.local_addr().expect("listener address");
         let target = StoreEndpointTarget {
@@ -357,6 +378,30 @@ mod tests {
             generation: "7".to_owned(),
             endpoint,
             image: std::env::current_exe().expect("test executable path"),
+        };
+        let observation = observe_store_endpoint(&target).expect("bound owner is a sample");
+        assert_eq!(observation.process_id(), std::process::id());
+        assert_eq!(observation.endpoint(), endpoint);
+        assert_eq!(observation.installation(), "installation-7");
+        assert_eq!(observation.generation(), "7");
+        assert!(!observation.image_path().is_empty());
+        assert_eq!(observation.readiness().as_str(), "unprobed");
+        drop(listener);
+    }
+
+    /// A live loopback listener whose retained approved image is not the
+    /// owning process image is a refusal: the image binding, not the PID,
+    /// admits the sample.
+    #[cfg(windows)]
+    #[test]
+    fn live_loopback_listener_with_foreign_image_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let endpoint = listener.local_addr().expect("listener address");
+        let target = StoreEndpointTarget {
+            installation: "installation-7".to_owned(),
+            generation: "7".to_owned(),
+            endpoint,
+            image: PathBuf::from(r"C:\Windows\System32\notepad.exe"),
         };
         assert!(matches!(
             observe_store_endpoint(&target),

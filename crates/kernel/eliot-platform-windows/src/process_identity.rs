@@ -364,7 +364,13 @@ pub(crate) fn same_process_identity(
     }
 }
 
-pub(crate) fn same_process_image_path(observed: &str, approved: &str) -> bool {
+/// True when both image paths are usable absolute Windows paths naming the
+/// same file (prefix, separator and case normalized).
+///
+/// This is the comparison the Watchdog store-endpoint probe uses to bind an
+/// observed listener-owner process to its retained approved image: a PID
+/// match alone never admits a sample.
+pub fn same_process_image_path(observed: &str, approved: &str) -> bool {
     if !valid_process_image_path(observed) || !valid_process_image_path(approved) {
         return false;
     }

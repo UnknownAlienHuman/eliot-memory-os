@@ -240,13 +240,12 @@ use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
 pub use process_identity::directory_identity_for_path;
 pub use process_identity::{
     FileIdentity, ProcessIdentity, ProcessIdentityError, is_process_builtin_administrator,
-    observe_process_identity,
+    observe_process_identity, same_process_image_path,
 };
 pub(crate) use process_identity::{
     file_identity, file_identity_from_handle, inspect_process_handle, inspect_process_identity,
     process_token_identity, process_token_is_builtin_administrator, same_process_identity,
-    same_process_image_path, same_windows_path, thread_token_is_builtin_administrator,
-    valid_process_image_path,
+    same_windows_path, thread_token_is_builtin_administrator, valid_process_image_path,
 };
 #[cfg(windows)]
 pub use process_job::OuterKillDomain;

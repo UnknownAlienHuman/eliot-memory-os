@@ -73,14 +73,15 @@ use crate::SpoolError;
 /// Revision of the sensor/capability map shape itself.
 ///
 /// A map-shape revision, not a digest and not an identity: a future change to
-/// the channel set, the class set, or the record shape increments it, and
+/// the channel set, the class set, a channel's measured wiring, or the record
+/// shape increments it, and
 /// [`IntervalCoverageReport::valid`] refuses a report stamped with any other
 /// value. It is an in-memory stamp on a report this process just derived: the
 /// report has no serialization and no retained or on-disk form, so no artifact,
 /// fence, or later reader ever loads an older revision. It is not a guard over a
 /// persisted one, and it is deliberately not a digest — there is nothing here to
 /// hash and no original recorded value to compare a hash against.
-pub const SENSOR_MAP_REVISION: u16 = 2;
+pub const SENSOR_MAP_REVISION: u16 = 3;
 
 /// One of the eleven Windows sensors I8.2 enumerates.
 ///
@@ -350,7 +351,7 @@ impl ChannelCapability {
 /// `Wired`/`MissingAdapter` is the measured state of this crate at
 /// `SENSOR_MAP_REVISION`, from `git grep` over `bins/eliot-watchdog/src` for a
 /// production runtime caller of each channel's source — not a design intent.
-/// Four channels are wired; the other seven are measured missing adapters and
+/// Six channels are wired; the other five are measured missing adapters and
 /// are the named gaps that keep a full-coverage claim unavailable.
 pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
     ChannelCapability {
@@ -477,16 +478,17 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ReadOnlyProbe],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::HostAdministrator,
-        coverage_limitation: "No store probe exists, so the canonical-store branch is blind. This \
-             owner correctly holds no SurrealDB SDK, database credential, raw SQL, or \
-             database-file access, and gains none to close this gap.",
-        wiring: ChannelWiring::MissingAdapter {
-            reason: "the probe call chain is live (`HostObservationSource::observe_store_endpoint` \
-                 -> `store_endpoint_observation::observe_store_endpoint` -> \
-                 `observe_loopback_tcp_listener_owner`, exercised every tick and by unit tests), \
-                 but binding the owner PID to a handle identity needs a safe PID-to-identity \
-                 wrapper that only `eliot-platform-windows` may own; this crate forbids \
-                 `unsafe_code`",
+        coverage_limitation: "The store loopback listener owner PID is bound to a handle \
+             identity through `eliot_platform_windows::observe_process_identity` and the observed \
+             image must equal the retained approved store image; readiness stays `Unprobed` \
+             (liveness only), and an unbindable or mismatched owner is a refusal, never a sample. \
+             This owner correctly holds no SurrealDB SDK, database credential, raw SQL, or \
+             database-file access, and gains none.",
+        wiring: ChannelWiring::Wired {
+            runtime_caller: "watchdog_composition::WatchdogComposition::start_with_shutdown_and_host_and_heartbeat \
+                 -> HostObservationSource::observe_store_endpoint -> \
+                 store_endpoint_observation::observe_store_endpoint -> \
+                 eliot_platform_windows::observe_process_identity",
         },
     },
     ChannelCapability {
@@ -528,12 +530,15 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ListenerBinding],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        coverage_limitation: "No listener is inventoried, so this interval is blind.",
-        wiring: ChannelWiring::MissingAdapter {
-            reason: "the store-listener probe call chain is live (see the `StoreProcessHealth` \
-                 entry), but the owner-PID-to-identity binding it needs is the same missing \
-                 `eliot-platform-windows` surface; other registered service listeners have no \
-                 owner-held endpoint yet",
+        coverage_limitation: "Only the canonical store loopback listener (the registry-selected \
+             manifest endpoint, owner PID bound to the approved image) is inventoried, so this \
+             channel is PARTIAL, never CONTINUOUS, until the other registered service listeners \
+             gain owner-held endpoints.",
+        wiring: ChannelWiring::Wired {
+            runtime_caller: "watchdog_composition::WatchdogComposition::start_with_shutdown_and_host_and_heartbeat \
+                 -> HostObservationSource::observe_store_endpoint -> \
+                 store_endpoint_observation::observe_store_endpoint (same sample the \
+                 `StoreProcessHealth` entry wires)",
         },
     },
     ChannelCapability {
@@ -907,7 +912,7 @@ impl IntervalCoverageReport {
     /// required. There is no `any` term, no early exit that skips an
     /// unexamined channel, and no per-channel shortcut: a report whose
     /// `Host` and `Kernel` records are both `CONTINUOUS` still returns `false`
-    /// while any of the seven measured missing adapters is `BLIND`. `false` is
+    /// while any of the five measured missing adapters is `BLIND`. `false` is
     /// also returned when no interval has been observed at all, because the
     /// report itself is then absent rather than empty-and-complete.
     #[must_use]

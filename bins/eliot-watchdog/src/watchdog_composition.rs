@@ -718,16 +718,14 @@ impl WatchdogComposition {
                                 ObservationClass::ArtifactDigest,
                             );
                         }
-                        // I8.2 (#1755 W2): this tick exercises the store-endpoint
-                        // probe that will feed the StoreProcessHealth and
-                        // ListenerInventory channels. The probe call chain is
-                        // live (manifest-shaped target -> OS listener-owner
-                        // table -> typed refusal); samples start flowing when
-                        // the owner-identity surface lands in
-                        // `eliot-platform-windows` (see
-                        // `store_endpoint_observation`). Until then a refused
-                        // probe records no sample, so both channels stay
-                        // UNKNOWN rather than healthy-by-absence.
+                        // I8.2 (#1755 W2-rem): this tick exercises the store-endpoint
+                        // probe feeding the StoreProcessHealth and
+                        // ListenerInventory channels (manifest-shaped target ->
+                        // OS listener-owner table -> platform PID-to-identity
+                        // binding -> approved-image match; see
+                        // `store_endpoint_observation`). A refused probe
+                        // records no sample, so both channels stay UNKNOWN
+                        // rather than healthy-by-absence.
                         if let Some(store) = host.observe_store_endpoint() {
                             tracing::debug!(
                                 event = "watchdog.store_endpoint_observed",

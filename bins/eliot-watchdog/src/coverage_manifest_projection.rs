@@ -177,7 +177,7 @@ mod tests {
         InstallationCoverageBinding {
             installation_id: "installation-1755".to_owned(),
             allowed_manifest_digest: "a".repeat(64),
-            sensor_map_revision: 2,
+            sensor_map_revision: crate::observation_coverage::SENSOR_MAP_REVISION,
             interval_start_ms: 1_000,
             interval_end_ms: 2_000,
             binding_version: INSTALLATION_COVERAGE_BINDING_VERSION,
