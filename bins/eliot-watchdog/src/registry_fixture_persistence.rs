@@ -21,9 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_installation::{
-    CandidateManifest, INSTALLATION_REGISTRY_WIRE_VERSION, InstallationEpoch, InstallationProfile,
-    PHASE_B_PENDING_MARKER, PHASE_B_PENDING_SCM_DIGEST, PlatformHandle, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, phase_b_scm_selector,
+    ActivationCommitFence, CandidateManifest, INSTALLATION_REGISTRY_WIRE_VERSION,
+    InstallationEpoch, InstallationProfile, PHASE_B_PENDING_MARKER, PHASE_B_PENDING_SCM_DIGEST,
+    PhaseBLiveBinding, PlatformHandle, RuntimeLaunchDescriptor, RuntimeStateRoots,
+    SupervisionAuthorityBinding, phase_b_scm_selector,
 };
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
@@ -36,6 +37,10 @@ use eliot_platform_windows::{
     prepare_protected_directory,
     test_support::{self, ProtectedRootOverride},
     watchdog_service_security_descriptor_digest,
+};
+use eliot_runtime_contracts::{
+    Ed25519SupervisionLeaseSigner, ProvisionedSupervisionAuthority,
+    SupervisionSealedKeyFileIdentity, SupervisionSealedKeyReference, SupervisionTrustAnchor,
 };
 use redb::{Database, TableDefinition};
 use serde::Serialize;
@@ -136,11 +141,13 @@ impl RegistryFixture {
                 host_root.display()
             )
         });
-        let artifact_root = std::env::temp_dir().join(format!(
-            "eliot-watchdog-registry-{}-{}",
-            std::process::id(),
-            &installation_key[..16]
-        ));
+        // The artifact copies live INSIDE the overridden protected root:
+        // the admission opens the approved images through retained
+        // protected leases, whose ProgramData-contour containment follows
+        // the same override the Host root already relies on. A sibling
+        // temporary directory would sit outside that contour and the image
+        // open would refuse it before any digest is read.
+        let artifact_root = program_data.join("artifact-copies");
         std::fs::create_dir_all(&artifact_root).unwrap_or_else(|error| {
             panic!(
                 "failed to create unique artifact fixture root {}: {error}",
@@ -198,6 +205,30 @@ impl RegistryFixture {
     #[must_use]
     pub fn base_bootstrap(&self) -> ServiceBootstrapArguments {
         self.bootstrap_for(7)
+    }
+
+    /// Live authority-descriptor readback digest the import-ready manifest
+    /// binds (a `Provisioned` authority requires the live overlay, never the
+    /// Phase-A pending marker).
+    const IMPORT_DESCRIPTOR_DIGEST: &'static str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// Returns the bootstrap selecting the import-ready generation: same
+    /// shape as [`Self::base_bootstrap`] but carrying the live descriptor
+    /// digest the import-ready manifest and its approvals bind.
+    #[must_use]
+    pub fn bootstrap_import_ready(&self) -> ServiceBootstrapArguments {
+        let descriptor_path = self.authority_descriptor_path(7);
+        ServiceBootstrapArguments::new(
+            descriptor_path,
+            Self::IMPORT_DESCRIPTOR_DIGEST,
+            &self.installation_key,
+            7,
+            std::iter::empty::<String>(),
+        )
+        .and_then(|value| value.with_host_state_root(&self.host_root))
+        .and_then(|value| value.with_registration_nonce(Self::digest(207)))
+        .unwrap_or_else(|error| panic!("invalid import-ready bootstrap: {error}"))
     }
 
     /// Returns a valid `SystemService` bootstrap for one fixture generation.
@@ -965,6 +996,331 @@ impl RegistryFixture {
         write
             .commit()
             .unwrap_or_else(|error| panic!("commit registry fixture: {error}"));
+    }
+}
+
+/// Import-positive contour (issues #955 T10/T12/T13/T14/T17).
+///
+/// The snapshot legs prove the owner port; the import legs need installer-
+/// admitted material the snapshot contour never mints: a destination
+/// admission (`admit_isolated_destination`) and an owner-issued active
+/// binding (`FileWatchdogAdmission::from_registry`). Both verify approved
+/// image digests against real bytes and the live admission additionally
+/// requires durable provisioned supervision authority plus the running image
+/// to be the approved Watchdog image. This block mints the digest- and
+/// authority-bound half, in-test only (parent AUTH-GRANTED, adapted): the
+/// image bytes are the real fixture bytes with their real digests, and the
+/// authority is self-provisioned through the public constructor with test
+/// values bound to this fixture's own installation and generation. The
+/// running-image string-equality gate is process-coupled by design —
+/// manifest validation forces the approved filename while `current_exe` is
+/// always the harness binary — so the active binding for the import comes
+/// from `test_binding_from_registry`, which runs the full production chain
+/// minus exactly that gate. No production path calls any of it: the values
+/// prove the import, never an approval.
+impl RegistryFixture {
+    /// Returns this contour's installation identity (the owner-issued value
+    /// the port, the admission and the sensor all bind).
+    #[must_use]
+    pub fn installation_key(&self) -> &str {
+        &self.installation_key
+    }
+
+    /// Returns the registry file the admission opens through the retained
+    /// Host root lease.
+    #[must_use]
+    pub fn registry_file(&self) -> &Path {
+        &self.registry_path
+    }
+
+    /// Creates every runtime child the admission retains and validates.
+    /// The constructor provisions only the Host root; retention walks the
+    /// whole runtime tree, so the import contour materializes the rest.
+    pub fn ensure_runtime_children(&self) {
+        let roots = self.runtime_roots();
+        for root in [
+            &roots.host_state_root,
+            &roots.kernel_ors_root,
+            &roots.kernel_work_root,
+            &roots.store_data_root,
+            &roots.store_work_root,
+            &roots.store_temp_root,
+            &roots.watchdog_state_root,
+        ] {
+            std::fs::create_dir_all(Path::new(root.as_str())).unwrap_or_else(|error| {
+                panic!(
+                    "failed to create import contour runtime child {}: {error}",
+                    root.as_str()
+                )
+            });
+        }
+    }
+
+    /// Mints the self-provisioned supervision authority this contour's
+    /// committed generation carries: the public constructor over test values
+    /// bound to this fixture's own installation and generation (the host
+    /// dispatch fixture's recipe, which drives the same registry gates).
+    fn test_authority(
+        installation_id: &str,
+        candidate_generation: &str,
+        authority_generation: ResourceGeneration,
+    ) -> ProvisionedSupervisionAuthority {
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "eliot-kernel",
+            "test-supervision-key",
+            [0x39; 32],
+        )
+        .unwrap_or_else(|error| panic!("mint fixture supervision signer: {error}"));
+        let trust_anchor = SupervisionTrustAnchor::new(
+            installation_id,
+            "eliot-kernel",
+            "test-supervision-key",
+            signer.public_key().to_vec(),
+        )
+        .unwrap_or_else(|error| panic!("mint fixture supervision trust anchor: {error}"));
+        let key_reference = SupervisionSealedKeyReference::new(
+            "test-supervision-authority.sealed",
+            "S-1-5-80-1-2-3-4-5",
+            SupervisionSealedKeyFileIdentity {
+                canonical_path_digest: "1".repeat(64),
+                volume_serial_number: 7,
+                file_index: 11,
+                security_descriptor_digest: "2".repeat(64),
+            },
+            "3".repeat(64),
+        )
+        .unwrap_or_else(|error| panic!("mint fixture supervision key reference: {error}"));
+        ProvisionedSupervisionAuthority::new(
+            "test-supervision-scope",
+            candidate_generation,
+            authority_generation,
+            key_reference,
+            trust_anchor,
+        )
+        .unwrap_or_else(|error| panic!("mint fixture supervision authority: {error}"))
+    }
+
+    /// Returns the manifest with real image digests over this contour's own
+    /// artifact copies plus the self-provisioned authority: the live
+    /// admission verifies both image digests and durable authority for the
+    /// selected generation (the running-image string-equality gate is
+    /// process-coupled by design and unmintable in-test — see
+    /// `test_binding_from_registry` — so the manifest keeps the approved
+    /// artifact-copy image the filename rule demands).
+    /// Every other field keeps the proven `manifest(7)` shape, re-sealed.
+    #[must_use]
+    pub fn manifest_import_ready(&self) -> CandidateManifest {
+        let mut manifest = self.manifest(7);
+        let host_digest = Self::artifact_digest(&self.artifact_root.join("eliot-host.exe"));
+        let watchdog_digest = Self::artifact_digest(&self.artifact_root.join("eliot-watchdog.exe"));
+        let authority = Self::test_authority(
+            &self.installation_key,
+            manifest.generation.as_str(),
+            manifest.runtime_launch.authority_generation,
+        );
+        manifest.runtime_launch.watchdog_artifact_digest = handle(watchdog_digest);
+        manifest.runtime_launch.host_artifact_digest = handle(host_digest.clone());
+        // A `Provisioned` authority is only valid on a live authority
+        // overlay: the descriptor digest leaves the Phase-A pending marker
+        // for a live readback digest, and the presented bootstrap below
+        // (`bootstrap_import_ready`) selects it through the same SCM
+        // selector the approval binds.
+        manifest.runtime_launch.authority_descriptor_digest =
+            handle(Self::IMPORT_DESCRIPTOR_DIGEST);
+        // Child argv is an authority input: the `--authority-descriptor-sha256`
+        // entry must select the live overlay digest above (production
+        // re-derives the whole argv in `refresh_kernel_arguments`; the
+        // fixture rebinds the single entry it moved).
+        let digest = manifest.runtime_launch.authority_descriptor_digest.clone();
+        let mut rebound = false;
+        let arguments = &mut manifest.runtime_launch.kernel_arguments;
+        let mut index = 0;
+        while index + 1 < arguments.len() {
+            if arguments[index].as_str() == "--authority-descriptor-sha256" {
+                arguments[index + 1] = digest.clone();
+                rebound = true;
+                break;
+            }
+            index += 1;
+        }
+        assert!(
+            rebound,
+            "import-ready descriptor carries the authority argv entry"
+        );
+        manifest.runtime_launch.supervision_authority = SupervisionAuthorityBinding::Provisioned {
+            authority: Box::new(authority),
+        };
+        manifest.runtime_launch = manifest
+            .runtime_launch
+            .with_computed_digest()
+            .unwrap_or_else(|error| panic!("re-seal import-ready descriptor: {error}"));
+        manifest.generation = manifest.runtime_launch.generation.clone();
+        manifest.runtime_state_roots_digest = manifest
+            .runtime_launch
+            .runtime_state_roots
+            .roots_digest
+            .clone();
+        manifest.host_artifact_digest = handle(host_digest);
+        manifest.host_executable_path = manifest.runtime_launch.host_executable_path.clone();
+        manifest
+    }
+
+    /// Returns the manifest with real image digests over this contour's own
+    /// artifact copies: the destination admission verifies both digests but
+    /// requires neither the running image nor durable authority.
+    #[must_use]
+    pub fn manifest_destination(&self) -> CandidateManifest {
+        let mut manifest = self.manifest(7);
+        let host_digest = Self::artifact_digest(&self.artifact_root.join("eliot-host.exe"));
+        let watchdog_digest = Self::artifact_digest(&self.artifact_root.join("eliot-watchdog.exe"));
+        manifest.runtime_launch.host_artifact_digest = handle(host_digest.clone());
+        manifest.runtime_launch.watchdog_artifact_digest = handle(watchdog_digest.clone());
+        manifest.runtime_launch = manifest
+            .runtime_launch
+            .with_computed_digest()
+            .unwrap_or_else(|error| panic!("re-seal destination descriptor: {error}"));
+        manifest.generation = manifest.runtime_launch.generation.clone();
+        manifest.runtime_state_roots_digest = manifest
+            .runtime_launch
+            .runtime_state_roots
+            .roots_digest
+            .clone();
+        manifest.host_artifact_digest = handle(host_digest);
+        manifest
+    }
+
+    /// Returns the committed terminal carrying the exact committed fence the
+    /// live admission reads its durable authority from: the Phase-B live
+    /// binding names this contour's own manifest digest and authority, so the
+    /// fence validates against the manifest it commits.
+    #[must_use]
+    pub fn committed_terminal(&self, manifest: &CandidateManifest) -> Value {
+        let authority = Self::test_authority(
+            &self.installation_key,
+            manifest.generation.as_str(),
+            manifest.runtime_launch.authority_generation,
+        );
+        let manifest_digest = sha256_hex(
+            &serde_json::to_vec(manifest)
+                .unwrap_or_else(|error| panic!("digest import-ready manifest: {error}")),
+        );
+        let fence = ActivationCommitFence {
+            generation: manifest.generation.clone(),
+            config_digest: manifest.config_digest.clone(),
+            materialized_config_digest: manifest.config_digest.clone(),
+            phase_b_live_binding: Some(PhaseBLiveBinding {
+                manifest_digest: handle(manifest_digest),
+                authority_descriptor_digest: handle(Self::digest(31)),
+                // NOTE: `digest(32)` is all zeros — the reserved legacy-zero
+                // Phase-B marker — so the live store-bootstrap readback uses
+                // a non-zero digest.
+                store_bootstrap_descriptor_digest: handle(Self::digest(47)),
+                config_file_digest: manifest.config_digest.clone(),
+                eliotd_descriptor_digest: handle(Self::digest(33)),
+                semantic_config_hash: handle(Self::digest(34)),
+                host_epoch_lineage: handle(format!("lineage-{}", &self.installation_key[..16])),
+                host_epoch_sequence: 1,
+                host_process_nonce_digest: handle(Self::digest(35)),
+                receipt_digest: handle(Self::digest(36)),
+                effect_id: handle("phase-b-effect-955"),
+                credential_receipt_digest: handle(Self::digest(37)),
+                request_digest: handle(Self::digest(38)),
+                host_owner_epoch: handle("host-owner-955-import"),
+                host_process_identity: handle(Self::digest(39)),
+                public_receipt_digest: handle(Self::digest(40)),
+                provisioned_supervision_authority: authority,
+                agent_bridge: None,
+                user_broker: None,
+            }),
+            authority_generation: manifest.runtime_launch.authority_generation,
+            authority_state_fence: StateFence::new(
+                EpochId::new(
+                    EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .unwrap_or_else(|error| panic!("canonical fixture lineage: {error}")),
+                    std::num::NonZeroU64::new(1)
+                        .unwrap_or_else(|| panic!("non-zero fixture sequence")),
+                )
+                .unwrap_or_else(|error| panic!("valid fixture epoch: {error}")),
+                manifest.runtime_launch.authority_generation,
+            ),
+            active_kernel_record_checksum: handle(Self::digest(41)),
+            probe_request_digest: handle(Self::digest(42)),
+            ready_receipt_digest: handle(Self::digest(43)),
+            store_proof_fence: handle("store-proof-955-import"),
+            candidate_binding_digest: handle(Self::digest(44)),
+            store_requirement_digest: handle(Self::digest(45)),
+            readiness_sequence: 1,
+            readiness_journal_checksum: handle(Self::digest(46)),
+        };
+        let fence_value = serde_json::to_value(&fence)
+            .unwrap_or_else(|error| panic!("serialize committed fence: {error}"));
+        json!({
+            "transaction_id": format!("transaction:{}", manifest.generation.as_str()),
+            "plan_digest": Self::digest(manifest.runtime_launch.authority_generation.value()),
+            "generation": manifest.generation,
+            "disposition": "COMMITTED",
+            "commit_fence": fence_value,
+            "abort_receipt": Value::Null,
+        })
+    }
+
+    /// Returns the source-side projection: the import-ready generation active
+    /// with both installer approvals (the Watchdog approval names the running
+    /// test binary, like the manifest does) plus the committed terminal the
+    /// live admission reads durable authority from.
+    #[must_use]
+    pub fn import_ready_projection(&self) -> Value {
+        let manifest = self.manifest_import_ready();
+        let terminal = self.committed_terminal(&manifest);
+        Self::registry_with_terminal(
+            vec![Self::generation(&manifest, true, false)],
+            vec![
+                self.service_approval(&manifest, true),
+                self.service_approval(&manifest, false),
+            ],
+            Some("generation-7"),
+            None,
+            Some(terminal),
+        )
+    }
+
+    /// Returns the destination-side projection: the destination manifest
+    /// active with both installer approvals over its own artifact copies.
+    /// No authority and no terminal: a new isolated installation has neither.
+    #[must_use]
+    pub fn destination_projection(&self) -> Value {
+        let manifest = self.manifest_destination();
+        Self::registry_with_terminal(
+            vec![Self::generation(&manifest, true, false)],
+            vec![
+                self.service_approval(&manifest, true),
+                self.service_approval(&manifest, false),
+            ],
+            Some("generation-7"),
+            None,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "owned JSON vectors keep each projection independent in the fixture"
+    )]
+    fn registry_with_terminal(
+        generations: Vec<Value>,
+        service_registration_approvals: Vec<Value>,
+        active_generation: Option<&str>,
+        pending_activation: Option<Value>,
+        terminal_activation: Option<Value>,
+    ) -> Value {
+        let mut value = Self::registry(
+            generations,
+            service_registration_approvals,
+            active_generation,
+            pending_activation,
+        );
+        value["last_terminal_activation"] = terminal_activation.unwrap_or(Value::Null);
+        value
     }
 }
 

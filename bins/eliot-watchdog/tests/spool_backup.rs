@@ -838,10 +838,11 @@ fn exact_import_replay_versus_changed_input_conflict() {
 #[test]
 fn lost_import_response_reconciles_without_duplicate_append() {
     // Owner-issued evidence throughout: the believed digest is the content
-    // digest of a fence the owner-bound port just captured. (The port's own
-    // import entry needs an installer-admitted destination; see T17. The
-    // ledger-plus-reconcile round exercised here is the exact lost-response
-    // core the owner runs inside the admitted destination's spool.)
+    // digest of a fence the owner-bound port just captured. The ledger-plus-
+    // reconcile round exercised here is the exact lost-response core the
+    // owner runs inside the admitted destination's spool; the production-path
+    // drive through the admitted destination lives in
+    // `import_positive_tests::owner_port_import_replay_reconciles_without_duplicate_append`.
     let (sensor, dir, fence, _) = capture_mixed_owner("t13", 0x955D);
     let mut ledger = SpoolImportReplayLedger::new();
     let operation = "op-955-t13-lost";
@@ -1029,18 +1030,16 @@ fn temp_redb_capture_reopen_import_round_trip_with_noninterference() {
     // feeds the exact restore-chain, replay-ledger, and reconcile primitives
     // the owner runs inside the admitted destination's spool.
     //
-    // The remaining substitution — `WatchdogBackupPort::import_isolated` in
-    // place of the primitive round below — is blocked on installer-admitted
-    // destination material: the import takes an `AdmittedIsolatedDestination`
-    // (minted only by `admit_isolated_destination`, whose registry seal
-    // `with_computed_digest` rejects every SystemService descriptor on this
-    // machine) and an owner-issued `WatchdogRuntimeBinding` active side (minted
-    // only by live admission, which additionally requires running-image
-    // equality). No installer-approved installation exists on this machine, so
-    // the positive owner import is unprovable here; it is reported as the
-    // single remaining gap. The `None`-destination refusal (`InvalidLease`,
-    // never a substitution of the active spool) holds by owner-signature
-    // construction and is not asserted here for the same reason.
+    // The production-path substitution — `WatchdogBackupPort::import_isolated`
+    // in place of the primitive round below — lives in
+    // `import_positive_tests::owner_port_imports_captured_fence_into_admitted_destination`:
+    // a real installer-admitted destination plus an owner-issued active
+    // binding minted through the full admission chain (minus only the
+    // process-coupled running-image gate, which no test process can satisfy —
+    // see `test_binding_from_registry`). The `None`-destination refusal
+    // (`InvalidLease`, never a substitution of the active spool) holds by
+    // owner-signature construction and is not asserted here for the same
+    // reason.
     let (sensor, dir, fence, _) = capture_mixed_owner("t17-source", 0x9560);
     let source_installation = fence.source_installation.clone();
     let content_digest = fence.content_digest.clone();
