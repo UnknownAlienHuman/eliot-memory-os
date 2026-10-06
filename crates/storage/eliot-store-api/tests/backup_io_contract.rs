@@ -239,6 +239,9 @@ fn page_for(begin: &SnapshotBeginRequest) -> SnapshotPage {
 }
 
 fn continuation_page_for(begin: &SnapshotBeginRequest, previous: &SnapshotPage) -> SnapshotPage {
+    let predecessor_digest = previous
+        .compute_digest()
+        .expect("the previous page has a canonical digest");
     let frontier = previous
         .next_cursor
         .clone()
@@ -254,7 +257,7 @@ fn continuation_page_for(begin: &SnapshotBeginRequest, previous: &SnapshotPage) 
         cumulative_bytes: frontier.cumulative_bytes + last.residency.byte_count,
         cumulative_work: 60,
         is_last: true,
-        predecessor_digest: hex('5'),
+        predecessor_digest,
         next_cursor: None,
         cursor: frontier,
         handle: handle_for(begin),
@@ -267,9 +270,10 @@ fn continuation_page_for(begin: &SnapshotBeginRequest, previous: &SnapshotPage) 
 /// across repeated computation and changes when any single field of the
 /// predecessor changes. A continuation that commits to its real predecessor's
 /// digest and one that commits to a foreign digest are both structurally
-/// accepted, because `validate_continuation` does not compare the field yet;
-/// both cases are pinned here so the comparison its owner still owes has a
-/// proven positive and a proven negative to apply to.
+/// accepted. `validate_continuation` compares exactly this field against the
+/// previous page digest, so both the bound positive and the foreign negative
+/// below are proved against the real check, not against structural validation
+/// alone.
 fn assert_predecessor_commitment_is_the_canonical_digest(
     previous: &SnapshotPage,
     continuation: &SnapshotPage,
@@ -293,6 +297,13 @@ fn assert_predecessor_commitment_is_the_canonical_digest(
     foreign.predecessor_digest = hex('5');
     assert!(foreign.validate().is_ok());
     assert_ne!(foreign.predecessor_digest, page_digest);
+    assert_eq!(
+        foreign.validate_continuation(previous),
+        Err(StoreError::InvalidField {
+            field: "snapshot.predecessor_digest",
+            reason: "continuation does not commit to the previous page digest",
+        })
+    );
     // The commitment is not self-referential: a page cannot name its own
     // digest as its predecessor.
     assert_ne!(previous.predecessor_digest, page_digest);
