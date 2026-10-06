@@ -75,6 +75,11 @@ fn main() {
 ///   typed denial: the envelope proves the claim but funds no permit;
 /// - stale or foreign grant, failed intent derivation, or failed issuance →
 ///   78 typed denial (the refused-grant family);
+/// - admitted without the owner-issued process-launch capacity section, or
+///   with a section that fails presentation (issue #1701, R2-owners/W5) →
+///   78 typed denial: the claimed start/recovery gates refuse with zero
+///   P-03 start effects (missing, foreign, stale, expired, wrong-dimension,
+///   or generation-moved evidence);
 /// - driven: `Ready` plus served frames → 0; a Kernel/owner admission refusal
 ///   at submit or in the claim join → 78; any other drive/serve failure → 1.
 ///   The admitted arm never emits `PROVIDER_RUNTIME_DEFERRED`.
@@ -200,6 +205,18 @@ fn run() -> i32 {
         Some(checkpoint),
         Some(Arc::new(BoundedEvidenceSink::new())),
     ));
+    // Issue #1701 (R2-owners/W5): the production launch composition presents
+    // the file-carried owner-issued process-launch capacity pair before the
+    // drive, under the same admission/attempt/operation identity the claimed
+    // gates re-check at every start and recovery. The pair was validated
+    // against the admitted claim at file read; a presentation failure denies
+    // fail-closed, and an absent section keeps the gates' missing-permit
+    // refusal — no permit is ever minted or caller-shaped here.
+    if let Some(carried) = material.capacity_permit.as_ref()
+        && let Err(error) = worker.admit_capacity_permit(&carried.binding, &carried.request, now)
+    {
+        return deny_invalid_material(&error.to_string());
+    }
     drive_admitted_material(&mut lifecycle, &mut worker, &material, process, &admission)
 }
 
@@ -1894,7 +1911,10 @@ mod tests {
             profile_id: request.profile_id.clone(),
             profile_revision: request.profile_revision.clone(),
             issued_at_ms: 1_000,
-            expires_at_ms: 4_000_000_000_000,
+            // The permit window must strictly cover the claim deadline
+            // (4_000_000_000_000), mirroring the executable-binding
+            // deadline-before-expiry rule.
+            expires_at_ms: 4_000_000_001_000,
             owner_evidence_refs: vec!["test-evidence-1".to_owned()],
         };
         worker
@@ -1920,6 +1940,7 @@ mod tests {
     fn governed_drive_parts(
         tag: &str,
         carriers: Vec<ActionEnvelopeCarrier>,
+        present_capacity: bool,
     ) -> (
         SliceDWorker,
         FakeLifecycle,
@@ -1978,7 +1999,9 @@ mod tests {
             Some(sink),
         );
         let mut worker: SliceDWorker = NativeWorker::new(core);
-        admit_drive_capacity(&mut worker, &capacity_operation, &capacity_epoch);
+        if present_capacity {
+            admit_drive_capacity(&mut worker, &capacity_operation, &capacity_epoch);
+        }
         (worker, FakeLifecycle::new(), material, process, bat, staged)
     }
 
@@ -2029,8 +2052,11 @@ mod tests {
     #[cfg(windows)]
     fn governed_drive_admits_enveloped_material_to_ready_with_provenance() {
         let (fence_json, epoch_json) = action_currency();
-        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-drive", drive_carriers(&fence_json, &epoch_json));
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-drive",
+            drive_carriers(&fence_json, &epoch_json),
+            true,
+        );
         let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
@@ -2056,6 +2082,46 @@ mod tests {
         assert!(lifecycle.registration.is_some());
         assert!(lifecycle.claim.is_some());
         remove_bat("governed-drive");
+    }
+
+    /// The production drive composition reaches the owner-capacity boundary:
+    /// with no presented permit the claimed start refuses (issue #1701,
+    /// R2-owners/W5) after the transport submits but before P-03 starts
+    /// anything — the worker never becomes `Ready` and no process effect
+    /// runs. This is the `run()` posture while the dispatch contour carries
+    /// no capacity section: fail-closed, zero starts.
+    #[test]
+    #[cfg(windows)]
+    fn governed_drive_without_capacity_presentation_refuses_before_start() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-no-capacity",
+            drive_carriers(&fence_json, &epoch_json),
+            false,
+        );
+        let failure = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ));
+        let (actions, error) = match failure {
+            Ok(_) => panic!("a drive with no capacity permit must refuse"),
+            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
+                (actions, error)
+            }
+            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
+                panic!("the capacity gate runs inside the drive, got {error:?}")
+            }
+        };
+        assert_eq!(actions.len(), 4);
+        let detail = error.to_string();
+        assert!(
+            detail.contains("capacity_permit_missing"),
+            "missing permit must be named, got {detail}"
+        );
+        assert_ne!(worker.lifecycle(), WorkerLifecycle::Ready);
+        remove_bat("governed-no-capacity");
     }
 
     /// A lifecycle that fails the readiness submit after the three submits
@@ -2108,8 +2174,11 @@ mod tests {
     #[cfg(windows)]
     fn partial_governed_drive_reports_completed_operations_and_finishes_honestly() {
         let (fence_json, epoch_json) = action_currency();
-        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-partial", drive_carriers(&fence_json, &epoch_json));
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-partial",
+            drive_carriers(&fence_json, &epoch_json),
+            true,
+        );
         let mut recorder = RecordedLifecycle {
             inner: &mut lifecycle,
             receipts: Vec::new(),
@@ -2218,7 +2287,7 @@ mod tests {
     #[cfg(windows)]
     fn a_pre_admission_refusal_retains_no_action_and_invents_no_finish() {
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-prerefuse", Vec::new());
+            governed_drive_parts("governed-prerefuse", Vec::new(), true);
         let failure = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
@@ -2252,7 +2321,7 @@ mod tests {
         let (fence_json, epoch_json) = action_currency();
         // Missing: legacy bytes carry no carriers; nothing is submitted.
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-missing", Vec::new());
+            governed_drive_parts("governed-missing", Vec::new(), true);
         let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
@@ -2277,6 +2346,7 @@ mod tests {
                 &fence_json,
                 &epoch_json,
             )],
+            true,
         );
         let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
@@ -2306,6 +2376,7 @@ mod tests {
                 &stale_fence,
                 &epoch_json,
             )],
+            true,
         );
         let detail = drive_refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
@@ -2328,8 +2399,11 @@ mod tests {
     #[cfg(windows)]
     fn governed_stdio_serves_only_with_valid_envelope() {
         let (fence_json, epoch_json) = action_currency();
-        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-stdio", drive_carriers(&fence_json, &epoch_json));
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-stdio",
+            drive_carriers(&fence_json, &epoch_json),
+            true,
+        );
         // Refusal leaves the writer empty and the reader unconsumed: no
         // frame is read and no response is written without an envelope.
         let frame_bytes = encode_frame(&health_frame());
@@ -2506,6 +2580,14 @@ mod tests {
             "config_digest": "c".repeat(64),
             "facet_manifest_ref": "facet-manifest-kernel-drive-1",
             "capability_cell": "cell-test-1",
+            "capability_cell_registry_digest": "1".repeat(64),
+            "kernel_execution_manifest_digest": "2".repeat(64),
+            "job_object_lineage_ref": "job-lineage-kernel-drive-1",
+            "resource_limits_digest": "3".repeat(64),
+            "cancellation_policy_ref": "cancel-policy-kernel-drive-1",
+            "checkpoint_policy_digest": "4".repeat(64),
+            "drain_policy_ref": "drain-policy-kernel-drive-1",
+            "restart_policy_digest": "5".repeat(64),
             "grant_graph_revision": 5,
             "module_catalog_revision": 7,
             "replay_stream_id": "claim-kernel-drive-1/gen-1",

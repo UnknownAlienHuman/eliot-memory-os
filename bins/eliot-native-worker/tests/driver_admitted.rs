@@ -689,7 +689,7 @@ fn hello() -> WorkerHello {
         request_id: load(RequestId::new("start-claim-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
-        artifact_manifest_digest: "facet-manifest-7".to_owned(),
+        artifact_manifest_digest: load(eliot_contracts::native_worker_resource_facet_ref_v1()),
         launch_nonce: "launch-nonce-claim-1".to_owned(),
         worker_generation: 1,
         authority_epoch: epoch(),
@@ -890,6 +890,67 @@ type DriverWorker = NativeWorker<
     TestCheckpoint,
 >;
 
+/// Presents the owner-capacity evidence the claimed gates require (issue
+/// #1701, R2-owners/W5): a self-consistent process-launch pair bound to the
+/// fixture claim's operation identity, authority epoch, and worker
+/// generation. Test-only presentation — the production dispatch contour
+/// carries the owner-issued pair — so the driver proofs exercise the
+/// enforced gate instead of its absence.
+fn present_test_capacity(core: &mut DriverWorkerCore, claim: &NativeWorkerClaim) {
+    use eliot_runtime_contracts::{
+        CapacityBottleneck, CapacityLimit, CapacityPermitBinding, CapacityRequest, NormalWorkClass,
+        RequestedOperationClass,
+    };
+    let operation = RequestedOperationClass::Normal(NormalWorkClass::Swarm);
+    let limit = CapacityLimit {
+        unit: CapacityBottleneck::ProcessLaunchSlots.unit(),
+        quantity: load(std::num::NonZeroU64::new(1).ok_or("nonzero test capacity")),
+    };
+    let request = CapacityRequest {
+        operation,
+        operation_id: claim.operation_id.as_str().to_owned(),
+        requested_bottleneck: CapacityBottleneck::ProcessLaunchSlots,
+        requested_limit: limit,
+        requesting_owner_ref: "test-worker-owner".to_owned(),
+        requesting_generation_ref: load(ResourceGeneration::new(claim.worker_generation)),
+        authority_epoch_ref: claim.authority_epoch.clone(),
+        profile_id: "profile-test-1".to_owned(),
+        profile_revision: "rev-7".to_owned(),
+        deadline_ms: 9_000,
+    };
+    let permit = CapacityPermitBinding {
+        permit_id: format!(
+            "TEST-{}-{}",
+            request.operation.as_contract_str(),
+            request.operation_id
+        ),
+        operation_id: request.operation_id.clone(),
+        capacity_class: operation.capacity_class(),
+        operation,
+        bottleneck: request.requested_bottleneck,
+        granted_limit: limit,
+        capacity_owner_ref: "test-capacity-owner".to_owned(),
+        capacity_owner_generation_ref: load(ResourceGeneration::new(9)),
+        requesting_owner_ref: request.requesting_owner_ref.clone(),
+        requesting_generation_ref: request.requesting_generation_ref,
+        authority_epoch_ref: request.authority_epoch_ref.clone(),
+        profile_id: request.profile_id.clone(),
+        profile_revision: request.profile_revision.clone(),
+        issued_at_ms: 1_000,
+        expires_at_ms: 4_000_000_001_000,
+        owner_evidence_refs: vec!["test-evidence-1".to_owned()],
+    };
+    core.admit_capacity_permit(&permit, &request, 5_000)
+        .unwrap_or_else(|error| panic!("driver capacity admits: {error:?}"));
+}
+
+type DriverWorkerCore = WorkerCore<
+    WindowsProcessExecutor,
+    TestAdmission,
+    KernelReplayPort<FakeTransport>,
+    TestCheckpoint,
+>;
+
 fn build_driver(
     tag: &str,
     operation: &str,
@@ -932,13 +993,14 @@ fn build_driver(
     });
     // Note: FakeTransport is moved into the port; direct transport-op counts
     // are asserted through a separate port instance in the replay test.
-    let core = WorkerCore::new(
+    let mut core = WorkerCore::new(
         Some(executor),
         Some(admission),
         Some(replay),
         Some(TestCheckpoint),
         Some(sink),
     );
+    present_test_capacity(&mut core, &claim_value);
     (
         NativeWorker::new(core),
         FakeTransport::new(&claim_value),

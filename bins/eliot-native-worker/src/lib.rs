@@ -1579,6 +1579,7 @@ pub mod admitted_material {
         ActionEnvelopeCarrier, ClaimAdmissionRequest, NativeWorkerClaim, ReadinessSubmission,
         WorkerHello,
     };
+    use eliot_runtime_contracts::{CapacityBottleneck, CapacityPermitBinding, CapacityRequest};
     use serde::{Deserialize, Serialize};
 
     use crate::ReconcileSubmission;
@@ -1637,6 +1638,26 @@ pub mod admitted_material {
         pub action_envelopes: Vec<ActionEnvelopeCarrier>,
     }
 
+    /// Owner-issued process-launch capacity evidence carried by the Kernel
+    /// dispatch file (issue #1701, R2-owners/W5).
+    ///
+    /// The request plus the binding the capacity owner issued for it, bound
+    /// to the same admitted claim the drive binds (same operation identity,
+    /// authority epoch, requester generation, and profile revision). The
+    /// dispatch contour populates this section when the process-capacity
+    /// owner (frozen owner map: the Host/Kernel process-tree owner) issues
+    /// the permit; until then the section is absent and the claimed
+    /// start/recovery gates refuse fail-closed. This side never mints a
+    /// permit: it only parses, validates, and presents the carried pair.
+    #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct AdmittedCapacityPermit {
+        /// Capacity request the owner issued the binding for.
+        pub request: CapacityRequest,
+        /// Owner-issued binding matching the request.
+        pub binding: CapacityPermitBinding,
+    }
+
     /// Session-bound claim material validated against itself.
     ///
     /// Carries exactly the presentations the admitted driver binds, plus —
@@ -1676,6 +1697,12 @@ pub mod admitted_material {
         /// (shape only). The governed drive decodes and enforces them
         /// before any lifecycle submit or process start.
         pub action_envelopes: Vec<ActionEnvelopeCarrier>,
+        /// Validated owner-issued process-launch capacity evidence. `Some`
+        /// when the dispatch file carries the section and it validates
+        /// against the admitted claim (issue #1701, R2-owners/W5); `None`
+        /// otherwise — the claimed start/recovery gates then refuse
+        /// fail-closed (`capacity_permit_missing`).
+        pub capacity_permit: Option<AdmittedCapacityPermit>,
     }
 
     /// Typed failure for the dispatch-file read. Every variant is fail-closed:
@@ -1888,6 +1915,9 @@ pub mod admitted_material {
             kernel_nonce: None,
             worker_artifact_digest,
             action_envelopes: envelope.action_envelopes,
+            // The legacy envelope path carries no owner capacity evidence
+            // (like its missing grant): it validates but cannot drive.
+            capacity_permit: None,
         })
     }
 
@@ -1928,8 +1958,76 @@ pub mod admitted_material {
     /// driver binds. Every check is fail-closed; the order is cheapest-first
     /// and performs no transport, no execution, and no authority minting.
     ///
+    /// Validates the optional owner-issued process-launch capacity section
+    /// against the admitted claim (issue #1701, R2-owners/W5).
+    ///
+    /// `None` stays `None`: the dispatch contour has not populated the
+    /// section yet, and the claimed start/recovery gates refuse fail-closed.
+    /// A carried section must be internally valid (request, binding, and
+    /// their match), name exactly the process-launch bottleneck, bind the
+    /// claim's operation identity, authority epoch, and worker generation,
+    /// and stay live at read time. Anything else refuses before anything
+    /// issues, drives, or starts. The binding's profile revision is
+    /// recorded but has no claim-bound counterpart to check against here;
+    /// the dispatch contour must bind the current profile revision into the
+    /// admitted material (owner contract, issue #1679).
+    pub(crate) fn validate_capacity_permit_section(
+        section: Option<AdmittedCapacityPermit>,
+        claim: &NativeWorkerClaim,
+        now_ms: u64,
+    ) -> Result<Option<AdmittedCapacityPermit>, AdmittedMaterialError> {
+        let Some(packet) = section else {
+            return Ok(None);
+        };
+        packet.request.validate().map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        packet.binding.validate().map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        if !packet.binding.matches_request(&packet.request) {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file capacity binding does not match its request".to_owned(),
+            ));
+        }
+        if packet.binding.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file capacity section names a dimension other than the process-launch path"
+                    .to_owned(),
+            ));
+        }
+        if packet.binding.operation_id != claim.operation_id.as_str() {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file capacity section does not bind the presented claim operation"
+                    .to_owned(),
+            ));
+        }
+        if !packet
+            .binding
+            .authority_epoch_ref
+            .is_same_authority(&claim.authority_epoch)
+        {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file capacity section epoch does not bind the presented claim".to_owned(),
+            ));
+        }
+        if packet.binding.requesting_generation_ref.value() != claim.worker_generation {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file capacity section generation does not bind the presented claim generation"
+                    .to_owned(),
+            ));
+        }
+        if packet.binding.expires_at_ms == 0 || packet.binding.expires_at_ms <= now_ms {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file capacity section window is stale or expired".to_owned(),
+            ));
+        }
+        Ok(Some(packet))
+    }
+
     /// The file shape is `{request, receipt, epoch, generation, nonce,
-    /// grant}` (see the module documentation). The `request` converts into
+    /// grant}` plus the optional `capacity_permit` section (see the module
+    /// documentation). The `request` converts into
     /// the worker-side claim whose production `validate` recomputes the
     /// canonical binding digest — the strongest local anchor: a tampered or
     /// foreign claim is refused even when every other field is well-formed.
@@ -1985,6 +2083,12 @@ pub mod admitted_material {
         /// governed drive then refuses with the missing-envelope negative.
         #[serde(default)]
         action_envelopes: Vec<ActionEnvelopeCarrier>,
+        /// Owner-issued process-launch capacity evidence (issue #1701,
+        /// R2-owners/W5). Absent until the dispatch contour populates it —
+        /// an `Option` stays readable on files the current Kernel writer
+        /// produces, and absence keeps the `capacity_permit_missing`
+        /// refusal at the claimed gates.
+        capacity_permit: Option<AdmittedCapacityPermit>,
     }
 
     /// Closed mirror of the shared `DispatchGrant`.
@@ -2263,6 +2367,13 @@ pub mod admitted_material {
         )
         .map_err(|error| AdmittedMaterialError::Contract(truncate_detail(&error.to_string())))?;
 
+        // Owner-issued process-launch capacity evidence (issue #1701,
+        // R2-owners/W5): validated against the admitted claim here, so the
+        // production drive presents exactly this pair — never a minted or
+        // caller-shaped one — and absence keeps the fail-closed refusal.
+        let capacity_permit =
+            validate_capacity_permit_section(file.capacity_permit, &claim, now_ms)?;
+
         // Registration derived from admitted material plus live process
         // observables. Every identity-carrying field comes from the admitted
         // request; the lease ends with the Kernel-issued grant, never with a
@@ -2439,6 +2550,7 @@ pub mod admitted_material {
             // population (see the 2251 kernel handoff); absent files keep
             // the missing-envelope refusal at the governed drive.
             action_envelopes: file.action_envelopes,
+            capacity_permit,
         })
     }
 
@@ -2997,6 +3109,255 @@ mod tests {
         assert!(
             detail.contains("not a closed envelope"),
             "undecodable bytes are named, got {detail}"
+        );
+    }
+
+    use crate::admitted_material::{
+        AdmittedCapacityPermit, AdmittedMaterialError, validate_capacity_permit_section,
+    };
+    use eliot_runtime_contracts::{
+        CapacityBottleneck, CapacityLimit, CapacityPermitBinding, CapacityRequest,
+        RequestedOperationClass,
+    };
+
+    const SECTION_NOW_MS: u64 = 5_000;
+
+    fn section_request(
+        operation: &str,
+        epoch_value: EpochId,
+        generation: u64,
+        bottleneck: CapacityBottleneck,
+    ) -> CapacityRequest {
+        CapacityRequest {
+            operation: RequestedOperationClass::Normal(
+                eliot_runtime_contracts::NormalWorkClass::Swarm,
+            ),
+            operation_id: operation.to_owned(),
+            requested_bottleneck: bottleneck,
+            requested_limit: CapacityLimit {
+                unit: bottleneck.unit(),
+                quantity: load(std::num::NonZeroU64::new(1).ok_or("nonzero capacity")),
+            },
+            requesting_owner_ref: "test-worker-owner".to_owned(),
+            requesting_generation_ref: load(ResourceGeneration::new(generation)),
+            authority_epoch_ref: epoch_value,
+            profile_id: "profile-test-1".to_owned(),
+            profile_revision: "rev-7".to_owned(),
+            deadline_ms: 9_000,
+        }
+    }
+
+    fn section_for(
+        request: &CapacityRequest,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> AdmittedCapacityPermit {
+        AdmittedCapacityPermit {
+            request: request.clone(),
+            binding: CapacityPermitBinding {
+                permit_id: format!(
+                    "TEST-{}-{}",
+                    request.operation.as_contract_str(),
+                    request.operation_id
+                ),
+                operation_id: request.operation_id.clone(),
+                capacity_class: request.operation.capacity_class(),
+                operation: request.operation,
+                bottleneck: request.requested_bottleneck,
+                granted_limit: request.requested_limit,
+                capacity_owner_ref: "test-capacity-owner".to_owned(),
+                capacity_owner_generation_ref: load(ResourceGeneration::new(9)),
+                requesting_owner_ref: request.requesting_owner_ref.clone(),
+                requesting_generation_ref: request.requesting_generation_ref,
+                authority_epoch_ref: request.authority_epoch_ref.clone(),
+                profile_id: request.profile_id.clone(),
+                profile_revision: request.profile_revision.clone(),
+                issued_at_ms,
+                expires_at_ms,
+                owner_evidence_refs: vec!["test-evidence-1".to_owned()],
+            },
+        }
+    }
+
+    fn section_claim() -> NativeWorkerClaim {
+        claim_with("route-1", "adapter-test", "launch-nonce-section-0001", true)
+    }
+
+    fn expect_section_read(
+        result: Result<Option<AdmittedCapacityPermit>, AdmittedMaterialError>,
+        what: &str,
+    ) -> Option<AdmittedCapacityPermit> {
+        match result {
+            Ok(validated) => validated,
+            Err(error) => panic!("{what} must read: {error:?}"),
+        }
+    }
+
+    fn expect_section_denial(
+        result: Result<Option<AdmittedCapacityPermit>, AdmittedMaterialError>,
+        what: &str,
+    ) -> AdmittedMaterialError {
+        match result {
+            Ok(_) => panic!("{what} must refuse"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn capacity_section_absent_stays_absent() {
+        let claim = section_claim();
+        let validated = expect_section_read(
+            validate_capacity_permit_section(None, &claim, SECTION_NOW_MS),
+            "absent section",
+        );
+        assert!(validated.is_none());
+    }
+
+    #[test]
+    fn capacity_section_matching_claim_validates() {
+        let claim = section_claim();
+        let request = section_request(
+            "operation-1",
+            epoch(),
+            1,
+            CapacityBottleneck::ProcessLaunchSlots,
+        );
+        let packet = section_for(&request, 1_000, 10_000);
+        let Some(validated) = expect_section_read(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "matching section",
+        ) else {
+            panic!("matching section must be present");
+        };
+        assert_eq!(validated.binding.operation_id, "operation-1");
+        assert_eq!(
+            validated.binding.bottleneck,
+            CapacityBottleneck::ProcessLaunchSlots
+        );
+    }
+
+    #[test]
+    fn capacity_section_foreign_operation_refuses() {
+        let claim = section_claim();
+        let request = section_request(
+            "operation-9",
+            epoch(),
+            1,
+            CapacityBottleneck::ProcessLaunchSlots,
+        );
+        let packet = section_for(&request, 1_000, 10_000);
+        let error = expect_section_denial(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "foreign section",
+        );
+        assert!(
+            matches!(error, AdmittedMaterialError::Binding(_)),
+            "unexpected refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_section_stale_epoch_refuses() {
+        let claim = section_claim();
+        let stale = load(EpochId::new(
+            load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+            load(std::num::NonZeroU64::new(2).ok_or("non-zero")),
+        ));
+        let request = section_request(
+            "operation-1",
+            stale,
+            1,
+            CapacityBottleneck::ProcessLaunchSlots,
+        );
+        let packet = section_for(&request, 1_000, 10_000);
+        let error = expect_section_denial(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "stale section",
+        );
+        assert!(
+            matches!(error, AdmittedMaterialError::Binding(_)),
+            "unexpected refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_section_generation_move_refuses() {
+        let claim = section_claim();
+        let request = section_request(
+            "operation-1",
+            epoch(),
+            2,
+            CapacityBottleneck::ProcessLaunchSlots,
+        );
+        let packet = section_for(&request, 1_000, 10_000);
+        let error = expect_section_denial(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "moved generation",
+        );
+        assert!(
+            matches!(error, AdmittedMaterialError::Binding(_)),
+            "unexpected refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_section_expired_window_refuses() {
+        let claim = section_claim();
+        let request = section_request(
+            "operation-1",
+            epoch(),
+            1,
+            CapacityBottleneck::ProcessLaunchSlots,
+        );
+        let packet = section_for(&request, 1_000, SECTION_NOW_MS);
+        let error = expect_section_denial(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "expired section",
+        );
+        assert!(
+            matches!(error, AdmittedMaterialError::Contract(_)),
+            "unexpected refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_section_wrong_dimension_refuses() {
+        let claim = section_claim();
+        let request = section_request(
+            "operation-1",
+            epoch(),
+            1,
+            CapacityBottleneck::KernelControlChannel,
+        );
+        let packet = section_for(&request, 1_000, 10_000);
+        let error = expect_section_denial(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "control-channel section",
+        );
+        assert!(
+            matches!(error, AdmittedMaterialError::Contract(_)),
+            "unexpected refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_section_mismatched_binding_refuses() {
+        let claim = section_claim();
+        let request = section_request(
+            "operation-1",
+            epoch(),
+            1,
+            CapacityBottleneck::ProcessLaunchSlots,
+        );
+        let mut packet = section_for(&request, 1_000, 10_000);
+        packet.binding.profile_revision = "rev-tampered".to_owned();
+        let error = expect_section_denial(
+            validate_capacity_permit_section(Some(packet), &claim, SECTION_NOW_MS),
+            "mismatched section",
+        );
+        assert!(
+            matches!(error, AdmittedMaterialError::Binding(_)),
+            "unexpected refusal: {error:?}"
         );
     }
 }

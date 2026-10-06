@@ -2134,6 +2134,61 @@ fn admit_test_permit(core: &mut TestCore, operation: &str) {
         .expect("capacity permit");
 }
 
+fn capacity_request_with(
+    operation: &str,
+    epoch: EpochId,
+    profile_revision: &str,
+    requesting_generation: u64,
+    bottleneck: CapacityBottleneck,
+) -> CapacityRequest {
+    let limit = CapacityLimit {
+        unit: bottleneck.unit(),
+        quantity: NonZeroU64::new(1).expect("nonzero capacity"),
+    };
+    CapacityRequest {
+        operation: RequestedOperationClass::Normal(NormalWorkClass::Swarm),
+        operation_id: operation.to_owned(),
+        requested_bottleneck: bottleneck,
+        requested_limit: limit,
+        requesting_owner_ref: "test-worker-owner".to_owned(),
+        requesting_generation_ref: ResourceGeneration::new(requesting_generation)
+            .expect("generation"),
+        authority_epoch_ref: epoch,
+        profile_id: TEST_CAPACITY_PROFILE.to_owned(),
+        profile_revision: profile_revision.to_owned(),
+        deadline_ms: 9_000,
+    }
+}
+
+fn capacity_permit_for_request(
+    request: &CapacityRequest,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> CapacityPermitBinding {
+    CapacityPermitBinding {
+        permit_id: format!(
+            "TEST-{}-{}",
+            request.operation.as_contract_str(),
+            request.operation_id
+        ),
+        operation_id: request.operation_id.clone(),
+        capacity_class: request.operation.capacity_class(),
+        operation: request.operation,
+        bottleneck: request.requested_bottleneck,
+        granted_limit: request.requested_limit,
+        capacity_owner_ref: "test-capacity-owner".to_owned(),
+        capacity_owner_generation_ref: ResourceGeneration::new(9).expect("generation"),
+        requesting_owner_ref: request.requesting_owner_ref.clone(),
+        requesting_generation_ref: request.requesting_generation_ref,
+        authority_epoch_ref: request.authority_epoch_ref.clone(),
+        profile_id: request.profile_id.clone(),
+        profile_revision: request.profile_revision.clone(),
+        issued_at_ms,
+        expires_at_ms,
+        owner_evidence_refs: vec!["test-evidence-1".to_owned()],
+    }
+}
+
 fn claimed_frame(connection: &str, request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
     let mut created = frame(request_id, body);
     created.connection_id = connection.to_owned();
@@ -2704,6 +2759,101 @@ fn capacity_permit_recovery_revalidates_epoch_after_restart() {
     .expect_err("stale epoch permit must refuse recovery");
     assert!(
         matches!(error, WorkerError::StaleEpoch),
+        "unexpected refusal: {error:?}"
+    );
+}
+
+#[test]
+fn capacity_permit_wrong_bottleneck_refuses_at_presentation() {
+    let (mut core, _, _, _, _) = fixture();
+    let request = capacity_request_with(
+        "operation-1",
+        test_epoch(1),
+        TEST_CAPACITY_REVISION,
+        1,
+        CapacityBottleneck::KernelControlChannel,
+    );
+    let permit = capacity_permit_for_request(&request, 1_000, 10_000);
+    let error = core
+        .admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect_err("control-channel permit must never authorize a process start");
+    assert!(
+        matches!(
+            error,
+            WorkerError::InvalidRequest("capacity_permit_bottleneck")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+}
+
+#[test]
+fn capacity_permit_generation_change_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_with(
+        "operation-1",
+        test_epoch(1),
+        TEST_CAPACITY_REVISION,
+        2,
+        CapacityBottleneck::ProcessLaunchSlots,
+    );
+    let permit = capacity_permit_for_request(&request, 1_000, 10_000);
+    core.admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect("self-consistent pair admits");
+    let error = drive_claim(&mut core, &claim).expect_err("moved generation must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_generation")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+#[test]
+fn capacity_permit_short_window_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 8_000);
+    core.admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect("live pair admits at presentation");
+    let error = drive_claim(&mut core, &claim)
+        .expect_err("permit expiring before the claim deadline must refuse");
+    assert!(
+        matches!(error, WorkerError::DeadlineExpired),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+#[test]
+fn capacity_permit_generation_change_refuses_recovery_after_restart() {
+    let (mut first, executor, admission, replay, claim, _) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    let moved_request = capacity_request_with(
+        "operation-1",
+        test_epoch(1),
+        TEST_CAPACITY_REVISION,
+        2,
+        CapacityBottleneck::ProcessLaunchSlots,
+    );
+    let moved_permit = capacity_permit_for_request(&moved_request, 1_000, 10_000);
+    restarted
+        .admit_capacity_permit(&moved_permit, &moved_request, TEST_CAPACITY_NOW_MS)
+        .expect("self-consistent moved pair admits");
+    let error = block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect_err("moved generation must refuse recovery");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_generation")
+        ),
         "unexpected refusal: {error:?}"
     );
 }

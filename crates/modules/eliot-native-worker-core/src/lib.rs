@@ -35,7 +35,7 @@ use eliot_process::{
     ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
-use eliot_runtime_contracts::{CapacityPermitBinding, CapacityRequest};
+use eliot_runtime_contracts::{CapacityBottleneck, CapacityPermitBinding, CapacityRequest};
 pub use generated::{
     NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError, compile_native_worker_execute_call_v1,
 };
@@ -311,8 +311,12 @@ where
     /// validates a presented binding against the request it was issued for
     /// and retains the exact bytes. A malformed request or binding, a binding
     /// that does not match its request (foreign operation, owner, epoch, or
-    /// profile revision), or an expired binding is refused here, before any
-    /// effect. Retention is keyed by operation identity: re-presenting the
+    /// profile revision), a binding that names any bottleneck dimension other
+    /// than the process-launch path this core starts through, or an expired
+    /// binding is refused here, before any effect. Only the exact
+    /// `ProcessLaunchSlots` vector is consumable here: any other dimension
+    /// (notably a control-channel permit) authorizes other work, never a
+    /// process start. Retention is keyed by operation identity: re-presenting the
     /// identical binding is idempotent (post-restart evidence replay), while
     /// changed content for the same operation conflicts instead of replaying
     /// unless the lifecycle is quiescent (`Created`, `Stopped`, `Cancelled`,
@@ -327,7 +331,9 @@ where
     /// # Errors
     ///
     /// Returns [`WorkerError::InvalidRequest`] for a malformed request or
-    /// binding, or a binding that does not match its request;
+    /// binding, a binding that does not match its request, or a binding that
+    /// names any bottleneck dimension other than the process-launch path
+    /// (`capacity_permit_bottleneck`);
     /// [`WorkerError::DeadlineExpired`] for an expired binding;
     /// [`WorkerError::IdempotencyConflict`] for changed content while a
     /// possible effect is outstanding; [`WorkerError::InvalidRequest`] with
@@ -346,6 +352,9 @@ where
             .map_err(|_| WorkerError::InvalidRequest("capacity_permit_binding"))?;
         if !permit.matches_request(request) {
             return Err(WorkerError::InvalidRequest("capacity_permit_foreign"));
+        }
+        if permit.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
+            return Err(WorkerError::InvalidRequest("capacity_permit_bottleneck"));
         }
         if permit.expires_at_ms <= now_ms {
             return Err(WorkerError::DeadlineExpired);
@@ -375,18 +384,31 @@ where
 
     /// Requires the retained capacity permit to cover the claimed start.
     ///
-    /// The retained binding must name the claim's exact operation identity
-    /// and agree with the claim's authority epoch; otherwise the start is
-    /// refused before P-03 starts anything. A missing retention refuses as
-    /// an admission prerequisite (fail-closed: no owner-issued process-launch
-    /// evidence, no effect).
+    /// The retained binding must name the claim's exact operation identity,
+    /// agree with the claim's authority epoch, name exactly the
+    /// process-launch bottleneck this core starts through, bind the claim's
+    /// own worker generation, and stay valid through the claim's deadline;
+    /// otherwise the start is refused before P-03 starts anything. A missing
+    /// retention refuses as an admission prerequisite (fail-closed: no
+    /// owner-issued process-launch evidence, no effect). The generation and
+    /// window re-checks run at every use — not only at presentation — so a
+    /// generation move or an expired new-start permit after presentation
+    /// refuses here, and an unknown outcome keeps the actual retained owner
+    /// exclusion (not a copied string) until receipted reconciliation or
+    /// release replaces it. A profile-revision move after presentation is not
+    /// checkable here: the claim carries no profile identity, so the
+    /// dispatch contour must bind the current profile revision into the
+    /// admitted material (owner contract, issue #1679).
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::AdmissionRejected`] when no permit is retained
     /// for the operation, [`WorkerError::AdmissionMismatch`] when the
-    /// retained permit names another operation, or [`WorkerError::StaleEpoch`]
-    /// when the retained permit's epoch disagrees with the claim epoch.
+    /// retained permit names another operation, another bottleneck dimension,
+    /// or another requester generation, [`WorkerError::StaleEpoch`] when the
+    /// retained permit's epoch disagrees with the claim epoch, or
+    /// [`WorkerError::DeadlineExpired`] when the retained permit does not
+    /// cover the claim's deadline.
     fn require_capacity_for_claim(&self, claim: &NativeWorkerClaim) -> Result<(), WorkerError> {
         let retained =
             self.capacity_permit.as_ref().ok_or_else(|| {
@@ -403,6 +425,15 @@ where
             .is_same_authority(&claim.authority_epoch)
         {
             return Err(WorkerError::StaleEpoch);
+        }
+        if retained.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
+            return Err(WorkerError::AdmissionMismatch("capacity_permit_bottleneck"));
+        }
+        if retained.requesting_generation_ref.value() != claim.worker_generation {
+            return Err(WorkerError::AdmissionMismatch("capacity_permit_generation"));
+        }
+        if claim.deadline_unix_ms >= retained.expires_at_ms {
+            return Err(WorkerError::DeadlineExpired);
         }
         Ok(())
     }
@@ -436,8 +467,10 @@ where
     /// `UnsupportedVersion`, `StaleEpoch`, `StaleFence`, or
     /// `DeadlineExpired`), the capacity-permit refusal (`AdmissionRejected`
     /// when no owner-issued process-launch permit is retained,
-    /// `AdmissionMismatch` for another operation, `StaleEpoch` for a moved
-    /// epoch), the downstream admission/start/proof failure, or
+    /// `AdmissionMismatch` for another operation, another bottleneck
+    /// dimension, or another requester generation, `StaleEpoch` for a moved
+    /// epoch, `DeadlineExpired` when the retained permit does not cover the
+    /// claim deadline), the downstream admission/start/proof failure, or
     /// the typed executable-join refusal (`InvalidRequest`, `StaleEpoch`,
     /// `StaleFence`, `DeadlineExpired`, `Revoked`, or `UnsupportedVersion`).
     pub async fn demand_start_claimed(
@@ -763,7 +796,9 @@ where
     ///
     /// Returns the `from_claim` join failure (`InvalidRequest`,
     /// `UnsupportedVersion`, `StaleEpoch`, `StaleFence`, or
-    /// `DeadlineExpired`), the downstream admission/inspect/replay failure, or
+    /// `DeadlineExpired`), the capacity-permit refusal (same family as
+    /// [`WorkerCore::demand_start_claimed`], re-checked before any replay
+    /// effect), the downstream admission/inspect/replay failure, or
     /// the typed executable-join refusal (`InvalidRequest`, `StaleEpoch`,
     /// `StaleFence`, `DeadlineExpired`, `Revoked`, or `UnsupportedVersion`).
     pub async fn recover_after_restart_claimed(
