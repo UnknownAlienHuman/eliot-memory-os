@@ -183,6 +183,15 @@ pub enum PortfolioError {
         /// Failing field path.
         field: &'static str,
     },
+    /// The frozen inquiry's aggregate acquisition-attempt budget is exhausted.
+    ///
+    /// Refused before any mutation, so the retained attempt chain stays intact
+    /// for replay and the run stops with a named frontier instead of a
+    /// silently growing history.
+    BudgetExhausted {
+        /// Failing field path.
+        field: &'static str,
+    },
 }
 
 /// Why one claim-audit job refused its run-bound reference authorization.
@@ -283,6 +292,9 @@ impl std::fmt::Display for PortfolioError {
             }
             Self::InvalidDigest { field } => {
                 write!(f, "{field} does not match its recomputed canonical digest")
+            }
+            Self::BudgetExhausted { field } => {
+                write!(f, "{field} exhausted its frozen attempt budget")
             }
         }
     }
@@ -1697,11 +1709,27 @@ pub struct CoverageAccount {
     exclusions: BTreeMap<String, String>,
     frontier: Option<String>,
     observed: BTreeMap<String, ObservedOutsideScope>,
+    /// Aggregate acquisition-attempt budget bound at construction: at most this
+    /// many attempts may be recorded across all members. The value is the
+    /// frozen inquiry's [`BudgetCaps::attempts`] ("Maximum acquisition
+    /// attempts"); accounts rebuilt from retained material carry no live budget
+    /// and therefore no bound.
+    attempt_limit: u64,
 }
 
 impl CoverageAccount {
     /// Opens accounting over the exact expected denominator members.
     pub fn open(expected: BTreeSet<String>) -> Result<Self, PortfolioError> {
+        Self::open_bounded(expected, u64::MAX)
+    }
+
+    /// Opens accounting with the aggregate attempt budget enforced: recording
+    /// refuses with [`PortfolioError::BudgetExhausted`] once `max_attempts`
+    /// attempts are retained, before any mutation.
+    pub fn open_bounded(
+        expected: BTreeSet<String>,
+        max_attempts: u64,
+    ) -> Result<Self, PortfolioError> {
         if expected.is_empty() {
             return Err(PortfolioError::IncompleteDenominator {
                 field: "coverage.expected",
@@ -1713,7 +1741,70 @@ impl CoverageAccount {
             exclusions: BTreeMap::new(),
             frontier: None,
             observed: BTreeMap::new(),
+            attempt_limit: max_attempts,
         })
+    }
+
+    /// Opens accounting over a verified empty eligible scope: the run
+    /// examined candidates, but the frozen denominator declared none.
+    ///
+    /// Norm `docs/architecture/I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md:32`
+    /// makes `complete_scope` the only absence basis, and the
+    /// `EnumerationState::VerifiedEmpty` vocabulary block in
+    /// `inquiry_governance.rs` (the "What one run actually established"
+    /// doc paragraph) is the vocabulary this constructor answers. An
+    /// enumeration that never ran leaves an absent measurement, never a
+    /// verified-empty scope, so an empty `examined` slice is refused with
+    /// the same [`PortfolioError::IncompleteDenominator`] [`Self::open`]
+    /// uses for its zero-member refusal. Otherwise every examined item is
+    /// fed through [`Self::observe`], so examined bindings get identical
+    /// shape validation plus idempotent-or-conflict semantics — a changed
+    /// binding under a retained handle conflicts instead of overwriting —
+    /// and no placeholder member is inserted: `expected` and `outcomes`
+    /// stay empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::IncompleteDenominator`] when `examined`
+    /// is empty, and [`Self::observe`]'s error for a malformed or
+    /// conflicting examined binding.
+    pub fn open_verified_empty(examined: &[ObservedOutsideScope]) -> Result<Self, PortfolioError> {
+        if examined.is_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "coverage.expected",
+            });
+        }
+        let mut account = Self {
+            expected: BTreeSet::new(),
+            outcomes: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
+            frontier: None,
+            observed: BTreeMap::new(),
+            attempt_limit: u64::MAX,
+        };
+        for item in examined {
+            account.observe(
+                &item.handle,
+                item.disposition,
+                &item.content_digest,
+                &item.operation_id,
+                &item.admitted_manifest_digest,
+            )?;
+        }
+        Ok(account)
+    }
+
+    /// Whether this account is a verified empty scope: an empty expected
+    /// denominator that only [`Self::open_verified_empty`] can produce,
+    /// with a non-empty observed population proving the run examined
+    /// candidates. `open` refuses every empty denominator, so an empty
+    /// `expected` can only come from that constructor, and a non-empty
+    /// `observed` proves the run examined candidates — the predicate
+    /// exactly characterizes that constructor's products with no flag to
+    /// drift.
+    #[must_use]
+    pub fn is_verified_empty(&self) -> bool {
+        self.expected.is_empty() && !self.observed.is_empty()
     }
 
     /// Records one disposition for one expected member, with the acquiring
@@ -1783,6 +1874,16 @@ impl CoverageAccount {
                 field: "coverage.member",
             });
         }
+        // W3 (#1767): the aggregate attempt budget is enforced before any
+        // append. The count is taken up front so the gate below cannot mutate;
+        // an already-recorded binding still replays idempotently through the
+        // first arm, and a refusal leaves the retained chain, frontier and
+        // observations untouched for replay.
+        let recorded_attempts: u64 = self
+            .outcomes
+            .values()
+            .map(|accounting| accounting.attempts.len() as u64)
+            .sum();
         match self.outcomes.get_mut(member) {
             // The identical binding repeating is a repeated receipt delivery:
             // idempotent, and it must not append a phantom attempt.
@@ -1791,6 +1892,11 @@ impl CoverageAccount {
                 field: "coverage.member",
             }),
             Some(current) => {
+                if recorded_attempts >= self.attempt_limit {
+                    return Err(PortfolioError::BudgetExhausted {
+                        field: "coverage.attempts",
+                    });
+                }
                 let recovery = MemberAttempt {
                     links_earlier_attempt: true,
                     ..attempt
@@ -1800,6 +1906,11 @@ impl CoverageAccount {
                 Ok(())
             }
             None => {
+                if recorded_attempts >= self.attempt_limit {
+                    return Err(PortfolioError::BudgetExhausted {
+                        field: "coverage.attempts",
+                    });
+                }
                 let mut accounting = MemberAccounting {
                     handle,
                     attempts: Vec::new(),
@@ -1963,6 +2074,13 @@ impl CoverageAccount {
             .collect()
     }
 
+    /// Declared members carrying a recorded attempt, in canonical member
+    /// order. Every outcome holds a non-empty attempt chain, so membership
+    /// here is exactly "carries a visible disposition" (issue #1767 W2).
+    pub fn observed_members(&self) -> Vec<String> {
+        self.outcomes.keys().cloned().collect()
+    }
+
     /// Whether every accounted member closed intact. Complete accounting with
     /// failures still reports `false` here: accounting completeness and
     /// evidence success stay distinct.
@@ -2079,7 +2197,7 @@ impl CoverageAccount {
     /// prevent.
     ///
     /// Transitively `absence-preconditions/v2` binds this digest through
-    /// `account_digest` and `coverage-receipt/v3` through `account_digest` and
+    /// `account_digest` and `coverage-receipt/v4` through `account_digest` and
     /// `AbsencePreconditions`'s own set, so all three change value for the same
     /// run. Their own field sets and domains are unchanged, and the value
     /// changing in a field a digest already declared is the dependency behaving
@@ -4238,7 +4356,7 @@ fn member_join_reason(
 /// the limitation note on
 /// [`NoMatchEvaluation`] for why no in-crate check can close it. The live
 /// composition owner does re-check the retained record, and it now does so by
-/// name rather than by verdict class alone: `coverage-receipt/v3` binds this
+/// name rather than by verdict class alone: `coverage-receipt/v4` binds this
 /// verdict's class, the reason it carries, the digest of the exact
 /// owner-issued evaluation it was derived from and that record's proof ceiling,
 /// and `InquiryGovernance::validate_integrity` re-checks that receipt digest
@@ -4485,7 +4603,7 @@ fn unclosed_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdi
 /// to reach the *absent-evaluation* arm instead, because it never entered
 /// `incompatible` at all. No test in this crate asserts this string, so treat it
 /// as unblessed by the suite: changing it is a visible change to every receipt
-/// that carries the reason, and it moves `coverage-receipt/v3`.
+/// that carries the reason, and it moves `coverage-receipt/v4`.
 fn incompatible_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
     if preconditions.incompatible.is_empty() {
         return None;
@@ -4605,7 +4723,7 @@ fn unestablished_dimensions(evaluation: &NoMatchEvaluation) -> Option<AbsenceVer
 /// that covered exactly the pre-#2893 `closed` set is now a mismatch. Every such
 /// input was already `Unproven` — the incompatibility arm runs first — so no
 /// input changes from `Proven` to `Unproven` or back. What changes is which
-/// reason a caller reads, and it moves `coverage-receipt/v3`. No test in this
+/// reason a caller reads, and it moves `coverage-receipt/v4`. No test in this
 /// crate asserts this string.
 fn mismatched_evaluated_members(
     evaluation: &NoMatchEvaluation,
@@ -6535,11 +6653,18 @@ pub enum IngestResult {
 
 impl EvidencePortfolio {
     /// Opens a portfolio over a frozen inquiry denominator.
+    ///
+    /// The coverage account enforces the frozen inquiry's aggregate
+    /// acquisition-attempt budget (W3, #1767): [`BudgetCaps::attempts`] is the
+    /// only declared attempts number, and it previously gated nothing.
     pub fn open(inquiry: &FrozenInquiry) -> Result<Self, PortfolioError> {
         Ok(Self {
             inquiry_digest: inquiry.digest.clone(),
             records: BTreeMap::new(),
-            coverage: CoverageAccount::open(inquiry.denominator_members())?,
+            coverage: CoverageAccount::open_bounded(
+                inquiry.denominator_members(),
+                inquiry.budgets.attempts,
+            )?,
         })
     }
 
