@@ -27,7 +27,7 @@
 
 use eliot_protocol::backup::BackupClassWire;
 
-use super::{must, registering_transaction, test_activation_approval, test_handle};
+use super::{must, registering_transaction, test_activation_approval, test_commit_fence, test_handle};
 use crate::isolated_destination::{
     DestinationLeafObservation, IsolationEvidence, PreparedDestinationAdmission,
     PreparedDestinationMaterialisation, ProposedRestorationRequirements,
@@ -41,7 +41,7 @@ use crate::isolated_destination::materialise_prepared_isolated_destination;
 use crate::{
     ApprovedGeneration, ApprovedGenerationRegistry, CandidateManifest, FileIdentity,
     InstallationActivationApproval, InstallationError, IsolatedDestinationError,
-    IsolatedDestinationRefusal, PlatformHandle,
+    IsolatedDestinationRefusal, PlatformHandle, RedbInstallationRegistry,
 };
 
 /// Purge-ledger revision the ORS owner reports for the admitted preparation.
@@ -1220,4 +1220,113 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
     );
 
     area.release();
+}
+
+/// Source: `RedbInstallationRegistry::open_at` /
+/// `RedbInstallationRegistry::open_existing_at`
+/// (`installation_registry.rs`) with
+/// `RedbInstallationRegistry::seed_active_generation_for_test_support` and
+/// `RedbInstallationRegistry::load` (`redb_state.rs`).
+/// Discovery: the sibling Host-recovery proofs drive a `Test` lease, which the
+/// owner-binding check refuses by construction, so none of them can reach the
+/// production durable path. This case takes the PRODUCTION lease under the T17
+/// override pattern instead, so the seeded row is committed and read back
+/// through real redb rather than an in-memory projection.
+/// Executed-pass: an active generation is seeded into a registry opened at a
+/// real retained root and read back, then the registry is dropped and reopened
+/// read-only, and the SAME active generation and installation identity are read
+/// again -- the row survived a close and a reopen through real redb.
+/// I5.13: `restore to isolated root;`.
+/// A13.7: `Restore occurs in an isolated area and verifies:`.
+// WORK_UNIT_CASE: 958/T5-redb
+#[cfg(windows)]
+#[test]
+fn seeded_active_generation_survives_redb_reopen() {
+    let installation = installation_key("0");
+    let owner_lease = eliot_platform_windows::HostOwnerLease::acquire(&installation)
+        .expect("redb case holds the installation owner lease");
+    let capability = owner_lease.activation_capability();
+
+    // The six steps of `live_isolated_area`, inlined because this case needs the
+    // LEASE itself rather than a `LiveArea`: `open_at` takes it by value and
+    // retains it, and the registry keeps the handles pinned.
+    let _serial = super::PRODUCTION_INSTALLER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let staging = std::env::temp_dir().join("eliot-958-installation-area");
+    std::fs::create_dir_all(&staging).expect("the isolated area staging root is creatable");
+    let _override = eliot_platform_windows::test_support::override_protected_root(&staging);
+    let path = staging.join("redb-t5").join(
+        super::NEXT_TRANSACTION_ROOT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    let _ = std::fs::remove_dir_all(&path);
+    eliot_platform_windows::prepare_protected_directory(&path)
+        .expect("the isolated area fixture is creatable inside the protected root");
+    let lease = crate::ProtectedRootLease::open_existing(&path)
+        .expect("the isolated area fixture admits a retained protected-root lease");
+    // Read off the lease, in the exact `LiveArea::root_text` form, BEFORE the
+    // move into the registry: this is the canonical observed root the owner
+    // binding compares the manifest's `host_state_root` against.
+    let area_root_text = lease
+        .canonical_path()
+        .expect("lease resolves its canonical root")
+        .to_string_lossy()
+        .into_owned();
+    let registry =
+        RedbInstallationRegistry::open_at(lease).expect("production open at the retained root");
+
+    let mut manifest = approved_generation(&installation, "generation-958-redb", true).manifest;
+    manifest.runtime_launch.runtime_state_roots.host_state_root = test_handle(area_root_text);
+    manifest.runtime_launch = must(manifest.runtime_launch.with_computed_digest());
+    must(manifest.validate());
+
+    registry
+        .seed_active_generation_for_test_support(
+            &capability,
+            &manifest,
+            &test_handle("transaction:958-redb"),
+            &test_handle("d".repeat(64)),
+            &super::test_commit_fence(&manifest),
+        )
+        .expect("seed commits the active row through real CAS");
+
+    let loaded = registry.load().expect("load");
+    let active = loaded
+        .active()
+        .expect("the seeded active row is present before the reopen");
+    assert_eq!(
+        active.manifest.generation, manifest.generation,
+        "the seeded active row is the generation this case committed"
+    );
+    assert_eq!(
+        active.manifest.runtime_launch.installation_epoch.installation, installation,
+        "the active row names this case's own installation identity"
+    );
+
+    // Close the writer and reopen read-only: what is asserted below can only
+    // come off disk, because the process handle that wrote it is gone.
+    drop(registry);
+    let lease2 = crate::ProtectedRootLease::open_existing(&path).expect("reopen lease");
+    let store2 = RedbInstallationRegistry::open_existing_at(lease2)
+        .expect("reopen")
+        .expect("registry file exists");
+    let reopened_loaded = store2.load().expect("load");
+    let reopened = reopened_loaded
+        .active()
+        .expect("the active row survived the close and reopen");
+    assert_eq!(
+        reopened.manifest.generation, manifest.generation,
+        "the active generation survived a real redb reopen, not memory"
+    );
+    assert_eq!(
+        reopened.manifest.runtime_launch.installation_epoch.installation, installation,
+        "the reopened row still names this case's own installation identity"
+    );
+
+    // Leases dropped first: their retained handles exclude delete sharing.
+    drop(store2);
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_dir_all(&staging);
 }
