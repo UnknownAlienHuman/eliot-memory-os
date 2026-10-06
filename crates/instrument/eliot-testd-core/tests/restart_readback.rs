@@ -248,7 +248,7 @@ impl ProcessStreamSourceReadbackPort for TestPort {
                 reason: "the readback names an unknown job or attempt",
             });
         }
-        let served = self.table.get(&request.locator).ok_or_else(|| {
+        let served = self.table.get(&request.locator).ok_or({
             TestdEvidenceError::SourceUnavailable {
                 stream: request.stream,
                 reason: "the test port serves no source under this locator",
@@ -744,6 +744,14 @@ fn reconcile_refuses_foreign_attempt_without_bytes() {
 ///
 /// This is the WD3 physical edge: real process bytes, not literals. The
 /// payload is alphanumeric so shell echo passes it through verbatim.
+// Disallowed-methods escape hatch (clippy.toml I10.8.2). Owner: the issue
+// #456 WD3 acceptance fixture in this crate's test surface. Operation: this
+// TEST-ONLY helper launches one real `cmd`/`sh` echo child to capture real
+// OS process bytes for the restart edge proof. Removal condition: deleted
+// with the WD3 proof, or as soon as the test binds the Kernel
+// `ProcessExecutor`, at which point the launch goes through that owner
+// instead of a raw spawn.
+#[allow(clippy::disallowed_methods)]
 fn spawn_real_child_stdout() -> Vec<u8> {
     #[cfg(windows)]
     {
