@@ -6926,6 +6926,46 @@ mod tests {
         assert_eq!(failure.cleanup, BlobCapacityCleanup::NotApplicable);
     }
 
+    /// Executes the real Windows raw-code arms of `native_capacity_cause`:
+    /// OS error 112/39 with a full-volume kind must keep their Windows
+    /// namespace, and a foreign code must never enter it.
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_disk_full_codes_keep_platform_namespace() {
+        assert_eq!(
+            native_capacity_cause(&std::io::Error::from_raw_os_error(112)),
+            Some(BlobCapacityCause::WindowsErrorDiskFull { code: 112 })
+        );
+        assert_eq!(
+            native_capacity_cause(&std::io::Error::from_raw_os_error(39)),
+            Some(BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 })
+        );
+        assert!(!matches!(
+            native_capacity_cause(&std::io::Error::from_raw_os_error(28)),
+            Some(
+                BlobCapacityCause::WindowsErrorDiskFull { .. }
+                    | BlobCapacityCause::WindowsErrorHandleDiskFull { .. }
+            )
+        ));
+    }
+
+    /// Executes the real Linux raw-code arm of `native_capacity_cause`:
+    /// OS error 28 with a full-volume kind must keep its POSIX namespace, and
+    /// a foreign code must never enter it. Runs on Linux targets only; the
+    /// Windows arm above is its platform mirror.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_linux_enospc_keeps_posix_namespace() {
+        assert_eq!(
+            native_capacity_cause(&std::io::Error::from_raw_os_error(28)),
+            Some(BlobCapacityCause::PosixEnospc { code: 28 })
+        );
+        assert!(!matches!(
+            native_capacity_cause(&std::io::Error::from_raw_os_error(112)),
+            Some(BlobCapacityCause::PosixEnospc { .. })
+        ));
+    }
+
     #[test]
     fn stage_journal_capacity_retains_operation_and_attempted_bytes() {
         let root = unique_test_root();
