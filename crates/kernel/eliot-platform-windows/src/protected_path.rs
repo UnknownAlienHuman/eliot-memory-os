@@ -92,6 +92,18 @@ fn protected_path_io_error(
 }
 
 pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
+    // Test-support consistency: the thread-local disposable root redirects
+    // the containment check (`expected_root`), the file-creation contour and
+    // the ACL bypass together; the OS-truth anchor resolver is the single
+    // seam that ignored it, so no override-anchored contour could ever
+    // retain roots in-test. Gated out of production builds, where the
+    // thread-local cannot exist and the OS lookup always runs.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(root) = test_protected_root() {
+        let canonical = canonical_windows_path(&root)?;
+        validate_directory_no_reparse(&canonical)?;
+        return Ok(canonical);
+    }
     let raw = known_folder_path(KnownFolder::ProgramData)?;
     reject_reparse_chain(&raw, true)?;
     let canonical = canonical_windows_path(&raw)?;

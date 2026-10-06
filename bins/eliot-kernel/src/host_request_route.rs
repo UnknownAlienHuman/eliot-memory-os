@@ -236,6 +236,13 @@ pub(crate) const AGENT_BRIDGE_EVENT_GAP_OPERATION: &str = "agent_bridge_event_ga
 /// Closed event-ownership/cursor reconciliation entry: reads the bridge-event
 /// tables only, never the host-request ledger.
 pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_event_reconcile";
+/// Closed receiving-owner receipt entry (issue #2731, item 1): records the
+/// downstream durable-acceptance adjudication (one closed terminal
+/// disposition plus the consumer-leg operation) against the staged handoff
+/// the retirement arm joins. The consumer leg's own apply-and-report behavior
+/// is the receiving side's job (issue #2561); this operation is the kernel
+/// recording frontier for it.
+pub(crate) const AGENT_BRIDGE_OWNER_RECEIPT_OPERATION: &str = "agent_bridge_owner_receipt";
 /// Version of the Kernel bridge-ingest adapter that admits durable/control
 /// bridge events (issue #1934, I7.23): staged with every event as
 /// `adapter_version` so the durable row answers which adapter admitted it
@@ -304,6 +311,7 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
             | AGENT_BRIDGE_EVENT_GAP_OPERATION
             | AGENT_BRIDGE_EVENT_RECONCILE_OPERATION
+            | AGENT_BRIDGE_OWNER_RECEIPT_OPERATION
     )
 }
 
@@ -316,6 +324,7 @@ pub(crate) fn is_bridge_event_operation(operation: &str) -> bool {
             | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
             | AGENT_BRIDGE_EVENT_GAP_OPERATION
             | AGENT_BRIDGE_EVENT_RECONCILE_OPERATION
+            | AGENT_BRIDGE_OWNER_RECEIPT_OPERATION
     )
 }
 
@@ -7286,6 +7295,11 @@ impl KernelComposition {
                     },
                 )?
             }
+            AGENT_BRIDGE_OWNER_RECEIPT_OPERATION => self.answer_bridge_owner_receipt_frame(
+                session,
+                &payload,
+                &identity.request.state_fence,
+            )?,
             _ => return Err(TransportError::SessionFenced),
         };
         let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
@@ -8037,6 +8051,100 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(serde_json::json!({ "status": "known", "value": outcome }))
+    }
+
+    /// Answers one receiving-owner receipt frame (issue #2731, item 1):
+    /// parses the wire receipt, then records it under the live bridge
+    /// application binding. Split from [`Self::dispatch_bridge_event_frame`]
+    /// so the dispatch match stays under the line bound.
+    fn answer_bridge_owner_receipt_frame(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        frame_fence: &eliot_contracts::StateFence,
+    ) -> Result<serde_json::Value, TransportError> {
+        let receipt = bridge_owner_receipt_from_payload(payload, &session.connection_id)?;
+        self.with_live_bridge_application_binding(session, frame_fence, |_| {
+            self.record_bridge_owner_receipt(session, &receipt, frame_fence)
+        })
+    }
+
+    /// Records one receiving-owner durable-acceptance receipt against its
+    /// staged handoff (issue #2731, item 1).
+    ///
+    /// The wire receipt names the stream identity the presenter already
+    /// proved (resolved here to its admitted namespace plus expected
+    /// revision/incarnation through the ORS ack-item resolution, exactly
+    /// like reconcile) - never a caller-asserted namespace. The ORS entry
+    /// re-validates the handoff identity, the owner epoch, the closed
+    /// terminal disposition, and the consumer-leg operation, then records
+    /// idempotently: a changed adjudication for the same key conflicts
+    /// (`IdentityConflict`) instead of overwriting, and a never-staged
+    /// identity fails the frame closed. The recorded `APPLIED` receipt is
+    /// what the retirement arm joins; this entry disposes nothing itself.
+    fn record_bridge_owner_receipt(
+        &self,
+        session: &Session,
+        receipt: &serde_json::Value,
+        frame_fence: &eliot_contracts::StateFence,
+    ) -> Result<serde_json::Value, TransportError> {
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let presenter = serde_json::json!({
+            "owner_authority_lineage": evidence.authority_lineage,
+            "owner_principal": evidence.principal,
+            "owner_connection": evidence.connection,
+        });
+        let stream_id = receipt
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let item = self
+            .generation_gateway
+            .ors
+            .resolve_bridge_ack_item(&presenter, stream_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let namespace = item
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let revision = item
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TransportError::SessionFenced)?;
+        let incarnation = item
+            .get("incarnation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TransportError::SessionFenced)?;
+        let request = serde_json::json!({
+            "owner_namespace": namespace,
+            "event_id": receipt.get("event_id").ok_or(TransportError::SessionFenced)?,
+            "sequence": receipt.get("sequence").ok_or(TransportError::SessionFenced)?,
+            "envelope_sha256": receipt.get("envelope_sha256").ok_or(TransportError::SessionFenced)?,
+            "expected_revision": revision,
+            "expected_incarnation": incarnation,
+            "receiving_operation": receipt.get("receiving_operation").ok_or(TransportError::SessionFenced)?,
+            "disposition": receipt.get("disposition").ok_or(TransportError::SessionFenced)?,
+            "staging_connection": session.connection_id,
+        });
+        let outcome = self
+            .generation_gateway
+            .ors
+            .record_bridge_owner_receipt_checked(&request)
+            .map_err(|error| match error {
+                OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        Ok(serde_json::json!({ "status": "known", "value": {
+            "accepted": true,
+            "receipt": outcome,
+        } }))
     }
 
     /// Answers event-ownership/cursor reconciliation from the bridge-event
@@ -9719,6 +9827,87 @@ pub(crate) fn bridge_gap_from_payload(
         "start_sequence": start,
         "end_sequence": end,
         "reason_ref": reason_ref,
+        "staging_connection": staging_connection,
+    }))
+}
+
+/// Decodes one receiving-owner receipt from a bridge receipt payload (issue
+/// #2731, item 1).
+///
+/// The payload carries the `receipt` object with the stream/event identity,
+/// the exact envelope digest, the consumer-leg operation reporting durable
+/// acceptance, and one closed terminal disposition (`APPLIED`, `REJECTED`,
+/// or `UNKNOWN`). Identities are non-blank without control characters or the
+/// key separator; the digest is an exact lowercase SHA-256 hex; the
+/// operation is non-blank without control characters; anything else fails
+/// the frame closed before any store call. The admitted owner
+/// namespace/epoch resolve through the presenter at record time (same as
+/// reconcile), so the wire carries stream identity, never a caller-asserted
+/// namespace.
+pub(crate) fn bridge_owner_receipt_from_payload(
+    payload: &serde_json::Value,
+    staging_connection: &str,
+) -> Result<serde_json::Value, TransportError> {
+    let receipt_value = payload
+        .get("receipt")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let stream_id = receipt_value
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                && !text.chars().any(char::is_control)
+                && !text.contains("::")
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let event_id = receipt_value
+        .get("event_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                && !text.chars().any(char::is_control)
+                && !text.contains("::")
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let sequence = receipt_value
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|sequence| *sequence != 0)
+        .ok_or(TransportError::SessionFenced)?;
+    let envelope_sha256 = receipt_value
+        .get("envelope_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let receiving_operation = receipt_value
+        .get("receiving_operation")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                && !text.chars().any(char::is_control)
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let disposition = receipt_value
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| *text == "APPLIED" || *text == "REJECTED" || *text == "UNKNOWN")
+        .ok_or(TransportError::SessionFenced)?;
+    Ok(serde_json::json!({
+        "stream_id": stream_id,
+        "event_id": event_id,
+        "sequence": sequence,
+        "envelope_sha256": envelope_sha256,
+        "receiving_operation": receiving_operation,
+        "disposition": disposition,
         "staging_connection": staging_connection,
     }))
 }
@@ -11562,5 +11751,121 @@ mod invoke_read_tool_tests {
         );
         drop(kernel);
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod bridge_owner_receipt_tests {
+    use super::*;
+
+    fn receipt_wire(
+        stream_id: &str,
+        event_id: &str,
+        sequence: u64,
+        digest: &str,
+        operation: &str,
+        disposition: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "operation": AGENT_BRIDGE_OWNER_RECEIPT_OPERATION,
+            "receipt": {
+                "stream_id": stream_id,
+                "event_id": event_id,
+                "sequence": sequence,
+                "envelope_sha256": digest,
+                "receiving_operation": operation,
+                "disposition": disposition,
+            },
+        })
+    }
+
+    const RECEIPT_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn receipt_operation_is_a_bridge_event_operation() {
+        // Issue #2731 item 1: the receipt entry rides the closed
+        // agent-bridge event-delivery dispatch, so it crosses the same
+        // admitted front-door gateway as forward/gap/reconcile.
+        assert!(is_bridge_event_operation(
+            AGENT_BRIDGE_OWNER_RECEIPT_OPERATION
+        ));
+        assert!(is_host_request_operation(
+            AGENT_BRIDGE_OWNER_RECEIPT_OPERATION
+        ));
+    }
+
+    #[test]
+    fn receipt_parser_accepts_a_terminal_adjudication() {
+        // Issue #2731 item 1: a well-formed terminal receipt parses with its
+        // identity, exact digest, consumer-leg operation, and disposition,
+        // bound to the presenting connection.
+        let parsed = bridge_owner_receipt_from_payload(
+            &receipt_wire(
+                "stream-1",
+                "evt-1",
+                3,
+                RECEIPT_DIGEST,
+                "governor-intake-op-1",
+                "APPLIED",
+            ),
+            "conn-9",
+        )
+        .expect("a terminal receipt must parse");
+        assert_eq!(
+            parsed.get("stream_id").and_then(serde_json::Value::as_str),
+            Some("stream-1")
+        );
+        assert_eq!(
+            parsed.get("sequence").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            parsed
+                .get("disposition")
+                .and_then(serde_json::Value::as_str),
+            Some("APPLIED")
+        );
+        assert_eq!(
+            parsed
+                .get("staging_connection")
+                .and_then(serde_json::Value::as_str),
+            Some("conn-9")
+        );
+    }
+
+    #[test]
+    fn receipt_parser_refuses_transport_phases_and_malformed_identity() {
+        // Issue #2731 item 1 (route-level negatives): an intermediate
+        // transport phase, a blank consumer-leg operation, a non-digest, a
+        // key-separator identity, a zero sequence, and a missing receipt
+        // object all fail the frame closed before any store call.
+        for payload in [
+            receipt_wire("stream-1", "evt-1", 1, RECEIPT_DIGEST, "op-1", "DURABLE"),
+            receipt_wire("stream-1", "evt-1", 1, RECEIPT_DIGEST, "op-1", "RECEIVED"),
+            receipt_wire("stream-1", "evt-1", 1, RECEIPT_DIGEST, "   ", "APPLIED"),
+            receipt_wire("stream-1", "evt-1", 1, "not-a-digest", "op-1", "APPLIED"),
+            receipt_wire(
+                "stream-1",
+                "evt-1",
+                1,
+                &RECEIPT_DIGEST.to_uppercase(),
+                "op-1",
+                "APPLIED",
+            ),
+            receipt_wire("stream::1", "evt-1", 1, RECEIPT_DIGEST, "op-1", "APPLIED"),
+            receipt_wire("stream-1", "evt-1", 0, RECEIPT_DIGEST, "op-1", "APPLIED"),
+            serde_json::json!({"operation": AGENT_BRIDGE_OWNER_RECEIPT_OPERATION}),
+        ] {
+            assert_eq!(
+                bridge_owner_receipt_from_payload(&payload, "conn-9"),
+                Err(TransportError::SessionFenced),
+                "malformed receipt must fail the frame closed: {payload}"
+            );
+        }
     }
 }

@@ -7,8 +7,8 @@
 //! Rejection is proven at the admit stage (or earlier, at compose for shapes
 //! the composer cannot represent). No test in this file activates an overlay:
 //! this crate owns no activation path, so the tests call only
-//! `compose_campaign_harness_overlay`, `admit_local`, and
-//! `admit_local_with_refs`.
+//! `compose_campaign_harness_overlay`, `admit_local`,
+//! `admit_local_with_refs`, and `revalidate_for_campaign`.
 
 #![allow(clippy::expect_used)]
 
@@ -31,9 +31,12 @@ use eliot_learning_contracts::{
 };
 use eliot_learning_overlay::OverlayError;
 use eliot_learning_overlay::{
-    AdmittedDeltaPair, FrozenPreEvaluation, OverlayComposeInput,
-    admission::{AuthoritativeRefs, admit_local, admit_local_with_refs},
-    compose_campaign_harness_overlay,
+    AdmittedDeltaPair, FrozenPreEvaluation, OverlayComposeInput, OverlayLifecycle,
+    admission::{
+        AuthoritativeRefs, RevalidationRequest, admit_local, admit_local_with_refs,
+        revalidate_for_campaign,
+    },
+    compose_campaign_harness_overlay, frozen_digest,
 };
 
 fn aid(value: &str) -> ArtifactId {
@@ -358,6 +361,24 @@ fn bind_slot_source_contract(
             .slot_projection_digests
             .push(CampaignSlotProjectionDigest {
                 slot_id: projection.slot_id.clone(),
+                digest: digest.clone(),
+            });
+        // WHY: ExactReference equality (state_view.rs:1307-1310) requires the
+        // recipe's expected_reference to equal the provenance resolution's
+        // reference; pushing only the recipe side diverges with ScopeMismatch
+        // on view.provenance.current_source_reference. Mirror the identical
+        // digest into the provenance side to restore equality.
+        provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved")
+            .reference
+            .as_mut()
+            .expect("slot source has a current resolution reference")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
                 digest,
             });
     }
@@ -372,7 +393,11 @@ fn fixture() -> Fixture {
         owner: OwnerId::from_artifact(aid("owner-1864")),
         source_role: CampaignSourceRole::ArtifactProjection,
         target: target.clone(),
-        requirement: SlotRequirement::Optional,
+        // WHY: the projection is honestly KnownEmpty with owner evidence and empty
+        // declared_members; Optional plus KnownEmpty derives Partial so the view's
+        // CompleteForDeclaredRecipe fails validate_against; Required plus KnownEmpty
+        // plus evidence stays Complete via evidenced_empty. Norm I12-24:1883.
+        requirement: SlotRequirement::Required,
         declared_members: vec![],
         accepted_type: "verification/v1".to_owned(),
         schema_digest: digest("schema-1864"),
@@ -491,6 +516,7 @@ fn delta(
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal().expect("delta seal");
@@ -603,6 +629,23 @@ fn valid_candidate(
     (deltas, candidate)
 }
 
+// W3: the contracts-side frozen digest of a composed candidate must equal the
+// overlay `freeze` digest over the same fixture bundle, identity and seal.
+#[test]
+fn contracts_frozen_digest_matches_freeze_digest() {
+    let fixture = fixture();
+    let (_, candidate) = valid_candidate(&fixture);
+    assert_eq!(
+        candidate.frozen_digest(),
+        frozen_digest(
+            &fixture.frozen,
+            candidate.overlay_id.as_str(),
+            &candidate.canonical_digest
+        ),
+        "contracts-side frozen digest must match the freeze digest (W3 #1864)"
+    );
+}
+
 // A2/1: a change whose target names a sealed-holdout reference is rejected at
 // the admit stage with `ProtectedSurfaceChanged`; no activation call exists.
 #[test]
@@ -707,5 +750,33 @@ fn bounded_local_change_with_matching_refs_admits_with_receipt() {
     .expect("matching refs admit");
     assert_eq!(receipt.overlay_id, candidate.overlay_id.as_str());
     assert_eq!(receipt.admitted_at_ms, 1_000);
+    assert_eq!(receipt.lifecycle, OverlayLifecycle::LocalAdmitted);
     assert!(admit_local(&candidate, &fixture.view, &deltas, 1_000).is_ok());
+}
+
+// W2/W6: the receipt records the reached lifecycle disposition — admission
+// issues `LocalAdmitted`, and same-campaign revalidation of the live revision
+// re-issues the receipt as `ActiveForNextAttempt`.
+#[test]
+fn revalidated_revision_receipt_records_active_disposition_1864() {
+    let fixture = fixture();
+    let (deltas, candidate) = valid_candidate(&fixture);
+    let refs_data = RefData::matching();
+    let refs = refs_data.refs(&fixture.view);
+    let admitted = admit_local_with_refs(&candidate, &fixture.view, &deltas, &refs, 1_000)
+        .expect("matching refs admit");
+    assert_eq!(admitted.lifecycle, OverlayLifecycle::LocalAdmitted);
+    let request = RevalidationRequest {
+        candidate: &candidate,
+        view: &fixture.view,
+        deltas: &deltas,
+        refs: &refs,
+        requesting_campaign_id: candidate.campaign_id.as_str(),
+        binding_compatible: true,
+        now_ms: 1_000,
+        cross_task: None,
+    };
+    let receipt = revalidate_for_campaign(&request).expect("live revision revalidates");
+    assert_eq!(receipt.overlay_id, candidate.overlay_id.as_str());
+    assert_eq!(receipt.lifecycle, OverlayLifecycle::ActiveForNextAttempt);
 }

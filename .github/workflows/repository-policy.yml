@@ -185,55 +185,15 @@ jobs:
               assert str(row.get('owner', '')).strip(), f'{relative} has no owner in the disposition record'
           PY
 
+      # Retirement authority lives in the accepted record
+      # workstreams/security/retired-authority-surfaces.toml (issue #1225
+      # N_step6/AC6, I00-08): restoring or retiring a surface means changing
+      # that record, and the verdict follows it. No inline path list here.
       - name: Reject retired authority and campaign surfaces
         shell: bash
         run: |
           set -euo pipefail
-          forbidden=(
-            '.eliot'
-            '.codebase-memory'
-            'research'
-            'reports'
-            'swarm'
-            'docs/tasks'
-            'docs/normative'
-            'docs/conformance.toml'
-            'docs/UNIMPLEMENTED.md'
-            'docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md'
-            'docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md'
-            'docs/operations/BRANCH_INTEGRATION_CLEANUP_HANDOFF_2026-08-28.md'
-            'docs/operations/M5_OPERATIONS_RUNBOOK.md'
-            'docs/operations/PRODUCTION_CUTOVER_RUNBOOK.md'
-            'docs/operations/RUNTIME_LIVE_V3_HANDOFF_2026-08-22.md'
-            'COGNITIVE_COMPLETION_RECOVERY_PROGRESS.md'
-            'UL_PROGRESS.md'
-            'crates/smart/.audit-probe'
-            '.github/workflows/runtime017-primary.yml'
-            '.github/workflows/candidate-release.yml'
-            'scripts/gen-composition-roots.ps1'
-            'scripts/verify-composition-roots.ps1'
-            'scripts/gen-conformance.ps1'
-            'scripts/verify-conformance.ps1'
-            'scripts/gen-contour-cut.ps1'
-            'scripts/verify-contour-cut.ps1'
-            'scripts/gen-module-manifests.ps1'
-            'scripts/verify-module-manifests.ps1'
-            'scripts/gen-unimplemented.ps1'
-            'scripts/verify-unimplemented.ps1'
-            'scripts/measure-stu.ps1'
-            'scripts/run-cognitive-field-certification.ps1'
-            'scripts/run-runtime017-primary.ps1'
-            'scripts/run-ul-cross-agent-certification.ps1'
-            'scripts/test-m5-isolated-operations.ps1'
-            'scripts/plan-eliot-production-cutover.ps1'
-          )
-
-          for path in "${forbidden[@]}"; do
-            if [[ -e "$path" ]]; then
-              echo "Retired authority/campaign surface is present: $path"
-              exit 1
-            fi
-          done
+          python scripts/verify-retired-authority-surfaces.py --root . --record workstreams/security/retired-authority-surfaces.toml
 
       - name: Verify canonical normative identity
         shell: pwsh

@@ -519,8 +519,10 @@ mod tests {
         let Ok(profile_binding_digest) = eliot_testd_core::testd_definition_digest() else {
             panic!("profile binding digest must compute");
         };
+        // The probe profile carries no environment bindings; the empty vector
+        // is part of the canonical digest exactly as the reader recomputes it.
         let admission_digest = dcf_canonical_hex(
-            &serde_json::json!({"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "profile": "cargo-test", "profile_binding_digest": profile_binding_digest, "cancelled": false, "admitted_at_unix_nanos": admitted_at}),
+            &serde_json::json!({"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "profile": "cargo-test", "profile_binding_digest": profile_binding_digest, "environment": [], "cancelled": false, "admitted_at_unix_nanos": admitted_at}),
         );
         let Ok(epoch_json) = serde_json::to_string(grant_epoch) else {
             panic!("test epoch must serialize");
@@ -547,7 +549,7 @@ mod tests {
         let file = serde_json::json!({
             "request": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "attempt_seq": 0, "closed_request_json": closed_request_json, "target_resource_digest": target_resource_digest, "request_digest": request_digest},
             "envelope": envelope,
-            "admission": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "profile": "cargo-test", "profile_binding_digest": profile_binding_digest, "cancelled": false, "admitted_at_unix_nanos": admitted_at, "admission_digest": admission_digest},
+            "admission": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "profile": "cargo-test", "profile_binding_digest": profile_binding_digest, "environment": [], "cancelled": false, "admitted_at_unix_nanos": admitted_at, "admission_digest": admission_digest},
             "epoch": epoch_value,
             "generation": 1,
             "nonce": nonce,

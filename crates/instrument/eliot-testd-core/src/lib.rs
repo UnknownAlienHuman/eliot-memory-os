@@ -5718,6 +5718,20 @@ mod tests {
             declared_scope: "scope".to_owned(),
             requested_at: ClockReading::default(),
         };
+        // Root identity validation (#1806) requires absolute existing
+        // directories, so the fixture materializes real roots under a unique
+        // temp dir instead of the historical relative placeholders.
+        let roots_base =
+            std::env::temp_dir().join(format!("eliot-testd-provider-roots-{}.d", Uuid::new_v4()));
+        let contour_root = roots_base.join("contour");
+        // The build target nests strictly inside the allowed contour while
+        // the source root stays disjoint from it.
+        let source_root = roots_base.join("source");
+        let target_root = contour_root.join("target");
+        for dir in [&source_root, &target_root] {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
         let job = TestJob {
             job_id: "job".to_owned(),
             project_id: "project".to_owned(),
@@ -5732,10 +5746,13 @@ mod tests {
                 invocation_digest: "invocation-digest".to_owned(),
             },
             target_roots: TargetRoots {
-                allowed_contour_root: "contour".to_owned(),
-                source_root: "source".to_owned(),
-                target_root: "target".to_owned(),
-                cache_root: "target".to_owned(),
+                allowed_contour_root: contour_root.to_string_lossy().into_owned(),
+                source_root: source_root.to_string_lossy().into_owned(),
+                // The active profile pins the cache root to the canonical
+                // target root, mirroring the historical fixture where both
+                // were the same placeholder.
+                target_root: target_root.to_string_lossy().into_owned(),
+                cache_root: target_root.to_string_lossy().into_owned(),
             },
             target_layout: None,
             work_envelope: None,
@@ -5765,6 +5782,12 @@ mod tests {
             let mut table = write.open_table(JOBS)?;
             table.insert(job.job_id.as_str(), encoded.as_slice())?;
         }
+        // The reopen path replays the durable project-sequence inventory, so
+        // the fixture records the same metadata a production submit would.
+        {
+            let mut meta = write.open_table(META)?;
+            meta.insert("project:project", b"1".as_slice())?;
+        }
         write.commit()?;
         Ok((store, path))
     }
@@ -5784,6 +5807,9 @@ mod tests {
     fn provider_test_registry_artifact(
         profile: &str,
         parser: &str,
+        source_root: &str,
+        target_root: &str,
+        cache_root: &str,
     ) -> Result<RawArtifact, TestdError> {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "job_id": "job",
@@ -5791,9 +5817,9 @@ mod tests {
             "profile": profile,
             "invocation_target": "target",
             "invocation_arguments": [],
-            "source_root": "source",
-            "target_root": "target",
-            "cache_root": "target",
+            "source_root": source_root,
+            "target_root": target_root,
+            "cache_root": cache_root,
             "original": { "parser_image_sha256": "a".repeat(64) },
             "metadata": {
                 "profile": eliot_instrument_nextest::NEXTEST_INSTRUMENT,
@@ -5893,7 +5919,13 @@ mod tests {
         let mut job = store
             .get("job")?
             .ok_or_else(|| std::io::Error::other("provider test job missing"))?;
-        let registry = provider_test_registry_artifact(TESTD_PRODUCTIVE_PROFILE, parser_id)?;
+        let registry = provider_test_registry_artifact(
+            TESTD_PRODUCTIVE_PROFILE,
+            parser_id,
+            job.target_roots.source_root.as_str(),
+            job.target_roots.target_root.as_str(),
+            job.target_roots.cache_root.as_str(),
+        )?;
         job.provider_registry_snapshot = Some(registry.clone());
         let encoded = serde_json::to_vec(&job)?;
         let write = store.database.begin_write()?;
@@ -6108,7 +6140,7 @@ mod tests {
             concat!(
                 r#"{"outcome":"DENIED","wire_id":"eliot.kernel.testd-owner-submit","#,
                 r#""wire_version":2,"request_digest":""#,
-                r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+                r#"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
                 r#""operation_id":"operation-owner-submit-1","#,
                 r#""directive":"TASK_SELECTION_REQUIRED"}"#,
             )
@@ -6401,6 +6433,9 @@ mod tests {
         foreign_job.provider_registry_snapshot = Some(provider_test_registry_artifact(
             TESTD_PRODUCTIVE_PROFILE,
             "foreign.parser",
+            foreign_job.target_roots.source_root.as_str(),
+            foreign_job.target_roots.target_root.as_str(),
+            foreign_job.target_roots.cache_root.as_str(),
         )?);
         assert!(readback.validate(&foreign_job).is_err());
         let mut forged = readback.clone();
