@@ -19,7 +19,7 @@ use eliot_governor::{
     QueueLimits, issue_learning_admission, verify_learning_admission,
 };
 use eliot_improvement::candidate_bounds::{
-    AdmitOutcome, ArchiveCause, BoundedBacklog, BoundsError,
+    AdmitOutcome, ArchiveCause, BoundedBacklog, BoundsError, CrossTaskCarryover,
 };
 use eliot_improvement::{
     ImprovementCandidate, ImprovementSurface, ReplayPlan,
@@ -520,4 +520,101 @@ fn local_surface_and_missing_overlay_refused_at_bridge_1864() {
         ),
         Err("missing_overlay")
     );
+}
+#[test]
+fn foreign_binding_without_carryover_refused() {
+    let setup = live_setup();
+    let permit = issue_for(
+        &setup,
+        Some(OVERLAY_1869),
+        Some(&setup.candidate_id.clone()),
+    );
+    let verified = verify_learning_admission(&setup.governor, &permit, &setup.fence)
+        .expect("live owner verifies");
+    // Well-formed foreign request, no distinct admission: the shared rule
+    // (`bound_compilation_task`, `candidate_bounds.rs:2098`) binds a
+    // carryover-less compilation to the LOCAL target, so the foreign binding
+    // mismatches.
+    let err = produce(
+        &setup,
+        &setup.candidate_id.clone(),
+        "closure-1869-a",
+        "governor-1869",
+        "task-1869-foreign",
+        &setup.fence,
+        Some(OVERLAY_1869),
+        &verified,
+    )
+    .expect_err("foreign compilation without a distinct admission is refused");
+    assert_eq!(err, BoundsError::CrossTaskAdmissionMismatch);
+}
+
+#[test]
+fn foreign_binding_with_owner_carryover_produces() {
+    let setup = live_setup();
+    let permit = issue_for(
+        &setup,
+        Some(OVERLAY_1869),
+        Some(&setup.candidate_id.clone()),
+    );
+    let verified = verify_learning_admission(&setup.governor, &permit, &setup.fence)
+        .expect("live owner verifies");
+    // Owner-issued distinct admission for the foreign task (I12.24:295):
+    // the same five revalidated refs as the local claim, a different target
+    // task. Mirrors the `cross_task_carryover_with_owner_issued_permit`
+    // construction in `candidate_bounds_1869.rs`.
+    let foreign_claim = LearningAdmissionClaim {
+        schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
+        source_campaign_id: CAMPAIGN_1869.to_string(),
+        target_task_id: "task-1869-foreign".to_string(),
+        fence: setup.fence.clone(),
+        overlay_id: Some(OVERLAY_1869.to_string()),
+        candidate_id: Some(setup.candidate_id.clone()),
+        scope_ref: "scope-1869".to_string(),
+        authority_ref: "governor-1869".to_string(),
+        retention_ref: "retention-1869".to_string(),
+        evaluator_ref: "evaluator-1869-a".to_string(),
+        rollback_ref: "rollback-1869".to_string(),
+    };
+    let (cross_permit, record) = permit
+        .issue_cross_task_admission(&setup.governor, &foreign_claim)
+        .expect("owner mints a distinct cross-task admission");
+    let cross_verified = verify_learning_admission(&setup.governor, &cross_permit, &setup.fence)
+        .expect("owner verifies the foreign admission");
+    let carryover = CrossTaskCarryover::verify(
+        &setup.governor,
+        &verified,
+        &cross_verified,
+        &record,
+        &setup.fence,
+        &setup.fence,
+    )
+    .expect("carryover verifies against both admissions");
+    // Same body as the `produce` helper (same file, line 200), except the
+    // foreign binding and the presented carryover.
+    let atom = produce_learning_candidate(LearningProduction {
+        backlog: &setup.backlog,
+        candidate_id: &setup.candidate_id,
+        closure_ref: "closure-1869-a",
+        owner: "governor-1869",
+        binding: &binding("task-1869-foreign", &setup.fence),
+        atom_id: "atom-learning-1869",
+        provider_role: &provider_role(),
+        source_id: "source-learning-1869",
+        source_owner: "governor-1869",
+        snapshot_id: "snapshot-learning-1869",
+        source_revision: "closure-1869-a",
+        content: "local update: tighten context budget",
+        overlay_id: Some(OVERLAY_1869),
+        expires_at_unix_secs: Some(NOW_1869 + 3600),
+        measurement_digest: &"d".repeat(64),
+        measurement_serializer: "json-v1",
+        verified: &verified,
+        cross_task: Some(&carryover),
+    })
+    .expect("foreign compilation with a verified carryover produces");
+    let mark = atom.learning.as_ref().expect("atom carries the mark");
+    assert_eq!(mark.campaign_id, CAMPAIGN_1869);
+    assert_eq!(atom.binding.task_id.as_str(), "task-1869-foreign");
+    assert_eq!(mark.permit_digest, permit.digest());
 }
